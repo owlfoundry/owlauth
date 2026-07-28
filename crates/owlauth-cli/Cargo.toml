@@ -1,6 +1,6 @@
 [package]
 name = "owlauth-cli"
-version = "0.0.2"
+version = "0.0.3"
 edition.workspace = true
 description = "Command-line interface for OwlAuth"
 license.workspace = true
