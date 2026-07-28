@@ -29,7 +29,7 @@ read -r package version < <(
   exit 1
 }
 
-cargo package --locked --manifest-path "$manifest"
+cargo package --locked --allow-dirty --manifest-path "$manifest"
 archive="target/package/${package}-${version}.crate"
 [[ -f "$archive" ]] || {
   printf 'cargo package did not create %s\n' "$archive" >&2
@@ -57,7 +57,7 @@ case "$status" in
     ;;
   404)
     : "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN is required}"
-    cargo publish --locked --manifest-path "$manifest"
+    cargo publish --locked --allow-dirty --manifest-path "$manifest"
     ;;
   *)
     printf 'crates.io returned HTTP %s while checking %s %s\n' \
