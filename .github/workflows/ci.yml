@@ -136,6 +136,8 @@ jobs:
           test -f docs/.vitepress/dist/robots.txt
           grep -q 'https://owlauth.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
           grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
+      - name: Dry-run documentation deployment
+        run: pnpm --filter @owlauth/docs run deploy --dry-run
 
   plugin:
     name: Plugin
