@@ -66,6 +66,7 @@ git -C "$work" add Cargo.toml scripts/release/verify-release.sh
 git -C "$work" commit --quiet -m "initial"
 git -C "$work" remote add origin "$remote"
 git -C "$work" push --quiet --set-upstream origin main
+git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
 
 run_verifier() {
   (

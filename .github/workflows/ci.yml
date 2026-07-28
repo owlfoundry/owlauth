@@ -168,6 +168,7 @@ jobs:
         env:
           CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
+          mkdir -p "$CODEX_HOME"
           npx --yes @openai/codex@0.142.3 plugin marketplace add . --json
           npx --yes @openai/codex@0.142.3 plugin add owlauth@owlauth --json
 
