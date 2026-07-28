@@ -26,6 +26,7 @@ check: ## Run formatting, lint, package metadata, and workflow checks
 	@test -f $(DOCS_DIR)/.vitepress/dist/sitemap.xml
 	@grep -q 'https://owlauth.owlfoundry.org/' $(DOCS_DIR)/.vitepress/dist/sitemap.xml
 	@grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' $(DOCS_DIR)/.vitepress/dist/robots.txt
+	@pnpm --filter @owlauth/docs run deploy --dry-run
 	@scripts/release/test-verify-release.sh
 	@actionlint
 
@@ -62,7 +63,7 @@ docs-build: ## Build documentation for deployment
 
 .PHONY: docs-deploy
 docs-deploy: ## Deploy documentation to Cloudflare Workers
-	@pnpm --filter @owlauth/docs deploy
+	@pnpm --filter @owlauth/docs run deploy
 
 .PHONY: docker-build
 docker-build: ## Build and smoke-test the local server image

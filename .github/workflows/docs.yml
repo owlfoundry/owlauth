@@ -52,6 +52,8 @@ jobs:
           test -f docs/.vitepress/dist/robots.txt
           grep -q 'https://owlauth.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
           grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
+      - name: Dry-run documentation deployment
+        run: pnpm --filter @owlauth/docs run deploy --dry-run
       - name: Upload documentation artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -107,4 +109,4 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: pnpm --filter @owlauth/docs deploy
+        run: pnpm --filter @owlauth/docs run deploy
