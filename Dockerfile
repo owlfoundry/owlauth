@@ -4,7 +4,7 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY sdks/rust ./sdks/rust
-RUN cargo build --release --locked --package owlauth
+RUN cargo build --release --locked --package owlauth-server
 
 FROM debian:bookworm-slim AS runtime
 
@@ -25,7 +25,7 @@ RUN apt-get update \
     && groupadd --gid 10001 owlauth \
     && useradd --uid 10001 --gid owlauth --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin owlauth
 
-COPY --from=builder --chown=owlauth:owlauth /workspace/target/release/owlauth /usr/local/bin/owlauth
+COPY --from=builder --chown=owlauth:owlauth /workspace/target/release/owlauth-server /usr/local/bin/owlauth-server
 COPY --chown=owlauth:owlauth LICENSE /usr/share/licenses/owlauth/LICENSE
 
 USER owlauth
@@ -33,4 +33,4 @@ ENV OWLAUTH_ADDR=0.0.0.0:8080
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null || exit 1
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/owlauth"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/owlauth-server"]

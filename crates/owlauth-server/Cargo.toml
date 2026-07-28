@@ -1,0 +1,21 @@
+[package]
+name = "owlauth-server"
+version = "0.0.2"
+edition.workspace = true
+description = "Self-hostable OAuth 2.1 authorization server and user management platform"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["oauth", "oauth2", "authentication", "server"]
+categories = ["authentication", "web-programming::http-server"]
+
+[dependencies]
+axum = "0.8.9"
+owlauth-types = { version = "=0.0.2", path = "../owlauth-types" }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }

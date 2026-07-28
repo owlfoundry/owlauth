@@ -23,7 +23,7 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Install Rust toolchain
@@ -34,11 +34,30 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
-      - name: Verify Rust SDK package
+      - name: Verify publishable Rust packages
         run: |
-          cargo package --manifest-path sdks/rust/Cargo.toml --locked --allow-dirty
-          package_files="$(cargo package --manifest-path sdks/rust/Cargo.toml --locked --allow-dirty --list)"
-          grep -qx LICENSE <<< "$package_files"
+          for manifest in \
+            crates/owlauth-types/Cargo.toml \
+            crates/owlauth-cli/Cargo.toml \
+            sdks/rust/Cargo.toml; do
+            cargo package --manifest-path "$manifest" --locked --allow-dirty
+            package_files="$(cargo package --manifest-path "$manifest" --locked --allow-dirty --list)"
+            grep -qx LICENSE <<< "$package_files"
+          done
+          # owlauth-types 0.0.2 is not in the registry until the first server release.
+          server_files="$(cargo package --manifest-path crates/owlauth-server/Cargo.toml --locked --allow-dirty --list)"
+          grep -qx LICENSE <<< "$server_files"
+      - name: Verify Rust product boundaries
+        run: |
+          cli_tree="$(cargo tree --locked --package owlauth-cli --edges normal --prefix none)"
+          ! grep -Eq '^owlauth-server |^owlauth_server ' <<< "$cli_tree"
+          ! grep -Eq '^owlauth-client |^owlauth_client ' <<< "$(cargo tree --locked --package owlauth-server --edges normal --prefix none)"
+      - name: Smoke-test CLI
+        run: |
+          cargo run --locked --package owlauth-cli -- --version
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' crates/owlauth-cli/Cargo.toml | head -n 1)"
+          cargo run --locked --package owlauth-cli -- update \
+            --version "$version" --force --dry-run --install-dir "${RUNNER_TEMP}/bin"
 
   python:
     name: Python ${{ matrix.python-version }}
@@ -50,11 +69,11 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install uv
@@ -86,11 +105,11 @@ jobs:
         node-version: ["20", "22", "24"]
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Set up tooling Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
       - name: Install pnpm
@@ -105,7 +124,7 @@ jobs:
         working-directory: sdks/typescript
         run: npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
       - name: Set up runtime Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
       - name: Run tests on supported Node.js
@@ -117,11 +136,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
       - name: Install pnpm
@@ -145,11 +164,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
       - name: Validate plugin metadata
@@ -183,7 +202,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Build server image
@@ -202,16 +221,24 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Generate and validate OpenAPI
         run: |
-          cargo run --locked --package owlauth -- --openapi > "${RUNNER_TEMP}/owlauth-openapi.json"
+          cargo run --locked --package owlauth-server -- --openapi > "${RUNNER_TEMP}/owlauth-openapi.json"
           python3 -m json.tool "${RUNNER_TEMP}/owlauth-openapi.json" >/dev/null
       - name: Validate JSON fixtures
         run: |
           python3 -m json.tool sdks/spec/fixtures/health-response.json >/dev/null
           python3 -m json.tool sdks/spec/conformance/cases.json >/dev/null
-      - name: Test release eligibility checks
-        run: scripts/release/test-verify-release.sh
+      - name: Test release tooling and installers
+        run: |
+          scripts/release/test-verify-release.sh
+          python3 scripts/release/test-changelog.py
+          sh -n scripts/install.sh
+          scripts/test-installers.sh
+          cmp scripts/install.sh crates/owlauth-cli/assets/install.sh
+          cmp scripts/install.ps1 crates/owlauth-cli/assets/install.ps1
+          pwsh -NoProfile -NonInteractive -Command \
+            '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Out-String | Write-Error; exit 1 }'

@@ -5,7 +5,7 @@
 SDK generation consumes one OpenAPI document emitted from the exact OwlAuth server source revision under validation:
 
 ```bash
-cargo run --package owlauth -- --openapi > <temporary-build-path>/owlauth-openapi.json
+cargo run --package owlauth-server -- --openapi > <temporary-build-path>/owlauth-openapi.json
 ```
 
 The OpenAPI file is ephemeral and MUST NOT be committed. Its source revision, server version, generator version/configuration, and digest MUST be recorded in CI or release provenance. The current document describes only health metadata and a small OAuth error enum; it is not a usable OAuth client contract.

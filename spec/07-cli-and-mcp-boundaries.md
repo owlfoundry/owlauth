@@ -1,16 +1,34 @@
-# 07 — Planned Rust CLI and server-side MCP boundaries
+# 07 — Rust CLI and planned server-side MCP boundaries
 
-## Status
+## Current CLI status
 
-Neither a management CLI nor an MCP server is implemented in the current scaffold. Names, commands, tools, transports, and schemas are therefore not a public promise. Plugin documentation must continue to prevent agents from inventing them.
+`crates/owlauth-cli` is a distinct publishable Rust package. Its executable is `owlauth`; it does not depend on `owlauth-server`. The current pre-alpha command surface is deliberately small:
 
-## Planned Rust CLI
+```text
+owlauth --version
+owlauth update [--version <SEMVER>] [--dry-run] [--force] [--install-dir <DIRECTORY>]
+```
 
-A future CLI SHOULD be delivered as a distinct Rust crate and executable. It is an adapter/client, not an alternate home for domain or storage policy. Remote workflows use documented server interfaces; carefully designed local bootstrap or recovery workflows may compose internal application services only if their deployment and locking model is explicit.
+`update` discovers only stable `cli-v*` GitHub Releases, compares SemVer, and runs a release-pinned installer embedded in the current binary. Unix and PowerShell installers download the exact target archive and require a matching SHA-256 entry from the release's `SHA256SUMS`. The Windows updater stages the replacement and waits for the running process to exit before replacing it.
 
-The CLI may eventually support operator/developer tasks such as validated configuration diagnostics, server status, client registration management, key/migration inspection, and safe authorization testing. Each command requires a separate contract before implementation.
+No operator, OAuth, storage, bootstrap, recovery, or local MCP command is currently implemented. Names and behavior for those future commands are not a public promise.
 
-CLI invariants:
+## CLI dependency and release boundary
+
+The CLI is an adapter/client, not an alternate home for domain, storage, or authorization policy. Remote workflows use documented public server interfaces and remain subject to current server-side authentication and authorization.
+
+Required dependency direction:
+
+```text
+owlauth-cli -X-> owlauth-server
+owlauth-cli --> owlauth-client   # permitted when a real remote command needs it
+```
+
+CLI and server follow independent SemVer. CLI releases use `release/cli/{version}` and `cli-v{version}`, publish the `owlauth-cli` crate, and attach platform archives, `SHA256SUMS`, and both installers to GitHub Releases. Supported installer targets and release artifacts MUST be identical. A release after the first MUST smoke-test update from the preceding CLI release.
+
+## CLI invariants
+
+Future command implementations retain these requirements:
 
 - secrets are read from a TTY prompt, protected file descriptor, or secret provider—not ordinary arguments or shell history;
 - stdout supports deliberate human or machine modes, while diagnostics go to stderr;
@@ -18,7 +36,11 @@ CLI invariants:
 - destructive actions require explicit targeting and confirmation, with a non-interactive equivalent that is difficult to trigger accidentally;
 - remote TLS verification is on by default; insecure development modes are explicit and noisy;
 - output redacts tokens, codes, secrets, cookies, verifiers, and signing material;
-- the CLI cannot bypass server-side authorization by constructing internal-looking identifiers.
+- the CLI cannot bypass server-side authorization by constructing internal-looking identifiers;
+- installers fail closed when archive download, checksum download, checksum lookup, or digest verification fails;
+- update discovery filters component tags and never uses the repository-wide latest release redirect.
+
+A package-manager installation may need to direct users back to that package manager rather than overwriting managed files. Such source detection is required before advertising self-update as universally compatible.
 
 ## Planned server-side MCP adapter
 
@@ -33,17 +55,17 @@ High-impact mutations SHOULD use preview/confirm or an equivalent capability-bou
 - CLI and MCP names/schemas are not inferred from HTTP OpenAPI automatically.
 - MCP is not included in public SDK generation unless explicitly designed as a public HTTP contract.
 - Agent plugins may provide discovery and setup guidance but MUST NOT request, relay, persist, or display credentials in agent context.
-- CLI, HTTP, and MCP can share domain use cases; each adapter retains its own authentication, admission, serialization, and output constraints.
-- Disabling MCP MUST NOT disable the core HTTP authorization server or require SDK changes.
+- CLI, HTTP, and MCP can share internal server use cases only through appropriate adapters; each retains its own authentication, admission, serialization, and output constraints.
+- Disabling MCP MUST NOT disable core HTTP authorization or require SDK changes.
 
 ## Compatibility
 
-CLI machine output and MCP tool schemas require independent compatibility review. Tool removal, renamed arguments, changed confirmation semantics, or altered side effects are breaking even if the underlying domain API is unchanged. Capabilities SHOULD be discoverable without exposing privileged state.
+CLI machine output and MCP tool schemas require independent compatibility review. Tool removal, renamed arguments, changed confirmation semantics, altered update asset naming, or changed side effects may be breaking even if the underlying domain API is unchanged. Capabilities SHOULD be discoverable without exposing privileged state.
 
-## Acceptance criteria before either surface is advertised
+## Acceptance criteria before management CLI or MCP surfaces are advertised
 
 - An accepted command/tool catalog defines actors, permissions, effects, bounds, errors, and audit events.
 - Threat-model tests cover prompt injection, confused deputy, stale confirmation, privilege escalation, secret exfiltration, replay, and denial of service.
-- End-to-end tests prove server-side policy is identical for equivalent actions across adapters.
+- End-to-end tests prove server-side policy is identical for equivalent operations across adapters.
 - Package/plugin installation contains no hidden server binary or invented local MCP process.
 - User guidance clearly labels available versus planned commands and tools.

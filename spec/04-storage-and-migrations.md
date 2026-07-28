@@ -2,7 +2,7 @@
 
 ## Ownership and current status
 
-Persistence belongs to `crates/storage`. Versioned migration assets belong under [`crates/storage/migrations/`](../crates/storage/migrations/), beside the code that interprets them. The repository currently has a minimal `UserStore` trait and a migration policy README; no database schema, adapter, or runner is implemented.
+Persistence is a server-internal concern under `crates/owlauth-server`. Versioned migration assets belong under [`crates/owlauth-server/migrations/`](../crates/owlauth-server/migrations/), beside the future code that interprets them. The repository currently has only a migration policy README; no persistence port, database schema, adapter, or runner is implemented.
 
 ## Persistence contract
 
@@ -14,8 +14,8 @@ Network calls and unbounded computation MUST NOT run inside transactions. Operat
 
 ## Embedded migration contract
 
-1. Migration source files MUST live in `crates/storage/migrations/`.
-2. The storage crate MUST embed migration bytes at build time; a deployed server MUST NOT depend on a separately copied migration directory.
+1. Migration source files MUST live in `crates/owlauth-server/migrations/`.
+2. The server package MUST embed migration bytes at build time; a deployed server MUST NOT depend on a separately copied migration directory.
 3. On every startup, after validating configuration and connecting to storage but before readiness or request admission, the server MUST acquire the migration mechanism's required lock and apply every pending migration in order.
 4. Migration identity and checksum MUST be recorded. A changed checksum for an already-applied migration MUST fail startup rather than silently rewrite history.
 5. Each migration MUST be transactional where supported. If the engine cannot transact an operation, the migration requires an explicit resumability, rollback, backup, and recovery review.

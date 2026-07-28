@@ -21,7 +21,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -30,6 +30,17 @@ jobs:
         run: |
           version="$(scripts/release/verify-release.sh python)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Generate release changelog
+        run: |
+          python3 scripts/release/generate-changelog.py \
+            --component python --version "${{ steps.release.outputs.version }}" \
+            --output release-notes.md
+      - name: Upload release changelog
+        uses: actions/upload-artifact@v6
+        with:
+          name: python-release-notes
+          path: release-notes.md
+          if-no-files-found: error
 
   ci:
     name: Full CI
@@ -46,12 +57,12 @@ jobs:
       contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@v6
         with:
           python-version: "3.14"
       - name: Install uv
@@ -66,6 +77,11 @@ jobs:
           uv run --locked twine check dist/*
           wheel_contents="$(unzip -Z1 dist/*.whl)"
           grep -Eq '\.dist-info/licenses/LICENSE$' <<< "$wheel_contents"
+      - name: Download release changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: python-release-notes
+          path: release-metadata
       - name: Re-verify release eligibility
         run: scripts/release/verify-release.sh python >/dev/null
       - name: Require PyPI token
@@ -83,12 +99,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          notes_args=(--generate-notes)
-          previous_tag="$(git tag --list 'python-v*' --sort=-v:refname | sed -n '1p')"
-          if [[ -n "$previous_tag" ]]; then
-            notes_args+=(--notes-start-tag "$previous_tag")
-          fi
           gh release create "python-v${VERSION}" \
+            --notes-file release-metadata/release-notes.md \
             --target "$GITHUB_SHA" \
-            --title "Python SDK v${VERSION}" \
-            "${notes_args[@]}"
+            --title "Python SDK v${VERSION}"

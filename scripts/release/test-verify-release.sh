@@ -57,33 +57,51 @@ updater="$temporary_directory/updater"
 git init --quiet --bare "$remote"
 git init --quiet --initial-branch=main "$work"
 cp "$repository_root/Cargo.toml" "$work/Cargo.toml"
-mkdir -p "$work/scripts/release"
+mkdir -p \
+  "$work/crates/owlauth-cli" \
+  "$work/crates/owlauth-server" \
+  "$work/crates/owlauth-types" \
+  "$work/scripts/release"
+cp "$repository_root/crates/owlauth-cli/Cargo.toml" "$work/crates/owlauth-cli/Cargo.toml"
+cp "$repository_root/crates/owlauth-server/Cargo.toml" "$work/crates/owlauth-server/Cargo.toml"
+cp "$repository_root/crates/owlauth-types/Cargo.toml" "$work/crates/owlauth-types/Cargo.toml"
 cp "$verifier" "$work/scripts/release/verify-release.sh"
+server_version="$(manifest_version "$repository_root/crates/owlauth-server/Cargo.toml")"
+cli_version="$(manifest_version "$repository_root/crates/owlauth-cli/Cargo.toml")"
 
 git -C "$work" config user.name "Release Test"
 git -C "$work" config user.email "release-test@example.com"
-git -C "$work" add Cargo.toml scripts/release/verify-release.sh
+git -C "$work" add Cargo.toml crates scripts/release/verify-release.sh
 git -C "$work" commit --quiet -m "initial"
 git -C "$work" remote add origin "$remote"
 git -C "$work" push --quiet --set-upstream origin main
 git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
 
 run_verifier() {
+  local component="$1"
+  shift
   (
     cd "$work"
-    env "$@" "$verifier" server
+    env "$@" "$verifier" "$component"
   )
 }
 
-run_verifier GITHUB_REF_NAME=release/server/0.0.1 >/dev/null
+run_verifier cli GITHUB_REF_NAME="release/cli/$cli_version" >/dev/null
+git -C "$work" tag "cli-v$cli_version"
+git -C "$work" push --quiet origin "cli-v$cli_version"
+expect_failure run_verifier cli GITHUB_REF_NAME="release/cli/$cli_version"
+git -C "$work" push --quiet --delete origin "cli-v$cli_version"
+git -C "$work" tag --delete "cli-v$cli_version" >/dev/null
 
-git -C "$work" tag server-v0.0.1
-git -C "$work" push --quiet origin server-v0.0.1
-expect_failure run_verifier GITHUB_REF_NAME=release/server/0.0.1
+run_verifier server GITHUB_REF_NAME="release/server/$server_version" >/dev/null
 
-git -C "$work" push --quiet --delete origin server-v0.0.1
-git -C "$work" tag --delete server-v0.0.1 >/dev/null
-expect_failure run_verifier GITHUB_REF_NAME=release/server/0.0.1 \
+git -C "$work" tag "server-v$server_version"
+git -C "$work" push --quiet origin "server-v$server_version"
+expect_failure run_verifier server GITHUB_REF_NAME="release/server/$server_version"
+
+git -C "$work" push --quiet --delete origin "server-v$server_version"
+git -C "$work" tag --delete "server-v$server_version" >/dev/null
+expect_failure run_verifier server GITHUB_REF_NAME="release/server/$server_version" \
   RELEASE_REMOTE=missing
 
 git clone --quiet "$remote" "$updater"
@@ -93,6 +111,6 @@ printf 'advanced\n' > "$updater/ADVANCED"
 git -C "$updater" add ADVANCED
 git -C "$updater" commit --quiet -m "advance main"
 git -C "$updater" push --quiet origin main
-expect_failure run_verifier GITHUB_REF_NAME=release/server/0.0.1
+expect_failure run_verifier server GITHUB_REF_NAME="release/server/$server_version"
 
 printf 'release verifier tests passed\n'

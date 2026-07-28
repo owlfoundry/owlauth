@@ -4,7 +4,7 @@ This directory is the language-neutral design index for the official TypeScript,
 
 The SDKs are currently `0.0.1` pre-alpha package-name reservations. Their `Client` objects only retain a base URL; they do not send HTTP requests, perform PKCE, exchange or refresh tokens, map server errors, or provide production OAuth behavior. Requirements below are targets and acceptance gates, not claims of implementation.
 
-The server's public wire contract comes from ephemeral OpenAPI generated from Rust definitions in `crates/protocol`; generated OpenAPI is not committed. SDK-specific generated models/transports, when introduced, remain subordinate to these handwritten lifecycle and security rules.
+The server's public wire contract comes from ephemeral OpenAPI generated from Rust definitions in `crates/owlauth-types`; generated OpenAPI is not committed. SDK-specific generated models/transports, when introduced, remain subordinate to these handwritten lifecycle and security rules.
 
 ## Specification map
 

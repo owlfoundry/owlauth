@@ -12,25 +12,34 @@ is_semver() {
   [[ "$version" =~ $pattern ]]
 }
 
+manifest_version() {
+  awk '
+    /^\[package\]$/ { in_package = 1; next }
+    /^\[/ { in_package = 0 }
+    in_package && /^version = / {
+      sub(/^[^"]*"/, "")
+      sub(/".*$/, "")
+      print
+      exit
+    }
+  ' "$1"
+}
+
 read_release_metadata() {
   local component="$1"
 
+  companion_version=""
   case "$component" in
     server)
       prefix="release/server/"
       tag_prefix="server-v"
-      manifest_version="$(
-        awk '
-          /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
-          /^\[/ { in_workspace_package = 0 }
-          in_workspace_package && /^version = / {
-            sub(/^[^"]*"/, "")
-            sub(/".*$/, "")
-            print
-            exit
-          }
-        ' Cargo.toml
-      )"
+      manifest_version="$(manifest_version crates/owlauth-server/Cargo.toml)"
+      companion_version="$(manifest_version crates/owlauth-types/Cargo.toml)"
+      ;;
+    cli)
+      prefix="release/cli/"
+      tag_prefix="cli-v"
+      manifest_version="$(manifest_version crates/owlauth-cli/Cargo.toml)"
       ;;
     typescript)
       prefix="release/sdk/typescript/"
@@ -48,7 +57,7 @@ read_release_metadata() {
       manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' sdks/rust/Cargo.toml | head -n 1)"
       ;;
     *)
-      printf 'usage: %s {server|typescript|python|rust}\n' "$0" >&2
+      printf 'usage: %s {server|cli|typescript|python|rust}\n' "$0" >&2
       return 2
       ;;
   esac
@@ -57,7 +66,7 @@ read_release_metadata() {
 main() {
   local component="${1:-}"
   local branch version remote release_commit main_commit tag tag_matches
-  local prefix tag_prefix manifest_version
+  local prefix tag_prefix manifest_version companion_version
 
   read_release_metadata "$component"
 
@@ -76,6 +85,11 @@ main() {
   if [[ -z "$manifest_version" || "$version" != "$manifest_version" ]]; then
     printf 'branch version %s does not match %s manifest version %s\n' \
       "$version" "$component" "${manifest_version:-<missing>}" >&2
+    return 1
+  fi
+  if [[ -n "$companion_version" && "$version" != "$companion_version" ]]; then
+    printf 'branch version %s does not match owlauth-types manifest version %s\n' \
+      "$version" "$companion_version" >&2
     return 1
   fi
 

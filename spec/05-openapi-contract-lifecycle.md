@@ -2,13 +2,13 @@
 
 ## Authority and current baseline
 
-Reviewed Rust definitions in `crates/protocol` are the source for the public HTTP contract. `utoipa` currently generates a document containing only `/health`, `HealthResponse`, and a small OAuth error-code schema. `crates/server` can emit it with:
+Reviewed Rust definitions in `crates/owlauth-types` are the source for the public HTTP contract. `utoipa` currently generates a document containing only `/health`, `HealthResponse`, and a small OAuth error-code schema. `crates/owlauth-server` can emit it with:
 
 ```bash
-cargo run --package owlauth -- --openapi
+cargo run --package owlauth-server -- --openapi
 ```
 
-This does not mean an HTTP listener or OAuth endpoints exist. The generated document MUST NOT be committed to this repository; generate it into a temporary/build location when validation or SDK tooling needs it.
+The server composes the documented health route; no OAuth endpoints exist. The generated document MUST NOT be committed to this repository; generate it into a temporary/build location when validation or SDK tooling needs it.
 
 ## Lifecycle
 

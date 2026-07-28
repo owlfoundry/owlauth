@@ -38,9 +38,13 @@ A releasable component has:
 - documentation that separates current capability from roadmap;
 - successful component-specific validation, including server-backed E2E only when the required server behavior exists.
 
-Server and each SDK have independent SemVer and tags. A server change does not force equal SDK versions, but tested compatibility ranges and coordinated breaking changes must be recorded.
+Server, CLI, and each SDK have independent SemVer and component tags. `owlauth-types` follows the server version and is published before `owlauth-server`. A server change does not force equal CLI or SDK versions, but tested compatibility ranges and coordinated breaking changes must be recorded.
 
-A server release publishes the same verified source as native archives and `ghcr.io/owlfoundry/owlauth:{version}`, then advances the mutable `latest` channel. OCI tags represent a SemVer `+` build-metadata separator as `_` because `+` is not valid in an OCI tag. The `dev` image follows `main`. Explicit `build/server/{tag}` branches provide isolated `build-{tag}` test tags that cannot collide with release channels. Every image is built from its triggering commit and must start successfully and pass `/health` before registry publication.
+Every release generates deterministic component-filtered notes from validated squash PR titles before any publication. The notes artifact consumed by final publication is the same artifact reviewed during the release gate; GitHub-generated cross-component notes are not mixed in.
+
+A server release publishes the same verified source as the `owlauth-types` and `owlauth-server` crates, native archives, and `ghcr.io/owlfoundry/owlauth:{version}`, then advances the mutable `latest` channel. OCI tags represent a SemVer `+` build-metadata separator as `_` because `+` is not valid in an OCI tag. The `dev` image follows `main`. Explicit `build/server/{tag}` branches provide isolated `build-{tag}` test tags that cannot collide with release channels. Every image is built from its triggering commit and must start successfully and pass `/health` before registry publication.
+
+A CLI release publishes `owlauth-cli` and platform-specific GitHub Release archives with mandatory SHA-256 checksums. Installers fail closed when checksums are absent or invalid. The release matrix and installer target detection remain identical, and every release after the first validates a real update from the preceding CLI version on Linux, macOS, and Windows.
 
 ## Evolution rules
 
