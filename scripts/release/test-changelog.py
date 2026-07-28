@@ -101,6 +101,7 @@ def test_uses_previous_component_tag_and_first_parent_order() -> None:
         git(repository, "tag", "server-v0.0.1")
         commit(repository, "fix(python): fix Python client (#2)")
         commit(repository, "fix(server+cli): improve diagnostics (#3)")
+        git(repository, "tag", "server-v0.0.2")
         output = repository / "notes.md"
 
         generate_notes(

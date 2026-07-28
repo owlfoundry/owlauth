@@ -15,6 +15,23 @@ function Resolve-Version {
     return $release.tag_name.Substring(5)
 }
 
+function Get-Sha256 {
+    param([string]$Path)
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $Hasher.Dispose()
+        }
+    }
+    finally {
+        $Stream.Dispose()
+    }
+}
+
 try {
     $Version = Resolve-Version
     if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$') {
@@ -33,7 +50,7 @@ try {
     $ChecksumLine = Get-Content $ChecksumFile | Where-Object { $_ -match "^[0-9a-fA-F]{64}\s+\*?$([Regex]::Escape($ArchiveName))$" } | Select-Object -First 1
     if (-not $ChecksumLine) { throw "SHA256SUMS has no entry for $ArchiveName" }
     $Expected = ($ChecksumLine -split '\s+')[0].ToLowerInvariant()
-    $Actual = (Get-FileHash -Algorithm SHA256 $Archive).Hash.ToLowerInvariant()
+    $Actual = Get-Sha256 $Archive
     if ($Expected -ne $Actual) { throw "checksum mismatch for $ArchiveName" }
     $Extracted = Join-Path $TemporaryDirectory "extracted"
     Expand-Archive -Path $Archive -DestinationPath $Extracted

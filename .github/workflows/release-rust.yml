@@ -2,8 +2,8 @@ name: Release Rust SDK
 
 on:
   push:
-    branches:
-      - "release/sdk/rust/**"
+    tags:
+      - "rust-v*"
 
 permissions:
   contents: read
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify release branch
+    name: Verify release tag
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -25,7 +25,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify branch, version, commit, and tag
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Verify tag, version, and commit
         id: release
         run: |
           version="$(scripts/release/verify-release.sh rust)"
@@ -44,6 +46,7 @@ jobs:
 
   ci:
     name: Full CI
+    needs: verify
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -61,6 +64,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
       - name: Download release changelog
         uses: actions/download-artifact@v7
         with:
@@ -83,5 +88,4 @@ jobs:
         run: |
           gh release create "rust-v${VERSION}" \
             --notes-file release-metadata/release-notes.md \
-            --target "$GITHUB_SHA" \
             --title "Rust SDK v${VERSION}"

@@ -4,4 +4,4 @@ OwlAuth is security-sensitive pre-release software. Do not use the current scaff
 
 Report suspected vulnerabilities through [GitHub private vulnerability reporting](https://github.com/owlfoundry/owlauth/security/advisories/new), not a public issue.
 
-Registry and Cloudflare credentials belong only in GitHub Actions secrets or trusted-publishing identities. Never commit tokens, put them in release branches, or paste them into issues and pull requests.
+Registry and Cloudflare credentials belong only in GitHub Actions secrets or trusted-publishing identities. Never commit tokens, include them in release metadata, or paste them into issues and pull requests.

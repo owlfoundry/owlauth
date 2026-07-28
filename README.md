@@ -58,13 +58,15 @@ owlauth update --version 0.0.2 --force
 
 The server, CLI, and each SDK follow independent SemVer. `owlauth-types` follows the server version.
 
-| Component | Package | Release branch | Tag |
-| --- | --- | --- | --- |
-| Server | `owlauth-server`, `owlauth-types` | `release/server/{version}` | `server-v{version}` |
-| CLI | `owlauth-cli` | `release/cli/{version}` | `cli-v{version}` |
-| TypeScript | `@owlauth/client` | `release/sdk/typescript/{version}` | `typescript-v{version}` |
-| Python | `owlauth-client` | `release/sdk/python/{version}` | `python-v{version}` |
-| Rust | `owlauth-client` | `release/sdk/rust/{version}` | `rust-v{version}` |
+| Component | Package | Release tag |
+| --- | --- | --- |
+| Server | `owlauth-server`, `owlauth-types` | `server-v{version}` |
+| CLI | `owlauth-cli` | `cli-v{version}` |
+| TypeScript | `@owlauth/client` | `typescript-v{version}` |
+| Python | `owlauth-client` | `python-v{version}` |
+| Rust | `owlauth-client` | `rust-v{version}` |
+
+Push a release tag at the current `main` commit. The workflow derives the version from the tag and materializes it in manifests and lockfiles without a version-bump commit.
 
 Server container images are hosted at `ghcr.io/owlfoundry/owlauth`. `main` updates `dev`; a server release publishes its version and updates `latest`; `build/server/{tag}` publishes the isolated, smoke-tested tag `build-{tag}`.
 

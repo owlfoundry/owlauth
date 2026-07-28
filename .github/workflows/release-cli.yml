@@ -2,8 +2,8 @@ name: Release CLI
 
 on:
   push:
-    branches:
-      - "release/cli/**"
+    tags:
+      - "cli-v*"
 
 permissions:
   contents: read
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify release branch
+    name: Verify release tag
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -25,7 +25,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify branch, version, commit, and tag
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Verify tag, version, and commit
         id: release
         run: |
           version="$(scripts/release/verify-release.sh cli)"
@@ -46,6 +48,7 @@ jobs:
 
   ci:
     name: Full CI
+    needs: verify
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -82,6 +85,8 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
       - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal
@@ -135,6 +140,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
       - name: Download CLI artifacts
         uses: actions/download-artifact@v7
         with:
@@ -178,11 +185,10 @@ jobs:
         run: |
           gh release create "cli-v${VERSION}" artifacts/* \
             --notes-file release-metadata/release-notes.md \
-            --target "$GITHUB_SHA" \
             --title "OwlAuth CLI v${VERSION}"
 
   update-smoke:
-    name: Update from previous CLI (${{ matrix.os }})
+    name: Exercise CLI update (${{ matrix.os }})
     needs: [verify, release]
     strategy:
       fail-fast: false
@@ -201,21 +207,31 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve previous CLI release
-        id: previous
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Resolve updater source CLI release
+        id: source
         env:
           CURRENT_TAG: cli-v${{ needs.verify.outputs.version }}
         run: |
           git fetch --quiet --tags origin
           previous="$(git tag --list 'cli-v*' --sort=-version:refname | grep -Fvx "$CURRENT_TAG" | head -n 1 || true)"
-          echo "tag=$previous" >> "$GITHUB_OUTPUT"
-      - name: Install previous CLI artifact
-        if: steps.previous.outputs.tag != ''
+          source="$previous"
+          if [[ "$RUNNER_OS" == "Windows" && ( "$previous" == "cli-v0.0.2" || "$previous" == "cli-v0.0.3" ) ]]; then
+            # These releases used PowerShell stdin mode, which did not execute the bundled installer on Windows.
+            # Exercise the repaired current updater in self-reinstall mode; the next release upgrades from it.
+            source="$CURRENT_TAG"
+          fi
+          echo "previous_tag=$previous" >> "$GITHUB_OUTPUT"
+          echo "tag=$source" >> "$GITHUB_OUTPUT"
+          echo "updater source: ${source:-<none>}"
+      - name: Install updater source CLI artifact
+        if: steps.source.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
         run: |
-          version="${PREVIOUS_TAG#cli-v}"
+          version="${SOURCE_TAG#cli-v}"
           case "$RUNNER_OS" in
             Linux) target=x86_64-unknown-linux-gnu; extension=tar.gz ;;
             macOS) target=x86_64-apple-darwin; extension=tar.gz ;;
@@ -223,7 +239,7 @@ jobs:
           esac
           archive="owlauth-cli-${version}-${target}.${extension}"
           mkdir -p previous installed
-          gh release download "$PREVIOUS_TAG" --pattern "$archive" --dir previous
+          gh release download "$SOURCE_TAG" --pattern "$archive" --dir previous
           if [[ "$extension" == zip ]]; then
             powershell -NoProfile -NonInteractive -Command \
               "Expand-Archive -LiteralPath 'previous/$archive' -DestinationPath 'installed'"
@@ -231,7 +247,7 @@ jobs:
             tar -xzf "previous/$archive" -C installed
           fi
       - name: Update to current CLI release
-        if: steps.previous.outputs.tag != ''
+        if: steps.source.outputs.tag != ''
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
@@ -247,5 +263,5 @@ jobs:
           echo "updated CLI did not report version $VERSION" >&2
           exit 1
       - name: Report first release
-        if: steps.previous.outputs.tag == ''
+        if: steps.source.outputs.previous_tag == ''
         run: echo "No previous CLI release exists; upgrade smoke test starts with the next release."

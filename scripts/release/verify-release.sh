@@ -12,50 +12,13 @@ is_semver() {
   [[ "$version" =~ $pattern ]]
 }
 
-manifest_version() {
-  awk '
-    /^\[package\]$/ { in_package = 1; next }
-    /^\[/ { in_package = 0 }
-    in_package && /^version = / {
-      sub(/^[^"]*"/, "")
-      sub(/".*$/, "")
-      print
-      exit
-    }
-  ' "$1"
-}
-
-read_release_metadata() {
-  local component="$1"
-
-  companion_version=""
-  case "$component" in
-    server)
-      prefix="release/server/"
-      tag_prefix="server-v"
-      manifest_version="$(manifest_version crates/owlauth-server/Cargo.toml)"
-      companion_version="$(manifest_version crates/owlauth-types/Cargo.toml)"
-      ;;
-    cli)
-      prefix="release/cli/"
-      tag_prefix="cli-v"
-      manifest_version="$(manifest_version crates/owlauth-cli/Cargo.toml)"
-      ;;
-    typescript)
-      prefix="release/sdk/typescript/"
-      tag_prefix="typescript-v"
-      manifest_version="$(sed -n 's/^  "version": "\([^"]*\)",$/\1/p' sdks/typescript/package.json | head -n 1)"
-      ;;
-    python)
-      prefix="release/sdk/python/"
-      tag_prefix="python-v"
-      manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' sdks/python/pyproject.toml | head -n 1)"
-      ;;
-    rust)
-      prefix="release/sdk/rust/"
-      tag_prefix="rust-v"
-      manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' sdks/rust/Cargo.toml | head -n 1)"
-      ;;
+release_tag_prefix() {
+  case "$1" in
+    server) printf 'server-v\n' ;;
+    cli) printf 'cli-v\n' ;;
+    typescript) printf 'typescript-v\n' ;;
+    python) printf 'python-v\n' ;;
+    rust) printf 'rust-v\n' ;;
     *)
       printf 'usage: %s {server|cli|typescript|python|rust}\n' "$0" >&2
       return 2
@@ -65,31 +28,23 @@ read_release_metadata() {
 
 main() {
   local component="${1:-}"
-  local branch version remote release_commit main_commit tag tag_matches
-  local prefix tag_prefix manifest_version companion_version
+  local tag_prefix tag version remote release_commit main_commit tag_commit remote_tag_commit
 
-  read_release_metadata "$component"
-
-  branch="${GITHUB_REF_NAME:-$(git branch --show-current)}"
-  if [[ "$branch" != "$prefix"* ]]; then
-    printf 'expected branch prefix %s, got %s\n' "$prefix" "$branch" >&2
+  tag_prefix="$(release_tag_prefix "$component")"
+  if [[ -n "${GITHUB_REF_TYPE:-}" && "$GITHUB_REF_TYPE" != "tag" ]]; then
+    printf 'release workflow requires a tag ref, got %s\n' "$GITHUB_REF_TYPE" >&2
     return 1
   fi
 
-  version="${branch#"$prefix"}"
-  if [[ "$version" == */* ]] || ! is_semver "$version"; then
-    printf 'branch does not end in a valid SemVer version: %s\n' "$version" >&2
+  tag="${GITHUB_REF_NAME:-$(git describe --tags --exact-match HEAD 2>/dev/null || true)}"
+  if [[ "$tag" != "$tag_prefix"* ]]; then
+    printf 'expected tag prefix %s, got %s\n' "$tag_prefix" "${tag:-<none>}" >&2
     return 1
   fi
 
-  if [[ -z "$manifest_version" || "$version" != "$manifest_version" ]]; then
-    printf 'branch version %s does not match %s manifest version %s\n' \
-      "$version" "$component" "${manifest_version:-<missing>}" >&2
-    return 1
-  fi
-  if [[ -n "$companion_version" && "$version" != "$companion_version" ]]; then
-    printf 'branch version %s does not match owlauth-types manifest version %s\n' \
-      "$version" "$companion_version" >&2
+  version="${tag#"$tag_prefix"}"
+  if ! is_semver "$version"; then
+    printf 'tag does not end in a valid SemVer version: %s\n' "$version" >&2
     return 1
   fi
 
@@ -100,25 +55,42 @@ main() {
     return 1
   fi
 
-  release_commit="$(git rev-parse HEAD)"
-  main_commit="$(git rev-parse refs/remotes/release-verification/main)"
+  release_commit="$(git rev-parse HEAD^{commit})"
+  main_commit="$(git rev-parse refs/remotes/release-verification/main^{commit})"
   if [[ "$release_commit" != "$main_commit" ]]; then
     printf 'release commit %s must equal current main commit %s\n' \
       "$release_commit" "$main_commit" >&2
     return 1
   fi
 
-  tag="${tag_prefix}${version}"
-  if ! tag_matches="$(git ls-remote --tags "$remote" "refs/tags/$tag")"; then
-    printf 'failed to query release tag %s from remote %s\n' "$tag" "$remote" >&2
+  if ! tag_commit="$(git rev-parse "refs/tags/$tag^{commit}" 2>/dev/null)"; then
+    printf 'release tag is not available in the checkout: %s\n' "$tag" >&2
     return 1
   fi
-  if [[ -n "$tag_matches" ]]; then
-    printf 'release tag already exists: %s\n' "$tag" >&2
+  if [[ "$tag_commit" != "$release_commit" ]]; then
+    printf 'release tag %s points at %s instead of checked-out commit %s\n' \
+      "$tag" "$tag_commit" "$release_commit" >&2
     return 1
   fi
 
-  printf 'verified %s release %s at %s\n' "$component" "$version" "$release_commit" >&2
+  if ! remote_tag_commit="$(
+    git ls-remote --tags "$remote" "refs/tags/$tag" "refs/tags/$tag^{}" |
+      awk '
+        $2 ~ /\^\{\}$/ { peeled = $1 }
+        $2 !~ /\^\{\}$/ { direct = $1 }
+        END { print (peeled != "" ? peeled : direct) }
+      '
+  )"; then
+    printf 'failed to query release tag %s from remote %s\n' "$tag" "$remote" >&2
+    return 1
+  fi
+  if [[ -z "$remote_tag_commit" || "$remote_tag_commit" != "$release_commit" ]]; then
+    printf 'remote release tag %s must resolve to %s, got %s\n' \
+      "$tag" "$release_commit" "${remote_tag_commit:-<missing>}" >&2
+    return 1
+  fi
+
+  printf 'verified %s release tag %s at %s\n' "$component" "$tag" "$release_commit" >&2
   printf '%s\n' "$version"
 }
 

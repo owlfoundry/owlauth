@@ -39,15 +39,15 @@ Generated notes classify `security`, `feat`, `fix`, `perf`, `refactor`, `docs`, 
 
 ## Releases
 
-Each component follows independent SemVer. A release branch must point at the current `main` commit and use one of these exact forms:
+Each component follows independent SemVer. A release tag must point at the current `main` commit and use one of these exact forms:
 
-- `release/server/{version}`
-- `release/cli/{version}`
-- `release/sdk/typescript/{version}`
-- `release/sdk/python/{version}`
-- `release/sdk/rust/{version}`
+- `server-v{version}`
+- `cli-v{version}`
+- `typescript-v{version}`
+- `python-v{version}`
+- `rust-v{version}`
 
-Creating a valid release branch runs all checks, generates component-filtered notes before publication, publishes that component, tags the commit, and creates a GitHub Release. A server release publishes `owlauth-types` followed by `owlauth-server`, publishes `ghcr.io/owlfoundry/owlauth:{version}`, and updates `latest`. A CLI release publishes `owlauth-cli` and checksum-verified native archives for supported Linux, macOS, and Windows targets. Do not reuse a version or move a release branch after publication.
+Pushing a valid release tag runs all checks, derives the package version from that tag, updates manifests and lockfiles only inside workflow workspaces, generates component-filtered notes, publishes that component, and creates a GitHub Release. A server release publishes `owlauth-types` followed by `owlauth-server`, publishes `ghcr.io/owlfoundry/owlauth:{version}`, and updates `latest`. A CLI release publishes `owlauth-cli` and checksum-verified native archives for supported Linux, macOS, and Windows targets. Do not reuse, move, or delete a release tag after publication.
 
 Server container channels use these branch rules:
 

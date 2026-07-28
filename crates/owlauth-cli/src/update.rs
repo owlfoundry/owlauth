@@ -1,10 +1,14 @@
 use std::{
     env,
-    io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
+
+#[cfg(not(windows))]
+use std::io::Write as _;
+#[cfg(windows)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use semver::Version;
@@ -53,7 +57,7 @@ pub enum UpdateError {
     NotNewer { current: Version, selected: Version },
     #[error("failed to start the installer: {0}")]
     InstallerStart(std::io::Error),
-    #[error("failed to send the bundled installer: {0}")]
+    #[error("failed to prepare the bundled installer: {0}")]
     InstallerInput(std::io::Error),
     #[error("installer exited with {status}: {stderr}")]
     InstallerFailed { status: String, stderr: String },
@@ -187,50 +191,80 @@ fn run_installer(version: &Version, install_dir: &Path) -> Result<(), UpdateErro
 #[cfg(windows)]
 fn run_installer(version: &Version, install_dir: &Path) -> Result<(), UpdateError> {
     let process_id = std::process::id();
-    let ready_file = env::temp_dir().join(format!("owlauth-update-{process_id}.ready"));
-    match std::fs::remove_file(&ready_file) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(UpdateError::InstallerStart(error)),
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary_directory = env::temp_dir();
+    let basename = format!("owlauth-update-{process_id}-{nonce}");
+    let ready_file = temporary_directory.join(format!("{basename}.ready"));
+    let script_file = temporary_directory.join(format!("{basename}.ps1"));
+    std::fs::write(&script_file, INSTALLER_PS1).map_err(UpdateError::InstallerInput)?;
+
+    let child = powershell_file_command(&script_file)
+        .env("OWLAUTH_VERSION", version.to_string())
+        .env("OWLAUTH_INSTALL_DIR", install_dir)
+        .env("OWLAUTH_UPDATER_PID", process_id.to_string())
+        .env("OWLAUTH_UPDATE_READY_FILE", &ready_file)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&script_file);
+            return Err(UpdateError::InstallerStart(error));
+        }
+    };
+
+    for _ in 0..600 {
+        if ready_file.is_file() {
+            remove_file_if_present(&ready_file)?;
+            let _ = std::fs::remove_file(&script_file);
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(UpdateError::InstallerStart)? {
+            let _ = std::fs::remove_file(&script_file);
+            return Err(UpdateError::InstallerFailed {
+                status: status.to_string(),
+                stderr: "the installer exited before staging the replacement".to_owned(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    let mut child = installer_command("powershell", version, install_dir)
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&script_file);
+    Err(UpdateError::InstallerTimeout)
+}
+
+#[cfg(windows)]
+fn remove_file_if_present(path: &Path) -> Result<(), UpdateError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(UpdateError::InstallerStart(error)),
+    }
+}
+
+#[cfg(windows)]
+fn powershell_file_command(script_file: &Path) -> Command {
+    let mut command = Command::new("powershell");
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            "-",
+            "-File",
         ])
-        .env("OWLAUTH_UPDATER_PID", process_id.to_string())
-        .env("OWLAUTH_UPDATE_READY_FILE", &ready_file)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(UpdateError::InstallerStart)?;
-    child
-        .stdin
-        .take()
-        .expect("installer stdin is piped")
-        .write_all(INSTALLER_PS1.as_bytes())
-        .map_err(UpdateError::InstallerInput)?;
-
-    for _ in 0..600 {
-        if ready_file.is_file() {
-            std::fs::remove_file(&ready_file).map_err(UpdateError::InstallerStart)?;
-            return Ok(());
-        }
-        if let Some(status) = child.try_wait().map_err(UpdateError::InstallerStart)? {
-            return Err(UpdateError::InstallerFailed {
-                status: status.to_string(),
-                stderr: "see installer diagnostics above".to_owned(),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(UpdateError::InstallerTimeout)
+        .arg(script_file)
+        .stdin(Stdio::null());
+    command
 }
 
+#[cfg(not(windows))]
 fn installer_command(program: &str, version: &Version, install_dir: &Path) -> Command {
     let mut command = Command::new(program);
     command
@@ -280,5 +314,35 @@ mod tests {
         ];
 
         assert_eq!(select_latest_stable(&releases), Some(Version::new(0, 0, 3)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_file_mode_executes_the_complete_script() {
+        let directory =
+            env::temp_dir().join(format!("owlauth-powershell-test-{}", std::process::id()));
+        let script_file = directory.join("installer.ps1");
+        let marker_file = directory.join("marker");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            &script_file,
+            r#"$ErrorActionPreference = "Stop"
+function Write-Marker {
+    Set-Content -LiteralPath $env:OWLAUTH_TEST_MARKER -Value "ready" -NoNewline
+}
+Write-Marker
+"#,
+        )
+        .unwrap();
+
+        let status = powershell_file_command(&script_file)
+            .env("OWLAUTH_TEST_MARKER", &marker_file)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&marker_file).unwrap(), "ready");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
