@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.toolchain }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.85.0", "stable"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+      - name: Verify Rust SDK package
+        run: |
+          cargo package --manifest-path sdks/rust/Cargo.toml --locked --allow-dirty
+          package_files="$(cargo package --manifest-path sdks/rust/Cargo.toml --locked --allow-dirty --list)"
+          grep -qx LICENSE <<< "$package_files"
+
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.32
+      - name: Install locked dependencies
+        run: uv sync --project sdks/python --locked
+      - name: Run Ruff
+        run: |
+          uv run --project sdks/python ruff check sdks/python
+          uv run --project sdks/python ruff format --check sdks/python
+      - name: Run tests
+        run: uv run --project sdks/python pytest
+      - name: Build and verify package
+        working-directory: sdks/python
+        run: |
+          rm -rf dist
+          uv run --locked hatchling build -d dist
+          uv run --locked twine check dist/*
+          wheel_contents="$(unzip -Z1 dist/*.whl)"
+          grep -Eq '\.dist-info/licenses/LICENSE$' <<< "$wheel_contents"
+
+  typescript:
+    name: TypeScript Node.js ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["20", "24"]
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Type-check
+        run: npm run check
+      - name: Run tests
+        run: npm test
+      - name: Verify package contents
+        run: npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build documentation
+        run: npm run build
+
+  plugin:
+    name: Plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+      - name: Validate plugin metadata
+        run: |
+          for file in \
+            .agents/plugins/marketplace.json \
+            .claude-plugin/marketplace.json \
+            plugins/owlauth/.claude-plugin/plugin.json \
+            plugins/owlauth/.codex-plugin/plugin.json; do
+            jq empty "$file"
+          done
+          test -L CLAUDE.md
+          test "$(readlink CLAUDE.md)" = "AGENTS.md"
+          test -f plugins/owlauth/skills/owlauth-integration/SKILL.md
+          test -f plugins/owlauth/skills/owlauth-integration/references/sdk-examples.md
+      - name: Validate Claude plugin
+        run: |
+          npx --yes @anthropic-ai/claude-code@2.1.220 plugin validate .
+          npx --yes @anthropic-ai/claude-code@2.1.220 plugin validate plugins/owlauth
+      - name: Smoke-test Codex plugin installation
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          npx --yes @openai/codex@0.142.3 plugin marketplace add . --json
+          npx --yes @openai/codex@0.142.3 plugin add owlauth@owlauth --json
+
+  contract:
+    name: Contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Generate and validate OpenAPI
+        run: |
+          cargo run --locked --package owlauth -- --openapi > "${RUNNER_TEMP}/owlauth-openapi.json"
+          python3 -m json.tool "${RUNNER_TEMP}/owlauth-openapi.json" >/dev/null
+      - name: Validate JSON fixtures
+        run: |
+          python3 -m json.tool sdks/spec/fixtures/health-response.json >/dev/null
+          python3 -m json.tool sdks/spec/conformance/cases.json >/dev/null
+      - name: Test release eligibility checks
+        run: scripts/release/test-verify-release.sh

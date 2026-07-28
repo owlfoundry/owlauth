@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node.js
+**/node_modules/
+**/dist/
+**/.wrangler/
+*.tsbuildinfo
+
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.venv/
+**/*.egg-info/
+**/build/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+.env
+.env.*
+!.env.example

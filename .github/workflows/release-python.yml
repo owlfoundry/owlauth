@@ -1,0 +1,94 @@
+name: Release Python SDK
+
+on:
+  push:
+    branches:
+      - "release/sdk/python/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-python-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify branch, version, commit, and tag
+        id: release
+        run: |
+          version="$(scripts/release/verify-release.sh python)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish owlauth-client
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.32
+      - name: Install locked build tools
+        run: uv sync --project sdks/python --locked
+      - name: Build package
+        working-directory: sdks/python
+        run: |
+          rm -rf dist
+          uv run --locked hatchling build -d dist
+          uv run --locked twine check dist/*
+          wheel_contents="$(unzip -Z1 dist/*.whl)"
+          grep -Eq '\.dist-info/licenses/LICENSE$' <<< "$wheel_contents"
+      - name: Re-verify release eligibility
+        run: scripts/release/verify-release.sh python >/dev/null
+      - name: Require PyPI token
+        env:
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: test -n "$TWINE_PASSWORD"
+      - name: Publish package
+        working-directory: sdks/python
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv run --locked twine upload --non-interactive dist/*
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          notes_args=(--generate-notes)
+          previous_tag="$(git tag --list 'python-v*' --sort=-v:refname | sed -n '1p')"
+          if [[ -n "$previous_tag" ]]; then
+            notes_args+=(--notes-start-tag "$previous_tag")
+          fi
+          gh release create "python-v${VERSION}" \
+            --target "$GITHUB_SHA" \
+            --title "Python SDK v${VERSION}" \
+            "${notes_args[@]}"

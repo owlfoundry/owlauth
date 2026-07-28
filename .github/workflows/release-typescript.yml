@@ -1,0 +1,90 @@
+name: Release TypeScript SDK
+
+on:
+  push:
+    branches:
+      - "release/sdk/typescript/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-typescript-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify branch, version, commit, and tag
+        id: release
+        run: |
+          version="$(scripts/release/verify-release.sh typescript)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish @owlauth/client
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - name: Install and build
+        working-directory: sdks/typescript
+        run: |
+          npm ci
+          npm run build
+      - name: Re-verify release eligibility
+        run: scripts/release/verify-release.sh typescript >/dev/null
+      - name: Require npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: test -n "$NODE_AUTH_TOKEN"
+      - name: Publish package
+        working-directory: sdks/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          notes_args=(--generate-notes)
+          previous_tag="$(git tag --list 'typescript-v*' --sort=-v:refname | sed -n '1p')"
+          if [[ -n "$previous_tag" ]]; then
+            notes_args+=(--notes-start-tag "$previous_tag")
+          fi
+          gh release create "typescript-v${VERSION}" \
+            --target "$GITHUB_SHA" \
+            --title "TypeScript SDK v${VERSION}" \
+            "${notes_args[@]}"

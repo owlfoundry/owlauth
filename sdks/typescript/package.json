@@ -1,0 +1,44 @@
+{
+  "name": "@owlauth/client",
+  "version": "0.0.1",
+  "description": "TypeScript client for OwlAuth",
+  "license": "BSD-3-Clause",
+  "author": "OwlFoundry",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/owlfoundry/owlauth.git",
+    "directory": "sdks/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/owlfoundry/owlauth/issues"
+  },
+  "homepage": "https://github.com/owlfoundry/owlauth#readme",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "5.8.3"
+  }
+}

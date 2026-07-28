@@ -1,0 +1,20 @@
+{
+  "name": "owlauth",
+  "interface": {
+    "displayName": "OwlAuth"
+  },
+  "plugins": [
+    {
+      "name": "owlauth",
+      "source": {
+        "source": "local",
+        "path": "./plugins/owlauth"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

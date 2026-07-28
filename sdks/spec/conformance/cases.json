@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "health response",
+      "fixture": "../fixtures/health-response.json",
+      "expected": {
+        "status": "ok"
+      }
+    }
+  ]
+}
