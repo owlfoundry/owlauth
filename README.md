@@ -42,7 +42,9 @@ The server and each SDK follow independent SemVer:
 | Python | `owlauth-client` | `release/sdk/python/{version}` | `python-v{version}` |
 | Rust | `owlauth-client` | `release/sdk/rust/{version}` | `rust-v{version}` |
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and [TODO.md](TODO.md) for maintainer setup.
+Server container images are hosted at `ghcr.io/owlfoundry/owlauth`. `main` updates `dev`; a server release publishes its version and updates `latest`; `build/server/{tag}` publishes the isolated, smoke-tested tag `build-{tag}`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and release conventions. Project documentation is published at [owlauth.owlfoundry.org](https://owlauth.owlfoundry.org).
 
 ## License
 

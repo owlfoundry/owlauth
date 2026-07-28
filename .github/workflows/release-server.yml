@@ -37,6 +37,16 @@ jobs:
     permissions:
       contents: read
 
+  image:
+    name: Build verified server image
+    needs: [verify, ci]
+    uses: ./.github/workflows/publish-server-image.yml
+    with:
+      mode: release
+      version: ${{ needs.verify.outputs.version }}
+    permissions:
+      contents: read
+
   build:
     name: Build server (${{ matrix.os }})
     needs: [verify, ci]
@@ -77,11 +87,12 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [verify, build]
+    needs: [verify, build, image]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: write
+      packages: write
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -91,13 +102,36 @@ jobs:
       - name: Download server artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: owlauth-*
           path: artifacts
           merge-multiple: true
+      - name: Download verified server image
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: server-container-image
+          path: container-artifact
       - name: Create checksums
         working-directory: artifacts
         run: sha256sum owlauth-*.tar.gz > SHA256SUMS
       - name: Re-verify release eligibility
         run: scripts/release/verify-release.sh server >/dev/null
+      - name: Load verified server image
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          gzip -dc container-artifact/server-image.tar.gz | docker load
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${VERSION//+/_}"
+          docker image inspect "$image" >/dev/null
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish versioned server image
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker push "$image:${VERSION//+/_}"
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,3 +147,10 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "OwlAuth Server v${VERSION}" \
             "${notes_args[@]}"
+      - name: Promote server image to latest
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag "$image:${VERSION//+/_}" "$image:latest"
+          docker push "$image:latest"

@@ -55,13 +55,12 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
-          cache: npm
-          cache-dependency-path: sdks/typescript/package-lock.json
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
       - name: Install and build
-        working-directory: sdks/typescript
         run: |
-          npm ci
-          npm run build
+          pnpm install --frozen-lockfile
+          pnpm --filter @owlauth/client build
       - name: Re-verify release eligibility
         run: scripts/release/verify-release.sh typescript >/dev/null
       - name: Publish package with npm trusted publishing

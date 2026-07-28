@@ -1,0 +1,13 @@
+{
+  "name": "owlauth-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.17.0",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "pnpm --filter @owlauth/client build && pnpm --filter @owlauth/docs build",
+    "check": "pnpm --filter @owlauth/client check",
+    "test": "pnpm --filter @owlauth/client test"
+  }
+}

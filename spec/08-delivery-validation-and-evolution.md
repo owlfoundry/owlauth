@@ -40,6 +40,8 @@ A releasable component has:
 
 Server and each SDK have independent SemVer and tags. A server change does not force equal SDK versions, but tested compatibility ranges and coordinated breaking changes must be recorded.
 
+A server release publishes the same verified source as native archives and `ghcr.io/owlfoundry/owlauth:{version}`, then advances the mutable `latest` channel. OCI tags represent a SemVer `+` build-metadata separator as `_` because `+` is not valid in an OCI tag. The `dev` image follows `main`. Explicit `build/server/{tag}` branches provide isolated `build-{tag}` test tags that cannot collide with release channels. Every image is built from its triggering commit and must start successfully and pass `/health` before registry publication.
+
 ## Evolution rules
 
 Normative changes begin in the owning numbered document and update cross-references rather than duplicating contracts. A proposal that adds a grant, token format, admin surface, CLI command, MCP tool, storage engine, or secret flow includes threat analysis, compatibility, migration, observability, and validation impact.

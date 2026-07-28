@@ -3,7 +3,6 @@ name = "owlauth"
 description = "Self-hostable OAuth 2.1 authorization server and user management platform"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false

@@ -1,0 +1,17 @@
+.git
+.github
+.agents
+.yaacli
+target
+**/target
+**/node_modules
+**/dist
+**/.venv
+**/__pycache__
+docs
+plugins
+sdks/python
+sdks/typescript
+.env
+.env.*
+.DS_Store

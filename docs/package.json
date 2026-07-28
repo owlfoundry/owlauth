@@ -5,6 +5,7 @@
   "description": "OwlAuth documentation",
   "license": "BSD-3-Clause",
   "type": "module",
+  "packageManager": "pnpm@11.17.0",
   "scripts": {
     "dev": "vitepress dev",
     "build": "vitepress build",
@@ -12,10 +13,7 @@
     "deploy": "wrangler deploy --config wrangler.jsonc"
   },
   "engines": {
-    "node": ">=20"
-  },
-  "overrides": {
-    "vite": "6.4.3"
+    "node": ">=22.13"
   },
   "devDependencies": {
     "vitepress": "1.6.4",

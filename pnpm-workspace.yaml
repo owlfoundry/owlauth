@@ -1,0 +1,10 @@
+packages:
+  - docs
+  - sdks/typescript
+
+allowBuilds:
+  esbuild: true
+  workerd: true
+
+overrides:
+  vite: 6.4.3
