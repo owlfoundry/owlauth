@@ -21,7 +21,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -30,6 +30,17 @@ jobs:
         run: |
           version="$(scripts/release/verify-release.sh rust)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Generate release changelog
+        run: |
+          python3 scripts/release/generate-changelog.py \
+            --component rust --version "${{ steps.release.outputs.version }}" \
+            --output release-notes.md
+      - name: Upload release changelog
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-release-notes
+          path: release-notes.md
+          if-no-files-found: error
 
   ci:
     name: Full CI
@@ -46,10 +57,15 @@ jobs:
       contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Download release changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-release-notes
+          path: release-metadata
       - name: Re-verify release eligibility
         run: scripts/release/verify-release.sh rust >/dev/null
       - name: Require crates.io token
@@ -65,12 +81,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          notes_args=(--generate-notes)
-          previous_tag="$(git tag --list 'rust-v*' --sort=-v:refname | sed -n '1p')"
-          if [[ -n "$previous_tag" ]]; then
-            notes_args+=(--notes-start-tag "$previous_tag")
-          fi
           gh release create "rust-v${VERSION}" \
+            --notes-file release-metadata/release-notes.md \
             --target "$GITHUB_SHA" \
-            --title "Rust SDK v${VERSION}" \
-            "${notes_args[@]}"
+            --title "Rust SDK v${VERSION}"

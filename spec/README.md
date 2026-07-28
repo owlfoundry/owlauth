@@ -2,7 +2,7 @@
 
 This directory is the architecture-first, normative design index for the OwlAuth server. The documents describe intended boundaries and acceptance conditions; a requirement appearing here does **not** mean it is implemented.
 
-OwlAuth is currently a pre-alpha scaffold. The binary serves only a health endpoint (or emits a generated OpenAPI document), the protocol crate describes that health operation and a small OAuth error-code set, and no OAuth authorization flow is implemented yet. These specifications guide implementation without representing production readiness.
+OwlAuth is currently a pre-alpha scaffold. The server serves only a health endpoint (or emits a generated OpenAPI document), `owlauth-types` describes that health operation and a small OAuth error-code set, the CLI provides only checksum-verified self-update, and no OAuth authorization flow is implemented yet. These specifications guide implementation without representing production readiness.
 
 User guides belong in [`docs/`](../docs/). Cross-language client requirements belong in [`sdks/spec/`](../sdks/spec/). Generated OpenAPI output, implementation plans, and test logs do not belong in this directory.
 
@@ -16,7 +16,7 @@ User guides belong in [`docs/`](../docs/). Cross-language client requirements be
 | [`04-storage-and-migrations.md`](04-storage-and-migrations.md) | persistence ownership, transactions, embedded automatic migrations, and recovery |
 | [`05-openapi-contract-lifecycle.md`](05-openapi-contract-lifecycle.md) | Rust-authored HTTP contract, generated OpenAPI, compatibility review, and SDK handoff |
 | [`06-operations-configuration-and-security.md`](06-operations-configuration-and-security.md) | startup, configuration, secrets, observability, deployment, and operational safety |
-| [`07-cli-and-mcp-boundaries.md`](07-cli-and-mcp-boundaries.md) | planned Rust CLI and server-side MCP interfaces and their security boundaries |
+| [`07-cli-and-mcp-boundaries.md`](07-cli-and-mcp-boundaries.md) | current updater-only Rust CLI, planned management commands, and server-side MCP boundaries |
 | [`08-delivery-validation-and-evolution.md`](08-delivery-validation-and-evolution.md) | test layers, release evidence, compatibility, and specification evolution |
 
 This README is the ordered navigation map. Detailed requirements should have one owning document and be referenced rather than duplicated.
@@ -25,10 +25,11 @@ This README is the ordered navigation map. Detailed requirements should have one
 
 | Concern | Authority |
 | --- | --- |
-| Core identities, authorization concepts, and policy | `crates/domain` types and services, as they are implemented |
-| Public HTTP shapes and generated API description | Rust definitions in `crates/protocol` |
-| Persistence adapters and schema migration assets | `crates/storage`, including `crates/storage/migrations/` |
-| Process composition and network serving | `crates/server` |
+| Server-only identities, authorization concepts, policy, and persistence | Internal modules of `crates/owlauth-server`, as they are implemented |
+| Public HTTP shapes and generated API description | Rust definitions in `crates/owlauth-types` |
+| Schema migration assets | `crates/owlauth-server/migrations/` |
+| Process composition and network serving | `crates/owlauth-server` |
+| Public CLI and updater | `crates/owlauth-cli` |
 | Language-neutral SDK behavior | [`sdks/spec/`](../sdks/spec/) plus a generated OpenAPI input |
 | User-facing guidance | [`docs/`](../docs/) |
 
@@ -40,10 +41,10 @@ Specifications govern intended design. Executable code and tests reveal current 
 2. Authorization decisions MUST be made server-side from current authoritative state; SDKs, CLI callers, and MCP clients are untrusted inputs.
 3. Secrets, authorization codes, access tokens, refresh tokens, PKCE verifiers, and session credentials MUST NOT appear in ordinary logs, generated contract examples, diagnostics, fixtures, or agent context.
 4. External redirects MUST be exact-match validated against registered client metadata, subject only to protocol-defined exceptions adopted explicitly by OwlAuth.
-5. Storage migrations MUST live under `crates/storage/migrations/`, be embedded in the executable, and run automatically before the server accepts requests. Migration failure MUST prevent serving.
+5. Storage migrations MUST live under `crates/owlauth-server/migrations/`, be embedded in the executable, and run automatically before the server accepts requests. Migration failure MUST prevent serving.
 6. Public OpenAPI is generated from reviewed Rust protocol definitions when needed and MUST NOT be committed as a generated artifact.
 7. Internal crates are not an SDK contract. Every SDK consumes only the public protocol contract and follows independent SemVer.
-8. The planned CLI is a separate Rust client surface. Planned MCP support is a server-side adapter; plugins MUST NOT bundle or invent a local authorization server.
+8. The CLI is a separate Rust client surface and currently implements only verified self-update. Planned MCP support is a server-side adapter; plugins MUST NOT bundle or invent a local authorization server.
 9. Network and storage side effects MUST be bounded, observable without disclosing secrets, and assigned explicit timeout and retry semantics.
 10. No document or release artifact may claim implemented OAuth behavior or production suitability until validation demonstrates it.
 

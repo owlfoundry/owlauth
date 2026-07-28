@@ -1,0 +1,25 @@
+[package]
+name = "owlauth-cli"
+version = "0.0.2"
+edition.workspace = true
+description = "Command-line interface for OwlAuth"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["oauth", "oauth2", "authentication", "cli"]
+categories = ["authentication", "command-line-utilities"]
+include = ["src/**", "assets/**", "README.md", "LICENSE"]
+
+[[bin]]
+name = "owlauth"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.5.54", features = ["derive"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "json", "rustls"] }
+semver = "1.0.27"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.18"

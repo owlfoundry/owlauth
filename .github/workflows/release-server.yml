@@ -21,7 +21,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -30,6 +30,19 @@ jobs:
         run: |
           version="$(scripts/release/verify-release.sh server)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Generate release changelog
+        run: |
+          python3 scripts/release/generate-changelog.py \
+            --component server \
+            --version "${{ steps.release.outputs.version }}" \
+            --output release-notes.md
+      - name: Upload release changelog
+        uses: actions/upload-artifact@v6
+        with:
+          name: server-release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
 
   ci:
     name: Full CI
@@ -61,27 +74,27 @@ jobs:
         shell: bash
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Build server
-        run: cargo build --release --locked --package owlauth
+        run: cargo build --release --locked --package owlauth-server
       - name: Package server
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           host="$(rustc -vV | sed -n 's/^host: //p')"
-          binary="owlauth"
+          binary="owlauth-server"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            binary="owlauth.exe"
+            binary="owlauth-server.exe"
           fi
-          archive="owlauth-${VERSION}-${host}.tar.gz"
+          archive="owlauth-server-${VERSION}-${host}.tar.gz"
           tar -czf "$archive" -C target/release "$binary"
       - name: Upload server artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
-          name: owlauth-${{ matrix.os }}
-          path: owlauth-*.tar.gz
+          name: owlauth-server-${{ matrix.os }}
+          path: owlauth-server-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -95,26 +108,49 @@ jobs:
       packages: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Download server artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@v4
         with:
-          pattern: owlauth-*
+          pattern: owlauth-server-*
           path: artifacts
           merge-multiple: true
+      - name: Download release changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: server-release-notes
+          path: release-metadata
       - name: Download verified server image
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@v4
         with:
           name: server-container-image
           path: container-artifact
       - name: Create checksums
         working-directory: artifacts
-        run: sha256sum owlauth-*.tar.gz > SHA256SUMS
+        run: sha256sum owlauth-server-*.tar.gz > SHA256SUMS
       - name: Re-verify release eligibility
         run: scripts/release/verify-release.sh server >/dev/null
+      - name: Require crates.io token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: test -n "$CARGO_REGISTRY_TOKEN"
+      - name: Publish server crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          scripts/release/publish-crate.sh crates/owlauth-types/Cargo.toml
+          for attempt in {1..12}; do
+            if scripts/release/publish-crate.sh crates/owlauth-server/Cargo.toml; then
+              exit 0
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              exit 1
+            fi
+            sleep 10
+          done
       - name: Load verified server image
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -138,15 +174,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          notes_args=(--generate-notes)
-          previous_tag="$(git tag --list 'server-v*' --sort=-v:refname | sed -n '1p')"
-          if [[ -n "$previous_tag" ]]; then
-            notes_args+=(--notes-start-tag "$previous_tag")
-          fi
           gh release create "server-v${VERSION}" artifacts/* \
+            --notes-file release-metadata/release-notes.md \
             --target "$GITHUB_SHA" \
-            --title "OwlAuth Server v${VERSION}" \
-            "${notes_args[@]}"
+            --title "OwlAuth Server v${VERSION}"
       - name: Promote server image to latest
         env:
           VERSION: ${{ needs.verify.outputs.version }}

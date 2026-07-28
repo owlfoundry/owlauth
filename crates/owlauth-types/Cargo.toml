@@ -1,11 +1,13 @@
 [package]
-name = "owlauth-protocol"
-description = "Public protocol types for the OwlAuth server"
-version.workspace = true
+name = "owlauth-types"
+version = "0.0.2"
 edition.workspace = true
+description = "Public API types for OwlAuth"
 license.workspace = true
 repository.workspace = true
-publish = false
+readme = "README.md"
+keywords = ["oauth", "oauth2", "authentication", "types"]
+categories = ["authentication", "web-programming"]
 
 [lints]
 workspace = true

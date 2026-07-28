@@ -1,0 +1,251 @@
+name: Release CLI
+
+on:
+  push:
+    branches:
+      - "release/cli/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cli-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify branch, version, commit, and tag
+        id: release
+        run: |
+          version="$(scripts/release/verify-release.sh cli)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Generate release changelog
+        run: |
+          python3 scripts/release/generate-changelog.py \
+            --component cli \
+            --version "${{ steps.release.outputs.version }}" \
+            --output release-notes.md
+      - name: Upload release changelog
+        uses: actions/upload-artifact@v6
+        with:
+          name: cli-release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  ci:
+    name: Full CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build CLI (${{ matrix.target }})
+    needs: [verify, ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            extension: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            extension: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            extension: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "${{ matrix.target }}" --toolchain stable
+      - name: Build CLI
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo build --release --locked --package owlauth-cli --target "${{ matrix.target }}"
+      - name: Smoke-test CLI binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="target/$TARGET/release/owlauth"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
+          "$binary" --version
+      - name: Package Unix CLI
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          archive="owlauth-cli-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "$archive" -C "target/$TARGET/release" owlauth
+      - name: Package Windows CLI
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          archive="owlauth-cli-${VERSION}-${TARGET}.zip"
+          powershell -NoProfile -NonInteractive -Command \
+            "Compress-Archive -LiteralPath 'target/$TARGET/release/owlauth.exe' -DestinationPath '$archive'"
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: owlauth-cli-${{ matrix.target }}
+          path: owlauth-cli-${{ needs.verify.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish CLI release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: owlauth-cli-*
+          path: artifacts
+          merge-multiple: true
+      - name: Download release changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-release-notes
+          path: release-metadata
+      - name: Verify artifact set and create checksums
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          expected=(
+            "owlauth-cli-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "owlauth-cli-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+            "owlauth-cli-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "owlauth-cli-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "owlauth-cli-${VERSION}-x86_64-pc-windows-msvc.zip"
+          )
+          for asset in "${expected[@]}"; do test -f "artifacts/$asset"; done
+          test "$(find artifacts -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq "${#expected[@]}"
+          (cd artifacts && sha256sum owlauth-cli-* > SHA256SUMS)
+          cp scripts/install.sh scripts/install.ps1 artifacts/
+      - name: Re-verify release eligibility
+        run: scripts/release/verify-release.sh cli >/dev/null
+      - name: Require crates.io token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: test -n "$CARGO_REGISTRY_TOKEN"
+      - name: Publish owlauth-cli crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: scripts/release/publish-crate.sh crates/owlauth-cli/Cargo.toml
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          gh release create "cli-v${VERSION}" artifacts/* \
+            --notes-file release-metadata/release-notes.md \
+            --target "$GITHUB_SHA" \
+            --title "OwlAuth CLI v${VERSION}"
+
+  update-smoke:
+    name: Update from previous CLI (${{ matrix.os }})
+    needs: [verify, release]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve previous CLI release
+        id: previous
+        env:
+          CURRENT_TAG: cli-v${{ needs.verify.outputs.version }}
+        run: |
+          git fetch --quiet --tags origin
+          previous="$(git tag --list 'cli-v*' --sort=-version:refname | grep -Fvx "$CURRENT_TAG" | head -n 1 || true)"
+          echo "tag=$previous" >> "$GITHUB_OUTPUT"
+      - name: Install previous CLI artifact
+        if: steps.previous.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        run: |
+          version="${PREVIOUS_TAG#cli-v}"
+          case "$RUNNER_OS" in
+            Linux) target=x86_64-unknown-linux-gnu; extension=tar.gz ;;
+            macOS) target=x86_64-apple-darwin; extension=tar.gz ;;
+            Windows) target=x86_64-pc-windows-msvc; extension=zip ;;
+          esac
+          archive="owlauth-cli-${version}-${target}.${extension}"
+          mkdir -p previous installed
+          gh release download "$PREVIOUS_TAG" --pattern "$archive" --dir previous
+          if [[ "$extension" == zip ]]; then
+            powershell -NoProfile -NonInteractive -Command \
+              "Expand-Archive -LiteralPath 'previous/$archive' -DestinationPath 'installed'"
+          else
+            tar -xzf "previous/$archive" -C installed
+          fi
+      - name: Update to current CLI release
+        if: steps.previous.outputs.tag != ''
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          binary=installed/owlauth
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
+          "$binary" update --version "$VERSION" --force --install-dir "$PWD/installed"
+          for attempt in {1..30}; do
+            if "$binary" --version | grep -Fq " $VERSION"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "updated CLI did not report version $VERSION" >&2
+          exit 1
+      - name: Report first release
+        if: steps.previous.outputs.tag == ''
+        run: echo "No previous CLI release exists; upgrade smoke test starts with the next release."

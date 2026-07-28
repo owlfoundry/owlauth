@@ -28,6 +28,11 @@ check: ## Run formatting, lint, package metadata, and workflow checks
 	@grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' $(DOCS_DIR)/.vitepress/dist/robots.txt
 	@pnpm --filter @owlauth/docs run deploy --dry-run
 	@scripts/release/test-verify-release.sh
+	@python3 scripts/release/test-changelog.py
+	@sh -n scripts/install.sh
+	@scripts/test-installers.sh
+	@cmp scripts/install.sh crates/owlauth-cli/assets/install.sh
+	@cmp scripts/install.ps1 crates/owlauth-cli/assets/install.ps1
 	@actionlint
 
 .PHONY: test
@@ -37,21 +42,24 @@ test: ## Run Rust, Python, and TypeScript unit tests
 	@pnpm --filter @owlauth/client test
 
 .PHONY: build
-build: ## Build the server, SDK distributions, and documentation
-	@cargo build --release --locked --package owlauth
+build: ## Build the server, CLI, SDK distributions, and documentation
+	@cargo build --release --locked --package owlauth-server --package owlauth-cli
 	@cd $(PYTHON_DIR) && rm -rf dist && uv run --locked hatchling build -d dist
 	@pnpm --filter @owlauth/client build
 	@pnpm --filter @owlauth/docs build
 
 .PHONY: package-check
-package-check: ## Verify exact SDK distribution contents
+package-check: ## Verify exact registry distribution contents
 	@cd $(PYTHON_DIR) && uv run --locked twine check dist/*
+	@cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty
+	@cargo package --manifest-path crates/owlauth-cli/Cargo.toml --locked --allow-dirty
 	@cargo package --manifest-path $(RUST_SDK_DIR)/Cargo.toml --locked --allow-dirty
+	@cargo package --manifest-path crates/owlauth-server/Cargo.toml --locked --allow-dirty --list | grep -qx LICENSE
 	@cd $(TYPESCRIPT_DIR) && npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
 
 .PHONY: openapi
 openapi: ## Generate the current OpenAPI document on stdout
-	@cargo run --quiet --locked --package owlauth -- --openapi
+	@cargo run --quiet --locked --package owlauth-server -- --openapi
 
 .PHONY: docs
 docs: ## Serve documentation locally

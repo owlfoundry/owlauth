@@ -6,12 +6,12 @@ OwlAuth is intended to be a self-hostable OAuth 2.1 authorization server and use
 
 ## Current baseline
 
-The repository is a `0.0.1` pre-alpha scaffold, not an operational authorization server:
+The repository is a pre-alpha scaffold, not an operational authorization server:
 
-- `crates/server` can print a version and generated OpenAPI JSON; it does not currently bind an HTTP listener.
-- `crates/protocol` currently describes `/health`, `HealthResponse`, and three OAuth error codes.
-- `crates/domain` currently contains only a non-empty `UserId` wrapper.
-- `crates/storage` currently exposes only a synchronous `UserStore::contains` boundary.
+- `crates/owlauth-server` binds an HTTP listener, serves only `/health`, and can emit generated OpenAPI JSON.
+- `crates/owlauth-types` currently describes `HealthResponse`, three OAuth error codes, and the `/health` OpenAPI operation.
+- No domain authorization policy, database adapter, schema, or migration runner is implemented.
+- `crates/owlauth-cli` provides version output and checksum-verified GitHub Release updates; it has no management or OAuth commands.
 - SDK packages store a base URL but do not send requests or implement OAuth flows.
 
 All flows and surfaces below are targets unless this baseline says otherwise.
@@ -48,7 +48,7 @@ All flows and surfaces below are targets unless this baseline says otherwise.
 
 ## Non-goals for the current scaffold
 
-The current repository does not promise production deployment, multi-tenancy, federation, social login, dynamic client registration, device authorization, token introspection, revocation, OIDC, SCIM, passkeys, an administrative HTTP API, a CLI, or MCP tools. Any such capability requires an explicit design and validation update before implementation or documentation can advertise it.
+The current repository does not promise production deployment, multi-tenancy, federation, social login, dynamic client registration, device authorization, token introspection, revocation, OIDC, SCIM, passkeys, an administrative HTTP API, CLI management commands, or MCP tools. Any such capability requires an explicit design and validation update before implementation or documentation can advertise it.
 
 ## Process model
 

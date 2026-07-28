@@ -1,11 +1,11 @@
 ---
 name: owlauth-integration
-description: Integrate applications and developer tooling with OwlAuth, select the TypeScript, Python, or Rust client, inspect the generated OpenAPI contract, and reason about planned CLI or server-side MCP capabilities. Use for OwlAuth setup, SDK usage, OAuth flow design, migration, troubleshooting, or agent integration requests.
+description: Integrate applications and developer tooling with OwlAuth, select the TypeScript, Python, or Rust client, inspect the generated OpenAPI contract, and reason about the updater-only CLI or planned server-side MCP capabilities. Use for OwlAuth setup, SDK usage, OAuth flow design, migration, troubleshooting, or agent integration requests.
 ---
 
 # OwlAuth Integration
 
-Treat OwlAuth as pre-alpha until published documentation says otherwise. The `0.0.1` clients reserve package names and expose only minimal client configuration; do not invent OAuth endpoints, deployment settings, CLI commands, MCP tools, or stability guarantees.
+Treat OwlAuth as pre-alpha until published documentation says otherwise. The `0.0.1` clients reserve package names and expose only minimal client configuration. The `owlauth` CLI currently provides version output and checksum-verified self-update only; do not invent OAuth endpoints, deployment settings, management commands, MCP tools, or stability guarantees.
 
 ## Workflow
 
@@ -13,7 +13,7 @@ Treat OwlAuth as pre-alpha until published documentation says otherwise. The `0.
 2. When working from a source checkout, inspect current Rust protocol definitions and generate the contract with:
 
    ```bash
-   cargo run --package owlauth -- --openapi
+   cargo run --package owlauth-server -- --openapi
    ```
 
 3. Select the public client without coupling it to server internals:
@@ -28,8 +28,8 @@ Treat OwlAuth as pre-alpha until published documentation says otherwise. The `0.
 ## Boundaries
 
 - Do not add a Git path dependency from any SDK to a server-internal Rust crate.
-- Do not commit generated OpenAPI output. Generate it from `crates/protocol` when needed.
+- Do not commit generated OpenAPI output. Generate it from `crates/owlauth-types` through `owlauth-server --openapi` when needed.
 - Treat MCP as a future server-side interface. The plugin does not bundle or launch a local MCP process.
-- Treat a Rust CLI as planned, not implemented. Confirm its package and command names before creating the crate.
+- The Rust package is `owlauth-cli` and its executable is `owlauth`. Treat all commands other than version output and `update` as unimplemented.
 - Never request OAuth client secrets, registry tokens, signing keys, or Cloudflare credentials in chat. Use secure local prompts, secret stores, or trusted publishing.
 - Do not recommend the current scaffold for production authorization workloads.

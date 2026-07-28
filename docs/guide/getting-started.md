@@ -10,13 +10,14 @@ OwlAuth is currently a pre-alpha project. This page documents repository develop
 - Python 3.11 through 3.14
 - `uv` 0.11.32 for Python development
 
-## Build and test the server
+## Build and test
 
 ```bash
 git clone git@github.com:owlfoundry/owlauth.git
 cd owlauth
 cargo test --workspace --all-features
-cargo run --package owlauth
+cargo run --package owlauth-server
+cargo run --package owlauth-cli -- --version
 ```
 
 Build and smoke-test the server container locally with:
@@ -27,14 +28,24 @@ make docker-build
 
 Published images use `ghcr.io/owlfoundry/owlauth`: `dev` follows `main`, version tags and `latest` come from server releases, and `build/server/{tag}` branches publish isolated `build-{tag}` test tags.
 
-## Generate OpenAPI
-
-The OpenAPI document is generated from Rust protocol definitions and is intentionally not committed:
+## Install the CLI
 
 ```bash
-cargo run --package owlauth -- --openapi > /tmp/owlauth-openapi.json
+curl -fsSL https://raw.githubusercontent.com/owlfoundry/owlauth/main/scripts/install.sh | sh
+owlauth --version
+owlauth update --dry-run
 ```
 
-The generated document is an ephemeral build input and should not be committed. See the [server specification index](https://github.com/owlfoundry/owlauth/tree/main/spec) for the target architecture and its explicit current-state boundaries.
+Windows users can run the PowerShell installer documented in the repository README. Installers and built-in updates require checksum-verified GitHub Release assets.
+
+## Generate OpenAPI
+
+The OpenAPI document is generated from reviewed public Rust types and is intentionally not committed:
+
+```bash
+cargo run --package owlauth-server -- --openapi > /tmp/owlauth-openapi.json
+```
+
+The generated document is an ephemeral build input. See the [server specification index](https://github.com/owlfoundry/owlauth/tree/main/spec) for the target architecture and explicit current-state boundaries.
 
 The container listens on port 8080 and defaults `OWLAUTH_ADDR` to `0.0.0.0:8080`. Production deployment guidance will be expanded when the server has a stable runtime configuration.
