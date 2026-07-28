@@ -4,6 +4,9 @@ export default defineConfig({
   title: "OwlAuth",
   description: "Self-hostable OAuth 2.1 authorization server and user management platform",
   cleanUrls: true,
+  sitemap: {
+    hostname: "https://owlauth.owlfoundry.org",
+  },
   head: [["meta", { name: "theme-color", content: "#7c3aed" }]],
   themeConfig: {
     nav: [

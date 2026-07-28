@@ -6,45 +6,47 @@ DOCS_DIR := docs
 .PHONY: install
 install: ## Install locked development dependencies
 	@cargo fetch --locked
-	@uv sync --project $(PYTHON_DIR) --locked
-	@npm --prefix $(TYPESCRIPT_DIR) ci
-	@npm --prefix $(DOCS_DIR) ci
+	@uv sync --all-packages --locked
+	@pnpm install --frozen-lockfile
 
 .PHONY: format
 format: ## Format Rust and Python sources
 	@cargo fmt --all
-	@uv run --project $(PYTHON_DIR) ruff format $(PYTHON_DIR)
+	@uv run --locked ruff format $(PYTHON_DIR)
 
 .PHONY: check
 check: ## Run formatting, lint, package metadata, and workflow checks
 	@cargo fmt --all --check
 	@cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-	@uv lock --project $(PYTHON_DIR) --check
-	@uv run --project $(PYTHON_DIR) ruff check $(PYTHON_DIR)
-	@uv run --project $(PYTHON_DIR) ruff format --check $(PYTHON_DIR)
-	@npm --prefix $(TYPESCRIPT_DIR) run check
-	@npm --prefix $(DOCS_DIR) run build
+	@uv lock --check
+	@uv run --locked ruff check $(PYTHON_DIR)
+	@uv run --locked ruff format --check $(PYTHON_DIR)
+	@pnpm --filter @owlauth/client check
+	@pnpm --filter @owlauth/docs build
+	@test -f $(DOCS_DIR)/.vitepress/dist/sitemap.xml
+	@grep -q 'https://owlauth.owlfoundry.org/' $(DOCS_DIR)/.vitepress/dist/sitemap.xml
+	@grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' $(DOCS_DIR)/.vitepress/dist/robots.txt
 	@scripts/release/test-verify-release.sh
 	@actionlint
 
 .PHONY: test
 test: ## Run Rust, Python, and TypeScript unit tests
 	@cargo test --workspace --all-features --locked
-	@uv run --project $(PYTHON_DIR) pytest
-	@npm --prefix $(TYPESCRIPT_DIR) test
+	@uv run --locked pytest
+	@pnpm --filter @owlauth/client test
 
 .PHONY: build
 build: ## Build the server, SDK distributions, and documentation
 	@cargo build --release --locked --package owlauth
 	@cd $(PYTHON_DIR) && rm -rf dist && uv run --locked hatchling build -d dist
-	@npm --prefix $(TYPESCRIPT_DIR) run build
-	@npm --prefix $(DOCS_DIR) run build
+	@pnpm --filter @owlauth/client build
+	@pnpm --filter @owlauth/docs build
 
 .PHONY: package-check
 package-check: ## Verify exact SDK distribution contents
 	@cd $(PYTHON_DIR) && uv run --locked twine check dist/*
 	@cargo package --manifest-path $(RUST_SDK_DIR)/Cargo.toml --locked --allow-dirty
-	@npm --prefix $(TYPESCRIPT_DIR) pack --dry-run
+	@cd $(TYPESCRIPT_DIR) && npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
 
 .PHONY: openapi
 openapi: ## Generate the current OpenAPI document on stdout
@@ -52,15 +54,20 @@ openapi: ## Generate the current OpenAPI document on stdout
 
 .PHONY: docs
 docs: ## Serve documentation locally
-	@npm --prefix $(DOCS_DIR) run dev
+	@pnpm --filter @owlauth/docs dev
 
 .PHONY: docs-build
 docs-build: ## Build documentation for deployment
-	@npm --prefix $(DOCS_DIR) run build
+	@pnpm --filter @owlauth/docs build
 
 .PHONY: docs-deploy
 docs-deploy: ## Deploy documentation to Cloudflare Workers
-	@npm --prefix $(DOCS_DIR) run deploy
+	@pnpm --filter @owlauth/docs deploy
+
+.PHONY: docker-build
+docker-build: ## Build and smoke-test the local server image
+	@docker build --tag owlauth:dev .
+	@scripts/docker/smoke-server-image.sh owlauth:dev
 
 .PHONY: help
 help: ## Show available targets

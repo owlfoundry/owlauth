@@ -2,6 +2,19 @@ version = 1
 revision = 3
 requires-python = ">=3.11"
 
+[manifest]
+members = [
+    "owlauth-client",
+]
+
+[manifest.dependency-groups]
+dev = [
+    { name = "hatchling", specifier = "==1.31.0" },
+    { name = "pytest", specifier = ">=8.3,<10" },
+    { name = "ruff", specifier = ">=0.11,<1" },
+    { name = "twine", specifier = "==6.2.0" },
+]
+
 [[package]]
 name = "backports-tarfile"
 version = "1.2.0"
@@ -390,25 +403,7 @@ wheels = [
 [[package]]
 name = "owlauth-client"
 version = "0.0.1"
-source = { editable = "." }
-
-[package.dev-dependencies]
-dev = [
-    { name = "hatchling" },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "twine" },
-]
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "hatchling", specifier = "==1.31.0" },
-    { name = "pytest", specifier = ">=8.3,<10" },
-    { name = "ruff", specifier = ">=0.11,<1" },
-    { name = "twine", specifier = "==6.2.0" },
-]
+source = { editable = "sdks/python" }
 
 [[package]]
 name = "packaging"

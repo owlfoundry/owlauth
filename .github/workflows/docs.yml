@@ -4,12 +4,18 @@ on:
   pull_request:
     paths:
       - "docs/**"
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
       - ".github/workflows/docs.yml"
   push:
     branches:
       - main
     paths:
       - "docs/**"
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -34,14 +40,18 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
-          cache: npm
-          cache-dependency-path: docs/package-lock.json
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
       - name: Install locked dependencies
-        working-directory: docs
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - name: Build documentation
-        working-directory: docs
-        run: npm run build
+        run: pnpm --filter @owlauth/docs build
+      - name: Verify sitemap
+        run: |
+          test -f docs/.vitepress/dist/sitemap.xml
+          test -f docs/.vitepress/dist/robots.txt
+          grep -q 'https://owlauth.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
+          grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
       - name: Upload documentation artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -70,11 +80,10 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
-          cache: npm
-          cache-dependency-path: docs/package-lock.json
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
       - name: Install locked dependencies
-        working-directory: docs
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - name: Download documentation artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -95,8 +104,7 @@ jobs:
           echo "configured=$configured" >> "$GITHUB_OUTPUT"
       - name: Deploy to Cloudflare Workers
         if: steps.cloudflare.outputs.configured == 'true'
-        working-directory: docs
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npm run deploy
+        run: pnpm --filter @owlauth/docs deploy

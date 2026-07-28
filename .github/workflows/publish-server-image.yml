@@ -1,0 +1,129 @@
+name: Publish Server Image
+
+on:
+  push:
+    branches:
+      - main
+      - "build/server/**"
+  workflow_call:
+    inputs:
+      mode:
+        description: Publication mode for a reusable invocation
+        required: true
+        type: string
+      version:
+        description: Verified server SemVer to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: server-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build or publish server image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve and validate image tag
+        id: image
+        env:
+          REQUESTED_MODE: ${{ inputs.mode }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          version_label="$GITHUB_SHA"
+
+          if [[ -n "$REQUESTED_MODE" ]]; then
+            if [[ "$REQUESTED_MODE" != "release" ]]; then
+              echo "unsupported reusable publication mode: $REQUESTED_MODE" >&2
+              exit 1
+            fi
+            verified_version="$(scripts/release/verify-release.sh server)"
+            if [[ "$verified_version" != "$RELEASE_VERSION" ]]; then
+              echo "verified version $verified_version does not match requested version $RELEASE_VERSION" >&2
+              exit 1
+            fi
+            tag="${RELEASE_VERSION//+/_}"
+            if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "server version cannot be represented as a container tag: $RELEASE_VERSION" >&2
+              exit 1
+            fi
+            version_label="$RELEASE_VERSION"
+            mode=release
+          elif [[ "$GITHUB_REF_NAME" == "main" ]]; then
+            tag=dev
+            mode=direct
+          elif [[ "$GITHUB_REF_NAME" == build/server/* ]]; then
+            requested_tag="${GITHUB_REF_NAME#build/server/}"
+            if [[ "$requested_tag" == */* || ! "$requested_tag" =~ ^[a-z0-9][a-z0-9._-]{0,120}$ ]]; then
+              echo "build branch must use one lowercase OCI tag segment of at most 121 characters" >&2
+              exit 1
+            fi
+            tag="build-$requested_tag"
+            mode=direct
+          else
+            echo "unsupported image publication ref: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "image=$image"
+            echo "tag=$tag"
+            echo "version-label=$version_label"
+            echo "mode=$mode"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build server image
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAG: ${{ steps.image.outputs.tag }}
+          VERSION_LABEL: ${{ steps.image.outputs.version-label }}
+        run: |
+          docker build --pull \
+            --build-arg "OWLAUTH_VERSION=$VERSION_LABEL" \
+            --build-arg "VCS_REF=$GITHUB_SHA" \
+            --build-arg "SOURCE_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --tag "$IMAGE:$TAG" \
+            .
+      - name: Smoke-test server image
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: scripts/docker/smoke-server-image.sh "$IMAGE:$TAG"
+      - name: Save verified release image
+        if: steps.image.outputs.mode == 'release'
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          mkdir image-artifact
+          docker save "$IMAGE:$TAG" | gzip -n > image-artifact/server-image.tar.gz
+      - name: Upload verified release image
+        if: steps.image.outputs.mode == 'release'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: server-container-image
+          path: image-artifact/server-image.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+      - name: Log in to GitHub Container Registry
+        if: steps.image.outputs.mode == 'direct'
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish development server image
+        if: steps.image.outputs.mode == 'direct'
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          TAG: ${{ steps.image.outputs.tag }}
+        run: docker push "$IMAGE:$TAG"

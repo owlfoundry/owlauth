@@ -16,22 +16,18 @@ concurrency:
 
 jobs:
   rust:
-    name: Rust ${{ matrix.toolchain }}
+    name: Rust stable
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain: ["1.85.0", "stable"]
     env:
-      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
       - name: Install Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy
@@ -51,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -64,13 +60,13 @@ jobs:
       - name: Install uv
         run: python -m pip install --disable-pip-version-check uv==0.11.32
       - name: Install locked dependencies
-        run: uv sync --project sdks/python --locked
+        run: uv sync --all-packages --locked
       - name: Run Ruff
         run: |
-          uv run --project sdks/python ruff check sdks/python
-          uv run --project sdks/python ruff format --check sdks/python
+          uv run --locked ruff check sdks/python
+          uv run --locked ruff format --check sdks/python
       - name: Run tests
-        run: uv run --project sdks/python pytest
+        run: uv run --locked pytest
       - name: Build and verify package
         working-directory: sdks/python
         run: |
@@ -87,37 +83,38 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["20", "24"]
-    defaults:
-      run:
-        working-directory: sdks/typescript
+        node-version: ["20", "22", "24"]
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Set up Node.js
+      - name: Set up tooling Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Type-check
+        run: pnpm --filter @owlauth/client check
+      - name: Build package
+        run: pnpm --filter @owlauth/client build
+      - name: Verify npm package contents
+        working-directory: sdks/typescript
+        run: npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
+      - name: Set up runtime Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ matrix.node-version }}
-          cache: npm
-          cache-dependency-path: sdks/typescript/package-lock.json
-      - name: Install locked dependencies
-        run: npm ci
-      - name: Type-check
-        run: npm run check
-      - name: Run tests
-        run: npm test
-      - name: Verify package contents
-        run: npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
+      - name: Run tests on supported Node.js
+        run: node --test sdks/typescript/test/*.test.mjs
 
   docs:
     name: Docs
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: docs
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -127,12 +124,18 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
-          cache: npm
-          cache-dependency-path: docs/package-lock.json
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
       - name: Install locked dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - name: Build documentation
-        run: npm run build
+        run: pnpm --filter @owlauth/docs build
+      - name: Verify sitemap
+        run: |
+          test -f docs/.vitepress/dist/sitemap.xml
+          test -f docs/.vitepress/dist/robots.txt
+          grep -q 'https://owlauth.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
+          grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
 
   plugin:
     name: Plugin
@@ -169,8 +172,27 @@ jobs:
           CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
           mkdir -p "$CODEX_HOME"
-          npx --yes @openai/codex@0.142.3 plugin marketplace add . --json
-          npx --yes @openai/codex@0.142.3 plugin add owlauth@owlauth --json
+          npx --yes @openai/codex@0.145.0 plugin marketplace add . --json
+          npx --yes @openai/codex@0.145.0 plugin add owlauth@owlauth --json
+
+  server-image:
+    name: Server image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build server image
+        run: |
+          docker build \
+            --build-arg OWLAUTH_VERSION=ci \
+            --build-arg "VCS_REF=$GITHUB_SHA" \
+            --tag owlauth:ci \
+            .
+      - name: Smoke-test server image
+        run: scripts/docker/smoke-server-image.sh owlauth:ci
 
   contract:
     name: Contract

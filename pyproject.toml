@@ -1,0 +1,24 @@
+[dependency-groups]
+dev = [
+    "hatchling==1.31.0",
+    "pytest>=8.3,<10",
+    "ruff>=0.11,<1",
+    "twine==6.2.0",
+]
+
+[tool.uv]
+required-version = "==0.11.32"
+
+[tool.uv.workspace]
+members = ["sdks/python"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["sdks/python/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
