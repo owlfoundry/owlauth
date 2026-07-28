@@ -25,6 +25,9 @@ SEMVER_PATTERN = re.compile(
     rf"(?:-{PRERELEASE_IDENTIFIER}(?:\.{PRERELEASE_IDENTIFIER})*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+STABLE_SEMVER_PATTERN = re.compile(
+    rf"^{NUMERIC_IDENTIFIER}\.{NUMERIC_IDENTIFIER}\.{NUMERIC_IDENTIFIER}$"
+)
 
 
 class PrepareError(RuntimeError):
@@ -64,6 +67,11 @@ def prepare_release(component: str, version: str, root: Path = Path(".")) -> Non
         raise PrepareError(f"unsupported release component: {component}")
     if not SEMVER_PATTERN.fullmatch(version):
         raise PrepareError(f"invalid release SemVer: {version}")
+    if component == "python" and not STABLE_SEMVER_PATTERN.fullmatch(version):
+        raise PrepareError(
+            "Python release versions must use stable X.Y.Z SemVer so package metadata "
+            "is not normalized to a different PEP 440 version"
+        )
 
     if component == "server":
         set_toml_version(root / "crates/owlauth-types/Cargo.toml", "package", version)

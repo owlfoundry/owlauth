@@ -101,6 +101,14 @@ def test_invalid_version(root: Path) -> None:
     raise AssertionError("invalid SemVer must fail")
 
 
+def test_python_rejects_normalized_version(root: Path) -> None:
+    try:
+        prepare_release("python", "1.0.0-alpha.1", root)
+    except PrepareError:
+        return
+    raise AssertionError("Python release versions that PEP 440 normalizes must fail")
+
+
 def test_environment_detection() -> None:
     with patch.dict(
         os.environ,
@@ -125,6 +133,7 @@ def main() -> None:
         root = Path(temporary_directory)
         copy_release_files(root)
         test_invalid_version(root)
+        test_python_rejects_normalized_version(root)
     test_environment_detection()
     print("release preparation tests passed")
 
