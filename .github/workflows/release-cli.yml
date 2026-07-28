@@ -136,13 +136,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Download CLI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: owlauth-cli-*
           path: artifacts
           merge-multiple: true
       - name: Download release changelog
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: cli-release-notes
           path: release-metadata

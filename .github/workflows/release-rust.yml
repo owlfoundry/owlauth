@@ -62,7 +62,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Download release changelog
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: rust-release-notes
           path: release-metadata
