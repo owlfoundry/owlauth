@@ -47,6 +47,8 @@ Each component follows independent SemVer. A release tag must point at the curre
 - `python-v{version}`
 - `rust-v{version}`
 
+Python releases currently require a stable `X.Y.Z` version because PEP 440 normalizes some SemVer prerelease and build forms to different package metadata.
+
 Pushing a valid release tag runs all checks, derives the package version from that tag, updates manifests and lockfiles only inside workflow workspaces, generates component-filtered notes, publishes that component, and creates a GitHub Release. A server release publishes `owlauth-types` followed by `owlauth-server`, publishes `ghcr.io/owlfoundry/owlauth:{version}`, and updates `latest`. A CLI release publishes `owlauth-cli` and checksum-verified native archives for supported Linux, macOS, and Windows targets. Do not reuse, move, or delete a release tag after publication.
 
 Server container channels use these branch rules:
