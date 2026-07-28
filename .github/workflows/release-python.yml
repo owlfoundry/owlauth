@@ -78,7 +78,7 @@ jobs:
           wheel_contents="$(unzip -Z1 dist/*.whl)"
           grep -Eq '\.dist-info/licenses/LICENSE$' <<< "$wheel_contents"
       - name: Download release changelog
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: python-release-notes
           path: release-metadata

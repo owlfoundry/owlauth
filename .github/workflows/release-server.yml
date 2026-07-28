@@ -59,6 +59,7 @@ jobs:
       version: ${{ needs.verify.outputs.version }}
     permissions:
       contents: read
+      packages: write
 
   build:
     name: Build server (${{ matrix.os }})
@@ -113,18 +114,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Download server artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: owlauth-server-*
           path: artifacts
           merge-multiple: true
       - name: Download release changelog
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: server-release-notes
           path: release-metadata
       - name: Download verified server image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: server-container-image
           path: container-artifact
