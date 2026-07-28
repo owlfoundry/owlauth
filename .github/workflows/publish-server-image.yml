@@ -35,6 +35,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
       - name: Resolve and validate image tag
         id: image
         env:

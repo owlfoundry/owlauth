@@ -2,7 +2,7 @@
 
 ## Independent components
 
-The server and each official SDK have separate SemVer, release branches, tags, registry artifacts, and changelogs:
+The server and each official SDK have separate SemVer, release tags, registry artifacts, and changelogs:
 
 | Component | Package | Tag pattern |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ Normally additive: new optional configuration, new operation/capability, or new 
 
 ## Release inputs and gates
 
-An SDK release is built from its tag and includes:
+An SDK release is built from a component tag at the current `main` commit. The tag is the version authority; CI materializes that version in package metadata and lockfiles without a release-only commit. The release includes:
 
 - pinned/locked supported tooling and dependencies;
 - the generated-contract provenance/digest used, even though OpenAPI is not committed;

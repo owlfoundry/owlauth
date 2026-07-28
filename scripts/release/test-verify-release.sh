@@ -56,22 +56,12 @@ updater="$temporary_directory/updater"
 
 git init --quiet --bare "$remote"
 git init --quiet --initial-branch=main "$work"
-cp "$repository_root/Cargo.toml" "$work/Cargo.toml"
-mkdir -p \
-  "$work/crates/owlauth-cli" \
-  "$work/crates/owlauth-server" \
-  "$work/crates/owlauth-types" \
-  "$work/scripts/release"
-cp "$repository_root/crates/owlauth-cli/Cargo.toml" "$work/crates/owlauth-cli/Cargo.toml"
-cp "$repository_root/crates/owlauth-server/Cargo.toml" "$work/crates/owlauth-server/Cargo.toml"
-cp "$repository_root/crates/owlauth-types/Cargo.toml" "$work/crates/owlauth-types/Cargo.toml"
+mkdir -p "$work/scripts/release"
 cp "$verifier" "$work/scripts/release/verify-release.sh"
-server_version="$(manifest_version "$repository_root/crates/owlauth-server/Cargo.toml")"
-cli_version="$(manifest_version "$repository_root/crates/owlauth-cli/Cargo.toml")"
 
 git -C "$work" config user.name "Release Test"
 git -C "$work" config user.email "release-test@example.com"
-git -C "$work" add Cargo.toml crates scripts/release/verify-release.sh
+git -C "$work" add scripts/release/verify-release.sh
 git -C "$work" commit --quiet -m "initial"
 git -C "$work" remote add origin "$remote"
 git -C "$work" push --quiet --set-upstream origin main
@@ -86,23 +76,25 @@ run_verifier() {
   )
 }
 
-run_verifier cli GITHUB_REF_NAME="release/cli/$cli_version" >/dev/null
-git -C "$work" tag "cli-v$cli_version"
-git -C "$work" push --quiet origin "cli-v$cli_version"
-expect_failure run_verifier cli GITHUB_REF_NAME="release/cli/$cli_version"
-git -C "$work" push --quiet --delete origin "cli-v$cli_version"
-git -C "$work" tag --delete "cli-v$cli_version" >/dev/null
-
-run_verifier server GITHUB_REF_NAME="release/server/$server_version" >/dev/null
-
-git -C "$work" tag "server-v$server_version"
-git -C "$work" push --quiet origin "server-v$server_version"
-expect_failure run_verifier server GITHUB_REF_NAME="release/server/$server_version"
-
-git -C "$work" push --quiet --delete origin "server-v$server_version"
-git -C "$work" tag --delete "server-v$server_version" >/dev/null
-expect_failure run_verifier server GITHUB_REF_NAME="release/server/$server_version" \
+cli_tag=cli-v1.2.3
+git -C "$work" tag "$cli_tag"
+git -C "$work" push --quiet origin "$cli_tag"
+run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag" >/dev/null
+expect_failure run_verifier cli GITHUB_REF_TYPE=branch GITHUB_REF_NAME="$cli_tag"
+expect_failure run_verifier server GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag"
+expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME=cli-v9.9.9
+expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag" \
   RELEASE_REMOTE=missing
+
+invalid_tag=cli-v01.2.3
+git -C "$work" tag "$invalid_tag"
+git -C "$work" push --quiet origin "$invalid_tag"
+expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$invalid_tag"
+
+server_tag=server-v2.0.0
+git -C "$work" tag -a "$server_tag" -m "$server_tag"
+git -C "$work" push --quiet origin "$server_tag"
+run_verifier server GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$server_tag" >/dev/null
 
 git clone --quiet "$remote" "$updater"
 git -C "$updater" config user.name "Release Test"
@@ -111,6 +103,6 @@ printf 'advanced\n' > "$updater/ADVANCED"
 git -C "$updater" add ADVANCED
 git -C "$updater" commit --quiet -m "advance main"
 git -C "$updater" push --quiet origin main
-expect_failure run_verifier server GITHUB_REF_NAME="release/server/$server_version"
+expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag"
 
 printf 'release verifier tests passed\n'

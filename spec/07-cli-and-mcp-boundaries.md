@@ -24,7 +24,7 @@ owlauth-cli -X-> owlauth-server
 owlauth-cli --> owlauth-client   # permitted when a real remote command needs it
 ```
 
-CLI and server follow independent SemVer. CLI releases use `release/cli/{version}` and `cli-v{version}`, publish the `owlauth-cli` crate, and attach platform archives, `SHA256SUMS`, and both installers to GitHub Releases. Supported installer targets and release artifacts MUST be identical. A release after the first MUST smoke-test update from the preceding CLI release.
+CLI and server follow independent SemVer. A CLI release is triggered by `cli-v{version}` at the current `main` commit; the workflow derives the package version from that tag, publishes the `owlauth-cli` crate, and attaches platform archives, `SHA256SUMS`, and both installers to GitHub Releases. Supported installer targets and release artifacts MUST be identical. A release after the first MUST smoke-test update from the preceding compatible CLI release.
 
 ## CLI invariants
 

@@ -10,17 +10,17 @@
 - OpenAPI is generated from Rust definitions in `crates/owlauth-types`; generated documents are not committed.
 - The Rust client crate remains `owlauth-client`. `plugins/owlauth` distributes shared agent skills. MCP remains a server-side capability; do not bundle a local MCP process until one exists.
 
-## Release branches
+## Release tags
 
-- Server and public types: `release/server/{version}`
-- CLI: `release/cli/{version}`
-- TypeScript SDK: `release/sdk/typescript/{version}`
-- Python SDK: `release/sdk/python/{version}`
-- Rust SDK: `release/sdk/rust/{version}`
+- Server and public types: `server-v{version}`
+- CLI: `cli-v{version}`
+- TypeScript SDK: `typescript-v{version}`
+- Python SDK: `python-v{version}`
+- Rust SDK: `rust-v{version}`
 
-Release branches must point at the current `main` commit. Each component follows independent SemVer; `owlauth-types` follows the server version.
+Release tags must point at the current `main` commit. Each component follows independent SemVer; `owlauth-types` follows the server version. The tag is the release version authority: workflows derive the component and version from it and update manifests and lockfiles only in their isolated workspaces. Do not commit release-only version bumps.
 
-Server images are published as `ghcr.io/owlfoundry/owlauth`. A server release publishes its version tag and updates `latest` (SemVer `+` build-metadata separators are represented as `_` because OCI tags do not allow `+`); a `main` push updates `dev`; a `build/server/{tag}` branch publishes the isolated test tag `build-{tag}`. The requested test tag must be one lowercase OCI tag segment; the `build-` registry prefix prevents collisions with release versions, `dev`, and `latest`.
+Server images are published as `ghcr.io/owlfoundry/owlauth`. A server release publishes its versioned image and updates `latest` (SemVer `+` build-metadata separators are represented as `_` because OCI tags do not allow `+`); a `main` push updates `dev`; a `build/server/{tag}` branch publishes the isolated test tag `build-{tag}`. The requested test tag must be one lowercase OCI tag segment; the `build-` registry prefix prevents collisions with release versions, `dev`, and `latest`.
 
 CLI binaries are hosted on GitHub Releases with mandatory `SHA256SUMS`. `scripts/install.sh`, `scripts/install.ps1`, and the built-in `owlauth update` command install only checksum-verified archives. The installers embedded in the CLI must remain byte-for-byte equal to the public scripts.
 

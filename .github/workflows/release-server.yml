@@ -2,8 +2,8 @@ name: Release Server
 
 on:
   push:
-    branches:
-      - "release/server/**"
+    tags:
+      - "server-v*"
 
 permissions:
   contents: read
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify release branch
+    name: Verify release tag
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -25,7 +25,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify branch, version, commit, and tag
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Verify tag, version, and commit
         id: release
         run: |
           version="$(scripts/release/verify-release.sh server)"
@@ -46,6 +48,7 @@ jobs:
 
   ci:
     name: Full CI
+    needs: verify
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
@@ -78,6 +81,8 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
       - name: Build server
         run: cargo build --release --locked --package owlauth-server
       - name: Package server
@@ -113,6 +118,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
       - name: Download server artifacts
         uses: actions/download-artifact@v7
         with:
@@ -177,7 +184,6 @@ jobs:
         run: |
           gh release create "server-v${VERSION}" artifacts/* \
             --notes-file release-metadata/release-notes.md \
-            --target "$GITHUB_SHA" \
             --title "OwlAuth Server v${VERSION}"
       - name: Promote server image to latest
         env:

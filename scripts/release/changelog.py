@@ -6,9 +6,9 @@ from __future__ import annotations
 import re
 import subprocess
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 COMPONENT_TAG_PREFIXES = {
     "server": "server-v",
@@ -72,9 +72,7 @@ class PullRequestTitle:
 def parse_title(title: str) -> PullRequestTitle:
     match = TITLE_PATTERN.fullmatch(title.strip())
     if match is None:
-        raise ChangelogError(
-            "title must match <type>(<scope>[+<scope>...])[!]: <summary>"
-        )
+        raise ChangelogError("title must match <type>(<scope>[+<scope>...])[!]: <summary>")
 
     change_type = match.group("type")
     if change_type not in ALLOWED_TYPES:
@@ -122,8 +120,9 @@ def git(*arguments: str, cwd: Path) -> str:
     return result.stdout
 
 
-def previous_tag(component: str, reference: str, cwd: Path) -> str | None:
+def previous_tag(component: str, version: str, reference: str, cwd: Path) -> str | None:
     prefix = COMPONENT_TAG_PREFIXES[component]
+    current_tag = f"{prefix}{version}"
     tags = git(
         "tag",
         "--merged",
@@ -133,7 +132,7 @@ def previous_tag(component: str, reference: str, cwd: Path) -> str | None:
         "--sort=-version:refname",
         cwd=cwd,
     ).splitlines()
-    return tags[0] if tags else None
+    return next((tag for tag in tags if tag != current_tag), None)
 
 
 def commit_titles(reference: str, start_tag: str | None, cwd: Path) -> list[str]:
@@ -202,7 +201,7 @@ def generate_notes(
 ) -> None:
     if component not in COMPONENT_TAG_PREFIXES:
         raise ChangelogError(f"unsupported component: {component}")
-    start_tag = previous_tag(component, reference, cwd)
+    start_tag = previous_tag(component, version, reference, cwd)
     notes = render_notes(
         component=component,
         version=version,
