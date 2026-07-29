@@ -22,6 +22,7 @@ check: ## Run formatting, lint, package metadata, and workflow checks
 	@uv run --locked ruff check $(PYTHON_DIR)
 	@uv run --locked ruff format --check $(PYTHON_DIR)
 	@pnpm --filter @owlauth/client check
+	@python3 scripts/check-markdown-links.py
 	@pnpm --filter @owlauth/docs build
 	@test -f $(DOCS_DIR)/.vitepress/dist/sitemap.xml
 	@grep -q 'https://owlauth.owlfoundry.org/' $(DOCS_DIR)/.vitepress/dist/sitemap.xml

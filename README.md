@@ -51,10 +51,13 @@ The two planes use distinct listeners and authentication policies even when one 
 ```text
 .
 ├── crates
-│   ├── owlauth-server  # server library and `owlauth-server` executable
+│   ├── owlauth-server  # server library, executable, migrations, and hosted-web ownership
+│   │   ├── migrations  # reviewed PostgreSQL migration assets
+│   │   └── web         # Runtime/Control hosted-web ownership boundary
 │   ├── owlauth-cli     # remote Control CLI and `owlauth` executable
 │   └── owlauth-types   # public HTTP DTO and OpenAPI authority
-├── spec                # normative server and CLI architecture
+├── spec                # normative server/CLI architecture and technology register
+│   └── technology      # detailed canonical technology decisions
 ├── docs                # VitePress user and operator documentation
 ├── plugins             # shared Codex and Claude integration skill
 └── sdks
@@ -68,6 +71,8 @@ Start with:
 
 - [User documentation](https://owlauth.owlfoundry.org)
 - [Server architecture specifications](spec/README.md)
+- [Technology selection register](spec/10-implementation-technology-selections.md)
+- [Detailed technology decisions](spec/technology/README.md)
 - [SDK specifications](sdks/spec/README.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
@@ -99,7 +104,7 @@ cargo run --package owlauth-server
 curl http://127.0.0.1:8080/health
 ```
 
-Database migrations belong in `crates/owlauth-server/migrations/`. The target design embeds and applies pending migrations before readiness; the current scaffold does not yet implement the migration runner.
+Database migration ownership is tracked in [`crates/owlauth-server/migrations/`](crates/owlauth-server/migrations/README.md), and hosted-web ownership is tracked in [`crates/owlauth-server/web/`](crates/owlauth-server/web/README.md). These directories establish ownership boundaries only; the current scaffold does not yet implement the migration runner or browser surfaces.
 
 ## CLI installation
 

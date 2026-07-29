@@ -8,11 +8,11 @@ The target contract separates:
 - Control DTOs for Project, Application, provider, user, policy, key, management, and audit administration;
 - minimal listener-specific health DTOs.
 
-This crate is the Rust source of generated OpenAPI documents. It does not provide an HTTP server or client, contain domain entities or database rows, or grant authorization merely by exposing a type.
+This crate is the Rust source of generated OpenAPI documents. The target export utility lives in this package and emits complete, separate Runtime and Control documents without compiling `owlauth-server`, as required by [`TS-002`](../../spec/technology/ts-002-hosted-web-and-asset-pipeline.md). It does not provide an HTTP server or client, contain domain entities or database rows, or grant authorization merely by exposing a type.
 
-> OwlAuth is pre-alpha. The current crate contains the health response and a small legacy OAuth error-code subset used by the scaffold. It does not yet define the target Runtime and Control contracts.
+> OwlAuth is pre-alpha. The current crate contains the health response and a small legacy OAuth error-code subset used by the scaffold. It does not yet define the target Runtime and Control contracts or their exporter.
 
-Generate the current document through the server binary:
+Generate the current legacy combined document through the server binary:
 
 ```bash
 cargo run --package owlauth-server -- --openapi

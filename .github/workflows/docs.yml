@@ -44,6 +44,8 @@ jobs:
         run: npm install --global pnpm@11.17.0
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
+      - name: Validate Markdown links
+        run: python3 scripts/check-markdown-links.py
       - name: Build documentation
         run: pnpm --filter @owlauth/docs build
       - name: Verify sitemap

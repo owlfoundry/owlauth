@@ -34,7 +34,7 @@ Project identifiers are globally unique within the deployment. User identifiers 
 | Application | starts login, exchanges a handoff ticket, stores/uses session results | public app identifiers are not secrets; redirect and origin registration is authoritative |
 | Application backend | verifies Project tokens and applies business authorization | separate authorization boundary |
 | Upstream identity provider | authenticates the end user and returns stable issuer/subject claims | remote security dependency with provider-specific validation |
-| Operator | creates Projects/Applications/providers and manages users, keys, credentials, and policy | privileged principal with scoped Control authorization and audit |
+| Deployment operator | creates Projects/Applications/providers and manages users, keys, and policy | trusted holder of the deployment-wide Control API key; all Control actions audit as the deployment operator |
 | External control gateway | optionally proxies Control for another product's organization/RBAC layer | separate policy-enforcement point; must validate `belongs_to` and object access |
 | PostgreSQL | stores authoritative Project, identity, login, session, token, key, and audit state | privileged durability and consistency boundary |
 | Redis | provides non-authoritative caching, rate coordination, and invalidation hints | disposable support dependency; values may be stale or absent |
@@ -72,15 +72,17 @@ OwlAuth is a modular monolith with two transport planes over one shared core.
 
 ```mermaid
 flowchart LR
-    EndUsers[Applications and end users] --> RL[Runtime listener]
-    Operators[Operator or external control gateway] --> CL[Control listener]
+    EndUsers[Applications and end users] --> Hosted[Hosted Authentication UI]
+    Hosted --> RL[Runtime listener]
+    Operators[Operator or external control gateway] --> Console[Management Console or Control client]
+    Console --> CL[Control listener]
 
     subgraph Artifact[One owlauth-server binary/container]
         subgraph Runtime[Runtime / Protocol Plane]
-            RL --> RH[Project Auth HTTP adapters]
+            RL --> RH[Hosted UI and Project Auth HTTP adapters]
         end
         subgraph Control[Control Plane]
-            CL --> CA[Control HTTP and MCP adapters]
+            CL --> CA[Management Console, Control HTTP, and MCP adapters]
         end
         RH --> AS[Shared application services]
         CA --> AS
@@ -100,6 +102,7 @@ Transport adapters perform parsing, admission control, caller authentication, Pr
 
 Runtime serves latency-sensitive public Project authentication traffic:
 
+- hosted Project/Application login, provider interaction, progress, and safe error/return pages;
 - public Project/Application auth configuration;
 - login start and upstream provider callbacks;
 - one-use handoff exchange;
@@ -112,31 +115,33 @@ Runtime is not a general OAuth authorization server. OAuth/OIDC protocol handlin
 
 ## Control Plane
 
-Control serves authenticated administrative operations:
+Control serves its embedded Management Console and authenticated administrative operations:
 
+- credential-free Console shell plus API-key-authenticated Console requests;
 - Project lifecycle and optional `belongs_to` metadata;
 - Applications, publishable configuration, allowed origins, and post-login redirects;
 - per-Project provider client IDs and secret references;
 - Project user lookup, disablement, merge, and linked-identity removal;
 - Project claims/session policy and token configuration;
-- management principals and credentials;
 - Project signing-key lifecycle commands and state inspection;
 - Project-scoped and deployment-scoped audit queries and safe health metadata.
 
-Control uses a distinct listener, stronger credentials, narrower network exposure, and explicit management scopes. Public Application identifiers or upstream provider credentials are never Control credentials. Control routes cannot be mounted into the Runtime router.
+Control uses a distinct listener, narrower network exposure, and exactly one deployment-level operator API key loaded from process configuration. A valid key grants the entire deployment's Control authority; OwlAuth has no server-side Control principals, permission sets, credential-management endpoints, or Control sessions of any kind. Public Application identifiers, publishable keys, Runtime access/refresh tokens, and upstream provider credentials are never Control credentials. Conversely, the operator API key is never accepted by Runtime. Control routes cannot be mounted into the Runtime router.
 
 ## Standalone deployment
 
 ```mermaid
 flowchart LR
     User[End user] --> App[Application]
-    App --> Runtime[OwlAuth Runtime]
+    App --> Hosted[OwlAuth hosted authentication]
+    Hosted --> Runtime[OwlAuth Runtime]
     Runtime --> Provider[GitHub / Google]
     Runtime --> PG[(PostgreSQL)]
     Runtime --> Redis[(Redis)]
     Runtime --> KMS[Project signer / key store]
 
-    Operator[Single operator] --> Control[OwlAuth Control]
+    Operator[Single operator] --> Console[OwlAuth Management Console]
+    Console --> Control[OwlAuth Control]
     Control --> PG
     Control --> KMS
 ```
@@ -148,7 +153,7 @@ In standalone operation, one operator manages every Project. `belongs_to` is nul
 ```mermaid
 flowchart LR
     OrgAdmin[External organization admin] --> Gateway[External API and RBAC gateway]
-    Gateway -->|Scoped Control credential| Control[OwlAuth Control]
+    Gateway -->|Deployment operator API key| Control[OwlAuth Control]
     Control --> PG[(PostgreSQL)]
 
     EndUser[End user] --> App[External product Application]
@@ -159,9 +164,9 @@ flowchart LR
     Gateway -. organization mapping .-> BT[Project belongs_to]
 ```
 
-The external gateway authenticates its administrators, resolves organization membership, applies its own RBAC, maps the organization to a Project `belongs_to` value, verifies the target Project and revision, and then invokes narrowly scoped Control operations. OwlAuth scopes constrain what the gateway credential may do; the gateway constrains which externally owned Projects its caller may reach.
+The external gateway authenticates its administrators, resolves organization membership, applies its own RBAC, maps the organization to a Project `belongs_to` value, verifies the target Project and revision, and then invokes allowlisted Control operations using the deployment operator API key. OwlAuth does not attenuate that key: only the gateway constrains which externally owned Projects and operations its callers may reach.
 
-`belongs_to` does not cause implicit filtering or authorization. Possession of an unrestricted OwlAuth management credential remains deployment-wide authority. An external product must not expose such a credential or forward arbitrary Control requests.
+`belongs_to` does not cause implicit filtering or authorization. Possession of the OwlAuth operator API key is deployment-wide Control authority. An external product must not expose the key or forward arbitrary Control requests.
 
 ## Deployment shape
 
@@ -181,7 +186,7 @@ A typical topology assigns `auth.example.com` to Runtime and `admin.auth.example
 
 1. **Project boundary:** every Project-owned resource and credential is resolved and mutated with an authoritative `project_id`; no unqualified lookup can cross Projects.
 2. **Public Runtime boundary:** every request is hostile until parsed, bounded, and Project/Application validated.
-3. **Administrative boundary:** management principal, scope, freshness, target Project, and mutation intent are verified independently of Runtime Application identity.
+3. **Administrative boundary:** the Control listener verifies the configured deployment operator API key before resolving a target Project or mutation; the key is independent of every Runtime Application and user identity.
 4. **Browser redirect boundary:** login state, provider callback values, redirect targets, cookies, and handoff values are attacker-controlled inputs.
 5. **Shared-core boundary:** only application services initiate domain state transitions; adapters and rows are not authority.
 6. **Persistence boundary:** PostgreSQL constraints and transactions protect durable invariants; stored rows are validated when mapped into domain types.
@@ -193,4 +198,4 @@ A typical topology assigns `auth.example.com` to Runtime and `admin.auth.example
 
 ## Design scope
 
-OwlAuth provides upstream social/OIDC federation, Project-scoped users and identities, Applications, sessions, token verification, provider configuration, user administration, and audit. Password authentication, SAML, SCIM, LDAP synchronization, organization membership, tenant billing, and general business RBAC/ABAC are outside this architecture.
+OwlAuth provides upstream social/OIDC federation, Project-scoped users and identities, Applications, sessions, token verification, provider configuration, user administration, and audit. Password authentication, SAML, SCIM, LDAP synchronization, organization membership, tenant RBAC, SaaS API keys, billing, and general business RBAC/ABAC are outside this server architecture. The separate SaaS architecture is defined in [`spec/saas/`](saas/).

@@ -28,6 +28,8 @@ features:
     details: OwlAuth uses OAuth or OIDC only with upstream identity providers such as GitHub, Google, or a configured OIDC issuer.
   - title: Runtime and Control separation
     details: Public authentication traffic and privileged administration use isolated listeners and policies over one shared application and domain core.
+  - title: Hosted web surfaces
+    details: Runtime provides hosted end-user authentication pages, while Control provides an API-key-driven Management Console in the same server artifact.
   - title: First-party SDK design
     details: TypeScript, Python, and Rust clients target the Runtime Project Auth contract, including PKCE handoff and coordinated refresh behavior.
   - title: Self-hosted authority
@@ -35,7 +37,7 @@ features:
 ---
 
 ::: danger Pre-alpha implementation
-The repository is **not a working Project Auth service yet**. The current server exposes only `GET /health` and generated OpenAPI for that scaffold. Project login, upstream-provider integration, persistence, sessions, token issuance, Runtime and Control APIs, migrations, and MCP are not implemented. The SDKs currently store only a base URL. Do not use this release for production authentication.
+The repository is **not a working Project Auth service yet**. The current server exposes only `GET /health` and generated OpenAPI for that scaffold. Project login, hosted authentication pages, the Management Console, upstream-provider integration, persistence, sessions, token issuance, Runtime and Control APIs, migrations, and MCP are not implemented. The SDKs currently store only a base URL. Do not use this release for production authentication.
 :::
 
 ## The product model

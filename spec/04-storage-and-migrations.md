@@ -2,11 +2,21 @@
 
 ## Storage authority
 
-PostgreSQL is OwlAuth's sole authoritative transactional store. Projects, Applications, redirect/origin registrations, provider configuration, Project users, linked identities, login transactions, handoff tickets, sessions, refresh families, revocation, policy, management credentials, Project key metadata, provisioning operations, and audit events are correct only when established by committed PostgreSQL state.
+PostgreSQL is OwlAuth's sole authoritative transactional store. Projects, Applications, redirect/origin registrations, provider configuration, Project users, linked identities, login transactions, handoff tickets, sessions, refresh families, revocation, policy, Project key metadata, provisioning operations, and audit events are correct only when established by committed PostgreSQL state. The deployment operator API key is deliberately excluded: it exists only in Control process configuration.
 
-Redis is a deployment dependency for distributed rate coordination, bounded caching, and invalidation hints. It is not an authority for Project ownership, identity, handoff consumption, session validity, refresh rotation, revocation, provider configuration, management authorization, or key state. Redis can be flushed and rebuilt without changing durable meaning.
+Redis is a deployment dependency for distributed rate coordination, bounded caching, and invalidation hints. It is not an authority for Project ownership, identity, handoff consumption, session validity, refresh rotation, revocation, provider configuration, Control authentication, or key state. Redis can be flushed and rebuilt without changing durable meaning.
 
 Runtime and Control use one schema and one shared core. There are no per-plane databases, cross-plane RPC transactions, message brokers, or distributed commits.
+
+## PostgreSQL adapter implementation
+
+The PostgreSQL adapter inside `crates/owlauth-server` uses SeaORM 2 for ordinary repository and Unit-of-Work queries. SeaORM entities, active models, query expressions, connections, transactions, and errors remain adapter-private and are explicitly mapped to application/domain types and persistence error classes. Application services receive transaction-bound semantic repositories through the application-owned `UnitOfWork`; a business transaction can include multiple repositories and the durable audit appender without exposing ORM types.
+
+Runtime and Control use independent bounded SeaORM serving pools even in `all` mode. All serving pools in one OwlAuth deployment connect to the same configured PostgreSQL server and database authority; split processes MAY use plane-specific login credentials and DDL-free roles, but not independent database targets. Schema-version equality is not evidence that two databases are one authority. Pool acquisition, statement, transaction, lock, and cancellation behavior are bounded according to specs 06 and 08.
+
+SQLx 0.9 is used directly only for embedded migration execution, DDL-free serving-schema compatibility verification, and migration-focused tests. It is not a second ordinary repository style. The production schema is controlled by reviewed SQL files under `crates/owlauth-server/migrations/`; SeaORM schema synchronization and entity-registry schema management MUST remain disabled. OwlAuth does not depend on `sea-orm-migration`, create a separate persistence/migration workspace crate, or expose either library across application ports.
+
+The concrete dependency and revisit decision is recorded in [`TS-001`](technology/ts-001-postgresql-repositories-and-migrations.md) and registered by [spec 10](10-implementation-technology-selections.md). This document remains the authority for storage and migration behavior.
 
 ## Logical data model
 
@@ -38,10 +48,11 @@ erDiagram
     PROJECT_KEY_RINGS ||--o{ SIGNING_KEYS : contains
     SIGNING_KEYS ||--o{ KEY_STATE_EVENTS : transitions
     PROJECT_KEY_RINGS ||--o{ JWKS_PUBLICATION_LEASES : observed_by
-    PROJECTS ||--o{ AUDIT_EVENTS : scopes
-    PROJECTS ||--o{ MCP_CONFIRMATION_CAPABILITIES : binds
-    MANAGEMENT_PRINCIPALS ||--o{ MANAGEMENT_CREDENTIALS : authenticates
-    MANAGEMENT_PRINCIPALS ||--o{ MCP_CONFIRMATION_CAPABILITIES : owns
+    PROJECTS o|--o{ AUDIT_EVENTS : scopes
+    PROJECTS o|--o{ MCP_CONFIRMATION_CAPABILITIES : binds
+    PROJECTS o|--o{ CONTROL_IDEMPOTENCY_RECORDS : targets
+    PROJECTS ||--o{ KEY_PROVISIONING_OPERATIONS : provisions
+    PROJECT_KEY_RINGS ||--o{ KEY_PROVISIONING_OPERATIONS : tracks
 
     PROJECTS {
         uuid id PK
@@ -235,7 +246,7 @@ erDiagram
         uuid signing_key_id FK
         enum from_state
         enum to_state
-        uuid actor_id
+        text actor_kind
         timestamptz occurred_at
     }
     JWKS_PUBLICATION_LEASES {
@@ -246,31 +257,15 @@ erDiagram
         timestamptz observed_at
         timestamptz lease_expires_at
     }
-    MANAGEMENT_PRINCIPALS {
-        uuid id PK
-        text principal_name UK
-        enum status
-        text_array scopes
-    }
-    MANAGEMENT_CREDENTIALS {
-        uuid id PK
-        uuid principal_id FK
-        enum credential_type
-        text credential_digest
-        timestamptz expires_at
-        timestamptz revoked_at
-    }
     CONTROL_IDEMPOTENCY_RECORDS {
-        uuid principal_id FK
+        text idempotency_key UK
         uuid project_id FK
-        text idempotency_key
         text request_digest
         uuid result_resource_id
         timestamptz expires_at
     }
     MCP_CONFIRMATION_CAPABILITIES {
         uuid id PK
-        uuid principal_id FK
         uuid project_id FK
         text capability_digest UK
         text command_digest
@@ -283,7 +278,6 @@ erDiagram
         uuid id PK
         uuid project_id FK
         text actor_kind
-        uuid actor_id
         text action
         text target_kind
         uuid target_id
@@ -294,7 +288,7 @@ erDiagram
     }
 ```
 
-The diagram expresses ownership and cardinality, not literal SQL names or every index. Nullable relationships such as `login_transactions.user_id`, `application_sessions.browser_session_id`, and deployment-scoped `audit_events.project_id` are constrained by their state/type.
+The diagram expresses ownership and cardinality, not literal SQL names or every index. Nullable relationships such as `login_transactions.user_id`, `application_sessions.browser_session_id`, `control_idempotency_records.project_id`, `mcp_confirmation_capabilities.project_id`, and deployment-scoped `audit_events.project_id` are constrained by their state/type. Project creation idempotency and deployment-level audit/MCP commands therefore remain representable without inventing a Project.
 
 ## Project isolation constraints
 
@@ -364,12 +358,13 @@ The diagram expresses ownership and cardinality, not literal SQL names or every 
 - A JWKS publication lease's `observed_at` records when that specific loaded revision was first loaded; heartbeat renewal changes only `lease_expires_at`. Key activation waits the full propagation interval from the latest qualifying observation.
 - Entering `Retiring` sets `verify_not_after` conservatively from transition time plus maximum Project token lifetime, clock skew, JWKS cache retention, and propagation margin.
 
-### Management and audit
+### Deployment operator and audit
 
-- Management credentials are typed, scoped, expiring, rotatable, and revocable. They cannot authenticate Runtime users or Applications.
-- Control idempotency is unique by `(principal_id, idempotency_key)`. Project-bound records carry the target Project. Reuse with another request digest is a conflict.
-- MCP confirmation capabilities are stored only as digests, expire, and are consumed exactly once in the same PostgreSQL transaction as the bound command and audit event.
-- Audit events are append-only. Security mutations and their audit event commit in the same PostgreSQL transaction.
+- The single Control API key is loaded from `OWLAUTH_CONTROL_API_KEY`, remains only in process configuration, and has no PostgreSQL or Redis row, digest, identifier, permission set, expiry, or lifecycle endpoint.
+- Control idempotency is deployment-operator-scoped: `idempotency_key` is unique across the deployment. Project-bound records also carry the target Project. Reuse with another request digest is a conflict.
+- An idempotency record for creation of a durable resource remains as a replay/tombstone record for at least the lifetime of that resource and MUST NOT expire into permission to execute the same key again; its `expires_at` is null while lifetime retention applies. Other eligible command records have a documented retention window longer than every supported client retry and reconciliation window. After expiry, an unknown create outcome is reconciliation-required rather than automatically replayable. Backup/restore preserves each record consistently with its committed resource transaction.
+- MCP confirmation capabilities are stored only as digests, expire, and are consumed exactly once in the same PostgreSQL transaction as the bound command and audit event. They bind the deployment operator, command, Project, and revisions without creating a durable operator identity.
+- Audit events are append-only. Security mutations and their audit event commit in the same PostgreSQL transaction. Every Control event has the fixed actor kind `deployment_operator`; OwlAuth stores no server-side operator identity.
 - Project-scoped events carry `project_id`; deployment-level events use a constrained null Project and cannot be confused with a Project event.
 - `safe_context` follows action-specific schemas and excludes arbitrary payloads and credentials.
 
@@ -417,7 +412,7 @@ Redis MUST NOT be the sole store or serialization point for:
 - Project users or linked identities;
 - login/callback completion or handoff consumption;
 - browser/Application sessions or refresh families;
-- revocation or management authorization;
+- revocation or Control authentication;
 - Project key lifecycle, JWKS publication proof, or private material;
 - audit records;
 - locks whose loss could cross Projects, duplicate a credential, or permit an invalid transition.
@@ -426,36 +421,48 @@ Redis MUST NOT be the sole store or serialization point for:
 
 Control commits a mutation and audit event to PostgreSQL first, then publishes a best-effort invalidation carrying Project, entity, identifier, and new revision. Runtime treats invalidation as a latency optimization.
 
-Project/Application/provider/user disablement, redirect removal, policy changes, credential revocation, and key changes are read from PostgreSQL at the login start, callback, handoff, refresh, current-user, and signing decision points. Their correctness does not depend on Redis delivery or TTL.
+Project/Application/provider/user disablement, redirect removal, policy changes, and key changes are read from PostgreSQL at the login start, callback, handoff, refresh, current-user, and signing decision points. Their correctness does not depend on Redis delivery or TTL.
 
 Already issued Project access tokens retain their signed expiry semantics. Cache invalidation cannot revoke a token already accepted offline by an Application backend.
 
 ## Migration architecture
 
-Migration source files live under `crates/owlauth-server/migrations/` and are embedded into the server artifact. PostgreSQL records migration identity, order, and checksum.
+SQL migration source files live under `crates/owlauth-server/migrations/` and are embedded into the server artifact at build time by SQLx 0.9. Released migration files are append-only repository artifacts. SQLx's `_sqlx_migrations` table and built-in checksum validation are the migration-history mechanism; OwlAuth does not add a second history table, checksum algorithm, or generic migration framework.
 
-The process distinguishes:
+The `MIGRATION_MODE` configuration defaults to `auto` and is one of:
 
-- a restricted serving credential used by Runtime/Control repositories with no schema DDL authority;
-- an optional separate migration credential/capability used only before listeners admit traffic.
+- `auto`: before serving pools or listeners are created, open one dedicated SQLx `PgConnection` to the single configured serving server/database target using an optional migration login credential (defaulting to the serving credential), configure bounded connection and PostgreSQL `lock_timeout`, activate the configured non-login owner role when used, and run the embedded SQLx migrator with PostgreSQL locking enabled. Migration configuration cannot override the server or database target;
+- `verify`: perform no DDL and use the restricted serving connection to compare the target's SQLx history with the embedded migration set.
+
+The deployment configures one serving PostgreSQL server/database target. Runtime and Control may use distinct credentials, roles, and pools for that target, and every actual pool verifies the same migration history. Configuration that points the planes at different database targets is invalid and fails before listeners bind; matching migration histories do not make independent databases one authority. Verification fails closed on an absent history table, failed/dirty entry, pending or missing version, checksum mismatch, or database-ahead version. The serving role has only the read privilege on migration history needed for this check; it does not gain schema DDL authority.
 
 ```mermaid
-flowchart LR
-    Start[Process composition] --> Connect[Connect with serving credential]
-    Connect --> Required{Schema migration required?}
-    Required -- no --> Verify[Verify identity, checksum, compatibility]
-    Required -- yes --> Capability{Migration capability configured?}
-    Capability -- no --> Closed[Remain unready]
-    Capability -- yes --> Lock[Acquire PostgreSQL migration lock]
-    Lock --> Apply[Apply embedded migrations with migration credential]
-    Apply --> Drop[Release migration connection/capability]
-    Drop --> Verify
-    Verify --> Ready[Enable selected plane readiness]
+flowchart TD
+    Start[Parse and validate configuration] --> Mode{Migration mode}
+    Mode -->|auto| Migration[Open one dedicated SQLx migration connection]
+    Migration --> Bounds[Set bounded connection and lock timeouts]
+    Bounds --> Owner[Activate configured non-login owner role if set]
+    Owner --> Apply[Run embedded SQLx migrator with PostgreSQL locking]
+    Apply --> Capture[Capture migration result]
+    Bounds -->|failure| Cleanup[Close or drop dedicated connection]
+    Owner -->|failure| Cleanup
+    Capture --> Cleanup
+    Cleanup --> Applied{Auto preparation succeeded?}
+    Applied -->|yes| Pools[Create independent bounded SeaORM serving pools]
+    Applied -->|no| Closed[Fail startup and remain unready]
+    Migration -->|connect failure| Closed
+    Mode -->|verify| Pools
+    Pools --> Targets[Read-only verify every serving pool against the one authority]
+    Targets --> Compatible{Exact compatible history?}
+    Compatible -->|yes| Listeners[Compose listeners and readiness]
+    Compatible -->|no| Closed
 ```
 
-A configured migration capability applies pending migrations automatically before traffic and is not retained in serving pools. Processes without it verify exact compatibility and remain unready if migration is required. Concurrent starts coordinate through PostgreSQL, not Redis.
+The dedicated migration connection is closed or dropped before any serving pool is admitted, on success, migration error, timeout, cancellation, or panic unwinding. A session-scoped advisory lock is never returned to a live pool. Concurrent `auto` starts coordinate through SQLx's PostgreSQL migration lock, not Redis or an OwlAuth lock protocol.
 
-Migration history is immutable, checksum-verified, ordered, and transactional. A PostgreSQL operation that cannot use one transaction has an explicit resumable state machine in schema metadata; partial state is incompatible and cannot serve.
+For hardened deployments, a non-login role owns the schema, SQLx history table, and migration-created objects. The migration login is permitted to assume it and MUST activate it before the migrator creates or changes objects. Owner default privileges or explicit migration grants provide each DDL-free serving role with only its required schema, table, sequence, and migration-history access.
+
+Migrations are transactional unless PostgreSQL cannot perform the operation in one transaction and the migration explicitly declares and documents a bounded resumable procedure. Partial or ambiguous state is incompatible and cannot serve. Rolling releases use expand/migrate/switch/contract: release N's schema remains usable by release N-1 during overlap, and destructive contraction occurs only in a later release after old binaries are drained.
 
 ## Durability and recovery model
 
@@ -463,7 +470,8 @@ A recoverable OwlAuth state consists of:
 
 - a transactionally consistent PostgreSQL backup;
 - deployment external URLs and Project issuer derivation configuration;
-- provider and management secret references plus access to their secret store;
+- provider secret references plus access to their secret store;
+- the current `OWLAUTH_CONTROL_API_KEY` supplied independently to Control processes when Control is enabled;
 - every active/retained Project signer key reference and corresponding key-store material;
 - active and retained `DataProtector` key versions needed by unexpired login transactions;
 - wrapping-key material where software key adapters use envelope encryption;

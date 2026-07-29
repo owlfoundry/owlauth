@@ -24,7 +24,7 @@ The shared source under [`plugins/owlauth`](https://github.com/owlfoundry/owlaut
 - inspect generated OpenAPI as an ephemeral contract view;
 - direct security reports to the private disclosure path.
 
-Plugin text or model output is never authority. Do not paste provider secrets, management credentials, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, private keys, full callback URLs, or user profiles into agent context.
+Plugin text or model output is never authority. Do not paste provider secrets, `OWLAUTH_CONTROL_API_KEY`, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, private keys, full callback URLs, or user profiles into agent context.
 
 ## Current CLI
 
@@ -46,13 +46,13 @@ The planned CLI is a remote client of the isolated Control listener:
 ```mermaid
 flowchart LR
     Operator --> CLI[owlauth CLI]
-    CLI -->|TLS + management credential| Control[Control listener]
-    Control --> Auth[Management principal + concrete scope]
+    CLI -->|TLS + operator Bearer key| Control[Control listener]
+    Control --> Auth[Authenticate deployment operator]
     Auth --> Core[Shared application command]
     Core --> PG[(PostgreSQL transaction + audit)]
 ```
 
-Every future command will need a stable Control contract, management authentication, concrete scope, explicit Project target, current revision, safe output, and idempotency/confirmation rules. Local-looking IDs cannot bypass server qualification.
+Every future command will need a stable Control contract, deployment-operator authentication, explicit Project target, current revision, safe output, and idempotency/confirmation rules. Local-looking IDs cannot bypass server qualification.
 
 Credentials must come from a TTY prompt, protected file descriptor, OS credential store, or secret-provider integration—not normal process arguments or shell history. Human and machine output remain separate; both redact credential and profile data. Destructive commands require an explicit target and revision plus deliberate confirmation, but confirmation never replaces server authorization.
 
@@ -62,14 +62,14 @@ MCP is an optional **Control adapter inside `owlauth-server`**, never a local au
 
 A tool must map to one bounded shared-core command/query with:
 
-- authenticated management principal and concrete scope;
+- authenticated deployment operator using `OWLAUTH_CONTROL_API_KEY`;
 - explicit Project and target revision;
 - closed input schema and bounded output;
 - deterministic side effects and idempotency policy;
 - timeout, rate, and audit policy;
-- step-up/fresh authentication for high-impact actions.
+- preview/commit confirmation for high-impact actions without pretending UI approval is additional authority.
 
-MCP will not provide raw SQL, generic HTTP forwarding, repository access, shell/filesystem execution, unrestricted bulk mutation, or export of secrets, provider tokens, sessions, management credentials, private keys, or user-profile dumps.
+MCP will not provide raw SQL, generic HTTP forwarding, repository access, shell/filesystem execution, unrestricted bulk mutation, or export of secrets, provider tokens, sessions, the operator API key, private keys, or user-profile dumps.
 
 ### High-impact confirmation
 
@@ -81,21 +81,21 @@ sequenceDiagram
     participant PG as PostgreSQL
 
     Agent->>Adapter: Preview exact typed command
-    Adapter->>Core: Authenticate, authorize scope, resolve Project and revisions
+    Adapter->>Core: Authenticate operator key; resolve Project and revisions
     Core->>PG: Store digest of short-lived bound capability
     Adapter-->>Agent: Redacted summary + one-use capability
     Agent->>Adapter: Commit identical command + capability
-    Adapter->>Core: Reauthorize principal, scope, payload, freshness
+    Adapter->>Core: Reauthenticate key; validate payload and revisions
     Core->>PG: Consume capability + mutate + audit atomically
     Adapter-->>Agent: Bounded result or stale/replay error
 ```
 
-The capability binds the principal, tool, normalized command, Project, metadata revision, target revision, and Control audience. PostgreSQL—not Redis—enforces one use in the same transaction as the mutation. Prompt text, tool selection, and UI approval are not authorization.
+The capability binds the fixed deployment-operator actor, tool, normalized command, Project, metadata revision, target revision, and Control audience. PostgreSQL—not Redis—enforces one use in the same transaction as the mutation. Prompt text, tool selection, and UI approval are not authorization.
 
 ## External control gateways
 
-A product with organization-aware administration may place its own API/RBAC gateway before OwlAuth Control. The gateway authenticates the tenant administrator, checks membership/roles, maps trusted ownership to Project `belongs_to`, verifies the target and revision, and forwards only allowlisted Control commands with a server-side management credential.
+A product with organization-aware administration may place its own API/RBAC gateway before OwlAuth Control. The gateway authenticates the tenant administrator, checks membership/roles, maps trusted ownership to Project `belongs_to`, verifies the target and revision, and forwards only allowlisted Control commands with the deployment's server-side operator key.
 
-OwlAuth scopes constrain what that credential can do, but OwlAuth does not infer tenant ownership from `belongs_to`. Generic Control forwarding or an unrestricted credential exposed to an agent would be deployment-wide authority.
+OwlAuth does not attenuate the operator key or infer tenant ownership from `belongs_to`; the external gateway owns every narrower permission decision. Generic Control forwarding or an operator key exposed to a browser/agent would grant deployment-wide authority.
 
 For the normative target boundary, read the [CLI and MCP specification](https://github.com/owlfoundry/owlauth/blob/main/spec/07-cli-and-mcp-boundaries.md).

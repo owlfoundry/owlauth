@@ -1,132 +1,104 @@
-# 07 — Control scopes, external ownership, CLI, and MCP
+# 07 — Deployment-operator Control, external ownership, CLI, and MCP
 
-## Single-operator control model
+## Single deployment-operator model
 
-OwlAuth has one administrative trust domain. Management principals and scopes define which Control operations a credential may perform across the deployment. OwlAuth does not model organizations, tenant memberships, tenant roles, invitations, or organization-scoped credentials.
+OwlAuth has one administrative trust domain and one Control actor: the deployment operator. The Control listener accepts only the single API key loaded from `OWLAUTH_CONTROL_API_KEY`. A valid key grants every Control operation across every Project in the deployment.
 
-Project `belongs_to` supports correlation with an external ownership system but does not change this authorization model.
+OwlAuth does not create or store management users, principals, roles, permission grants, API-key records, browser Control sessions, or secondary-authentication state. It exposes no endpoint to issue, inspect, attenuate, rotate, or revoke Control credentials. The fixed audit actor for every Control command is `deployment_operator`.
 
-## Management scope vocabulary
+The operator API key is unrelated to Runtime credentials. Publishable keys, Project access tokens, refresh tokens, browser sessions, handoff tickets, provider credentials, and public Project/Application IDs cannot invoke Control. Conversely, the operator API key is categorically invalid on Runtime routes.
 
-Scopes are action capabilities with deny-by-default evaluation. Wildcard/admin aliases may exist only as explicit bundles of concrete scopes; the concrete operation always maps to a stable scope.
+## Control admission
 
-| Scope family | Concrete scopes |
-| --- | --- |
-| Project lifecycle | `projects:create`, `projects:read`, `projects:update`, `projects:disable` |
-| External ownership metadata | `projects.belongs_to:read`, `projects.belongs_to:write` |
-| Applications | `applications:create`, `applications:read`, `applications:update`, `applications:disable` |
-| Application keys/config | `applications.keys:read`, `applications.keys:rotate`, `applications.redirects:write`, `applications.origins:write` |
-| Providers | `providers:create`, `providers:read`, `providers:update`, `providers:disable` |
-| Provider secrets | `providers.secrets:write`, `providers.secrets:rotate` |
-| Project users | `users:read`, `users:update`, `users:disable`, `users:merge` |
-| Linked identities | `users.identities:read`, `users.identities:link`, `users.identities:unlink` |
-| Sessions | `sessions:read`, `sessions:revoke` |
-| Project policies | `policies:read`, `policies:write` |
-| Project keys | `keys:read`, `keys:provision`, `keys:publish`, `keys:activate`, `keys:retire`, `keys:revoke` |
-| Audit/system | `audit:read`, `system:read` |
-| Management access | `management.principals:read`, `management.principals:write`, `management.credentials:rotate`, `management.credentials:revoke` |
+A Control HTTP request is admitted only when it contains exactly:
 
-Read and write scopes are separate. Secret-reference mutation, key transition, user merge, Project disablement, and management credential operations require step-up/fresh management authentication in addition to the scope. Project/Application/provider/user removal is represented by disablement or merge tombstones; no undefined hard-delete Control capability exists.
-
-These scopes authorize Control actions. They are unrelated to Project access-token custom claims or an application's business RBAC.
-
-## Project target and object authorization
-
-A Control operation follows:
-
-```mermaid
-flowchart LR
-    Credential[Management credential] --> Principal[Current ManagementPrincipal]
-    Principal --> Scope[Required concrete scope]
-    Scope --> Project[Explicit target Project]
-    Project --> Revision[Current Project/resource revision]
-    Revision --> Command[Shared application command]
+```http
+Authorization: Bearer <operator-api-key>
 ```
 
-Scope answers what the principal may do. OwlAuth Project resolution answers which concrete Project object is being mutated but does not constrain that Project to an external organization. A deployment-wide credential with `users:disable` can disable a user in any Project when given a valid Project target.
+The adapter strictly parses the header, rejects duplicate or conflicting credentials, and compares the presented key with process configuration in constant time. Authentication completes before target lookup or command execution. Optional TLS, mTLS, private networking, proxy policy, and rate limiting are defense in depth; none is an alternate Control identity.
 
-High-impact commands include Project/resource expected revision and reject stale state. Child IDs are always resolved under the route Project; a globally valid child ID from another Project yields a non-enumerating not-found/denied result.
+After authentication, Project qualification, expected revisions, command preconditions, state transitions, request bounds, and idempotency still apply. Full deployment authority does not permit a caller to bypass domain invariants or combine child resources from different Projects.
+
+Control idempotency is deployment-operator-scoped. An idempotency key names one normalized request across the deployment, not one request per user or credential. Reusing it with a different request digest is a conflict.
 
 ## `belongs_to` semantics
 
 `belongs_to` is Project-only, nullable opaque metadata:
 
-- default is null;
-- exact value is bounded and indexed, not unique;
-- it has no syntax/namespace meaning inside OwlAuth;
-- it is not inherited as a duplicated child column;
-- it is absent from Runtime configuration, Project tokens, user data, provider callbacks, metrics labels, and default Control representations;
-- explicit read/filter requires `projects.belongs_to:read`;
-- create/update requires `projects.belongs_to:write`;
-- update advances Project metadata revision and emits an audit event;
-- no implicit list/search filtering occurs when a caller omits the exact filter.
+- its value is bounded, exactly comparable, indexed, and not unique;
+- it has no syntax, namespace, ownership, or authorization meaning inside OwlAuth;
+- it is not inherited or duplicated on child rows;
+- it is absent from Runtime configuration, Project tokens, user data, provider callbacks, and metric labels;
+- setting or changing it advances the Project metadata revision and emits an audit event;
+- exact filtering is supported, but no implicit list/search filtering occurs.
 
-OwlAuth never interprets a matching `belongs_to` value as proof that the management principal belongs to that owner.
+A matching value never reduces the deployment-wide authority of the operator key. OwlAuth does not treat the field as an organization, tenant, membership, role, or policy decision.
 
-## External RBAC gateway integration
+## External policy-gateway integration
 
-An external product can expose tenant-aware project management by placing its own authenticated gateway before OwlAuth Control.
+An external product MAY place its own authenticated policy gateway before OwlAuth Control to expose a narrower organization-aware API.
 
 ```mermaid
 sequenceDiagram
-    actor Admin as External tenant admin
-    participant Gateway as External API/RBAC gateway
+    actor Admin as External organization admin
+    participant Gateway as External API/policy gateway
     participant Control as OwlAuth Control
     participant Core as Shared core
     participant PG as PostgreSQL
 
-    Admin->>Gateway: Manage auth Project for organization
-    Gateway->>Gateway: Authenticate admin; check organization membership and RBAC
-    Gateway->>Control: Exact Project lookup/list filtered by belongs_to
-    Control->>Core: Authorize projects:read + projects.belongs_to:read
-    Core->>PG: Read matching Project ID and revision
-    PG-->>Gateway: Project metadata permitted by scopes
-    Gateway->>Gateway: Confirm target belongs to caller organization
-    Gateway->>Control: Project-bound mutation + expected revision
-    Control->>Core: Authorize concrete operation scope
-    Core->>PG: Conditional Project-scoped mutation + audit
-    PG-->>Gateway: committed result or revision conflict
+    Admin->>Gateway: Request Project administration
+    Gateway->>Gateway: Authenticate caller; enforce external membership and RBAC
+    Gateway->>Control: Exact belongs_to lookup using operator Bearer key
+    Control->>Core: Execute deployment-operator query
+    Core->>PG: Read Project ID and metadata revision
+    PG-->>Gateway: Matching Project metadata
+    Gateway->>Gateway: Verify external ownership and allowlisted operation
+    Gateway->>Control: Project command + expected revisions using same operator key
+    Control->>Core: Execute bounded Project command
+    Core->>PG: Conditional mutation + deployment-operator audit
+    PG-->>Gateway: Committed result or conflict
 ```
 
 The gateway MUST:
 
-- keep its OwlAuth management credential server-side;
-- authenticate the external caller and enforce organization membership/role;
-- derive `belongs_to` from trusted external identity, never caller-supplied authority alone;
-- verify every target Project maps to that value before forwarding a Project-bound command;
-- send the observed `project.metadata_revision` on every forwarded Project-bound mutation; OwlAuth compares it in the same transaction as the child mutation so concurrent ownership changes cause conflict;
-- expose only an allowlisted mapping from external operations to OwlAuth Control calls;
-- prevent generic Control forwarding, arbitrary Project IDs, credential export, and scope escalation;
-- treat a changed `belongs_to` as ownership-sensitive and repeat authorization.
+- keep `OWLAUTH_CONTROL_API_KEY` server-side and never expose it to external administrators, browsers, agents, or tenant workloads;
+- authenticate external callers and enforce its own organization membership, roles, plans, and policy;
+- derive expected `belongs_to` from trusted external identity rather than caller assertion alone;
+- verify each target Project before forwarding a Project-bound operation;
+- send the observed Project metadata revision and command-specific target revision so concurrent metadata or state changes fail with conflict;
+- map only allowlisted external operations to fixed Control commands;
+- prevent generic Control forwarding, arbitrary Project selection, key export, and policy bypass.
 
-OwlAuth provides indexed lookup and revision conditions but does not claim the gateway performed these checks. A product requiring server-enforced tenant credentials or row isolation requires a different multi-tenant Control architecture.
+OwlAuth provides indexed metadata, revision conditions, Project isolation, and domain validation. It does not provide server-enforced tenant isolation for callers sharing the operator key. Organization membership, SaaS API keys, tenant RBAC, plans, and billing belong to the separate [`spec/saas/`](saas/) architecture, not `owlauth-server`.
 
 ## CLI boundary
 
-`crates/owlauth-cli` is a remote Control client and does not depend on `owlauth-server`. It uses an isolated Control client module/feature rather than extending the default Runtime SDK with administrative methods.
+`crates/owlauth-cli` is a remote client for a trusted deployment operator. It does not depend on `owlauth-server`, open PostgreSQL/Redis, run repositories, load Project signing keys, or host a Control listener. It uses a deliberately isolated Control transport rather than adding administrative methods to the default Runtime SDK.
+
+The CLI uses the same `OWLAUTH_CONTROL_API_KEY` value and sends it only as the Control request's Bearer credential. It does not exchange the key for a user identity or session and cannot request reduced authority from OwlAuth. The key is acquired from protected environment/descriptor, OS credential storage, or secret-provider integration; it is never accepted as a normal command-line argument, placed in process titles/history, printed, logged, included in machine output, or persisted by OwlAuth.
 
 The CLI:
 
-- parses commands and safely acquires credentials;
-- authenticates as a management principal and sends no self-asserted authority accepted without verification;
-- never opens PostgreSQL/Redis, runs serving repositories, loads Project/provider keys, or hosts listeners;
-- cannot bypass Project qualification or Control scopes with internal-looking IDs;
+- requires an explicit Control endpoint and TLS verification;
+- treats every invocation as the trusted deployment operator;
+- sends explicit Project/target identifiers and expected revisions for destructive commands;
+- uses deployment-operator-scoped idempotency for eligible retries;
+- shows a safe interactive summary before destructive commands, while deliberate non-interactive confirmation does not alter server authority;
 - distinguishes stable machine output from human diagnostics;
-- redacts tokens, secrets, provider values, tickets, cookies, user profile data, and key references.
-
-Secrets are read from a TTY prompt, protected file descriptor, OS credential store, or secret-provider integration, never normal arguments/process titles/history. TLS verification is enabled; development overrides are explicit and endpoint-scoped.
-
-Destructive commands require explicit Project/target and expected revision. Interactive confirmation shows a safe summary. Non-interactive confirmation remains deliberate and does not replace server authorization.
+- redacts the operator key, Runtime credentials, provider values, tickets, cookies, user profile data, and private key references.
 
 ## MCP placement and constraints
 
-MCP is an optional server-side Control adapter, never a local authorization server bundled into an agent plugin and never exposed on Runtime. The transport authenticates a management principal through a defined Control credential class.
+MCP is an optional Control adapter for a trusted deployment operator. It is never exposed on Runtime and is not a local authorization server embedded in an agent plugin. Its transport uses the same Control API key and therefore has the same deployment-wide authority; OwlAuth does not assign a distinct agent identity or narrower permission set.
 
-Every tool maps to one bounded application command/query and defines required scope, step-up condition, Project target, closed input schema, expected revision, deterministic side effects, idempotency, timeout/rate policy, safe output, and audit action.
+Every tool maps to one bounded application command or query and defines a closed input schema, explicit Project target where applicable, expected revisions, deterministic side effects, idempotency behavior, timeout/rate policy, safe output, and audit action. Tools MUST NOT provide raw SQL, arbitrary repository access, generic HTTP forwarding, shell/filesystem execution, unrestricted bulk mutation, or export of provider secrets/tokens, handoff/session credentials, the operator key, private keys, or user profile dumps.
 
-MCP tools MUST NOT provide raw SQL, arbitrary repository access, generic HTTP forwarding, shell/filesystem execution, unrestricted bulk mutation, or export of provider secrets/tokens, handoff/session credentials, management credentials, private keys, or user profile dumps.
+Prompt text, model output, UI approval, and tool arguments are untrusted input. They cannot establish authority; only successful operator-key authentication admits the request.
 
-## High-impact MCP flow
+## High-impact MCP confirmation
+
+High-impact tools use a preview/commit flow to bind operator intent to current state:
 
 ```mermaid
 sequenceDiagram
@@ -136,28 +108,35 @@ sequenceDiagram
     participant PG as PostgreSQL
 
     Agent->>Adapter: Preview typed Project command
-    Adapter->>Core: Authorize scope and calculate safe summary
-    Core->>PG: Read revisions; persist digest of short-lived confirmation capability
-    PG-->>Core: authoritative snapshot + capability record
-    Core-->>Adapter: raw bound confirmation capability
-    Adapter-->>Agent: redacted summary + capability
+    Adapter->>Adapter: Authenticate deployment operator key
+    Adapter->>Core: Calculate safe summary
+    Core->>PG: Read revisions; store confirmation digest
+    PG-->>Core: Authoritative snapshot + capability record
+    Core-->>Agent: Redacted summary + raw capability
     Agent->>Adapter: Commit exact command + capability
-    Adapter->>Core: Reauthorize principal, scope, Project, payload, freshness
-    Core->>PG: Consume capability digest + conditional mutation + audit atomically
-    PG-->>Core: committed, replayed, expired, or stale/conflict
-    Core-->>Agent: bounded result
+    Adapter->>Adapter: Reauthenticate deployment operator key
+    Adapter->>Core: Validate command, Project, and revisions
+    Core->>PG: Consume capability + conditional mutation + audit atomically
+    PG-->>Core: Committed, replayed, expired, or stale/conflict
+    Core-->>Agent: Bounded result
 ```
 
-The capability is high-entropy/integrity protected and bound to principal, tool, exact normalized command, Project, Project metadata revision, target revision, and Control audience. PostgreSQL stores only its digest and atomically sets `consumed_at` with the command/audit transaction, enforcing one use without Redis. Prompt text and UI approval are never authorization.
+The confirmation capability is high entropy and integrity protected. It is bound to:
 
-## Surface separation
+- the fixed deployment-operator actor and Control audience;
+- the exact tool and normalized command digest;
+- the explicit Project when Project-bound;
+- the Project metadata revision and command-specific target revisions;
+- a short expiry and one-use consumption state.
 
-- CLI commands are operator workflows, not mechanically generated OpenAPI paths.
-- MCP tools are bounded capabilities, not generated CLI commands or generic OpenAPI wrappers.
-- Control HTTP, CLI, and MCP share application commands but retain adapter-specific authentication, admission, schema, confirmation, and output mapping.
-- Disabling MCP has no Runtime or Control HTTP contract effect.
-- Agent plugins may provide discovery/setup but cannot request, relay, persist, or display credentials in agent context.
+It is not bound to a server-side user, role, permission grant, or secondary-authentication session. PostgreSQL stores only its digest and atomically consumes it with the command and deployment-operator audit event. A capability cannot be moved to another command, Project, revision, deployment, or Runtime route.
 
-## Recovery operations
+## Surface and recovery boundaries
 
-Direct storage, key-store, or offline recovery is not an ordinary CLI/MCP command. Such procedures require separately isolated access, cryptographic authorization, exclusive/maintenance semantics, and audit. Convenience cannot give the public CLI a server dependency or bypass Project/Control policy.
+- CLI workflows are not mechanically generated OpenAPI paths.
+- MCP tools are bounded operator capabilities, not generated CLI commands or generic OpenAPI wrappers.
+- Control HTTP, CLI, and MCP share application commands while retaining adapter-specific parsing, admission, confirmation, and output mapping.
+- Disabling CLI use or MCP has no Runtime contract or credential effect.
+- Agent plugins may provide discovery/setup but must not request, relay, persist, or display the operator key in agent context.
+
+Direct storage, key-store, or offline disaster recovery is not an ordinary CLI/MCP command. Such procedures require separately isolated operational access, maintenance/exclusion semantics, and audit. They do not create another Control identity or bypass Project/domain invariants.

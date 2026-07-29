@@ -3,7 +3,7 @@
 OwlAuth is designed as self-hostable, project-scoped authentication and identity infrastructure. It is a modular monolith: one Rust server artifact, one shared application/domain core, and two isolated transport planes.
 
 ::: warning Design versus implementation
-This page summarizes the approved target architecture. The current pre-alpha server implements only `/health` and OpenAPI generation. It has no Project model, authentication flow, persistence, tokens, plane separation, migration runner, provider adapter, or key lifecycle yet.
+This page summarizes the approved target architecture. The current pre-alpha server implements only `/health` and OpenAPI generation. It has no Project model, authentication flow, persistence, tokens, plane separation, migration runner, provider adapter, hosted authentication UI, Management Console, or key lifecycle yet.
 :::
 
 The normative details live in the repository [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec).
@@ -46,18 +46,25 @@ OAuth/OIDC exists only between OwlAuth and the upstream provider. The downstream
 sequenceDiagram
     actor User
     participant App as Application / SDK
+    participant Hosted as Hosted Authentication UI
     participant Runtime as OwlAuth Runtime
     participant Provider as Upstream OAuth/OIDC provider
     participant PG as PostgreSQL
 
     App->>Runtime: Begin login with Project, Application, exact redirect, PKCE challenge
     Runtime->>PG: Validate Project/Application/provider; create bound transaction
+    Runtime-->>App: Bound hosted interaction URL
+    App-->>User: Navigate to hosted authentication
+    User->>Hosted: Continue transaction-bound provider interaction
+    Hosted->>Runtime: Continue opaque interaction
     Runtime-->>User: Redirect to upstream provider
     User->>Provider: Authenticate
     Provider-->>Runtime: Code + server-bound state
     Runtime->>Provider: Exchange once; validate issuer and subject
     Runtime->>PG: Resolve Project user; create browser session and one-use handoff
-    Runtime-->>App: Exact redirect with opaque handoff ticket
+    Runtime-->>Hosted: Safe completion result
+    Hosted-->>User: Redirect to exact Application URL
+    User->>App: Opaque handoff ticket
     App->>Runtime: Exchange ticket + PKCE verifier
     Runtime->>PG: Atomically consume ticket and create Application session
     Runtime-->>App: Project user + access token + rotating refresh token
@@ -82,12 +89,14 @@ Refresh tokens are opaque and one-use. Rotation is serialized in PostgreSQL. Reu
 
 ```mermaid
 flowchart LR
-    Apps[Applications and end users] --> RL[Runtime listener]
-    Ops[Operator or external gateway] --> CL[Control listener]
+    Apps[Applications and end users] --> Hosted[Hosted Authentication UI]
+    Hosted --> RL[Runtime listener]
+    Ops[Operator or external gateway] --> Console[Management Console or Control client]
+    Console --> CL[Control listener]
 
     subgraph Server[One owlauth-server artifact]
-        RL --> RA[Project Auth adapters]
-        CL --> CA[Control HTTP / future MCP adapters]
+        RL --> RA[Hosted UI / Project Auth adapters]
+        CL --> CA[Management Console / Control HTTP / future MCP adapters]
         RA --> Core[Shared application and domain core]
         CA --> Core
     end
@@ -100,13 +109,15 @@ flowchart LR
 
 ### Runtime / Protocol Plane
 
-Runtime is public and latency-sensitive. The target surface covers public Project/Application configuration, login start, provider callback, handoff exchange, current user, refresh, logout, and Project JWKS. Every operation is Project-qualified.
+Runtime is public and latency-sensitive. The target surface covers the Hosted Authentication UI, public Project/Application configuration, login start, provider callback, handoff exchange, current user, refresh, logout, and Project JWKS. Every operation is Project-qualified.
 
 ### Control Plane
 
-Control administers Projects, Applications, provider registrations, users, sessions, policies, keys, management principals, and audit. It uses a separate listener, credential audience, middleware, scopes, CORS, rate/concurrency budgets, and network exposure. Public Project IDs, Application IDs, publishable keys, Project tokens, and provider credentials are never Control credentials.
+Control serves the embedded Management Console and administers Projects, Applications, provider registrations, users, sessions, policies, keys, and audit. It accepts only the deployment's `OWLAUTH_CONTROL_API_KEY`; a valid Bearer key has full deployment Control authority and is not stored in PostgreSQL. The Console keeps it only in active page memory. Public Project IDs, Application IDs, publishable keys, Project tokens, and provider credentials are never Control credentials.
 
-The two routers remain isolated even in combined mode; routing by `Host` on one untrusted socket is not equivalent to listener separation.
+The two routers remain isolated even in combined mode. Distinct Runtime and Control origins are recommended because they isolate the Console's in-memory operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary; routing by `Host` or path on one untrusted socket is not equivalent to the required internal listener separation.
+
+The accepted hosted-web stack is one private React 19/TypeScript/Vite 8 package in the repository pnpm workspace with two independent builds. Runtime and Control have separate OpenAPI 3.1 generated clients, entry graphs, output roots, manifests, and Rust embeds; they share no emitted chunk. Rust serves only manifest-allowlisted embedded assets and generates external-only strict-CSP shells from configured plane bases. Node.js is a build tool and is absent from the server runtime, published-binary asset path, and final container.
 
 ## Shared core and packages
 
@@ -132,11 +143,11 @@ Dependencies point inward. HTTP frameworks, SQL rows, Redis clients, provider pa
 
 ## Storage and consistency
 
-PostgreSQL is the sole transactional authority for Project ownership, identities, login state, handoff consumption, sessions, refresh rotation, revocation, policy, management access, keys, and audit. Security-critical mutations use Project-qualified predicates, constraints, conditional updates, and transactions.
+PostgreSQL is the sole transactional authority for Project ownership, identities, login state, handoff consumption, sessions, refresh rotation, revocation, policy, keys, and audit. The deployment operator key is process configuration, not database state. Security-critical mutations use Project-qualified predicates, constraints, conditional updates, and transactions.
 
 Redis is non-authoritative. It may coordinate rate limits, cache public configuration/JWKS, and carry invalidation hints. Losing or flushing Redis must not change identity, grant duplicate credential use, undo revocation, activate a key, or cross a Project boundary.
 
-Migration files belong in `crates/owlauth-server/migrations/` and are embedded in the server artifact. A configured migration capability will apply pending migrations before listeners become ready; serving pools need no DDL privilege. This runner is target design and is not implemented today.
+SeaORM 2 is selected for ordinary PostgreSQL repositories. SQLx 0.9 embeds migration files from `crates/owlauth-server/migrations/`, coordinates PostgreSQL startup migration locking, and verifies serving-schema compatibility. `MIGRATION_MODE` defaults to `auto`; `verify` performs no DDL. Serving pools have no DDL privilege, and SeaORM schema sync is disabled. This adapter and runner are target design and are not implemented today.
 
 ## Composition and deployment modes
 

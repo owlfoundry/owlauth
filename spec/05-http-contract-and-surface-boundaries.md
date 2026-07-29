@@ -17,28 +17,46 @@ Runtime and Control operations are never combined merely because one process ser
 ```mermaid
 flowchart TB
     subgraph RuntimeListener[Runtime listener: auth.example.com]
+        HU[Hosted Authentication UI]
         RM[Public admission and Project resolution]
         RR[Project Auth router]
         RC[Public Project config and JWKS]
     end
 
     subgraph ControlListener[Control listener: admin.auth.example.com or private bind]
-        CM[Management authentication and scopes]
+        WC[Embedded Web Console]
+        CM[Deployment operator API-key authentication]
         CR[Control API router]
         CO[Control OpenAPI]
     end
 
+    HU --> RM
     RM --> RR
     RM --> RC
+    WC --> CM
     CM --> CR
     CM --> CO
     RR --> APP[Shared application services]
     CR --> APP
 ```
 
-Listeners have distinct bind addresses, trusted-proxy settings, TLS policy, routers, middleware, authentication, CORS, rate limits, request bounds, connection budgets, metrics dimensions, and readiness. Routing by `Host` on one untrusted socket is not equivalent.
+Listeners have distinct bind addresses, trusted-proxy settings, TLS policy, routers, middleware, authentication, CORS, rate limits, request bounds, connection budgets, metrics dimensions, and readiness. Routing by `Host` on one untrusted socket is not equivalent. Distinct Runtime and Control external origins are recommended to isolate the browser-held operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root base paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary as defined by spec 09. Internal listener isolation remains unchanged.
 
 In `--plane=all`, a request accepted by one listener cannot dispatch to the other plane's router through path, host, forwarding header, content type, or method manipulation.
+
+## Management Console surface
+
+The Control listener serves the embedded administrative Console at the configured Control-base-relative `console/` path. The credential-free shell accepts the operator's deployment API key and then calls the same Control-base-relative `v1/*` contract with a Bearer header. It has no direct application-service, repository, database, or secret-provider path.
+
+Console HTML/assets and client-side routes are server-owned implementation surfaces, not OpenAPI operations. Stable API DTOs remain in `owlauth-types`. Runtime never serves the Console or receives its deployment key.
+
+## Hosted Authentication UI surface
+
+The Runtime listener serves Project/Application-bound hosted authentication interactions and their fingerprinted assets under the configured Runtime base. The UI presents the transaction-bound provider, shows progress or bounded local errors, may reuse a valid Project browser session, and completes an Application return. It resolves all authority from stored login-transaction and public Project/Application state; caller input cannot replace Project, Application, provider assignment, callback, exact redirect, browser binding, or PKCE.
+
+After successful authentication, navigation returns only to the exact registered Application redirect captured by the transaction and carries only the short-lived one-use handoff allowed by spec 03. Hosted UI assets and pages never expose the Control endpoint/key or mount Control routes.
+
+The complete two-surface route partition, distinct/shared external URL models, key/browser storage behavior, CSP, caching, redirect safety, and packaging requirements are owned by [spec 09](09-hosted-web-surfaces-and-control-auth.md).
 
 ## Runtime Project Auth surface
 
@@ -69,7 +87,7 @@ Public configuration may include:
 - safe Runtime URLs and SDK feature flags;
 - allowed authentication methods that contain no secret.
 
-It never includes provider client secrets, provider access tokens, management endpoints/credentials/scopes, `belongs_to`, user counts, internal IDs, KMS references, Redis/PostgreSQL topology, or policy internals.
+It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal IDs, KMS references, Redis/PostgreSQL topology, or policy internals. Runtime authentication middleware does not recognize `OWLAUTH_CONTROL_API_KEY`; presenting that value to any Runtime route never grants access.
 
 ### Runtime parsing and errors
 
@@ -96,42 +114,48 @@ Publishable keys and public IDs can identify rate/quotas but do not authorize us
 
 Control resources are rooted at `/v1/` and Project-owned operations always carry Project identity in the path:
 
-| Resource family | Representative operations | Scope family |
-| --- | --- | --- |
-| `/projects` | create/read/update/disable; read/write `belongs_to` | `projects:*`, `projects.belongs_to:*` |
-| `/projects/{project}/applications` | register/disable app; origins, redirects, publishable keys | `applications:*`, `applications.keys:*` |
-| `/projects/{project}/providers` | configure/disable provider client registrations, assign Applications, rotate secret reference | `providers:*`, `providers.secrets:*` |
-| `/projects/{project}/users` | query/disable/merge users; view/unlink identities | `users:*`, `users.identities:*` |
-| `/projects/{project}/sessions` | list and revoke Project/Application sessions | `sessions:*` |
-| `/projects/{project}/policy` | claims, token lifetime, login/session policy | `policies:*` |
-| `/projects/{project}/signing-keys` | inspect/provision/publish/activate/retire/revoke | `keys:*` |
-| `/audit-events` and Project audit subresource | filtered immutable queries | `audit:read` |
-| `/management-principals` and `/credentials` | provision/revoke Control access | `management:*` |
-| `/system` and Control health | safe deployment metadata | `system:read` or probe policy |
+| Resource family | Representative operations |
+| --- | --- |
+| `/projects` | create/read/update/disable; read/write/filter exact `belongs_to` |
+| `/projects/{project}/applications` | register/disable app; origins, redirects, publishable keys |
+| `/projects/{project}/providers` | configure/disable provider client registrations, assign Applications, rotate secret reference |
+| `/projects/{project}/users` | query/disable/merge users; view/unlink identities |
+| `/projects/{project}/sessions` | list and revoke Project/Application sessions |
+| `/projects/{project}/policy` | claims, token lifetime, login/session policy |
+| `/projects/{project}/signing-keys` | inspect/provision/publish/activate/retire/revoke |
+| `/audit-events` and Project audit subresource | filtered immutable queries |
+| `/system` | validate the operator key and return bounded Console/client capabilities |
+| Control health | safe probe response under the configured probe policy |
 
-Route authorization is deny-by-default and command-specific. A generic PATCH cannot bypass lifecycle transitions. Mutations include target revision and use Control idempotency where retry could duplicate a resource or external side effect. Every external-gateway mutation also supplies the observed Project `metadata_revision`, compared in the same PostgreSQL transaction as the child command.
+Every business route requires the valid deployment operator API key, which grants the whole Control surface. There are no principal, permission, credential-management, or session-escalation routes. Command/domain validation remains deny-by-default: a generic PATCH cannot bypass lifecycle transitions. Mutations include target revision and use deployment-operator-scoped Control idempotency where retry could duplicate a resource or external side effect. Every external-gateway mutation also supplies the observed Project `metadata_revision`, compared in the same PostgreSQL transaction as the child command.
 
 ### Control authentication
 
-Accepted credential classes are explicit deployment policy, such as mTLS identities, short-lived operator sessions for the Control audience, or scoped service credentials. Every credential maps to a current `ManagementPrincipal` and scopes in PostgreSQL.
+Control accepts exactly one HTTP authentication form:
+
+```http
+Authorization: Bearer <operator-api-key>
+```
+
+The expected canonical ASCII value is loaded from the required `OWLAUTH_CONTROL_API_KEY` environment variable whenever the `control` or `all` plane is composed. Its `owl_ctrl_v1_` grammar and 256-bit random payload are owned by spec 06. After strict Bearer and structural parsing, the server compares the complete presented key with the configured bytes using a constant-time comparison. Missing, malformed, duplicate, or mismatched authorization fails before route handling. The key remains in protected process configuration only and is never written to PostgreSQL or Redis.
+
+A valid key represents the deployment operator and grants the entire deployment's Control authority. OwlAuth has no server-side operator principals, permissions, credential endpoints, browser Control sessions, or secondary authentication transitions. Network placement and optional transport TLS/mTLS hardening do not create alternate application credentials.
 
 The following are never Control credentials:
 
 - Project/Application public IDs or publishable keys;
 - Project access/refresh tokens;
 - upstream provider client IDs/secrets/tokens;
-- network location, forwarding headers, or knowledge of internal IDs alone.
+- network location, client-certificate identity, forwarding headers, or knowledge of internal IDs alone.
 
-Browser-based Control sessions use CSRF and step-up/fresh-authentication policy for high-impact commands. Service credentials appear only in authenticated transport/headers, never URLs.
+The operator API key appears only in the Authorization header, never URLs, bodies, query parameters, or output. Runtime categorically rejects it as an authentication credential. The built-in Console keeps it only in active page memory and sends it to same-origin Control routes as specified by spec 09; no credential cookie or server-side Console session is created.
 
 ### `belongs_to` contract
 
 `belongs_to` is nullable, bounded opaque text on Project only.
 
-- Project creation/update can set it only with `projects.belongs_to:write`.
-- Reading it or explicitly filtering by exact value requires `projects.belongs_to:read`.
-- Without that read scope, Project representations omit the field rather than returning null/redacted hints.
-- Ordinary Project list/search has no implicit ownership filter and does not include the field.
+- The deployment operator can set it during Project creation/update and read or filter by exact value.
+- Ordinary Project list/search has no implicit ownership filter.
 - An explicit `belongs_to` filter uses the PostgreSQL index and exact comparison; partial/regex search is not supported.
 - Multiple Projects may share one value; the field is not unique.
 - Child resources never duplicate the field and inherit only structural Project ownership through `project_id`.
@@ -141,9 +165,9 @@ This contract supports external indexing but does not promise tenant isolation. 
 
 ### Control errors
 
-Control uses stable problem details containing safe code/type, status, correlation ID, optional bounded field violations, and authorized revision/conflict metadata. Authentication, authorization, and hidden-resource failures avoid Project/principal enumeration.
+Control uses stable problem details containing safe code/type, status, correlation ID, optional bounded field violations, and revision/conflict metadata. Authentication and hidden-resource failures avoid Project enumeration.
 
-PostgreSQL, Redis, KMS, secret-store, and provider errors map to dependency classes without vendor detail. A scope denial does not disclose the protected resource or its `belongs_to` value.
+PostgreSQL, Redis, KMS, secret-store, and provider errors map to dependency classes without vendor detail. An authentication denial does not disclose the protected resource or its `belongs_to` value.
 
 ## Contract mapping
 
@@ -151,14 +175,14 @@ PostgreSQL, Redis, KMS, secret-store, and provider errors map to dependency clas
 flowchart LR
     Wire[Surface-specific DTO] --> Parse[Bounded parse and structural validation]
     Parse --> Context[Resolve actor and Project/Application context]
-    Context --> Map[Explicit command mapping]
+    Context --> Map[Explicit command mapping and domain admission]
     Map --> App[Application service]
     App --> Result[Domain result/error]
     Result --> Shape[Surface-specific response mapping]
     Shape --> WireOut[HTTP response]
 ```
 
-DTO validation handles wire shape. Domain validation enforces current Project ownership and state. Every operation defines owning plane, authentication, scope, Project resolution, input bounds, idempotency/concurrency, side effects, sensitive fields, errors, and caching.
+DTO validation handles wire shape. Domain validation enforces current Project ownership and state. Every operation defines owning plane, authentication, Project resolution, input bounds, idempotency/concurrency, side effects, sensitive fields, errors, and caching.
 
 ## SDK, CLI, and MCP separation
 

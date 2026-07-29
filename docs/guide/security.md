@@ -22,9 +22,9 @@ Every Runtime request is hostile until bounded, parsed, and resolved to an activ
 
 ### Control boundary
 
-Control has a distinct listener and credential audience. Each command authenticates a current management principal, checks a concrete scope, resolves the explicit Project, and revalidates current target revisions. Control adapters cannot mutate tables directly.
+Control has a distinct listener and accepts only the single API key loaded from `OWLAUTH_CONTROL_API_KEY`. A valid Bearer key represents the deployment operator and has full Control authority; every command still resolves the explicit Project and revalidates current target revisions. The key is process configuration, not PostgreSQL state, and Control adapters cannot mutate tables directly.
 
-Public IDs, Project access/refresh tokens, upstream provider credentials, network location, and forwarding headers are not management credentials.
+Public IDs, Project access/refresh tokens, upstream provider credentials, network location, client-certificate identity, and forwarding headers are not Control credentials. Runtime never accepts the operator key.
 
 ### Provider and redirect boundary
 
@@ -34,7 +34,7 @@ External Runtime and callback origins derive from trusted configuration, never a
 
 ## Login and handoff invariants
 
-The target flow binds Project, Application, provider registration, exact callback, exact Application redirect, browser interaction, policy revisions, and PKCE challenge in a short-lived PostgreSQL transaction.
+The target flow binds Project, Application, provider registration, exact callback, exact Application redirect, Hosted Authentication UI interaction, policy revisions, and PKCE challenge in a short-lived PostgreSQL transaction.
 
 - Application handoff requires PKCE `S256`; omitted or `plain` challenges fail.
 - Upstream provider state is high entropy, one-use, and bound to the exact Project/provider transaction.
@@ -69,11 +69,11 @@ Never use unverified claims to select a permissive issuer, audience, algorithm, 
 
 ## Durable authority and cache safety
 
-PostgreSQL is authoritative for identity, one-use state, sessions, revocation, management authorization, keys, and audit. Security mutations and required audit records commit in one transaction.
+PostgreSQL is authoritative for identity, one-use state, sessions, revocation, Project keys, and audit. The operator API key remains only in Control process configuration. Security mutations and required audit records commit in one transaction.
 
 Redis may coordinate limits and cache public derived data. A cache hit cannot turn an authoritative denial into an allow. Redis never proves identity, consumes a ticket, rotates refresh, revokes a credential, activates a key, or establishes Project ownership.
 
-Migrations are designed to be embedded, checksum verified, coordinated in PostgreSQL, and applied before readiness through a capability absent from normal serving pools. Migration or schema incompatibility leaves business listeners unready.
+SQLx 0.9 embeds ordered migrations, uses its PostgreSQL history/checksum validation and startup locking, and applies them before readiness in default `auto` mode through a capability absent from normal serving pools. DDL-free `verify` mode checks exact compatibility. OwlAuth adds no second checksum subsystem, and SeaORM schema sync is disabled. Migration or schema incompatibility leaves business listeners unready.
 
 ## Keys and secrets
 
@@ -85,23 +85,26 @@ Secrets enter through protected environment/file descriptors, files, or secret m
 
 ## Browser and request safety
 
+Runtime serves the Hosted Authentication UI; Control serves the Management Console. They may use distinct origins or trusted disjoint non-root base paths on one origin while retaining separate internal listeners and credentials. In the shared-origin form, Runtime cookies are path-contained so browsers do not send them to Control. Shared origin deliberately shares one browser/XSS trust boundary; distinct origins provide stronger isolation.
+
 - Cookies use `Secure`, `HttpOnly`, host-only/narrow scope where possible, and reviewed `SameSite` behavior.
 - Browser state changes use CSRF protection tied to the interaction/session.
-- Pages use restrictive CSP, framing, referrer, and cache policy.
-- Handoff tickets are removed from browser history before third-party resources load.
+- Both surfaces use restrictive CSP, framing, referrer, and cache policy, no third-party executable assets, and no service workers. Their React/Vite output is built and embedded separately per plane; Rust emits only external same-origin scripts/styles from validated manifests, and neither a generic SPA fallback nor one plane's asset tree can serve the other.
+- Hosted authentication returns only to the exact stored Application redirect with a short-lived one-use PKCE-bound handoff; interaction handles and tickets are removed from browser history and redacted from referrers/logs before third-party navigation.
+- The Management Console keeps the operator key only in active page memory, sends it only as a Bearer header under the configured Control base URL, and clears it on reload, close, lock, or authentication failure.
 - CORS is deny-by-default and exact Application-origin based; redirect navigation is not CORS authorization.
 - Bodies, headers, URIs, parameter counts, arrays, strings, decompression, concurrency, and deadlines are bounded.
 - Duplicate singleton parameters, ambiguous encoding, unsupported media, and conflicting credentials fail consistently.
 
 ## Observability and data disclosure
 
-Logs, traces, metrics, errors, audit events, generated examples, and agent context must never contain provider codes/tokens, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, management credentials, private keys, full callback URLs, or complete profiles.
+Logs, traces, metrics, errors, audit events, generated examples, and agent context must never contain provider codes/tokens, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, the operator API key, private keys, full callback URLs, or complete profiles.
 
 Redaction happens before serialization/export. Metrics use bounded-cardinality labels; `belongs_to`, provider subjects, arbitrary URLs, and user profiles are not labels. External errors carry stable safe codes and correlation IDs without revealing cross-Project existence or vendor internals.
 
 ## Operational posture
 
-Runtime and Control use TLS directly or through declared trusted proxies, separate listeners, budgets, PostgreSQL pools/quotas, readiness, and rate policy. Control should bind privately; network placement supplements rather than replaces authentication.
+Runtime and Control use TLS directly or through declared trusted proxies, separate internal listeners, routers, budgets, PostgreSQL pools/quotas, readiness, and rate policy. Control should bind privately; network placement supplements rather than replaces authentication.
 
 No business listener becomes ready before typed configuration, PostgreSQL/schema compatibility, and plane-critical key/data-protection capabilities are valid. Redis failure follows endpoint-specific bounded fallback or fail-closed behavior and never weakens an invariant.
 

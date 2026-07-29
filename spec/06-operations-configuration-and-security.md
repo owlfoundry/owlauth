@@ -16,12 +16,13 @@ Mode changes adapter composition, exposure, dependency readiness, and database r
 
 ```mermaid
 flowchart TD
-    Config[Parse and validate typed configuration] --> Telemetry[Initialize redacted telemetry]
-    Telemetry --> Secrets[Resolve secret, signer, and data-protection handles]
-    Secrets --> PG[Connect PostgreSQL serving role]
-    PG --> Schema[Apply or verify embedded schema using isolated migration capability]
-    Schema --> Redis[Connect Redis and select safe degradation policy]
-    Redis --> Core[Compose shared core and selected adapters]
+    Config[Parse and validate typed configuration] --> OperatorKey[Load required Control operator key when Control is selected]
+    OperatorKey --> Telemetry[Initialize redacted telemetry]
+    Telemetry --> Secrets[Resolve provider, signer, and data-protection handles]
+    Secrets --> Schema[Run auto migration or prepare DDL-free verification]
+    Schema --> PG[Create plane serving pools and verify every target]
+    PG --> Redis[Connect Redis and select safe degradation policy]
+    Redis --> Core[Compose shared core, selected adapters, and plane-specific web surfaces]
     Core --> Bind[Bind selected listeners]
     Bind --> Ready[Evaluate readiness per listener]
 
@@ -39,7 +40,7 @@ Configuration has one precedence model, rejects unknown fields, and separates gl
 
 ### Global fields
 
-- immutable deployment external Runtime/Control origins;
+- immutable deployment external Runtime and Control base URLs; when they share an origin, both use disjoint non-root prefixes so Runtime cookies can remain outside the Control path;
 - Project issuer derivation rule;
 - environment/instance namespace;
 - selected plane mode;
@@ -53,21 +54,24 @@ Project/provider/Application policy is authoritative PostgreSQL state, not repli
 - bind address, external origin, TLS/trusted-proxy mode;
 - limits, deadlines, concurrency, Project/Application rate policy;
 - cookie security and Project namespace behavior;
-- public configuration and JWKS cache bounds;
+- public configuration, hosted authentication UI, and JWKS cache bounds;
 - exact CORS enforcement mode.
 
 ### Control listener fields
 
-- distinct bind address/origin;
-- TLS and optional mTLS roots;
-- accepted management credential classes and Control audience;
-- stricter session, step-up, request, and rate policy;
-- deny-by-default CORS and private-network assumptions.
+- distinct internal bind address and configured external Control base URL;
+- TLS and optional mTLS transport roots as hardening, not alternate Control identity;
+- the single operator API key from `OWLAUTH_CONTROL_API_KEY`;
+- strict request, connection, and authentication rate policy;
+- deny-by-default CORS, private-network assumptions, and Management Console security-header policy.
+
+`OWLAUTH_CONTROL_API_KEY` is required when mode is `control` or `all`; startup fails before binding Control if it is absent or does not match the canonical format below. Mode `runtime` does not require or load it. No configuration field defines additional keys, operator identities, permissions, or Control sessions. Any built-in Control UI invokes the same Control API using the same Bearer key and creates no server-side login/session model.
 
 ### Infrastructure fields
 
-- PostgreSQL serving DSN/secret reference, pool bounds, role, and timeouts;
-- optional separate PostgreSQL migration credential reference used only during schema preparation;
+- one PostgreSQL serving server/database target, with optional plane-specific login credential references, independent pool bounds, DDL-free roles, and timeouts for that same authority;
+- `MIGRATION_MODE`, defaulting to `auto` and accepting only `auto` or `verify`, with semantics owned by spec 04;
+- optional separate PostgreSQL migration login credential and non-login owner role used only by `auto` against the one configured serving server/database target; migration configuration cannot override that target;
 - Redis endpoint/TLS/credential reference, namespace, bounds, and deadlines;
 - signer provider, Project key namespace, allowed algorithms, and opaque references;
 - data-protection provider and retained key versions;
@@ -75,11 +79,31 @@ Project/provider/Application policy is authoritative PostgreSQL state, not repli
 
 Issuer, callback, and redirect decisions never derive from arbitrary `Host`, `Forwarded`, or `X-Forwarded-*`. Proxy headers are honored only from configured trusted proxies.
 
-Secrets enter through protected environment/file descriptors, files, or secret managers. They are not ordinary command-line values, serialized config output, public config, health, panic text, telemetry, or OpenAPI examples.
+Provider and cryptographic secrets enter through protected environment/file descriptors, files, or secret managers. The Control operator key specifically enters through `OWLAUTH_CONTROL_API_KEY`, typically populated by the deployment's environment-secret mechanism. Secrets are not ordinary command-line values, serialized config output, public config, health, panic text, telemetry, or OpenAPI examples.
+
+## Operator API-key lifecycle
+
+The canonical operator key is ASCII text in this exact form:
+
+```text
+owl_ctrl_v1_<secret>
+```
+
+`<secret>` is the 43-character unpadded base64url encoding of exactly 32 cryptographically random bytes. The complete key is therefore 55 ASCII characters and permits only the literal prefix plus `[A-Za-z0-9_-]` in the secret. Whitespace, control characters, padding, alternate encodings, trimming, Unicode normalization, and values outside this exact length/grammar are rejected. The environment value and Bearer token are compared as the same canonical ASCII bytes; shared server/CLI/Console test vectors define parity.
+
+The operator key is held only in immutable process configuration for the lifetime of each Control process. It is never persisted to PostgreSQL or Redis, returned by an endpoint, exposed in OpenAPI examples, or copied into audit/telemetry context. Control accepts only strict `Authorization: Bearer <operator-api-key>` authentication and uses constant-time comparison of the complete canonical value after bounded structural parsing. Runtime uses separate authentication middleware and never compares or accepts this key.
+
+Rotation is an operational rollout, not an OwlAuth API operation:
+
+1. generate and distribute a replacement through the deployment environment-secret mechanism as `OWLAUTH_CONTROL_API_KEY`;
+2. restart or roll out every process that composes Control so it loads the replacement;
+3. retire the previous environment secret according to deployment policy.
+
+There is one configured value per process and no server-managed overlap set or credential endpoint. Control may be briefly unavailable during a coordinated rotation. In split-process topology, Runtime remains available because it neither loads nor depends on the operator key. In a redundant `all` deployment, a healthy rolling replacement MAY preserve Runtime capacity. Restarting a single-instance `all` process interrupts both listeners even though Runtime credential semantics do not change; uninterrupted Runtime during Control-key rotation is not promised for that topology.
 
 ## Network and resource posture
 
-Runtime and Control require TLS directly or through a declared trusted proxy. Control SHOULD bind privately; network isolation supplements application authentication.
+Runtime and Control require TLS directly or through a declared trusted proxy. Control SHOULD bind privately; network isolation supplements application authentication. Runtime serves the Hosted Authentication UI; Control serves the Management Console. Distinct external origins are recommended. An explicitly configured shared origin uses disjoint non-root paths, contains Runtime cookies to the Runtime base, registers no service workers, applies restrictive opener policy, and deliberately shares one browser/XSS boundary; internal listeners, routers, credentials, fallbacks, and resource budgets remain separate as defined by spec 09.
 
 Each listener applies connection/header/body/URI bounds, trusted client-address derivation, correlation, plane rate/concurrency controls, authentication where applicable, and safe response headers before expensive work.
 
@@ -198,7 +222,7 @@ Compromise revocation differs from normal retirement:
 
 Liveness answers whether the process event loop responds and does not query every dependency.
 
-Runtime readiness requires compatible PostgreSQL state, resolvable Project key/data-protection capabilities for served Projects, and a safe response to Redis availability. Project-specific provider/KMS failures can close only affected capabilities/Projects without exposing detail globally. Control readiness requires PostgreSQL and management-authentication verification; key/provider mutations can return scoped dependency failure.
+Runtime readiness requires compatible PostgreSQL state, resolvable Project key/data-protection capabilities for served Projects, and a safe response to Redis availability. Project-specific provider/KMS failures can close only affected capabilities/Projects without exposing detail globally. Control readiness requires PostgreSQL and a valid loaded `OWLAUTH_CONTROL_API_KEY`; key/provider mutations can return operation-specific dependency failure.
 
 In `all`, listeners have independent readiness. Control loss does not force Runtime unready when Runtime authority remains usable. Health exposes no versions, Project names/counts, `belongs_to`, DSNs, Redis keys, provider names, key/secret references, migration SQL, or user/Application existence.
 
@@ -206,9 +230,9 @@ In `all`, listeners have independent readiness. Control loss does not force Runt
 
 Structured telemetry contains time, level, stable event name, plane, operation, outcome class, correlation, and bounded latency. Project/Application IDs appear only in controlled fields where operationally required; `belongs_to`, user/provider subjects, URLs, and arbitrary errors are not metric labels.
 
-Redaction occurs before serialization/export. Authorization headers, cookies, protocol query values, bodies, provider codes/tokens, tickets, access/refresh tokens, PKCE, user profiles, provider secrets, management credentials, and private keys are denied fields.
+Redaction occurs before serialization/export. Authorization headers, cookies, protocol query values, bodies, provider codes/tokens, tickets, access/refresh tokens, PKCE, user profiles, provider secrets, the operator API key, and private keys are denied fields.
 
-Security audit events append through the shared core and follow spec 04 transaction rules. Control audit queries are scope/Project constrained and cannot recover data that was never recorded.
+Security audit events append through the shared core and follow spec 04 transaction rules. Control audit queries are Project/filter constrained and cannot recover data that was never recorded.
 
 ## Retry and backpressure
 

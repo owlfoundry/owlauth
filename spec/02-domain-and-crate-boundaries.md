@@ -28,12 +28,12 @@ This is the single server package. It owns:
 
 - the `owlauth-server` executable and `all`, `runtime`, and `control` composition roots;
 - internal Project/Application/identity/login/session/token/key domain modules;
-- application services and Project-bound authorization policy;
+- application services, Project-bound invariants, and deployment-operator Control admission policy;
 - persistence, cache, upstream-provider, signer, data-protection, clock, entropy, and audit ports;
 - PostgreSQL and Redis adapters and embedded migrations;
-- Runtime HTTP, Control HTTP, MCP, telemetry, health, and process-lifecycle adapters.
+- Runtime HTTP and Hosted Authentication UI, Control HTTP and Management Console, MCP, telemetry, health, and process-lifecycle adapters.
 
-Server-only concepts remain internal modules. Logical plane separation does not create separate Cargo packages or duplicated service layers.
+PostgreSQL implementation technology and migration behavior are owned by spec 04; hosted web surfaces, route/base separation, and browser credential behavior are owned by spec 09. Server-only concepts remain internal modules. Logical plane separation does not create separate Cargo packages or duplicated service layers.
 
 ### `crates/owlauth-types`
 
@@ -86,8 +86,8 @@ Forbidden dependencies apply transitively:
 | `TokenApplicationService` | issue Project access token, rotate refresh family, revoke family | Runtime |
 | `ProjectPolicyService` | manage token claims, lifetimes, provider/app admission, and session policy | Control writes; Runtime evaluates |
 | `KeyLifecycleService` | provision, publish, activate, retire, and revoke Project signing keys | Control commands; Runtime signs and publishes Project JWKS |
-| `ManagementAccessService` | authenticate management principal and authorize Control scope | Control adapters |
-| `AuditApplicationService` | append Project/deployment security events and query authorized views | both append; Control queries |
+| `DeploymentOperatorAccessService` | authenticate the process-configured operator API key for the Control listener | Control adapters |
+| `AuditApplicationService` | append Project/deployment security events and query Control views | both append; Control queries as the deployment operator |
 
 Every Project-bound service method receives a validated `ProjectId` established by the adapter and revalidated against authoritative state. A payload field cannot override the route/actor Project context.
 
@@ -103,8 +103,7 @@ Every Project-bound service method receives a validated `ProjectId` established 
 | Project browser session | Project/user/browser binding, rotation, expiry, and termination; reusable across Applications in one Project |
 | Application session and refresh family | Project/Application/user binding, one current generation, strict replay-family revocation |
 | Project signing-key ring | Project issuer/purpose, unique `kid`, publish-before-sign lifecycle, verification overlap |
-| Management principal | deployment-wide credential class and management scopes; no implicit Project tenancy |
-| Audit event | immutable actor/action/Project/target/outcome/correlation semantics without recoverable secrets |
+| Audit event | immutable actor/action/Project/target/outcome/correlation semantics without recoverable secrets; Control actor is always the deployment operator |
 
 Aggregate boundaries define transaction scope where one aggregate can enforce the rule alone. Cross-aggregate commands use an application-owned unit of work and PostgreSQL constraints; adapters cannot approximate them with unrelated writes.
 
@@ -112,7 +111,7 @@ Aggregate boundaries define transaction scope where one aggregate can enforce th
 
 Every Project-owned table has `project_id` directly or reaches it through a constraint that PostgreSQL can verify. Security-critical queries include Project qualification even when object IDs are globally unique. Composite foreign keys or equivalent constraints prevent a child row from referencing a parent in another Project.
 
-A Runtime request resolves Project and Application before provider, user, session, ticket, or token lookup. A Control request authorizes its management scope and then invokes a Project-bound command. `belongs_to` does not replace either step.
+A Runtime request resolves Project and Application before provider, user, session, ticket, or token lookup. A Control request first authenticates the deployment operator API key and then invokes a Project-bound command. A valid key grants all Control commands; `belongs_to` does not replace Project qualification and is never an authorization check.
 
 Project disablement cannot transfer child resources to another Project. A disabled Project rejects new login, handoff, refresh, current-user, and signing operations while preserving identifiers and durable state for audit and controlled recovery. The Control model exposes no hard-delete transition for Projects, Applications, providers, or users.
 
@@ -143,8 +142,8 @@ sequenceDiagram
     participant Infra as PostgreSQL / signer / provider
 
     Caller->>Adapter: untrusted request
-    Adapter->>Adapter: bounds + transport authentication + Project/Application resolution
-    Adapter->>App: typed command + verified actor/Project context
+    Adapter->>Adapter: bounds + plane authentication + Project/Application resolution
+    Adapter->>App: typed command + verified plane actor/Project context
     App->>Domain: validate policy and state transition
     App->>Tx: execute Project-qualified state change
     Tx->>Infra: constrained operations
@@ -161,6 +160,6 @@ sequenceDiagram
 - Provider errors distinguish unavailable, rejected callback, invalid claims, and configuration failure without returning provider tokens.
 - Cache failures are explicitly degradable or fail-closed according to spec 08.
 - Runtime maps errors to the Project Auth API contract and avoids Project/user enumeration.
-- Control maps errors to authenticated administrative problem details.
+- Control maps errors to deployment-operator administrative problem details.
 - CLI, SDK, and MCP map only public errors.
 - Unknown failures produce a generic external response and a correlated redacted internal event.

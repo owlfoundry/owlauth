@@ -20,7 +20,7 @@ OAuth/OIDC is used only between OwlAuth and a Project's configured upstream prov
 | Project access token | short-lived signed JWT | authenticate Project user to that Project's backend | Project issuer/audience; Application and session context |
 | Refresh token | high-entropy opaque value | rotate one Application session family | digest in PostgreSQL; Project/Application/user bound |
 | Provider secret | secret-store reference | authenticate OwlAuth to GitHub/Google/upstream provider | Project provider adapter only; never browser-visible |
-| Management credential | scoped Control credential | administer OwlAuth resources | distinct listener/audience and never accepted by Runtime |
+| Deployment operator API key | single secret loaded from `OWLAUTH_CONTROL_API_KEY` | administer the entire deployment through Control | Control-listener only and categorically never accepted by Runtime |
 
 A Project access token is an OwlAuth application-session credential, not an OAuth access token. Its use as an HTTP Bearer token does not make Runtime an OAuth authorization server.
 
@@ -47,7 +47,7 @@ A Project access token contains at least:
 | `auth_time` | time of the underlying Project authentication |
 | `claims_rev` | Project/user claims-policy revision |
 
-Project-defined custom claims are bounded, namespaced, and generated from current Project policy. Provider payloads, provider tokens, email verification internals, `belongs_to`, management scopes, and secret references never enter the token.
+Project-defined custom claims are bounded, namespaced, and generated from current Project policy. Provider payloads, provider tokens, email verification internals, `belongs_to`, the operator API key, and secret references never enter the token.
 
 The Application backend verifies signature, allowlisted algorithm, `kid`, exact Project issuer, exact Project audience, token type, and time claims. The Project is also the token trust boundary: Applications in one Project share backend token trust by default, while `app_id` records the initiating Application for policy/audit and may be allowlisted by a backend for additional restriction. Applications requiring mutually isolated token audiences use separate Projects. A token from Project A is invalid for Project B even if signing infrastructure is shared physically.
 
@@ -62,6 +62,7 @@ Two redirect classes remain separate:
 sequenceDiagram
     actor User as End user
     participant App as Application / SDK
+    participant Hosted as Runtime Hosted Authentication UI
     participant Runtime
     participant Core as Shared core
     participant PG as PostgreSQL
@@ -72,6 +73,12 @@ sequenceDiagram
     Runtime->>Core: BeginLogin(command)
     Core->>PG: Validate active Project/Application/provider and exact redirect; create transaction
     PG-->>Core: login transaction
+    Core-->>Runtime: bounded hosted interaction URL
+    Runtime-->>App: hosted authentication URL
+    App-->>User: Navigate to hosted authentication
+    User->>Hosted: Open bound interaction
+    Hosted->>Runtime: Continue with transaction-bound provider
+    Runtime->>Core: Revalidate interaction and build provider authorization
     Core-->>Runtime: provider authorization request + upstream state
     Runtime-->>User: Set Project interaction cookie; redirect to provider
     User->>Provider: Authenticate
@@ -84,7 +91,8 @@ sequenceDiagram
     Core->>PG: Revalidate assignment; resolve/create Project user; create browser session and handoff ticket
     PG-->>Core: committed login result
     Core-->>Runtime: exact Application redirect + opaque handoff ticket + app_state
-    Runtime-->>User: Redirect to Application
+    Runtime-->>Hosted: Safe completion result
+    Hosted-->>User: Redirect to exact Application URL
     User->>App: handoff ticket + app_state
 ```
 
@@ -98,6 +106,14 @@ sequenceDiagram
 - The transaction binds Project, Application, provider, exact provider callback, exact application redirect, PKCE challenge, browser interaction, and trusted external origin.
 - A valid Project browser session may satisfy local authentication for another active Application in the same Project without another provider redirect, subject to Project policy. It never authenticates another Project.
 - Public identifiers and publishable keys may drive rate/quota policy but cannot bypass these checks.
+
+### Hosted-interaction invariants
+
+- The Hosted Authentication UI is a Runtime adapter governed by spec 09. It loads an opaque transaction handle and derives Project/Application/provider/redirect state from PostgreSQL; page fields and query parameters cannot replace that state.
+- The displayed/continued provider is the active configuration already bound to the transaction, is assigned to the Application, and is revalidated before redirect. A future provider-picker contract would require an explicit transaction-state revision rather than accepting an arbitrary page value.
+- Project branding and Application display values are bounded public configuration and rendered as untrusted content. Hosted pages load no caller-controlled executable resources or navigation targets.
+- A completion page redirects only to the exact Application URL stored at login start and includes only the permitted handoff and bounded application state. A local error/restart page cannot redirect from provider or caller error input.
+- Runtime and Control hosted web surfaces may share an external origin only under the explicit non-overlapping base-path model in spec 09; the operator key is never available to the hosted interaction.
 
 ### Provider-callback invariants
 
@@ -217,4 +233,4 @@ Request bodies, headers, parameter counts, and string lengths have endpoint-spec
 
 Random values come from the operating-system CSPRNG. Raw tickets, refresh tokens, cookies, and provider credentials cross the smallest possible interface and are stored only as digests or encrypted provider-specific material where recovery is necessary.
 
-Logs, traces, metrics, errors, audit events, OpenAPI examples, and agent context never contain provider tokens, provider codes, handoff tickets, Project access tokens, refresh tokens, PKCE verifiers, cookies, provider secrets, management credentials, private keys, full callback URLs, or complete user profiles. Audit events record Project, Application, stable user/target references where authorized, action, outcome, reason class, and correlation without recoverable credentials.
+Logs, traces, metrics, errors, audit events, OpenAPI examples, and agent context never contain provider tokens, provider codes, handoff tickets, Project access tokens, refresh tokens, PKCE verifiers, cookies, provider secrets, the deployment operator API key, private keys, full callback URLs, or complete user profiles. Audit events record Project, Application, stable user/target references where authorized, action, outcome, reason class, and correlation without recoverable credentials.

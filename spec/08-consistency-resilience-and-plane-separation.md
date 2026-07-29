@@ -26,7 +26,7 @@ Runtime consults PostgreSQL for mutable Project/Application/user/session/key fac
 | Runtime authorization state | Application/provider/user/session/policy status | current Project-scoped revision checked before effect/credential commit |
 | Cryptographic state | Project active key, JWKS publication, key revocation | PostgreSQL key ring/publication leases plus signer capability; Redis never activates |
 | External metadata | Project `belongs_to` | PostgreSQL indexed metadata and revision; no Runtime/tenant authority |
-| Durable audit | Project/deployment security events | same transaction as mutation where atomic attribution is required |
+| Durable audit | Project/deployment security events | same transaction as mutation where atomic attribution is required; Control actor is fixed as `deployment_operator` |
 | Public derived data | Project/Application config and JWKS | generated from authoritative revision; cacheable with hard TTL |
 | Admission coordination | Project/Application/IP rate counters | Redis coordinated; loss follows safe endpoint fallback/fail-closed policy |
 
@@ -50,7 +50,7 @@ After Control commit:
 - provider unassignment advances the Application-provider assignment revision and invalidates matching in-flight callback/handoff completion;
 - terminated Project browser session blocks refresh for every derived Application session through authoritative browser-session validation;
 - disabled user rejects all credentials for that user within the Project only;
-- revoked management credential cannot authorize a new Control command;
+- a Control process admits commands only with the operator key it loaded from `OWLAUTH_CONTROL_API_KEY`; key replacement becomes effective only as Control processes restart/roll out;
 - Project key transitions affect signing/JWKS according to spec 06.
 
 Already issued self-contained Project access tokens remain subject to signed expiry and backend verifier behavior. New refresh/current-user/session operations observe authoritative changes. Stronger immediate backend invalidation requires an explicitly designed online check.
@@ -61,10 +61,10 @@ Already issued self-contained Project access tokens remain subject to signed exp
 | --- | --- | --- | --- |
 | PostgreSQL unavailable/incompatible | business routes unready/fail closed | business routes unready/fail closed | no alternate authority or acknowledged mutation |
 | Redis unavailable | ignore caches; generate public data from authority; use strict bounded local rate fallback or fail closed | direct PostgreSQL commands; omit optional cache/invalidation; strict auth-rate fallback or fail closed | no Project/auth invariant weakens |
-| Signer unavailable | affected Project handoff/refresh issuance fails closed; public JWKS may remain | unrelated administration remains; key operation reports scoped dependency failure | no unsigned/wrong-key token |
+| Signer unavailable | affected Project handoff/refresh issuance fails closed; public JWKS may remain | unrelated administration remains; key operation reports operation-specific dependency failure | no unsigned/wrong-key token |
 | DataProtector key unavailable | affected login transactions cannot resume and are cancelled/fail closed | unrelated operations remain | no state guessed or returned incorrectly |
 | Secret store/provider unavailable | affected Project/provider login returns bounded unavailable result | configuration metadata remains manageable; secret operation reports dependency failure | no other Project identity rewritten |
-| Control unavailable | Runtime continues from PostgreSQL and key/secret authority | unavailable | no Runtime-to-Control RPC dependency |
+| Control unavailable or restarting for operator-key rotation | continues in split-process topology; redundant `all` rollout may preserve capacity; single-instance `all` restart interrupts Runtime too | unavailable | no Runtime-to-Control dependency or credential crossover; process topology still determines restart availability |
 | Runtime unavailable | unavailable | Control remains subject to dependencies | administration has no Runtime RPC dependency |
 | Invalidation lost | stale cache ignored at authoritative decision | committed mutation remains | derived staleness only, no stale allow |
 | Crash during transaction | no committed success unless commit completed | same | PostgreSQL atomicity defines outcome |
@@ -76,9 +76,10 @@ A fallback is safe only if bounded and unable to convert cross-Project data, den
 ## Retry and idempotency
 
 - Read-only operations may retry classified transient failures within deadline.
-- PostgreSQL serialization/deadlock retries rerun the complete command with the same verified actor/Project context.
+- PostgreSQL serialization/deadlock retries rerun the complete command with the same verified plane actor/Project context.
 - Handoff and refresh submissions retain one-use semantics and are not made replay-safe by HTTP retries.
-- Control creation/eligible mutation uses principal-scoped PostgreSQL idempotency with normalized request digest.
+- Control creation/eligible mutation uses deployment-operator-scoped PostgreSQL idempotency with a normalized request digest; the idempotency namespace is deployment-wide.
+- Durable-resource creation keys retain a replay result or tombstone for at least the resource lifetime and never expire into permission to execute the same key again. Other retention exceeds every supported retry/reconciliation window; an unknown create is reconciled or escalated, not automatically replayed after expiry.
 - Reusing an idempotency key for another digest is conflict.
 - Provider code exchange and signing are not blindly retried after ambiguous effects; provisioning uses durable reconciliation from spec 06.
 
@@ -138,7 +139,7 @@ flowchart LR
 
 Split mode uses the same binary, schema, application/domain modules, and ports. There is no Runtime-to-Control RPC, duplicate domain policy, or separate authoritative database. Runtime observes Control changes through PostgreSQL; Redis only reduces derived-cache latency.
 
-Planes may use different serving database roles. Schema preparation uses the separately authorized migration capability in spec 04 rather than DDL privileges in serving pools.
+Planes may use different serving login credentials, database roles, and pools only against the same configured PostgreSQL server/database authority. Matching schema histories on independent targets are insufficient and such configuration is invalid. Schema preparation uses the separately authorized migration capability in spec 04 rather than DDL privileges in serving pools.
 
 ## Conditions for physical plane separation
 
