@@ -2,11 +2,11 @@
 name = "owlauth-server"
 version = "0.0.2"
 edition.workspace = true
-description = "Self-hostable OAuth 2.1 authorization server and user management platform"
+description = "Self-hostable Project Auth and identity server"
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-keywords = ["oauth", "oauth2", "authentication", "server"]
+keywords = ["authentication", "identity", "self-hosted", "server"]
 categories = ["authentication", "web-programming::http-server"]
 
 [dependencies]

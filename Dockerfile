@@ -13,7 +13,7 @@ ARG VCS_REF=unknown
 ARG SOURCE_URL=https://github.com/owlfoundry/owlauth
 
 LABEL org.opencontainers.image.title="OwlAuth" \
-      org.opencontainers.image.description="Self-hostable OAuth 2.1 authorization server and user management platform" \
+      org.opencontainers.image.description="Self-hostable Project Auth and identity infrastructure" \
       org.opencontainers.image.source="${SOURCE_URL}" \
       org.opencontainers.image.version="${OWLAUTH_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \

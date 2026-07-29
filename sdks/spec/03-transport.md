@@ -1,53 +1,75 @@
-# 03 — Transport
+# 03 — Runtime transport
 
-## Status
+## Current status
 
-No SDK currently sends network requests. The following rules apply when transport is introduced.
+No official SDK currently sends a network request. These rules apply when Runtime Project Auth transport is introduced.
 
 ## URL and connection policy
 
-The client validates an absolute base URL at construction. HTTPS is the production default. Any plain-HTTP allowance is explicit and limited to loopback/development policy. URL joining MUST preserve configured path prefixes and prevent endpoint paths or redirects from switching authority unexpectedly.
+A client validates one absolute Runtime base URL at construction. HTTPS is mandatory by default outside an explicit loopback development policy. URL joining preserves a configured path prefix and prevents endpoint paths, provider-returned values, redirects, or headers from changing authority unexpectedly.
 
-TLS certificate and hostname verification are enabled by default. Custom trust roots are explicit; a global “disable verification” convenience MUST NOT be a normal option. Proxy behavior, environment inheritance, and redirect following are documented because they alter trust boundaries.
+TLS certificate and hostname verification are enabled. Custom trust roots are explicit; a general “disable verification” option is not a normal public API. Proxy/environment inheritance and redirect behavior are documented because they change trust boundaries.
 
-Transport sets an identifiable, non-sensitive user agent and supported content types. It applies bounded response bodies, header limits where the HTTP stack permits, connect/read/overall deadlines, and connection-pool limits. Decompression has output bounds.
+Transport uses a non-sensitive user agent, bounded request/response sizes, header limits where supported, connect/read/overall deadlines, connection-pool limits, and bounded decompression. Runtime and Control base URLs are distinct; the default SDK never redirects or falls through to a Control listener.
 
-## Request behavior
+## Project-qualified request behavior
 
-Public methods define:
+Every public operation defines:
 
-- HTTP method/path and accepted success statuses;
-- authentication placement;
-- encoding and content type;
-- idempotency/replay classification;
-- cancellation and timeout behavior;
+- Runtime method/path and accepted success statuses;
+- configured Project/Application binding;
+- credential placement and content type;
+- operation replay/idempotency classification;
+- cancellation and deadline behavior;
 - maximum response assumptions;
-- semantic error mapping.
+- stable semantic error mapping.
 
-Authorization headers, cookies, codes, verifiers, tokens, and client secrets MUST never appear in URL query parameters unless the adopted protocol explicitly requires a front-channel value; bearer credentials always use reviewed header/body placement.
+`project_id`, `application_id`, and a publishable key may appear where the public Runtime contract specifies. They remain identifiers, not secrets. Project access tokens use reviewed authorization-header placement. Refresh tokens, handoff tickets, PKCE verifiers, browser cookies, and management credentials never appear in URLs. The only front-channel value returned to an Application redirect is the protocol-defined short-lived handoff result plus bounded Application state.
 
-## Retries and ambiguous outcomes
+Transport does not send provider credentials or provider tokens: OwlAuth Runtime owns upstream-provider interaction.
 
-Retries are disabled by default for one-use or state-changing OAuth exchanges. A request may be automatically retried only when all of these hold:
+## Redirect behavior
 
-1. its operation is classified as safe/replayable;
-2. no application-visible cancellation/deadline has occurred;
-3. backoff is bounded and honors server guidance such as `Retry-After` safely;
-4. retry does not cross an origin or repeat exposed credential material to a different authority.
+Low-level API requests do not automatically follow redirects across origins. Login initiation may return or navigate to a provider authorization URL only through the explicit lifecycle/browser boundary. A provider authorization URL is not adopted as the SDK's API origin and never receives Project session credentials.
 
-Authorization-code exchange and refresh rotation MUST NOT be blindly replayed after an ambiguous network outcome. The SDK returns a semantic indeterminate/transport result and lets server state or the lifecycle coordinator determine safe recovery.
+The final Application redirect is processed by the Application/SDK handoff boundary, not followed as an HTTP API redirect. Exact redirect registration and callback binding remain Runtime authority.
+
+## Retry and ambiguous outcomes
+
+Automatic retry is disabled for one-use or state-changing Project Auth operations unless replay safety is explicitly proven.
+
+A request may be retried automatically only when:
+
+1. the operation is classified as safe/replayable (for example, public configuration or Project JWKS retrieval);
+2. no caller cancellation/deadline has occurred;
+3. bounded backoff safely honors reviewed `Retry-After` guidance;
+4. credentials are never repeated to another authority;
+5. the retry cannot consume a handoff or rotate/revoke a session twice.
+
+Handoff exchange and strict refresh rotation are never blindly replayed after timeout, cancellation, disconnect, or another ambiguous outcome. The SDK returns an `Indeterminate` semantic error and requires reconciliation or reauthentication according to spec 04. Login-start retry also creates a new explicit transaction rather than guessing whether an earlier one exists.
+
+Logout may be designed as idempotent by the Runtime contract, but the SDK must not assume this without an operation-specific guarantee.
 
 ## Cancellation and concurrency
 
-TypeScript accepts `AbortSignal`; Python and Rust expose idiomatic cancellation/deadline mechanisms chosen by their implementations. Cancellation stops waiting but does not claim the server did not execute. Client instances document thread/task safety. Shared mutable token state is coordinated outside the raw transport.
+TypeScript accepts `AbortSignal`; Python and Rust expose their selected idiomatic cancellation/deadline mechanisms. Cancellation stops local waiting but does not assert that Runtime did not commit an exchange, refresh, or logout.
+
+Client instances document thread/task safety. Raw transport is stateless except for connection management. Pending PKCE state, access/refresh credentials, and refresh single-flight coordination belong to the lifecycle/session layer and remain Project/Application scoped.
+
+## Error responses
+
+Transport parses only bounded reviewed Runtime error fields. Raw bodies, arbitrary headers, URLs, provider diagnostics, or HTTP-library error strings do not become public messages. Correlation IDs and retry metadata are retained only under the allowlist in spec 05.
+
+A response whose Project/Application/session identity contradicts the active client context is a protocol violation, not a new context to accept.
 
 ## Testability
 
-Transport depends on a narrow injectable interface so unit and conformance tests can provide deterministic responses without real network access. Test doubles MUST be called mocks/fakes, not end-to-end tests. Security and interoperability eventually require a real TLS/HTTP-capable stack against a real OwlAuth server.
+Transport depends on a narrow injectable interface so tests can provide deterministic responses without network access. Such tests are unit/contract tests, never end-to-end tests. Security and interoperability claims eventually require a real OwlAuth Runtime process and real HTTP/TLS behavior.
 
 ## Acceptance criteria
 
-- Cross-language tests cover URL normalization, path prefixes, redirect refusal, limits, timeouts, cancellation, and redaction.
-- Retry tests prove no automatic replay for code exchange or refresh rotation.
-- HTTP-library errors do not leak directly as the stable public taxonomy.
-- Real-server tests, once available, exercise proxy/TLS assumptions supported by release documentation.
+- Shared tests cover URL/path-prefix handling, HTTPS policy, Runtime/Control separation, redirect refusal, limits, deadlines, cancellation, and redaction.
+- Project/Application context cannot be changed by a response or redirect.
+- Retry tests prove no automatic replay of handoff exchange or refresh rotation.
+- HTTP-library errors map to the stable taxonomy rather than leaking as public API.
+- Real-server tests exercise every transport capability claimed by a release.

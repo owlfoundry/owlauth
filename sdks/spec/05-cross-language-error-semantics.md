@@ -1,47 +1,79 @@
-# 05 — Cross-language error semantics
+# 05 — Cross-language Project Auth error semantics
 
 ## Goal
 
-Applications need the same decision-relevant meaning in every official SDK without depending on raw HTTP-library exceptions or unsafe server diagnostics. Errors are typed, chain their redacted cause where idiomatic, and preserve stable machine-readable fields.
+Applications need the same decision-relevant Runtime meaning in every official SDK without depending on HTTP-library exceptions, upstream-provider diagnostics, or unsafe response bodies. Errors are typed, preserve stable reviewed fields, and chain only redacted causes where idiomatic.
 
-## Semantic taxonomy
+## Stable taxonomy
 
-| Class | Meaning | Typical application action |
+| Category | Meaning | Typical Application action |
 | --- | --- | --- |
-| `Configuration` | invalid local base URL, timeout, client config, or unsupported option | fix configuration; no request |
-| `Protocol` | malformed/unexpected HTTP response or contract violation | stop; diagnose compatibility/server |
-| `OAuth` | standards-defined OAuth error with safe code/metadata | branch by code and flow context |
-| `Authentication` | client/user/session authentication cannot proceed | reauthenticate or fix credentials |
-| `Authorization` | authenticated actor lacks permission/scope | request appropriate access; do not retry blindly |
-| `RateLimited` | request rejected by rate policy | honor bounded retry guidance |
-| `Transport` | DNS/TLS/connectivity/I/O failure before a definite protocol result | retry only if operation policy permits |
-| `Timeout` | deadline elapsed; server effect may be unknown | treat one-use mutation as ambiguous |
-| `Cancelled` | caller stopped waiting; server effect may be unknown | application decides recovery |
-| `Indeterminate` | outcome of a security-sensitive one-use/state change cannot be known safely | reconcile or reauthorize; never blind replay |
+| `Configuration` | invalid local Runtime URL, Project/Application identifiers, deadline, store, or unsupported option | fix configuration; no request or credential reuse |
+| `Protocol` | malformed/unexpected Runtime response, context mismatch, or unsupported contract | stop; diagnose server/SDK compatibility |
+| `Login` | login cannot start or the upstream-provider interaction completed with a safe normalized failure | restart login or choose another enabled provider |
+| `Handoff` | callback state/ticket/PKCE is invalid, expired, already used, or context-bound elsewhere | discard pending state and start a new login |
+| `Authentication` | Project access/session credential is absent, expired, revoked, or no longer valid | clear affected local state and reauthenticate |
+| `Session` | current-user/logout/session operation cannot complete under current Project/Application state | reauthenticate, correct mode, or stop according to code |
+| `Refresh` | refresh family is expired, revoked, replayed, or definitively unusable | clear the family and reauthenticate; never retry consumed material |
+| `RateLimited` | Runtime admission policy rejected the request | honor bounded reviewed retry guidance |
+| `Transport` | DNS/TLS/connectivity/I/O failure without a definite Runtime response | retry only when operation policy proves safety |
+| `Timeout` | deadline elapsed; server effect may be unknown | treat one-use operations as ambiguous |
+| `Cancelled` | caller stopped waiting; server effect may be unknown | Application selects recovery under operation policy |
+| `Indeterminate` | outcome of handoff, refresh, logout, or another sensitive mutation cannot be known safely | quarantine/clear uncertain state and reauthenticate or reconcile; never blind replay |
 
-Not-found/conflict/validation classes MAY be added when real public operations require them. Taxonomy changes require cross-language review.
+Validation/not-found/conflict subclasses may be added when the real Runtime contract requires them. Cross-language review is required before taxonomy changes.
+
+There is no downstream generic `OAuth` error category. Upstream OAuth/OIDC failures are normalized by Runtime into safe Project Auth login errors. SDKs neither expose provider tokens nor require Applications to branch on provider-specific wire diagnostics.
 
 ## Required fields
 
-Every public error exposes a stable category/code, safe message, optional request/correlation ID, and a retry classification (`never`, `safe_after_delay`, or `application_decision`). OAuth errors preserve the standardized `error` code and only reviewed optional fields. Server response bodies, headers, URLs, and causes are not exposed wholesale.
+Every public error exposes:
 
-An unknown OAuth code remains inspectable without deserialization failure, while known codes may have typed conveniences. HTTP status assists diagnostics but is not the sole semantic classifier.
+- a stable category and machine code;
+- a safe human message;
+- optional allowlisted correlation/request ID;
+- retry classification: `never`, `safe_after_delay`, or `application_decision`;
+- operation context that does not contain credentials or hidden resource existence.
+
+HTTP status may aid diagnostics but is not the sole classifier. Unknown Runtime error codes remain inspectable through a forward-compatible representation and map to a conservative category/retry policy rather than failing deserialization or becoming retryable by default.
+
+An error may identify the configured Project/Application only when that data was already public Application configuration. It never reveals whether another Project, Application, user, identity, ticket, session, or token exists.
+
+## Operation-specific mapping
+
+- Local state/PKCE mismatch fails as `Handoff` without sending a request.
+- Definitive invalid/expired/consumed handoff fails as `Handoff` and destroys pending material.
+- Definitive refresh expiry/revocation/replay fails as `Refresh` and invalidates the local family.
+- Timeout/disconnect/cancellation after dispatching handoff exchange or refresh rotation becomes `Indeterminate`, not generic retryable `Transport`.
+- Disabled Project/Application/user/session maps to a non-enumerating authentication/session category according to the public Runtime code.
+- Provider rejection/unavailability maps to `Login`; raw provider error descriptions are not forwarded.
+- A response contradicting configured Project/Application context is `Protocol` and is never adopted.
 
 ## Language mapping
 
-- TypeScript uses exported error classes or a documented discriminant and preserves `cause` safely.
-- Python uses an exported exception hierarchy with stable attributes and no secret-bearing `repr`/`str`.
-- Rust uses a non-exhaustive exported error enum/struct strategy so additions do not force unsafe matching; `Display` is redacted and sources are bounded.
+- TypeScript exports error classes or a stable discriminant, supports narrowing, and preserves a safe `cause`.
+- Python exports an exception hierarchy with stable attributes and secret-free `str`/`repr`.
+- Rust exports a non-exhaustive error enum/struct strategy; `Display`, `Debug`, and sources remain redacted.
 
-Names may differ idiomatically, but fixtures map each to the same semantic class and retry policy.
+Names may differ idiomatically, but shared fixtures map each language to the same category, stable code, retry classification, and local credential action.
 
 ## Disclosure control
 
-Messages MUST NOT contain authorization headers, cookies, client secrets, passwords, codes, tokens, PKCE verifiers, raw response bodies, or callback URLs. Truncation alone is not sufficient redaction. Diagnostic opt-in may expose safe status, headers allowlisted by name, timing, and correlation metadata—never raw secrets.
+Messages and causes never include:
+
+- authorization headers or cookies;
+- provider codes/tokens/errors with unreviewed text;
+- handoff tickets, PKCE verifiers, Project access/refresh tokens;
+- management credentials or provider secrets;
+- raw response bodies or full callback URLs;
+- complete user/profile payloads.
+
+Truncation is not redaction. Diagnostic opt-in may expose allowlisted status/header names, timing, operation name, and correlation metadata, but never raw credentials or hidden cross-Project state.
 
 ## Acceptance criteria
 
-- Shared conformance cases verify category, stable fields, retry classification, unknown-code behavior, and redaction across languages.
-- HTTP library implementation details are available only as safe chained causes and are not required for application branching.
-- Ambiguous token/code operations never become a generic automatically retryable transport error.
-- Public error taxonomy changes receive SemVer review per SDK.
+- Shared conformance cases verify category, code, retry classification, unknown-code behavior, context mismatch, and redaction.
+- Equivalent Runtime responses have equivalent semantic outcomes in every language.
+- HTTP/provider library implementation details are not required for Application branching.
+- Ambiguous handoff/refresh/logout outcomes never become automatically retryable transport errors.
+- Public taxonomy changes receive independent SemVer review for every SDK.

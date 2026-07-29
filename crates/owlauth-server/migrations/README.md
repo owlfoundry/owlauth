@@ -1,5 +1,13 @@
-# Embedded database migrations
+# OwlAuth database migrations
 
-Versioned database migrations for OwlAuth storage belong in this directory. The storage crate must embed them into the server binary and apply pending migrations automatically during startup before serving requests.
+Versioned PostgreSQL migrations for OwlAuth's authoritative state belong in this directory.
 
-Automatic migration must be transactional where the database supports it, safe to retry, and fail startup without partially exposing a newer server against an older schema. Destructive or irreversible migrations require an explicit compatibility and recovery plan.
+The target schema stores Project-scoped Applications, provider registrations and secret references, users and linked identities, login transactions, handoff tickets, browser and Application sessions, refresh families, public key metadata, management principals, idempotency records, and audit events. Project ownership must be enforceable through direct or composite database constraints; Redis is never authoritative for these records.
+
+The server must embed migrations into the `owlauth-server` artifact and apply compatible pending migrations before either Runtime or Control reports readiness. Migration execution must be serialized, transactional where PostgreSQL permits it, safe to retry, and fail startup rather than expose a newer binary against an incompatible schema.
+
+Destructive or irreversible migrations require an explicit compatibility, rollout, backup, and recovery design. Expand-and-contract changes must preserve mixed-version operation for the declared rollout window.
+
+> The current pre-alpha server scaffold does not implement persistence or the migration runner, and this directory does not yet contain schema migrations.
+
+The target storage and migration invariants are defined in [`spec/04-storage-and-migrations.md`](../../../spec/04-storage-and-migrations.md).

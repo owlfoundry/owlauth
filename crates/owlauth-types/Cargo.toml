@@ -2,11 +2,11 @@
 name = "owlauth-types"
 version = "0.0.2"
 edition.workspace = true
-description = "Public API types for OwlAuth"
+description = "Public Project Auth and Control API types for OwlAuth"
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-keywords = ["oauth", "oauth2", "authentication", "types"]
+keywords = ["authentication", "identity", "api", "types"]
 categories = ["authentication", "web-programming"]
 
 [lints]

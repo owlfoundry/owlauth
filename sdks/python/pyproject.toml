@@ -5,13 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "owlauth-client"
 version = "0.0.1"
-description = "Python client for OwlAuth"
+description = "Python Project Auth client for OwlAuth"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 authors = [{ name = "OwlFoundry" }]
-keywords = ["oauth", "oauth2", "authentication", "client"]
+keywords = ["authentication", "identity", "project-auth", "client"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "License :: OSI Approved :: BSD License",

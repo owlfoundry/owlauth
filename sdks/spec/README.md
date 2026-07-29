@@ -1,44 +1,60 @@
 # OwlAuth SDK specifications
 
-This directory is the language-neutral design index for the official TypeScript, Python, and Rust clients. It defines shared observable behavior while allowing idiomatic language APIs and independent releases.
+This directory defines the language-neutral behavior of the official TypeScript, Python, and Rust SDKs for OwlAuth Project Auth. It allows each package to use idiomatic language APIs while preserving one observable Runtime contract, one security model, and equivalent errors.
 
-The SDKs are currently `0.0.1` pre-alpha package-name reservations. Their `Client` objects only retain a base URL; they do not send HTTP requests, perform PKCE, exchange or refresh tokens, map server errors, or provide production OAuth behavior. Requirements below are targets and acceptance gates, not claims of implementation.
+OwlAuth brokers authentication to Project-configured upstream providers such as GitHub, Google, or another OIDC provider. Downstream Applications do not act as generic OAuth clients of OwlAuth: they initialize from public Project/Application configuration, begin provider login through OwlAuth Runtime, exchange a short-lived PKCE-bound handoff ticket, and receive an OwlAuth Project user and session credentials.
 
-The server's public wire contract comes from ephemeral OpenAPI generated from Rust definitions in `crates/owlauth-types`; generated OpenAPI is not committed. SDK-specific generated models/transports, when introduced, remain subordinate to these handwritten lifecycle and security rules.
+## Current implementation status
+
+The SDK packages are currently pre-alpha scaffolds and package-name reservations. Their `Client` types only retain a base URL. They do not yet:
+
+- fetch public Project/Application configuration;
+- begin an upstream-provider login;
+- generate or retain PKCE material;
+- exchange a one-use handoff ticket;
+- issue, verify, refresh, or persist Project credentials;
+- call current-user or logout operations;
+- map Runtime errors or send HTTP requests.
+
+The specifications below are target behavior and release acceptance gates, not claims about the current packages.
+
+Reviewed Rust definitions in `crates/owlauth-types` are the source of public Runtime DTOs and generated OpenAPI. OpenAPI is emitted from the exact server revision under test and is not committed. Generated models remain subordinate to the handwritten lifecycle, transport, isolation, and security rules in this directory.
 
 ## Specification map
 
 | Spec | Owning concern |
 | --- | --- |
-| [`01-system-context-and-boundaries.md`](01-system-context-and-boundaries.md) | SDK role, trust model, public surface, and server separation |
-| [`02-generated-contract-and-models.md`](02-generated-contract-and-models.md) | OpenAPI input provenance, generated code, model conventions, and drift |
-| [`03-transport.md`](03-transport.md) | URLs, HTTP behavior, timeouts, retries, cancellation, and testability |
-| [`04-pkce-and-token-lifecycle.md`](04-pkce-and-token-lifecycle.md) | authorization orchestration, PKCE, token refresh, races, and persistence boundaries |
-| [`05-cross-language-error-semantics.md`](05-cross-language-error-semantics.md) | stable error taxonomy and language mappings |
-| [`06-fixtures-and-conformance.md`](06-fixtures-and-conformance.md) | machine-readable shared inputs, conformance runners, and real-server E2E |
-| [`07-security.md`](07-security.md) | secret handling, redirect/browser boundary, logging, storage, and supply chain |
-| [`08-versioning-and-releases.md`](08-versioning-and-releases.md) | independent SemVer, compatibility ranges, artifacts, and release gates |
+| [`01-system-context-and-boundaries.md`](01-system-context-and-boundaries.md) | SDK role, Project/Application trust boundaries, public surface, and server separation |
+| [`02-generated-contract-and-models.md`](02-generated-contract-and-models.md) | OpenAPI provenance, generated Runtime models, compatibility, and drift |
+| [`03-transport.md`](03-transport.md) | Runtime URLs, HTTP behavior, deadlines, retries, cancellation, and testability |
+| [`04-pkce-and-token-lifecycle.md`](04-pkce-and-token-lifecycle.md) | Project login initiation, handoff PKCE, Project credentials, refresh, current user, and logout |
+| [`05-cross-language-error-semantics.md`](05-cross-language-error-semantics.md) | stable Project Auth errors and language mappings |
+| [`06-fixtures-and-conformance.md`](06-fixtures-and-conformance.md) | shared Project Auth fixtures, conformance runners, and real-server E2E |
+| [`07-security.md`](07-security.md) | secret handling, browser/native redirects, token storage, isolation, and supply chain |
+| [`08-versioning-and-releases.md`](08-versioning-and-releases.md) | independent SemVer, compatibility statements, artifacts, and release gates |
 
-The root server architecture is specified in [`../../spec/`](../../spec/). This README is the ordered SDK navigation map.
+The normative server architecture is specified in [`../../spec/`](../../spec/), especially the [Project Auth flow](../../spec/03-project-auth-flows-and-security-invariants.md) and [Runtime HTTP contract](../../spec/05-http-contract-and-surface-boundaries.md).
 
-## Shared artifacts
+## Shared attachments
 
-- [`fixtures/`](fixtures/) contains machine-readable protocol examples. The current corpus has only [`health-response.json`](fixtures/health-response.json).
-- [`conformance/`](conformance/) contains language-neutral cases. The current [`cases.json`](conformance/cases.json) has only a health-response assertion.
+- [`fixtures/`](fixtures/) contains reviewed machine-readable wire examples. The current corpus contains only [`health-response.json`](fixtures/health-response.json).
+- [`conformance/`](conformance/) contains language-neutral behavior cases. The current [`cases.json`](conformance/cases.json) asserts only the health fixture.
 
-These files are attachments to the specifications, not evidence of a complete SDK. They MUST contain synthetic, non-secret data and use explicit schema versions.
+These attachments are not evidence of Project Auth implementation. They use synthetic, non-secret values and explicit schema versions.
 
 ## Cross-cutting invariants
 
-1. SDKs are untrusted clients; the server remains authoritative for every security decision.
-2. SDKs consume public wire behavior only. The Rust SDK MUST NOT depend on internal OwlAuth server crates.
-3. Generated models and low-level operations MAY follow OpenAPI; PKCE, refresh coordination, secure persistence integration, retries, and idiomatic errors remain explicitly designed behavior.
-4. Credentials, codes, PKCE verifiers, tokens, cookies, and client secrets MUST NOT appear in default string/debug representations, logs, traces, fixtures, exception messages, or telemetry.
-5. Automatic retry MUST be limited to demonstrably safe cases and MUST NOT replay an ambiguous one-use grant or refresh operation.
-6. Equivalent server responses map to equivalent semantic error classes in every language.
-7. Each SDK versions and ships independently from the server and other SDKs.
-8. Current package/unit/conformance checks MUST be distinguished from future real-server, cross-language end-to-end tests. No fake E2E suite should be added before OAuth behavior exists.
+1. SDKs are untrusted Runtime clients. OwlAuth remains authoritative for Project, Application, user, provider, handoff, session, refresh, and policy decisions.
+2. `project_id`, `application_id`, and a publishable Application key are public identifiers, not secrets, user credentials, or Control authority.
+3. Every Project Auth operation remains bound to one Project and, where applicable, one Application. SDK state from one Project/Application cannot be reused for another.
+4. SDKs consume only public Runtime wire behavior. They do not import server domain modules, storage adapters, provider payloads, or Control authority. The Rust SDK receives no special access from sharing the implementation language.
+5. Generated models and low-level operations may follow OpenAPI. PKCE custody, one-use handoff exchange, strict refresh coordination, persistence integration, retry safety, and semantic errors remain handwritten behavior.
+6. Handoff tickets, access tokens, refresh tokens, PKCE verifiers, browser/session cookies, provider callback values, and management credentials never appear in default strings, debug output, logs, traces, fixtures, exceptions, or telemetry.
+7. Automatic retry is limited to demonstrably replay-safe operations. Ambiguous handoff exchange or refresh rotation is never blindly replayed.
+8. Equivalent Runtime responses map to equivalent semantic outcomes in every official SDK.
+9. Each SDK versions and ships independently from the server and other SDKs. Numeric version equality never implies compatibility.
+10. Package, unit, fixture, and conformance checks remain distinct from future real-server end-to-end tests. A mock or health fixture is not Project Auth E2E.
 
 ## Normative language
 
-`MUST`, `MUST NOT`, `SHOULD`, and `MAY` are normative design terms. Acceptance criteria define when a capability may be claimed. Language-specific APIs can differ in naming and async idiom while preserving these observable semantics.
+`MUST`, `MUST NOT`, `SHOULD`, and `MAY` are normative design terms. Language-specific APIs can differ in naming, async model, and type idiom while preserving these observable semantics.

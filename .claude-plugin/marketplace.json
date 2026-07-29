@@ -1,7 +1,7 @@
 {
   "name": "owlauth",
   "metadata": {
-    "description": "OwlAuth application and developer-tool integration guidance."
+    "description": "OwlAuth Project Auth application and developer-tool integration guidance."
   },
   "owner": {
     "name": "OwlFoundry"
@@ -10,7 +10,7 @@
     {
       "name": "owlauth",
       "source": "./plugins/owlauth",
-      "description": "Use OwlAuth through its public contract and first-party SDK boundaries.",
+      "description": "Integrate applications through OwlAuth Project Auth and first-party SDK boundaries.",
       "version": "0.0.1",
       "author": {
         "name": "OwlFoundry"
@@ -18,7 +18,7 @@
       "homepage": "https://github.com/owlfoundry/owlauth",
       "repository": "https://github.com/owlfoundry/owlauth",
       "license": "BSD-3-Clause",
-      "keywords": ["oauth", "oauth2", "authentication", "sdk"],
+      "keywords": ["authentication", "identity", "project-auth", "sdk"],
       "category": "Developer Tools"
     }
   ]

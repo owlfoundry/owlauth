@@ -2,11 +2,11 @@
 name = "owlauth-cli"
 version = "0.0.3"
 edition.workspace = true
-description = "Command-line interface for OwlAuth"
+description = "Control command-line interface for OwlAuth"
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-keywords = ["oauth", "oauth2", "authentication", "cli"]
+keywords = ["authentication", "identity", "management", "cli"]
 categories = ["authentication", "command-line-utilities"]
 include = ["src/**", "assets/**", "README.md", "LICENSE"]
 

@@ -2,48 +2,88 @@
 
 ## Machine-readable attachments
 
-[`fixtures/`](fixtures/) stores shared wire examples; [`conformance/`](conformance/) stores language-neutral behavior cases. They are reviewed attachments to these specifications and use relative paths plus an explicit `schemaVersion`.
+[`fixtures/`](fixtures/) stores reviewed wire examples; [`conformance/`](conformance/) stores language-neutral behavior cases. Attachments use relative paths, stable names, and an explicit `schemaVersion`.
 
-The current attachments are intentionally minimal:
+The current corpus is intentionally minimal:
 
-- [`fixtures/health-response.json`](fixtures/health-response.json) contains `{ "status": "ok" }`;
-- [`conformance/cases.json`](conformance/cases.json) asserts that health fixture only.
+- [`fixtures/health-response.json`](fixtures/health-response.json) contains only `{ "status": "ok" }`;
+- [`conformance/cases.json`](conformance/cases.json) asserts only that health response.
 
-This corpus does not validate a transport or OAuth behavior. It MUST NOT be described as an OAuth conformance suite.
+It does not describe a public Project/Application configuration, provider login, PKCE, handoff, Project token, refresh, current-user, logout, or error case. It is not a Project Auth conformance suite and does not prove any SDK transport exists.
+
+## Future fixture families
+
+As Runtime capabilities become real, shared attachments should cover:
+
+- bounded public Project/Application auth configuration and provider display keys;
+- login-start inputs/results with synthetic exact redirects and S256 challenges;
+- successful and failed one-use handoff exchange;
+- bounded Project user/session and access/refresh response shapes;
+- strict refresh rotation, replay-family revocation, and ambiguous outcomes;
+- current-user and Application/Project-browser logout semantics;
+- cross-Project/Application mismatch rejection;
+- stable Project Auth error codes, retry classification, and redaction.
+
+Fixtures describe public wire/semantic behavior only. They never copy internal rows, provider payloads, secret references, management DTOs, or a generated OpenAPI document.
 
 ## Fixture rules
 
-Fixtures MUST be valid JSON (or another explicitly adopted machine format), deterministic, minimal, and synthetic. They MUST NOT contain usable secrets, real domains/accounts, live tokens, production identifiers, or generated OpenAPI copies. Secret-like tests use obvious non-production sentinels and assert that those sentinels never appear in rendered output.
+Fixtures are deterministic, minimal, synthetic, and valid under their declared schema. They contain no usable secret, real domain/account, live token, production Project/Application/user identifier, or private endpoint.
 
-Each case has a unique stable name, input or fixture reference, expected semantic output/error, and optional capability/version requirement. Corpus schema changes increment `schemaVersion` and keep runners able to explain unsupported versions rather than silently skipping them.
+Secret/redaction cases use unmistakable non-production sentinels and assert those exact sentinels never appear in formatted output, errors, logs, traces, or snapshots. A fixture may represent a token-shaped value only when its schema marks it synthetic and tests prohibit accidental disclosure.
+
+Each conformance case defines:
+
+- a unique stable name;
+- fixture/input reference;
+- required capability and minimum corpus schema;
+- configured Project/Application context where relevant;
+- expected semantic output/error and local credential action.
+
+Corpus schema changes increment `schemaVersion`. Runners explain unsupported required versions instead of silently skipping them.
 
 ## Conformance runner responsibilities
 
-Every official SDK loads the same corpus and translates only the language binding. A runner MUST:
+Every official SDK loads the same corpus and translates only language binding details. A runner must:
 
-- fail on unknown required fields, missing fixtures, duplicate case names, or unsupported schema versions;
+- fail on unknown required fields, missing fixtures, duplicate names, bad references, or unsupported required schema versions;
 - report skipped optional capabilities explicitly;
-- compare semantic output rather than incidental formatting;
-- exercise generated models plus handwritten transport/lifecycle/error layers as applicable;
-- keep language-specific unit tests for idioms not representable in shared data.
+- compare semantic Project Auth outcomes rather than incidental formatting;
+- exercise generated Runtime models plus handwritten transport/lifecycle/error layers where applicable;
+- assert Project/Application context never changes because of fixture data;
+- retain language-specific unit tests for idioms not representable in shared data.
 
-A case passing in one language is not cross-language conformance. Required cases pass in all SDKs that claim the capability.
+A case passing in one language is not cross-language conformance. Every SDK claiming that capability passes all required cases.
 
 ## Validation stages
 
 ### Current checks
 
-While SDKs are base-URL-only package scaffolds, CI can run package builds, static checks, unit tests, OpenAPI generation checks, and the small health fixture/case validation if a runner exists. Mock transport tests, once added, are unit/contract tests.
+While SDKs are base-URL-only scaffolds, CI may run package builds, static checks, unit tests, generated OpenAPI checks, JSON attachment validation, and the one health case if a runner exists. These stages must not be called Project Auth conformance or E2E.
 
-### Future real-server E2E
+Mock/fake transport tests introduced later are unit or contract tests. They may validate failure paths and coordination, but they do not establish interoperability.
 
-After OwlAuth implements HTTP OAuth behavior, CI MUST start a real OwlAuth server with isolated configuration, keys, database, port, and deterministic test clients/users. It MUST then run TypeScript, Python, and Rust SDKs against that process for every claimed cross-language flow, including negative and refresh/concurrency cases where supported. Server logs are scanned for seeded secrets and the database/environment are discarded after the job.
+### Real-server E2E
 
-Do **not** add fake or placeholder E2E tests now. A mocked response, static fixture, generated client compile, or health-model round trip is not server-backed E2E and must not be labeled as such.
+Before a package claims a Project Auth capability, CI starts a real `owlauth-server` Runtime with isolated PostgreSQL/Redis/configuration, test keys, one synthetic Project/Application/provider setup, and deterministic non-secret test identities. The official SDK then exercises the claimed flow over real HTTP.
+
+The eventual cross-language matrix covers, as capabilities ship:
+
+- public configuration and Project/Application rejection;
+- provider login start and exact redirect behavior through a deterministic test provider adapter;
+- PKCE-bound one-use handoff success, mismatch, expiry, and replay;
+- Project JWT/session response shape and current-user behavior;
+- strict refresh rotation, concurrency, replay-family revocation, and ambiguous response handling;
+- Application-only and Project-browser logout;
+- Project isolation and disabled Project/Application/user/session behavior;
+- stable errors and seeded-secret log scanning.
+
+The database and environment are destroyed after the job. A static fixture, mock response, generated-client compile, or health endpoint round trip is never labeled E2E.
 
 ## Acceptance criteria
 
-- Attachment references resolve and schema versions are validated.
-- All required cases execute in every claiming SDK with equivalent outcomes.
-- CI labels package/unit/contract/conformance/E2E stages accurately.
-- OAuth release claims wait for a real-server cross-language E2E job, not a mock.
+- Every attachment link resolves and every schema version is validated.
+- Fixture descriptions state current limited coverage truthfully.
+- Required cases produce equivalent results in every claiming SDK.
+- CI names package/unit/contract/conformance/E2E stages accurately.
+- Project Auth release claims wait for a real-server test of that capability.

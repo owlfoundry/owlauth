@@ -1,53 +1,53 @@
-# OwlAuth server specifications
+# OwlAuth architecture specifications
 
-This directory is the architecture-first, normative design index for the OwlAuth server. The documents describe intended boundaries and acceptance conditions; a requirement appearing here does **not** mean it is implemented.
+This directory defines the normative high-level architecture of OwlAuth: system boundaries, project isolation, authentication flows, data structures, consistency rules, security invariants, and deployment topology.
 
-OwlAuth is currently a pre-alpha scaffold. The server serves only a health endpoint (or emits a generated OpenAPI document), `owlauth-types` describes that health operation and a small OAuth error-code set, the CLI provides only checksum-verified self-update, and no OAuth authorization flow is implemented yet. These specifications guide implementation without representing production readiness.
+OwlAuth is a project-scoped authentication and identity service. It uses OAuth/OIDC only when federating to upstream identity providers such as GitHub or Google. Downstream applications consume OwlAuth's project authentication, session, user, and token APIs; OwlAuth does not act as a general-purpose OAuth authorization server for them.
 
-User guides belong in [`docs/`](../docs/). Cross-language client requirements belong in [`sdks/spec/`](../sdks/spec/). Generated OpenAPI output, implementation plans, and test logs do not belong in this directory.
+User guidance belongs in [`docs/`](../docs/). Language-neutral SDK behavior belongs in [`sdks/spec/`](../sdks/spec/). Generated OpenAPI documents are derived from Rust definitions in `crates/owlauth-types`.
 
 ## Specification map
 
 | Spec | Owning concern |
 | --- | --- |
-| [`01-system-context-and-goals.md`](01-system-context-and-goals.md) | actors, goals, scope, trust boundaries, and current-state baseline |
-| [`02-domain-and-crate-boundaries.md`](02-domain-and-crate-boundaries.md) | domain ownership, crate dependency direction, and public/internal boundaries |
-| [`03-oauth-protocol-and-security-invariants.md`](03-oauth-protocol-and-security-invariants.md) | OAuth 2.1 profile, protocol invariants, threat controls, and non-goals |
-| [`04-storage-and-migrations.md`](04-storage-and-migrations.md) | persistence ownership, transactions, embedded automatic migrations, and recovery |
-| [`05-openapi-contract-lifecycle.md`](05-openapi-contract-lifecycle.md) | Rust-authored HTTP contract, generated OpenAPI, compatibility review, and SDK handoff |
-| [`06-operations-configuration-and-security.md`](06-operations-configuration-and-security.md) | startup, configuration, secrets, observability, deployment, and operational safety |
-| [`07-cli-and-mcp-boundaries.md`](07-cli-and-mcp-boundaries.md) | current updater-only Rust CLI, planned management commands, and server-side MCP boundaries |
-| [`08-delivery-validation-and-evolution.md`](08-delivery-validation-and-evolution.md) | test layers, release evidence, compatibility, and specification evolution |
+| [`01-system-context-and-goals.md`](01-system-context-and-goals.md) | product model, Project/Application boundaries, logical planes, and standalone/integrated topology |
+| [`02-domain-and-crate-boundaries.md`](02-domain-and-crate-boundaries.md) | shared application/domain core, package ownership, use cases, and dependency direction |
+| [`03-project-auth-flows-and-security-invariants.md`](03-project-auth-flows-and-security-invariants.md) | upstream provider authentication, handoff, project sessions/tokens, refresh, and logout |
+| [`04-storage-and-migrations.md`](04-storage-and-migrations.md) | PostgreSQL authority, Redis roles, project-scoped data model, transactions, migrations, and recovery |
+| [`05-http-contract-and-surface-boundaries.md`](05-http-contract-and-surface-boundaries.md) | Runtime and Control HTTP surfaces, listener isolation, DTO ownership, and error contracts |
+| [`06-operations-configuration-and-security.md`](06-operations-configuration-and-security.md) | process composition, configuration, project keys, health, observability, and network posture |
+| [`07-cli-and-mcp-boundaries.md`](07-cli-and-mcp-boundaries.md) | Control scopes, CLI/MCP adapters, `belongs_to`, and external RBAC gateway boundaries |
+| [`08-consistency-resilience-and-plane-separation.md`](08-consistency-resilience-and-plane-separation.md) | cross-plane consistency, failure semantics, resource isolation, and physical split conditions |
 
-This README is the ordered navigation map. Detailed requirements should have one owning document and be referenced rather than duplicated.
+Each requirement has one owning document. Other documents reference that requirement instead of redefining it.
 
 ## Authority map
 
 | Concern | Authority |
 | --- | --- |
-| Server-only identities, authorization concepts, policy, and persistence | Internal modules of `crates/owlauth-server`, as they are implemented |
-| Public HTTP shapes and generated API description | Rust definitions in `crates/owlauth-types` |
-| Schema migration assets | `crates/owlauth-server/migrations/` |
-| Process composition and network serving | `crates/owlauth-server` |
-| Public CLI and updater | `crates/owlauth-cli` |
-| Language-neutral SDK behavior | [`sdks/spec/`](../sdks/spec/) plus a generated OpenAPI input |
-| User-facing guidance | [`docs/`](../docs/) |
-
-Specifications govern intended design. Executable code and tests reveal current implementation. A conflict must be resolved explicitly; documentation must never be used to imply that absent behavior exists.
+| Project, application, identity, provider, login, session, refresh, token, key, and policy rules | Internal application and domain modules of `crates/owlauth-server` |
+| Public Runtime and Control HTTP DTOs and OpenAPI definitions | Rust definitions in `crates/owlauth-types` |
+| PostgreSQL schema and migration assets | `crates/owlauth-server/migrations/` |
+| Runtime and Control composition, listeners, persistence adapters, and operational ports | `crates/owlauth-server` |
+| Public remote administration client | `crates/owlauth-cli` through a deliberately isolated Control client surface |
+| Language-neutral SDK behavior | [`sdks/spec/`](../sdks/spec/) and generated public contracts |
+| User-facing operational guidance | [`docs/`](../docs/) |
 
 ## Cross-cutting invariants
 
-1. OwlAuth MUST fail closed on malformed, expired, replayed, mismatched, or unauthorized OAuth state.
-2. Authorization decisions MUST be made server-side from current authoritative state; SDKs, CLI callers, and MCP clients are untrusted inputs.
-3. Secrets, authorization codes, access tokens, refresh tokens, PKCE verifiers, and session credentials MUST NOT appear in ordinary logs, generated contract examples, diagnostics, fixtures, or agent context.
-4. External redirects MUST be exact-match validated against registered client metadata, subject only to protocol-defined exceptions adopted explicitly by OwlAuth.
-5. Storage migrations MUST live under `crates/owlauth-server/migrations/`, be embedded in the executable, and run automatically before the server accepts requests. Migration failure MUST prevent serving.
-6. Public OpenAPI is generated from reviewed Rust protocol definitions when needed and MUST NOT be committed as a generated artifact.
-7. Internal crates are not an SDK contract. Every SDK consumes only the public protocol contract and follows independent SemVer.
-8. The CLI is a separate Rust client surface and currently implements only verified self-update. Planned MCP support is a server-side adapter; plugins MUST NOT bundle or invent a local authorization server.
-9. Network and storage side effects MUST be bounded, observable without disclosing secrets, and assigned explicit timeout and retry semantics.
-10. No document or release artifact may claim implemented OAuth behavior or production suitability until validation demonstrates it.
+1. One OwlAuth deployment is one administrative trust domain with one operator policy. It may contain many isolated Projects but is not itself a multi-tenant organization or RBAC system.
+2. A Project is the identity and authentication isolation boundary. Applications within one Project share its user directory; users, linked identities, sessions, refresh families, provider credentials, and token namespace never cross Projects.
+3. `belongs_to` is optional opaque Project metadata for an external control system. It is indexed but is not a tenant, principal, scope, or OwlAuth authorization boundary.
+4. OwlAuth has one shared application/domain core. Runtime HTTP, Control HTTP, CLI-facing APIs, and MCP adapters do not own alternate business rules.
+5. PostgreSQL is the authoritative transactional store. Redis is non-authoritative and cannot prove identity, handoff consumption, session validity, refresh rotation, revocation, Project status, or key state.
+6. Runtime / Protocol Plane and Control Plane use distinct listeners and authentication policies even when composed into one process.
+7. Control adapters cannot mutate tables directly. Every mutation passes through an application service and Project-bound domain invariants.
+8. Provider callbacks and application redirects are distinct URL classes and both use exact registered values. Login state, handoff tickets, refresh tokens, sessions, and management credentials have explicit binding and replay semantics.
+9. Browser applications receive only public Project/Application configuration. Provider secrets, management credentials, refresh-token digests, and private keys never enter public configuration or logs.
+10. Private signing and data-protection keys exist only behind key-provider interfaces. PostgreSQL contains public material and opaque references, never ordinary private-key bytes.
+11. The server is one Rust server package and one binary/container artifact. `all`, `runtime`, and `control` are composition modes, not independent domain implementations.
+12. Network and storage side effects are bounded and have explicit timeout, retry, idempotency, and failure semantics.
 
-## Normative language and status
+## Normative language
 
-`MUST`, `MUST NOT`, `SHOULD`, and `MAY` are normative design terms. Each document separates the **current baseline** from the **target contract**. Acceptance criteria are gates for claiming implementation, not statements that the gate already passes.
+`MUST`, `MUST NOT`, `SHOULD`, and `MAY` are normative design terms. “Runtime” is shorthand for “Runtime / Protocol Plane.” “Control” means the administrative control plane. “Shared core” means the application services, domain model, and ports used by both planes.

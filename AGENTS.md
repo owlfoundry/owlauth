@@ -48,7 +48,7 @@ Release scopes are `server`, `cli`, `typescript`, `python`, `rust`, and `all`. I
 - Run package-content checks for every registry artifact, including the BSD license text.
 - Enforce the Rust product dependency direction in CI: CLI must not reach server; server must not reach client SDK.
 - Shared fixtures and conformance cases define cross-language behavioral parity.
-- Once real OAuth behavior exists, add server-backed end-to-end jobs that start OwlAuth and run all three SDK suites against the same instance. Do not add fake E2E tests before the server and flows exist.
+- Once real Project Auth behavior exists, add server-backed end-to-end jobs that start OwlAuth and run all three SDK suites against the same instance. Do not add fake E2E tests before the Runtime flows exist.
 
 ## AnyCap
 

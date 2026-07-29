@@ -1,6 +1,8 @@
-# SDK examples
+# Current SDK examples
 
-These examples reflect the current `0.0.1` placeholder API. Do not extend them with OAuth operations until those operations exist in the published clients.
+These examples reflect the current placeholder API. Each client stores only a base URL. Project/Application configuration, provider login, handoff exchange, tokens, refresh, current-user operations, and logout are not implemented in these packages yet.
+
+Do not extend the examples with target Project Auth methods until those methods exist in the published client.
 
 ## TypeScript
 

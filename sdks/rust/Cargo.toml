@@ -2,11 +2,11 @@
 name = "owlauth-client"
 version = "0.0.1"
 edition.workspace = true
-description = "Rust client for OwlAuth"
+description = "Rust Project Auth client for OwlAuth"
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-keywords = ["oauth", "oauth2", "authentication", "client"]
+keywords = ["authentication", "identity", "project-auth", "client"]
 categories = ["authentication", "api-bindings"]
 
 [lints]

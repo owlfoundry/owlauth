@@ -1,53 +1,90 @@
-# 02 — Generated contract and models
+# 02 — Generated Runtime contract and models
 
-## Contract input
+## Contract authority
 
-SDK generation consumes one OpenAPI document emitted from the exact OwlAuth server source revision under validation:
+SDK generation consumes an OpenAPI document emitted from the exact OwlAuth server revision under validation:
 
 ```bash
 cargo run --package owlauth-server -- --openapi > <temporary-build-path>/owlauth-openapi.json
 ```
 
-The OpenAPI file is ephemeral and MUST NOT be committed. Its source revision, server version, generator version/configuration, and digest MUST be recorded in CI or release provenance. The current document describes only health metadata and a small OAuth error enum; it is not a usable OAuth client contract.
+The OpenAPI file is derived from reviewed public DTOs in `crates/owlauth-types` and is never committed. CI/release provenance records the source revision, server version, generator version/configuration, and contract digest.
+
+The current server and SDKs remain scaffolds. A generated health operation or model is not evidence that Project Auth login, handoff, session, refresh, current-user, or logout behavior exists.
+
+## Surface separation
+
+The source contract distinguishes:
+
+- Runtime Project Auth DTOs and operations intended for public SDKs;
+- Control administrative DTOs intended for a separate privileged client/CLI surface;
+- health/diagnostic vocabulary that does not imply authentication support.
+
+Default SDK generation consumes Runtime only. It must not expose Control endpoints, management credentials/scopes, server storage models, provider payloads, key references, or internal health detail merely because one server binary contains those surfaces.
 
 ## Generation boundary
 
-Generation MAY produce:
+Generation may produce:
 
-- wire request/response models;
-- serialization/deserialization code;
-- endpoint path/method declarations;
-- low-level operation clients.
+- public Project/Application configuration models;
+- login-start and provider-selection wire models;
+- PKCE challenge and handoff-exchange request/response DTOs;
+- Project user, session, access-token metadata, refresh, and logout DTOs;
+- stable Runtime error wire shapes;
+- endpoint path/method declarations and low-level Runtime operations.
 
-Generation MUST NOT invent lifecycle policy for browser opening, PKCE verifier custody, token persistence, refresh rotation/replay, retry safety, or language-level error taxonomy. Those layers remain handwritten and tested.
+Generation must not invent policy for:
 
-Generated output location and commit policy are chosen per SDK package. Regardless of whether language source is shipped, regeneration MUST be deterministic and reviewed. This repository still does not commit the generated OpenAPI input.
+- trusted Runtime origin selection;
+- PKCE verifier generation/custody;
+- browser/native redirect handling and history cleanup;
+- one-use handoff and refresh retry behavior;
+- credential persistence or cross-process coordination;
+- Project/Application state isolation;
+- language-level errors and redaction.
+
+Those layers remain handwritten and tested.
 
 ## Model conventions
 
-All SDKs MUST preserve wire distinctions relevant to compatibility:
+All language bindings preserve wire distinctions that affect compatibility and security:
 
 - absent versus explicit `null`;
 - required versus optional fields;
-- unknown enum values according to a documented forward-compatibility policy;
-- integer/string/time formats without lossy conversion;
-- OAuth error code plus safe optional metadata;
+- exact `project_id`/`application_id` representation;
+- unknown enum values under a documented forward-compatibility policy;
+- integer, string, URI, and time formats without lossy conversion;
+- stable Project Auth error code plus reviewed optional metadata;
 - unknown response fields where tolerant reading is intended.
 
-Wire models MUST not expose secret-bearing default `repr`, `Debug`, inspection, equality snapshots, or serialization accidentally. Secret wrappers SHOULD redact by default and require an explicit operation to access raw material.
+Names may be idiomatic, but mappings are deterministic. Reserved-word escaping and acronym casing are pinned in generator configuration. Generated code never overwrites handwritten lifecycle/security code.
 
-Names may be idiomatic but mappings remain deterministic. Reserved-word escaping and acronym casing rules are pinned in generator configuration. Generated code MUST not overwrite handwritten files.
+Project access tokens, refresh tokens, handoff tickets, PKCE verifiers, cookies, and provider callback values use redacted wrappers where language/tooling permits. Default `repr`, `Debug`, object inspection, snapshots, equality diagnostics, and serialization must not expose raw values.
+
+A Project JWT may be carried as an opaque credential by an SDK. Decoding unverified claims for display or scheduling must be explicitly distinguished from cryptographic validation; the Application backend or an explicitly designed verifier validates signature and Project issuer/audience.
 
 ## Drift and compatibility
 
-CI regenerates from the single ephemeral contract and either compares generated source to the package baseline or builds/tests directly from the output. Unexplained drift fails. An OpenAPI-aware diff flags removal, required-input additions, type narrowing, authentication changes, response/error changes, and enum compatibility hazards before SDK updates proceed.
+CI regenerates from one ephemeral OpenAPI artifact and either compares checked-in generated source or builds/tests directly from generated output. Unexplained drift fails.
 
-The server contract may evolve independently of an SDK. Each SDK records supported server contract/version ranges and tests tolerant behavior. A new OpenAPI operation is not part of the SDK's stable public API until its generated layer, handwritten semantics where needed, tests, and docs are released.
+Compatibility review flags at least:
+
+- operation/field removal or rename;
+- required-input additions;
+- narrowed types or enum behavior;
+- changes to Project/Application resolution;
+- authentication/credential placement changes;
+- handoff, refresh, logout, or retry semantic changes;
+- error-code/category changes;
+- Runtime/Control surface leakage.
+
+The server and each SDK release independently. Each SDK publishes a tested Runtime contract/server compatibility statement. A new OpenAPI operation is not part of the stable SDK API until generated mapping, required handwritten lifecycle semantics, tests, and documentation ship together.
 
 ## Acceptance criteria
 
 - Generation is reproducible with pinned tools/configuration.
-- A clean generation job does not modify the checked-out OpenAPI tree or leave an OpenAPI file to commit.
-- Model round-trip tests cover omission/null, unknown fields/enums, bounds, and redaction.
-- Handwritten code imports generated layers through a narrow adapter so generator replacement is possible.
-- Release provenance identifies the exact contract digest used.
+- A clean generation job leaves no OpenAPI file in the source tree.
+- The generated default SDK surface contains Runtime Project Auth only.
+- Model tests cover omission/null, unknown fields/enums, bounds, Project/Application identifiers, and secret redaction.
+- Handwritten code imports generated output through a narrow adapter so the generator can be replaced.
+- Release provenance identifies the exact contract digest and server revision.

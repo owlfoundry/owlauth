@@ -16,6 +16,7 @@
     "node": ">=22.13"
   },
   "devDependencies": {
+    "mermaid": "11.16.0",
     "vitepress": "1.6.4",
     "wrangler": "4.114.0"
   }

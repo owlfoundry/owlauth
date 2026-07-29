@@ -1,7 +1,7 @@
 {
   "name": "owlauth",
   "version": "0.0.1",
-  "description": "Integrate applications and developer tooling with OwlAuth using its public protocol and SDK boundaries.",
+  "description": "Integrate applications and developer tooling with OwlAuth Project Auth and its public SDK boundaries.",
   "author": {
     "name": "OwlFoundry",
     "url": "https://github.com/owlfoundry"
@@ -9,12 +9,12 @@
   "homepage": "https://github.com/owlfoundry/owlauth",
   "repository": "https://github.com/owlfoundry/owlauth",
   "license": "BSD-3-Clause",
-  "keywords": ["oauth", "oauth2", "authentication", "sdk"],
+  "keywords": ["authentication", "identity", "project-auth", "sdk"],
   "skills": "./skills/",
   "interface": {
     "displayName": "OwlAuth Integration",
-    "shortDescription": "Public OwlAuth protocol and SDK integration guidance",
-    "longDescription": "Guides server, SDK, and agent integration while preserving the public contract boundary and accurately representing pre-alpha CLI and MCP availability.",
+    "shortDescription": "OwlAuth Project Auth and SDK integration guidance",
+    "longDescription": "Guides Project Auth, SDK, and agent integration while preserving Runtime and Control boundaries and accurately representing pre-alpha CLI and MCP availability.",
     "developerName": "OwlFoundry",
     "category": "Developer Tools",
     "capabilities": ["Read"],

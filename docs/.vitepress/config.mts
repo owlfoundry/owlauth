@@ -2,26 +2,44 @@ import { defineConfig } from "vitepress";
 
 export default defineConfig({
   title: "OwlAuth",
-  description: "Self-hostable OAuth 2.1 authorization server and user management platform",
+  description:
+    "Self-hostable, project-scoped authentication and identity infrastructure",
   cleanUrls: true,
   sitemap: {
     hostname: "https://owlauth.owlfoundry.org",
   },
   head: [["meta", { name: "theme-color", content: "#7c3aed" }]],
+  markdown: {
+    config(markdown) {
+      const defaultFence = markdown.renderer.rules.fence;
+      markdown.renderer.rules.fence = (tokens, index, options, environment, renderer) => {
+        const token = tokens[index];
+        if (token.info.trim().split(/\s+/, 1)[0] === "mermaid") {
+          const encoded = encodeURIComponent(token.content);
+          return `<MermaidDiagram encoded="${encoded}"></MermaidDiagram>`;
+        }
+        return defaultFence?.(tokens, index, options, environment, renderer) ?? "";
+      };
+    },
+  },
   themeConfig: {
     nav: [
       { text: "Guide", link: "/guide/getting-started" },
+      { text: "Architecture", link: "/guide/architecture" },
       { text: "SDKs", link: "/guide/sdks" },
-      { text: "Agent integrations", link: "/guide/agent-integrations" },
+      { text: "CLI & agents", link: "/guide/agent-integrations" },
     ],
     sidebar: [
       {
-        text: "Guide",
+        text: "OwlAuth guide",
         items: [
           { text: "Getting started", link: "/guide/getting-started" },
           { text: "Architecture", link: "/guide/architecture" },
           { text: "SDKs", link: "/guide/sdks" },
-          { text: "Agent integrations", link: "/guide/agent-integrations" },
+          {
+            text: "CLI & agent integrations",
+            link: "/guide/agent-integrations",
+          },
           { text: "Security", link: "/guide/security" },
         ],
       },

@@ -1,58 +1,97 @@
 # 08 — Independent SemVer and releases
 
-## Independent components
+## Independently versioned components
 
-The server and each official SDK have separate SemVer, release tags, registry artifacts, and changelogs:
+The server, CLI, and every official SDK have separate SemVer, tags, artifacts, compatibility statements, and changelogs. For SDKs:
 
-| Component | Package | Tag pattern |
+| Component | Registry identity | Tag pattern |
 | --- | --- | --- |
-| TypeScript | `@owlauth/client` | `typescript-v{version}` |
+| TypeScript | npm `@owlauth/client` | `typescript-v{version}` |
 | Python | distribution `owlauth-client`, import `owlauth` | `python-v{version}` |
-| Rust | `owlauth-client` / `owlauth_client` | `rust-v{version}` |
+| Rust | crate `owlauth-client`, library `owlauth_client` | `rust-v{version}` |
 
-A release in one language MUST NOT require synchronized version bumps in the others. Server and SDK versions do not imply compatibility by numeric equality. Each SDK publishes a tested server contract/version range or compatibility statement.
+An SDK release never requires synchronized server/CLI/other-SDK versions. Equal version numbers do not imply compatibility. Each SDK release identifies the Runtime Project Auth contract/server range it has actually tested.
 
-Current `0.0.1` packages reserve names and expose a minimal base-URL object. Pre-1.0 SemVer allows intentional API iteration but every break is still documented; `0.x` is not permission for silent churn or production-readiness claims.
+Current SDK packages are pre-alpha scaffolds that expose only a base-URL holder. Pre-1.0 SemVer permits deliberate iteration but does not permit silent breaking changes or false claims that Project Auth, PKCE, handoff, refresh, current-user, or logout exists.
+
+## Capability and compatibility statements
+
+Release notes and package metadata distinguish:
+
+- scaffold-only behavior;
+- generated models/low-level operations;
+- mock-tested handwritten lifecycle behavior;
+- shared conformance coverage;
+- real-server E2E coverage;
+- production support, if and when explicitly declared.
+
+Compatibility is expressed by tested Runtime contract digest/range and required capability, not guessed from a server version string alone. An SDK fails clearly when a required Runtime capability is absent.
 
 ## Change classification
 
 Normally breaking:
 
-- removing/renaming public symbols or changing required arguments;
-- changing sync/async behavior, cancellation, retry, or token persistence semantics;
-- narrowing supported server contracts or runtime/toolchain versions;
-- changing semantic error categories or exhaustive variants;
-- changing default TLS/security behavior in a way that breaks valid secure use (security fixes may justify an explicit break).
+- removing/renaming a public symbol or requiring a new argument;
+- changing sync/async, cancellation, retry, redirect, or credential-store behavior;
+- changing Project/Application binding or public configuration semantics;
+- changing PKCE, handoff ambiguity, strict refresh, current-user, or logout behavior;
+- narrowing supported Runtime contracts, language runtimes, or toolchains;
+- changing stable error categories or exhaustive variants;
+- weakening/strengthening a security default in a way requiring caller changes.
 
-Normally additive: new optional configuration, new operation/capability, or new non-exhaustive error detail. Patch changes fix behavior without intentionally changing the documented public contract. Every classification is reviewed in the conventions of that language.
+Normally additive:
+
+- an optional configuration field;
+- a new Project Auth operation/capability;
+- additional forward-compatible response/error detail;
+- a new explicitly selected platform adapter.
+
+Patch changes correct behavior without intentionally changing the documented public contract. Security fixes may require an explicit breaking release and migration guidance. Each language applies its ecosystem conventions under this shared meaning.
 
 ## Release inputs and gates
 
-An SDK release is built from a component tag at the current `main` commit. The tag is the version authority; CI materializes that version in package metadata and lockfiles without a release-only commit. The release includes:
+An SDK release branch/tag points at the current `main` commit under repository release policy. Tag, package metadata, and runtime-reported version agree. Release validation occurs before registry publication and includes:
 
-- pinned/locked supported tooling and dependencies;
-- the generated-contract provenance/digest used, even though OpenAPI is not committed;
-- formatting, lint/type checks, unit and package tests;
-- all shared conformance cases for claimed capabilities;
-- license/readme/package metadata and registry artifact smoke tests;
+- pinned/locked supported tools and dependencies;
+- exact generated Runtime contract source revision and digest;
+- formatting, lint/type checks, unit/package tests;
+- all shared cases for every claimed capability;
+- Project/Application isolation and credential-redaction tests;
+- license, README, package metadata, and clean-install smoke tests;
 - dependency, secret, and artifact inspection;
-- release notes including compatibility and security-relevant behavior.
+- component-specific changelog generated from reviewed PR titles;
+- explicit compatibility and implementation-status notes.
 
-Once OAuth exists, claimed OAuth-capable releases additionally require CI to start a real OwlAuth server and run that SDK plus the cross-language matrix end to end. Until then, package/unit/conformance checks are reported by those names; fake E2E gates MUST NOT be created.
+A release that claims Project Auth behavior additionally starts a real `owlauth-server` Runtime and passes the corresponding SDK and cross-language E2E cases. Until then, CI labels package/unit/fixture/contract checks accurately; mocks are never promoted to E2E.
 
-## Compatibility and deprecation
+## Generated contract coordination
 
-SDKs SHOULD tolerate additive response fields and unknown server error codes according to spec 02/05. They MUST fail clearly when a required capability is unavailable rather than guessing from server version alone. Capability/metadata negotiation, if introduced, becomes part of the public contract.
+A server contract may change without an immediate SDK release. OpenAPI generation remains ephemeral. When an SDK does release generated changes, provenance records the exact contract and generator; drift review confirms Runtime-only surface and the required handwritten lifecycle/error updates.
 
-Deprecations include replacement guidance and persist for a documented period appropriate to the next major release. Security-sensitive behavior may be removed sooner with coordinated advisories and release notes.
+Server changes that are additive may remain compatible with older SDKs under unknown-field/enum policy. Removing or semantically changing a Project Auth operation requires coordinated compatibility/changelog planning but not equal component version numbers.
+
+## Deprecation
+
+Deprecations provide replacement guidance and remain for a documented period appropriate to the next major release. Security-sensitive behavior may be removed sooner with coordinated advisories, explicit release notes, and safe migration instructions.
+
+Deprecated aliases do not weaken Project/Application isolation, PKCE, one-use handoff, refresh replay containment, TLS, or redaction.
 
 ## Artifact policy
 
-Registry artifacts contain only intended source/build output, license, and metadata. They MUST NOT contain repository secrets, test credentials, local paths, temporary OpenAPI documents, caches, virtual environments, or unrelated workspace crates. Installation smoke tests use a clean environment and public import/package names.
+Registry artifacts contain only intended source/build output, license, README, and metadata. They exclude:
+
+- repository or test credentials;
+- local paths, caches, virtual environments, and build workspaces;
+- temporary generated OpenAPI documents;
+- unrelated SDK/server crates or packages;
+- fixtures containing credential-shaped values not explicitly intended and synthetic.
+
+Clean installation verifies the public package/import/crate identity and only implemented examples. Package documentation links the SDK specs and security reporting path.
 
 ## Acceptance criteria
 
 - Tag, package metadata, and runtime-reported version agree.
-- A release can be traced to source, build, dependencies, and contract digest.
-- Compatibility is expressed explicitly, not inferred from matching version numbers.
-- Release notes truthfully distinguish scaffold, implemented operations, and production support.
+- Every release traces source, build, dependencies, generator, and Runtime contract digest.
+- Compatibility is explicit and independent of numeric equality.
+- Changelog and README truthfully distinguish scaffold, implemented operations, conformance, E2E, and production support.
+- No SDK claims Project Auth capability before real-server validation of that capability.
