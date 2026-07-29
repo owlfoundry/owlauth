@@ -4,8 +4,8 @@ Public HTTP request, response, error, and OpenAPI types for [OwlAuth](https://gi
 
 The target contract separates:
 
-- Runtime Project Auth DTOs for public configuration, upstream login initiation, handoff exchange, Project users, sessions, refresh, logout, and public verification keys;
-- Control DTOs for Project, Application, provider, user, policy, key, management, and audit administration;
+- Runtime Project Auth DTOs for public configuration, upstream or passwordless-email login, handoff exchange, revisioned Application user projections, sessions, refresh, logout, and public verification keys;
+- Control DTOs for Project, Application, provider/managed-connection, email/SMTP, user/identity, Application webhook, session, policy, key, management, and audit administration;
 - minimal listener-specific health DTOs.
 
 This crate is the Rust source of generated OpenAPI documents. The target export utility lives in this package and emits complete, separate Runtime and Control documents without compiling `owlauth-server`, as required by [`TS-002`](../../spec/technology/ts-002-hosted-web-and-asset-pipeline.md). It does not provide an HTTP server or client, contain domain entities or database rows, or grant authorization merely by exposing a type.

@@ -42,9 +42,16 @@ The target flow binds Project, Application, provider registration, exact callbac
 - Provider issuer/signature/claims and stable subject are validated by a provider-specific adapter.
 - Local identity lookup uses Project + provider issuer + provider subject—not email or profile fields.
 - Matching email never silently links two users.
-- Provider access and refresh tokens are transient, never returned to Applications, and never retained in public profile data.
+- Provider access tokens are transient. A renewable credential may be retained only as Project/identity/generation-bound encrypted material for adapter-declared bounded profile synchronization; it is never returned to Applications, accepted for caller-selected scopes, or retained in public profile data/webhooks.
 - The final Application redirect carries only a short-lived, one-use, PKCE-bound handoff ticket.
+- Reusing a valid same-Project browser session requires explicit CSRF-bound confirmation, current session/user/auth-age/policy checks, and a transaction-revision race against provider/email selection; page input cannot name the user/session.
 - Handoff consumption and Application-session creation commit atomically. A losing exchange receives no token material.
+
+## Email identity and Application synchronization
+
+Passwordless email uses the same exact Application redirect and PKCE-bound handoff. After server-validated method selection, email challenge requests are enumeration-safe; canonical lookup uses a keyed digest; OTP and magic-link proofs are newest-generation, short-lived, attempt-bounded, and one-use. Challenge plus encrypted mail outbox pinned to one SMTP configuration generation and eligibility revision commit together. Proof completion revalidates that PostgreSQL status/revision, so a committed disable/compromise denies later proof even after physical delivery; SMTP delivery itself never proves identity. A matching provider email never links accounts without recent explicit proof of both identities.
+
+Each Application receives only its policy-approved revisioned projection after its first successful handoff creates an Application-user binding. Webhook events commit durably with the projection mutation, are HMAC-signed, at-least-once, and may duplicate or arrive out of order. Receivers deduplicate immutable event IDs and compare the Application binding's `projection_revision`; `user_revision` separately identifies the Project-user base revision. Endpoint egress is exact/HTTPS, denies redirects and unsafe/private destinations by default, and webhook payloads never contain provider credentials, source payloads, SMTP data, or unrelated Project users. OwlAuth exposes no v1 Runtime directory, SCIM feed, or bulk export.
 
 ## Sessions, refresh, and revocation
 
@@ -98,7 +105,7 @@ Runtime serves the Hosted Authentication UI; Control serves the Management Conso
 
 ## Observability and data disclosure
 
-Logs, traces, metrics, errors, audit events, generated examples, and agent context must never contain provider codes/tokens, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, the operator API key, private keys, full callback URLs, or complete profiles.
+Logs, traces, metrics, errors, audit events, generated examples, and agent context must never contain provider codes/tokens or renewable credentials, email addresses/OTP/magic tokens, SMTP credentials/message bodies, webhook secrets/bodies, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, the operator API key, private keys, full callback URLs, or complete profiles.
 
 Redaction happens before serialization/export. Metrics use bounded-cardinality labels; `belongs_to`, provider subjects, arbitrary URLs, and user profiles are not labels. External errors carry stable safe codes and correlation IDs without revealing cross-Project existence or vendor internals.
 
@@ -108,4 +115,5 @@ Runtime and Control use TLS directly or through declared trusted proxies, separa
 
 No business listener becomes ready before typed configuration, PostgreSQL/schema compatibility, and plane-critical key/data-protection capabilities are valid. Redis failure follows endpoint-specific bounded fallback or fail-closed behavior and never weakens an invariant.
 
-For the complete target rules, see the [Project Auth flow specification](https://github.com/owlfoundry/owlauth/blob/main/spec/03-project-auth-flows-and-security-invariants.md), [operational security specification](https://github.com/owlfoundry/owlauth/blob/main/spec/06-operations-configuration-and-security.md), and repository [`SECURITY.md`](https://github.com/owlfoundry/owlauth/blob/main/SECURITY.md).
+For the complete target rules, see the [Project Auth flow specification](https://github.com/owlfoundry/owlauth/blob/main/spec/03-project-auth-flows-and-security-invariants.md), [operational security specification](https://github.com/owlfoundry/owlauth/blob/main/spec/06-operations-configuration-and-security.md), [identity connection/email/Application sync specification](https://github.com/owlfoundry/owlauth/blob/main/spec/11-identity-connections-passwordless-email-and-user-sync.md), and repository [`SECURITY.md`](https://github.com/owlfoundry/owlauth/blob/main/SECURITY.md).
+com/owlfoundry/owlauth/blob/main/SECURITY.md).

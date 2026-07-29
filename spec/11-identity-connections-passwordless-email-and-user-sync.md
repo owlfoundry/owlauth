@@ -1,0 +1,396 @@
+# 11 — Identity connections, passwordless email, and Application user synchronization
+
+## Scope and product decisions
+
+This document owns three related identity-lifecycle concerns that extend the Project Auth model:
+
+1. **managed upstream identity connections:** OwlAuth may retain a provider-issued renewable credential solely to refresh the linked identity's bounded source profile;
+2. **first-party passwordless email:** a Project may authenticate a verified email identity with a one-time code or one-use magic link delivered through Project-selected SMTP;
+3. **Application user synchronization:** an Application receives a revisioned bounded user projection in Runtime responses and may subscribe to signed, durable asynchronous projection events.
+
+These capabilities remain Project-scoped and use the same Project user, login transaction, handoff, session, and explicit identity-linking rules as specs 03 and 04. They do not turn OwlAuth into an upstream-token broker, mail-marketing service, general event bus, or directory-provisioning product.
+
+The initial profile explicitly excludes:
+
+- returning provider access tokens, refresh tokens, authorization codes, or reusable provider credentials to an Application;
+- proxying arbitrary provider APIs or accepting arbitrary provider scopes for downstream use;
+- silently linking identities because email, name, picture, or another profile field matches;
+- password authentication, password reset, SMS, SAML, SCIM, LDAP, bulk/full user-directory export, or incremental directory feeds;
+- arbitrary webhook event bodies, caller-supplied signing algorithms, and synchronous Application callbacks on a login transaction's critical path.
+
+## External capability check and deliberate differences
+
+The product boundary was checked against current official Auth0 and Firebase documentation rather than inferred from product names:
+
+| Observed pattern | OwlAuth decision |
+| --- | --- |
+| Auth0 supports email OTP and magic links, newest/one-use challenges, short expiry/attempt limits, Application assignment, and custom SMTP. Firebase supports email-link sign-in, verified email ownership, authorized continuation domains, and enumeration protection. | Support both OTP and magic link, with Project/Application/redirect/PKCE binding, generic start responses, Project rate policy, and durable SMTP delivery. |
+| Auth0 keeps identities separate by default and requires proof of both accounts for linking. Firebase links a fresh provider credential to an already authenticated user. | Preserve issuer/subject identity lookup and require explicit recent proof of both identities. Matching verified email may suggest a link in UI but never performs one. |
+| Auth0 can refresh normalized provider profile attributes on first or every login. Firebase exposes one stable local user plus provider-specific profiles. | Store a bounded source profile per identity, map it deterministically into a local projection, and support login-triggered plus provider-capability-gated background refresh. |
+| Auth0 Connected Accounts can store provider tokens for delegated external API use; Firebase browser flows can expose provider OAuth credentials to a client. | Deliberately do not provide that capability. A retained credential is server-only, least-scope, and usable only by the identity-profile synchronization adapter. |
+| Auth0 event streams document duplicate/out-of-order delivery and retries; Firebase exposes auth lifecycle functions and privileged user management/listing. | Provide a smaller per-Application projection webhook with immutable event IDs, monotonic user revisions, HMAC signatures, durable delivery/replay, and no bulk directory API. |
+
+Research sources, snapshots, and the detailed gap analysis are retained in the gitignored `local-reference/identity-expansion/` workspace. The normative behavior is this specification, not competitor behavior.
+
+## Terminology and ownership
+
+| Concept | Meaning |
+| --- | --- |
+| Provider configuration | Project-owned OAuth/OIDC client registration and Application assignment from specs 01–05. It is not a user's consent or credential. |
+| Linked identity | Stable `(project_id, provider_issuer, provider_subject)` proof attached to one Project user. |
+| Managed provider connection | Optional lifecycle and encrypted renewable credential for one linked identity, used only to retrieve that identity's bounded source profile. |
+| Email identity | First-party Project identity proving control of one canonicalized email address; it is not an upstream provider identity. |
+| Email challenge | Short-lived, generation-controlled OTP or magic-link proof bound to one login transaction. |
+| Source profile | Bounded provider/email-origin attributes plus source and observation metadata; never an arbitrary provider payload. |
+| User projection | Versioned, policy-approved representation of one Project user exposed to a particular Application. |
+| Application-user binding | Durable record that the user has been delivered to that Application; it prevents synchronization to unrelated Applications in the Project. |
+| Projection event | Immutable Application-specific snapshot and revision delivered by webhook. |
+
+Spec 04 owns the PostgreSQL representation and transaction constraints. Spec 05 owns stable wire DTOs and routes. Specs 06 and 08 own worker composition, dependency failure, resource limits, and operations. Spec 09 owns browser routes and security. This document owns lifecycle meaning, information-flow limits, and cross-surface behavior.
+
+## Managed upstream provider connections
+
+### Lifecycle
+
+A linked upstream identity may have at most one managed connection for its provider configuration. The connection state is one of:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: callback stores renewable credential
+    Active --> Active: generation-fenced credential replacement or profile sync
+    Active --> ReauthRequired: invalid grant, expired consent, missing scope, or ambiguous rotation
+    Active --> Revoked: provider gives authoritative revocation evidence
+    ReauthRequired --> Active: explicit reauthorization succeeds
+    ReauthRequired --> Disconnected: user or operator disconnects
+    Revoked --> Active: explicit reauthorization succeeds
+    Revoked --> Disconnected: user or operator disconnects
+    Active --> Disconnected: user or operator disconnects
+    Disconnected --> Active: new explicit authorization succeeds
+```
+
+- `active` means a current encrypted renewable credential is available and the provider configuration/identity is eligible for synchronization. It does not guarantee that the remote provider is currently reachable.
+- `reauth_required` means OwlAuth cannot safely renew the credential or required profile consent is no longer sufficient. Automatic refresh stops; ordinary authentication may start a new explicit provider authorization.
+- `revoked` requires provider-origin evidence or a successful explicit provider revocation action. A generic timeout or ambiguous response does not prove revocation.
+- `disconnected` is a local terminalization of the current credential generation. Recoverable credential material is erased or made cryptographically inaccessible and background synchronization stops. A later connection is a new generation.
+
+Provider configuration disablement, Application unassignment, and Project/user disablement are separate authoritative states. They make login/synchronization ineligible without inventing a connection-state transition. Unlinking the linked identity disconnects its managed connection in the same Project transaction and must not leave usable credential material.
+
+### Credential boundary
+
+A provider adapter declares whether it supports renewable profile access, which exact least-privilege scopes it requires, whether refresh tokens rotate, how revocation is classified, and which bounded source fields it can return. Unsupported providers remain login-only and never create a managed connection.
+
+In v1, each renewable credential is versioned, purpose-bound AEAD ciphertext in PostgreSQL. The authenticated context binds deployment, Project, provider configuration, linked identity, connection generation, credential generation, and field purpose. This keeps credential replacement inside one authoritative PostgreSQL transition and avoids an external-secret-store/database dual write. Provider client secrets, SMTP credentials, and webhook secrets remain opaque secret-store references because their lifecycle is configuration-owned rather than a rotating per-user protocol result.
+
+A renewable credential:
+
+- is decrypted only inside the provider-profile synchronization adapter for that exact connection generation;
+- is replaced only by a generation-fenced commit, and every replacement advances the credential/connection generation even when the provider returns an equivalent token value;
+- makes the predecessor locally inaccessible after the replacement commit;
+- never enters Runtime/Control DTOs, user projections, webhook payloads, redirects, logs, audit safe context, Redis, or an Application process;
+- is not usable to request caller-selected scopes or provider resources.
+
+An adapter separately declares whether its read-only profile fetch is safely retryable and whether renewable-credential rotation supports an idempotent replay mechanism. Rotation is never assumed idempotent. A durable renewal operation records the expected/successor generation and attempt identity. Before the external call, OwlAuth commits it as `submitted`; a crash while merely `prepared` permits a new claim, while any crash/lease loss after `submitted` is conservatively ambiguous even if the remote request may not have left the process. If the response is lost or OwlAuth cannot prove whether the provider consumed/rotated the credential, it must not present the old credential again unless that adapter can replay the exact attempt idempotently. Otherwise a guarded commit advances the generation, destroys access to the old credential, and sets `reauth_required`. A received successor credential is protected and committed before any optional read-only profile fetch; failure of that fetch cannot discard or roll back the safer successor.
+
+Provider access tokens obtained by renewal are memory-only and bounded to one synchronization attempt. OwlAuth stores no general provider-token vault. Disconnect attempts provider revocation when the adapter supports it, but local credential destruction does not claim remote revocation after an ambiguous response.
+
+### Login-triggered and background profile synchronization
+
+Provider callback completion always validates the stable issuer/subject first. It then maps a bounded callback profile and, only when explicit consent yielded a renewable credential, prepares a managed-connection update. Profile mapping has an allowlisted schema, per-field size limits, source timestamps, and a deterministic precedence policy. Provider payload extensions are ignored unless a reviewed adapter revision admits them.
+
+```mermaid
+sequenceDiagram
+    participant Trigger as Login or sync scheduler
+    participant Core as IdentityConnectionService
+    participant PG as PostgreSQL
+    participant Provider
+    participant Protect as Credential protector
+
+    Trigger->>Core: Synchronize(connection_id, expected generation)
+    Core->>PG: Claim eligible generation and create renewal operation when needed
+    PG-->>Core: fenced snapshot and protected credential, or not eligible
+    Core->>Protect: Decrypt exact generation in protected memory
+    alt credential renewal required
+        Core->>Provider: Submit one fenced renewal attempt
+        Provider-->>Core: successor credential or classified/ambiguous result
+        Core->>Protect: Protect successor before persistence
+        Core->>PG: Commit successor and advance generation before profile fetch
+        PG-->>Core: replacement committed or stale conflict
+    end
+    Core->>Provider: Fetch bounded profile with current access
+    Provider-->>Core: bounded profile or retryable read failure
+    Core->>PG: Commit profile under current generation/provider/user guards
+    PG-->>Core: updated source profile and user revision, or conflict
+    Core-->>Trigger: success, reschedule, reauth, revoked, or retry class
+```
+
+No PostgreSQL transaction is held during provider I/O. A short claim/lease bounds concurrent work but is not authority. Read-only profile fetch may be retried only when the adapter declares it safe. Renewal uses the durable operation and expected generation; lease loss after credential submission is an ambiguous protocol outcome, not permission to reuse the predecessor. Final compare-and-swap on connection generation and captured revisions rejects output from a stale, disconnected, unlinked, disabled, or reauthorized connection.
+
+- Login-triggered sync uses the callback result and must not make handoff completion depend on a second optional provider call when required identity claims are already validated. A callback-provided renewable credential still commits as a new generation before later optional sync.
+- Background sync is enabled only by Project policy and adapter capability, uses bounded jittered scheduling, and has per-Project/provider concurrency and retry budgets.
+- Transient read-only profile failures retain `active`, record a safe failure class, and reschedule with bounded exponential backoff. A transient renewal response is retryable only through an adapter-declared idempotent replay of the same durable attempt.
+- `invalid_grant`, expired consent, required-scope loss, or an ambiguous non-replayable rotation moves to `reauth_required` under the expected-generation guard; provider-confirmed revocation moves to `revoked`.
+- Profile changes advance `project_users.user_revision` only when the materialized Application-visible base projection or user security state changes. Observation timestamps alone do not create revision churn.
+- Every successfully committed renewable-credential replacement advances generation, supersedes prior material, and may restore `active`; this rule is not limited to login.
+
+## First-party passwordless email
+
+### Email identity and linking
+
+An email identity is unique by its canonical address within a Project. OwlAuth applies one versioned canonicalization algorithm before computing versioned keyed lookup digests; it does not perform provider-specific dot removal, plus-address rewriting, Unicode guessing, or mailbox equivalence. Each identity can retain old/new lookup aliases during digest-key rotation. Lookup computes every accepted version, creation rejects a match under any accepted alias, and rotation backfills/uniqueness-checks the new alias before switching writes, so key rotation cannot create a duplicate identity. The recoverable normalized address is protected as Project PII and is returned only when Project/Application projection policy allows it.
+
+Successful OTP or magic-link completion proves control of that email address for that challenge and creates or resolves the Project email identity atomically. It never searches provider identities by email and never attaches itself to a different existing user merely because a provider profile has the same email. Linking an email identity to an existing provider-backed user requires a valid recent Project browser/user session plus fresh email proof; linking two existing users requires the explicit merge rules from spec 04 and fresh proof of both sides.
+
+### Login start, method selection, and challenge creation
+
+The Application starts one generic login transaction with active Project/Application, exact redirect, PKCE S256, bounded Application state, trusted Runtime origin, and a snapshot of all currently assigned methods. It may supply a safe presentation hint, but cannot select or start a provider/email proof. The Hosted UI renders only that snapshot. One explicit Runtime command compare-and-swap selects exactly one method while revalidating current assignment/policy: provider selection starts upstream authorization; email selection moves to address entry, and a later explicit email-challenge command accepts the address and creates the newest challenge/outbox. Once provider exchange or email proof state begins, the method cannot change. Restart creates a new transaction.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant App as Application / SDK
+    participant Hosted as Hosted Authentication UI
+    participant Runtime
+    participant Core as Login and PasswordlessEmail services
+    participant PG as PostgreSQL
+    participant Mail as SMTP delivery worker
+
+    User->>App: Choose sign in
+    App->>Runtime: Begin generic login with exact redirect and PKCE challenge
+    Runtime->>Core: BeginLogin(command, optional safe method hint)
+    Core->>PG: Create bound transaction with allowed-method revision snapshot
+    Runtime-->>App: Hosted interaction URL
+    User->>Hosted: Open interaction and choose email
+    Hosted->>Runtime: Select email method with CSRF and expected transaction revision
+    Runtime->>Core: SelectAuthenticationMethod(command)
+    Core->>PG: CAS method from unselected to email
+    Hosted->>Runtime: Submit email and request challenge
+    Runtime->>Core: BeginEmailChallenge(command)
+    Core->>PG: Create newest challenge generation and pinned mail outbox atomically
+    Core-->>Runtime: Generic accepted result
+    PG-->>Mail: Claim durable mail job after commit
+    Mail-->>User: OTP and/or one-use magic link
+    User->>Hosted: Enter OTP or open magic link
+    Hosted->>Runtime: Complete bound challenge proof
+    Runtime->>Core: VerifyEmailChallenge(command)
+    Core->>PG: Atomically consume newest challenge, resolve identity/user, create browser session and handoff
+    PG-->>Core: committed login result
+    Core-->>Runtime: exact Application redirect plus handoff and app_state
+    Runtime-->>User: Redirect only to stored exact Application URL
+```
+
+The email-challenge response is generic and materially equivalent whether the address is new, existing, disabled, blocked by sign-up policy, or rate-limited. When policy forbids new users, OwlAuth may suppress delivery for an unknown digest but does not disclose that choice. Rate policy combines Project, Application, keyed email digest, trusted client address, and abuse signals without using raw email as a metric label or log field. Transaction state/revision, browser binding, same-origin CSRF, allowed-method snapshot, and current method-policy revision govern every selection/address/resend/proof command.
+
+Creating a challenge and its mail-outbox item is one PostgreSQL transaction. SMTP is never called inside it. A challenge binds:
+
+- Project, Application, exact redirect entry, PKCE S256 challenge, login transaction, and relevant revisions;
+- canonical email lookup digest and recoverable address ciphertext/reference;
+- allowed proof set (`otp`, `magic_link`, or both), parent generation/expiry, and per-proof digest/attempt policy;
+- browser interaction where policy requires it, without weakening Application PKCE when a link opens in another user agent;
+- exact Project/default SMTP selection, nullable Project configuration ID, generation, and security-eligibility revision shared by the challenge and its outbox row.
+
+Issuing generation `n+1` invalidates every older unconsumed generation for the same login/email challenge family. Mail retries may produce duplicate copies of the same generation; they never mint a new proof. A new proof requires a new committed generation.
+
+### OTP and magic-link proof
+
+- OTPs are CSPRNG-generated, fixed-length values stored only as a keyed digest with key-version metadata. Comparison is constant-time after bounded structural parsing. Server-enforced v1 floors/ceilings require at least 6 decimal digits, at most 10 minutes of validity, and at most 5 failed attempts per generation.
+- A failed OTP attempt increments the authoritative attempt count atomically. Exhaustion terminalizes that generation. Resend is no faster than once per 30 seconds, at most 5 challenge generations may be issued per login transaction, and the complete login transaction lasts at most 30 minutes. Project policy may tighten but never weaken these limits; deployment-wide abuse controls may be stricter.
+- Magic-link tokens contain at least 128 bits of CSPRNG entropy, are valid for at most 30 minutes and never beyond their login transaction, and are stored only as keyed digests. The email link carries the raw proof in the URL fragment so it is not sent in the initial HTTP request; the Hosted UI removes it from URL/history immediately, then requires an explicit user Continue action that submits a same-origin CSRF-protected POST. Link-preview/security scanners performing GET cannot consume the challenge. Hosted pages load no third-party content and use `no-store`/strict referrer policy.
+- OTP and magic-link proofs are separate children of one challenge generation when both are enabled. Exactly one verifier can transition the parent newest challenge from pending to consumed, invalidating every sibling proof. Concurrent or later submissions receive the same generic invalid/expired result and cannot receive handoff material.
+- Completion revalidates Project/Application/email-method/user status, exact redirect registration, transaction and challenge generation, PKCE challenge, and policy/security revisions.
+- The final transaction resolves or creates the email identity and Project user, creates the Project browser session and one-use handoff, advances `user_revision` when necessary, re-materializes/events only already-existing bounded Application bindings affected by that user change, and audits the safe outcome. The initiating Application's first binding/projection is still created only by successful handoff exchange.
+
+The email proof never directly returns an access or refresh token. It produces the ordinary one-use PKCE-bound handoff from spec 03, preserving one downstream protocol across provider and email methods.
+
+### SMTP configuration and durable delivery
+
+A Project may select exactly one active SMTP configuration generation. It contains bounded host/port/TLS mode, safe sender/reply metadata, template/locale configuration, revision/generation, and an opaque credential secret reference. Passwords or API credentials are write-only Control input and are committed through the Project-scoped secret-store adapter; PostgreSQL, DTOs, Console state after submission, audit, and logs retain only the opaque reference and safe version metadata. Production SMTP permits implicit TLS or mandatory STARTTLS with hostname and certificate validation and no downgrade. Plaintext SMTP is available only behind explicit development configuration for loopback destinations and is never a default or Project-selectable production mode.
+
+Configuration precedence is explicit:
+
+1. use the active Project SMTP configuration when present;
+2. otherwise use the deployment default only when the Project explicitly enables `allow_deployment_default` and that default is configured;
+3. otherwise email authentication is unavailable for that Project and cannot be advertised by public auth configuration.
+
+There is no implicit cross-Project fallback or borrowing of another Project's sender, templates, credentials, rate budget, or delivery health. The Console offers a test-delivery command whose recipient and result are bounded/audited; successful test delivery does not activate a configuration without the explicit lifecycle command.
+
+At enqueue, both challenge and mail outbox immutably snapshot `smtp_selection_kind` (`project` or `deployment_default`), nullable Project SMTP configuration ID, and exact SMTP generation plus security-eligibility revision. Project SMTP configuration generations and deployment-default generations have authoritative PostgreSQL status/revision metadata; the latter contains only a safe fingerprint that must match the process-configured handle, never secret bytes. A worker resolves only that pinned generation; replacing configuration never retargets pending mail.
+
+Planned rotation selects a new generation while retaining an old generation's eligibility revision only through the maximum usefulness of its associated challenges. Disabling or marking either kind of generation compromised atomically advances its PostgreSQL status/revision. Every subsequent mail claim and proof-completion transaction revalidates the pinned generation and revision, so it fails closed immediately after that commit; bounded cleanup then terminalizes/cancels pending jobs and challenges. One SMTP attempt already in flight may complete physically, but the delivered proof cannot authenticate after the eligibility revision changed.
+
+Sensitive payload columns are encrypted and subject to short retention. Workers claim with leases, use stable message IDs, set strict connect/TLS/command/data deadlines, classify SMTP responses, retry transient failures with bounded jitter, terminalize permanent failures, and never retry beyond challenge usefulness. SMTP provides at-least-once attempt semantics; challenge one-use semantics preserve authentication correctness if a message is delivered more than once.
+
+## Revisioned Application user projection
+
+### Projection contract
+
+Every handoff exchange, successful refresh, and current-user response returns the same versioned projection shape for that Application and includes at least:
+
+| Field | Meaning |
+| --- | --- |
+| `user_id` | stable Project-scoped local subject |
+| `user_revision` | monotonic Project-user base profile/security revision |
+| `projection_revision` | monotonic revision of this Application-user materialized projection, including relevant Project/Application projection-policy changes |
+| `projection_schema` | additive wire-schema identifier understood by the SDK |
+| `status` | bounded Application-visible active/disabled state |
+| `profile` | Project policy-approved fields such as display name, picture, locale, and verified email |
+| `identities` | optional bounded presentation metadata such as method/provider display key; never issuer subject unless explicitly safe policy allows it |
+| `created_at`, `updated_at` | bounded local lifecycle timestamps |
+
+Provider payloads, source-profile fields not admitted by policy, provider subjects by default, connection credential/status internals, SMTP data, secret references, Control metadata, `belongs_to`, and provider tokens are absent. Access-token claims and user projections remain separate contracts; `user_revision` does not imply that every projection field belongs in a JWT.
+
+A deterministic mapper combines local operator-managed attributes and bounded source profiles using explicit per-field ownership/precedence. By default an explicitly set local field wins; otherwise only the user's designated primary profile identity may supply provider-owned display fields, while a first-party email identity supplies only its verified email field. The identity that creates the user becomes the initial primary source. Linking or synchronizing another identity never changes that designation implicitly; unlinking the designated source must atomically select another proven source or clear its source-owned materialized fields. An upstream source cannot overwrite local security status, identifiers, policy, or operator-owned attributes. Canonical base-profile comparison advances `user_revision` only for base/security changes; each Application binding separately compares its canonical projection digest and advances `projection_revision` when either that base or relevant Project/Application projection policy changes. Timestamp-only observations advance neither revision.
+
+A user-base mutation can fan out only across the Project's bounded Application-binding limit and commits each affected projection and, when the webhook event contract is installed, immutable event atomically with that mutation. A Project/Application projection-policy update does not update an unbounded directory in its command transaction: it commits the policy revision plus a durable expansion operation. Runtime detects a stale policy snapshot and re-materializes the requested binding before returning a projection; Runtime-capable workers scan affected bindings in bounded resumable batches, and each binding's projection revision/event/delivery commits atomically. Policy commit therefore makes new reads authoritative immediately and webhook convergence durable without one unbounded transaction.
+
+### Application-user visibility boundary
+
+Applications in one Project share a user directory for authentication, but an Application does not automatically receive every user in that Project. The first successful handoff exchange for `(project_id, application_id, user_id)` creates an Application-user binding and the initial materialized projection in the handoff transaction. Only an existing active binding can receive later projection webhooks. Deploying webhook support or creating an endpoint later does not invent a retroactive `user.projection.created` event for an existing binding; the Application already received that snapshot in its handoff. A later real projection change emits `updated` or `disabled` as applicable. Disabling an Application stops delivery; removing a webhook endpoint does not delete the binding or user.
+
+There is no Runtime list-all-users or change-feed endpoint. Control can search users for administration under the deployment operator key, but that capability is never added to Runtime SDKs.
+
+## Signed Application webhooks
+
+### Endpoint and event model
+
+An Application may have a bounded number of active webhook endpoints configured through Control. Each endpoint has an immutable exact HTTPS URL, subscribed event types, status, secret versions, delivery policy, and safe health metadata. A URL change creates and tests a new endpoint resource before disabling the old one; pending/history from the old endpoint is never silently retargeted.
+
+Private/loopback destinations are denied by default; an operator may enable specific private destinations only through deployment egress allowlists. Creation, testing, and every delivery attempt resolve and validate the complete CNAME chain plus every A/AAAA result; any denied answer rejects the destination. The attempt connects only to one validated pinned IP while preserving the configured hostname for TLS SNI, certificate verification, and HTTP `Host`. Redirects are not followed. IPv4-mapped IPv6, link-local, cloud-metadata, cross-plane listener, mixed public/private answers, and DNS rebinding are handled as denied destinations. An outbound proxy is permitted only when it enforces equivalent resolution and destination policy and cannot bypass OwlAuth's allow/deny decision.
+
+The initial event vocabulary is deliberately small:
+
+- `user.projection.created` — first Application-user binding and projection;
+- `user.projection.updated` — later projection digest/revision change;
+- `user.projection.disabled` — user state becomes unusable by that Application.
+
+An immutable event contains `event_id`, event type, Project/Application public IDs, Project-scoped user ID, `user_revision`, Application-specific `projection_revision`, projection schema, occurred time, and the bounded Application-specific projection snapshot appropriate to the type. It contains no credentials or fields beyond the corresponding Runtime projection policy.
+
+The user/profile mutation, Application-specific materialized projection, immutable event, delivery-outbox target, and audit record commit atomically. A successful login or Control mutation never waits for an Application endpoint. Project policy bounds Applications/endpoints per user mutation so transactional fan-out cannot be unbounded.
+
+```mermaid
+sequenceDiagram
+    participant Core as Identity or session service
+    participant PG as PostgreSQL and outbox
+    participant Worker as Webhook worker
+    participant App as Application endpoint
+    participant Control
+
+    Core->>PG: Commit user revision, Application projection, immutable event, delivery target
+    PG-->>Core: authoritative success
+    Worker->>PG: Claim due delivery with lease
+    PG-->>Worker: immutable body, endpoint, secret version
+    Worker->>App: POST signed body with event ID and attempt timestamp
+    alt 2xx
+        App-->>Worker: accepted after durable receiver enqueue
+        Worker->>PG: Mark delivered
+    else transient or ambiguous
+        Worker->>PG: Record safe class and schedule bounded retry
+    else permanent or exhausted
+        Worker->>PG: Mark terminal and update endpoint health
+        Control->>PG: Request authorized replay of immutable event
+    end
+```
+
+### Signature and receiver semantics
+
+For each attempt OwlAuth sends:
+
+```text
+OwlAuth-Webhook-Id: <immutable event_id>
+OwlAuth-Webhook-Timestamp: <attempt unix seconds>
+OwlAuth-Webhook-Signature: v1=<unpadded-base64url(HMAC-SHA-256(secret, timestamp "." event_id "." raw_body))>[,v1=<overlap-signature>]
+```
+
+The exact canonical byte grammar, comma/whitespace rules, maximum signature count, and shared conformance fixtures live with the public Control/Application integration contract. The attempt timestamp is regenerated and re-signed for retry/replay while `event_id`, event occurrence time, payload, `user_revision`, and `projection_revision` remain immutable. Receivers verify the exact raw body, supported signature version, bounded clock window, signed header event ID, and at least one active/overlap signature. The `OwlAuth-Webhook-Id` value must exactly equal the body `event_id`; mismatch is rejected before deduplication. Receivers durably deduplicate `event_id` and ignore a projection revision older than the stored revision for that Application user. Delivery is at least once and ordering is not guaranteed across endpoints or attempts.
+
+Endpoint secret material is generated by OwlAuth or accepted as write-only input, shown at most once when policy permits, and stored behind a Project/Application-scoped secret reference. Rotation is staged: create/show a pending new version, let the receiver install it, explicitly activate it, emit both old/new `v1` signatures for a bounded overlap, then retire the old version. A failed/abandoned preparation never changes signing. Disabling an endpoint stops new claims while preserving event/delivery history for bounded inspection.
+
+Control may inspect safe delivery status and replay an existing immutable event to the same eligible endpoint. Replay creates a new attempt/delivery record; it cannot edit payload, change target Application/user, substitute a URL, or regenerate current user data under an old event ID. Arbitrary event injection is forbidden.
+
+### Retry and retention
+
+Webhook connect/TLS/request/response deadlines, response-size limits, per-endpoint concurrency, and Project quotas are bounded. A `2xx` response acknowledges delivery; redirects are permanent policy failures; retryable transport/`408`/`425`/`429`/selected `5xx` outcomes use bounded exponential backoff with jitter and optional bounded `Retry-After`; other `4xx` outcomes are terminal unless an operator explicitly replays after correction. An ambiguous lost response is retryable and may duplicate delivery.
+
+Immutable event retention is longer than the supported replay window. Delivery metadata excludes response bodies and stores only status, safe outcome class, attempt count, timestamps, and correlation. Payload/PII retention is documented, bounded, and erased independently of append-only security audit requirements.
+
+## Control and Hosted UI workflows
+
+### Control lifecycle
+
+The ordinary Control API and Console support:
+
+- provider adapter capability inspection; connection/profile sync policy; per-user connection state, last safe outcome, next sync, explicit synchronize, reauthorize guidance, revoke, and disconnect;
+- email-method enablement and Application assignment; OTP length/expiry/attempt/resend bounds; magic-link expiry; sign-up and linking policy;
+- create/test/activate/replace/disable/mark-compromised Project SMTP generations; separately reconcile/activate/disable/mark-compromised deployment-scoped default-generation eligibility against the process-configured safe fingerprint; configure each Project's explicit default opt-in; inspect safe delivery health; preserve write-only secret handling;
+- user source/profile provenance, `user_revision`, email/provider identities, explicit link/unlink/merge with fresh-proof requirements, and Application bindings;
+- webhook endpoint create/test/activate/rotate-secret/disable, event subscription, delivery health, immutable event inspection, and authorized replay.
+
+A Control key can administer these resources deployment-wide but cannot retrieve stored provider/SMTP/webhook secrets. Commands use expected revisions, idempotency where an external secret or delivery side effect could duplicate, explicit confirmation for disconnect/unlink/merge/revoke, and same-transaction audit where required.
+
+### Hosted Authentication UI
+
+The Runtime Hosted UI expands its stored transaction-driven flow without becoming a generic account portal:
+
+```mermaid
+flowchart TD
+    Open[Open bound hosted interaction] --> Methods[Render only assigned active methods]
+    Open --> Reuse[Optional explicit continue as eligible Project browser session]
+    Reuse --> Result[Resolve identity and handoff]
+    Methods --> Provider[Continue upstream provider]
+    Methods --> Email[Enter email]
+    Email --> Sent[Show enumeration-safe check-email or OTP screen]
+    Sent --> OTP[Submit OTP]
+    Sent --> Link[Open link and stage fragment proof]
+    Link --> Confirm[Explicit same-origin Continue POST]
+    Provider --> Result[Resolve identity and handoff]
+    OTP --> Result
+    Confirm --> Result
+    Result --> Return[Exact stored Application redirect]
+    Result --> LinkChoice[Optional explicit link flow when already authenticated]
+    LinkChoice --> Proof[Fresh proof of both identities]
+    Proof --> Result
+```
+
+Method keys, branding, email address, challenge kind, and next actions come from the persisted transaction and public Project policy. Page/query input cannot enable an unassigned method or replace Application, redirect, PKCE, provider, or Project. Email entry, resend, OTP, expired-link restart, connection reauthorization, and explicit-link screens use generic errors and preserve the route/cookie/CSP/redaction requirements of spec 09.
+
+## Security, consistency, and failure rules
+
+1. PostgreSQL remains authority for connection generation/state, email challenge one-use state, identity uniqueness, user revision, Application visibility, event immutability, and outbox/delivery state. Redis may coordinate rate limits or cache safe presentation only.
+2. Provider, secret-store, SMTP, and webhook calls never occur while a business PostgreSQL transaction is held. External results commit only under captured revision/generation guards.
+3. Mail and webhook delivery are asynchronous correctness-preserving side effects. Their outage can make email login or synchronization delivery unavailable/degraded but cannot authorize, link, consume, or mutate identity from stale state. Email proof completion conditionally revalidates its pinned SMTP generation/revision, so a committed compromise wins over later proof use even if mail was already delivered.
+4. Worker leases are recoverable scheduling aids. Lease loss may duplicate read-only profile fetch or delivery work but is not permission to repeat a non-idempotent renewable-credential rotation. It cannot duplicate challenge consumption, credential-generation activation, event identity, or user revision.
+5. Every secret/ciphertext uses purpose and Project/Application/identity context. Short-term transaction/challenge/outbox key loss terminalizes affected work. Long-term email PII and active managed credentials require proven re-encryption/rewrap before an old protector key retires.
+6. Raw email, OTP, magic token, provider credentials/payloads, SMTP body, webhook secret/body, and full user projections are denied from ordinary logs, metrics, traces, error reports, audit safe context, and agent output.
+7. Current-user/handoff/refresh projection reads observe authoritative user/Application policy and revision. A disabled user cannot be made active by stale provider sync or webhook state.
+8. Backup/restore includes email canonicalization/digest key versions and aliases, long-term email PII protector versions, managed-credential ciphertext and AEAD keys, retained mail challenge/outbox protector versions, SMTP/webhook secret references and overlap generations, projection expansions/events/deliveries, and required signer/schema state. Missing short-term keys terminalize the affected transactions/jobs; missing long-term PII/active-credential keys keep the affected capability unready and require recovery or explicit destructive reauthorization. Restored workers resume only from committed generation/cursor/outbox state.
+
+## Acceptance criteria
+
+This concern is implemented only when all of the following hold:
+
+1. provider adapters explicitly declare managed-sync capability and least scopes; login-only adapters retain no renewable credential;
+2. active/reauth-required/revoked/disconnected transitions, credential rotation, stale-result rejection, disconnect erasure, and provider failure classification pass concurrency and recovery tests;
+3. provider tokens cannot appear in any Runtime/Control DTO, Application projection/webhook, redirect, Redis value, log, audit safe context, or browser asset/configuration;
+4. email OTP and magic-link starts are enumeration-safe and bind the exact Project/Application/redirect/PKCE transaction; newest-generation, expiry, attempt, one-use, concurrent verification, and restart behavior are tested;
+5. no matching provider/email profile silently links users; explicit linking proves both identities recently and merge preserves Project/issuer/subject uniqueness;
+6. Project SMTP, explicit deployment fallback, write-only secrets, test/activate transitions, production TLS/no-downgrade policy, immutable challenge/outbox generation+revision pinning, disable/compromise versus proof-completion races, in-flight delivery followed by proof denial, durable outbox, duplicate delivery, retry cutoff, and redaction have integration tests;
+7. handoff, refresh, and current-user return one generated-contract projection with monotonic `user_revision` and Application-specific `projection_revision`; source observation-only changes churn neither, while relevant projection-policy changes advance only affected bound projections;
+8. an Application receives events only after its own Application-user binding and never receives another Application's projection or an unrelated Project user;
+9. webhook events and payloads commit with the materialized projection, retain both revisions immutably on retry/replay, sign `timestamp.event_id.raw_body`, reject header/body ID mismatch, tolerate duplicates/out-of-order delivery, and enforce DNS-chain/IP-pinning/proxy/redirect/response bounds;
+10. Control and Hosted UI workflows preserve plane separation, expected revisions, idempotency, exact redirects, generic errors, accessibility, and no browser secret persistence;
+11. worker shutdown/restart, expired leases, PostgreSQL/Redis/provider/SMTP/endpoint outages, backup/restore, and secret/protector rotation preserve the failure rules above;
+12. SCIM, bulk directory, arbitrary provider API access, provider-token brokering, password authentication, and silent email linking are absent from routes, DTOs, UI claims, and documentation.
+
+## Official comparison sources
+
+- [Auth0: Passwordless Authentication with Email](https://auth0.com/docs/authenticate/passwordless/authentication-methods/email-otp)
+- [Auth0: Passwordless Authentication with Magic Links](https://auth0.com/docs/authenticate/passwordless/authentication-methods/email-magic-link)
+- [Auth0: Configure an Email Provider using SMTP](https://auth0.com/docs/customize/email/smtp-email-providers/configure-custom-external-smtp-email-provider)
+- [Auth0: Configure Identity Provider Connection for User Profile Updates](https://auth0.com/docs/manage-users/user-accounts/user-profiles/configure-connection-sync-with-auth0)
+- [Auth0: User Account Linking](https://auth0.com/docs/manage-users/user-accounts/user-account-linking)
+- [Auth0: Connected Accounts for Token Vault](https://auth0.com/docs/secure/tokens/token-vault/connected-accounts-for-token-vault)
+- [Auth0: Events Best Practices](https://auth0.com/docs/customize/events/events-best-practices)
+- [Firebase: Email Link Authentication](https://firebase.google.com/docs/auth/web/email-link-auth)
+- [Firebase: Account Linking](https://firebase.google.com/docs/auth/web/account-linking)
+- [Firebase: Manage Users](https://firebase.google.com/docs/auth/web/manage-users)
+- [Firebase: Admin User Management](https://firebase.google.com/docs/auth/admin/manage-users)
+- [Firebase: Extend Authentication with Cloud Functions](https://firebase.google.com/docs/auth/extend-with-functions)

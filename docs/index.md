@@ -24,8 +24,12 @@ features:
     details: Each Project owns its users, linked identities, provider configuration, sessions, refresh families, token namespace, and signing keys.
   - title: Application sharing
     details: Web, mobile, native, and server Applications inside one Project share its user directory and Project token trust boundary.
-  - title: Upstream federation
-    details: OwlAuth uses OAuth or OIDC only with upstream identity providers such as GitHub, Google, or a configured OIDC issuer.
+  - title: Upstream federation and managed profiles
+    details: OwlAuth uses OAuth or OIDC only with upstream identity providers and may retain a server-only least-scope renewable credential for bounded profile synchronization.
+  - title: Passwordless email
+    details: Projects can host OTP and magic-link authentication through Project-selected SMTP, with one-use proofs and no silent email linking.
+  - title: Application user synchronization
+    details: Applications receive bounded revisioned user projections and optional signed durable webhooks only for users already bound to them.
   - title: Runtime and Control separation
     details: Public authentication traffic and privileged administration use isolated listeners and policies over one shared application and domain core.
   - title: Hosted web surfaces
@@ -62,7 +66,7 @@ OwlAuth owns authentication, identity linking, Project sessions, and Project tok
 
 ## OAuth/OIDC is upstream only
 
-OwlAuth brokers sign-in to a Project's configured upstream provider, then returns an OwlAuth Project user and session credentials through a one-use, PKCE-bound handoff. Downstream Applications consume the **Project Auth API**; they do not register general OAuth grants or receive OAuth/OIDC tokens from OwlAuth.
+OwlAuth can broker sign-in to a Project's configured upstream provider or verify a first-party email OTP/magic link, then returns an OwlAuth Project user projection and session credentials through the same one-use, PKCE-bound handoff. Downstream Applications consume the **Project Auth API**; they do not register general OAuth grants or receive OAuth/OIDC provider tokens from OwlAuth.
 
 A Project access token is an OwlAuth application-session JWT. It is not an upstream provider token and it does not make OwlAuth a general-purpose OAuth authorization server.
 

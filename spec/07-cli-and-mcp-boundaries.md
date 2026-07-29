@@ -48,7 +48,7 @@ sequenceDiagram
     participant PG as PostgreSQL
 
     Admin->>Gateway: Request Project administration
-    Gateway->>Gateway: Authenticate caller; enforce external membership and RBAC
+    Gateway->>Gateway: Authenticate caller and enforce external membership/RBAC
     Gateway->>Control: Exact belongs_to lookup using operator Bearer key
     Control->>Core: Execute deployment-operator query
     Core->>PG: Read Project ID and metadata revision
@@ -110,7 +110,7 @@ sequenceDiagram
     Agent->>Adapter: Preview typed Project command
     Adapter->>Adapter: Authenticate deployment operator key
     Adapter->>Core: Calculate safe summary
-    Core->>PG: Read revisions; store confirmation digest
+    Core->>PG: Read revisions and store confirmation digest
     PG-->>Core: Authoritative snapshot + capability record
     Core-->>Agent: Redacted summary + raw capability
     Agent->>Adapter: Commit exact command + capability

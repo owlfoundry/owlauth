@@ -80,8 +80,11 @@ Forbidden dependencies apply transitively:
 | `ProjectApplicationService` | create/disable Project, read/update metadata, set `belongs_to` | Control |
 | `ApplicationConfigurationService` | register/disable Application, manage origins, redirects, publishable key revisions | Control; Runtime reads authoritative state |
 | `ProviderConfigurationService` | configure per-Project provider client registrations/secrets and assign them to Applications | Control; Runtime uses active assigned configuration |
-| `LoginApplicationService` | begin login, validate provider callback, complete one-use handoff | Runtime |
-| `IdentityApplicationService` | resolve/create Project user, link/unlink provider identity, disable/merge user | Runtime and Control with command-specific authorization |
+| `IdentityConnectionService` | retain/rotate a renewable profile credential, synchronize bounded source profile, reauthorize/revoke/disconnect | Runtime login and bounded workers; Control lifecycle commands |
+| `PasswordlessEmailService` | begin/verify OTP or magic-link proof, resolve email identity, enqueue challenge delivery | Runtime; Control configures policy/SMTP |
+| `LoginApplicationService` | begin login, validate provider or email completion, complete one-use handoff | Runtime |
+| `IdentityApplicationService` | resolve/create Project user, explicitly link/unlink proven identities, disable/merge user, materialize user revision | Runtime and Control with command-specific authorization |
+| `ApplicationUserSyncService` | maintain Application-user binding/projection, append immutable events, administer endpoint delivery/replay | Runtime/identity mutations append; Control configures and inspects |
 | `SessionApplicationService` | create/validate Project browser session, issue Application session, terminate session | Runtime; Control can revoke through administrative commands |
 | `TokenApplicationService` | issue Project access token, rotate refresh family, revoke family | Runtime |
 | `ProjectPolicyService` | manage token claims, lifetimes, provider/app admission, and session policy | Control writes; Runtime evaluates |
@@ -122,7 +125,10 @@ Application-owned ports expose semantics rather than vendor APIs:
 - `UnitOfWork` and repositories with Project qualification, isolation, conditional mutation, and conflict classification;
 - `Signer` and `VerificationKeyDirectory` keyed by Project/key-ring purpose and opaque key references;
 - `DataProtector` for integrity-bound encryption of recoverable login state;
-- `UpstreamProviderClient` with bounded authorization URL, code exchange, issuer/subject validation, and profile retrieval;
+- `UpstreamProviderClient` with bounded authorization URL, code exchange, issuer/subject validation, profile retrieval, and adapter-declared renewable-profile capability; it exposes no generic provider API or downstream token export;
+- `ProviderCredentialProtector` for Project/identity/generation-bound renewable credential encryption and rotation;
+- `ProjectSecretStore` for write-only provider, SMTP, and webhook secret provisioning through opaque references;
+- `MailDelivery` and `WebhookDelivery` with exact envelope/endpoint, deadlines, response classification, and no authority over durable outbox state;
 - `Cache` for disposable values and `RateLimiter` for coordinated admission control;
 - `Clock` and `EntropySource`;
 - `AuditSink` only for events not required in the same PostgreSQL transaction;

@@ -2,7 +2,7 @@
 
 The server library and `owlauth-server` executable for [OwlAuth](https://github.com/owlfoundry/owlauth), a self-hostable Project Auth and identity service.
 
-OwlAuth's target architecture isolates users, linked identities, upstream provider configuration, sessions, tokens, and signing keys by Project. Applications and end users use the Runtime Project Auth API plus its Hosted Authentication UI, while operators use the separately exposed Control API and embedded Management Console. OAuth/OIDC is used only to federate with upstream identity providers; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server.
+OwlAuth's target architecture isolates users, provider/email identities, managed profile connections, SMTP, Application projections/webhooks, sessions, tokens, and signing keys by Project. Applications and end users use the Runtime Project Auth API plus its Hosted Authentication UI for upstream federation or passwordless email, while operators use the separately exposed Control API and embedded Management Console. OAuth/OIDC is used only to federate with upstream identity providers; provider credentials remain server-only for bounded profile sync and OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server.
 
 > OwlAuth is pre-alpha. This crate currently serves only `GET /health` and can print a generated OpenAPI scaffold. Project login, storage, token issuance, Runtime/Control plane composition, and MCP are not implemented. The architecture in the repository [`spec/`](../../spec/README.md) defines target behavior, not current functionality.
 

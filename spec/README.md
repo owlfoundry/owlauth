@@ -22,7 +22,10 @@ User guidance belongs in [`docs/`](../docs/). Language-neutral SDK behavior belo
 | [`08-consistency-resilience-and-plane-separation.md`](08-consistency-resilience-and-plane-separation.md) | cross-plane consistency, failure semantics, resource isolation, and physical split conditions |
 | [`09-hosted-web-surfaces-and-control-auth.md`](09-hosted-web-surfaces-and-control-auth.md) | Runtime Hosted Authentication UI, Control Management Console, external URL separation, and browser credential/security boundaries |
 | [`10-implementation-technology-selections.md`](10-implementation-technology-selections.md) | implementation technology selection register and decision status |
+| [`11-identity-connections-passwordless-email-and-user-sync.md`](11-identity-connections-passwordless-email-and-user-sync.md) | managed provider connection/profile sync, passwordless email/SMTP, revisioned user projections, and signed Application webhooks |
 | [`technology/`](technology/README.md) | detailed accepted selections, dependency boundaries, focused validation, alternatives, and revisit triggers |
+
+[`implementation-plan.md`](implementation-plan.md) is the tracked bottom-up execution sequence for the server and hosted web surfaces. It is not behavioral authority: when it conflicts with a numbered specification or accepted technology record, the canonical specification/record wins and the plan must be corrected.
 
 Each requirement has one owning document. Other documents reference that requirement instead of redefining it.
 
@@ -53,6 +56,7 @@ Each requirement has one owning document. Other documents reference that require
 11. The server is one Rust server package and one binary/container artifact. `all`, `runtime`, and `control` are composition modes, not independent domain implementations.
 12. Network and storage side effects are bounded and have explicit timeout, retry, idempotency, and failure semantics.
 13. Runtime owns the Hosted Authentication UI and Control owns the Management Console. They may use distinct origins or trusted non-overlapping base paths, but never share routers or credentials; the Console keeps the operator key only in active page memory.
+14. Managed provider credentials are retained only for OwlAuth's bounded identity-profile synchronization and never brokered downstream. Email proof is one-use and never silently links a provider identity. Application user synchronization is revisioned, bounded to an existing Application-user binding, signed, asynchronous, and durable-outbox-backed.
 
 ## Normative language
 

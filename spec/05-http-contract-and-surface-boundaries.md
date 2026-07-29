@@ -52,7 +52,7 @@ Console HTML/assets and client-side routes are server-owned implementation surfa
 
 ## Hosted Authentication UI surface
 
-The Runtime listener serves Project/Application-bound hosted authentication interactions and their fingerprinted assets under the configured Runtime base. The UI presents the transaction-bound provider, shows progress or bounded local errors, may reuse a valid Project browser session, and completes an Application return. It resolves all authority from stored login-transaction and public Project/Application state; caller input cannot replace Project, Application, provider assignment, callback, exact redirect, browser binding, or PKCE.
+The Runtime listener serves Project/Application-bound hosted authentication interactions and their fingerprinted assets under the configured Runtime base. The UI presents only the transaction's admitted provider/email methods, submits one explicit method-selection command, shows progress or bounded local errors, may reuse a valid Project browser session, and completes an Application return. It resolves all authority from stored login-transaction and public Project/Application state; caller input or an optional start hint cannot select/enable a method or replace Project, Application, provider assignment, callback, exact redirect, browser binding, or PKCE.
 
 After successful authentication, navigation returns only to the exact registered Application redirect captured by the transaction and carries only the short-lived one-use handoff allowed by spec 03. Hosted UI assets and pages never expose the Control endpoint/key or mount Control routes.
 
@@ -65,16 +65,21 @@ A representative stable path model is:
 | Route | Purpose | Caller security |
 | --- | --- | --- |
 | `GET /v1/projects/{project_id}/auth/config` | bounded public configuration for one Application | active Project/Application public identifiers; no secrets |
-| `POST /v1/projects/{project_id}/auth/login/{provider}/start` | create login transaction and provider redirect | exact Application, redirect, PKCE, origin/interaction controls |
-| `GET /v1/projects/{project_id}/auth/providers/{provider}/callback` | receive exact upstream callback | server-owned state and Project/provider binding |
-| `POST /v1/projects/{project_id}/auth/handoff/exchange` | exchange one-use ticket for user/session credentials | Application binding and PKCE verifier |
+| `POST /v1/projects/{project_id}/auth/login/start` | create one generic hosted login transaction with an allowed-method snapshot | exact Application, redirect, PKCE, origin/interaction controls; optional method hint is presentation-only |
+| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/method` | compare-and-swap selection of one admitted current provider or email method | opaque interaction, browser binding, same-origin CSRF, expected transaction revision; no method switching |
+| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/session/reuse` | explicitly confirm an eligible current Project browser session and issue the ordinary handoff | hardened cookie, same-origin CSRF, browser binding, expected transaction revision, current Project/user/session/auth-age/reuse-policy checks; page cannot name user/session |
+| `GET /v1/projects/{project_id}/auth/providers/{provider}/callback` | receive exact upstream callback after stored provider selection | server-owned state and Project/provider binding |
+| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/challenges` | accept email after stored email selection, then create an enumeration-safe newest challenge and pinned durable mail job | assigned email method, browser/CSRF/revision binding, email/IP rate policy and server safety floors |
+| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/otp/verify` | consume newest OTP challenge | opaque interaction, proof attempt/expiry/generation and transaction binding |
+| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/link/verify` | consume a fragment-staged magic-link proof after explicit user confirmation | same-origin CSRF protection, digest-bound token, exact stored transaction and safe local error/redirect policy |
+| `POST /v1/projects/{project_id}/auth/handoff/exchange` | exchange one-use ticket for revisioned user/session credentials | Application binding and PKCE verifier |
 | `POST /v1/projects/{project_id}/auth/sessions/refresh` | rotate refresh family | Project/Application-bound opaque refresh token |
 | `GET /v1/projects/{project_id}/auth/users/me` | return bounded current Project user | valid Project access token |
 | `POST /v1/projects/{project_id}/auth/sessions/logout` | revoke Application and/or Project browser session | current session plus CSRF/interaction policy |
 | `GET /projects/{project_id}/.well-known/jwks.json` | publish Project verification keys | public, cacheable, revisioned |
 | Runtime health route | deployment probe | no Project/topology/secret disclosure |
 
-These paths define the wire-level resource model. Every Runtime operation is Project-qualified, provider callback and Application redirect classes remain separate, and no downstream general-purpose OAuth surface exists.
+These paths define the wire-level resource model. Every Runtime operation is Project-qualified, provider/email proof callbacks and Application redirects remain separate URL classes, and no downstream general-purpose OAuth surface exists. Generic start never performs a provider redirect or sends email. Method selection is an explicit one-way transaction transition; provider and email methods then converge on the same handoff/session contract. Handoff, refresh, and current-user responses share the generated versioned projection with monotonic `user_revision` and Application-specific `projection_revision` owned by spec 11; Runtime exposes no list-all-users/change-feed route.
 
 ### Public auth configuration
 
@@ -85,7 +90,7 @@ Public configuration may include:
 - publishable application key metadata;
 - enabled provider display keys;
 - safe Runtime URLs and SDK feature flags;
-- allowed authentication methods that contain no secret.
+- allowed authentication methods that contain no secret; the server still snapshots and revalidates assignment when starting/selecting a method.
 
 It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal IDs, KMS references, Redis/PostgreSQL topology, or policy internals. Runtime authentication middleware does not recognize `OWLAUTH_CONTROL_API_KEY`; presenting that value to any Runtime route never grants access.
 
@@ -118,8 +123,11 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 | --- | --- |
 | `/projects` | create/read/update/disable; read/write/filter exact `belongs_to` |
 | `/projects/{project}/applications` | register/disable app; origins, redirects, publishable keys |
-| `/projects/{project}/providers` | configure/disable provider client registrations, assign Applications, rotate secret reference |
-| `/projects/{project}/users` | query/disable/merge users; view/unlink identities |
+| `/projects/{project}/providers` | configure/disable provider client registrations, assign Applications, rotate secret reference and managed-sync policy |
+| `/projects/{project}/users` | query/disable/merge users; inspect revision/source provenance; explicitly link/unlink identities; inspect/sync/reauthorize/revoke/disconnect managed connections |
+| `/projects/{project}/email-auth` | configure assigned OTP/magic-link policy, sign-up/linking bounds, Project SMTP generations, and explicit deployment-default opt-in; test, activate, disable/mark-compromised, and inspect safe Project delivery eligibility |
+| `/system/smtp-default-generations` | reconcile the process-configured deployment-default generation/fingerprint and activate/disable/mark-compromised its deployment-scoped eligibility metadata | deployment operator only; no secret input/read-back and no Project fallback authority |
+| `/projects/{project}/applications/{application}/webhooks` | configure exact endpoints/event filters, rotate write-only secret, inspect safe health/deliveries, and replay immutable events |
 | `/projects/{project}/sessions` | list and revoke Project/Application sessions |
 | `/projects/{project}/policy` | claims, token lifetime, login/session policy |
 | `/projects/{project}/signing-keys` | inspect/provision/publish/activate/retire/revoke |
@@ -127,7 +135,9 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 | `/system` | validate the operator key and return bounded Console/client capabilities |
 | Control health | safe probe response under the configured probe policy |
 
-Every business route requires the valid deployment operator API key, which grants the whole Control surface. There are no principal, permission, credential-management, or session-escalation routes. Command/domain validation remains deny-by-default: a generic PATCH cannot bypass lifecycle transitions. Mutations include target revision and use deployment-operator-scoped Control idempotency where retry could duplicate a resource or external side effect. Every external-gateway mutation also supplies the observed Project `metadata_revision`, compared in the same PostgreSQL transaction as the child command.
+The webhook resource returns only safe endpoint/secret-version/delivery metadata. Secret input is write-only, and replay names an existing immutable event plus its existing endpoint; Control has no arbitrary event-send route. Webhook payload/signature headers are an Application integration contract but endpoint configuration/replay remain Control operations. The exact `v1` HMAC grammar and duplicate/out-of-order receiver fixtures are generated and versioned with public contracts.
+
+Every business route requires the valid deployment operator API key, which grants the whole Control surface. There are no principal, permission, Control-credential-management, or session-escalation routes. Project provider/SMTP/webhook secret-setting is resource configuration, not creation of another Control credential. Command/domain validation remains deny-by-default: a generic PATCH cannot bypass lifecycle transitions. Mutations include target revision and use deployment-operator-scoped Control idempotency where retry could duplicate a resource or external side effect. Every external-gateway mutation also supplies the observed Project `metadata_revision`, compared in the same PostgreSQL transaction as the child command.
 
 ### Control authentication
 

@@ -4,7 +4,7 @@
 
 OwlAuth is a self-hostable authentication and identity service for applications. A single deployment lets one operator define multiple isolated Projects. Each Project can register multiple web, mobile, server, or native Applications that share one Project user directory and authentication policy.
 
-OwlAuth brokers login to configured upstream identity providers, maps verified provider identities to Project-scoped users, and returns a Project user plus OwlAuth session credentials to the initiating Application. Applications and their backends do not integrate with OwlAuth as general OAuth clients; they use the Project Auth API and SDK.
+OwlAuth authenticates through configured upstream identity providers or first-party passwordless email, maps proven identities to Project-scoped users, and returns a revisioned Project user projection plus OwlAuth session credentials to the initiating Application. It may manage a provider connection solely for bounded profile synchronization and may notify an already bound Application through signed user-projection webhooks. Applications and their backends do not integrate with OwlAuth as general OAuth clients; they use the Project Auth API and SDK and never receive upstream provider credentials.
 
 OwlAuth owns authentication, identity linking, Project sessions, and Project token claims. An application backend still owns business authorization such as organization membership, document access, billing roles, and domain-specific permissions.
 
@@ -22,6 +22,9 @@ OwlAuth owns authentication, identity linking, Project sessions, and Project tok
 | Handoff ticket | short-lived one-use credential used to deliver a login result to an Application | bound to Project, Application, redirect, browser transaction, and PKCE |
 | Project access token | short-lived signed OwlAuth token for the Project backend | Project issuer/audience and Application context; not a generic OAuth access token |
 | Refresh token/family | opaque rotating credential for one Application session | Project/Application/user bound and PostgreSQL-authoritative |
+| Managed provider connection | optional renewable provider credential and sync lifecycle for one linked identity | server-only, least-scope profile synchronization; never an Application token vault |
+| Email identity/challenge | first-party verified email plus OTP or magic-link proof | Project-bound, one-use, enumeration-safe, and tied to the Application login transaction |
+| User projection/webhook | revisioned Application-visible user view and asynchronous change notification | emitted only after an Application-user binding; bounded and credential-free |
 | `belongs_to` | nullable opaque Project metadata supplied by an external control system | index/correlation only; no built-in tenant authorization semantics |
 
 Project identifiers are globally unique within the deployment. User identifiers may use globally unique UUIDs operationally, but their semantic identity is `(project_id, user_id)`. The same provider account can map to independent users in different Projects.
@@ -198,4 +201,4 @@ A typical topology assigns `auth.example.com` to Runtime and `admin.auth.example
 
 ## Design scope
 
-OwlAuth provides upstream social/OIDC federation, Project-scoped users and identities, Applications, sessions, token verification, provider configuration, user administration, and audit. Password authentication, SAML, SCIM, LDAP synchronization, organization membership, tenant RBAC, SaaS API keys, billing, and general business RBAC/ABAC are outside this server architecture. The separate SaaS architecture is defined in [`spec/saas/`](saas/).
+OwlAuth provides upstream social/OIDC federation, managed identity-profile connections, first-party passwordless email OTP/magic-link authentication, Project-scoped users and identities, Applications, sessions, revisioned user projections, signed Application webhooks, token verification, provider/SMTP configuration, user administration, and audit. Provider-token brokering, password authentication, SAML, SCIM, bulk directory synchronization, LDAP synchronization, organization membership, tenant RBAC, SaaS API keys, billing, and general business RBAC/ABAC are outside this server architecture. The detailed identity expansion is owned by [spec 11](11-identity-connections-passwordless-email-and-user-sync.md); the separate SaaS architecture is defined in [`spec/saas/`](saas/).

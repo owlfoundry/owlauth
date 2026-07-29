@@ -4,7 +4,7 @@
 
 OwlAuth exposes a Project Auth protocol to downstream Applications. It is not a general OAuth/OIDC authorization server: downstream Applications do not register OAuth grants, request OAuth scopes, receive OIDC ID tokens, or use OwlAuth client secrets.
 
-OAuth/OIDC is used only between OwlAuth and a Project's configured upstream provider. The downstream protocol uses a Project/Application login transaction, a short-lived one-use handoff ticket with PKCE, a Project access token, and a stateful rotating refresh token.
+OAuth/OIDC is used only between OwlAuth and a Project's configured upstream provider. A Project may alternatively prove a first-party email identity through the OTP or magic-link flow owned by [spec 11](11-identity-connections-passwordless-email-and-user-sync.md). Both methods converge on the same downstream Project/Application login transaction, short-lived one-use handoff ticket with PKCE, Project access token, and stateful rotating refresh token.
 
 ## Public identifiers and credentials
 
@@ -69,18 +69,19 @@ sequenceDiagram
     participant Provider as GitHub / Google
 
     User->>App: Start sign-in
-    App->>Runtime: Begin login(project_id, application_id, provider, redirect_to, PKCE challenge, app_state)
+    App->>Runtime: Begin generic login(project_id, application_id, redirect_to, PKCE challenge, app_state, optional method hint)
     Runtime->>Core: BeginLogin(command)
-    Core->>PG: Validate active Project/Application/provider and exact redirect; create transaction
-    PG-->>Core: login transaction
+    Core->>PG: Validate active Project/Application and exact redirect, snapshot assigned methods, create transaction
+    PG-->>Core: unselected login transaction
     Core-->>Runtime: bounded hosted interaction URL
     Runtime-->>App: hosted authentication URL
     App-->>User: Navigate to hosted authentication
-    User->>Hosted: Open bound interaction
-    Hosted->>Runtime: Continue with transaction-bound provider
-    Runtime->>Core: Revalidate interaction and build provider authorization
+    User->>Hosted: Open bound interaction and choose provider
+    Hosted->>Runtime: Select method with CSRF and expected revision
+    Runtime->>Core: CAS-select assigned provider and build authorization
+    Core->>PG: Revalidate assignment and transition method once
     Core-->>Runtime: provider authorization request + upstream state
-    Runtime-->>User: Set Project interaction cookie; redirect to provider
+    Runtime-->>User: Set Project interaction cookie and redirect to provider
     User->>Provider: Authenticate
     Provider-->>Runtime: Exact Project/provider callback + provider code + state
     Runtime->>Core: ClaimProviderCallback(command)
@@ -88,7 +89,7 @@ sequenceDiagram
     PG-->>Core: claimed callback transaction
     Core->>Provider: Exchange provider code and validate identity exactly once
     Provider-->>Core: verified issuer + subject + bounded claims
-    Core->>PG: Revalidate assignment; resolve/create Project user; create browser session and handoff ticket
+    Core->>PG: Revalidate assignment, resolve/create Project user, create browser session and handoff ticket
     PG-->>Core: committed login result
     Core-->>Runtime: exact Application redirect + opaque handoff ticket + app_state
     Runtime-->>Hosted: Safe completion result
@@ -98,19 +99,28 @@ sequenceDiagram
 
 ### Login-start invariants
 
-- Project, Application, provider configuration, and redirect entry are active and belong to the same Project; the provider configuration is explicitly assigned to that Application.
+- Project, Application, and redirect entry are active and belong to the same Project. Login start snapshots the bounded set and revisions of currently assigned active provider/email methods; it does not bind or start one method.
 - `redirect_to` is parsed safely and exact-match compared with the selected Application's registered value. Wildcards, prefixes, substring matching, user-info confusion, and redirect chaining are forbidden.
 - Web/native login handoff requires Application-generated PKCE S256. `plain` and omitted challenges are rejected.
-- The upstream provider adapter independently uses provider-side PKCE S256 when supported or required; its verifier is server-generated, transaction-bound, encrypted at rest, and never reused as the Application verifier.
-- Application-provided state is bounded and retained as integrity-bound ciphertext solely for return; it is never interpreted as authority.
-- The transaction binds Project, Application, provider, exact provider callback, exact application redirect, PKCE challenge, browser interaction, and trusted external origin.
-- A valid Project browser session may satisfy local authentication for another active Application in the same Project without another provider redirect, subject to Project policy. It never authenticates another Project.
+- The upstream provider adapter independently uses provider-side PKCE S256 when supported or required; its verifier is generated only after provider selection, transaction-bound, encrypted at rest, and never reused as the Application verifier.
+- Application-provided state is bounded and retained as integrity-bound ciphertext solely for return; it is never interpreted as authority. An optional method hint affects presentation only and cannot select, enable, or authorize a method.
+- Before selection, the transaction binds Project, Application, exact Application redirect, PKCE challenge, browser interaction, trusted external origin, allowed-method snapshot, CSRF state, and monotonic transaction revision. An explicit same-origin command compare-and-swaps one method from `unselected`; provider selection then binds exact provider configuration/callback/upstream state, while email selection permits address/challenge creation under spec 11.
+- Method selection is one-way once provider exchange or email proof state starts. Changing method requires a new login transaction; query/page fields cannot mutate the stored selection.
+- A valid Project browser session may satisfy local authentication for another active Application in the same Project without another provider redirect, but only through the explicit reuse confirmation transition below. It never authenticates another Project.
 - Public identifiers and publishable keys may drive rate/quota policy but cannot bypass these checks.
+
+### Project browser-session reuse
+
+When Project policy permits reuse and the Hosted request presents a currently valid Project browser-session cookie, the UI may offer a bounded “continue as” action separate from provider/email method selection. The display is not authority. An explicit same-origin `ConfirmBrowserSessionReuse` command carries CSRF and expected login-transaction revision; Runtime derives the browser credential from the hardened cookie rather than a page-supplied session/user ID.
+
+One PostgreSQL transaction compare-and-swaps `awaiting_method_selection` directly to `handoff_issued`, while revalidating the exact Project/Application/redirect/PKCE transaction, current Project/user/browser-session status and security revisions, session authentication age/reuse policy, and browser binding. It creates exactly one ordinary handoff ticket and audit event. A concurrent provider/email selection or reuse confirmation loses the same transaction-revision/status guard. A terminated, expired, wrong-Project, stale-revision, or otherwise ineligible browser session fails generically and cannot fall back to a caller-selected identity; the user may restart and choose an admitted provider/email method.
+
+Reuse is not an authentication method in the allowed provider/email snapshot and cannot bypass fresh authentication where policy requires it. The resulting handoff still creates the destination Application binding/projection and Application session only when exchanged successfully.
 
 ### Hosted-interaction invariants
 
-- The Hosted Authentication UI is a Runtime adapter governed by spec 09. It loads an opaque transaction handle and derives Project/Application/provider/redirect state from PostgreSQL; page fields and query parameters cannot replace that state.
-- The displayed/continued provider is the active configuration already bound to the transaction, is assigned to the Application, and is revalidated before redirect. A future provider-picker contract would require an explicit transaction-state revision rather than accepting an arbitrary page value.
+- The Hosted Authentication UI is a Runtime adapter governed by spec 09. It loads an opaque transaction handle and derives Project/Application/allowed-method/selected-method/redirect state from PostgreSQL; page fields and query parameters cannot replace that state.
+- It displays only methods in the admitted snapshot. Provider/email selection submits a same-origin CSRF-protected Runtime command with the expected transaction revision; the server revalidates current assignment and permits exactly one method-specific transition. The separate browser-session reuse action follows its own confirmation command and competes on the same `awaiting_method_selection` revision/status. A provider authorization request uses only the resulting stored provider configuration.
 - Project branding and Application display values are bounded public configuration and rendered as untrusted content. Hosted pages load no caller-controlled executable resources or navigation targets.
 - A completion page redirects only to the exact Application URL stored at login start and includes only the permitted handoff and bounded application state. A local error/restart page cannot redirect from provider or caller error input.
 - Runtime and Control hosted web surfaces may share an external origin only under the explicit non-overlapping base-path model in spec 09; the operator key is never available to the hosted interaction.
@@ -119,7 +129,7 @@ sequenceDiagram
 
 - The callback route itself identifies the expected Project and provider configuration; callback parameters cannot select another Project/provider.
 - OwlAuth validates upstream state digest, login transaction status, browser binding, provider ID, Project ID, exact callback URI, expiry, and one-use transition.
-- Before the external exchange, PostgreSQL atomically moves the transaction from `pending_authentication` to `provider_exchange_in_progress`; concurrent callbacks cannot claim it.
+- Before the external exchange, PostgreSQL atomically moves a provider-selected transaction from `provider_authorization_started` to `provider_exchange_in_progress`; concurrent callbacks cannot claim it.
 - Provider code exchange uses only the Project's configured client ID, secret reference, transaction-bound provider PKCE verifier where applicable, endpoint allowlist, TLS policy, and timeout. It is not automatically retried after an ambiguous outcome.
 - Explicit or ambiguous exchange failure moves the transaction to terminal `provider_exchange_failed`; the user starts a new login instead of replaying the provider code.
 - Provider issuer/signature/claims where applicable and stable provider subject are validated by the provider adapter.
@@ -128,8 +138,8 @@ sequenceDiagram
 - Matching email never silently links users. Link or merge requires explicit proof and Project-bound domain preconditions.
 - A disabled Project or user cannot produce a handoff ticket.
 - Callback completion revalidates that the provider registration remains actively assigned to the Application; an assignment revision mismatch terminates the login.
-- Provider access/refresh tokens are used only transiently for the configured identity/profile retrieval and are discarded after callback completion. They are never returned downstream or retained in Project profile data.
-- Provider credentials and full provider payloads never enter redirect parameters, user profile JSON, audit context, or ordinary logs.
+- Provider access tokens are transient and discarded after the bounded identity/profile call. When the adapter and Project policy enable managed profile synchronization, OwlAuth may retain only the least-scope renewable credential under the connection lifecycle, encryption, rotation, and stale-result rules in spec 11; login-only providers retain none.
+- No provider access/refresh token is returned downstream, stored in Project profile data, exposed through a generic provider API, or usable for Application-requested scopes. Provider credentials and full provider payloads never enter redirects, user projections, webhooks, audit context, Redis, or ordinary logs.
 
 ## Handoff exchange
 
@@ -145,27 +155,29 @@ sequenceDiagram
 
     App->>Runtime: Exchange(ticket, application_id, PKCE verifier)
     Runtime->>Core: ExchangeHandoff(command)
-    Core->>PG: Read ticket and authoritative Project/Application/user state
-    PG-->>Core: eligible revision snapshot
+    Core->>PG: Read ticket and authoritative Project/Application/user/projection policy
+    PG-->>Core: eligible snapshot and bounded candidate projection
     Core->>Signer: Sign prepared Project access-token claims
     Signer-->>Core: signed token output
-    Core->>PG: Conditionally consume ticket; create Application session and refresh family under signing epoch guard
-    PG-->>Core: committed or conflict
-    Core-->>Runtime: user + session metadata + access token + refresh token
+    Core->>PG: Consume ticket, upsert Application-user binding/projection, create session/refresh family under signing epoch guard
+    PG-->>Core: committed projection/session or conflict
+    Core-->>Runtime: revisioned user projection + session metadata + access token + refresh token
     Runtime-->>App: bounded Project Auth response
 ```
 
 The final transaction:
 
 - verifies the handoff ticket digest and unconsumed status;
-- binds exact Project, Application, redirect result, user, provider result, and PKCE verifier;
-- revalidates Project/Application/user status, current Application-provider assignment, and policy revisions;
+- binds exact Project, Application, redirect result, user, selected authentication-method result, and PKCE verifier;
+- revalidates Project/Application/user status and policy revisions, plus the current Application-provider assignment only for a provider-authenticated handoff;
 - requires the Project signing-key epoch used for prepared claims to remain active;
 - consumes the ticket exactly once;
+- creates or reuses the unique `(project_id, application_id, user_id)` binding and materializes its authoritative bounded projection with `user_revision`, `projection_revision`, schema, digest, and current policy snapshot;
 - creates one Application session and refresh-family generation;
+- when the webhook event contract is installed, emits `user.projection.created` only for a binding first created by this transaction and creates targets only for already-active eligible endpoints; deploying webhook support or adding an endpoint later never invents a historical created event;
 - appends the audit event atomically.
 
-Signed output prepared from a stale snapshot is discarded. A losing exchange returns a generic expired/invalid handoff result and never receives token material.
+Binding/projection, session/family, optional initial event targets, ticket consumption, and audit either commit together or not at all. Signed output prepared from a stale snapshot is discarded. A losing exchange returns a generic expired/invalid handoff result and never receives token material.
 
 ## Application and browser session model
 
@@ -205,9 +217,9 @@ Refresh revalidates Project, Application, user, Application session, family, cla
 
 ## Current user and profile data
 
-A valid Project access token can request the current Project user from the Runtime current-user endpoint. The response includes only Project policy-approved user/profile fields and the current Application/session context. It does not expose linked-provider tokens, secret references, management metadata, `belongs_to`, users in another Project, or arbitrary provider payloads.
+A valid Project access token can request the current Project user from the Runtime current-user endpoint. The response uses the Application-specific projection from spec 11, including monotonic Project-user `user_revision` and binding-specific `projection_revision`, and includes only Project policy-approved profile fields plus current Application/session context. It does not expose linked-provider tokens, source-profile internals, secret references, connection management metadata, `belongs_to`, users in another Project, or arbitrary provider payloads.
 
-The handoff exchange and refresh response may include the same bounded current-user representation so an Application does not need a second request solely to initialize local state.
+The handoff exchange and every successful refresh return the same versioned current-user projection so an Application can initialize or reconcile local state without a second request. An Application may additionally consume spec 11's signed asynchronous projection events, but webhook delivery is never a prerequisite for login/session success.
 
 ## Logout and revocation
 

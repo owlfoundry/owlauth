@@ -2,7 +2,7 @@
 
 OwlAuth is self-hostable authentication and identity infrastructure for applications. One deployment can host multiple isolated Projects, and each Project can contain multiple web, mobile, native, or server Applications that share its user directory and authentication policy.
 
-OwlAuth uses OAuth/OIDC to federate with upstream identity providers such as GitHub and Google. Applications integrate with OwlAuth through a Project Auth API and language SDKs; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server.
+OwlAuth federates with upstream OAuth/OIDC providers such as GitHub and Google and targets first-party passwordless email OTP/magic-link authentication through user-configured SMTP. Applications integrate through a Project Auth API, revisioned user projections, optional signed webhooks, and language SDKs; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server or provider-token broker.
 
 > [!IMPORTANT]
 > OwlAuth is pre-alpha. The repository currently contains architecture specifications, release infrastructure, placeholder SDKs, a checksum-verifying CLI updater, and a server scaffold with a health endpoint and generated OpenAPI. Project login, persistence, sessions, token issuance, Control APIs, and MCP are not implemented. Do not use the current scaffold for production authentication.
@@ -12,7 +12,9 @@ OwlAuth uses OAuth/OIDC to federate with upstream identity providers such as Git
 - A **Deployment** is one administrative trust domain operated under one policy.
 - A **Project** is the isolation boundary for users, linked identities, provider configuration, sessions, refresh families, access tokens, and signing keys.
 - An **Application** is a web, mobile, native, or server integration inside a Project. Applications in the same Project share users and Project token trust.
-- A **provider configuration** is a Project-owned upstream OAuth/OIDC client registration that can be assigned to one or more Applications.
+- A **provider configuration** is a Project-owned upstream OAuth/OIDC client registration that can be assigned to one or more Applications; an optional managed connection retains only a server-side least-scope renewable credential for bounded profile synchronization.
+- A **first-party email identity** is proved by a newest/one-use OTP or magic link delivered through Project SMTP (or explicit deployment-default opt-in) and never silently linked by matching provider email.
+- An Application receives one bounded `user_revision` projection after handoff and may subscribe to signed durable-outbox webhooks only for users already bound to it.
 - An application backend verifies short-lived Project JWTs and remains responsible for business authorization such as organization membership, roles, billing, or document access.
 
 Applications that require isolated users or token audiences use separate Projects. OwlAuth intentionally does not model product organizations, tenant membership, or business RBAC. The optional Project `belongs_to` field is opaque indexed metadata for an external control system, not an OwlAuth authorization boundary.
@@ -41,8 +43,8 @@ The handoff ticket is short-lived, one-use, and bound to the Project, Applicatio
 
 The target server exposes two isolated transport planes over one shared application/domain core:
 
-- **Runtime / Protocol Plane:** public Project configuration, upstream login, handoff exchange, user/session operations, token refresh, logout, and Project JWKS.
-- **Control Plane:** Project, Application, provider, user, policy, key, management-principal, and audit administration.
+- **Runtime / Protocol Plane:** hosted provider/email login, public Project configuration, handoff exchange, revisioned user/session operations, token refresh, logout, Project JWKS, and bounded delivery workers.
+- **Control Plane:** Project, Application, provider/managed-connection, SMTP/email policy, user/identity, Application webhook, session, policy, key, and audit administration under the single deployment operator key.
 
 The two planes use distinct listeners and authentication policies even when one `owlauth-server` process composes both.
 
@@ -72,6 +74,8 @@ Start with:
 - [User documentation](https://owlauth.owlfoundry.org)
 - [Server architecture specifications](spec/README.md)
 - [Technology selection register](spec/10-implementation-technology-selections.md)
+- [Identity connection, passwordless email, and user-sync specification](spec/11-identity-connections-passwordless-email-and-user-sync.md)
+- [Bottom-up server and hosted-web implementation plan](spec/implementation-plan.md)
 - [Detailed technology decisions](spec/technology/README.md)
 - [SDK specifications](sdks/spec/README.md)
 - [Contributing guide](CONTRIBUTING.md)

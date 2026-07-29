@@ -81,11 +81,11 @@ sequenceDiagram
     participant PG as PostgreSQL
 
     Agent->>Adapter: Preview exact typed command
-    Adapter->>Core: Authenticate operator key; resolve Project and revisions
+    Adapter->>Core: Authenticate operator key and resolve Project/revisions
     Core->>PG: Store digest of short-lived bound capability
     Adapter-->>Agent: Redacted summary + one-use capability
     Agent->>Adapter: Commit identical command + capability
-    Adapter->>Core: Reauthenticate key; validate payload and revisions
+    Adapter->>Core: Reauthenticate key and validate payload/revisions
     Core->>PG: Consume capability + mutate + audit atomically
     Adapter-->>Agent: Bounded result or stale/replay error
 ```

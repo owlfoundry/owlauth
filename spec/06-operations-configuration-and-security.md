@@ -12,6 +12,8 @@ One `owlauth-server` artifact supports:
 
 Mode changes adapter composition, exposure, dependency readiness, and database role; it does not change Project/domain semantics.
 
+Runtime-capable processes (`runtime` and `all`) compose the provider-profile, mail, projection-expansion, and Application-webhook worker executors because these workers support Runtime identity/Application behavior and must not depend on Control availability. `control` alone can configure resources and enqueue mutation-derived events but does not execute these outbound jobs; without a Runtime-capable process they remain durably pending and the corresponding capability reports unavailable/degraded. Multiple Runtime processes may execute workers concurrently through PostgreSQL claims/leases and guarded commits; no singleton worker or Redis lock is correctness authority.
+
 ## Process lifecycle
 
 ```mermaid
@@ -23,7 +25,9 @@ flowchart TD
     Schema --> PG[Create plane serving pools and verify every target]
     PG --> Redis[Connect Redis and select safe degradation policy]
     Redis --> Core[Compose shared core, selected adapters, and plane-specific web surfaces]
+    Core --> Workers[Compose bounded profile-sync, mail, projection-expansion, and webhook workers when enabled]
     Core --> Bind[Bind selected listeners]
+    Workers --> Ready
     Bind --> Ready[Evaluate readiness per listener]
 
     Stop[Shutdown signal] --> Unready[Mark selected listeners unready]
@@ -44,10 +48,12 @@ Configuration has one precedence model, rejects unknown fields, and separates gl
 - Project issuer derivation rule;
 - environment/instance namespace;
 - selected plane mode;
-- protocol lifetime/clock-skew bounds;
-- trusted secret/key-provider configuration.
+- protocol lifetime/clock-skew bounds plus non-overridable email-auth safety floors/ceilings from spec 11; Project configuration may only tighten them;
+- trusted secret/key-provider configuration, including distinct retained key sets for short-term transaction/mail state, long-term email PII, and v1 PostgreSQL managed-credential AEAD;
+- optional deployment-default SMTP adapter/secret reference with explicit generation and safe fingerprint, unavailable to a Project unless that Project explicitly opts in; its process handle must match the authoritative PostgreSQL generation registry and cannot silently reactivate a disabled/compromised generation;
+- outbound provider/SMTP/webhook DNS, proxy, TLS, private-network allowlist, destination, and concurrency policy.
 
-Project/provider/Application policy is authoritative PostgreSQL state, not replicated process configuration.
+Project/provider/Application/email/webhook policy is authoritative PostgreSQL state, not replicated process configuration. Deployment defaults and egress policy constrain Project choices but never imply cross-Project configuration fallback. PostgreSQL stores only deployment-default SMTP generation/status/revision and a safe configuration fingerprint; startup/readiness rejects a configured handle whose generation/fingerprint does not match, while secret bytes remain in protected process/secret-provider configuration.
 
 ### Runtime listener fields
 
@@ -75,7 +81,8 @@ Project/provider/Application policy is authoritative PostgreSQL state, not repli
 - Redis endpoint/TLS/credential reference, namespace, bounds, and deadlines;
 - signer provider, Project key namespace, allowed algorithms, and opaque references;
 - data-protection provider and retained key versions;
-- provider endpoint allowlists and Project secret-store adapter.
+- provider endpoint allowlists and Project secret-store adapter;
+- production SMTP modes restricted to implicit TLS or mandatory STARTTLS with hostname/certificate validation and no downgrade; explicit plaintext development mode accepts loopback only and is never the default.
 
 Issuer, callback, and redirect decisions never derive from arbitrary `Host`, `Forwarded`, or `X-Forwarded-*`. Proxy headers are honored only from configured trusted proxies.
 
@@ -111,21 +118,28 @@ Runtime and Control use separate PostgreSQL pools or quotas. Control list/audit 
 
 CORS is deny-by-default and exact Application-origin based. Provider callbacks and browser redirects are navigation endpoints, not permissive cross-origin APIs.
 
+Outbound webhook admission and every attempt resolve the complete CNAME chain and all A/AAAA answers under the deployment policy; one denied result denies the destination. The socket connects to a validated IP pinned for that attempt while TLS SNI, certificate verification, and HTTP `Host` retain the configured hostname. Redirects, rebinding, mixed public/private answers, IPv4-mapped IPv6 bypasses, link-local/metadata/cross-plane destinations, and proxies without equivalent enforceable destination policy are denied. SMTP uses the same destination-policy framework plus its stricter transport-mode rules. An outbox resolves only its pinned Project/default SMTP generation; config replacement cannot retarget queued mail.
+
 ## Key and secret ownership
 
 | Component | May access | Must not access |
 | --- | --- | --- |
 | Control | Project key metadata/public JWK, lifecycle command, provider secret reference | exportable private key or provider secret bytes in DTOs |
 | Runtime | active Project signer reference, Project verification set, provider secret handle, signing/provider operation | arbitrary Project lifecycle mutation or raw private key bytes |
-| PostgreSQL | public JWK, opaque signer/provider references, revisions, lifecycle/provisioning state | private key, provider secret, wrapping key bytes |
+| PostgreSQL | public JWK, opaque signer/provider/SMTP/webhook references, Project/default SMTP generation eligibility and safe default fingerprint, versioned purpose-bound managed-credential and long-term email-PII ciphertext, revisions, lifecycle/provisioning state | plaintext private key, provider/SMTP/webhook secret, managed credential, email PII, or wrapping-key bytes |
 | Redis | public Project config/JWKS cache with revision | key/provider authority, secret material, activation locks |
 | Signer/KMS | Project-namespaced private material and operation authorization | user/Application policy or routing |
-| Secret store | Project provider secret material by opaque reference | Project user/session data |
-| Data protector | login-state encryption/decryption material | token signing authority or Project policy |
+| Secret store | Project provider/SMTP/webhook secret material by opaque purpose-bound reference | Project user/session/profile data or secret read-back DTOs |
+| Provider-sync worker | exact linked-identity renewable credential and bounded provider profile operation | Application-selected provider scope/API, downstream token export, or unrelated identity |
+| Mail worker | one leased encrypted Project mail job and selected Project/explicit-default SMTP handle | identity/challenge authority, another Project sender, or secret read-back |
+| Webhook worker | one leased immutable Application event, exact endpoint, and active signing handle | projection mutation, arbitrary payload/URL, provider token, or Control endpoint |
+| Data protector | purpose-separated login/challenge/outbox, long-term email PII, and managed-credential AEAD key versions | token signing authority, external configuration-secret storage, or Project policy |
 
 KMS identities are least-privilege separated: Control provisioning identity creates/manages Project keys; Runtime identity can sign only with authorized active Project key references. Software keys use a dedicated envelope-encrypted store with external wrapping keys.
 
-Transaction data protection uses versioned AEAD keys. Ciphertext authenticated context binds deployment, Project, transaction, and field purpose. Older versions remain decryptable through maximum transaction lifetime plus clock skew, or affected transactions are cancelled before readiness after recovery.
+Data protection uses versioned, purpose-separated AEAD keys. Authenticated context binds deployment, Project, owning aggregate/generation, and field purpose. Short-term login/challenge/mail-outbox versions remain decryptable through the maximum retained usefulness plus clock skew; missing versions cause those transactions/jobs to be cancelled or terminalized before the affected capability is ready.
+
+SMTP proof recovery additionally requires each challenge's pinned Project/default generation and eligibility revision plus the matching active/retained secret handle; generation status remains PostgreSQL authority after restore. Long-term recoverable email PII and active managed credentials follow a stronger retirement rule: every retained ciphertext must be inventoried and successfully re-encrypted/rewrapped under the new version with its uniqueness/generation guards before the old key can retire. A missing long-term key keeps only the affected capability unready or requires an explicit destructive identity/reauthorization workflow; it cannot be treated like disposable login state. Restore inventory also proves email canonicalization/digest versions, active/overlap SMTP and webhook references, signer material, and projection expansion/event/delivery continuation. Missing external references fail their exact purpose closed and enter reconciliation without fallback to another Project/generation.
 
 ## Project signing-key provisioning
 
@@ -143,7 +157,7 @@ sequenceDiagram
     PG-->>Control: stable provider operation alias
     Control->>KMS: Create/import using stable Project alias/idempotency identifier
     KMS-->>Control: key reference + public JWK or existing result
-    Control->>PG: Finalize key as Published; append state/audit events
+    Control->>PG: Finalize key as Published and append state/audit events
     PG-->>Control: committed Project key metadata
 ```
 
@@ -200,7 +214,7 @@ sequenceDiagram
     Runtime-->>Verifier: Serve old + new Project JWKS
     Runtime->>PG: Record loaded revision publication lease
     Verifier-->>Verifier: Cache window elapses
-    Control->>PG: Verify leases + duration from latest observation; initial-activate or rotate under epoch guard
+    Control->>PG: Verify leases and duration, then initial-activate or rotate under epoch guard
     Runtime->>PG: Acquire shared active signing epoch
     Runtime->>KMS: Sign with new Project key
 ```
@@ -222,7 +236,9 @@ Compromise revocation differs from normal retirement:
 
 Liveness answers whether the process event loop responds and does not query every dependency.
 
-Runtime readiness requires compatible PostgreSQL state, resolvable Project key/data-protection capabilities for served Projects, and a safe response to Redis availability. Project-specific provider/KMS failures can close only affected capabilities/Projects without exposing detail globally. Control readiness requires PostgreSQL and a valid loaded `OWLAUTH_CONTROL_API_KEY`; key/provider mutations can return operation-specific dependency failure.
+Runtime readiness requires compatible PostgreSQL state, resolvable Project key/data-protection capabilities for served Projects, and a safe response to Redis availability. Project-specific provider/KMS/SMTP/protector failures close only the affected provider, signing, email-auth, PII, or managed-sync capability without exposing detail globally. A missing/mismatched deployment-default SMTP registry generation keeps default-backed email challenge admission/claims unready; provider login and active sessions may remain available when only asynchronous profile sync/webhook delivery is degraded. Readiness never discards a pending projection cursor/event or silently substitutes a missing key/secret generation. Control readiness requires PostgreSQL and a valid loaded `OWLAUTH_CONTROL_API_KEY`; key/provider/secret mutations can return operation-specific dependency failure.
+
+Profile-sync, mail, and webhook worker health is reported through bounded queue-age/count/outcome classes without recipient, endpoint path/query, payload, user, or secret labels. Backlog does not make an identity mutation uncommitted. Readiness may fail or a capability may stop admitting new work when configured hard backlog/retention bounds would otherwise lose a promised mail or event; it never drops durable work silently.
 
 In `all`, listeners have independent readiness. Control loss does not force Runtime unready when Runtime authority remains usable. Health exposes no versions, Project names/counts, `belongs_to`, DSNs, Redis keys, provider names, key/secret references, migration SQL, or user/Application existence.
 
@@ -236,6 +252,6 @@ Security audit events append through the shared core and follow spec 04 transact
 
 ## Retry and backpressure
 
-Every network call has a deadline shorter than the caller's remaining deadline. Retries are bounded/jittered and occur only for classified transient failures. Non-idempotent external effects require a durable idempotency operation as used by key provisioning.
+Every network call has a deadline shorter than the caller's remaining deadline. Retries are bounded/jittered and occur only for classified transient failures. Non-idempotent external effects require a durable operation or reconciliation contract. In particular, provider read-only profile fetch and renewable-credential rotation are separate operations: a rotation is not retried after ambiguous submission unless its adapter declares idempotent replay of the exact durable attempt; otherwise the guarded generation becomes `reauth_required`.
 
 PostgreSQL/Redis pools, provider exchanges, KMS operations, and per-listener/Project concurrency are bounded independently. Backpressure rejects before unbounded queues form. Detailed dependency outcomes are defined by spec 08.

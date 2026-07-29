@@ -28,7 +28,10 @@ Runtime consults PostgreSQL for mutable Project/Application/user/session/key fac
 | External metadata | Project `belongs_to` | PostgreSQL indexed metadata and revision; no Runtime/tenant authority |
 | Durable audit | Project/deployment security events | same transaction as mutation where atomic attribution is required; Control actor is fixed as `deployment_operator` |
 | Public derived data | Project/Application config and JWKS | generated from authoritative revision; cacheable with hard TTL |
-| Admission coordination | Project/Application/IP rate counters | Redis coordinated; loss follows safe endpoint fallback/fail-closed policy |
+| Managed identity sync | connection/credential generation, durable renewal operation, AEAD ciphertext, and bounded source profile | remote I/O occurs outside transaction; non-idempotent renewal is generation-fenced and guarded PostgreSQL commit rejects stale/ambiguous predecessor reuse |
+| Email proof and mail | newest challenge generation/attempt/consumption plus challenge/outbox pinned to one SMTP selection generation and eligibility revision | PostgreSQL proof completion revalidates current SMTP generation status/revision; SMTP is at-least-once delivery only and replacement never retargets queued mail |
+| Application user sync | user revision, Application binding/projection, immutable event/delivery outbox | mutation/event commit together; webhook is at-least-once and unordered |
+| Admission coordination | Project/Application/email-digest/IP rate counters | Redis coordinated; loss follows safe endpoint fallback/fail-closed policy |
 
 ## Project isolation under concurrency
 
@@ -62,8 +65,12 @@ Already issued self-contained Project access tokens remain subject to signed exp
 | PostgreSQL unavailable/incompatible | business routes unready/fail closed | business routes unready/fail closed | no alternate authority or acknowledged mutation |
 | Redis unavailable | ignore caches; generate public data from authority; use strict bounded local rate fallback or fail closed | direct PostgreSQL commands; omit optional cache/invalidation; strict auth-rate fallback or fail closed | no Project/auth invariant weakens |
 | Signer unavailable | affected Project handoff/refresh issuance fails closed; public JWKS may remain | unrelated administration remains; key operation reports operation-specific dependency failure | no unsigned/wrong-key token |
-| DataProtector key unavailable | affected login transactions cannot resume and are cancelled/fail closed | unrelated operations remain | no state guessed or returned incorrectly |
-| Secret store/provider unavailable | affected Project/provider login returns bounded unavailable result | configuration metadata remains manageable; secret operation reports dependency failure | no other Project identity rewritten |
+| Short-term DataProtector key unavailable | affected login/challenge/mail jobs cannot resume and are cancelled/terminalized | unrelated operations remain | no state guessed, delivered under another generation, or returned incorrectly |
+| Long-term email-PII or managed-credential AEAD key unavailable | affected identity/profile/sync capability is unready or requires explicit destructive recovery | key inventory/recovery remains available without plaintext read-back | old key cannot retire without proven re-encryption; no silent data loss or credential reuse |
+| Secret store/provider unavailable | affected Project/provider login returns bounded unavailable result; profile sync retains guarded state and backs off | configuration metadata remains manageable; secret operation reports dependency failure | no other Project identity rewritten and no stale profile commit |
+| SMTP unavailable/permanent rejection or generation disabled/compromised | generic login start/method picker remain independent; challenge admission remains enumeration-safe, and jobs retry only while the pinned generation/revision is eligible and useful | metadata/lifecycle remains manageable and test reports safe failure class | completion revalidates pinned eligibility in PostgreSQL; compromise commit denies later proof even after in-flight delivery |
+| Webhook endpoint unavailable, duplicate, or out of order | login/current-user/profile mutation success is unchanged | safe delivery health/replay remains available | immutable event persists; receiver deduplicates event ID and compares Application-specific `projection_revision` |
+| Worker crash or lease expiry | another worker may repeat bounded external attempt | same durable state is inspectable | PostgreSQL challenge/generation/event state prevents duplicate identity effects |
 | Control unavailable or restarting for operator-key rotation | continues in split-process topology; redundant `all` rollout may preserve capacity; single-instance `all` restart interrupts Runtime too | unavailable | no Runtime-to-Control dependency or credential crossover; process topology still determines restart availability |
 | Runtime unavailable | unavailable | Control remains subject to dependencies | administration has no Runtime RPC dependency |
 | Invalidation lost | stale cache ignored at authoritative decision | committed mutation remains | derived staleness only, no stale allow |
@@ -82,6 +89,8 @@ A fallback is safe only if bounded and unable to convert cross-Project data, den
 - Durable-resource creation keys retain a replay result or tombstone for at least the resource lifetime and never expire into permission to execute the same key again. Other retention exceeds every supported retry/reconciliation window; an unknown create is reconciled or escalated, not automatically replayed after expiry.
 - Reusing an idempotency key for another digest is conflict.
 - Provider code exchange and signing are not blindly retried after ambiguous effects; provisioning uses durable reconciliation from spec 06.
+- Provider-profile read and renewable-credential rotation are classified separately. A read-only fetch may retry only when adapter-declared safe and commits against the same current generation. Before rotation OwlAuth persists a durable expected-generation attempt; an ambiguous response or post-submission lease loss must not reuse the predecessor unless the adapter idempotently replays that exact attempt. Otherwise a guarded generation advance makes the connection `reauth_required`. A received successor commits before optional profile fetch and cannot overwrite reauthorization/disconnect.
+- SMTP/webhook attempts may repeat after an ambiguous response because their durable outboxes provide at-least-once delivery. Mail reuses the challenge and exact pinned SMTP generation; webhook reuses immutable event ID/body and signs `timestamp.event_id.raw_body`. Retry never repeats identity proof/mutation or retargets a replacement URL/configuration.
 
 ## Resource isolation
 
