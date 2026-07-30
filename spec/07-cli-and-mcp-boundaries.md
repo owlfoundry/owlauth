@@ -1,4 +1,4 @@
-# 07 — Deployment-operator Control, external ownership, CLI, and MCP
+# 07 — Deployment-operator Control, endpoint-discovered CLI, and remote HTTP MCP
 
 ## Single deployment-operator model
 
@@ -72,29 +72,104 @@ The gateway MUST:
 
 OwlAuth provides indexed metadata, revision conditions, Project isolation, and domain validation. It does not provide server-enforced tenant isolation for callers sharing the operator key. Organization membership, SaaS API keys, tenant RBAC, plans, and billing belong to the separate [`spec/saas/`](saas/) architecture, not `owlauth-server`.
 
-## CLI boundary
+## One CLI, endpoint-discovered products
 
-`crates/owlauth-cli` is a remote client for a trusted deployment operator. It does not depend on `owlauth-server`, open PostgreSQL/Redis, run repositories, load Project signing keys, or host a Control listener. It uses a deliberately isolated Control transport rather than adding administrative methods to the default Runtime SDK.
+`crates/owlauth-cli` publishes one `owlauth` executable. A profile stores a trusted administrative service origin but no user-configured `server`/`saas` type. This spec owns the shared profile/descriptor schema and lifecycle; SaaS spec 07 owns the `owlauth-saas` descriptor values and post-discovery behavior.
 
-The CLI uses the same `OWLAUTH_CONTROL_API_KEY` value and sends it only as the Control request's Bearer credential. It does not exchange the key for a user identity or session and cannot request reduced authority from OwlAuth. The key is acquired from protected environment/descriptor, OS credential storage, or secret-provider integration; it is never accepted as a normal command-line argument, placed in process titles/history, printed, logged, included in machine output, or persisted by OwlAuth.
+A self-hosted descriptor declares `owlauth-server`, stable non-secret instance ID, canonical Control API base/versions, optional remote MCP URL, and operator-API-key credential class. It contains no Project, user, credential, health, or private capability detail.
 
-The CLI:
+### Shared profile and descriptor contract
 
-- requires an explicit Control endpoint and TLS verification;
-- treats every invocation as the trusted deployment operator;
+A saved profile contains the selected HTTPS service origin, a discovered product/instance/authority/API-base/credential-class pin, a protected credential reference, optional product context, and non-authoritative version/capability cache. The product pin is discovered security metadata, not a user-selected type.
+
+The profile UX is conceptually:
+
+```text
+owlauth profile add <name> --endpoint <https-origin>
+owlauth profile inspect <name>
+owlauth profile use <name>
+owlauth --profile <name> <command>
+```
+
+`profile add` performs origin-root `GET /.well-known/owlauth`, validation, display, and confirmation; there is no `--type`. A deliberate `profile rebind` shows old/new product, instance, authority, API base, and credential class, then requires confirmation. Committing the rebind atomically replaces the pin, discards the old credential reference, clears every identity-bound Organization/Project/Managed Project default and version/capability/output-derived cache, and requires a newly selected credential reference and context under the new pin. Only service-independent display preferences may survive. It never silently carries credentials or target context across identity change.
+
+The version-1 descriptor is side-effect-free `application/json` with `Cache-Control: no-store`:
+
+```json
+{
+  "schema_version": "1",
+  "product": "owlauth-server",
+  "instance_id": "deployment-public-id",
+  "api_base_url": "https://admin.example.com/v1/",
+  "api_versions": ["v1"],
+  "credential_class": "operator-api-key",
+  "mcp_url": "https://admin.example.com/mcp"
+}
+```
+
+`product` is exactly `owlauth-server` or `owlauth-saas`; its credential class is respectively `operator-api-key` or `saas-api-key`. `mcp_url` is omitted when disabled. `instance_id` is bounded opaque ASCII and compared exactly. URLs are canonical absolute HTTPS URLs on the selected origin, with no user info, query, fragment, ambiguous encoding, or redirect; API base URLs end in `/`.
+
+The client bounds parsing and rejects redirects, cross-origin URLs, duplicate fields, unknown critical fields, invalid product/credential pairs, and unsupported schema versions. Profile creation confirms discovery before selecting a credential. Every later command validates discovery against the pin before reading/sending the key. A changed product/instance/authority/API base/credential class, missing/malformed descriptor, or TLS/version error fails before credential release. Direct one-shot endpoint use obtains explicit discovery confirmation first. The CLI never probes both authenticated APIs, sends both keys, infers product from `401`/`403`/`404`, or switches clients after failure.
+
+When discovery selects `owlauth-server`, this root spec owns dispatch and `OWLAUTH_CONTROL_API_KEY` use. When it selects `owlauth-saas`, [`spec/saas/07-cli-and-http-mcp-surfaces.md`](saas/07-cli-and-http-mcp-surfaces.md) owns dispatch and `OWLAUTH_SAAS_API_KEY` use. Raw keys are absent from profile files and ordinary arguments, URLs, process titles/history, output, and logs.
+
+The same top-level command vocabulary is used where SaaS exposes a tenant-safe equivalent of the self-hosted Project/Application/provider/user/session/policy/key/audit operation. Reuse is presentation and semantic mapping only: the two adapters have separate generated/typed clients, wire DTOs, identifiers, authority, and error mapping. Deployment-wide operator commands remain server-only; Organization, membership, Service Account, SaaS API-key metadata/status/revocation, billing, entitlement, and usage commands are SaaS-only. Secret-producing SaaS API-key creation/rotation remain outside the initial CLI/MCP catalogs as specified by SaaS spec 07.
+
+The CLI never imports `owlauth-server` or a SaaS implementation package, opens PostgreSQL/Redis, runs repositories/migrations, loads Project signing keys, hosts Runtime/Control, shells out from one product adapter to the other, or directly accesses a managed cell when discovery selected SaaS.
+
+## CLI behavior for a self-hosted endpoint
+
+A profile pinned to discovered `owlauth-server` uses `OWLAUTH_CONTROL_API_KEY` and sends it only as the Control request's Bearer credential. It does not exchange the key for a user identity/session or request reduced authority. The key comes from protected environment/file descriptor, OS credential storage, or secret-provider integration; it is never an ordinary command argument, process-title/history value, output, log field, or OwlAuth persistence value.
+
+The self-hosted adapter:
+
+- requires a validated/pinned self-hosted descriptor, exact Control endpoint, and TLS verification;
+- treats every invocation as the fixed deployment operator;
 - sends explicit Project/target identifiers and expected revisions for destructive commands;
 - uses deployment-operator-scoped idempotency for eligible retries;
-- shows a safe interactive summary before destructive commands, while deliberate non-interactive confirmation does not alter server authority;
-- distinguishes stable machine output from human diagnostics;
-- redacts the operator key, Runtime credentials, provider values, tickets, cookies, user profile data, and private key references.
+- shows the selected profile/endpoint and a safe summary before destructive commands;
+- treats deliberate non-interactive confirmation as intent UX, not extra authority;
+- separates stable machine output from human diagnostics;
+- redacts operator/Runtime credentials, provider values, tickets, cookies, user profile data, and private-key references.
 
-## MCP placement and constraints
+## Self-hosted HTTP MCP placement
 
-MCP is an optional Control adapter for a trusted deployment operator. It is never exposed on Runtime and is not a local authorization server embedded in an agent plugin. Its transport uses the same Control API key and therefore has the same deployment-wide authority; OwlAuth does not assign a distinct agent identity or narrower permission set.
+When enabled, OwlAuth exposes a standards-conformant MCP Streamable HTTP endpoint at `mcp` relative to the configured Control base URL. It is a server-side Control adapter for a trusted deployment operator, never a Runtime route, local plugin process, or distinct authorization server.
 
-Every tool maps to one bounded application command or query and defines a closed input schema, explicit Project target where applicable, expected revisions, deterministic side effects, idempotency behavior, timeout/rate policy, safe output, and audit action. Tools MUST NOT provide raw SQL, arbitrary repository access, generic HTTP forwarding, shell/filesystem execution, unrestricted bulk mutation, or export of provider secrets/tokens, handoff/session credentials, the operator key, private keys, or user profile dumps.
+Every MCP HTTP request, including protocol initialization, tool discovery, execution, streaming continuation, and session teardown, requires exactly:
 
-Prompt text, model output, UI approval, and tool arguments are untrusted input. They cannot establish authority; only successful operator-key authentication admits the request.
+```http
+Authorization: Bearer owl_ctrl_v1_...
+```
+
+The protected MCP host/client supplies this header. The key MUST NOT enter prompt text, model-visible context, tool arguments/schemas/results, protocol errors, URLs, session IDs, logs, or agent-plugin configuration visible to the model. An MCP session identifier is non-authoritative routing/conversation state and never substitutes for per-request key authentication.
+
+The endpoint negotiates a supported MCP protocol version and identifies itself as `owlauth-server` in the `initialize` exchange, then returns its current bounded tools through `tools/list`. A client does not maintain an OwlAuth `server`/`saas` tool-mode table. If the client connects to both products, its normal MCP server-registration namespace distinguishes the endpoints.
+
+The initial MCP capability set is tools-only. It exposes no prompt/resource catalog and does not request client roots, sampling, or elicitation; adding one requires an explicit data-disclosure and authorization specification. Tool discovery is not authorization. The operator key is reauthenticated and current Project/target revisions are validated for every invocation. MCP is disabled unless explicitly composed; disabling it does not change Control REST, CLI, or Runtime behavior.
+
+## HTTP MCP transport security
+
+The MCP endpoint:
+
+- requires HTTPS except explicit loopback development and remains on the Control network/exposure boundary;
+- validates the configured external authority/Host and validates `Origin` when present to prevent DNS-rebinding and browser cross-origin abuse;
+- denies broad browser CORS by default;
+- bounds protocol messages, batches, request/response bodies, streams, sessions, deadlines, concurrency, and rate;
+- rejects unsupported protocol versions/methods without generic HTTP fallback;
+- never exposes a stdio transport or causes the CLI/plugin to launch a child MCP process.
+
+POST, optional GET streaming, DELETE, and session-header behavior follow the negotiated standards-conformant Streamable HTTP protocol version rather than a private OwlAuth transport.
+
+## MCP tool constraints
+
+Every tool maps to one bounded application command/query and defines a closed input schema, explicit Project target where applicable, expected revisions, deterministic side effects, idempotency behavior, timeout/rate policy, safe output, audit action, and server-owned impact class that no request parameter can override. Tools are hand-designed and are not generated from OpenAPI or CLI commands.
+
+Every new or otherwise unclassified mutating tool defaults to high impact and therefore requires preview/commit. Only a reviewed read-only tool or bounded, reversible low-impact mutation may be classified lower. High-impact v1 operations include deletion; disabling or revoking a user, session family, provider, Application, Project, credential, or signing key; signing-key activation/rotation; security-policy, redirect/origin, provider, email, or webhook trust changes; identity merge/link/disconnect; and any bulk, irreversible, or externally visible security-sensitive mutation. The owning catalog records this classification, conformance tests prove that each high-impact operation has no direct-commit alias or alternate lower-class path, and safe tool annotations or `tools/list` metadata never replace server-side enforcement.
+
+Tools MUST NOT provide raw SQL, repository access, generic HTTP/OpenAPI forwarding, arbitrary path/method/body invocation, CLI/shell/filesystem execution, unrestricted bulk mutation, or export of provider secrets/tokens, handoff/session credentials, the operator key, private keys, or user profile dumps.
+
+Prompt text, model output, UI approval, tool discovery, and tool arguments are untrusted input. They cannot establish authority; only successful operator-key authentication admits a self-hosted request.
 
 ## High-impact MCP confirmation
 
@@ -102,8 +177,8 @@ High-impact tools use a preview/commit flow to bind operator intent to current s
 
 ```mermaid
 sequenceDiagram
-    participant Agent as MCP client
-    participant Adapter as MCP Control adapter
+    participant Agent as Remote MCP client
+    participant Adapter as HTTP MCP Control adapter
     participant Core as Shared core
     participant PG as PostgreSQL
 
@@ -121,22 +196,23 @@ sequenceDiagram
     Core-->>Agent: Bounded result
 ```
 
-The confirmation capability is high entropy and integrity protected. It is bound to:
+The high-entropy integrity-protected capability binds:
 
-- the fixed deployment-operator actor and Control audience;
+- the fixed deployment-operator actor and MCP/Control audience;
 - the exact tool and normalized command digest;
 - the explicit Project when Project-bound;
-- the Project metadata revision and command-specific target revisions;
-- a short expiry and one-use consumption state.
+- Project metadata and command-specific target revisions;
+- a short expiry and one-use state.
 
-It is not bound to a server-side user, role, permission grant, or secondary-authentication session. PostgreSQL stores only its digest and atomically consumes it with the command and deployment-operator audit event. A capability cannot be moved to another command, Project, revision, deployment, or Runtime route.
+It is not bound to a server-side user, role, permission grant, transport session, or secondary-authentication session. PostgreSQL stores only its digest and atomically consumes it with the command and deployment-operator audit event. A capability cannot move to another tool, command, Project, revision, deployment, endpoint, or Runtime route.
 
 ## Surface and recovery boundaries
 
 - CLI workflows are not mechanically generated OpenAPI paths.
-- MCP tools are bounded operator capabilities, not generated CLI commands or generic OpenAPI wrappers.
-- Control HTTP, CLI, and MCP share application commands while retaining adapter-specific parsing, admission, confirmation, and output mapping.
-- Disabling CLI use or MCP has no Runtime contract or credential effect.
-- Agent plugins may provide discovery/setup but must not request, relay, persist, or display the operator key in agent context.
+- MCP protocol self-description does not make tools generic OpenAPI wrappers.
+- Control HTTP, server CLI, and self-hosted MCP share application commands while retaining adapter-specific parsing, admission, confirmation, and output mapping.
+- SaaS CLI and SaaS HTTP MCP enter SaaS application services; they do not call this adapter or shared core directly.
+- Disabling CLI use or either MCP endpoint has no Runtime credential/contract effect.
+- Agent plugins may document remote endpoint setup but MUST NOT request, relay, persist, display, bundle, launch, supervise, or impersonate an MCP server or operator key in model context.
 
-Direct storage, key-store, or offline disaster recovery is not an ordinary CLI/MCP command. Such procedures require separately isolated operational access, maintenance/exclusion semantics, and audit. They do not create another Control identity or bypass Project/domain invariants.
+Direct storage, key-store, or offline disaster recovery is not an ordinary CLI/MCP command. It requires separately isolated operational access, maintenance/exclusion semantics, and audit. It creates no alternate Control identity and bypasses no Project/domain invariant.

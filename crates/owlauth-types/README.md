@@ -1,24 +1,31 @@
 # owlauth-types
 
-Public HTTP request, response, error, and OpenAPI types for [OwlAuth](https://github.com/owlfoundry/owlauth).
+Stable public HTTP response and OpenAPI types for [OwlAuth](https://github.com/owlfoundry/owlauth).
 
-The target contract separates:
+The crate currently defines complete, separate OpenAPI 3.1 documents for the implemented Runtime and Control surfaces:
 
-- Runtime Project Auth DTOs for public configuration, upstream or passwordless-email login, handoff exchange, revisioned Application user projections, sessions, refresh, logout, and public verification keys;
-- Control DTOs for Project, Application, provider/managed-connection, email/SMTP, user/identity, Application webhook, session, policy, key, management, and audit administration;
-- minimal listener-specific health DTOs.
+- listener liveness and readiness responses;
+- the Runtime Hosted Authentication UI shell routes;
+- the authenticated Control system-information endpoint and Management Console shell routes.
 
-This crate is the Rust source of generated OpenAPI documents. The target export utility lives in this package and emits complete, separate Runtime and Control documents without compiling `owlauth-server`, as required by [`TS-002`](../../spec/technology/ts-002-hosted-web-and-asset-pipeline.md). It does not provide an HTTP server or client, contain domain entities or database rows, or grant authorization merely by exposing a type.
+Future Project Auth and management DTOs will be added here as their server behavior is implemented. MCP protocol messages and hand-designed tool schemas follow the negotiated MCP protocol and are not OpenAPI DTOs generated into this crate.
 
-> OwlAuth is pre-alpha. The current crate contains the health response and a small legacy OAuth error-code subset used by the scaffold. It does not yet define the target Runtime and Control contracts or their exporter.
+This crate is the Rust authority for generated public documents and does not compile or depend on `owlauth-server`. It provides no HTTP server or client, domain entities, database rows, or authorization behavior.
 
-Generate the current legacy combined document through the server binary:
+Export both current documents from the repository root:
 
 ```bash
-cargo run --package owlauth-server -- --openapi
+make openapi
 ```
 
-Generated OpenAPI output is not committed. See the [HTTP contract specification](../../spec/05-http-contract-and-surface-boundaries.md) for the target boundary.
+Or export one document directly:
+
+```bash
+cargo run --package owlauth-types --bin export-openapi -- runtime target/openapi/runtime.json
+cargo run --package owlauth-types --bin export-openapi -- control target/openapi/control.json
+```
+
+Generated JSON documents are build artifacts and are not committed. The two derived hosted-web type files are committed and checked for clean regeneration. See the [HTTP contract specification](../../spec/05-http-contract-and-surface-boundaries.md) for the boundary.
 
 ## License
 

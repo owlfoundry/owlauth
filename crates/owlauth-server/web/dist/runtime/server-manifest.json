@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "plane": "runtime",
+  "entry": "assets/runtime-B9Hzz-e6.js",
+  "scripts": [
+    "assets/runtime-B9Hzz-e6.js"
+  ],
+  "stylesheets": [
+    "assets/runtime-DHs0pn5M.css"
+  ],
+  "assetSetSha256": "ee63a040ed0f2e0a3d911c684a90c41fee92b48eeeb476cdceec8670c5ef282c",
+  "files": [
+    {
+      "path": "assets/runtime-B9Hzz-e6.js",
+      "mime": "text/javascript; charset=utf-8",
+      "bytes": 190423,
+      "sha256": "180deb1e744f9fbb856799f1c5c39f42e92e54424ad38b7e4a254091ce80b781",
+      "representations": {
+        "identity": {
+          "path": "assets/runtime-B9Hzz-e6.js",
+          "bytes": 190423,
+          "sha256": "180deb1e744f9fbb856799f1c5c39f42e92e54424ad38b7e4a254091ce80b781"
+        },
+        "gzip": {
+          "path": "assets/runtime-B9Hzz-e6.js.gz",
+          "bytes": 59181,
+          "sha256": "36d5a0cf38b8c56075c8cfe984bbdc6a7fe352b4752c3a24955b36577d97144f"
+        },
+        "brotli": {
+          "path": "assets/runtime-B9Hzz-e6.js.br",
+          "bytes": 51107,
+          "sha256": "ba54a67ea65129a9a83a186657f6c3b0f1323f60457eadf11e16a73f57857d45"
+        }
+      }
+    },
+    {
+      "path": "assets/runtime-DHs0pn5M.css",
+      "mime": "text/css; charset=utf-8",
+      "bytes": 1157,
+      "sha256": "d4ed3dcfd78ec9b48ee0329d706bd927fc1d12d7a99f212c32a287ebea2f3622",
+      "representations": {
+        "identity": {
+          "path": "assets/runtime-DHs0pn5M.css",
+          "bytes": 1157,
+          "sha256": "d4ed3dcfd78ec9b48ee0329d706bd927fc1d12d7a99f212c32a287ebea2f3622"
+        },
+        "gzip": {
+          "path": "assets/runtime-DHs0pn5M.css.gz",
+          "bytes": 609,
+          "sha256": "935525185e62ee3e7e8c489b58ce1b30d7806f6915ae41774822dcf5acc5053e"
+        },
+        "brotli": {
+          "path": "assets/runtime-DHs0pn5M.css.br",
+          "bytes": 515,
+          "sha256": "edf2013db269a12312cf16e986e1593ba416b933dba72396a6293babddb1c916"
+        }
+      }
+    }
+  ]
+}

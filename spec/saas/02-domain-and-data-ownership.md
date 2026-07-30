@@ -8,7 +8,7 @@ Likewise, `owlauth-server` does not depend on the SaaS implementation or its dom
 
 ```mermaid
 flowchart LR
-    UI[SaaS console / CLI / MCP] --> API[SaaS API adapters]
+    UI[SaaS console / discovered owlauth SaaS client / remote HTTP MCP] --> API[SaaS API adapters]
     API --> APP[SaaS application services]
     APP --> DOMAIN[SaaS domain]
     APP --> SDB[(SaaS PostgreSQL)]

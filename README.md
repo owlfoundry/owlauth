@@ -5,7 +5,7 @@ OwlAuth is self-hostable authentication and identity infrastructure for applicat
 OwlAuth federates with upstream OAuth/OIDC providers such as GitHub and Google and targets first-party passwordless email OTP/magic-link authentication through user-configured SMTP. Applications integrate through a Project Auth API, revisioned user projections, optional signed webhooks, and language SDKs; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server or provider-token broker.
 
 > [!IMPORTANT]
-> OwlAuth is pre-alpha. The repository currently contains architecture specifications, release infrastructure, placeholder SDKs, a checksum-verifying CLI updater, and a server scaffold with a health endpoint and generated OpenAPI. Project login, persistence, sessions, token issuance, Control APIs, and MCP are not implemented. Do not use the current scaffold for production authentication.
+> OwlAuth is pre-alpha. The repository currently contains architecture specifications, release infrastructure, placeholder SDKs, a checksum-verifying CLI updater, and production-shaped server foundations: PostgreSQL migrations/repositories, isolated Runtime and Control composition, health/readiness, plane-specific OpenAPI, and embedded browser shells. Project login, sessions, token issuance, provider integration, the full Control API, and MCP are not implemented. Do not use the current server for production authentication.
 
 ## Product model
 
@@ -56,7 +56,7 @@ The two planes use distinct listeners and authentication policies even when one 
 │   ├── owlauth-server  # server library, executable, migrations, and hosted-web ownership
 │   │   ├── migrations  # reviewed PostgreSQL migration assets
 │   │   └── web         # Runtime/Control hosted-web ownership boundary
-│   ├── owlauth-cli     # remote Control CLI and `owlauth` executable
+│   ├── owlauth-cli     # endpoint-discovered self-hosted/SaaS remote CLI
 │   └── owlauth-types   # public HTTP DTO and OpenAPI authority
 ├── spec                # normative server/CLI architecture and technology register
 │   └── technology      # detailed canonical technology decisions
@@ -73,6 +73,7 @@ Start with:
 
 - [User documentation](https://owlauth.owlfoundry.org)
 - [Server architecture specifications](spec/README.md)
+- [SaaS architecture specifications](spec/saas/README.md)
 - [Technology selection register](spec/10-implementation-technology-selections.md)
 - [Identity connection, passwordless email, and user-sync specification](spec/11-identity-connections-passwordless-email-and-user-sync.md)
 - [Bottom-up server and hosted-web implementation plan](spec/implementation-plan.md)
@@ -95,24 +96,28 @@ make build
 make package-check
 ```
 
-Generate the current OpenAPI document from the Rust definitions without committing the generated output:
+Start local PostgreSQL and Redis, export both OpenAPI documents, and run the Runtime listener:
 
 ```bash
-cargo run --package owlauth-server -- --openapi
-```
-
-Run the current server scaffold:
-
-```bash
-cargo run --package owlauth-server
+make dev-up
+make openapi
+OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_dev@127.0.0.1:5432/owlauth \
+  cargo run --package owlauth-server
 curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
 ```
 
-Database migration ownership is tracked in [`crates/owlauth-server/migrations/`](crates/owlauth-server/migrations/README.md), and hosted-web ownership is tracked in [`crates/owlauth-server/web/`](crates/owlauth-server/web/README.md). These directories establish ownership boundaries only; the current scaffold does not yet implement the migration runner or browser surfaces.
+Container-backed integration tests start isolated PostgreSQL and Redis instances and skip locally when Docker is unavailable; CI requires Docker execution:
+
+```bash
+make test-containers
+```
+
+Database migrations are embedded from [`crates/owlauth-server/migrations/`](crates/owlauth-server/migrations/README.md). The tracked prepared Runtime and Control assets under [`crates/owlauth-server/web/`](crates/owlauth-server/web/README.md) make ordinary Cargo and package builds deterministic and offline; `make web-build` regenerates and validates them.
 
 ## CLI installation
 
-The published CLI currently provides version/help output and checksum-verified self-update. Planned Control commands are not available yet.
+The CLI provides strict endpoint-discovered profiles, self-hosted system inspection, and checksum-verified self-update. It discovers and pins product, instance, authority, API base, and credential class before choosing an isolated typed client or reading a referenced credential; profiles have no user-configured server/SaaS type. Resource-management and SaaS tenant commands are not implemented yet.
 
 Unix-like systems:
 

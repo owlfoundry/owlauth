@@ -68,7 +68,7 @@ Authorization: Bearer owl_saas_v1_<key-id>_<secret>
 
 Creation requires current `api-keys:write` authority in the target Organization. An Account-owned key can be created only by that authenticated Account; administrators use an Organization-owned Service Account for delegated automation rather than minting a credential that impersonates another human. A Service Account key requires authority to manage that Service Account. The request selects an expiry and an explicit scope subset. The granted scope MUST be a subset of the creator's delegable permissions and the target principal's current maximum permissions.
 
-The service generates a cryptographically random secret, returns it exactly once, and stores only:
+The service generates a cryptographically random secret and returns it exactly once through the explicitly human-facing SaaS API/Console flow. The initial CLI and MCP catalogs do not expose creation because their ordinary output/result channels cannot carry the raw secret safely. The service stores only:
 
 - key ID and non-secret lookup prefix;
 - a versioned keyed digest of the secret;
@@ -82,6 +82,12 @@ Keys MUST be high entropy and MUST NOT be derived from passwords, Organization n
 ### Authentication
 
 Authentication strictly parses the canonical Bearer form, resolves `<key-id>`, computes the versioned keyed digest over the complete canonical key, and compares it in constant time. No query parameter, cookie, form/body field, URL user info, forwarding header, or alternate legacy header is accepted. Invalid-key attempts use dedicated rate limits without revealing whether the key ID, Organization, principal, scope, status, or expiry caused denial.
+
+### SaaS HTTP MCP admission
+
+The remote SaaS MCP endpoint is API-key-only even though ordinary SaaS browser/API surfaces may authenticate a human through Platform Identity. Every MCP HTTP request, including initialization, tool discovery, execution, streaming continuation, and teardown, must contain exactly the canonical SaaS API-key Bearer credential.
+
+The MCP endpoint rejects Platform Identity bearer tokens, browser/session cookies, managed-cell operator keys, Runtime credentials, mixed credentials, query/body credentials, and forwarding headers. It then executes the same current principal, Organization, scope, permission, ownership, entitlement, revision, audit, and enumeration checks as the corresponding SaaS API operation. Any negotiated transport session is non-authoritative and bound to the exact product/instance/audience, API-key ID, principal kind/ID, and key-owning Organization; every session request reauthenticates and matches that binding before session state is read or emitted. Tool discovery MAY omit unavailable tools for usability but is never an authorization grant; each invocation reauthenticates and reauthorizes current state. SaaS spec 07 owns the complete session and transport behavior.
 
 ### Effective permission
 
@@ -105,7 +111,7 @@ Consequently, removing membership, disabling a principal, or reducing current gr
 
 ### Rotation and revocation
 
-Rotation creates a new independent key and explicitly revokes the old key after a bounded customer-controlled transition. A key is never overwritten with a replacement secret. Revocation is authoritative SaaS state and takes effect before another tenant command can be admitted.
+Rotation creates a new independent key, returns its secret once through the same explicitly human-facing delivery boundary, and explicitly revokes the old key after a bounded customer-controlled transition. The initial CLI and MCP catalogs do not expose rotation. A key is never overwritten with a replacement secret. Revocation is authoritative SaaS state and takes effect before another tenant command can be admitted.
 
 API key list responses contain prefixes and metadata only. No API can recover or redisplay secret material.
 

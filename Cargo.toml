@@ -18,3 +18,13 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+# Keep local artifacts bounded without trading away useful line-level backtraces.
+# Incremental caches are disproportionately large for this multi-target workspace.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false

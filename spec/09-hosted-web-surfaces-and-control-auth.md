@@ -9,7 +9,7 @@
 
 Neither surface is a second backend. Both call their plane's reviewed HTTP/application boundary, never repositories directly, and own no alternate business rules. Runtime authentication pages never accept the operator key; the Management Console never acts as an end-user or Application authentication surface.
 
-The standalone Control profile accepts exactly one deployment API key supplied through the `OWLAUTH_CONTROL_API_KEY` environment variable. An operator opens the Console, enters that key, and can then administer the deployment. This credential also authenticates the CLI and an enabled MCP Control transport, but never Runtime Project Auth, hosted login interactions, end users, Applications, provider callbacks, or Project tokens.
+The standalone Control profile accepts exactly one deployment API key supplied through the `OWLAUTH_CONTROL_API_KEY` environment variable. An operator opens the Console, enters that key, and can then administer the deployment. After well-known endpoint discovery, this credential also authenticates the CLI and an enabled remote Streamable HTTP MCP Control endpoint, but never Runtime Project Auth, hosted login interactions, end users, Applications, provider callbacks, or Project tokens.
 
 Additional Control credential classes, persistent management-principal administration, delegated scopes, and browser login/session protocols are outside the initial profile. Adding one requires an explicit specification and technology-selection update; it cannot become an implicit fallback.
 
@@ -78,7 +78,7 @@ Hosted Authentication UI and Management Console source/built assets belong to `c
 
 ## Control API-key configuration and verification
 
-- `OWLAUTH_CONTROL_API_KEY` is required whenever the Control listener or MCP Control transport is enabled. Startup fails before binding those surfaces when it is absent, empty, malformed, or below the documented minimum strength. Runtime-only mode does not require it.
+- `OWLAUTH_CONTROL_API_KEY` is required whenever the Control listener or remote HTTP MCP endpoint is enabled. Startup fails before binding those surfaces when it is absent, empty, malformed, or below the documented minimum strength. Runtime-only mode does not require it.
 - The value uses the exact canonical `owl_ctrl_v1_<secret>` ASCII grammar from spec 06: `<secret>` is the 43-character unpadded base64url encoding of exactly 32 unpredictable bytes. OwlAuth does not accept alternate encodings or silently trim, normalize, generate, print, or persist it.
 - Configuration keeps the secret in a redacted secret type. Request verification uses bounded parsing and constant-time verification; plaintext copies are not retained beyond what the process environment and verification mechanism require.
 - A Control client sends `Authorization: Bearer <api-key>`. No query parameter, URL user info, form/body field, cookie, WebSocket subprotocol, forwarding header, or alternate legacy header is accepted as the key.

@@ -1,6 +1,6 @@
 ---
 name: owlauth-integration
-description: Integrate applications and developer tooling with OwlAuth Project Auth, select the TypeScript, Python, or Rust client, inspect generated Runtime contracts, and reason about the updater-only CLI or planned server-side Control and MCP capabilities. Use for OwlAuth setup, Project/Application integration, upstream provider login, SDK usage, migration, troubleshooting, or agent integration requests.
+description: Integrate applications and developer tooling with OwlAuth Project Auth, select the TypeScript, Python, or Rust client, inspect generated Runtime contracts, and reason about the updater-only CLI or planned endpoint-discovered self-hosted/SaaS CLI and remote HTTP MCP capabilities. Use for OwlAuth setup, Project/Application integration, upstream provider login, SDK usage, migration, troubleshooting, or agent integration requests.
 ---
 
 # OwlAuth integration
@@ -37,7 +37,7 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
 - Public `project_id`, `application_id`, and publishable configuration are identifiers, not secrets or Control credentials.
 - Do not add a path or package dependency from any SDK or CLI to `owlauth-server`.
 - Do not commit generated OpenAPI output. Generate it from `crates/owlauth-types` through `owlauth-server --openapi` when needed.
-- Treat MCP as a future server-side Control adapter. The plugin does not bundle or launch a local MCP process.
-- Treat all CLI commands other than help/version output and `update` as unimplemented.
+- Treat self-hosted and SaaS MCP as future separate remote Streamable HTTP server adapters authenticated by operator and SaaS API keys respectively. The plugin never bundles, launches, downloads, supervises, or impersonates a local MCP process.
+- Treat all CLI commands other than help/version output and `update` as unimplemented. The target single CLI discovers/pins the endpoint product before selecting isolated self-hosted or SaaS clients; it never guesses from an authenticated failure or falls back across credentials.
 - Never request provider client secrets, registry tokens, Project access/refresh tokens, management credentials, signing keys, or Cloudflare credentials in chat. Use secure local prompts, secret stores, or trusted publishing.
 - Do not recommend the current scaffold for production authentication or authorization workloads.

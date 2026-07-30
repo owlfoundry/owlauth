@@ -121,6 +121,7 @@ Runtime is not a general OAuth authorization server. OAuth/OIDC protocol handlin
 Control serves its embedded Management Console and authenticated administrative operations:
 
 - credential-free Console shell plus API-key-authenticated Console requests;
+- an optional remote Streamable HTTP MCP adapter authenticated by the same operator API key;
 - Project lifecycle and optional `belongs_to` metadata;
 - Applications, publishable configuration, allowed origins, and post-login redirects;
 - per-Project provider client IDs and secret references;
@@ -129,7 +130,7 @@ Control serves its embedded Management Console and authenticated administrative 
 - Project signing-key lifecycle commands and state inspection;
 - Project-scoped and deployment-scoped audit queries and safe health metadata.
 
-Control uses a distinct listener, narrower network exposure, and exactly one deployment-level operator API key loaded from process configuration. A valid key grants the entire deployment's Control authority; OwlAuth has no server-side Control principals, permission sets, credential-management endpoints, or Control sessions of any kind. Public Application identifiers, publishable keys, Runtime access/refresh tokens, and upstream provider credentials are never Control credentials. Conversely, the operator API key is never accepted by Runtime. Control routes cannot be mounted into the Runtime router.
+Control uses a distinct listener, narrower network exposure, and exactly one deployment-level operator API key loaded from process configuration. A valid key grants the entire deployment's Control authority; OwlAuth has no server-side Control principals, permission sets, credential-management endpoints, or Control sessions of any kind. Public Application identifiers, publishable keys, Runtime access/refresh tokens, and upstream provider credentials are never Control credentials. Conversely, the operator API key is never accepted by Runtime. Control REST, Console, and HTTP MCP routes cannot be mounted into the Runtime router.
 
 ## Standalone deployment
 
@@ -197,7 +198,7 @@ A typical topology assigns `auth.example.com` to Runtime and `admin.auth.example
 8. **Cryptographic boundary:** private-key operations occur behind Project-aware signer/data-protector interfaces; only public keys and opaque references cross it.
 9. **External-provider boundary:** remote calls use exact configured endpoints, TLS, timeouts, response bounds, state binding, and issuer/subject validation.
 10. **External-gateway boundary:** `belongs_to` is evidence for the gateway's policy decision, not proof that OwlAuth performed tenant authorization.
-11. **Agent boundary:** MCP prompt text and tool arguments cannot authorize side effects or expose credentials.
+11. **Agent boundary:** MCP is a remote HTTP adapter owned by the serving product; protocol self-description, prompt text, tool arguments, transport sessions, and UI approval cannot authorize side effects or expose credentials. No plugin/CLI launches a local MCP server.
 
 ## Design scope
 

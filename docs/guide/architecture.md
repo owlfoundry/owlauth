@@ -103,7 +103,7 @@ flowchart LR
 
     subgraph Server[One owlauth-server artifact]
         RL --> RA[Hosted UI / Project Auth adapters]
-        CL --> CA[Management Console / Control HTTP / future MCP adapters]
+        CL --> CA[Management Console / Control HTTP / remote HTTP MCP adapters]
         RA --> Core[Shared application and domain core]
         CA --> Core
     end
@@ -120,7 +120,7 @@ Runtime is public and latency-sensitive. The target surface covers the Hosted Au
 
 ### Control Plane
 
-Control serves the embedded Management Console and administers Projects, Applications, provider registrations/managed connections, email/SMTP policy, users and identity proofs, Application webhooks/delivery replay, sessions, policies, keys, and audit. It accepts only the deployment's `OWLAUTH_CONTROL_API_KEY`; a valid Bearer key has full deployment Control authority and is not stored in PostgreSQL. The Console keeps it only in active page memory. Public Project IDs, Application IDs, publishable keys, Project tokens, and provider credentials are never Control credentials.
+Control serves the embedded Management Console, the credential-free origin-root `/.well-known/owlauth` CLI descriptor, and an optional remote Streamable HTTP MCP endpoint in addition to Project/Application/provider/user/session/policy/key/audit administration. It accepts only the deployment's `OWLAUTH_CONTROL_API_KEY`; a valid Bearer key has full deployment Control authority and is not stored in PostgreSQL. The Console keeps it only in active page memory. Public Project IDs, Application IDs, publishable keys, Project tokens, and provider credentials are never Control credentials.
 
 The two routers remain isolated even in combined mode. Distinct Runtime and Control origins are recommended because they isolate the Console's in-memory operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary; routing by `Host` or path on one untrusted socket is not equivalent to the required internal listener separation.
 
@@ -132,7 +132,7 @@ The accepted hosted-web stack is one private React 19/TypeScript/Vite 8 package 
 flowchart TB
     RuntimeHTTP[Runtime HTTP] --> App[Application services]
     ControlHTTP[Control HTTP] --> App
-    MCP[Future MCP adapter] --> App
+    MCP[Remote Streamable HTTP MCP adapter] --> App
     App --> Domain[Project-scoped domain model]
     App --> Ports[Application-owned ports]
     PostgreSQL[PostgreSQL adapter] --> Ports
@@ -143,7 +143,7 @@ flowchart TB
 
 - `crates/owlauth-server` is the single server package. The target shared core, adapters, composition, and embedded migrations remain here.
 - `crates/owlauth-types` owns public Runtime, Control, and health wire vocabulary plus OpenAPI derivation—not domain entities or database rows.
-- `crates/owlauth-cli` is a remote Control client. It cannot depend on the server, access storage, or load keys.
+- `crates/owlauth-cli` is one remote client with endpoint-discovered profiles pinned to product, instance, authority, API base, and credential class for self-hosted Control and SaaS. Discovery selects isolated clients before credential release; it cannot depend on either service implementation, access storage, load keys, or launch local MCP.
 - `sdks/*` consume the public Runtime Project Auth contract. The Rust SDK receives no privileged server dependency.
 
 Dependencies point inward. HTTP frameworks, SQL rows, Redis clients, provider payloads, CLI types, MCP schemas, and SDK code cannot become the domain model.

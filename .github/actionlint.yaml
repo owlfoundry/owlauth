@@ -1,0 +1,5 @@
+# actionlint v1.7.7 predates GitHub's public macos-15-intel hosted label.
+paths:
+  .github/workflows/release-cli.yml:
+    ignore:
+      - 'label "macos-15-intel" is unknown'

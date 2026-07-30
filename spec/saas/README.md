@@ -16,6 +16,7 @@ These documents describe product and service boundaries. They do not require the
 | [`04-managed-cells-and-control-workflows.md`](04-managed-cells-and-control-workflows.md) | cell registry, Project provisioning, `belongs_to`, Control gateway behavior, reconciliation, and Runtime routing |
 | [`05-billing-entitlements-and-metering.md`](05-billing-entitlements-and-metering.md) | plans, subscriptions, entitlements, quotas, usage measurement, and billing failure semantics |
 | [`06-operations-security-and-resilience.md`](06-operations-security-and-resilience.md) | deployment isolation, secret handling, recovery, audit, support access, and availability |
+| [`07-cli-and-http-mcp-surfaces.md`](07-cli-and-http-mcp-surfaces.md) | SaaS behavior for the shared endpoint-discovered CLI profile and descriptor values, command baseline/extensions, SaaS API-key admission, remote HTTP MCP, tool discovery, and confirmation |
 
 The root [`spec/`](../README.md) remains authoritative for each `owlauth-server` deployment. This directory is authoritative only for the SaaS layer and its orchestration of those deployments. Where an OwlAuth server invariant is referenced here, the root specification owns its detailed semantics.
 
@@ -30,6 +31,8 @@ The root [`spec/`](../README.md) remains authoritative for each `owlauth-server`
 | Project `belongs_to` | OwlAuth Project metadata used as a checked copy of the SaaS Organization identifier; never the SaaS ownership authority by itself |
 | Platform administrator authentication | A separate Platform Identity OwlAuth deployment; Organization authorization remains in the SaaS layer |
 | Deployment-level OwlAuth Control authorization | The configured `OWLAUTH_CONTROL_API_KEY` for that managed deployment |
+| SaaS CLI profile and SaaS HTTP MCP authorization | Current SaaS API key, principal, Organization, grants/scope, ownership, entitlement, and revisions in SaaS authority |
+| SaaS MCP product identity and tool catalog | The remote SaaS MCP endpoint through normal protocol initialization and tool discovery |
 | Detailed tenant actor attribution | SaaS audit records; a managed OwlAuth server sees only its deployment operator |
 
 ## Cross-cutting invariants
@@ -46,6 +49,9 @@ The root [`spec/`](../README.md) remains authoritative for each `owlauth-server`
 10. A managed Project has a stable cell assignment and Runtime issuer. Moving it between deployments is not assumed to be transparent.
 11. The SaaS layer never imports `owlauth-server` implementation modules or reads/writes an OwlAuth database directly.
 12. The managed deployment operator key is a fleet secret with full Control authority for that deployment. Network isolation, per-cell credentials, secret rotation, and strict gateway allowlists contain its blast radius.
+13. One `owlauth` executable uses endpoint-discovered profiles pinned to product, instance, authority, API base, and credential class. The endpoint selects separate server/SaaS clients, identifiers, credentials, and authority; discovery failure or identity change never triggers authenticated probing or fallback.
+14. SaaS MCP is a remote Streamable HTTP server that accepts only a SaaS API key. Initialization and tool discovery self-describe its SaaS tool superset, but invocation always reauthorizes current tenant state.
+15. Neither the CLI nor an agent/plugin bundles or launches a local MCP process; self-hosted and SaaS MCP are separate remote HTTP endpoints owned by their services.
 
 ## Normative language
 

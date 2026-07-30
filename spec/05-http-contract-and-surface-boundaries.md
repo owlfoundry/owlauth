@@ -115,6 +115,12 @@ CORS is deny-by-default and Application-specific. Runtime compares the exact req
 
 Publishable keys and public IDs can identify rate/quotas but do not authorize user data. Current-user and refresh responses require actual session credentials.
 
+## Control service discovery
+
+The Control listener exposes credential-free origin-root `GET /.well-known/owlauth` for CLI endpoint discovery before any key is released. The CLI profile stores the administrative service origin; the descriptor returns the canonical Control base path. In a shared Runtime/Control origin, the trusted reverse proxy reserves this exact root route for Control discovery while all other plane routes remain under their disjoint bases; no catch-all or redirect is allowed. It returns the shared versioned descriptor shape owned by root spec 07 with product `owlauth-server`, stable non-secret deployment instance ID, canonical external Control API base, supported public Control API versions, credential class `operator-api-key`, and the canonical remote MCP URL only when MCP is enabled. This root spec owns those self-hosted values and route behavior; it does not redefine the common CLI profile schema.
+
+The descriptor contains no Project, user, `belongs_to`, health/dependency, private capability, operator-key fingerprint, internal listener, or topology data. It is side-effect-free, rejects redirects/authority confusion, and uses the public cache/response policy defined by spec 07. A distinct Runtime-only origin does not serve this Control descriptor; a Runtime URL therefore cannot be mistaken for an administrative CLI target.
+
 ## Control surface
 
 Control resources are rooted at `/v1/` and Project-owned operations always carry Project identity in the path:
@@ -137,7 +143,7 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 
 The webhook resource returns only safe endpoint/secret-version/delivery metadata. Secret input is write-only, and replay names an existing immutable event plus its existing endpoint; Control has no arbitrary event-send route. Webhook payload/signature headers are an Application integration contract but endpoint configuration/replay remain Control operations. The exact `v1` HMAC grammar and duplicate/out-of-order receiver fixtures are generated and versioned with public contracts.
 
-Every business route requires the valid deployment operator API key, which grants the whole Control surface. There are no principal, permission, Control-credential-management, or session-escalation routes. Project provider/SMTP/webhook secret-setting is resource configuration, not creation of another Control credential. Command/domain validation remains deny-by-default: a generic PATCH cannot bypass lifecycle transitions. Mutations include target revision and use deployment-operator-scoped Control idempotency where retry could duplicate a resource or external side effect. Every external-gateway mutation also supplies the observed Project `metadata_revision`, compared in the same PostgreSQL transaction as the child command.
+Every `/v1` business route requires the valid deployment operator API key, which grants the whole Control surface. The credential-free well-known descriptor is discovery metadata only and admits no command/query. There are no principal, permission, Control-credential-management, or session-escalation routes. Project provider/SMTP/webhook secret-setting is resource configuration, not creation of another Control credential. Command/domain validation remains deny-by-default: a generic PATCH cannot bypass lifecycle transitions. Mutations include target revision and use deployment-operator-scoped Control idempotency where retry could duplicate a resource or external side effect. Every external-gateway mutation also supplies the observed Project `metadata_revision`, compared in the same PostgreSQL transaction as the child command.
 
 ### Control authentication
 
@@ -159,6 +165,10 @@ The following are never Control credentials:
 - network location, client-certificate identity, forwarding headers, or knowledge of internal IDs alone.
 
 The operator API key appears only in the Authorization header, never URLs, bodies, query parameters, or output. Runtime categorically rejects it as an authentication credential. The built-in Console keeps it only in active page memory and sends it to same-origin Control routes as specified by spec 09; no credential cookie or server-side Console session is created.
+
+### HTTP MCP route
+
+When enabled, the Control listener exposes `mcp` relative to its configured external base as a standards-conformant Streamable HTTP endpoint. Every MCP protocol request uses the same operator Bearer key and full deployment authority. It is absent from Runtime and never accepts a Runtime/SaaS credential. Normal MCP initialization and tool discovery own protocol self-description; MCP schemas are not REST/OpenAPI operations. Transport, tool, confirmation, redaction, and no-local-process rules are owned by spec 07.
 
 ### `belongs_to` contract
 
@@ -196,7 +206,7 @@ DTO validation handles wire shape. Domain validation enforces current Project ow
 
 ## SDK, CLI, and MCP separation
 
-Default SDK generation consumes Runtime Project Auth only. Control uses a distinct client module/feature or CLI-owned typed transport generated solely from the Control contract. Health/internal diagnostics and MCP schemas do not enter either client automatically.
+Default SDK generation consumes Runtime Project Auth only. Control uses a distinct client module/feature or CLI-owned typed transport generated solely from the Control contract. The well-known service descriptor is a small shared CLI-discovery contract, not authorization or product capability discovery. Health/internal diagnostics and MCP schemas do not enter either client automatically.
 
 MCP tools are hand-designed Control capabilities over application commands, not generated generic forwarding. No client can access server-internal rows or provider payloads.
 

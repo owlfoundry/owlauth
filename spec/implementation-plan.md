@@ -14,8 +14,10 @@
 
 This document turns the target architecture into an incremental, bottom-up delivery
 sequence for the single `owlauth-server` package, the Runtime Hosted Authentication UI,
-and the Control Management Console. It does not define another product contract or move
-behavioral authority out of the concern-specific specifications.
+and the Control Management Console. It includes the server-side well-known descriptor and
+remote HTTP MCP adapter, but not delivery planning for the SaaS service or the CLI's SaaS
+client. It does not define another product contract or move behavioral authority out of the
+concern-specific specifications.
 
 The current repository is a health-only pre-alpha scaffold: there is no domain core,
 persistence adapter, migration runner, Runtime/Control composition, Project Auth flow,
@@ -666,6 +668,14 @@ back up/restore, and diagnose bounded failures without exposing secrets.
 6. Prove expand/migrate/switch/contract compatibility, artifact contents and licenses,
    identical web digest, source-free/no-network runtime image, and server-backed SDK
    conformance against the same instance.
+7. After the reviewed Control commands are stable, add the public
+   origin-root `/.well-known/owlauth` descriptor and self-hosted Streamable HTTP MCP adapter. Implement
+   normal protocol initialization/tool discovery, per-request `owl_ctrl` authentication,
+   bounded hand-designed tools, a server-owned impact-class catalog with fail-safe
+   high-impact defaults, preview/commit confirmation, Control-only routing, and
+   protocol/version conformance. Do not generate tools from OpenAPI and do not add a
+   stdio/local process mode. Add the CLI's complete self-hosted descriptor-pin lifecycle
+   and typed Control-client path; the SaaS client/MCP remain outside this server plan.
 
 **Dependencies:** completed vertical phases for every feature included in the release.
 
@@ -679,7 +689,19 @@ back up/restore, and diagnose bounded failures without exposing secrets.
   and Control-list resource use with per-Project fairness and no unbounded queues;
 - security tests cover cross-Project references, request ambiguity/bounds, SSRF, open
   redirect, CSRF/origin/fetch metadata, CORS, CSP, DOM injection, cache classes, credential
-  redaction, and cross-plane route/asset confusion;
+  redaction, cross-plane route/asset confusion, MCP Host/Origin/DNS-rebinding defenses,
+  key/session separation, and no Runtime/local MCP route;
+- table-driven CLI discovery tests cover first-use and one-shot confirmation; missing,
+  malformed, duplicate-field, and unsupported-schema descriptors; redirect, TLS, and
+  cross-origin URL rejection; invalid product/credential pairing; and every product,
+  instance, authority, API-base, and credential-class pin change. An observable credential
+  provider proves these cases fail before key access, and test servers prove that no
+  `Authorization` probe reaches either product. Rebind tests prove old credentials,
+  identity-bound target context, and derived caches are cleared before new selection;
+- authenticated capability/version negotiation failure, unsupported commands, transport
+  failure, and `401`/`403`/`404` prove there is no other-client probe, credential crossover,
+  product rediscovery, or post-failure fallback. MCP catalog conformance proves every
+  high-impact mutation has only the enforced preview/commit path and no lower-class alias;
 - restore resumes workers only from committed generations/cursors/outboxes; short-term
   missing keys terminalize defined work, while long-term email PII/active credentials require
   proven re-encryption before retirement or remain unready. External reference loss fails
@@ -696,6 +718,7 @@ failure modes. A green build of isolated mocks or static shells is insufficient.
 | Actor journey | First complete phase | Later extension |
 | --- | --- | --- |
 | Operator enters one deployment key and creates Project/Application | 1 | full lifecycle and hardening in 8 |
+| Operator CLI discovers/pins self-hosted endpoint and remote MCP self-describes bounded tools | 8 | SaaS CLI/MCP delivery is owned by a separate SaaS plan |
 | Operator provisions signing and assigns a provider | 2 | more adapters/rotation in 8 |
 | End user federates and Application exchanges handoff | 3 | managed connection sync in 6 |
 | Application receives first binding/projection at handoff | 3 | current-user/refresh in 4; projection evolution/webhooks in 7 |

@@ -1,88 +1,45 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+//! Stable public HTTP contracts for `OwlAuth`'s isolated Runtime and Control planes.
 
-use serde::Serialize;
-use utoipa::{OpenApi, ToSchema};
+pub mod control;
+pub mod export;
+pub mod health;
+pub mod runtime;
 
-/// OAuth error codes exposed by `OwlAuth`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-#[schema(rename_all = "snake_case")]
-pub enum OAuthErrorCode {
-    /// The request is missing a required parameter or is otherwise malformed.
-    InvalidRequest,
-    /// Client authentication failed.
-    InvalidClient,
-    /// The authorization grant is invalid or expired.
-    InvalidGrant,
-}
-
-impl fmt::Display for OAuthErrorCode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::InvalidRequest => "invalid_request",
-            Self::InvalidClient => "invalid_client",
-            Self::InvalidGrant => "invalid_grant",
-        };
-        formatter.write_str(value)
-    }
-}
-
-/// Response returned by the server health endpoint.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
-pub struct HealthResponse {
-    /// Stable health status. Healthy servers return `ok`.
-    pub status: String,
-}
-
-#[utoipa::path(
-    get,
-    path = "/health",
-    responses(
-        (status = 200, description = "The server is healthy", body = HealthResponse)
-    )
-)]
-#[doc(hidden)]
-#[must_use]
-pub fn get_health() -> HealthResponse {
-    HealthResponse {
-        status: "ok".to_owned(),
-    }
-}
-
-#[derive(OpenApi)]
-#[openapi(
-    info(
-        title = "OwlAuth API",
-        description = "Public HTTP API for the OwlAuth server"
-    ),
-    paths(get_health),
-    components(schemas(HealthResponse, OAuthErrorCode))
-)]
-struct ApiDoc;
-
-/// Generates the current server `OpenAPI` document from Rust protocol definitions.
-#[must_use]
-pub fn openapi() -> utoipa::openapi::OpenApi {
-    ApiDoc::openapi()
-}
+pub use health::HealthResponse;
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::Value;
 
-    use super::openapi;
+    use crate::{control, export, runtime};
 
     #[test]
-    fn generated_openapi_matches_wire_values() {
-        let document = serde_json::to_value(openapi()).expect("generated OpenAPI should serialize");
+    fn generated_documents_are_plane_pure_and_versioned() {
+        let runtime =
+            serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI should serialize");
+        let control =
+            serde_json::to_value(control::openapi()).expect("Control OpenAPI should serialize");
 
-        assert!(document["paths"]["/health"].is_object());
-        assert_eq!(document["info"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(
-            document["components"]["schemas"]["OAuthErrorCode"]["enum"],
-            json!(["invalid_request", "invalid_client", "invalid_grant"])
-        );
+        assert_eq!(runtime["info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(control["info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(runtime["paths"]["/health"].is_object());
+        assert!(runtime["paths"]["/ready"].is_object());
+        assert!(runtime["paths"].get("/v1/system").is_none());
+        assert!(control["paths"]["/v1/system"].is_object());
+        assert!(control["components"]["securitySchemes"]["operator_api_key"].is_object());
+    }
+
+    #[test]
+    fn separate_exports_are_deterministic() {
+        for plane in [export::OpenApiPlane::Runtime, export::OpenApiPlane::Control] {
+            let first = export::to_pretty_json(plane).expect("OpenAPI should serialize");
+            let second = export::to_pretty_json(plane).expect("OpenAPI should serialize");
+            assert_eq!(first, second);
+
+            let parsed: Value = serde_json::from_str(&first).expect("OpenAPI should be JSON");
+            assert_eq!(parsed["openapi"], "3.1.0");
+        }
     }
 }

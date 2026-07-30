@@ -75,5 +75,5 @@ A Project access token is an OwlAuth application-session JWT. It is not an upstr
 - [Architecture](/guide/architecture) — Projects, Applications, authentication flow, logical planes, storage, and deployment.
 - [Getting started](/guide/getting-started) — build and inspect the current scaffold without confusing it with the target design.
 - [SDKs](/guide/sdks) — current package status and the planned Project Auth client boundary.
-- [CLI and agent integrations](/guide/agent-integrations) — the updater-only CLI, documentation plugin, and future server-side MCP boundary.
+- [CLI and agent integrations](/guide/agent-integrations) — the updater-only CLI, endpoint-discovered self-hosted/SaaS target design, documentation plugin, and future remote HTTP MCP boundaries.
 - [Security](/guide/security) — target invariants, operational trust boundaries, and vulnerability reporting.

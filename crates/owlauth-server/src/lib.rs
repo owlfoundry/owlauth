@@ -1,43 +1,11 @@
 #![forbid(unsafe_code)]
 
-use axum::{Json, Router, routing::get};
-use owlauth_types::HealthResponse;
+//! `OwlAuth` server composition, persistence, and isolated HTTP planes.
 
-/// Builds the public HTTP application.
-pub fn app() -> Router {
-    Router::new().route("/health", get(health))
-}
+mod adapters;
+mod composition;
+pub mod config;
+mod http;
+mod web_assets;
 
-async fn health() -> Json<HealthResponse> {
-    Json(owlauth_types::get_health())
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::{
-        body::{Body, to_bytes},
-        http::{Request, StatusCode},
-    };
-    use tower::ServiceExt;
-
-    use super::app;
-
-    #[tokio::test]
-    async fn serves_documented_health_endpoint() {
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .expect("health request should build"),
-            )
-            .await
-            .expect("health request should succeed");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024)
-            .await
-            .expect("health response should be readable");
-        assert_eq!(&body[..], br#"{"status":"ok"}"#);
-    }
-}
+pub use composition::{ServerError, run};

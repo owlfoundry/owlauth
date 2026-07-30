@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./node_modules/.cache/types/control",
+    "tsBuildInfoFile": "./node_modules/.cache/control.tsbuildinfo"
+  },
+  "include": ["src/control/**/*.ts", "src/control/**/*.tsx", "src/vite-env.d.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"],
+  "references": [
+    { "path": "./tsconfig.shared.json" },
+    { "path": "./tsconfig.generated-control.json" }
+  ]
+}

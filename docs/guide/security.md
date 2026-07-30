@@ -26,6 +26,8 @@ Control has a distinct listener and accepts only the single API key loaded from 
 
 Public IDs, Project access/refresh tokens, upstream provider credentials, network location, client-certificate identity, and forwarding headers are not Control credentials. Runtime never accepts the operator key.
 
+The optional self-hosted MCP endpoint is remote Streamable HTTP on Control and reauthenticates the operator Bearer key on every request. OwlAuth SaaS exposes a separate remote MCP endpoint that accepts only a SaaS API key and rechecks current tenant authority. A protected MCP host supplies the header; neither key enters prompts, model-visible context, tools/results, transport session IDs, or a local plugin/CLI process. Protocol tool discovery is not authorization.
+
 ### Provider and redirect boundary
 
 Provider callbacks and Application redirects are different URL classes. Both are exact registered values. Wildcards, prefix matching, user-info confusion, redirect chaining, and caller-selected callback identities are forbidden.

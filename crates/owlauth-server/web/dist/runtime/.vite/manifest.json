@@ -1,0 +1,11 @@
+{
+  "src/runtime/main.tsx": {
+    "file": "assets/runtime-B9Hzz-e6.js",
+    "name": "main",
+    "src": "src/runtime/main.tsx",
+    "isEntry": true,
+    "css": [
+      "assets/runtime-DHs0pn5M.css"
+    ]
+  }
+}

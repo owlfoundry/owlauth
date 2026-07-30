@@ -12,10 +12,30 @@ categories = ["authentication", "web-programming::http-server"]
 [dependencies]
 axum = "0.8.9"
 owlauth-types = { version = "=0.0.2", path = "../owlauth-types" }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net"] }
+rust-embed = { version = "8.11.0", features = ["debug-embed", "include-exclude"] }
+sea-orm = { version = "2.0.0", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "uuid", "time", "json"] }
+subtle = "2.6.1"
+thiserror = "2.0.18"
+time = "0.3.47"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
+tower = { version = "0.5.3", features = ["limit", "util"] }
+tower-http = { version = "0.6.8", features = ["catch-panic", "limit", "request-id", "timeout", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
+url = "2.5.8"
+uuid = { version = "1.21.0", features = ["v4"] }
 
 [lints]
 workspace = true
 
+[build-dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+
 [dev-dependencies]
-tower = { version = "0.5.3", features = ["util"] }
+crc = "3.4.0"
+testcontainers = "0.27.3"

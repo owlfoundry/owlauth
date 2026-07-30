@@ -1,0 +1,16 @@
+.form {
+  display: grid;
+  gap: 0.75rem;
+  max-width: 30rem;
+}
+
+.form input {
+  border: 1px solid var(--owl-muted);
+  border-radius: 0.375rem;
+  font: inherit;
+  padding: 0.625rem 0.75rem;
+}
+
+.form button {
+  justify-self: start;
+}

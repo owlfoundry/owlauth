@@ -46,12 +46,14 @@ Configuration has one precedence model, rejects unknown fields, and separates gl
 
 - immutable deployment external Runtime and Control base URLs; when they share an origin, both use disjoint non-root prefixes so Runtime cookies can remain outside the Control path;
 - Project issuer derivation rule;
-- environment/instance namespace;
+- immutable environment/instance namespace and its stable non-secret public instance ID used by the well-known CLI descriptor;
 - selected plane mode;
 - protocol lifetime/clock-skew bounds plus non-overridable email-auth safety floors/ceilings from spec 11; Project configuration may only tighten them;
 - trusted secret/key-provider configuration, including distinct retained key sets for short-term transaction/mail state, long-term email PII, and v1 PostgreSQL managed-credential AEAD;
 - optional deployment-default SMTP adapter/secret reference with explicit generation and safe fingerprint, unavailable to a Project unless that Project explicitly opts in; its process handle must match the authoritative PostgreSQL generation registry and cannot silently reactivate a disabled/compromised generation;
 - outbound provider/SMTP/webhook DNS, proxy, TLS, private-network allowlist, destination, and concurrency policy.
+
+The public instance ID is stable across ordinary upgrade, process replacement, and backup/restore. Deliberate replacement is an administrative service-identity change that causes pinned CLI profiles to fail before key release until the operator explicitly accepts/rebinds the new identity.
 
 Project/provider/Application/email/webhook policy is authoritative PostgreSQL state, not replicated process configuration. Deployment defaults and egress policy constrain Project choices but never imply cross-Project configuration fallback. PostgreSQL stores only deployment-default SMTP generation/status/revision and a safe configuration fingerprint; startup/readiness rejects a configured handle whose generation/fingerprint does not match, while secret bytes remain in protected process/secret-provider configuration.
 
@@ -69,9 +71,10 @@ Project/provider/Application/email/webhook policy is authoritative PostgreSQL st
 - TLS and optional mTLS transport roots as hardening, not alternate Control identity;
 - the single operator API key from `OWLAUTH_CONTROL_API_KEY`;
 - strict request, connection, and authentication rate policy;
-- deny-by-default CORS, private-network assumptions, and Management Console security-header policy.
+- deny-by-default CORS, private-network assumptions, and Management Console security-header policy;
+- explicit remote HTTP MCP enablement, canonical path under the Control base, protocol/message/session/stream/concurrency bounds, and external MCP URL published by the well-known descriptor.
 
-`OWLAUTH_CONTROL_API_KEY` is required when mode is `control` or `all`; startup fails before binding Control if it is absent or does not match the canonical format below. Mode `runtime` does not require or load it. No configuration field defines additional keys, operator identities, permissions, or Control sessions. Any built-in Control UI invokes the same Control API using the same Bearer key and creates no server-side login/session model.
+`OWLAUTH_CONTROL_API_KEY` is required when mode is `control` or `all`; startup fails before binding Control, Console business routes, or an enabled HTTP MCP endpoint if it is absent or does not match the canonical format below. Mode `runtime` does not require or load it. No configuration field defines additional keys, operator identities, permissions, or Control sessions. Any built-in Control UI invokes the same Control API using the same Bearer key and creates no server-side login/session model.
 
 ### Infrastructure fields
 

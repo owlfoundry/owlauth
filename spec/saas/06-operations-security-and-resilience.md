@@ -40,11 +40,18 @@ The diagram shows trust relationships, not a requirement that every arrow be a d
 - Managed Runtime is public through approved ingress and exposes Runtime routes only.
 - Managed Control is private and accepts traffic only from trusted SaaS/fleet workloads.
 - Runtime ingress cannot route Control paths or ports.
-- SaaS tenant traffic cannot select arbitrary backend origins, trusted proxy headers, or cell addresses.
+- The SaaS API ingress may expose its remote `mcp` endpoint, but that route accepts only canonical SaaS API-key Bearer authentication, denies broad browser CORS, bounds Streamable HTTP protocol resources, and never appears on Platform Identity or Managed Runtime/Control origins.
+- SaaS tenant traffic, including CLI and MCP calls, cannot select arbitrary backend origins, trusted proxy headers, cell addresses, raw Control routes, or operator credentials.
 - Egress from the SaaS service, cells, and provider/billing adapters is allowlisted and bounded according to function.
 - TLS verification is mandatory; mTLS/workload identity SHOULD supplement private Control networking where available.
 
 Network position never replaces the OwlAuth Control operator API key or SaaS caller authorization.
+
+## SaaS service discovery identity
+
+The SaaS administrative origin exposes credential-free origin-root `GET /.well-known/owlauth` with product `owlauth-saas`, descriptor version, a stable non-secret SaaS environment/instance ID, canonical SaaS API base and supported versions, credential class `saas-api-key`, and canonical remote MCP URL. It contains no Organization, plan, tenant capability, cell, health, credential, or internal topology data.
+
+The public instance ID is immutable environment identity preserved through ordinary upgrade, backup/restore, and regional service replacement. Deliberately replacing it is a service-identity event that requires CLI profiles to rediscover and explicitly accept/rebind before any credential is released. The descriptor is bounded, side-effect-free, same-origin, non-redirecting, and never substitutes for API-key authentication or tenant authorization.
 
 ## Operator API key operations
 

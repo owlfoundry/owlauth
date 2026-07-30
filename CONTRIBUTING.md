@@ -6,7 +6,7 @@ OwlAuth is in its initial design and scaffold phase. Open an issue before making
 
 The repository separates target design from implemented behavior:
 
-- [`spec/`](spec/README.md) defines the normative server, Runtime, Control, CLI, and MCP architecture.
+- [`spec/`](spec/README.md) defines the normative self-hosted server, Runtime, Control, endpoint-discovered CLI, and remote HTTP MCP architecture; [`spec/saas/`](spec/saas/README.md) owns SaaS tenant behavior and its CLI/MCP adapter.
 - [`sdks/spec/`](sdks/spec/README.md) defines language-neutral SDK behavior and conformance requirements.
 - [`docs/`](docs/index.md) provides user-facing guidance and must state pre-alpha limitations truthfully.
 - Rust definitions in `crates/owlauth-types` are the source of generated public HTTP/OpenAPI contracts.
@@ -17,7 +17,7 @@ Do not document target behavior as currently available. OwlAuth is Project-scope
 
 - Server-only domain, storage, HTTP, and composition code stays inside `crates/owlauth-server` until a real independent package boundary exists.
 - `crates/owlauth-types` contains public DTOs and OpenAPI definitions, not domain entities or persistence rows.
-- `crates/owlauth-cli` is a remote Control client and must not depend on `owlauth-server` or bypass server-side authorization.
+- `crates/owlauth-cli` is one endpoint-discovered self-hosted/SaaS remote client. It must not depend on either service implementation, probe/fallback across credentials, access storage, or bypass server/SaaS authorization. CLI/plugins never bundle a local MCP process.
 - TypeScript, Python, and Rust SDKs consume public Runtime contracts plus shared fixtures; none may depend on server implementation crates.
 - Generated OpenAPI documents and release-only version bumps are not committed.
 

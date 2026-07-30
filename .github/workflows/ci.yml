@@ -15,12 +15,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust stable
+  hosted-web:
+    name: Hosted web
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Rebuild embedded assets
+        run: pnpm --filter @owlauth/server-web build
+      - name: Run hosted-web checks
+        run: pnpm --filter @owlauth/server-web check
+      - name: Reject generated contract or asset drift
+        run: git diff --exit-code -- crates/owlauth-server/web/src/generated crates/owlauth-server/web/dist
+
+  rust:
+    name: Rust stable
+    needs: hosted-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       RUSTUP_TOOLCHAIN: stable
+      OWLAUTH_REQUIRE_DOCKER: "1"
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -46,9 +74,9 @@ jobs:
             package_files="$(cargo package --manifest-path "$manifest" --locked --allow-dirty --list)"
             grep -qx LICENSE <<< "$package_files"
           done
-          # owlauth-types 0.0.2 is not in the registry until the first server release.
-          server_files="$(cargo package --manifest-path crates/owlauth-server/Cargo.toml --locked --allow-dirty --list)"
-          grep -qx LICENSE <<< "$server_files"
+          # The server package uses the just-packaged unpublished owlauth-types through
+          # a temporary local patch and must compile without network access.
+          scripts/test-server-package.sh
       - name: Verify Rust product boundaries
         run: |
           cli_tree="$(cargo tree --locked --package owlauth-cli --edges normal --prefix none)"
@@ -269,7 +297,7 @@ jobs:
   contract:
     name: Contract
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -277,10 +305,20 @@ jobs:
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
+      - name: Set up Go for workflow validation
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.23.x"
+          cache: false
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
       - name: Generate and validate OpenAPI
         run: |
-          cargo run --locked --package owlauth-server -- --openapi > "${RUNNER_TEMP}/owlauth-openapi.json"
-          python3 -m json.tool "${RUNNER_TEMP}/owlauth-openapi.json" >/dev/null
+          for plane in runtime control; do
+            cargo run --locked --package owlauth-types --bin export-openapi -- \
+              "$plane" "${RUNNER_TEMP}/${plane}-openapi.json"
+            python3 -m json.tool "${RUNNER_TEMP}/${plane}-openapi.json" >/dev/null
+          done
       - name: Validate JSON fixtures
         run: |
           python3 -m json.tool sdks/spec/fixtures/health-response.json >/dev/null

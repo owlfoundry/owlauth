@@ -6,8 +6,8 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "build": "pnpm --filter @owlauth/client build && pnpm --filter @owlauth/docs build",
-    "check": "pnpm --filter @owlauth/client check",
-    "test": "pnpm --filter @owlauth/client test"
+    "build": "pnpm --filter @owlauth/server-web build && pnpm --filter @owlauth/client build && pnpm --filter @owlauth/docs build",
+    "check": "pnpm --filter @owlauth/server-web check && pnpm --filter @owlauth/client check",
+    "test": "pnpm --filter @owlauth/server-web test && pnpm --filter @owlauth/client test"
   }
 }

@@ -200,8 +200,10 @@ Dedicated cells differ in placement and operational policy, not in tenant creden
 
 A cell cannot be removed while authoritative Managed Project mappings remain. Drain/migration requires a separate Project migration design or confirmed deletion/export. Deleting a registry row is never a data migration.
 
-## Customer CLI and MCP
+## Customer CLI and HTTP MCP
 
-A SaaS CLI or MCP surface authenticates to the SaaS layer with Platform Identity or SaaS API credentials and invokes the same tenant authorization/application services as the SaaS HTTP API. It MUST NOT wrap the trusted `owlauth` operator CLI, expose cell Control URLs, or relay operator keys into local configuration or agent context.
+When an `owlauth` endpoint profile validates a descriptor pinned to `owlauth-saas`, the CLI selects its isolated SaaS client; it never invokes, shells out to, proxies, or falls back to the self-hosted client. Common Project-management commands map to tenant-aware SaaS product operations; Organization, membership, Service Account, API-key, billing, entitlement, and usage commands are SaaS-only. No SaaS CLI command exposes a cell Control URL, accepts a raw cell target, or receives an operator key.
 
-High-impact SaaS MCP tools use bounded schemas, previews, exact command/Organization/target binding, short-lived one-use confirmation, revision checks, and SaaS audit. Human approval is additional intent evidence; it does not replace SaaS authentication, permission, ownership, or entitlement checks.
+The SaaS MCP surface is a remote Streamable HTTP server owned by the SaaS API layer and accepts only a canonical SaaS API key. MCP `initialize` and `tools/list` self-describe the endpoint and its SaaS tool superset, so clients do not maintain an OwlAuth product-mode tool table. Tools still enter the same tenant authorization/application services as REST/CLI operations and never forward generic Control requests.
+
+High-impact SaaS MCP tools use bounded schemas, server-owned fail-safe impact classification, previews, exact API-key actor/Organization/target binding, short-lived one-use confirmation, and current permission/entitlement/revision checks. A SaaS-owned mutation atomically consumes confirmation with its authoritative mutation and audit; a managed-cell or other external side effect first commits an actor-bound durable operation/intent or outbox and is then finalized or reconciled by its owning adapter. Human approval is additional intent evidence; it does not replace authentication, permission, ownership, entitlement, or managed-cell reconciliation. SaaS spec 07 owns the complete CLI and HTTP MCP boundary.

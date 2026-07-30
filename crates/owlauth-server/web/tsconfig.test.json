@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./node_modules/.cache/types/test",
+    "tsBuildInfoFile": "./node_modules/.cache/test.tsbuildinfo",
+    "types": ["vitest/globals", "@testing-library/jest-dom"]
+  },
+  "include": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test-setup.ts"],
+  "references": [{ "path": "./tsconfig.runtime.json" }, { "path": "./tsconfig.control.json" }]
+}

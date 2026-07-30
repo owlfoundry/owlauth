@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.shared.json" },
+    { "path": "./tsconfig.generated-runtime.json" },
+    { "path": "./tsconfig.generated-control.json" },
+    { "path": "./tsconfig.runtime.json" },
+    { "path": "./tsconfig.control.json" },
+    { "path": "./tsconfig.test.json" }
+  ]
+}

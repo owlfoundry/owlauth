@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./node_modules/.cache/types/shared",
+    "tsBuildInfoFile": "./node_modules/.cache/shared.tsbuildinfo"
+  },
+  "include": ["src/shared/**/*.ts", "src/shared/**/*.tsx", "src/vite-env.d.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+}

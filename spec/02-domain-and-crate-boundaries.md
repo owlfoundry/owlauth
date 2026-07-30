@@ -2,13 +2,13 @@
 
 ## Dependency rule
 
-Dependencies point inward. Runtime HTTP, Control HTTP, PostgreSQL, Redis, KMS, upstream providers, CLI, MCP, and SDKs are adapters around Project-scoped application and domain policy.
+Dependencies point inward. Runtime HTTP, Control HTTP, PostgreSQL, Redis, KMS, upstream providers, the CLI's discovered self-hosted client, self-hosted HTTP MCP, and SDKs are adapters around Project-scoped application and domain policy. The discovered SaaS client and SaaS MCP terminate at SaaS application services instead.
 
 ```mermaid
 flowchart TB
     RHTTP[Runtime HTTP adapter] --> APP[Application services]
     CHTTP[Control HTTP adapter] --> APP
-    MCP[MCP Control adapter] --> APP
+    MCP[Remote HTTP MCP Control adapter] --> APP
     APP --> DOMAIN[Project-scoped domain model]
     APP --> PORTS[Application-owned ports]
     PG[PostgreSQL adapter] --> PORTS
@@ -31,7 +31,7 @@ This is the single server package. It owns:
 - application services, Project-bound invariants, and deployment-operator Control admission policy;
 - persistence, cache, upstream-provider, signer, data-protection, clock, entropy, and audit ports;
 - PostgreSQL and Redis adapters and embedded migrations;
-- Runtime HTTP and Hosted Authentication UI, Control HTTP and Management Console, MCP, telemetry, health, and process-lifecycle adapters.
+- Runtime HTTP and Hosted Authentication UI, Control HTTP and Management Console, remote Streamable HTTP MCP, telemetry, health, and process-lifecycle adapters.
 
 PostgreSQL implementation technology and migration behavior are owned by spec 04; hosted web surfaces, route/base separation, and browser credential behavior are owned by spec 09. Server-only concepts remain internal modules. Logical plane separation does not create separate Cargo packages or duplicated service layers.
 
@@ -43,9 +43,9 @@ This package owns stable public HTTP DTOs, wire enums, error serialization, endp
 
 ### `crates/owlauth-cli`
 
-This package owns the `owlauth` remote Control client experience: argument parsing, safe credential input, confirmation, machine output, and public Control API calls. It MUST NOT link server composition, open PostgreSQL/Redis, invoke domain repositories, load Project keys, or act as a local Control Plane.
+This package owns the one `owlauth` remote administration experience: argument parsing, endpoint profiles, well-known product/instance/authority/API-base/credential-class discovery and pinning, safe credential input, product-specific typed clients, confirmation, machine output, and public server/SaaS API calls. It MUST NOT link either service implementation, open PostgreSQL/Redis, invoke domain repositories, load Project keys, act as a local Control Plane, or launch a local MCP process.
 
-The CLI uses a deliberately isolated Control client module. Default Runtime SDK surfaces do not gain administrative operations merely because the CLI and SDK share a transport implementation.
+The CLI uses isolated self-hosted Control and SaaS client modules selected only after endpoint discovery validation. Default Runtime SDK surfaces do not gain administrative operations merely because the CLI and SDK share transport primitives. The two CLI clients do not call or fall back to one another.
 
 ### `sdks/*`
 
@@ -59,17 +59,20 @@ SDKs have no privileged knowledge of rows or domain types. The Rust SDK receives
 flowchart LR
     SERVER[owlauth-server] --> TYPES[owlauth-types]
     SDK[Runtime SDKs] -. Runtime DTO vocabulary .-> TYPES
-    CLI[owlauth-cli] --> CCLIENT[Isolated Control client module]
+    CLI[owlauth-cli] --> DISCOVERY[Well-known descriptor client]
+    DISCOVERY --> CCLIENT[Isolated Control client]
+    DISCOVERY --> SCLIENT[Isolated SaaS client]
     CCLIENT -. Control DTO vocabulary .-> TYPES
+    SCLIENT -. SaaS public contract .-> SAASAPI[OwlAuth SaaS API]
 
-    CLI ~~~ NO1["must not depend on owlauth-server"]
+    CLI ~~~ NO1["must not depend on either service implementation"]
     SDK ~~~ NO2["must not depend on owlauth-server"]
 ```
 
 Forbidden dependencies apply transitively:
 
-- `owlauth-cli -> owlauth-server`;
-- any client SDK or Control client `-> owlauth-server`;
+- `owlauth-cli -> owlauth-server` or any SaaS service implementation package;
+- any client SDK, Control client, or SaaS client `->` its service implementation;
 - `owlauth-server -> owlauth-cli | client SDK`;
 - `owlauth-types -> owlauth-server | owlauth-cli | client SDK`.
 

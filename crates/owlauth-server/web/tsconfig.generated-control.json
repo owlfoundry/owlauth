@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./node_modules/.cache/types/generated-control",
+    "tsBuildInfoFile": "./node_modules/.cache/generated-control.tsbuildinfo"
+  },
+  "include": ["src/generated/control-openapi.ts"]
+}

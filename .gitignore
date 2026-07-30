@@ -5,6 +5,8 @@
 # Node.js
 **/node_modules/
 **/dist/
+!/crates/owlauth-server/web/dist/
+!/crates/owlauth-server/web/dist/**
 **/.wrangler/
 *.tsbuildinfo
 

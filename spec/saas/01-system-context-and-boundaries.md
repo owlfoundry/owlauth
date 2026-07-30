@@ -9,7 +9,7 @@ OwlAuth SaaS owns:
 - SaaS accounts and Organization membership;
 - tenant roles, permissions, invitations, service accounts, and SaaS API keys;
 - Organization-to-Project ownership and cell assignment;
-- customer-facing management APIs, console, CLI, and optional SaaS MCP capabilities;
+- customer-facing management APIs, console, the `owlauth` CLI's `saas` profile, and the remote SaaS HTTP MCP server;
 - subscriptions, entitlements, quotas, billing, and support workflows;
 - managed-cell provisioning, reconciliation, and fleet operations.
 
@@ -134,7 +134,8 @@ The SaaS product exposes its own contracts:
 
 - tenant-aware SaaS HTTP API;
 - SaaS console;
-- optional SaaS CLI and MCP surfaces;
+- the shared `owlauth` CLI when its selected endpoint profile discovers and pins `owlauth-saas`;
+- a remote SaaS Streamable HTTP MCP endpoint authenticated only by SaaS API key;
 - webhooks and billing/customer integrations.
 
 These surfaces MAY internally use OwlAuth Control, but MUST NOT expose:
@@ -145,7 +146,7 @@ These surfaces MAY internally use OwlAuth Control, but MUST NOT expose:
 - OwlAuth internal database identifiers or repositories;
 - provider secret bytes, signing private keys, Runtime credentials, or raw audit payloads.
 
-The existing `owlauth` CLI remains a trusted deployment-operator client for direct/self-hosted OwlAuth administration. A customer-facing cloud CLI is a SaaS client and uses SaaS credentials and authorization instead.
+The same `owlauth` executable uses endpoint profiles without a user-configured product type. A standard public descriptor declares and pins product, instance, authority, API base, and credential class before credential release; the discovered product selects the isolated operator or tenant client. Discovery failure or identity change fails rather than probing/falling back. The two products likewise expose separate self-describing HTTP MCP endpoints as specified by SaaS spec 07.
 
 ## Out of scope for `owlauth-server`
 

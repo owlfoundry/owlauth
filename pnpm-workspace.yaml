@@ -1,4 +1,5 @@
 packages:
+  - crates/owlauth-server/web
   - docs
   - sdks/typescript
 
@@ -7,4 +8,4 @@ allowBuilds:
   workerd: true
 
 overrides:
-  vite: 6.4.3
+  "vitepress>vite": 6.4.3

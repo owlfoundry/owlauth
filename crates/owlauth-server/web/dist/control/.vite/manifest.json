@@ -1,0 +1,11 @@
+{
+  "src/control/main.tsx": {
+    "file": "assets/control-FLgYnG_O.js",
+    "name": "main",
+    "src": "src/control/main.tsx",
+    "isEntry": true,
+    "css": [
+      "assets/control-DtpLqc4i.css"
+    ]
+  }
+}
