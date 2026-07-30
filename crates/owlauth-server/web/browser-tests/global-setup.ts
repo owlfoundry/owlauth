@@ -59,7 +59,7 @@ export default async function globalSetup() {
         OWLAUTH_MODE: "runtime",
         OWLAUTH_RUNTIME_ADDR: `127.0.0.1:${String(runtimePort)}`,
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "inherit", "inherit"],
     });
     controlServer = spawn("cargo", ["run", "--quiet", "--locked", "-p", "owlauth-server"], {
       cwd: repository,
@@ -70,7 +70,7 @@ export default async function globalSetup() {
         OWLAUTH_CONTROL_BASE_URL: controlBase,
         OWLAUTH_CONTROL_API_KEY: operatorKey,
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "inherit", "inherit"],
     });
     await waitForUrl(`${runtimeBase}health`, runtimeServer);
     await waitForUrl(`${controlBase}health`, controlServer);
@@ -142,7 +142,7 @@ async function waitForExit(process: ReturnType<typeof spawn>): Promise<void> {
 }
 
 async function waitForUrl(url: string, process: ReturnType<typeof spawn>): Promise<void> {
-  for (let attempt = 0; attempt < 120; attempt += 1) {
+  for (let attempt = 0; attempt < 480; attempt += 1) {
     if (process.exitCode !== null) throw new Error("OwlAuth browser-test server exited early");
     try {
       const response = await fetch(url);

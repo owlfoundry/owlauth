@@ -40,6 +40,8 @@ jobs:
         run: pnpm --filter @owlauth/server-web check
       - name: Install Chromium for the real browser journey
         run: pnpm --filter @owlauth/server-web exec playwright install --with-deps chromium
+      - name: Build the browser-test server
+        run: cargo build --locked --package owlauth-server
       - name: Run real PostgreSQL and Rust provisioning-readiness journey
         run: pnpm --filter @owlauth/server-web exec playwright test --project=chromium
       - name: Reject generated contract or asset drift
