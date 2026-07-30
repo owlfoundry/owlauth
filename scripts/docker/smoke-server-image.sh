@@ -52,6 +52,7 @@ docker run --detach \
   --name "$server_container" \
   --network "$network" \
   --env OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_smoke@postgres:5432/owlauth \
+  --env OWLAUTH_RUNTIME_PROCESS_ID=smoke-runtime \
   "$image" >/dev/null
 
 pid_one=""

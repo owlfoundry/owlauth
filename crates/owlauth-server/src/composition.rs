@@ -41,7 +41,7 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let pools = create_pools(&config)
         .await
         .map_err(|_| ServerError::DatabasePools)?;
-    let mut routers = build_routers(&config);
+    let mut routers = build_routers(&config, Some(&pools));
 
     let runtime_listener = match bind_selected(config.mode.has_runtime(), config.runtime.bind).await
     {

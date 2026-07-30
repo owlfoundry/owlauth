@@ -78,6 +78,10 @@ The eventual cross-language matrix covers, as capabilities ship:
 - Project isolation and disabled Project/Application/user/session behavior;
 - stable errors and seeded-secret log scanning.
 
+The same published `@owlauth/client` artifact and public protocol API run in every declared Node.js version and supported browser engine. The browser-direct test Application owns navigation, history cleanup, pending/credential state, refresh serialization, and atomic replacement; those harness behaviors are not attributed to the core SDK. Browser tests also prove that the browser bundle has no Node-only runtime dependency and that real Runtime CORS, Web Crypto, cancellation, callback parsing, and browser-callable protocol operations work without a separate browser package or entry point.
+
+A separate product E2E topology uses a real Application backend for handoff exchange, credential custody, Project JWT verification, refresh, current user, and logout. The browser-direct compatibility matrix and backend-custody product E2E are distinct required evidence when both support claims apply; neither substitutes for the other.
+
 The database and environment are destroyed after the job. A static fixture, mock response, generated-client compile, or health endpoint round trip is never labeled E2E.
 
 ## Acceptance criteria
@@ -85,5 +89,6 @@ The database and environment are destroyed after the job. A static fixture, mock
 - Every attachment link resolves and every schema version is validated.
 - Fixture descriptions state current limited coverage truthfully.
 - Required cases produce equivalent results in every claiming SDK.
+- TypeScript Node.js and browser jobs exercise one `@owlauth/client` core rather than divergent platform implementations.
 - CI names package/unit/contract/conformance/E2E stages accurately.
 - Project Auth release claims wait for a real-server test of that capability.

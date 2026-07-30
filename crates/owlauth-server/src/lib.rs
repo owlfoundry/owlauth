@@ -3,8 +3,10 @@
 //! `OwlAuth` server composition, persistence, and isolated HTTP planes.
 
 mod adapters;
+mod application;
 mod composition;
 pub mod config;
+mod domain;
 mod http;
 mod web_assets;
 

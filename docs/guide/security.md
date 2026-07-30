@@ -59,7 +59,7 @@ Each Application receives only its policy-approved revisioned projection after i
 
 A Project browser session is opaque, hardened, and Project/user/browser bound. It may support sign-in reuse among Applications in that Project. Application sessions and refresh families remain Application-bound.
 
-Refresh tokens are high-entropy opaque values stored as digests. Every generation is one-use. At most one concurrent presentation creates a successor; later or concurrent reuse revokes the whole family. SDKs serialize refresh per family and treat an ambiguous lost response as reauthentication.
+Refresh tokens are high-entropy opaque values stored as digests. Every generation is one-use. At most one concurrent presentation creates a successor; later or concurrent reuse revokes the whole family. Core SDKs never blindly replay an ambiguous refresh; the Application or an external stateful integration serializes refresh per family, atomically replaces the credential pair, and treats an ambiguous lost response as reauthentication.
 
 Project, Application, user, browser session, policy, and signing revisions are revalidated before handoff or refresh commits. Project/user disablement invalidates all affected state; Application disablement affects only that Application. Already issued self-contained access tokens remain valid until short expiry unless a separately designed online check is used.
 

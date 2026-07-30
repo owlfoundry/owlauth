@@ -3,13 +3,16 @@ use std::{
     env, fmt,
     net::SocketAddr,
     num::NonZeroU32,
+    path::PathBuf,
     str::FromStr,
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use url::Url;
+use zeroize::Zeroizing;
 
 const CONTROL_KEY_PREFIX: &str = "owl_ctrl_v1_";
 const CONTROL_KEY_SECRET_LENGTH: usize = 43;
@@ -22,6 +25,15 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_CONTROL_ADDR",
     "OWLAUTH_CONTROL_BASE_URL",
     "OWLAUTH_CONTROL_API_KEY",
+    "OWLAUTH_SIGNER_STORE_ROOT",
+    "OWLAUTH_SIGNER_STORE_KEY",
+    "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
+    "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
+    "OWLAUTH_RUNTIME_PROCESS_ID",
+    "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
+    "OWLAUTH_PUBLICATION_LEASE_TTL_MS",
+    "OWLAUTH_KEY_PROPAGATION_DELAY_MS",
+    "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
     "OWLAUTH_POSTGRES_URL",
     "OWLAUTH_RUNTIME_POSTGRES_URL",
     "OWLAUTH_CONTROL_POSTGRES_URL",
@@ -175,6 +187,43 @@ pub struct PostgresConfig {
     pub migration_lock_timeout: Duration,
 }
 
+#[derive(Clone)]
+pub struct StoreMasterKey(Zeroizing<[u8; 32]>);
+
+impl StoreMasterKey {
+    fn parse(key: &'static str, value: String) -> Result<Self, ConfigError> {
+        let decoded = URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| ConfigError::InvalidValue {
+                key,
+                reason: "must be exactly 32 bytes encoded as unpadded base64url".to_owned(),
+            })?;
+        let bytes: [u8; 32] = decoded.try_into().map_err(|_| ConfigError::InvalidValue {
+            key,
+            reason: "must be exactly 32 bytes encoded as unpadded base64url".to_owned(),
+        })?;
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    pub(crate) fn expose_copy(&self) -> [u8; 32] {
+        *self.0
+    }
+}
+
+impl fmt::Debug for StoreMasterKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StoreMasterKey([REDACTED])")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProvisioningConfig {
+    pub signer_store_root: PathBuf,
+    pub signer_store_key: StoreMasterKey,
+    pub configuration_secret_store_root: PathBuf,
+    pub configuration_secret_store_key: StoreMasterKey,
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub mode: PlaneMode,
@@ -182,6 +231,12 @@ pub struct ServerConfig {
     pub runtime: ListenerConfig,
     pub control: ListenerConfig,
     pub control_api_key: Option<OperatorApiKey>,
+    pub provisioning: Option<ProvisioningConfig>,
+    pub runtime_process_id: String,
+    pub required_runtime_process_ids: Vec<String>,
+    pub publication_lease_ttl: Duration,
+    pub key_propagation_delay: Duration,
+    pub signing_verification_retention: Duration,
     pub postgres: PostgresConfig,
     pub request_timeout: Duration,
     pub max_request_bytes: usize,
@@ -222,6 +277,10 @@ impl ServerConfig {
         Self::from_values(values)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear parser preserves strict whole-environment validation"
+    )]
     fn from_values(values: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
         reject_unknown_keys(values)?;
 
@@ -265,6 +324,28 @@ impl ServerConfig {
         validate_external_bases(mode, &runtime.external_base, &control.external_base)?;
 
         let (instance_id, control_api_key) = parse_control_identity(mode, values)?;
+        let provisioning = parse_provisioning(mode, values)?;
+        let configured_runtime_process_id = required(values, "OWLAUTH_RUNTIME_PROCESS_ID")?;
+        let runtime_process_id = validate_process_id(&configured_runtime_process_id)?;
+        let required_runtime_process_ids =
+            match optional(values, "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS") {
+                Some(configured) => {
+                    let ids = configured
+                        .split(',')
+                        .map(validate_process_id)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if ids.is_empty()
+                        || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+                    {
+                        return Err(ConfigError::InvalidValue {
+                            key: "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
+                            reason: "must contain unique comma-separated process IDs".to_owned(),
+                        });
+                    }
+                    ids
+                }
+                None => vec![runtime_process_id.clone()],
+            };
 
         let serving_url = required(values, "OWLAUTH_POSTGRES_URL")?;
         let runtime_url = optional(values, "OWLAUTH_RUNTIME_POSTGRES_URL")
@@ -294,6 +375,20 @@ impl ServerConfig {
             runtime,
             control,
             control_api_key,
+            provisioning,
+            runtime_process_id,
+            required_runtime_process_ids,
+            publication_lease_ttl: parse_millis(
+                values,
+                "OWLAUTH_PUBLICATION_LEASE_TTL_MS",
+                30_000,
+            )?,
+            key_propagation_delay: parse_millis(values, "OWLAUTH_KEY_PROPAGATION_DELAY_MS", 2_000)?,
+            signing_verification_retention: parse_millis(
+                values,
+                "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
+                1_200_000,
+            )?,
             postgres: PostgresConfig {
                 serving_url: SecretString::new(serving_url),
                 runtime_url: SecretString::new(runtime_url),
@@ -369,6 +464,78 @@ fn parse_control_identity(
     let control_api_key = OperatorApiKey::parse(required(values, "OWLAUTH_CONTROL_API_KEY")?)?;
     let instance_id = validate_instance_id(required(values, "OWLAUTH_INSTANCE_ID")?)?;
     Ok((Some(instance_id), Some(control_api_key)))
+}
+
+fn parse_provisioning(
+    mode: PlaneMode,
+    values: &BTreeMap<String, String>,
+) -> Result<Option<ProvisioningConfig>, ConfigError> {
+    if !mode.has_control() {
+        return Ok(None);
+    }
+    let signer_store_root = parse_store_root(
+        "OWLAUTH_SIGNER_STORE_ROOT",
+        required(values, "OWLAUTH_SIGNER_STORE_ROOT")?,
+    )?;
+    let configuration_secret_store_root = parse_store_root(
+        "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
+        required(values, "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT")?,
+    )?;
+    if signer_store_root == configuration_secret_store_root {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
+            reason: "must be separate from the signer store root".to_owned(),
+        });
+    }
+    let signer_store_key = StoreMasterKey::parse(
+        "OWLAUTH_SIGNER_STORE_KEY",
+        required(values, "OWLAUTH_SIGNER_STORE_KEY")?,
+    )?;
+    let configuration_secret_store_key = StoreMasterKey::parse(
+        "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
+        required(values, "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY")?,
+    )?;
+    if signer_store_key.0.as_ref() == configuration_secret_store_key.0.as_ref() {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
+            reason: "must be separate from the signer store wrapping key".to_owned(),
+        });
+    }
+    Ok(Some(ProvisioningConfig {
+        signer_store_root,
+        signer_store_key,
+        configuration_secret_store_root,
+        configuration_secret_store_key,
+    }))
+}
+
+fn parse_store_root(key: &'static str, value: String) -> Result<PathBuf, ConfigError> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(ConfigError::InvalidValue {
+            key,
+            reason: "must be an absolute path without parent traversal".to_owned(),
+        });
+    }
+    Ok(path)
+}
+
+fn validate_process_id(value: &str) -> Result<String, ConfigError> {
+    if !(1..=128).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_RUNTIME_PROCESS_ID",
+            reason: "must be 1 to 128 URL-safe opaque ASCII characters".to_owned(),
+        });
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_instance_id(value: String) -> Result<String, ConfigError> {
@@ -556,10 +723,31 @@ mod tests {
     }
 
     fn runtime_values() -> BTreeMap<String, String> {
-        values(&[(
-            "OWLAUTH_POSTGRES_URL",
-            "postgres://runtime:secret@database.example/owlauth",
-        )])
+        values(&[
+            (
+                "OWLAUTH_POSTGRES_URL",
+                "postgres://runtime:secret@database.example/owlauth",
+            ),
+            ("OWLAUTH_RUNTIME_PROCESS_ID", "test-runtime"),
+        ])
+    }
+
+    fn control_store_values() -> BTreeMap<String, String> {
+        values(&[
+            ("OWLAUTH_SIGNER_STORE_ROOT", "/tmp/owlauth-test-signers"),
+            (
+                "OWLAUTH_SIGNER_STORE_KEY",
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            ),
+            (
+                "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
+                "/tmp/owlauth-test-configuration-secrets",
+            ),
+            (
+                "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
+                "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            ),
+        ])
     }
 
     #[test]
@@ -596,6 +784,7 @@ mod tests {
             "OWLAUTH_INSTANCE_ID".to_owned(),
             "test-deployment".to_owned(),
         );
+        input.extend(control_store_values());
         let config = ServerConfig::from_values(&input).expect("canonical key should parse");
         let key = config.control_api_key.expect("Control key should load");
         assert!(key.matches(format!("{CONTROL_KEY_PREFIX}{}", "A".repeat(43)).as_bytes()));
@@ -636,6 +825,7 @@ mod tests {
     #[test]
     fn validates_shared_origin_base_partition() {
         let mut input = runtime_values();
+        input.extend(control_store_values());
         input.extend(values(&[
             ("OWLAUTH_MODE", "all"),
             ("OWLAUTH_INSTANCE_ID", "test-deployment"),

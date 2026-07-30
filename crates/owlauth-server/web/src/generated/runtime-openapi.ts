@@ -20,6 +20,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/projects/{project_public_id}/.well-known/jwks.json": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_project_jwks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ready": {
         parameters: {
             query?: never;
@@ -28,6 +44,22 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_readiness"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_public_application_config"];
         put?: never;
         post?: never;
         delete?: never;
@@ -45,6 +77,50 @@ export interface components {
             /** @description Stable probe status. Successful probes return `ok`. */
             status: string;
         };
+        /** @enum {string} */
+        JwkCurve: "Ed25519";
+        /** @enum {string} */
+        JwkKeyType: "OKP";
+        JwksDocument: {
+            keys: components["schemas"]["PublicJwk"][];
+            /** Format: int64 */
+            revision: number;
+            /** Format: int64 */
+            signing_epoch: number;
+        };
+        /** @enum {string} */
+        JwkUse: "sig";
+        /** @enum {string} */
+        ProviderKind: "oidc";
+        PublicApplicationConfig: {
+            application_display_name: string;
+            application_public_id: string;
+            login_available: boolean;
+            project_display_name: string;
+            project_public_id: string;
+            providers: components["schemas"]["PublicProvider"][];
+            publishable_keys: string[];
+        };
+        PublicJwk: {
+            alg: components["schemas"]["SigningAlgorithm"];
+            crv: components["schemas"]["JwkCurve"];
+            kid: string;
+            kty: components["schemas"]["JwkKeyType"];
+            use: components["schemas"]["JwkUse"];
+            x: string;
+        };
+        PublicProvider: {
+            display_name: string;
+            key: string;
+            kind: components["schemas"]["ProviderKind"];
+        };
+        RuntimeError: {
+            code: string;
+            message: string;
+            request_id: string;
+        };
+        /** @enum {string} */
+        SigningAlgorithm: "EdDSA";
     };
     responses: never;
     parameters: never;
@@ -74,6 +150,55 @@ export interface operations {
             };
         };
     };
+    get_project_jwks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project verification key set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JwksDocument"];
+                };
+            };
+            /** @description Credentials are not accepted on public Runtime endpoints */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            /** @description Public Project or key ring not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            /** @description Runtime authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
     get_readiness: {
         parameters: {
             query?: never;
@@ -99,6 +224,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+        };
+    };
+    get_public_application_config: {
+        parameters: {
+            query: {
+                application_id: string;
+            };
+            header?: never;
+            path: {
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact public application configuration */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicApplicationConfig"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            /** @description Public Project or Application not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            /** @description Runtime authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
                 };
             };
         };

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
+pub use crate::control_resources::*;
 use crate::health::HealthResponse;
 
 /// Side-effect-free origin-root descriptor used before credential selection.
@@ -68,7 +69,7 @@ pub struct SystemCapabilities {
 pub fn get_system() -> SystemCapabilities {
     SystemCapabilities {
         product: "owlauth-server".to_owned(),
-        project_auth: false,
+        project_auth: true,
     }
 }
 
@@ -82,9 +83,70 @@ pub fn get_system() -> SystemCapabilities {
         crate::health::get_liveness,
         crate::health::get_readiness,
         get_service_descriptor,
-        get_system
+        get_system,
+        crate::control_resources::list_projects,
+        crate::control_resources::create_project,
+        crate::control_resources::get_project,
+        crate::control_resources::update_project,
+        crate::control_resources::get_project_policy,
+        crate::control_resources::update_project_policy,
+        crate::control_resources::disable_project,
+        crate::control_resources::list_applications,
+        crate::control_resources::create_application,
+        crate::control_resources::get_application,
+        crate::control_resources::update_application,
+        crate::control_resources::replace_application_configuration,
+        crate::control_resources::disable_application,
+        crate::control_resources::list_signing_keys,
+        crate::control_resources::create_signing_key,
+        crate::control_resources::activate_signing_key,
+        crate::control_resources::retire_signing_key,
+        crate::control_resources::revoke_signing_key,
+        crate::control_resources::list_providers,
+        crate::control_resources::create_provider,
+        crate::control_resources::disable_provider,
+        crate::control_resources::assign_provider,
+        crate::control_resources::unassign_provider
     ),
-    components(schemas(HealthResponse, ServiceDescriptor, SystemCapabilities)),
+    components(schemas(
+        HealthResponse,
+        ServiceDescriptor,
+        SystemCapabilities,
+        ProblemDetails,
+        ProjectStatus,
+        ApplicationType,
+        ApplicationStatus,
+        SigningKeyState,
+        ProviderStatus,
+        crate::runtime::ProviderKind,
+        crate::runtime::JwkKeyType,
+        crate::runtime::JwkCurve,
+        crate::runtime::SigningAlgorithm,
+        crate::runtime::JwkUse,
+        crate::runtime::PublicJwk,
+        Project,
+        ProjectList,
+        CreateProjectRequest,
+        UpdateProjectRequest,
+        ProjectPolicy,
+        UpdateProjectPolicyRequest,
+        ExpectedSecurityRevision,
+        ApplicationConfiguration,
+        Application,
+        ApplicationList,
+        CreateApplicationRequest,
+        UpdateApplicationRequest,
+        ReplaceApplicationConfigurationRequest,
+        SigningKey,
+        SigningKeyList,
+        CreateSigningKeyRequest,
+        KeyTransitionRequest,
+        Provider,
+        ProviderList,
+        CreateProviderRequest,
+        ProviderRevisionRequest,
+        ProviderAssignmentRequest
+    )),
     modifiers(&ControlSecurity)
 )]
 struct ControlApiDoc;

@@ -6,20 +6,20 @@ Applications need the same decision-relevant Runtime meaning in every official S
 
 ## Stable taxonomy
 
-| Category | Meaning | Typical Application action |
-| --- | --- | --- |
-| `Configuration` | invalid local Runtime URL, Project/Application identifiers, deadline, store, or unsupported option | fix configuration; no request or credential reuse |
-| `Protocol` | malformed/unexpected Runtime response, context mismatch, or unsupported contract | stop; diagnose server/SDK compatibility |
-| `Login` | login cannot start or the upstream-provider interaction completed with a safe normalized failure | restart login or choose another enabled provider |
-| `Handoff` | callback state/ticket/PKCE is invalid, expired, already used, or context-bound elsewhere | discard pending state and start a new login |
-| `Authentication` | Project access/session credential is absent, expired, revoked, or no longer valid | clear affected local state and reauthenticate |
-| `Session` | current-user/logout/session operation cannot complete under current Project/Application state | reauthenticate, correct mode, or stop according to code |
-| `Refresh` | refresh family is expired, revoked, replayed, or definitively unusable | clear the family and reauthenticate; never retry consumed material |
-| `RateLimited` | Runtime admission policy rejected the request | honor bounded reviewed retry guidance |
-| `Transport` | DNS/TLS/connectivity/I/O failure without a definite Runtime response | retry only when operation policy proves safety |
-| `Timeout` | deadline elapsed; server effect may be unknown | treat one-use operations as ambiguous |
-| `Cancelled` | caller stopped waiting; server effect may be unknown | Application selects recovery under operation policy |
-| `Indeterminate` | outcome of handoff, refresh, logout, or another sensitive mutation cannot be known safely | quarantine/clear uncertain state and reauthenticate or reconcile; never blind replay |
+| Category         | Meaning                                                                                                     | Typical Application action                                                           |
+| ---------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `Configuration`  | invalid local Runtime URL, Project/Application identifiers, deadline, explicit state, or unsupported option | fix configuration; no request or credential reuse                                    |
+| `Protocol`       | malformed/unexpected Runtime response, context mismatch, or unsupported contract                            | stop; diagnose server/SDK compatibility                                              |
+| `Login`          | login cannot start or the upstream-provider interaction completed with a safe normalized failure            | restart login or choose another enabled provider                                     |
+| `Handoff`        | callback state/ticket/PKCE is invalid, expired, already used, or context-bound elsewhere                    | discard pending state and start a new login                                          |
+| `Authentication` | Project access/session credential is absent, expired, revoked, or no longer valid                           | clear affected local state and reauthenticate                                        |
+| `Session`        | current-user/logout/session operation cannot complete under current Project/Application state               | reauthenticate, correct mode, or stop according to code                              |
+| `Refresh`        | refresh family is expired, revoked, replayed, or definitively unusable                                      | clear the family and reauthenticate; never retry consumed material                   |
+| `RateLimited`    | Runtime admission policy rejected the request                                                               | honor bounded reviewed retry guidance                                                |
+| `Transport`      | DNS/TLS/connectivity/I/O failure without a definite Runtime response                                        | retry only when operation policy proves safety                                       |
+| `Timeout`        | deadline elapsed; server effect may be unknown                                                              | treat one-use operations as ambiguous                                                |
+| `Cancelled`      | caller stopped waiting; server effect may be unknown                                                        | Application selects recovery under operation policy                                  |
+| `Indeterminate`  | outcome of handoff, refresh, logout, or another sensitive mutation cannot be known safely                   | quarantine/clear uncertain state and reauthenticate or reconcile; never blind replay |
 
 Validation/not-found/conflict subclasses may be added when the real Runtime contract requires them. Cross-language review is required before taxonomy changes.
 
@@ -42,8 +42,8 @@ An error may identify the configured Project/Application only when that data was
 ## Operation-specific mapping
 
 - Local state/PKCE mismatch fails as `Handoff` without sending a request.
-- Definitive invalid/expired/consumed handoff fails as `Handoff` and destroys pending material.
-- Definitive refresh expiry/revocation/replay fails as `Refresh` and invalidates the local family.
+- Definitive invalid/expired/consumed handoff fails as `Handoff` and requires the caller to destroy pending material.
+- Definitive refresh expiry/revocation/replay fails as `Refresh` and requires the caller to invalidate the local family.
 - Timeout/disconnect/cancellation after dispatching handoff exchange or refresh rotation becomes `Indeterminate`, not generic retryable `Transport`.
 - Disabled Project/Application/user/session maps to a non-enumerating authentication/session category according to the public Runtime code.
 - Provider rejection/unavailability maps to `Login`; raw provider error descriptions are not forwarded.
@@ -51,7 +51,7 @@ An error may identify the configured Project/Application only when that data was
 
 ## Language mapping
 
-- TypeScript exports error classes or a stable discriminant, supports narrowing, and preserves a safe `cause`.
+- TypeScript exports the same error classes or stable discriminants in supported browsers and Node.js, supports narrowing, and preserves a safe `cause`.
 - Python exports an exception hierarchy with stable attributes and secret-free `str`/`repr`.
 - Rust exports a non-exhaustive error enum/struct strategy; `Display`, `Debug`, and sources remain redacted.
 
@@ -72,7 +72,7 @@ Truncation is not redaction. Diagnostic opt-in may expose allowlisted status/hea
 
 ## Acceptance criteria
 
-- Shared conformance cases verify category, code, retry classification, unknown-code behavior, context mismatch, and redaction.
+- Shared conformance cases verify category, code, retry classification, required caller state action, unknown-code behavior, context mismatch, and redaction.
 - Equivalent Runtime responses have equivalent semantic outcomes in every language.
 - HTTP/provider library implementation details are not required for Application branching.
 - Ambiguous handoff/refresh/logout outcomes never become automatically retryable transport errors.

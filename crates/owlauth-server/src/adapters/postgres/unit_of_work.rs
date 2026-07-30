@@ -13,6 +13,7 @@ use super::entity::{audit_event, control_idempotency_record, project};
 pub(crate) struct NewProject {
     pub id: Uuid,
     pub public_id: String,
+    pub display_name: String,
     pub belongs_to: Option<String>,
 }
 
@@ -57,9 +58,11 @@ impl ProjectUnitOfWork {
             id: Set(project.id),
             public_id: Set(project.public_id),
             belongs_to: Set(project.belongs_to),
+            display_name: Set(project.display_name),
             status: Set("active".to_owned()),
             metadata_revision: Set(1),
             security_revision: Set(1),
+            ..Default::default()
         }
         .insert(&self.transaction)
         .await
@@ -95,6 +98,9 @@ impl ProjectUnitOfWork {
             state: Set("pending".to_owned()),
             result_resource_id: Set(None),
             response: Set(None),
+            operation_kind: Set("project.create".to_owned()),
+            request_scope: Set("deployment".to_owned()),
+            expires_at: Set(None),
             completed_at: Set(None),
         }
         .insert(&self.transaction)

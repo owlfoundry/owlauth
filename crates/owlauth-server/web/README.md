@@ -39,12 +39,16 @@ From the repository root:
 pnpm --filter @owlauth/server-web contracts:generate
 pnpm --filter @owlauth/server-web check
 pnpm --filter @owlauth/server-web build
+pnpm --filter @owlauth/server-web test:e2e
 ```
 
 `contracts:generate` exports complete OpenAPI documents from `owlauth-types` and updates only the
 two committed generated type files. `check` runs boundary validation, ESLint, Prettier, TypeScript
 project references, Vitest, and build-script tests. `build` rejects contract drift, rebuilds both
 planes independently, then creates deterministic gzip/Brotli representations and server manifests.
+`test:e2e` starts an isolated PostgreSQL 17 container and the real Rust Runtime/Control listeners,
+then runs the fresh-database provisioning-readiness journey with Playwright and axe. Install the
+selected Playwright browsers first with `pnpm --filter @owlauth/server-web exec playwright install`.
 
 Prepared `dist/` trees are tracked so an ordinary Cargo source build and a crates.io package build
 remain deterministic and offline. `owlauth-server/build.rs` rejects missing, stale, extra,
@@ -55,9 +59,11 @@ roots separately and never serves this directory from the filesystem.
 
 The Runtime shell contains no Control client or operator credential path. The Console verifies the
 deployment operator key through the ordinary Control API and keeps it only in active page memory. It
-does not place the key in React state, browser storage, URLs, logs, or emitted assets, and disposes
-the authenticated client on lock, verification failure, and unmount.
+does not expose the key from the disposable client's closure or place it in React state, browser
+storage, URLs, logs, or emitted assets, and disposes the authenticated client on lock, verification
+failure, stale completion, and unmount.
 
-The current Runtime screen is intentionally limited to a truthful availability shell until login
-interactions are implemented. The Console currently exposes only system verification and lock
-behavior; it does not imply that the full management resource API exists.
+The Runtime can render exact bounded Project/Application public readiness when explicitly addressed,
+but remains a truthful no-login-interaction screen. The Console implements Project, Application,
+signing-key, provider-secret, and assignment provisioning through the ordinary generated Control
+client; it does not synthesize login, user, session, or token behavior.

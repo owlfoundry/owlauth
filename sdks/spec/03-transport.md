@@ -4,13 +4,19 @@
 
 No official SDK currently sends a network request. These rules apply when Runtime Project Auth transport is introduced.
 
+## TypeScript runtime portability
+
+The TypeScript protocol client is published once as `@owlauth/client`. Its portable runtime path uses Web-standard `fetch`, `URL`, `AbortSignal`, and Web Crypto APIs shared by the declared browser and Node.js support matrices; it does not require Node-only modules, browser globals, environment auto-detection, or an `@owlauth/client/browser` entry point.
+
+This portability covers protocol API execution only. The package does not navigate, mutate browser history, select browser storage, install framework hooks, or manage an Application session. Browser support is claimed only after the same published artifact passes real browser bundling, CORS, crypto, cancellation, callback parsing, and real-Runtime tests in the declared matrix.
+
 ## URL and connection policy
 
 A client validates one absolute Runtime base URL at construction. HTTPS is mandatory by default outside an explicit loopback development policy. URL joining preserves a configured path prefix and prevents endpoint paths, provider-returned values, redirects, or headers from changing authority unexpectedly.
 
-TLS certificate and hostname verification are enabled. Custom trust roots are explicit; a general “disable verification” option is not a normal public API. Proxy/environment inheritance and redirect behavior are documented because they change trust boundaries.
+TLS certificate and hostname verification remain enabled through each platform's transport. A general “disable verification” option is not a normal public API. Custom trust roots and proxy/environment inheritance are explicit only on platforms whose transport exposes them; browser execution uses the user agent's trust and proxy policy and does not emulate unavailable controls through Node-only shims. Redirect behavior is documented everywhere because it changes trust boundaries.
 
-Transport uses a non-sensitive user agent, bounded request/response sizes, header limits where supported, connect/read/overall deadlines, connection-pool limits, and bounded decompression. Runtime and Control base URLs are distinct; the default SDK never redirects or falls through to a Control listener.
+Every transport enforces origin separation, an overall deadline/cancellation boundary, bounded parsed response data, and no credential-bearing cross-origin redirect. A non-sensitive user agent, raw header limits, separate connect/read deadlines, connection-pool limits, decompression controls, custom roots, and proxy policy are configured only where the platform exposes them. Each release documents and tests this platform capability matrix rather than claiming browser control over user-agent-managed behavior. Runtime and Control base URLs are distinct; the default SDK never redirects or falls through to a Control listener.
 
 ## Project-qualified request behavior
 
@@ -30,7 +36,7 @@ Transport does not send provider credentials or provider tokens: OwlAuth Runtime
 
 ## Redirect behavior
 
-Low-level API requests do not automatically follow redirects across origins. Login initiation may return or navigate to a provider authorization URL only through the explicit lifecycle/browser boundary. A provider authorization URL is not adopted as the SDK's API origin and never receives Project session credentials.
+Low-level API requests do not automatically follow redirects across origins. Login initiation returns a provider authorization URL as data; only the Application or an external platform integration may navigate to it. A provider authorization URL is not adopted as the SDK's API origin and never receives Project session credentials.
 
 The final Application redirect is processed by the Application/SDK handoff boundary, not followed as an HTTP API redirect. Exact redirect registration and callback binding remain Runtime authority.
 
@@ -54,7 +60,7 @@ Logout may be designed as idempotent by the Runtime contract, but the SDK must n
 
 TypeScript accepts `AbortSignal`; Python and Rust expose their selected idiomatic cancellation/deadline mechanisms. Cancellation stops local waiting but does not assert that Runtime did not commit an exchange, refresh, or logout.
 
-Client instances document thread/task safety. Raw transport is stateless except for connection management. Pending PKCE state, access/refresh credentials, and refresh single-flight coordination belong to the lifecycle/session layer and remain Project/Application scoped.
+Client instances document thread/task safety. Raw transport is stateless except for connection management. Pending PKCE state and access/refresh credentials are explicit caller-held values. Refresh serialization and durable atomic replacement belong to the Application or an external stateful integration layer and remain Project/Application scoped; the core transport does not imply a process-wide session coordinator.
 
 ## Error responses
 
@@ -68,8 +74,9 @@ Transport depends on a narrow injectable interface so tests can provide determin
 
 ## Acceptance criteria
 
-- Shared tests cover URL/path-prefix handling, HTTPS policy, Runtime/Control separation, redirect refusal, limits, deadlines, cancellation, and redaction.
+- Shared tests cover URL/path-prefix handling, HTTPS policy, Runtime/Control separation, redirect refusal, bounded parsed data, overall deadlines, cancellation, and redaction; platform-specific tests cover only transport controls that platform exposes.
 - Project/Application context cannot be changed by a response or redirect.
 - Retry tests prove no automatic replay of handoff exchange or refresh rotation.
 - HTTP-library errors map to the stable taxonomy rather than leaking as public API.
+- The same `@owlauth/client` artifact passes the declared Node.js and browser transport matrices without Node-only code in its browser closure.
 - Real-server tests exercise every transport capability claimed by a release.

@@ -8,6 +8,6 @@ SQLx 0.9 embeds these migrations into the `owlauth-server` artifact and applies 
 
 Destructive or irreversible migrations require an explicit compatibility, rollout, backup, and recovery design. Expand-and-contract changes must preserve mixed-version operation for the declared rollout window.
 
-The initial migration establishes Project and Application ownership, deployment-operator idempotency, and audit records. New migrations must use final domain names and preserve the invariants above.
+The initial migration establishes Project and Application ownership, deployment-operator idempotency, and audit records. The additive Control provisioning/readiness migration adds exact redirect/origin registration, publishable Application identifiers, signing rings and lifecycle operations, Runtime publication leases, provider secret operations, and same-Project provider assignments. New migrations must use final domain names and preserve the invariants above.
 
 The target storage and migration invariants are defined in [`spec/04-storage-and-migrations.md`](../../../spec/04-storage-and-migrations.md).

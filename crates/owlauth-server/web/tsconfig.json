@@ -6,6 +6,7 @@
     { "path": "./tsconfig.generated-control.json" },
     { "path": "./tsconfig.runtime.json" },
     { "path": "./tsconfig.control.json" },
-    { "path": "./tsconfig.test.json" }
+    { "path": "./tsconfig.test.json" },
+    { "path": "./tsconfig.browser.json" }
   ]
 }

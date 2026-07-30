@@ -25,11 +25,13 @@ Future releases will provide idiomatic TypeScript APIs for:
 
 - initialization with a Runtime base URL and public Project/Application identifiers;
 - safe retrieval of publishable authentication configuration;
-- upstream-provider login initiation;
-- Application-generated PKCE and one-use handoff exchange;
-- short-lived Project JWT access tokens and opaque rotating refresh tokens;
-- current Project user/session lookup and logout;
+- upstream-provider login initiation with explicit pending-transaction output;
+- Application-generated PKCE, callback validation, and one-use handoff exchange;
+- short-lived Project JWT access tokens and opaque rotating refresh tokens returned as one credential result;
+- explicit refresh, current Project user/session lookup, and logout operations;
 - stable errors, cancellation with `AbortSignal`, and strict retry behavior.
+
+The package will use one Web-standard core for its declared browser and Node.js support matrices. It will continue to publish as `@owlauth/client`; the initial protocol API has no separate browser package or `@owlauth/client/browser` entry point. Navigation, browser-history cleanup, persistent storage, automatic session/refresh management, request interceptors, and framework bindings remain Application or external-library concerns.
 
 OwlAuth uses OAuth/OIDC only with configured upstream identity providers. This package will not expose OwlAuth as a downstream general-purpose OAuth authorization server, and public Application identifiers will never grant Control access.
 

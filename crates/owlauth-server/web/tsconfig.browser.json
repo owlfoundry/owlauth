@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./node_modules/.cache/types/browser",
+    "tsBuildInfoFile": "./node_modules/.cache/browser.tsbuildinfo",
+    "types": ["node", "@playwright/test"]
+  },
+  "include": ["browser-tests/**/*.ts", "playwright.config.ts"]
+}

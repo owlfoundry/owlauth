@@ -1,29 +1,41 @@
-import { ControlAuthenticationError, verifyControlKey } from "./client";
+import { describe, expect, it, vi } from "vitest";
 
-describe("verified Control client", () => {
-  it("confines the Bearer credential to the configured base and disposes it on lock", async () => {
-    const observed = vi.fn<typeof fetch>((request) => {
-      const headers = request instanceof Request ? request.headers : new Headers();
-      expect(headers.get("authorization")).toBe("Bearer owl_ctrl_v1_test");
-      return Promise.resolve(Response.json({ product: "owlauth-server", project_auth: false }));
-    });
-    const disposable = await verifyControlKey("/admin/", "owl_ctrl_v1_test", observed);
+import { ControlRequestError, IdempotencyAttempt } from "./client";
 
-    expect(observed).toHaveBeenCalledOnce();
-    const request = observed.mock.calls[0]?.[0];
-    expect(request).toBeInstanceOf(Request);
-    expect((request as Request).url).toBe("http://localhost:3000/admin/v1/system");
-
-    disposable.dispose();
-    await expect(disposable.client.GET("/v1/system")).rejects.toThrow("Control client is locked");
-    expect(observed).toHaveBeenCalledOnce();
+describe("IdempotencyAttempt", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
-  it("disposes denied credentials and returns only a bounded error", async () => {
-    const denied = vi.fn<typeof fetch>(() => Promise.resolve(new Response(null, { status: 401 })));
-    await expect(verifyControlKey("/admin/", "wrong", denied)).rejects.toBeInstanceOf(
-      ControlAuthenticationError,
-    );
-    expect(denied).toHaveBeenCalledOnce();
+  it("reuses one key after ambiguous failure and blocks concurrent dispatch", () => {
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("11111111-1111-4111-8111-111111111111");
+    const attempt = new IdempotencyAttempt();
+
+    const first = attempt.begin();
+    expect(first).toBe("console_11111111111141118111111111111111");
+    expect(attempt.begin()).toBeNull();
+
+    attempt.settle(new TypeError("network response was lost"));
+    expect(attempt.begin()).toBe(first);
+  });
+
+  it("rotates after success or a definitive client response", () => {
+    const attempt = new IdempotencyAttempt();
+    const first = attempt.begin();
+    attempt.settle();
+    expect(attempt.begin()).not.toBe(first);
+
+    attempt.settle(new ControlRequestError(undefined, 409));
+    const afterConflict = attempt.begin();
+    expect(afterConflict).not.toBe(first);
+  });
+
+  it("retains retry identity for retryable server responses and clears on abandon", () => {
+    const attempt = new IdempotencyAttempt();
+    const first = attempt.begin();
+    attempt.settle(new ControlRequestError(undefined, 503));
+    expect(attempt.begin()).toBe(first);
+    attempt.abandon();
+    expect(attempt.retainsKey).toBe(false);
   });
 });

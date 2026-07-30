@@ -44,9 +44,9 @@ The Rust SDK must not depend on `owlauth-server`, its internal modules, migratio
 
 ## Browser and native boundaries
 
-Application redirects are untrusted input. The SDK validates pending state and local context before handoff exchange, consumes local pending state once, and removes handoff values from browser history before third-party resources load where platform integration permits.
+Application redirects are untrusted input. The core SDK validates an explicitly supplied callback value against explicitly supplied pending state and local context before handoff exchange. The Application or external integration consumes its stored pending state once and removes handoff values from browser history or other platform-visible state before third-party resources can observe them; the core SDK does not read browser globals or mutate navigation/history.
 
-Loopback listeners, custom schemes, universal/app links, browser storage, and automatic navigation each require a platform-specific threat model and tests before support is claimed. The general SDK does not prescribe `localStorage`, embed a confidential secret, or treat CORS as authentication.
+Loopback listeners, custom schemes, universal/app links, browser or native storage, automatic navigation, and framework session bindings each require a platform-specific threat model and tests before support is claimed by the library that implements them. The core SDK does not prescribe `localStorage`, embed a confidential secret, or treat CORS as authentication.
 
 Provider authorization URLs originate from Runtime login start and are used only for explicit navigation. They never become an SDK API base URL and never receive Project session credentials.
 
@@ -54,17 +54,17 @@ Provider authorization URLs originate from Runtime login start and are used only
 
 PKCE verifier/state generation uses the operating-system CSPRNG and S256 only. Verifiers remain local until the single handoff exchange and are never reused.
 
-Handoff tickets and refresh tokens are one-use server credentials. Timeout, cancellation, disconnect, or lost responses are ambiguous; the SDK does not replay automatically. Strict refresh-family reuse can revoke a concurrently issued successor, so SDKs serialize in-process rotation and require atomic versioned storage for cross-process use.
+Handoff tickets and refresh tokens are one-use server credentials. Timeout, cancellation, disconnect, or lost responses are ambiguous; the SDK does not replay automatically. Strict refresh-family reuse can revoke a concurrently issued successor, so the Application or external stateful integration serializes refresh per family and atomically replaces versioned credentials. The core SDK does not claim stateful coordination it does not own.
 
 Availability fallbacks cannot weaken one-use, replay, Project/Application binding, or credential cleanup rules.
 
-## Credential-store boundary
+## Application-state boundary
 
-Default state is memory-only unless documented otherwise. An Application-supplied store defines encryption, access control, concurrency, backup, retention, and deletion.
+The core SDK selects no memory, browser, filesystem, keychain, database, or other credential store. Pending-login and credential values are returned explicitly to the caller. An Application or external integration that retains them defines encryption, access control, concurrency, backup, retention, deletion, and recovery.
 
-Stored records carry schema version and exact Runtime/Project/Application identity. Updates atomically replace one access/refresh generation. Multi-process stores require compare-and-swap or leases that meet spec 04; optional OS storage is not advertised as universally encrypted or safe.
+Persisted records carry schema version and exact Runtime/Project/Application identity. Updates atomically replace one access/refresh generation. Multi-process stores require compare-and-swap or leases that meet spec 04; optional browser or OS storage is not advertised as universally encrypted or safe.
 
-Logout/local clear APIs distinguish removing local material from confirmed Runtime revocation. Backup/crash/reporting tools are treated as disclosure paths.
+Logout results distinguish confirmed Runtime revocation from an ambiguous outcome; the caller owns removal or quarantine of local material. Backup/crash/reporting tools are treated as disclosure paths.
 
 ## Transport and dependency security
 
@@ -87,4 +87,5 @@ Vulnerabilities follow [`SECURITY.md`](../../SECURITY.md). Public issues and SDK
 - Stored/pending/session state cannot cross Runtime/Project/Application context.
 - Handoff and refresh ambiguity never causes blind replay.
 - Published artifacts trace source, dependencies, contract digest, and build job.
-- Platform-specific redirect/storage support is undocumented until its own security review and real tests pass.
+- The TypeScript core has no Node-only dependency in its browser closure and no implicit navigation, history, storage, or framework side effects.
+- Platform-specific redirect/storage support is documented only by the separate Application integration or library that owns its security review and real tests.

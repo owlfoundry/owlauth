@@ -9,6 +9,8 @@
 !/crates/owlauth-server/web/dist/**
 **/.wrangler/
 *.tsbuildinfo
+**/test-results/
+**/playwright-report/
 
 # Python
 **/__pycache__/

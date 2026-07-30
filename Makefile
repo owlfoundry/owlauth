@@ -81,6 +81,10 @@ web-check: ## Lint, type-check, and test hosted-web sources and build scripts
 web-build: ## Rebuild deterministic Runtime and Control embedded assets
 	@pnpm --filter @owlauth/server-web build
 
+.PHONY: web-e2e
+web-e2e: web-build ## Run the real PostgreSQL/Rust/browser provisioning-readiness journey
+	@pnpm --filter @owlauth/server-web test:e2e
+
 .PHONY: web-verify
 web-verify: web-build ## Rebuild hosted-web assets and reject committed contract or asset drift
 	@git diff --exit-code -- $(SERVER_WEB_DIR)/src/generated $(SERVER_WEB_DIR)/dist

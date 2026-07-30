@@ -8,13 +8,15 @@ The current SDKs contain only a `Client` that stores a base URL. They do not mak
 
 ## Packages and compatibility
 
-| Language | Registry package | Import | Current runtime floor |
-| --- | --- | --- | --- |
-| TypeScript | `@owlauth/client` | `@owlauth/client` | Node.js 20+ |
-| Python | `owlauth-client` | `owlauth` | Python 3.11+ |
-| Rust | `owlauth-client` | `owlauth_client` | repository Rust baseline |
+| Language   | Registry package  | Import            | Current runtime floor    |
+| ---------- | ----------------- | ----------------- | ------------------------ |
+| TypeScript | `@owlauth/client` | `@owlauth/client` | Node.js 20+              |
+| Python     | `owlauth-client`  | `owlauth`         | Python 3.11+             |
+| Rust       | `owlauth-client`  | `owlauth_client`  | repository Rust baseline |
 
 Each SDK follows independent SemVer and release tags (`typescript-v{version}`, `python-v{version}`, and `rust-v{version}`). Server and SDK versions do not move in lockstep; compatibility must be expressed as tested Runtime contract ranges rather than matching numbers.
+
+TypeScript will continue to publish one package, `@owlauth/client`. Its implemented protocol API will use one Web-standard core for the declared browser and Node.js matrices; there is no separately published browser package and the initial scope defines no `@owlauth/client/browser` entry point. The current scaffold has only Node.js tests, so browser support is not claimed until real browser and Runtime validation lands.
 
 ## Target client boundary
 
@@ -41,17 +43,17 @@ flowchart LR
 
 ## Target sign-in lifecycle
 
-The planned high-level SDK flow is:
+The planned explicit protocol flow is:
 
-1. generate fresh PKCE verifier/challenge and correlation state with a CSPRNG;
-2. call Runtime login start for the exact Project, Application, provider, and registered redirect;
-3. hand off explicitly to a browser or native user agent;
-4. capture the Application redirect and remove the ticket from browser history promptly;
-5. validate state, expiry, Project/Application context, and handoff success/error exclusivity;
-6. exchange the one-use ticket directly with the PKCE verifier;
-7. return the bounded Project user, Application session metadata, short-lived access token, and rotating refresh token.
+1. the SDK generates a fresh PKCE verifier/challenge, correlation state, and bound pending-transaction value with a CSPRNG;
+2. the SDK calls Runtime login start for the exact Project, Application, provider, and registered redirect;
+3. the Application retains the pending transaction and explicitly navigates a browser or native user agent to the returned target;
+4. the Application captures the redirect, removes the ticket from browser history or equivalent platform state promptly, and supplies the callback plus retained transaction to the SDK;
+5. the SDK validates state, expiry, Project/Application context, and handoff success/error exclusivity;
+6. the SDK exchanges the one-use ticket directly with the PKCE verifier without blind retry;
+7. the SDK returns the bounded Project user, Application session metadata, and one typed access/refresh credential-pair result.
 
-The SDK never collects the user's upstream password. It never receives provider tokens. Opening a browser is an explicit application action, not a hidden constructor side effect.
+The SDK never collects the user's upstream password or receives provider tokens. It does not navigate, mutate history, choose storage, install interceptors, or maintain framework session state; those behaviors belong to the Application or another integration library.
 
 ## Multiple Applications in one Project
 
@@ -61,25 +63,23 @@ Each Application still has its own redirects, origins, status, Application sessi
 
 ## Token lifecycle
 
-Target SDK behavior includes:
+Target core SDK behavior includes:
 
 - redacted secret wrappers where the language supports them;
-- short-lived access-token expiry handling with a documented skew window;
-- single-flight refresh for one refresh family within a process;
-- atomic replacement through an application-provided token store;
+- short-lived access-token timing metadata with a documented skew window;
+- one explicit refresh operation that accepts one generation and returns its successor pair as one result;
 - no blind retry after an ambiguous handoff or refresh response;
-- reauthentication after a definitive expired, revoked, replayed, or indeterminate refresh outcome;
-- explicit compare-and-swap or external serialization for multi-process token stores.
+- typed outcomes that require reauthentication after a definitive expired, revoked, replayed, or indeterminate refresh result.
 
-SDKs do not silently choose persistent storage. The application supplies a reviewed store or keeps credentials in memory. Browser storage, native secure storage, backup, concurrency, and deletion need platform-specific designs.
+The Application or an external stateful integration owns pending-state and credential persistence, single-flight refresh, atomic compare-and-swap replacement, backup, concurrency, and deletion. The core SDK does not silently retain credentials or provide `localStorage`, native keychain, filesystem, backend-session, or framework adapters.
 
-An application backend—not the browser SDK—verifies Project access-token signature, algorithm, Project issuer/audience, type, time claims, and required Application/session context. Business authorization remains in the backend.
+An application backend—not a TypeScript client running in the browser—verifies Project access-token signature, algorithm, Project issuer/audience, type, time claims, and required Application/session context. Business authorization remains in the backend.
 
 ## Generated and handwritten layers
 
 Reviewed Rust definitions in `crates/owlauth-types` produce separate Runtime and Control OpenAPI descriptions in the target architecture. The OpenAPI artifact is generated ephemerally from the exact source revision and is not committed.
 
-Generated code may own wire models, serialization, endpoint declarations, and low-level operations. Handwritten code owns transport policy, PKCE custody, redirect handling, refresh coordination, token-store integration, safe retries, and idiomatic errors.
+Generated code may own wire models, serialization, endpoint declarations, and low-level operations. Handwritten core SDK code owns transport policy, PKCE custody, callback validation, safe one-use request semantics, Project/Application isolation, redaction, and idiomatic errors. Application or separate integration code owns navigation, history mutation, persistence, refresh coordination, and framework state.
 
 The three clients share semantic behavior while using native conventions such as promises and `AbortSignal`, Python exceptions and typing, or Rust `Result` and non-exhaustive errors.
 

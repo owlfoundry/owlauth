@@ -61,6 +61,15 @@ export default tseslint.config(
     },
   },
   {
+    files: ["browser-tests/**/*.ts"],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+  {
     files: ["scripts/**/*.mjs", "eslint.config.js", "*.config.ts"],
     ...tseslint.configs.disableTypeChecked,
   },

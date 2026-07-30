@@ -8,19 +8,19 @@ OAuth/OIDC is used only between OwlAuth and a Project's configured upstream prov
 
 ## Public identifiers and credentials
 
-| Value | Form | Purpose | Security role |
-| --- | --- | --- | --- |
-| `project_id` | public stable identifier | select isolated Project auth namespace | not a secret or authorization credential |
-| `application_id` | public stable identifier | identify web/mobile/native/server Application | not a secret or Control credential |
-| Publishable application key | public revocable identifier | SDK initialization, quotas, and abuse attribution | never grants administrative or user authority |
-| Login transaction handle | high-entropy opaque browser value | bind provider redirect and browser interaction | digest in PostgreSQL; short-lived and one-use where transitioned |
-| Upstream provider state | high-entropy opaque value | bind provider callback to Project login transaction | digest in PostgreSQL; exact provider/Project binding |
-| Handoff ticket | high-entropy opaque value | transfer authenticated result to an Application | digest in PostgreSQL; one-use and PKCE-bound |
-| Project browser session | opaque hardened cookie | reuse authentication among Applications in one Project | digest in PostgreSQL; Project/user/browser bound |
-| Project access token | short-lived signed JWT | authenticate Project user to that Project's backend | Project issuer/audience; Application and session context |
-| Refresh token | high-entropy opaque value | rotate one Application session family | digest in PostgreSQL; Project/Application/user bound |
-| Provider secret | secret-store reference | authenticate OwlAuth to GitHub/Google/upstream provider | Project provider adapter only; never browser-visible |
-| Deployment operator API key | single secret loaded from `OWLAUTH_CONTROL_API_KEY` | administer the entire deployment through Control | Control-listener only and categorically never accepted by Runtime |
+| Value                       | Form                                                | Purpose                                                 | Security role                                                     |
+| --------------------------- | --------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------- |
+| `project_id`                | public stable identifier                            | select isolated Project auth namespace                  | not a secret or authorization credential                          |
+| `application_id`            | public stable identifier                            | identify web/mobile/native/server Application           | not a secret or Control credential                                |
+| Publishable application key | public revocable identifier                         | SDK initialization, quotas, and abuse attribution       | never grants administrative or user authority                     |
+| Login transaction handle    | high-entropy opaque browser value                   | bind provider redirect and browser interaction          | digest in PostgreSQL; short-lived and one-use where transitioned  |
+| Upstream provider state     | high-entropy opaque value                           | bind provider callback to Project login transaction     | digest in PostgreSQL; exact provider/Project binding              |
+| Handoff ticket              | high-entropy opaque value                           | transfer authenticated result to an Application         | digest in PostgreSQL; one-use and PKCE-bound                      |
+| Project browser session     | opaque hardened cookie                              | reuse authentication among Applications in one Project  | digest in PostgreSQL; Project/user/browser bound                  |
+| Project access token        | short-lived signed JWT                              | authenticate Project user to that Project's backend     | Project issuer/audience; Application and session context          |
+| Refresh token               | high-entropy opaque value                           | rotate one Application session family                   | digest in PostgreSQL; Project/Application/user bound              |
+| Provider secret             | secret-store reference                              | authenticate OwlAuth to GitHub/Google/upstream provider | Project provider adapter only; never browser-visible              |
+| Deployment operator API key | single secret loaded from `OWLAUTH_CONTROL_API_KEY` | administer the entire deployment through Control        | Control-listener only and categorically never accepted by Runtime |
 
 A Project access token is an OwlAuth application-session credential, not an OAuth access token. Its use as an HTTP Bearer token does not make Runtime an OAuth authorization server.
 
@@ -34,18 +34,18 @@ https://auth.example.com/projects/{project_id}
 
 A Project access token contains at least:
 
-| Claim | Meaning |
-| --- | --- |
-| `iss` | exact Project issuer |
-| `aud` | exact immutable Project public ID |
-| `sub` | Project-scoped user ID |
-| `app_id` | initiating Application ID |
-| `sid` | Application session ID |
-| `iat`, `nbf`, `exp` | bounded issuance and validity times |
-| `jti` | unique token identifier |
-| `typ` | Project access-token type |
-| `auth_time` | time of the underlying Project authentication |
-| `claims_rev` | Project/user claims-policy revision |
+| Claim               | Meaning                                       |
+| ------------------- | --------------------------------------------- |
+| `iss`               | exact Project issuer                          |
+| `aud`               | exact immutable Project public ID             |
+| `sub`               | Project-scoped user ID                        |
+| `app_id`            | initiating Application ID                     |
+| `sid`               | Application session ID                        |
+| `iat`, `nbf`, `exp` | bounded issuance and validity times           |
+| `jti`               | unique token identifier                       |
+| `typ`               | Project access-token type                     |
+| `auth_time`         | time of the underlying Project authentication |
+| `claims_rev`        | Project/user claims-policy revision           |
 
 Project-defined custom claims are bounded, namespaced, and generated from current Project policy. Provider payloads, provider tokens, email verification internals, `belongs_to`, the operator API key, and secret references never enter the token.
 
@@ -211,7 +211,7 @@ sequenceDiagram
 
 A refresh token is one-use and one family has one current generation. At most one transaction presenting generation `n` creates generation `n+1`. Any later or concurrent presentation of consumed generation `n` is replay and revokes the entire family, including a successor created by a competing request. There is no stable winner after reuse is detected.
 
-This strict policy favors containment. SDKs serialize refresh per family and treat an ambiguous lost rotation response as reauthentication rather than retrying the old token indefinitely.
+This strict policy favors containment. The core SDK never blindly retries an ambiguous rotation. The Application or an external stateful integration serializes refresh per family, atomically replaces or quarantines its caller-owned credential pair, and treats an ambiguous lost rotation response as reauthentication.
 
 Refresh revalidates Project, Application, user, Application session, family, claims policy, expiry, and active signing epoch. If the Application session references a Project browser session, refresh also checks that browser session's current status and revision; Project browser logout therefore blocks further refresh for every derived session. Refresh cannot move a session to another Project/Application or broaden claims.
 
@@ -237,7 +237,7 @@ Already issued self-contained Project access tokens remain cryptographically val
 
 Browser state-changing operations use CSRF protection bound to Project interaction or browser session. Cookies are `Secure`, `HttpOnly`, host-only where possible, narrowly scoped, and use a reviewed `SameSite` policy. Session credentials rotate after authentication and privilege changes.
 
-Web pages use restrictive CSP, framing, referrer, and cache-control policies. Provider values, Project tokens, refresh tokens, and user data are not exposed to third-party resources. A handoff ticket may appear only in the exact final Application redirect, is short-lived/one-use/PKCE-bound, and the Application SDK removes it from browser history immediately after capture before loading third-party resources. Native redirects use exact registered schemes/universal links and PKCE; custom-scheme ambiguity is rejected.
+Web pages use restrictive CSP, framing, referrer, and cache-control policies. Provider values, Project tokens, refresh tokens, and user data are not exposed to third-party resources. A handoff ticket may appear only in the exact final Application redirect and is short-lived, one-use, and PKCE-bound. The Application or its browser integration removes it from history immediately after capture before loading third-party resources; the core SDK validates explicitly supplied callback state but performs no navigation or history mutation. Native redirects use exact registered schemes/universal links and PKCE; custom-scheme ambiguity is rejected.
 
 Request bodies, headers, parameter counts, and string lengths have endpoint-specific bounds. Duplicate singleton parameters, ambiguous encodings, unsupported content types, and conflicting credentials are rejected. External Runtime URLs and provider callbacks derive from trusted configuration, not arbitrary `Host` or forwarding headers.
 

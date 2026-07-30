@@ -10,12 +10,18 @@ keywords = ["authentication", "identity", "self-hosted", "server"]
 categories = ["authentication", "web-programming::http-server"]
 
 [dependencies]
+async-trait = "0.1.91"
 axum = "0.8.9"
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+getrandom = "0.3.4"
 owlauth-types = { version = "=0.0.2", path = "../owlauth-types" }
 rust-embed = { version = "8.11.0", features = ["debug-embed", "include-exclude"] }
 sea-orm = { version = "2.0.0", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.10.9"
 sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "uuid", "time", "json"] }
 subtle = "2.6.1"
 thiserror = "2.0.18"
@@ -27,6 +33,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 url = "2.5.8"
 uuid = { version = "1.21.0", features = ["v4"] }
+zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 
 [lints]
 workspace = true

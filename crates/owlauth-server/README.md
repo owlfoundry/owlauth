@@ -4,7 +4,7 @@ The server library and `owlauth-server` executable for [OwlAuth](https://github.
 
 OwlAuth isolates users, provider/email identities, managed profile connections, SMTP, Application projections/webhooks, sessions, tokens, and signing keys by Project. Applications and end users use the Runtime Project Auth API and Hosted Authentication UI, while operators use the separately exposed Control API and embedded Management Console. OAuth/OIDC is used only for upstream federation; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server.
 
-> OwlAuth is pre-alpha. The executable now provides production-shaped configuration, PostgreSQL migration and pool startup, isolated Runtime/Control listeners, health/readiness endpoints, embedded browser assets, and the initial Control system endpoint. Project login, token/session issuance, provider integration, the full Control resource API, and MCP are not implemented. Do not use it for production authentication.
+> OwlAuth is pre-alpha. The executable provides production-shaped configuration, PostgreSQL migrations and pools, isolated Runtime/Control listeners, embedded browser assets, and the Control provisioning and Runtime login-readiness surface. Operators can provision Projects, Applications, exact redirects/origins, policy, signing keys, and OIDC provider configuration, but Project login, provider authorization/code exchange, users, sessions, and token issuance are not implemented. Do not use it for production authentication.
 
 ## Run locally
 
@@ -30,6 +30,12 @@ OWLAUTH_MODE=all \
 OWLAUTH_INSTANCE_ID=local-development \
 OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_dev@127.0.0.1:5432/owlauth \
 OWLAUTH_CONTROL_API_KEY='owl_ctrl_v1_<43-character-base64url-secret>' \
+OWLAUTH_RUNTIME_PROCESS_ID=local-runtime \
+OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS=local-runtime \
+OWLAUTH_SIGNER_STORE_ROOT=/absolute/path/to/owlauth/signers \
+OWLAUTH_SIGNER_STORE_KEY='<43-character-base64url-wrapping-key>' \
+OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT=/absolute/path/to/owlauth/configuration-secrets \
+OWLAUTH_CONFIGURATION_SECRET_STORE_KEY='<different-43-character-base64url-wrapping-key>' \
   cargo run --package owlauth-server
 ```
 
@@ -48,6 +54,15 @@ The process rejects unknown `OWLAUTH_*` variables and validates all selected-pla
 | `OWLAUTH_CONTROL_ADDR` | `127.0.0.1:8081` | Control bind socket |
 | `OWLAUTH_CONTROL_BASE_URL` | `http://127.0.0.1:8081/` | Canonical external Control base |
 | `OWLAUTH_CONTROL_API_KEY` | required for Control | `owl_ctrl_v1_` plus 43 base64url characters |
+| `OWLAUTH_SIGNER_STORE_ROOT` | required for Control | Absolute root for versioned encrypted software signer material |
+| `OWLAUTH_SIGNER_STORE_KEY` | required for Control | 32-byte signer wrapping key encoded as 43 unpadded base64url characters |
+| `OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT` | required for Control | Separate absolute root for encrypted provider configuration secrets |
+| `OWLAUTH_CONFIGURATION_SECRET_STORE_KEY` | required for Control | Separate 32-byte wrapping key encoded as 43 unpadded base64url characters |
+| `OWLAUTH_RUNTIME_PROCESS_ID` | required | Stable URL-safe identity used by this Runtime process when publishing observation leases |
+| `OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS` | Runtime process ID | Comma-separated deployment roster; every listed Runtime process must hold a current lease before key activation |
+| `OWLAUTH_PUBLICATION_LEASE_TTL_MS` | `30000` | Runtime key-publication lease lifetime |
+| `OWLAUTH_KEY_PROPAGATION_DELAY_MS` | `2000` | Minimum full-roster observation interval before key activation |
+| `OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS` | `1200000` | Verification overlap retained before a rotated key may be fully retired |
 | `OWLAUTH_POSTGRES_URL` | required | Serving PostgreSQL URL and authority anchor |
 | `OWLAUTH_RUNTIME_POSTGRES_URL` | serving URL | Runtime pool URL on the same database authority |
 | `OWLAUTH_CONTROL_POSTGRES_URL` | serving URL | Control pool URL on the same database authority |

@@ -37,13 +37,11 @@ Generation must not invent policy for:
 
 - trusted Runtime origin selection;
 - PKCE verifier generation/custody;
-- browser/native redirect handling and history cleanup;
 - one-use handoff and refresh retry behavior;
-- credential persistence or cross-process coordination;
 - Project/Application state isolation;
 - language-level errors and redaction.
 
-Those layers remain handwritten and tested.
+Those protocol-safety layers remain handwritten in the core SDK and tested. Browser/native navigation, history mutation, credential persistence, cross-process coordination, request interception, and framework state are instead owned by the Application or another integration library; generated code and the core SDK do not select or implement them.
 
 ## Model conventions
 
@@ -57,7 +55,7 @@ All language bindings preserve wire distinctions that affect compatibility and s
 - stable Project Auth error code plus reviewed optional metadata;
 - unknown response fields where tolerant reading is intended.
 
-Names may be idiomatic, but mappings are deterministic. Reserved-word escaping and acronym casing are pinned in generator configuration. Generated code never overwrites handwritten lifecycle/security code.
+Names may be idiomatic, but mappings are deterministic. Reserved-word escaping and acronym casing are pinned in generator configuration. Generated code never overwrites handwritten protocol-safety/security code.
 
 Project access tokens, refresh tokens, handoff tickets, PKCE verifiers, cookies, and provider callback values use redacted wrappers where language/tooling permits. Default `repr`, `Debug`, object inspection, snapshots, equality diagnostics, and serialization must not expose raw values.
 
@@ -78,7 +76,7 @@ Compatibility review flags at least:
 - error-code/category changes;
 - Runtime/Control surface leakage.
 
-The server and each SDK release independently. Each SDK publishes a tested Runtime contract/server compatibility statement. A new OpenAPI operation is not part of the stable SDK API until generated mapping, required handwritten lifecycle semantics, tests, and documentation ship together.
+The server and each SDK release independently. Each SDK publishes a tested Runtime contract/server compatibility statement. A new OpenAPI operation is not part of the stable SDK API until generated mapping, required handwritten protocol-safety semantics, tests, and documentation ship together.
 
 ## Acceptance criteria
 

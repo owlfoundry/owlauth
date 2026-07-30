@@ -1,7 +1,14 @@
 import createClient from "openapi-fetch";
 
-import type { paths } from "../generated/control-openapi";
+import type { components, paths } from "../generated/control-openapi";
 import { assertSameOriginPlaneUrl } from "../shared/configured-base";
+
+export type Project = components["schemas"]["Project"];
+export type ProjectPolicy = components["schemas"]["ProjectPolicy"];
+export type Application = components["schemas"]["Application"];
+export type SigningKey = components["schemas"]["SigningKey"];
+export type Provider = components["schemas"]["Provider"];
+export type ProblemDetails = components["schemas"]["ProblemDetails"];
 
 export interface DisposableControlClient {
   readonly client: ReturnType<typeof createClient<paths>>;
@@ -15,6 +22,68 @@ export class ControlAuthenticationError extends Error {
   }
 }
 
+export class ControlRequestError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(problem: ProblemDetails | undefined, status: number) {
+    super(problem?.detail ?? "The Control request could not be completed.");
+    this.name = "ControlRequestError";
+    this.code = problem?.code ?? "request_failed";
+    this.status = status;
+  }
+}
+
+export function newIdempotencyKey(): string {
+  return `console_${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+export class IdempotencyAttempt {
+  private key: string | null = null;
+  private inFlight = false;
+
+  begin(): string | null {
+    if (this.inFlight) return null;
+    this.inFlight = true;
+    this.key ??= newIdempotencyKey();
+    return this.key;
+  }
+
+  settle(error?: unknown): void {
+    this.inFlight = false;
+    if (
+      error === undefined ||
+      (error instanceof ControlRequestError && error.status >= 400 && error.status < 500)
+    ) {
+      this.key = null;
+    }
+  }
+
+  abandon(): void {
+    this.inFlight = false;
+    this.key = null;
+  }
+
+  get retainsKey(): boolean {
+    return this.key !== null;
+  }
+}
+
+export function requireData<T>(data: T | undefined, error: unknown, response: Response): T {
+  if (data !== undefined) return data;
+  throw new ControlRequestError(isProblemDetails(error) ? error : undefined, response.status);
+}
+
+function isProblemDetails(value: unknown): value is ProblemDetails {
+  if (typeof value !== "object" || value === null) return false;
+  return (
+    "code" in value &&
+    typeof value.code === "string" &&
+    "detail" in value &&
+    typeof value.detail === "string"
+  );
+}
+
 function createControlClient(
   controlBase: string,
   operatorKey: string,
@@ -22,6 +91,7 @@ function createControlClient(
 ): DisposableControlClient {
   let activeKey = operatorKey;
   let disposed = false;
+  const lifetime = new AbortController();
 
   const baseUrl = assertSameOriginPlaneUrl(controlBase, controlBase).href;
   const client = createClient<paths>({
@@ -36,14 +106,17 @@ function createControlClient(
       const headers = new Headers(request.headers);
       headers.delete("authorization");
       headers.set("authorization", `Bearer ${activeKey}`);
-      return fetchImplementation(new Request(request, { headers }));
+      const signal = AbortSignal.any([request.signal, lifetime.signal]);
+      return fetchImplementation(new Request(request, { headers, signal }));
     },
   });
 
   return {
     client,
     dispose() {
+      if (disposed) return;
       disposed = true;
+      lifetime.abort();
       activeKey = "";
     },
   };
@@ -57,15 +130,15 @@ export async function verifyControlKey(
   controlBase: string,
   operatorKey: string,
   fetchImplementation: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<DisposableControlClient> {
   const disposable = createControlClient(controlBase, operatorKey, fetchImplementation);
   try {
-    const { data, response } = await disposable.client.GET("/v1/system");
-    if (
-      !response.ok ||
-      data?.product !== "owlauth-server" ||
-      typeof data.project_auth !== "boolean"
-    ) {
+    const { data, response } = await disposable.client.GET(
+      "/v1/system",
+      signal === undefined ? {} : { signal },
+    );
+    if (!response.ok || data?.product !== "owlauth-server" || !data.project_auth) {
       throw new ControlAuthenticationError();
     }
     return disposable;
