@@ -80,8 +80,15 @@ jobs:
       - name: Verify Rust product boundaries
         run: |
           cli_tree="$(cargo tree --locked --package owlauth-cli --edges normal --prefix none)"
-          ! grep -Eq '^owlauth-server |^owlauth_server ' <<< "$cli_tree"
-          ! grep -Eq '^owlauth-client |^owlauth_client ' <<< "$(cargo tree --locked --package owlauth-server --edges normal --prefix none)"
+          if grep -Eq '^owlauth-server |^owlauth_server ' <<< "$cli_tree"; then
+            echo "CLI must not depend on owlauth-server" >&2
+            exit 1
+          fi
+          server_tree="$(cargo tree --locked --package owlauth-server --edges normal --prefix none)"
+          if grep -Eq '^owlauth-client |^owlauth_client ' <<< "$server_tree"; then
+            echo "server must not depend on owlauth-client" >&2
+            exit 1
+          fi
       - name: Smoke-test CLI
         run: |
           cargo run --locked --package owlauth-cli -- --version
@@ -332,5 +339,6 @@ jobs:
           scripts/test-installers.sh
           cmp scripts/install.sh crates/owlauth-cli/assets/install.sh
           cmp scripts/install.ps1 crates/owlauth-cli/assets/install.ps1
+          # shellcheck disable=SC2016
           pwsh -NoProfile -NonInteractive -Command \
             '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Out-String | Write-Error; exit 1 }'

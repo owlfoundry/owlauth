@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
+import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
+
+import { gzipSync } from "fflate";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLANES = ["runtime", "control"];
@@ -70,7 +72,7 @@ function sha256(bytes) {
 }
 
 function compressionVariants(bytes) {
-  const gzip = gzipSync(bytes, { level: 9 });
+  const gzip = Buffer.from(gzipSync(bytes, { level: 9, mtime: 0 }));
   const brotli = brotliCompressSync(bytes, {
     params: {
       [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
@@ -78,7 +80,10 @@ function compressionVariants(bytes) {
       [zlibConstants.BROTLI_PARAM_SIZE_HINT]: Math.min(bytes.length, bufferConstants.MAX_LENGTH),
     },
   });
-  invariant(gzip.equals(gzipSync(bytes, { level: 9 })), "gzip output is not deterministic");
+  invariant(
+    gzip.equals(Buffer.from(gzipSync(bytes, { level: 9, mtime: 0 }))),
+    "gzip output is not deterministic",
+  );
   invariant(
     brotli.equals(
       brotliCompressSync(bytes, {

@@ -23,8 +23,8 @@
         },
         "gzip": {
           "path": "assets/control-DtpLqc4i.css.gz",
-          "bytes": 684,
-          "sha256": "39a829ba1631a8afbc6e03f74f2505d0bdd18336de198527ca125ff4c69009ee"
+          "bytes": 685,
+          "sha256": "cbf2bbbcbdfaeca28b5d561f77b6377663f3fc207e1c4b1fa4c7da2ead2c778b"
         },
         "brotli": {
           "path": "assets/control-DtpLqc4i.css.br",
@@ -46,8 +46,8 @@
         },
         "gzip": {
           "path": "assets/control-FLgYnG_O.js.gz",
-          "bytes": 76066,
-          "sha256": "a935531b4bd6737f5a9835bee09384c18b048afb73d43bba2802b7d346c3370a"
+          "bytes": 79340,
+          "sha256": "bb508bd639db83a26174b57e186c1e39a2bd597046114728ba9d16aaea318e69"
         },
         "brotli": {
           "path": "assets/control-FLgYnG_O.js.br",

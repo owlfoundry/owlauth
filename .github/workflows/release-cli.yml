@@ -254,7 +254,7 @@ jobs:
           binary=installed/owlauth
           if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
           "$binary" update --version "$VERSION" --force --install-dir "$PWD/installed"
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             if "$binary" --version | grep -Fq " $VERSION"; then
               exit 0
             fi

@@ -6,12 +6,25 @@ suffix="${RANDOM}-$$"
 network="owlauth-smoke-${suffix}"
 database_container="owlauth-smoke-postgres-${suffix}"
 server_container="owlauth-smoke-server-${suffix}"
+postgres_image="${OWLAUTH_SMOKE_POSTGRES_IMAGE:-postgres:17-bookworm}"
 
+# shellcheck disable=SC2317
 cleanup() {
   docker rm --force "$server_container" "$database_container" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+for attempt in 1 2 3; do
+  if docker pull "$postgres_image" >/dev/null; then
+    break
+  fi
+  if [[ "$attempt" == 3 ]]; then
+    printf 'failed to pull smoke-test PostgreSQL image after %s attempts: %s\n' "$attempt" "$postgres_image" >&2
+    exit 1
+  fi
+  sleep "$((attempt * 2))"
+done
 
 docker network create "$network" >/dev/null
 docker run --detach \
@@ -21,7 +34,7 @@ docker run --detach \
   --env POSTGRES_DB=owlauth \
   --env POSTGRES_USER=owlauth \
   --env POSTGRES_PASSWORD=owlauth_smoke \
-  postgres:17-bookworm >/dev/null
+  "$postgres_image" >/dev/null
 
 for _ in {1..60}; do
   if docker exec "$database_container" pg_isready --username owlauth --dbname owlauth >/dev/null 2>&1; then
@@ -41,8 +54,16 @@ docker run --detach \
   --env OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_smoke@postgres:5432/owlauth \
   "$image" >/dev/null
 
-if [[ "$(docker exec "$server_container" sh -c 'cat /proc/1/comm')" != "tini" ]]; then
+pid_one=""
+for _ in {1..30}; do
+  if pid_one="$(docker exec "$server_container" sh -c 'cat /proc/1/comm' 2>/dev/null)"; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$pid_one" != "tini" ]]; then
   printf 'server image must run under tini as PID 1: %s\n' "$image" >&2
+  docker inspect "$server_container" >&2 || true
   docker logs "$server_container" >&2
   exit 1
 fi
@@ -65,6 +86,9 @@ if docker exec "$server_container" test -e /workspace; then
 fi
 
 for _ in {1..60}; do
+  if [[ "$(docker inspect --format '{{.State.Running}}' "$server_container")" != "true" ]]; then
+    break
+  fi
   if docker exec "$server_container" \
     curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null 2>&1 \
     && docker exec "$server_container" \

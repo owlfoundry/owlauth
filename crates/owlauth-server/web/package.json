@@ -43,6 +43,7 @@
     "eslint": "10.8.0",
     "eslint-plugin-jsx-a11y": "6.10.2",
     "eslint-plugin-react-hooks": "7.1.1",
+    "fflate": "0.8.2",
     "jsdom": "27.4.0",
     "openapi-typescript": "7.13.0",
     "prettier": "3.9.6",
