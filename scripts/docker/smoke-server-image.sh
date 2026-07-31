@@ -53,6 +53,14 @@ docker run --detach \
   --network "$network" \
   --env OWLAUTH_INSTANCE_ID=smoke-deployment \
   --env OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_smoke@postgres:5432/owlauth \
+  --env OWLAUTH_SIGNER_STORE_ROOT=/tmp/owlauth-smoke/signers \
+  --env OWLAUTH_SIGNER_STORE_KEY=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE \
+  --env OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT=/tmp/owlauth-smoke/secrets \
+  --env OWLAUTH_CONFIGURATION_SECRET_STORE_KEY=AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI \
+  --env OWLAUTH_RUNTIME_KEY_VERSION=1 \
+  --env OWLAUTH_RUNTIME_DIGEST_KEY=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM \
+  --env OWLAUTH_RUNTIME_PROTECTION_KEY=BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ \
+  --env OWLAUTH_PROVIDER_ALLOWED_ORIGINS=https://provider.smoke.invalid/ \
   --env OWLAUTH_RUNTIME_PROCESS_ID=smoke-runtime \
   "$image" >/dev/null
 
