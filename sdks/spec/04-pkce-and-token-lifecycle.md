@@ -2,7 +2,7 @@
 
 ## Current status
 
-Public configuration retrieval, provider login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout are not implemented in any official SDK. Current packages must not be presented as production authentication clients.
+Public configuration retrieval, generic Hosted Project login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout are not implemented in any official SDK. Current packages must not be presented as production authentication clients.
 
 This specification becomes applicable as each capability is implemented and validated against a real OwlAuth Runtime.
 
@@ -18,7 +18,11 @@ sequenceDiagram
     App->>Runtime: Fetch public config(project_id, application_id)
     Runtime-->>App: Safe providers and Application config
     App->>App: Generate PKCE verifier/challenge + bounded app state
-    App->>Runtime: Begin login(provider, redirect_to, challenge, app_state)
+    App->>Runtime: Begin generic login(redirect_to, challenge, app_state, optional presentation hint)
+    Runtime-->>App: Hosted interaction target + pending-login context
+    App-->>User: Explicitly navigate to Hosted interaction
+    User->>Runtime: First top-level Hosted GET binds browser and renders admitted methods
+    User->>Runtime: Explicit same-origin provider selection
     Runtime-->>User: Provider authorization navigation
     User->>Provider: Authenticate
     Provider-->>Runtime: Provider callback
@@ -46,13 +50,14 @@ For every login attempt, the protocol API:
 1. generates a fresh high-entropy PKCE verifier using the operating-system CSPRNG;
 2. derives only an `S256` challenge; `plain` and caller-requested downgrade are rejected;
 3. generates or accepts bounded Application correlation state under an explicit API;
-4. constructs a short-lived pending-transaction value bound to Runtime origin, Project, Application, selected provider, exact Application redirect, challenge/verifier, state, and creation/expiry;
-5. submits login start to the Project-qualified Runtime route;
-6. returns the navigation target and pending-transaction value without logging URL query values or secrets.
+4. constructs a versioned short-lived pending-login value bound to Runtime origin, Project, Application, exact Application redirect, challenge/verifier, state, and creation/expiry, with no selected provider;
+5. optionally supplies a bounded presentation hint that cannot select, enable, or authorize a method and is not retained as caller authority;
+6. submits generic login start to the Project-qualified Runtime route;
+7. returns the Hosted interaction navigation target and pending-login value without logging URL query values or secrets.
 
 The SDK's verifier protects the downstream one-use handoff. Runtime may independently use provider-side PKCE with the upstream provider; that server-generated verifier is never visible to the SDK. The Application owns custody of the returned pending transaction across the user-agent round trip; the core SDK neither persists it nor selects a platform store.
 
-Opening a browser or performing platform navigation is explicit Application or external integration behavior, not a hidden constructor/network side effect. The SDK never collects an upstream password.
+Opening a browser or performing platform navigation is explicit Application or external integration behavior, not a hidden constructor/network side effect. Generic start may run in a backend that has no Runtime browser cookie: the first top-level Hosted GET performs the server-authoritative one-browser binding before method selection. The SDK neither performs that navigation nor selects an upstream provider and never collects an upstream password.
 
 ## Application redirect and handoff result
 
@@ -117,10 +122,10 @@ The response never exposes linked-provider tokens, provider secret references, `
 
 ## Logout
 
-The protocol API distinguishes:
+The protocol API distinguishes separate credential and DTO classes:
 
-- **Application logout:** request revocation of the selected Application session/refresh family; the caller then clears or quarantines its local credentials according to the semantic result;
-- **Project browser logout:** request termination of the underlying Project browser session where supported, preventing refresh for all derived Application sessions in that Project/browser.
+- **Application logout:** directly send the Project access token to the Project-qualified Runtime operation, which derives and idempotently revokes only that exact Application session/refresh family; no browser cookie or caller-named session substitutes for the token. The caller then clears or quarantines its local credentials according to the semantic result.
+- **Project browser logout:** first send the Project access token to a direct preparation operation. Runtime returns a short-lived one-use Hosted confirmation target bound to the exact Application session and its Project browser session. The SDK returns that target as data and never navigates. The top-level Hosted flow requires the matching hardened Project-session cookie and same-origin CSRF before atomically consuming the preparation and terminating the browser session. No Bearer token appears in the target URL or page state.
 
 The Application chooses the mode explicitly. Application-only logout must not claim to sign out other Applications. Project browser logout must not claim to invalidate already issued JWTs before their short expiry; it blocks authoritative session/refresh operations.
 

@@ -161,7 +161,6 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Project verification key set */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -170,16 +169,6 @@ export interface operations {
                     "application/json": components["schemas"]["JwksDocument"];
                 };
             };
-            /** @description Credentials are not accepted on public Runtime endpoints */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RuntimeError"];
-                };
-            };
-            /** @description Public Project or key ring not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -188,7 +177,6 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            /** @description Runtime authority unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -241,7 +229,6 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Exact public application configuration */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -250,7 +237,6 @@ export interface operations {
                     "application/json": components["schemas"]["PublicApplicationConfig"];
                 };
             };
-            /** @description Invalid request */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -259,7 +245,6 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            /** @description Public Project or Application not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -268,7 +253,6 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            /** @description Runtime authority unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

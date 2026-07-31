@@ -228,6 +228,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/providers/{provider_id}/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["reconcile_provider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/signing-keys": {
         parameters: {
             query?: never;
@@ -254,6 +270,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["activate_signing_key"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/signing-keys/{key_id}/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["reconcile_signing_key"];
         delete?: never;
         options?: never;
         head?: never;
@@ -449,6 +481,15 @@ export interface components {
             use: components["schemas"]["JwkUse"];
             x: string;
         };
+        ReconcileProviderRequest: {
+            client_secret: string;
+            /** Format: int64 */
+            expected_project_revision: number;
+        };
+        ReconcileSigningKeyRequest: {
+            /** Format: int64 */
+            expected_project_revision: number;
+        };
         ReplaceApplicationConfigurationRequest: {
             allowed_origins: string[];
             /** Format: int64 */
@@ -479,7 +520,7 @@ export interface components {
             id: string;
             kid: string;
             project_id: string;
-            public_jwk: components["schemas"]["PublicJwk"];
+            public_jwk?: null | components["schemas"]["PublicJwk"];
             /** Format: int64 */
             ring_revision: number;
             sign_not_before?: string | null;
@@ -495,10 +536,14 @@ export interface components {
         SigningKeyState: "provisioning" | "published" | "active" | "retiring" | "retired" | "revoked" | "abandoned";
         /** @description Bounded capabilities returned after Control operator authentication. */
         SystemCapabilities: {
+            /** @description Whether end-user federated login, handoff, and session operations are implemented. */
+            federated_project_auth: boolean;
+            /** @description Whether Runtime configuration and signing-key publication readiness is implemented. */
+            login_readiness: boolean;
             /** @description Product identifier for this Control endpoint. */
             product: string;
-            /** @description Whether Project Auth business operations are implemented. */
-            project_auth: boolean;
+            /** @description Whether Project, Application, key, and provider provisioning is implemented. */
+            provisioning: boolean;
         };
         UpdateApplicationRequest: {
             display_name: string;
@@ -2027,6 +2072,87 @@ export interface operations {
             };
         };
     };
+    reconcile_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReconcileProviderRequest"];
+            };
+        };
+        responses: {
+            /** @description Reconciled provider secret provisioning */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Provider"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_signing_keys: {
         parameters: {
             query?: never;
@@ -2202,6 +2328,87 @@ export interface operations {
         };
         responses: {
             /** @description Activated signing key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SigningKey"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    reconcile_signing_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                key_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReconcileSigningKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description Reconciled signing key provisioning */
             200: {
                 headers: {
                     [name: string]: unknown;

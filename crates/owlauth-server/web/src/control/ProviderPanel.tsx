@@ -36,6 +36,8 @@ export function ProviderPanel({
     event.preventDefault();
     const form = event.currentTarget;
     const fields = new FormData(form);
+    const secretInput = form.elements.namedItem("client_secret");
+    if (secretInput instanceof HTMLInputElement) secretInput.value = "";
     const idempotencyKey = createAttempt.current.begin();
     if (idempotencyKey === null) return;
     const body = {
@@ -47,23 +49,63 @@ export function ProviderPanel({
       expected_project_revision: project.metadata_revision,
     };
     try {
-      const result = await session.client.POST("/v1/projects/{project_id}/providers", {
-        params: {
-          path: { project_id: project.id },
-          header: { "Idempotency-Key": idempotencyKey },
-        },
-        body,
-      });
+      const result = await (async () => {
+        try {
+          return await session.client.POST("/v1/projects/{project_id}/providers", {
+            params: {
+              path: { project_id: project.id },
+              header: { "Idempotency-Key": idempotencyKey },
+            },
+            body,
+          });
+        } finally {
+          body.client_secret = "";
+        }
+      })();
       requireData(result.data, result.error, result.response);
       createAttempt.current.settle();
-      body.client_secret = "";
       form.reset();
       await onChanged();
       setMessage("Provider configured; its client secret is write-only.");
     } catch (error) {
       createAttempt.current.settle(error);
-      body.client_secret = "";
       if (!createAttempt.current.retainsKey) form.reset();
+      await onError(error);
+    }
+  }
+
+  async function reconcile(
+    provider: Provider,
+    event: SyntheticEvent<HTMLFormElement, SubmitEvent>,
+  ) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const fields = new FormData(form);
+    const secretInput = form.elements.namedItem("client_secret");
+    if (secretInput instanceof HTMLInputElement) secretInput.value = "";
+    const body = {
+      client_secret: fieldText(fields, "client_secret"),
+      expected_project_revision: project.metadata_revision,
+    };
+    try {
+      const result = await (async () => {
+        try {
+          return await session.client.POST(
+            "/v1/projects/{project_id}/providers/{provider_id}/reconcile",
+            {
+              params: { path: { project_id: project.id, provider_id: provider.id } },
+              body,
+            },
+          );
+        } finally {
+          body.client_secret = "";
+        }
+      })();
+      requireData(result.data, result.error, result.response);
+      form.reset();
+      await onChanged();
+      setMessage("Provider secret provisioning reconciled.");
+    } catch (error) {
       await onError(error);
     }
   }
@@ -200,6 +242,25 @@ export function ProviderPanel({
                   </button>
                 ) : null}
               </div>
+              {provider.status === "provisioning" ? (
+                <form
+                  className={styles["inlineForm"]}
+                  onSubmit={(event) => void reconcile(provider, event)}
+                >
+                  <label htmlFor={`provider-secret-reconcile-${provider.id}`}>
+                    Re-enter client secret to resume
+                  </label>
+                  <input
+                    id={`provider-secret-reconcile-${provider.id}`}
+                    name="client_secret"
+                    type="password"
+                    required
+                    autoComplete="new-password"
+                    maxLength={4096}
+                  />
+                  <button type="submit">Resume provisioning</button>
+                </form>
+              ) : null}
               {provider.status === "active" &&
               applications.some((app) => app.status === "active") ? (
                 <form

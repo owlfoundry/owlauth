@@ -49,8 +49,9 @@ Release scopes are `server`, `cli`, `typescript`, `python`, `rust`, and `all`. I
 
 ## Testing
 
+- Keep local verification proportional to the changed capability and its material risks. Run focused tests plus the relevant package or end-to-end gate; do not reproduce the entire CI matrix by default. Leave unaffected component matrices, release/package checks, plugin validation, documentation deployment, and container-image smoke tests to CI unless their boundary changed, a release is being prepared, CI is being diagnosed, or the user explicitly requests them.
 - Keep CI matrices aligned with declared runtime support. Python SDK CI covers 3.11, 3.12, 3.13, and 3.14; TypeScript SDK CI covers Node.js 20, 22, and 24 and, once browser support is claimed, runs the same `@owlauth/client` artifact in the declared browser matrix; Rust CI covers stable.
-- Run package-content checks for every registry artifact, including the BSD license text.
+- CI and release workflows run package-content checks for every registry artifact, including the BSD license text.
 - Enforce the Rust product dependency direction in CI: CLI must not reach server; server must not reach client SDK.
 - Shared fixtures and conformance cases define cross-language behavioral parity.
 - Once real Project Auth behavior exists, add server-backed end-to-end jobs that start OwlAuth and run all three SDK suites against the same instance. Do not add fake E2E tests before the Runtime flows exist.

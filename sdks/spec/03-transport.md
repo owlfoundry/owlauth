@@ -36,7 +36,7 @@ Transport does not send provider credentials or provider tokens: OwlAuth Runtime
 
 ## Redirect behavior
 
-Low-level API requests do not automatically follow redirects across origins. Login initiation returns a provider authorization URL as data; only the Application or an external platform integration may navigate to it. A provider authorization URL is not adopted as the SDK's API origin and never receives Project session credentials.
+Low-level API requests do not automatically follow redirects across origins. Generic login initiation returns the OwlAuth Hosted Authentication interaction target as data; only the Application or an external platform integration may navigate to it. The SDK does not select a provider. A provider authorization request is created only after the browser-bound Hosted UI commits an explicit same-origin method-selection transition; its upstream URL is never adopted as the SDK's API origin and never receives Project session credentials.
 
 The final Application redirect is processed by the Application/SDK handoff boundary, not followed as an HTTP API redirect. Exact redirect registration and callback binding remain Runtime authority.
 

@@ -9,13 +9,19 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use owlauth_types::FEDERATED_PROJECT_AUTH_AVAILABLE;
+use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use url::Url;
 use zeroize::Zeroizing;
 
+use crate::domain::MAX_ACCESS_TOKEN_LIFETIME_SECONDS;
+
 const CONTROL_KEY_PREFIX: &str = "owl_ctrl_v1_";
 const CONTROL_KEY_SECRET_LENGTH: usize = 43;
+const MAX_KEY_PROPAGATION_DELAY: Duration = Duration::from_hours(24);
+const MAX_SIGNING_VERIFICATION_RETENTION: Duration = Duration::from_hours(24);
 
 const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_MODE",
@@ -29,6 +35,11 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_SIGNER_STORE_KEY",
     "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
     "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
+    "OWLAUTH_RUNTIME_KEY_VERSION",
+    "OWLAUTH_RUNTIME_DIGEST_KEY",
+    "OWLAUTH_RUNTIME_PROTECTION_KEY",
+    "OWLAUTH_RUNTIME_RETAINED_KEYS",
+    "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
     "OWLAUTH_RUNTIME_PROCESS_ID",
     "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
     "OWLAUTH_PUBLICATION_LEASE_TTL_MS",
@@ -225,6 +236,19 @@ pub struct ProvisioningConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct RuntimeKeyConfig {
+    pub digest_key: StoreMasterKey,
+    pub protection_key: StoreMasterKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeProtectionConfig {
+    pub active_version: i32,
+    pub active: RuntimeKeyConfig,
+    pub retained: BTreeMap<i32, RuntimeKeyConfig>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub mode: PlaneMode,
     pub instance_id: Option<String>,
@@ -232,6 +256,8 @@ pub struct ServerConfig {
     pub control: ListenerConfig,
     pub control_api_key: Option<OperatorApiKey>,
     pub provisioning: Option<ProvisioningConfig>,
+    pub runtime_protection: Option<RuntimeProtectionConfig>,
+    pub provider_allowed_origins: Vec<String>,
     pub runtime_process_id: String,
     pub required_runtime_process_ids: Vec<String>,
     pub publication_lease_ttl: Duration,
@@ -247,7 +273,8 @@ impl ServerConfig {
     /// Reads and validates the complete `OwlAuth` environment configuration.
     ///
     /// Unknown `OWLAUTH_*` variables are rejected. Runtime-only mode deliberately does
-    /// not read the operator-key value.
+    /// not read Control operator or provisioning-store secrets while federated Project
+    /// authentication is unavailable.
     ///
     /// # Errors
     ///
@@ -321,12 +348,19 @@ impl ServerConfig {
                 5,
             )?,
         };
-        validate_external_bases(mode, &runtime.external_base, &control.external_base)?;
+        validate_external_bases(&runtime.external_base, &control.external_base)?;
 
         let (instance_id, control_api_key) = parse_control_identity(mode, values)?;
         let provisioning = parse_provisioning(mode, values)?;
-        let configured_runtime_process_id = required(values, "OWLAUTH_RUNTIME_PROCESS_ID")?;
-        let runtime_process_id = validate_process_id(&configured_runtime_process_id)?;
+        let runtime_protection = parse_runtime_protection(mode, values)?;
+        let provider_allowed_origins = parse_provider_allowed_origins(mode, values)?;
+        let configured_runtime_process_id = optional(values, "OWLAUTH_RUNTIME_PROCESS_ID")
+            .map(validate_process_id)
+            .transpose()?;
+        if mode.has_runtime() && configured_runtime_process_id.is_none() {
+            return Err(ConfigError::Missing("OWLAUTH_RUNTIME_PROCESS_ID"));
+        }
+        let runtime_process_id = configured_runtime_process_id.unwrap_or_default();
         let required_runtime_process_ids =
             match optional(values, "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS") {
                 Some(configured) => {
@@ -344,8 +378,21 @@ impl ServerConfig {
                     }
                     ids
                 }
+                None if mode == PlaneMode::Control => {
+                    return Err(ConfigError::Missing("OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS"));
+                }
                 None => vec![runtime_process_id.clone()],
             };
+        if mode.has_runtime()
+            && !required_runtime_process_ids
+                .iter()
+                .any(|process_id| process_id == &runtime_process_id)
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
+                reason: "must include this Runtime process's OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
+            });
+        }
 
         let serving_url = required(values, "OWLAUTH_POSTGRES_URL")?;
         let runtime_url = optional(values, "OWLAUTH_RUNTIME_POSTGRES_URL")
@@ -368,6 +415,43 @@ impl ServerConfig {
         let migration_owner_role = optional(values, "OWLAUTH_MIGRATION_OWNER_ROLE")
             .map(validate_role)
             .transpose()?;
+        let publication_lease_ttl =
+            parse_millis(values, "OWLAUTH_PUBLICATION_LEASE_TTL_MS", 30_000)?;
+        let key_propagation_delay =
+            parse_millis(values, "OWLAUTH_KEY_PROPAGATION_DELAY_MS", 2_000)?;
+        if key_propagation_delay > MAX_KEY_PROPAGATION_DELAY {
+            return Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_KEY_PROPAGATION_DELAY_MS",
+                reason: "must not exceed 86400000 milliseconds".to_owned(),
+            });
+        }
+        let signing_verification_retention = parse_millis(
+            values,
+            "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
+            1_200_000,
+        )?;
+        if signing_verification_retention > MAX_SIGNING_VERIFICATION_RETENTION {
+            return Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
+                reason: "must not exceed 86400000 milliseconds".to_owned(),
+            });
+        }
+        let maximum_token_lifetime = Duration::from_secs(
+            u64::try_from(MAX_ACCESS_TOKEN_LIFETIME_SECONDS)
+                .expect("the access-token lifetime maximum is positive"),
+        );
+        let required_verification_overlap = maximum_token_lifetime
+            .checked_add(signing_verification_retention)
+            .and_then(|retention| retention.checked_add(key_propagation_delay));
+        if required_verification_overlap
+            .and_then(|retention| time::Duration::try_from(retention).ok())
+            .is_none()
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
+                reason: "is too large to form the required verification overlap".to_owned(),
+            });
+        }
 
         Ok(Self {
             mode,
@@ -376,19 +460,13 @@ impl ServerConfig {
             control,
             control_api_key,
             provisioning,
+            runtime_protection,
+            provider_allowed_origins,
             runtime_process_id,
             required_runtime_process_ids,
-            publication_lease_ttl: parse_millis(
-                values,
-                "OWLAUTH_PUBLICATION_LEASE_TTL_MS",
-                30_000,
-            )?,
-            key_propagation_delay: parse_millis(values, "OWLAUTH_KEY_PROPAGATION_DELAY_MS", 2_000)?,
-            signing_verification_retention: parse_millis(
-                values,
-                "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
-                1_200_000,
-            )?,
+            publication_lease_ttl,
+            key_propagation_delay,
+            signing_verification_retention,
             postgres: PostgresConfig {
                 serving_url: SecretString::new(serving_url),
                 runtime_url: SecretString::new(runtime_url),
@@ -458,19 +536,24 @@ fn parse_control_identity(
     mode: PlaneMode,
     values: &BTreeMap<String, String>,
 ) -> Result<(Option<String>, Option<OperatorApiKey>), ConfigError> {
-    if !mode.has_control() {
-        return Ok((None, None));
-    }
-    let control_api_key = OperatorApiKey::parse(required(values, "OWLAUTH_CONTROL_API_KEY")?)?;
     let instance_id = validate_instance_id(required(values, "OWLAUTH_INSTANCE_ID")?)?;
-    Ok((Some(instance_id), Some(control_api_key)))
+    let control_api_key = if mode.has_control() {
+        Some(OperatorApiKey::parse(required(
+            values,
+            "OWLAUTH_CONTROL_API_KEY",
+        )?)?)
+    } else {
+        None
+    };
+    Ok((Some(instance_id), control_api_key))
 }
 
 fn parse_provisioning(
     mode: PlaneMode,
     values: &BTreeMap<String, String>,
 ) -> Result<Option<ProvisioningConfig>, ConfigError> {
-    if !mode.has_control() {
+    let runtime_needs_stores = mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE;
+    if !mode.has_control() && !runtime_needs_stores {
         return Ok(None);
     }
     let signer_store_root = parse_store_root(
@@ -507,6 +590,123 @@ fn parse_provisioning(
         configuration_secret_store_root,
         configuration_secret_store_key,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedRuntimeKeyConfig {
+    digest_key: String,
+    protection_key: String,
+}
+
+fn parse_runtime_protection(
+    mode: PlaneMode,
+    values: &BTreeMap<String, String>,
+) -> Result<Option<RuntimeProtectionConfig>, ConfigError> {
+    if !mode.has_runtime() {
+        return Ok(None);
+    }
+    let active_version = required(values, "OWLAUTH_RUNTIME_KEY_VERSION")?
+        .parse::<i32>()
+        .map_err(|_| ConfigError::InvalidValue {
+            key: "OWLAUTH_RUNTIME_KEY_VERSION",
+            reason: "must be a positive integer".to_owned(),
+        })?;
+    if active_version <= 0 {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_RUNTIME_KEY_VERSION",
+            reason: "must be a positive integer".to_owned(),
+        });
+    }
+    let active = parse_runtime_key(
+        required(values, "OWLAUTH_RUNTIME_DIGEST_KEY")?,
+        required(values, "OWLAUTH_RUNTIME_PROTECTION_KEY")?,
+    )?;
+    let serialized = optional(values, "OWLAUTH_RUNTIME_RETAINED_KEYS").unwrap_or("{}");
+    let retained = serde_json::from_str::<BTreeMap<i32, SerializedRuntimeKeyConfig>>(serialized)
+        .map_err(|_| ConfigError::InvalidValue {
+            key: "OWLAUTH_RUNTIME_RETAINED_KEYS",
+            reason: "must be a JSON object keyed by unique positive key versions".to_owned(),
+        })?
+        .into_iter()
+        .map(|(version, key)| {
+            if version <= 0 || version == active_version {
+                return Err(ConfigError::InvalidValue {
+                    key: "OWLAUTH_RUNTIME_RETAINED_KEYS",
+                    reason: "versions must be positive and must not repeat the active version"
+                        .to_owned(),
+                });
+            }
+            Ok((
+                version,
+                parse_runtime_key(key.digest_key, key.protection_key)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(Some(RuntimeProtectionConfig {
+        active_version,
+        active,
+        retained,
+    }))
+}
+
+fn parse_runtime_key(
+    digest_key: String,
+    protection_key: String,
+) -> Result<RuntimeKeyConfig, ConfigError> {
+    let digest_key = StoreMasterKey::parse("OWLAUTH_RUNTIME_DIGEST_KEY", digest_key)?;
+    let protection_key = StoreMasterKey::parse("OWLAUTH_RUNTIME_PROTECTION_KEY", protection_key)?;
+    if digest_key.0.as_ref() == protection_key.0.as_ref() {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_RUNTIME_PROTECTION_KEY",
+            reason: "must be separate from the Runtime digest key".to_owned(),
+        });
+    }
+    Ok(RuntimeKeyConfig {
+        digest_key,
+        protection_key,
+    })
+}
+
+fn parse_provider_allowed_origins(
+    mode: PlaneMode,
+    values: &BTreeMap<String, String>,
+) -> Result<Vec<String>, ConfigError> {
+    if !mode.has_runtime() {
+        return Ok(Vec::new());
+    }
+    let configured = required(values, "OWLAUTH_PROVIDER_ALLOWED_ORIGINS")?;
+    let origins = configured
+        .split(',')
+        .map(|value| {
+            let url = Url::parse(value).map_err(|_| ConfigError::InvalidValue {
+                key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
+                reason: "must contain comma-separated canonical HTTPS origins".to_owned(),
+            })?;
+            if url.scheme() != "https"
+                || url.username() != ""
+                || url.password().is_some()
+                || url.host_str().is_none()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.as_str() != value
+            {
+                return Err(ConfigError::InvalidValue {
+                    key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
+                    reason: "must contain comma-separated canonical HTTPS origins".to_owned(),
+                });
+            }
+            Ok(value.to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if origins.is_empty() || origins.iter().collect::<BTreeSet<_>>().len() != origins.len() {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
+            reason: "must contain unique canonical HTTPS origins".to_owned(),
+        });
+    }
+    Ok(origins)
 }
 
 fn parse_store_root(key: &'static str, value: String) -> Result<PathBuf, ConfigError> {
@@ -636,12 +836,8 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn validate_external_bases(
-    mode: PlaneMode,
-    runtime: &Url,
-    control: &Url,
-) -> Result<(), ConfigError> {
-    if mode == PlaneMode::All && same_origin(runtime, control) {
+fn validate_external_bases(runtime: &Url, control: &Url) -> Result<(), ConfigError> {
+    if same_origin(runtime, control) {
         let runtime_path = runtime.path();
         let control_path = control.path();
         if runtime_path == "/"
@@ -728,7 +924,21 @@ mod tests {
                 "OWLAUTH_POSTGRES_URL",
                 "postgres://runtime:secret@database.example/owlauth",
             ),
+            ("OWLAUTH_INSTANCE_ID", "test-deployment"),
             ("OWLAUTH_RUNTIME_PROCESS_ID", "test-runtime"),
+            ("OWLAUTH_RUNTIME_KEY_VERSION", "2"),
+            (
+                "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
+                "https://accounts.example/",
+            ),
+            (
+                "OWLAUTH_RUNTIME_DIGEST_KEY",
+                "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+            ),
+            (
+                "OWLAUTH_RUNTIME_PROTECTION_KEY",
+                "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+            ),
         ])
     }
 
@@ -751,23 +961,69 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mode_does_not_require_or_retain_operator_key() {
-        let mut input = runtime_values();
-        input.insert(
-            "OWLAUTH_CONTROL_API_KEY".to_owned(),
-            "this value must not be loaded".to_owned(),
-        );
-        let config = ServerConfig::from_values(&input).expect("Runtime config should parse");
+    fn runtime_mode_does_not_require_or_load_control_secrets() {
+        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
+        let config =
+            ServerConfig::from_values(&runtime_values()).expect("Runtime config should parse");
         assert_eq!(config.mode, PlaneMode::Runtime);
         assert!(config.control_api_key.is_none());
-        assert!(!format!("{config:?}").contains("secret"));
-        assert!(!format!("{config:?}").contains("this value"));
+        assert!(config.provisioning.is_none());
+
+        let mut ignored = runtime_values();
+        ignored.extend(values(&[
+            ("OWLAUTH_CONTROL_API_KEY", "this value must not be loaded"),
+            ("OWLAUTH_SIGNER_STORE_ROOT", "not-an-absolute-path"),
+            ("OWLAUTH_SIGNER_STORE_KEY", "not-base64"),
+            (
+                "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
+                "also-not-an-absolute-path",
+            ),
+            ("OWLAUTH_CONFIGURATION_SECRET_STORE_KEY", "also-not-base64"),
+        ]));
+        let config = ServerConfig::from_values(&ignored)
+            .expect("Runtime must ignore unavailable Control capabilities");
+        assert!(config.control_api_key.is_none());
+        assert!(config.provisioning.is_none());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("this value"));
+        assert!(!debug.contains("not-base64"));
+        assert!(!debug.contains("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"));
+    }
+
+    #[test]
+    fn control_and_all_modes_retain_provisioning_stores() {
+        for mode in ["control", "all"] {
+            let mut input = runtime_values();
+            input.extend(control_store_values());
+            input.insert("OWLAUTH_MODE".to_owned(), mode.to_owned());
+            input.insert(
+                "OWLAUTH_CONTROL_API_KEY".to_owned(),
+                format!(
+                    "{CONTROL_KEY_PREFIX}{}",
+                    "A".repeat(CONTROL_KEY_SECRET_LENGTH)
+                ),
+            );
+            if mode == "control" {
+                input.insert(
+                    "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
+                    "runtime-a".to_owned(),
+                );
+            }
+            let config = ServerConfig::from_values(&input)
+                .expect("Control composition must retain provisioning stores");
+            assert!(config.provisioning.is_some(), "mode {mode}");
+        }
     }
 
     #[test]
     fn control_requires_exact_canonical_key() {
         let mut input = runtime_values();
         input.insert("OWLAUTH_MODE".to_owned(), "control".to_owned());
+        input.insert(
+            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
+            "runtime-a".to_owned(),
+        );
+        input.remove("OWLAUTH_RUNTIME_PROCESS_ID");
         assert_eq!(
             ServerConfig::from_values(&input).expect_err("missing key must fail"),
             ConfigError::Missing("OWLAUTH_CONTROL_API_KEY")
@@ -823,6 +1079,65 @@ mod tests {
     }
 
     #[test]
+    fn runtime_process_must_be_present_in_its_required_roster() {
+        let mut input = runtime_values();
+        input.insert(
+            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
+            "other-runtime".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
+                ..
+            })
+        ));
+
+        input.insert(
+            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
+            "test-runtime,other-runtime".to_owned(),
+        );
+        let config = ServerConfig::from_values(&input)
+            .expect("a Runtime process may require itself and additional roster members");
+        assert_eq!(
+            config.required_runtime_process_ids,
+            ["test-runtime", "other-runtime"]
+        );
+    }
+
+    #[test]
+    fn rejects_propagation_delay_beyond_the_upgrade_safety_bound() {
+        let mut input = runtime_values();
+        input.insert(
+            "OWLAUTH_KEY_PROPAGATION_DELAY_MS".to_owned(),
+            "86400001".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_KEY_PROPAGATION_DELAY_MS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_verification_retention_beyond_the_safety_bound() {
+        let mut input = runtime_values();
+        input.insert(
+            "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS".to_owned(),
+            "86400001".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn validates_shared_origin_base_partition() {
         let mut input = runtime_values();
         input.extend(control_store_values());
@@ -854,13 +1169,18 @@ mod tests {
             })
         ));
 
-        input.insert(
-            "OWLAUTH_CONTROL_BASE_URL".to_owned(),
-            "https://identity.example/auth/control/".to_owned(),
-        );
-        assert_eq!(
-            ServerConfig::from_values(&input).expect_err("overlap must fail"),
-            ConfigError::SharedOriginBases
-        );
+        for mode in ["all", "runtime", "control"] {
+            let mut overlapping = input.clone();
+            overlapping.insert("OWLAUTH_MODE".to_owned(), mode.to_owned());
+            overlapping.insert(
+                "OWLAUTH_CONTROL_BASE_URL".to_owned(),
+                "https://identity.example/auth/control/".to_owned(),
+            );
+            assert_eq!(
+                ServerConfig::from_values(&overlapping)
+                    .expect_err("overlap must fail in every process mode"),
+                ConfigError::SharedOriginBases
+            );
+        }
     }
 }

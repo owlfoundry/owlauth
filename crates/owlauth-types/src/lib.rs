@@ -10,6 +10,13 @@ pub mod runtime;
 
 pub use health::HealthResponse;
 
+/// Compile-time availability of the still-partial federated Project Auth surface.
+///
+/// Block A deliberately keeps this false so Runtime login and session handlers remain
+/// compiled without being advertised or mounted. Block B may flip this only after its
+/// complete public contract and end-to-end invariants are ready.
+pub const FEDERATED_PROJECT_AUTH_AVAILABLE: bool = false;
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
@@ -32,6 +39,24 @@ mod tests {
         assert!(
             runtime["paths"]["/projects/{project_public_id}/.well-known/jwks.json"].is_object()
         );
+        for excluded in [
+            "/v1/projects/{project_public_id}/auth/login/start",
+            "/auth/interactions/{interaction}",
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/method",
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/session/reuse",
+            "/v1/projects/{project_public_id}/auth/handoff/exchange",
+            "/v1/projects/{project_public_id}/auth/sessions/refresh",
+            "/v1/projects/{project_public_id}/auth/users/me",
+            "/v1/projects/{project_public_id}/auth/sessions/logout",
+            "/v1/projects/{project_public_id}/auth/browser-logout/prepare",
+            "/auth/browser-logout/{preparation}",
+            "/v1/projects/{project_public_id}/auth/browser-logout/{preparation}/confirm",
+        ] {
+            assert!(
+                runtime["paths"].get(excluded).is_none(),
+                "partial Block B path leaked into Runtime OpenAPI: {excluded}"
+            );
+        }
         assert!(runtime["paths"].get("/v1/projects").is_none());
         assert!(
             runtime["components"]["schemas"]
@@ -40,7 +65,24 @@ mod tests {
         );
 
         assert!(control["paths"]["/v1/system"].is_object());
+        let capabilities = &control["components"]["schemas"]["SystemCapabilities"];
+        assert!(capabilities["properties"].get("project_auth").is_none());
+        assert!(capabilities["properties"]["provisioning"].is_object());
+        assert!(capabilities["properties"]["login_readiness"].is_object());
+        assert!(capabilities["properties"]["federated_project_auth"].is_object());
+        let advertised = control::get_system();
+        assert!(advertised.provisioning);
+        assert!(advertised.login_readiness);
+        assert!(!advertised.federated_project_auth);
         assert!(control["paths"]["/v1/projects"].is_object());
+        assert!(
+            control["paths"]["/v1/projects/{project_id}/signing-keys/{key_id}/reconcile"]
+                .is_object()
+        );
+        assert!(
+            control["paths"]["/v1/projects/{project_id}/providers/{provider_id}/reconcile"]
+                .is_object()
+        );
         assert!(
             control["paths"]
                 .get("/v1/projects/{project_public_id}/auth/config")
@@ -54,6 +96,11 @@ mod tests {
         assert!(control["components"]["securitySchemes"]["operator_api_key"].is_object());
         assert_eq!(
             control["components"]["schemas"]["CreateProviderRequest"]["properties"]["client_secret"]
+                ["writeOnly"],
+            true
+        );
+        assert_eq!(
+            control["components"]["schemas"]["ReconcileProviderRequest"]["properties"]["client_secret"]
                 ["writeOnly"],
             true
         );

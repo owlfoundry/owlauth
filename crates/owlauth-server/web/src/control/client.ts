@@ -138,7 +138,7 @@ export async function verifyControlKey(
       "/v1/system",
       signal === undefined ? {} : { signal },
     );
-    if (!response.ok || data?.product !== "owlauth-server" || !data.project_auth) {
+    if (!response.ok || data?.product !== "owlauth-server" || !data.provisioning) {
       throw new ControlAuthenticationError();
     }
     return disposable;

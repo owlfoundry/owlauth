@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DatabaseTransaction,
     EntityTrait, QueryFilter, TransactionTrait,
@@ -8,20 +9,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::entity::{audit_event, control_idempotency_record, project};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NewProject {
-    pub id: Uuid,
-    pub public_id: String,
-    pub display_name: String,
-    pub belongs_to: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CompleteIdempotency {
-    Completed,
-    AlreadyCompleted,
-}
+use crate::application::{
+    ApplicationError, CompleteIdempotency, NewProject, ProjectUnitOfWork as ProjectUnitOfWorkPort,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum RepositoryError {
@@ -151,5 +141,60 @@ impl ProjectUnitOfWork {
             .rollback()
             .await
             .map_err(|_| RepositoryError::Rollback)
+    }
+}
+
+#[async_trait]
+impl ProjectUnitOfWorkPort for ProjectUnitOfWork {
+    async fn insert_project_with_audit(
+        &self,
+        project: NewProject,
+        correlation_id: Uuid,
+    ) -> Result<(), ApplicationError> {
+        ProjectUnitOfWork::insert_project_with_audit(self, project, correlation_id)
+            .await
+            .map_err(repository_error)
+    }
+
+    async fn insert_pending_idempotency(
+        &self,
+        key: String,
+        project_id: Uuid,
+        request_digest: Vec<u8>,
+    ) -> Result<(), ApplicationError> {
+        ProjectUnitOfWork::insert_pending_idempotency(self, key, project_id, request_digest)
+            .await
+            .map_err(repository_error)
+    }
+
+    async fn complete_idempotency_once(
+        &self,
+        key: &str,
+        response: Value,
+    ) -> Result<CompleteIdempotency, ApplicationError> {
+        ProjectUnitOfWork::complete_idempotency_once(self, key, response)
+            .await
+            .map_err(repository_error)
+    }
+
+    async fn commit(self) -> Result<(), ApplicationError> {
+        ProjectUnitOfWork::commit(self)
+            .await
+            .map_err(repository_error)
+    }
+
+    async fn rollback(self) -> Result<(), ApplicationError> {
+        ProjectUnitOfWork::rollback(self)
+            .await
+            .map_err(repository_error)
+    }
+}
+
+fn repository_error(error: RepositoryError) -> ApplicationError {
+    match error {
+        RepositoryError::Mutation => ApplicationError::Integrity,
+        RepositoryError::Begin | RepositoryError::Commit | RepositoryError::Rollback => {
+            ApplicationError::Persistence
+        }
     }
 }

@@ -68,9 +68,21 @@ async fn migrate(config: &PostgresConfig) -> Result<(), SchemaError> {
                 .map_err(|_| SchemaError::Migration)?;
             Ok(())
         }
+        Ok(Err(error)) if is_database_lock_timeout(&error) => Err(SchemaError::LockTimeout),
         Ok(Err(_)) => Err(SchemaError::Migration),
         Err(_) => Err(SchemaError::LockTimeout),
     }
+}
+
+fn is_database_lock_timeout(error: &sqlx::migrate::MigrateError) -> bool {
+    let database_error = match error {
+        sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(error))
+        | sqlx::migrate::MigrateError::ExecuteMigration(sqlx::Error::Database(error), _) => {
+            Some(error)
+        }
+        _ => None,
+    };
+    database_error.is_some_and(|error| error.code().as_deref() == Some("55P03"))
 }
 
 pub(crate) async fn verify_url(url: &str, deadline: Duration) -> Result<(), SchemaError> {

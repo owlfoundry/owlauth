@@ -43,6 +43,8 @@ erDiagram
     PROJECT_BROWSER_SESSIONS o|--o{ APPLICATION_SESSIONS : authenticates
     APPLICATIONS ||--o{ APPLICATION_SESSIONS : receives
     PROJECT_USERS ||--o{ APPLICATION_SESSIONS : owns
+    APPLICATION_SESSIONS ||--o{ BROWSER_LOGOUT_PREPARATIONS : prepares
+    PROJECT_BROWSER_SESSIONS ||--o{ BROWSER_LOGOUT_PREPARATIONS : terminates
     APPLICATION_SESSIONS ||--|| REFRESH_FAMILIES : refreshes
     REFRESH_FAMILIES ||--o{ REFRESH_TOKENS : rotates
     PROJECT_KEY_RINGS ||--o{ SIGNING_KEYS : contains
@@ -73,6 +75,7 @@ erDiagram
         enum application_type
         enum status
         bigint security_revision
+        bigint projection_revision
     }
     APPLICATION_REDIRECT_URIS {
         uuid id PK
@@ -117,6 +120,7 @@ erDiagram
         uuid project_id PK
         bigint claims_revision
         bigint session_revision
+        bigint projection_revision
         jsonb claims_policy
         jsonb session_policy
     }
@@ -133,7 +137,7 @@ erDiagram
         uuid id PK
         uuid project_id FK
         uuid user_id FK
-        uuid provider_configuration_id FK
+        uuid created_via_provider_configuration_id FK
         text provider_issuer
         text provider_subject
         jsonb profile_attributes
@@ -153,6 +157,8 @@ erDiagram
         text app_state_ciphertext
         text handoff_pkce_challenge
         text provider_pkce_verifier_ciphertext
+        text oidc_nonce_digest
+        text provider_callback_uri
         jsonb allowed_methods_snapshot
         enum selected_method_kind
         bigint transaction_revision
@@ -180,7 +186,9 @@ erDiagram
         bigint security_revision
         jsonb revision_snapshot
         timestamptz authenticated_at
-        timestamptz expires_at
+        timestamptz last_activity_at
+        timestamptz idle_expires_at
+        timestamptz absolute_expires_at
     }
     APPLICATION_SESSIONS {
         uuid id PK
@@ -193,6 +201,22 @@ erDiagram
         timestamptz authenticated_at
         timestamptz expires_at
     }
+    BROWSER_LOGOUT_PREPARATIONS {
+        uuid id PK
+        uuid project_id FK
+        uuid application_id FK
+        uuid user_id FK
+        uuid application_session_id FK
+        uuid browser_session_id FK
+        text preparation_digest UK
+        text csrf_digest
+        enum status
+        bigint revision
+        jsonb revision_snapshot
+        timestamptz created_at
+        timestamptz expires_at
+        timestamptz consumed_at
+    }
     REFRESH_FAMILIES {
         uuid id PK
         uuid project_id FK
@@ -201,6 +225,7 @@ erDiagram
         uuid application_session_id FK
         enum status
         bigint current_generation
+        int allowed_clock_skew_seconds
         jsonb revision_snapshot
         timestamptz expires_at
     }
@@ -432,7 +457,8 @@ erDiagram
         uuid project_id FK
         bigint user_revision
         bigint projection_revision
-        jsonb policy_revision_snapshot
+        bigint project_policy_revision
+        bigint application_policy_revision
         text projection_schema
         text projection_digest
         jsonb bounded_projection
@@ -488,7 +514,7 @@ erDiagram
     }
 ```
 
-`project_users` additionally carries monotonic `user_revision`, a canonical materialized-base-profile digest, and an optional same-user designated primary profile identity reference/discriminator. The Project email-auth policy—not a possibly absent SMTP configuration row—stores explicit deployment-default opt-in. Nullable SMTP relationships are constrained by `smtp_selection_kind`: Project selection requires the same-Project configuration ID/generation/revision and no default generation; deployment-default selection requires no Project configuration ID and an existing deployment registry generation/revision. `projection_expansion_operations.application_id` is null only for a Project-wide projection-policy revision and otherwise identifies one same-Project Application. A new `login_transaction` has no selected provider/method: it snapshots admitted methods and revisions, then one CSRF/browser-bound expected-revision command selects provider or email. `provider_configuration_id` and upstream fields are null unless provider is selected. Credential/payload columns are purpose-bound versioned ciphertext or opaque secret references according to spec 11; specifically, v1 managed renewable credentials are PostgreSQL AEAD ciphertext so replacement is one authoritative database transition, while provider/SMTP/webhook configuration secrets remain opaque external references.
+`project_users` additionally carries monotonic `user_revision`, a canonical materialized-base-profile digest, and an optional same-user designated primary profile identity reference/discriminator. The Project email-auth policy—not a possibly absent SMTP configuration row—stores explicit deployment-default opt-in. Nullable SMTP relationships are constrained by `smtp_selection_kind`: Project selection requires the same-Project configuration ID/generation/revision and no default generation; deployment-default selection requires no Project configuration ID and an existing deployment registry generation/revision. `projection_expansion_operations.application_id` is null only for a Project-wide projection-policy revision and otherwise identifies one same-Project Application. A new `login_transaction` is `awaiting_browser_binding` with no selected provider/method or browser/CSRF binding: it snapshots admitted methods and revisions, the first eligible top-level Hosted GET conditionally binds one browser and advances to `awaiting_method_selection`, then one CSRF/browser-bound expected-revision command selects provider or email. `provider_configuration_id` and upstream fields are null unless provider is selected. Credential/payload columns are purpose-bound versioned ciphertext or opaque secret references according to spec 11; specifically, v1 managed renewable credentials are PostgreSQL AEAD ciphertext so replacement is one authoritative database transition, while provider/SMTP/webhook configuration secrets remain opaque external references.
 
 ## Project isolation constraints
 
@@ -496,7 +522,7 @@ erDiagram
 - `projects.belongs_to` is nullable bounded opaque text with a non-unique B-tree index. It has no foreign key to an OwlAuth organization because OwlAuth has no organization model.
 - Every Project-owned object carries `project_id`. Composite foreign keys or equivalent constraints ensure every referenced parent has the same Project.
 - Repository operations accept `ProjectId` as a required argument for Project-owned state; unqualified object lookup is forbidden in Runtime and Project-bound Control use cases.
-- `(project_id, provider_issuer, provider_subject)` is unique for linked identities.
+- Canonical `(project_id, provider_issuer, provider_subject)` is unique for linked identities across all provider registrations in that Project.
 - Application/provider public keys are unique in a namespace that cannot resolve to another Project accidentally.
 - Project transfer does not exist. Changing `belongs_to` changes external metadata, not Project identity or child ownership.
 - Project disablement advances `security_revision`; all Runtime operations compare their revision snapshot and fail closed.
@@ -516,14 +542,16 @@ erDiagram
 - `(project_id, provider_key)` is unique. A provider configuration represents one upstream OAuth/OIDC client registration with canonical issuer/kind, client ID, callback identity, and opaque secret-manager reference.
 - A Project may define multiple registrations for the same provider kind, such as separate web/native client IDs. An Application can select only an active configuration assignment established through a same-Project join constraint.
 - Assigning/unassigning a provider advances the assignment `security_revision`. Login transaction, callback completion, and handoff exchange revalidate the captured assignment revision.
-- Provider callback identity is derived from trusted Runtime external URL, Project public ID, and provider key; caller input cannot replace it.
+- Provider callback identity is derived from trusted Runtime external URL and is exactly `projects/{project_public_id}/auth/callback/{provider_key}` relative to that base; caller input cannot replace it and no alternate callback alias is accepted.
 - Secret bytes are absent from PostgreSQL, Redis, public Project config, Runtime responses, and audit events.
 - Provider configuration disablement/revision invalidates pending login callbacks for that provider without affecting another Project.
 
 ### Project users and identities
 
 - `project_users.id` is a stable local subject under one Project. Email is neither primary key nor linking key.
-- A linked identity belongs to one Project user and the same Project provider configuration.
+- `(project_id, provider_issuer, provider_subject)` is unique across all provider registrations in that Project.
+- A linked identity belongs to one Project user. Its immutable `created_via_provider_configuration_id` references the same-Project registration that first created it and is provenance only, not authorization ownership for later authentication.
+- A later callback through another registration with the same canonical issuer may resolve the same `(project_id, provider_issuer, provider_subject)` identity only after revalidating that the current registration and Application assignment are active and that the verified issuer exactly equals the current registration's canonical issuer. Creation provenance is never used to bypass those checks.
 - Matching email/profile data never links users automatically.
 - One proven identity may be designated as the user's primary provider-owned profile source. Initial creation selects its creating identity; linking/sync never switches it implicitly, and unlinking it atomically selects another same-user proven identity or clears its source-owned fields.
 - Merge locks both Project users, proves they share the same Project, rejects issuer/subject conflicts, resolves the primary-profile-source choice explicitly, moves identities, and tombstones the losing user ID. Cross-Project merge is forbidden.
@@ -539,26 +567,28 @@ erDiagram
 - Email challenge families permit only the newest pending generation and may own separate OTP and magic-link proof rows. Proof digests, OTP attempt increments, expiry, and parent `consumed_at` are authoritative; exactly one conditional parent transition can create the user/session/handoff result and invalidates sibling proofs.
 - Email challenge creation and its mail-outbox item commit together. Both rows immutably pin Project-versus-deployment-default selection, nullable Project SMTP configuration ID, and exact generation plus security-eligibility revision; `message_id` is stable across retries and encrypted payload retention is bounded. `(project_id, generation)` is unique for Project SMTP history; Project email-auth policy owns explicit deployment-default opt-in. Deployment-default generations have a deployment-scoped PostgreSQL status/revision registry whose safe fingerprint must match process configuration; no SMTP secret bytes enter it. Replacement never retargets existing rows.
 - Project/default SMTP generation disablement or compromise atomically advances that generation's eligibility revision/status. Every proof completion and mail claim conditionally revalidates the challenge's pinned selection/generation/revision in PostgreSQL, so all later attempts fail closed immediately after commit. Bounded cleanup then terminalizes pending jobs/challenges without making an unbounded fan-out part of the security commit. Planned rotation selects a new generation while retaining the old generation's eligibility revision only through the maximum usefulness of its challenges.
-- `(project_id, application_id, user_id)` is unique for Application-user bindings. A materialized projection belongs to exactly one binding, records the Project-user revision and relevant policy revisions, and advances its own monotonic `projection_revision` when its canonical bounded projection or any governing Project/Application projection-policy revision changes; source observation timestamps alone do not advance it.
+- `(project_id, application_id, user_id)` is unique for Application-user bindings. One Project user has at most 64 bindings; binding creation checks this hard limit while holding that user row exclusively, and fan-out reads at most 65 active rows to fail closed if authoritative state violates the bound. A materialized projection belongs to exactly one binding and records the Project-user revision plus independent Project and Application projection-policy revision snapshots. It advances its own monotonic `projection_revision` when its canonical bounded projection or either governing projection-policy revision changes; source observation timestamps alone do not advance it.
 - A user-base mutation re-materializes its bounded set of Application bindings and inserts immutable events/targets in the same transaction. A Project/Application projection-policy mutation instead commits one durable expansion operation; Runtime lazily repairs a stale requested binding, and workers advance the durable cursor in bounded batches whose per-binding projection/event/delivery changes commit atomically. `(event_id, endpoint_id)` is unique; replay creates a distinct delivery attempt referencing the same immutable event.
 - SMTP/webhook credential writes use durable secret-provisioning operations and opaque Project-scoped references. A retry resolves the same provider operation; an ambiguous external write is reconciled instead of silently creating another secret. Managed renewable credentials deliberately do not use this external dual-write path in v1.
 - Mail/webhook leases may expire and duplicate an external attempt, but conditional delivery/event/challenge state prevents a lease from becoming identity or ordering authority.
 
 ### Login transactions and handoff tickets
 
-- Transaction handles, upstream state, browser bindings, and handoff tickets use keyed digests with key-version metadata.
-- Bounded Application state and any server-generated upstream provider PKCE verifier must be recoverable across the redirect, so they are stored as purpose-bound authenticated ciphertext through `DataProtector` and are never logged or used outside that transaction.
+- Transaction handles, upstream state, browser bindings, OIDC nonces, and handoff tickets use purpose-keyed digests with key-version metadata.
+- Bounded Application state and any server-generated upstream provider PKCE verifier required by the selected provider profile must be recoverable across the redirect, so they are stored as purpose-bound authenticated ciphertext through `DataProtector` and are never logged or used outside that transaction. The first restricted OIDC profile requires provider-side PKCE S256. A fresh OIDC nonce is mandatory independently of provider-side PKCE and does not need recovery after authorization construction: only its purpose-keyed digest and digest-key version are stored for exact ID-token comparison.
 - `login_transactions.user_id`, selected method, selected provider, and method-specific proof state are null at generic start; user remains null until authentication resolves a Project user.
-- Login transaction states are `awaiting_method_selection`, `email_address_entry`, `email_challenge_pending`, `provider_authorization_started`, `provider_exchange_in_progress`, `provider_exchange_failed`, `authenticated`, `handoff_issued`, `completed`, `expired`, and `cancelled`. Provider/email selection compare-and-swaps one method-specific transition from `awaiting_method_selection` under browser binding, CSRF, current assignment/policy, allowed-method snapshot, and expected `transaction_revision`. A separate confirmed browser-session-reuse command may atomically move `awaiting_method_selection` directly to `handoff_issued` after current Project/user/session/reuse-policy checks. All three choices compete on the same status/revision; method cannot change after one wins. `provider_exchange_failed` is terminal and requires a new login.
-- Resend advances only the newest email-challenge generation under the already selected email method; it does not change transaction method. A login transaction produces at most one handoff ticket.
-- A handoff ticket binds Project, Application, exact redirect, Project user, selected authentication-method result, PKCE challenge, and relevant revisions. Provider-authenticated tickets additionally bind and revalidate the active Application-provider assignment; email-authenticated tickets have no invented provider dependency.
+- Login transaction states are `awaiting_browser_binding`, `awaiting_method_selection`, `email_address_entry`, `email_challenge_pending`, `provider_authorization_started`, `provider_exchange_in_progress`, `provider_exchange_failed`, `authenticated`, `handoff_issued`, `completed`, `expired`, and `cancelled`. Generic start creates `awaiting_browser_binding` with null browser/CSRF fields. Only the first eligible top-level Hosted GET may conditionally bind a fresh browser credential and CSRF state and move it to `awaiting_method_selection`; it cannot rebind a transaction owned by another browser. Provider/email selection compare-and-swaps one method-specific transition from `awaiting_method_selection` under browser binding, CSRF, current assignment/policy, allowed-method snapshot, and expected `transaction_revision`. A separate confirmed browser-session-reuse command may atomically move `awaiting_method_selection` directly to `handoff_issued` after current Project/user/session/reuse-policy checks. All three choices compete on the same status/revision; method cannot change after one wins. `provider_exchange_failed` is terminal and requires a new login.
+- OIDC provider selection atomically establishes the exact stored callback URL snapshot, upstream-state digest, mandatory OIDC nonce digest, provider/assignment revisions, first provider state, and a recoverable provider PKCE verifier when required by that profile. The first restricted OIDC profile requires both PKCE S256 and nonce. An OIDC callback cannot resolve identity until the adapter validates the exact nonce from the required ID token.
+- Resend advances only the newest email-challenge generation under the already selected email method; it does not change transaction method. A login transaction expires 10 minutes after generic start and produces at most one handoff ticket; retry or policy change cannot extend it.
+- A handoff ticket binds Project, Application, exact redirect, Project user, selected authentication-method result, PKCE challenge, and relevant revisions. Its `expires_at` is `LEAST(issued_at + 60 seconds, login_transaction.expires_at)`, so 60 seconds is the fixed maximum rather than a promise to outlive its parent transaction. Provider-authenticated tickets additionally bind and revalidate the active Application-provider assignment; email-authenticated tickets have no invented provider dependency.
 - Conditional update of `consumed_at` from null is the handoff's one-use serialization point.
 
 ### Sessions and refresh families
 
-- A Project browser session is Project/user/browser-bound and carries only Project/user/session-policy revisions. It is not Application-bound.
+- A Project browser session is Project/user/browser-bound and carries only Project/user/session-policy revisions. It is not Application-bound. It stores independent last-activity/idle expiry and absolute expiry under fixed v1 bounds of 8 hours idle and 24 hours absolute. Only committed fresh provider/email authentication and explicit eligible browser-session reuse are authoritative activity. Their transaction updates `last_activity_at` monotonically and sets `idle_expires_at = LEAST(activity_time + 8 hours, absolute_expires_at)`; passive/failed Hosted requests and Application handoff/current-user/refresh or other backend traffic do not update activity.
+- A Project access-token-authenticated browser-logout preparation stores only a purpose-keyed digest and binds the exact Project/Application/user/Application session, referenced Project browser session, revision snapshot, 60-second expiry, and one-use `consumed_at`. Its first eligible top-level Hosted GET requires the matching browser-session cookie and conditionally stores fresh CSRF state without terminating the session. The same-origin POST returns that proof; preparation consumption and browser-session termination commit together. The access token never enters a URL or page state. The raw preparation appears only in the returned Hosted target and is absent from PostgreSQL, audit, logs, and browser cookies; PostgreSQL stores its purpose-keyed digest.
 - An Application session belongs to one Project/Application/user and may reference the Project browser session that authenticated it.
-- A refresh family belongs to one Application session and retains Project/Application/user/policy revisions.
+- A refresh family belongs to one Application session and retains Project/Application/user/policy revisions. Application sessions and families share the fixed v1 absolute deadline 30 days after creation, while revocation or an owning resource's earlier expiry may terminate them sooner; no Project policy configures a shorter or longer lifetime. Replay evidence is retained through at least that deadline plus allowed clock skew. The family snapshots the deployment's `allowed_clock_skew_seconds` at creation; every later generation derives its retention from that immutable family value rather than caller input.
 - If an Application session references a Project browser session, refresh locks/revalidates that browser session status and revision. A terminated browser session cannot mint another access token.
 - `(family_id, generation)` is unique; exactly one unconsumed current generation is allowed for an active family.
 - Rotation consumes the current token, inserts the successor, and advances the generation atomically.
@@ -588,14 +618,17 @@ erDiagram
 
 | Operation | Rows/aggregates serialized together | Commit invariant |
 | --- | --- | --- |
-| Select login method | Project/login transaction revision and allowed-method snapshot, current Application method/provider assignment revision, browser/CSRF binding | exactly one assigned current provider/email method moves `awaiting_method_selection` to its first method-specific state; method cannot be switched |
-| Confirm browser-session reuse | Project/login transaction revision, exact Application/redirect/PKCE, current Project user and browser-session status/security/auth-age/reuse-policy revisions, browser/CSRF binding, handoff, audit | one eligible same-Project browser session moves `awaiting_method_selection` directly to `handoff_issued`; concurrent reuse/method selection loses and no caller-selected identity is accepted |
+| Bind Hosted browser | Project/login transaction revision and allowed-method snapshot, fresh browser credential digest and CSRF state | one eligible top-level Hosted GET moves `awaiting_browser_binding` to `awaiting_method_selection`; another browser cannot rebind it |
+| Select login method | Project/login transaction revision and allowed-method snapshot, current Application method/provider assignment revision, browser/CSRF binding; exact callback/upstream-state/provider-PKCE/OIDC-nonce facts for OIDC | exactly one assigned current provider/email method moves `awaiting_method_selection` to its first method-specific state; method cannot be switched |
+| Confirm browser-session reuse | Project/login transaction revision, exact Application/redirect/PKCE, current Project user and browser-session status/security/auth-age/reuse-policy revisions, monotonic activity/idle-expiry update clamped to absolute expiry, browser/CSRF binding, handoff, audit | one eligible same-Project browser session moves `awaiting_method_selection` directly to `handoff_issued`; concurrent reuse/method selection loses and no caller-selected identity is accepted |
 | Claim provider callback | Project/provider-selected login transaction, provider and Application-assignment revisions, audit | exactly one callback moves `provider_authorization_started` to `provider_exchange_in_progress`; no automatic retry after ambiguous exchange |
-| Complete provider callback | claimed transaction, provider/assignment revisions, linked identity, optional managed-credential generation, Project user, browser session, handoff ticket, audit | identity resolves within one Project; managed successor is protected before commit; at most one ticket is produced; failure becomes terminal |
+| Complete provider callback | claimed transaction, exact adapter-validated OIDC issuer/subject/nonce result, provider/assignment revisions, linked identity, optional managed-credential generation, Project user, browser session, handoff ticket, audit | identity resolves only after required ID-token nonce validation and within one Project; managed successor is protected before commit; at most one ticket is produced; failure becomes terminal |
 | Exchange handoff | ticket, Project/Application/user/projection-policy revisions, provider assignment when applicable, Application-user binding/materialized projection, optional eligible initial event/targets, Application session, refresh family/token, signing epoch, audit | one successful consumer; binding/projection exists from first handoff; session and projection commit together |
 | Rotate refresh token | family, Application session, referenced browser session, presented/successor token, Project/Application/user/policy revisions, signing epoch, audit | at most one successor; terminated browser session denies refresh; detected reuse revokes family |
-| Application logout/revoke | selected Application session/family and audit | selected credentials cannot become active again |
-| Project browser logout | browser-session status/revision and audit | browser credential cannot authenticate another handoff and derived sessions cannot refresh |
+| Application logout/revoke | verified Project access-token claims, selected Application session/family and audit | direct idempotent revocation affects only the exact Application session; selected credentials cannot become active again |
+| Prepare Project browser logout | verified Project access-token claims, exact Application/browser session and one-use preparation digest/revisions | returns only a short-lived Hosted target; no Bearer credential enters the URL |
+| Bind Project browser-logout confirmation | one-use preparation revision, matching browser cookie/session, fresh CSRF digest | one eligible top-level GET binds confirmation CSRF without logout; another browser cannot claim or inspect it |
+| Confirm Project browser logout | one-use preparation, matching browser cookie, same-origin CSRF, browser-session status/revision and audit | preparation consumption and termination are atomic; browser credential cannot authenticate another handoff and derived sessions cannot refresh |
 | Disable Project | Project status/security revision and audit | every Project Runtime operation observes disablement after commit |
 | Disable Application | Application status/security revision and audit | its tickets/sessions/families become logically invalid; other Applications remain valid |
 | Disable user | Project user status/security/user revisions, bounded bound-Application projections and installed-contract events/deliveries, audit | all credentials become logically invalid and each existing binding observes a disabled projection atomically |

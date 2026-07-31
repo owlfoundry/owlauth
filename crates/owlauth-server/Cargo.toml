@@ -15,8 +15,12 @@ axum = "0.8.9"
 base64 = "0.22.1"
 chacha20poly1305 = "0.10.1"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 getrandom = "0.3.4"
+hmac = "0.12.1"
+jsonwebtoken = { version = "9.3.1", default-features = false }
 owlauth-types = { version = "=0.0.2", path = "../owlauth-types" }
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "rustls", "stream"] }
 rust-embed = { version = "8.11.0", features = ["debug-embed", "include-exclude"] }
 sea-orm = { version = "2.0.0", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -31,7 +35,7 @@ tower = { version = "0.5.3", features = ["limit", "util"] }
 tower-http = { version = "0.6.8", features = ["catch-panic", "limit", "request-id", "timeout", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
-url = "2.5.8"
+url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.21.0", features = ["v4"] }
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 
@@ -45,4 +49,5 @@ sha2 = "0.10.9"
 
 [dev-dependencies]
 crc = "3.4.0"
+jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }
 testcontainers = "0.27.3"

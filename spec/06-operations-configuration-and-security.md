@@ -48,7 +48,7 @@ Configuration has one precedence model, rejects unknown fields, and separates gl
 - Project issuer derivation rule;
 - immutable environment/instance namespace and its stable non-secret public instance ID used by the well-known CLI descriptor;
 - selected plane mode;
-- protocol lifetime/clock-skew bounds plus non-overridable email-auth safety floors/ceilings from spec 11; Project configuration may only tighten them;
+- the fixed protocol lifetime and clock-skew safety bounds below, plus non-overridable email-auth safety floors/ceilings from spec 11; only access-token lifetime and browser-session reuse age are Project-configurable, within their stated ranges and owning revisions;
 - trusted secret/key-provider configuration, including distinct retained key sets for short-term transaction/mail state, long-term email PII, and v1 PostgreSQL managed-credential AEAD;
 - optional deployment-default SMTP adapter/secret reference with explicit generation and safe fingerprint, unavailable to a Project unless that Project explicitly opts in; its process handle must match the authoritative PostgreSQL generation registry and cannot silently reactivate a disabled/compromised generation;
 - outbound provider/SMTP/webhook DNS, proxy, TLS, private-network allowlist, destination, and concurrency policy.
@@ -56,6 +56,22 @@ Configuration has one precedence model, rejects unknown fields, and separates gl
 The public instance ID is stable across ordinary upgrade, process replacement, and backup/restore. Deliberate replacement is an administrative service-identity change that causes pinned CLI profiles to fail before key release until the operator explicitly accepts/rebinds the new identity.
 
 Project/provider/Application/email/webhook policy is authoritative PostgreSQL state, not replicated process configuration. Deployment defaults and egress policy constrain Project choices but never imply cross-Project configuration fallback. PostgreSQL stores only deployment-default SMTP generation/status/revision and a safe configuration fingerprint; startup/readiness rejects a configured handle whose generation/fingerprint does not match, while secret bytes remain in protected process/secret-provider configuration.
+
+The v1 Project Auth protocol bounds are exact implementation and readiness inputs:
+
+| Value | v1 bound | Authority and effect |
+| --- | --- | --- |
+| login transaction | fixed 10 minutes | captured at start; no later configuration change extends it |
+| one-use handoff | fixed maximum 60 seconds | `min(issued_at + 60 seconds, login transaction expiry)`; captured when issued |
+| Project browser session idle / absolute lifetime | fixed 8 hours / 24 hours | authoritative activity and `session_revision`; activity never extends the absolute deadline |
+| browser-session reuse maximum authentication age | Project-configurable 0–24 hours, default 8 hours | `session_revision`; revalidated at confirmation |
+| Application session and refresh-family absolute lifetime | fixed 30 days | Project, Application, user, and session revisions revalidated on refresh |
+| Project access token | Project-configurable 60–3,600 seconds | `claims_revision`; exact lifetime captured for each issuance |
+| allowed clock skew | fixed deployment safety bound, default 60 seconds | applied consistently to OwlAuth and upstream-provider token/time checks |
+| Project browser-logout preparation | fixed 60 seconds | one-use and bound to the initiating Application and Project browser sessions |
+| consumed-credential replay evidence | at least the owning family/session lifetime plus clock skew | configuration and cleanup cannot shorten this floor |
+
+Fixed bounds are not Project policy and cannot be lengthened or shortened per Project. Policy changes use the owning revision checks rather than synchronously rewriting unbounded pending/session rows. Runtime startup and readiness reject unsupported bounds, replay retention below the safety floor, or an active/retained digest or data-protection key set that cannot cover every unexpired value plus allowed skew.
 
 ### Runtime listener fields
 
@@ -142,7 +158,7 @@ Outbound webhook admission and every attempt resolve the complete CNAME chain an
 
 KMS identities are least-privilege separated: Control provisioning identity creates/manages Project keys; Runtime identity can sign only with authorized active Project key references. Software keys use a dedicated envelope-encrypted store with external wrapping keys.
 
-Data protection uses versioned, purpose-separated AEAD keys. Authenticated context binds deployment, Project, owning aggregate/generation, and field purpose. Short-term login/challenge/mail-outbox versions remain decryptable through the maximum retained usefulness plus clock skew; missing versions cause those transactions/jobs to be cancelled or terminalized before the affected capability is ready.
+Data protection uses versioned, purpose-separated AEAD keys. Keyed digests use independently purpose-separated versioned roots. Authenticated context binds deployment, Project, owning aggregate/generation, and field purpose. Short-term login, handoff, browser-logout preparation, challenge, and mail-outbox protection and digest versions remain available through the maximum retained usefulness plus clock skew; refresh/session replay-evidence digest versions remain available through their longer safety floor. Missing versions cause the affected transactions, sessions, or jobs to be cancelled or terminalized before that capability is ready; they never trigger fallback to an unrelated key version or credential.
 
 SMTP proof recovery additionally requires each challenge's pinned Project/default generation and eligibility revision plus the matching active/retained secret handle; generation status remains PostgreSQL authority after restore. Long-term recoverable email PII and active managed credentials follow a stronger retirement rule: every retained ciphertext must be inventoried and successfully re-encrypted/rewrapped under the new version with its uniqueness/generation guards before the old key can retire. A missing long-term key keeps only the affected capability unready or requires an explicit destructive identity/reauthorization workflow; it cannot be treated like disposable login state. Restore inventory also proves email canonicalization/digest versions, active/overlap SMTP and webhook references, signer material, and projection expansion/event/delivery continuation. Missing external references fail their exact purpose closed and enter reconciliation without fallback to another Project/generation.
 
@@ -224,7 +240,7 @@ sequenceDiagram
     Runtime->>KMS: Sign with new Project key
 ```
 
-Normal retirement sets `verify_not_after` at transition using the maximum Project access-token lifetime, clock skew, JWKS cache retention, and propagation margin. Concurrent issuance uses shared epoch guards; lifecycle transitions use the conflicting exclusive guard, avoiding a per-token hot-row update while preventing issuance after the cutoff.
+Normal retirement sets `verify_not_after` at transition using the server's hard supported access-token lifetime maximum of 3,600 seconds, not the Project's current policy value, plus allowed clock skew, advertised JWKS cache retention, and propagation margin. This preserves verification for tokens issued before a policy reduction. Concurrent issuance uses shared epoch guards; lifecycle transitions use the conflicting exclusive guard, avoiding a per-token hot-row update while preventing issuance after the cutoff.
 
 ## Emergency key revocation
 

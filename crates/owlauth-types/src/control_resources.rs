@@ -70,6 +70,7 @@ pub struct Project {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct ProjectList {
+    #[schema(max_items = 100)]
     pub items: Vec<Project>,
 }
 
@@ -146,6 +147,7 @@ pub struct Application {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct ApplicationList {
+    #[schema(max_items = 100)]
     pub items: Vec<Application>,
 }
 
@@ -185,11 +187,13 @@ pub struct SigningKey {
     pub signing_epoch: i64,
     pub sign_not_before: Option<String>,
     pub verify_not_after: Option<String>,
-    pub public_jwk: PublicJwk,
+    /// Absent until the external signer material has been reconciled.
+    pub public_jwk: Option<PublicJwk>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
 pub struct SigningKeyList {
+    #[schema(max_items = 100)]
     pub items: Vec<SigningKey>,
 }
 
@@ -219,11 +223,13 @@ pub struct Provider {
     pub callback_url: String,
     pub status: ProviderStatus,
     pub revision: i64,
+    #[schema(max_items = 100)]
     pub assigned_application_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct ProviderList {
+    #[schema(max_items = 100)]
     pub items: Vec<Provider>,
 }
 
@@ -237,6 +243,20 @@ pub struct CreateProviderRequest {
     pub issuer: String,
     #[schema(min_length = 1, max_length = 512)]
     pub client_id: String,
+    #[schema(write_only, min_length = 1, max_length = 4096)]
+    pub client_secret: String,
+    #[schema(minimum = 1)]
+    pub expected_project_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ReconcileSigningKeyRequest {
+    #[schema(minimum = 1)]
+    pub expected_project_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ReconcileProviderRequest {
     #[schema(write_only, min_length = 1, max_length = 4096)]
     pub client_secret: String,
     #[schema(minimum = 1)]
@@ -426,6 +446,15 @@ control_path!(
     )
 );
 control_path!(
+    reconcile_signing_key,
+    post,
+    "/v1/projects/{project_id}/signing-keys/{key_id}/reconcile",
+    SigningKey,
+    "Reconciled signing key provisioning",
+    body = ReconcileSigningKeyRequest,
+    params(("project_id" = String, Path), ("key_id" = String, Path))
+);
+control_path!(
     activate_signing_key,
     post,
     "/v1/projects/{project_id}/signing-keys/{key_id}/activate",
@@ -470,6 +499,18 @@ control_path!(
     params(
         ("project_id" = String, Path),
         ("Idempotency-Key" = String, Header)
+    )
+);
+control_path!(
+    reconcile_provider,
+    post,
+    "/v1/projects/{project_id}/providers/{provider_id}/reconcile",
+    Provider,
+    "Reconciled provider secret provisioning",
+    body = ReconcileProviderRequest,
+    params(
+        ("project_id" = String, Path),
+        ("provider_id" = String, Path)
     )
 );
 control_path!(

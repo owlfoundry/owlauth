@@ -77,6 +77,14 @@ fn manifest(plane: WebPlane) -> &'static ServerManifest {
 }
 
 pub(crate) fn shell(plane: WebPlane, base_path: &str) -> Response {
+    shell_with_context(plane, base_path, &[])
+}
+
+pub(crate) fn shell_with_context(
+    plane: WebPlane,
+    base_path: &str,
+    context: &[(&str, &str)],
+) -> Response {
     let manifest = manifest(plane);
     let application_path = match plane {
         WebPlane::Runtime => "auth/",
@@ -114,6 +122,15 @@ pub(crate) fn shell(plane: WebPlane, base_path: &str) -> Response {
         .expect("writing to a String cannot fail");
     }
 
+    for (name, value) in context {
+        write!(
+            head,
+            "<meta name=\"{}\" content=\"{}\">",
+            html_escape(name),
+            html_escape(value)
+        )
+        .expect("writing to a String cannot fail");
+    }
     let document = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"{configured_base_name}\" content=\"{}\"><title>{title}</title>{head}</head><body><div id=\"owlauth-root\"></div><script type=\"module\" src=\"{}\"></script></body></html>",
         html_escape(base_path),

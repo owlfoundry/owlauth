@@ -2,6 +2,9 @@ use std::fmt;
 
 use super::DomainError;
 
+pub(crate) const MIN_ACCESS_TOKEN_LIFETIME_SECONDS: i32 = 60;
+pub(crate) const MAX_ACCESS_TOKEN_LIFETIME_SECONDS: i32 = 3_600;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DisplayName(String);
 

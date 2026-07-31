@@ -2,14 +2,14 @@
 
 This directory defines the language-neutral behavior of the official TypeScript, Python, and Rust SDKs for OwlAuth Project Auth. It allows each package to use idiomatic language APIs while preserving one observable Runtime contract, one security model, and equivalent errors.
 
-OwlAuth brokers authentication to Project-configured upstream providers such as GitHub, Google, or another OIDC provider. Downstream Applications do not act as generic OAuth clients of OwlAuth: they initialize from public Project/Application configuration, begin provider login through OwlAuth Runtime, exchange a short-lived PKCE-bound handoff ticket, and receive an OwlAuth Project user and session credentials.
+OwlAuth brokers authentication through Project-configured methods, including upstream providers and first-party email proof where enabled. Downstream Applications do not act as generic OAuth clients of OwlAuth: they initialize from public Project/Application configuration, begin one generic Hosted Project login through OwlAuth Runtime, let the browser-bound Hosted UI select an admitted authentication method, exchange a short-lived PKCE-bound handoff ticket, and receive an OwlAuth Project user and session credentials.
 
 ## Current implementation status
 
 The SDK packages are currently pre-alpha scaffolds and package-name reservations. Their `Client` types only retain a base URL. They do not yet:
 
 - fetch public Project/Application configuration;
-- begin an upstream-provider login;
+- begin a generic Hosted Project login;
 - generate or retain PKCE material;
 - exchange a one-use handoff ticket;
 - issue, verify, refresh, or persist Project credentials;

@@ -52,7 +52,9 @@ Console HTML/assets and client-side routes are server-owned implementation surfa
 
 ## Hosted Authentication UI surface
 
-The Runtime listener serves Project/Application-bound hosted authentication interactions and their fingerprinted assets under the configured Runtime base. The UI presents only the transaction's admitted provider/email methods, submits one explicit method-selection command, shows progress or bounded local errors, may reuse a valid Project browser session, and completes an Application return. It resolves all authority from stored login-transaction and public Project/Application state; caller input or an optional start hint cannot select/enable a method or replace Project, Application, provider assignment, callback, exact redirect, browser binding, or PKCE.
+The Runtime listener serves Project/Application-bound hosted authentication interactions and their fingerprinted assets under the configured Runtime base. Generic start may originate in an Application backend and therefore creates an unbound interaction. Only its first eligible top-level Hosted GET may conditionally bind a fresh Runtime browser credential and CSRF state before rendering admitted methods; an API fetch, subresource, frame, copied URL after binding, query value, or initiating backend cannot provide or replace that browser authority. Ordinary interaction reads and every method/reuse command require the already matching binding.
+
+The UI presents only the transaction's admitted provider/email methods, submits one explicit method-selection command, shows progress or bounded local errors, may reuse a valid Project browser session, and completes an Application return. It resolves all authority from stored login-transaction and public Project/Application state; caller input or an optional start hint cannot select/enable a method or replace Project, Application, provider assignment, callback, exact redirect, browser binding, or PKCE.
 
 After successful authentication, navigation returns only to the exact registered Application redirect captured by the transaction and carries only the short-lived one-use handoff allowed by spec 03. Hosted UI assets and pages never expose the Control endpoint/key or mount Control routes.
 
@@ -65,17 +67,21 @@ A representative stable path model is:
 | Route | Purpose | Caller security |
 | --- | --- | --- |
 | `GET /v1/projects/{project_id}/auth/config` | bounded public configuration for one Application | active Project/Application public identifiers; no secrets |
-| `POST /v1/projects/{project_id}/auth/login/start` | create one generic hosted login transaction with an allowed-method snapshot | exact Application, redirect, PKCE, origin/interaction controls; optional method hint is presentation-only |
-| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/method` | compare-and-swap selection of one admitted current provider or email method | opaque interaction, browser binding, same-origin CSRF, expected transaction revision; no method switching |
+| `POST /v1/projects/{project_id}/auth/login/start` | create one generic `awaiting_browser_binding` hosted login transaction with an allowed-method snapshot | exact Application, redirect, PKCE, origin/interaction controls; optional method hint is presentation-only |
+| `GET /auth/interactions/{interaction}` | top-level Hosted bootstrap and bounded interaction presentation | first eligible top-level navigation may bind one fresh Runtime browser/CSRF context; later reads require that exact binding; no copied-browser disclosure |
+| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/method` | compare-and-swap selection of one admitted current provider or email method | opaque interaction in `awaiting_method_selection`, browser binding, same-origin CSRF, expected transaction revision; no method switching |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/session/reuse` | explicitly confirm an eligible current Project browser session and issue the ordinary handoff | hardened cookie, same-origin CSRF, browser binding, expected transaction revision, current Project/user/session/auth-age/reuse-policy checks; page cannot name user/session |
-| `GET /v1/projects/{project_id}/auth/providers/{provider}/callback` | receive exact upstream callback after stored provider selection | server-owned state and Project/provider binding |
+| `GET /projects/{project_public_id}/auth/callback/{provider_key}` | receive the exact upstream callback after stored provider selection; no alias exists | trusted Runtime base plus immutable Project public ID/provider key and server-owned state binding |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/challenges` | accept email after stored email selection, then create an enumeration-safe newest challenge and pinned durable mail job | assigned email method, browser/CSRF/revision binding, email/IP rate policy and server safety floors |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/otp/verify` | consume newest OTP challenge | opaque interaction, proof attempt/expiry/generation and transaction binding |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/link/verify` | consume a fragment-staged magic-link proof after explicit user confirmation | same-origin CSRF protection, digest-bound token, exact stored transaction and safe local error/redirect policy |
 | `POST /v1/projects/{project_id}/auth/handoff/exchange` | exchange one-use ticket for revisioned user/session credentials | Application binding and PKCE verifier |
 | `POST /v1/projects/{project_id}/auth/sessions/refresh` | rotate refresh family | Project/Application-bound opaque refresh token |
 | `GET /v1/projects/{project_id}/auth/users/me` | return bounded current Project user | valid Project access token |
-| `POST /v1/projects/{project_id}/auth/sessions/logout` | revoke Application and/or Project browser session | current session plus CSRF/interaction policy |
+| `POST /v1/projects/{project_id}/auth/sessions/logout` | idempotently revoke only the access token's exact Application session/family | Project access token; no browser-cookie or caller-named session authority |
+| `POST /v1/projects/{project_id}/auth/browser-logout/prepare` | create a 60-second one-use Project-browser logout preparation and return a Hosted target | Project access token bound to its exact Application and referenced Project browser session; no Bearer value in URL |
+| `GET /auth/browser-logout/{preparation}` | bind fresh confirmation CSRF and render the top-level Project-browser logout confirmation without terminating a session | opaque preparation plus matching hardened Project-session cookie; one eligible top-level navigation; no logout mutation or credential disclosure |
+| `POST /v1/projects/{project_id}/auth/browser-logout/{preparation}/confirm` | consume the preparation and terminate its exact Project browser session | matching cookie, same-origin CSRF, current preparation/session revisions; no caller-named user/session |
 | `GET /projects/{project_id}/.well-known/jwks.json` | publish Project verification keys | public, cacheable, revisioned |
 | Runtime health route | deployment probe | no Project/topology/secret disclosure |
 
@@ -129,19 +135,28 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 | --- | --- |
 | `/projects` | create/read/update/disable; read/write/filter exact `belongs_to` |
 | `/projects/{project}/applications` | register/disable app; origins, redirects, publishable keys |
-| `/projects/{project}/providers` | configure/disable provider client registrations, assign Applications, rotate secret reference and managed-sync policy |
+| `/projects/{project}/providers` | configure/disable provider client registrations, resource-keyed reconcile of interrupted secret provisioning with write-only secret re-entry, assign Applications, rotate secret reference and managed-sync policy |
 | `/projects/{project}/users` | query/disable/merge users; inspect revision/source provenance; explicitly link/unlink identities; inspect/sync/reauthorize/revoke/disconnect managed connections |
 | `/projects/{project}/email-auth` | configure assigned OTP/magic-link policy, sign-up/linking bounds, Project SMTP generations, and explicit deployment-default opt-in; test, activate, disable/mark-compromised, and inspect safe Project delivery eligibility |
 | `/system/smtp-default-generations` | reconcile the process-configured deployment-default generation/fingerprint and activate/disable/mark-compromised its deployment-scoped eligibility metadata | deployment operator only; no secret input/read-back and no Project fallback authority |
 | `/projects/{project}/applications/{application}/webhooks` | configure exact endpoints/event filters, rotate write-only secret, inspect safe health/deliveries, and replay immutable events |
 | `/projects/{project}/sessions` | list and revoke Project/Application sessions |
 | `/projects/{project}/policy` | claims, token lifetime, login/session policy |
-| `/projects/{project}/signing-keys` | inspect/provision/publish/activate/retire/revoke |
+| `/projects/{project}/signing-keys` | inspect/provision/publish/activate/retire/revoke and resource-keyed reconcile of interrupted provisioning |
 | `/audit-events` and Project audit subresource | filtered immutable queries |
 | `/system` | validate the operator key and return bounded Console/client capabilities |
 | Control health | safe probe response under the configured probe policy |
 
 The webhook resource returns only safe endpoint/secret-version/delivery metadata. Secret input is write-only, and replay names an existing immutable event plus its existing endpoint; Control has no arbitrary event-send route. Webhook payload/signature headers are an Application integration contract but endpoint configuration/replay remain Control operations. The exact `v1` HMAC grammar and duplicate/out-of-order receiver fixtures are generated and versioned with public contracts.
+
+A provisioning resource that remains pending after an ambiguous response or process restart is
+visible in its ordinary bounded list. Its Project-qualified resource ID addresses the existing
+durable operation through a dedicated `reconcile` command; operation aliases are not exposed or
+stored by the Console. Signing reconciliation reuses the original external alias. Provider
+reconciliation requires exact secret re-entry, keeps that input write-only, and rejects a changed
+secret before another external write. Both commands require the currently observed Project
+metadata revision. A signing key with no material is represented with a null public JWK only while
+`provisioning` or `abandoned`; abandoning it terminalizes both resource and operation atomically.
 
 Every `/v1` business route requires the valid deployment operator API key, which grants the whole Control surface. The credential-free well-known descriptor is discovery metadata only and admits no command/query. There are no principal, permission, Control-credential-management, or session-escalation routes. Project provider/SMTP/webhook secret-setting is resource configuration, not creation of another Control credential. Command/domain validation remains deny-by-default: a generic PATCH cannot bypass lifecycle transitions. Mutations include target revision and use deployment-operator-scoped Control idempotency where retry could duplicate a resource or external side effect. Every external-gateway mutation also supplies the observed Project `metadata_revision`, compared in the same PostgreSQL transaction as the child command.
 

@@ -1,14 +1,63 @@
+#[allow(
+    dead_code,
+    reason = "the HTTP-free authentication repository slice precedes Runtime composition"
+)]
+mod authentication;
 mod error;
+mod infrastructure;
 mod provisioning;
 mod readiness;
+mod runtime_auth;
+mod runtime_security;
+#[allow(
+    dead_code,
+    reason = "the HTTP-free session authority precedes Runtime composition"
+)]
+mod session_authority;
+mod unit_of_work;
 
+pub(crate) use authentication::{
+    AdmittedProviderMethod, AuthenticationRepository, BindHostedBrowser, ClaimProviderCallback,
+    ClaimedProviderExchange, CreateLoginTransaction, FailProviderExchange, LoginRevisionSnapshot,
+    LoginTransactionRecord, ProtectedValue, SelectProviderMethod, VersionedDigest,
+};
 pub(crate) use error::ApplicationError;
+pub(crate) use infrastructure::{
+    Clock, ConfigurationSecretStore, EntropySource, RequestDigester, SignerStore,
+};
 pub(crate) use provisioning::{
-    ApplicationConfiguration, ApplicationRecord, CreateApplication, CreateProject, CreateProvider,
-    ProjectPolicyRecord, ProjectRecord, ProviderRecord, ProvisioningPort, ProvisioningService,
-    ReplaceApplicationConfiguration, SigningKeyRecord, UpdateApplication, UpdateProject,
-    UpdateProjectPolicy,
+    ApplicationConfiguration, ApplicationProvisioningPort, ApplicationRecord, CreateApplication,
+    CreateProject, CreateProvider, PrepareProvider, PreparedProvider, PreparedSigningKey,
+    ProjectPolicyRecord, ProjectProvisioningPort, ProjectRecord, ProviderProvisioningPort,
+    ProviderRecord, ProviderRecovery, ProvisioningInfrastructure, ProvisioningOperationState,
+    ProvisioningService, ReplaceApplicationConfiguration, SigningKeyActivationCandidate,
+    SigningKeyProvisioningPort, SigningKeyRecord, SigningKeyRecovery, UpdateApplication,
+    UpdateProject, UpdateProjectPolicy,
 };
 pub(crate) use readiness::{
     JwksDocument, PublicApplicationConfig, PublicProvider, ReadinessPort, ReadinessService,
 };
+pub(crate) use runtime_auth::{
+    BeginLogin, ConfirmProjectBrowserLogout, ConfirmSessionReuse, CredentialPair, ExchangeHandoff,
+    HostedBootstrap, ProviderCallback, RefreshSession, RuntimeAuthService, SelectProvider,
+};
+pub(crate) use runtime_security::{
+    BrowserLogoutContext, CurrentSession, HostedInteraction, HostedProviderMethod,
+    LoginStartContext, OpaquePurpose, ProtectedPurpose, ProviderAuthorizationRequest,
+    ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity, ProviderRuntimeContext,
+    ProviderSecretResolver, RuntimeAuthorityRepository, RuntimeProtector, RuntimeSigner,
+    UpstreamProviderClient, VerificationKey,
+};
+#[allow(
+    unused_imports,
+    reason = "the HTTP-free session authority precedes Runtime composition"
+)]
+pub(crate) use session_authority::{
+    BindBrowserLogout, BrowserLogoutRecord, CommitHandoffExchange, CompleteProviderCallback,
+    ConfirmBrowserLogout, ConfirmBrowserSessionReuse, HandoffPreparation, HandoffSessionRecord,
+    IssuedHandoff, LogoutApplicationSession, PrepareBrowserLogout, PrepareHandoffExchange,
+    PrepareRefreshRotation, RecoverProviderExchanges, RefreshPreparation, RefreshPreparationResult,
+    RefreshRotationResult, RotateRefreshToken, SessionAuthorityRepository,
+    VerifiedProviderIdentity,
+};
+pub(crate) use unit_of_work::{CompleteIdempotency, NewProject, ProjectUnitOfWork};

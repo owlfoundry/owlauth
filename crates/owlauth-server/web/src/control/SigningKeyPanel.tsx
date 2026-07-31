@@ -49,9 +49,30 @@ export function SigningKeyPanel({
     }
   }
 
+  async function reconcile(key: SigningKey) {
+    try {
+      const result = await session.client.POST(
+        "/v1/projects/{project_id}/signing-keys/{key_id}/reconcile",
+        {
+          params: { path: { project_id: project.id, key_id: key.id } },
+          body: { expected_project_revision: project.metadata_revision },
+        },
+      );
+      requireData(result.data, result.error, result.response);
+      await onChanged();
+      setMessage("Signing key provisioning reconciled.");
+    } catch (error) {
+      await onError(error);
+    }
+  }
+
   async function transition(key: SigningKey, operation: "activate" | "retire" | "revoke") {
     const destructive = operation === "revoke" || operation === "retire";
-    if (destructive && !window.confirm(`${operation} signing key ${key.kid}?`)) return;
+    const description =
+      operation === "revoke" && key.state === "provisioning" && key.public_jwk === null
+        ? `abandon incomplete signing key ${key.kid}`
+        : `${operation} signing key ${key.kid}`;
+    if (destructive && !window.confirm(`${description}?`)) return;
     const path =
       operation === "activate"
         ? ("/v1/projects/{project_id}/signing-keys/{key_id}/activate" as const)
@@ -95,6 +116,11 @@ export function SigningKeyPanel({
               <strong>{key.kid}</strong> — {key.algorithm}, {key.state}, ring revision{" "}
               {key.ring_revision}
               <div className={styles["actions"]}>
+                {key.state === "provisioning" ? (
+                  <button type="button" onClick={() => void reconcile(key)}>
+                    Resume provisioning
+                  </button>
+                ) : null}
                 {key.state === "published" ? (
                   <button type="button" onClick={() => void transition(key, "activate")}>
                     Activate
@@ -105,13 +131,22 @@ export function SigningKeyPanel({
                     Finalize retirement
                   </button>
                 ) : null}
-                {!["retired", "revoked", "abandoned"].includes(key.state) ? (
+                {!["retired", "revoked", "abandoned", "provisioning"].includes(key.state) ? (
                   <button
                     className={styles["danger"]}
                     type="button"
                     onClick={() => void transition(key, "revoke")}
                   >
                     Emergency revoke
+                  </button>
+                ) : null}
+                {key.state === "provisioning" && key.public_jwk === null ? (
+                  <button
+                    className={styles["danger"]}
+                    type="button"
+                    onClick={() => void transition(key, "revoke")}
+                  >
+                    Abandon incomplete key
                   </button>
                 ) : null}
               </div>

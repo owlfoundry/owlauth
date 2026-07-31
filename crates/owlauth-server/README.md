@@ -58,11 +58,11 @@ The process rejects unknown `OWLAUTH_*` variables and validates all selected-pla
 | `OWLAUTH_SIGNER_STORE_KEY` | required for Control | 32-byte signer wrapping key encoded as 43 unpadded base64url characters |
 | `OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT` | required for Control | Separate absolute root for encrypted provider configuration secrets |
 | `OWLAUTH_CONFIGURATION_SECRET_STORE_KEY` | required for Control | Separate 32-byte wrapping key encoded as 43 unpadded base64url characters |
-| `OWLAUTH_RUNTIME_PROCESS_ID` | required | Stable URL-safe identity used by this Runtime process when publishing observation leases |
-| `OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS` | Runtime process ID | Comma-separated deployment roster; every listed Runtime process must hold a current lease before key activation |
-| `OWLAUTH_PUBLICATION_LEASE_TTL_MS` | `30000` | Runtime key-publication lease lifetime |
-| `OWLAUTH_KEY_PROPAGATION_DELAY_MS` | `2000` | Minimum full-roster observation interval before key activation |
-| `OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS` | `1200000` | Verification overlap retained before a rotated key may be fully retired |
+| `OWLAUTH_RUNTIME_PROCESS_ID` | required when Runtime is selected | Stable URL-safe identity used by this Runtime process when publishing observation leases |
+| `OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS` | Runtime process ID; required in Control-only mode | Comma-separated deployment roster; every Runtime-capable process must include itself, every required member must lease the revision, and any additional live stale lease blocks activation |
+| `OWLAUTH_PUBLICATION_LEASE_TTL_MS` | `30000` | Runtime key-publication lease lifetime; draining stops renewal and waits for expiry |
+| `OWLAUTH_KEY_PROPAGATION_DELAY_MS` | `2000` | Minimum all-live-process observation interval and retirement propagation margin; maximum `86400000` |
+| `OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS` | `1200000` | Additional clock-skew and advertised JWKS-cache retention added to the 3600-second token maximum; maximum `86400000` |
 | `OWLAUTH_POSTGRES_URL` | required | Serving PostgreSQL URL and authority anchor |
 | `OWLAUTH_RUNTIME_POSTGRES_URL` | serving URL | Runtime pool URL on the same database authority |
 | `OWLAUTH_CONTROL_POSTGRES_URL` | serving URL | Control pool URL on the same database authority |

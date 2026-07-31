@@ -1,8 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, FromQueryResult, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Statement,
+    TransactionTrait,
 };
 use time::OffsetDateTime;
 
@@ -38,15 +39,24 @@ impl PostgresReadinessAdapter {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear transaction makes the complete public configuration snapshot auditable"
+    )]
     pub(crate) async fn public_application_config(
         &self,
         project_public_id: &str,
         application_public_id: &str,
     ) -> Result<PublicApplicationConfig, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        // Every Control mutation takes the same Project row exclusively before touching
+        // child aggregates. This shared guard therefore linearizes the complete public
+        // snapshot and prevents a child disable/unassignment from committing mid-read.
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -54,7 +64,8 @@ impl PostgresReadinessAdapter {
             .filter(application::Column::ProjectId.eq(project.id))
             .filter(application::Column::PublicId.eq(application_public_id))
             .filter(application::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -64,29 +75,28 @@ impl PostgresReadinessAdapter {
             .filter(application_publishable_key::Column::Status.eq("active"))
             .order_by_asc(application_publishable_key::Column::PublicId)
             .limit(51)
-            .all(&self.database)
+            .lock_shared()
+            .all(&transaction)
             .await
             .map_err(persistence)?;
         if publishable_keys.len() > 50 {
             return Err(ApplicationError::Integrity);
         }
-        let publishable_keys = publishable_keys
-            .into_iter()
-            .map(|key| key.public_id)
-            .collect();
         let assignments = application_provider_assignment::Entity::find()
             .filter(application_provider_assignment::Column::ProjectId.eq(project.id))
             .filter(application_provider_assignment::Column::ApplicationId.eq(application.id))
             .filter(application_provider_assignment::Column::Status.eq("active"))
+            .order_by_asc(application_provider_assignment::Column::ProviderId)
             .limit(51)
-            .all(&self.database)
+            .lock_shared()
+            .all(&transaction)
             .await
             .map_err(persistence)?;
         if assignments.len() > 50 {
             return Err(ApplicationError::Integrity);
         }
         let provider_ids: Vec<_> = assignments
-            .into_iter()
+            .iter()
             .map(|assignment| assignment.provider_id)
             .collect();
         let providers = if provider_ids.is_empty() {
@@ -94,34 +104,97 @@ impl PostgresReadinessAdapter {
         } else {
             let providers = provider_configuration::Entity::find()
                 .filter(provider_configuration::Column::ProjectId.eq(project.id))
+                .filter(provider_configuration::Column::Id.is_in(provider_ids.clone()))
+                .filter(provider_configuration::Column::Status.eq("active"))
+                .order_by_asc(provider_configuration::Column::ProviderKey)
+                .limit(51)
+                .lock_shared()
+                .all(&transaction)
+                .await
+                .map_err(persistence)?;
+            if providers.len() != assignments.len() {
+                return Err(ApplicationError::Integrity);
+            }
+            providers
+        };
+
+        let final_publishable_keys = application_publishable_key::Entity::find()
+            .filter(application_publishable_key::Column::ProjectId.eq(project.id))
+            .filter(application_publishable_key::Column::ApplicationId.eq(application.id))
+            .filter(application_publishable_key::Column::Status.eq("active"))
+            .order_by_asc(application_publishable_key::Column::PublicId)
+            .limit(51)
+            .all(&transaction)
+            .await
+            .map_err(persistence)?;
+        let final_assignments = application_provider_assignment::Entity::find()
+            .filter(application_provider_assignment::Column::ProjectId.eq(project.id))
+            .filter(application_provider_assignment::Column::ApplicationId.eq(application.id))
+            .filter(application_provider_assignment::Column::Status.eq("active"))
+            .order_by_asc(application_provider_assignment::Column::ProviderId)
+            .limit(51)
+            .all(&transaction)
+            .await
+            .map_err(persistence)?;
+        let final_providers = if provider_ids.is_empty() {
+            Vec::new()
+        } else {
+            provider_configuration::Entity::find()
+                .filter(provider_configuration::Column::ProjectId.eq(project.id))
                 .filter(provider_configuration::Column::Id.is_in(provider_ids))
                 .filter(provider_configuration::Column::Status.eq("active"))
                 .order_by_asc(provider_configuration::Column::ProviderKey)
                 .limit(51)
-                .all(&self.database)
+                .all(&transaction)
                 .await
-                .map_err(persistence)?;
-            if providers.len() > 50 {
-                return Err(ApplicationError::Integrity);
-            }
-            providers
+                .map_err(persistence)?
+        };
+        let final_project = project::Entity::find_by_id(project.id)
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::RevisionConflict)?;
+        let final_application = application::Entity::find_by_id(application.id)
+            .filter(application::Column::ProjectId.eq(project.id))
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::RevisionConflict)?;
+        if final_project.status != "active"
+            || final_project.metadata_revision != project.metadata_revision
+            || final_project.security_revision != project.security_revision
+            || final_application.status != "active"
+            || final_application.revision != application.revision
+            || final_application.metadata_revision != application.metadata_revision
+            || final_application.security_revision != application.security_revision
+            || final_publishable_keys != publishable_keys
+            || final_assignments != assignments
+            || final_providers != providers
+        {
+            return Err(ApplicationError::RevisionConflict);
+        }
+
+        let result = PublicApplicationConfig {
+            project_public_id: project.public_id,
+            project_display_name: project.display_name,
+            application_public_id: application.public_id,
+            application_display_name: application.display_name,
+            publishable_keys: publishable_keys
+                .into_iter()
+                .map(|key| key.public_id)
+                .collect(),
+            providers: providers
                 .into_iter()
                 .map(|provider| PublicProvider {
                     key: provider.provider_key,
                     display_name: provider.display_name,
                     kind: provider.kind,
                 })
-                .collect()
-        };
-        Ok(PublicApplicationConfig {
-            project_public_id: project.public_id,
-            project_display_name: project.display_name,
-            application_public_id: application.public_id,
-            application_display_name: application.display_name,
-            publishable_keys,
-            providers,
+                .collect(),
             login_available: false,
-        })
+        };
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 
     pub(crate) async fn project_jwks(
@@ -129,9 +202,13 @@ impl PostgresReadinessAdapter {
         project_public_id: &str,
     ) -> Result<JwksDocument, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        // Control mutations serialize on the Project row exclusively. Keep the
+        // corresponding shared guard through lease observation so disablement and
+        // publication have one database ordering point, with no post-disable lease.
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
+            .lock_shared()
             .one(&transaction)
             .await
             .map_err(persistence)?
@@ -145,7 +222,7 @@ impl PostgresReadinessAdapter {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        let now = OffsetDateTime::now_utc();
+        let now = database_now(&transaction).await?;
         let loaded = project_signing_key::Entity::find()
             .filter(project_signing_key::Column::ProjectId.eq(project.id))
             .filter(project_signing_key::Column::RingId.eq(ring.id))
@@ -182,7 +259,7 @@ impl PostgresReadinessAdapter {
         ring_id: uuid::Uuid,
         loaded_revision: i64,
     ) -> Result<(), ApplicationError> {
-        let now = OffsetDateTime::now_utc();
+        let now = database_now(transaction).await?;
         let expires_at = now + self.lease_ttl;
         let existing = runtime_publication_lease::Entity::find_by_id((
             project_id,
@@ -198,10 +275,11 @@ impl PostgresReadinessAdapter {
                 if existing.loaded_revision > loaded_revision {
                     return Err(ApplicationError::RevisionConflict);
                 }
-                let revision_advanced = existing.loaded_revision < loaded_revision;
+                let observation_restarted =
+                    existing.loaded_revision < loaded_revision || existing.expires_at <= now;
                 let mut active = existing.into_active_model();
                 active.loaded_revision = Set(loaded_revision);
-                if revision_advanced {
+                if observation_restarted {
                     active.first_observed_at = Set(now);
                 }
                 active.last_observed_at = Set(now);
@@ -225,6 +303,26 @@ impl PostgresReadinessAdapter {
         }
         Ok(())
     }
+}
+
+#[derive(FromQueryResult)]
+struct DatabaseTime {
+    database_now: OffsetDateTime,
+}
+
+async fn database_now<C>(connection: &C) -> Result<OffsetDateTime, ApplicationError>
+where
+    C: ConnectionTrait,
+{
+    DatabaseTime::find_by_statement(Statement::from_string(
+        connection.get_database_backend(),
+        "SELECT transaction_timestamp() AS database_now",
+    ))
+    .one(connection)
+    .await
+    .map_err(persistence)?
+    .map(|row| row.database_now)
+    .ok_or(ApplicationError::Persistence)
 }
 
 fn persistence(_: impl std::fmt::Debug) -> ApplicationError {

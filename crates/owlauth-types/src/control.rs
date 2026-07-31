@@ -51,8 +51,12 @@ pub fn get_service_descriptor() -> ServiceDescriptor {
 pub struct SystemCapabilities {
     /// Product identifier for this Control endpoint.
     pub product: String,
-    /// Whether Project Auth business operations are implemented.
-    pub project_auth: bool,
+    /// Whether Project, Application, key, and provider provisioning is implemented.
+    pub provisioning: bool,
+    /// Whether Runtime configuration and signing-key publication readiness is implemented.
+    pub login_readiness: bool,
+    /// Whether end-user federated login, handoff, and session operations are implemented.
+    pub federated_project_auth: bool,
 }
 
 #[utoipa::path(
@@ -69,7 +73,9 @@ pub struct SystemCapabilities {
 pub fn get_system() -> SystemCapabilities {
     SystemCapabilities {
         product: "owlauth-server".to_owned(),
-        project_auth: true,
+        provisioning: true,
+        login_readiness: true,
+        federated_project_auth: crate::FEDERATED_PROJECT_AUTH_AVAILABLE,
     }
 }
 
@@ -99,11 +105,13 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::disable_application,
         crate::control_resources::list_signing_keys,
         crate::control_resources::create_signing_key,
+        crate::control_resources::reconcile_signing_key,
         crate::control_resources::activate_signing_key,
         crate::control_resources::retire_signing_key,
         crate::control_resources::revoke_signing_key,
         crate::control_resources::list_providers,
         crate::control_resources::create_provider,
+        crate::control_resources::reconcile_provider,
         crate::control_resources::disable_provider,
         crate::control_resources::assign_provider,
         crate::control_resources::unassign_provider
@@ -140,10 +148,12 @@ pub fn get_system() -> SystemCapabilities {
         SigningKey,
         SigningKeyList,
         CreateSigningKeyRequest,
+        ReconcileSigningKeyRequest,
         KeyTransitionRequest,
         Provider,
         ProviderList,
         CreateProviderRequest,
+        ReconcileProviderRequest,
         ProviderRevisionRequest,
         ProviderAssignmentRequest
     )),

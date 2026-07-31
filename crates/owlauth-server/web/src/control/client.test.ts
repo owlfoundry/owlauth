@@ -1,6 +1,51 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { ControlRequestError, IdempotencyAttempt } from "./client";
+import {
+  ControlAuthenticationError,
+  ControlRequestError,
+  IdempotencyAttempt,
+  verifyControlKey,
+} from "./client";
+
+describe("Control capability verification", () => {
+  it("unlocks for provisioning readiness without claiming federated Project Auth", async () => {
+    const client = await verifyControlKey(
+      "/v1/",
+      "operator-key",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          Response.json({
+            product: "owlauth-server",
+            provisioning: true,
+            login_readiness: true,
+            federated_project_auth: false,
+          }),
+        ),
+      ),
+    );
+
+    client.dispose();
+  });
+
+  it("rejects a deployment that lacks provisioning capability", async () => {
+    await expect(
+      verifyControlKey(
+        "/v1/",
+        "operator-key",
+        vi.fn<typeof fetch>(() =>
+          Promise.resolve(
+            Response.json({
+              product: "owlauth-server",
+              provisioning: false,
+              login_readiness: true,
+              federated_project_auth: false,
+            }),
+          ),
+        ),
+      ),
+    ).rejects.toBeInstanceOf(ControlAuthenticationError);
+  });
+});
 
 describe("IdempotencyAttempt", () => {
   afterEach(() => {

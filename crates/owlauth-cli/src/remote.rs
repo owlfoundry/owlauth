@@ -96,7 +96,9 @@ impl Default for ProfileStore {
 #[serde(deny_unknown_fields)]
 struct SystemCapabilities {
     product: String,
-    project_auth: bool,
+    provisioning: bool,
+    login_readiness: bool,
+    federated_project_auth: bool,
 }
 
 #[derive(Serialize)]
@@ -699,5 +701,16 @@ mod tests {
         assert!(is_operator_key(&format!("owl_ctrl_v1_{}", "A".repeat(43))));
         assert!(!is_operator_key(&format!("owl_saas_v1_{}", "A".repeat(43))));
         assert!(!is_operator_key(&format!("owl_ctrl_v1_{}", "A".repeat(42))));
+    }
+
+    #[test]
+    fn system_capabilities_match_the_public_control_contract() {
+        let response = serde_json::to_vec(&owlauth_types::control::get_system()).unwrap();
+        let capabilities: SystemCapabilities = serde_json::from_slice(&response).unwrap();
+
+        assert_eq!(capabilities.product, "owlauth-server");
+        assert!(capabilities.provisioning);
+        assert!(capabilities.login_readiness);
+        assert!(!capabilities.federated_project_auth);
     }
 }

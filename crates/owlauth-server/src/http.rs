@@ -1,7 +1,13 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest, Sha256};
 
 use axum::{
     Extension, Json, Router,
@@ -12,10 +18,11 @@ use axum::{
     routing::{get, post, put},
 };
 use owlauth_types::{
-    HealthResponse,
+    FEDERATED_PROJECT_AUTH_AVAILABLE, HealthResponse,
     control::{self as control_types, ServiceDescriptor, SystemCapabilities},
     runtime as runtime_types,
 };
+use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer};
@@ -24,15 +31,25 @@ use uuid::Uuid;
 
 use crate::{
     adapters::{
+        oidc::RestrictedOidcProviderClient,
         postgres::{
-            DatabasePools, provisioning::PostgresProvisioningAdapter,
-            readiness::PostgresReadinessAdapter,
+            DatabasePools, authentication::PostgresAuthenticationRepository,
+            provisioning::PostgresProvisioningAdapter, readiness::PostgresReadinessAdapter,
+            runtime_authority::PostgresRuntimeAuthorityRepository,
+            session_authority::PostgresSessionAuthorityRepository,
+        },
+        runtime_security::{
+            EncryptedFileProviderSecretResolver, EncryptedFileRuntimeSigner, RuntimeKeyMaterial,
+            SoftwareRuntimeProtector,
         },
         software_store::EncryptedFileStore,
+        system::{Sha256RequestDigester, SystemClock, SystemEntropy},
     },
     application::{
-        self, ApplicationError, CreateApplication, CreateProject, CreateProvider,
-        ProvisioningService, ReadinessService, ReplaceApplicationConfiguration, UpdateApplication,
+        self, ApplicationError, BeginLogin, ConfirmProjectBrowserLogout, ConfirmSessionReuse,
+        CreateApplication, CreateProject, CreateProvider, ExchangeHandoff, ProviderCallback,
+        ProvisioningInfrastructure, ProvisioningService, ReadinessService, RefreshSession,
+        ReplaceApplicationConfiguration, RuntimeAuthService, SelectProvider, UpdateApplication,
         UpdateProject, UpdateProjectPolicy,
     },
     config::{ListenerConfig, OperatorApiKey, ServerConfig},
@@ -65,6 +82,9 @@ struct ProbeState {
 struct RuntimeState {
     probe: ProbeState,
     readiness: Option<Arc<ReadinessService>>,
+    auth: Option<Arc<RuntimeAuthService>>,
+    cookie_path: Arc<str>,
+    external_origin: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -78,6 +98,7 @@ struct ControlState {
 pub(crate) struct PlaneRouters {
     pub runtime: Option<Router>,
     pub control: Option<Router>,
+    pub runtime_auth: Option<Arc<RuntimeAuthService>>,
     runtime_ready: Arc<AtomicBool>,
     control_ready: Arc<AtomicBool>,
 }
@@ -101,6 +122,13 @@ impl PlaneRouters {
 pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>) -> PlaneRouters {
     let runtime_ready = Arc::new(AtomicBool::new(false));
     let control_ready = Arc::new(AtomicBool::new(false));
+    let runtime_auth = (config.mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE)
+        .then(|| {
+            pools
+                .and_then(|pools| pools.runtime.clone())
+                .map(|database| build_runtime_auth_service(database, config))
+        })
+        .flatten();
 
     let runtime = config.mode.has_runtime().then(|| {
         let readiness = pools
@@ -122,6 +150,11 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
                     base_path: Arc::from(config.runtime.external_base.path()),
                 },
                 readiness,
+                auth: runtime_auth.clone(),
+                cookie_path: Arc::from(config.runtime.external_base.path()),
+                external_origin: Arc::from(
+                    config.runtime.external_base.origin().ascii_serialization(),
+                ),
             },
             config,
         )
@@ -159,31 +192,7 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
                 }),
                 provisioning: pools
                     .and_then(|pools| pools.control.clone())
-                    .map(|database| {
-                        let provisioning = config
-                            .provisioning
-                            .as_ref()
-                            .expect("validated Control configuration has provisioning stores");
-                        Arc::new(ProvisioningService::new(Arc::new(
-                            PostgresProvisioningAdapter::new(
-                                database,
-                                EncryptedFileStore::new(
-                                    provisioning.signer_store_root.clone(),
-                                    provisioning.signer_store_key.expose_copy(),
-                                )
-                                .expect("validated signer store configuration"),
-                                EncryptedFileStore::new(
-                                    provisioning.configuration_secret_store_root.clone(),
-                                    provisioning.configuration_secret_store_key.expose_copy(),
-                                )
-                                .expect("validated secret store configuration"),
-                                config.runtime.external_base.clone(),
-                                config.required_runtime_process_ids.clone(),
-                                config.key_propagation_delay,
-                                config.signing_verification_retention,
-                            ),
-                        )))
-                    }),
+                    .map(|database| build_provisioning_service(database, config)),
             },
             config,
         )
@@ -192,13 +201,114 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
     PlaneRouters {
         runtime,
         control,
+        runtime_auth,
         runtime_ready,
         control_ready,
     }
 }
 
+fn build_provisioning_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<ProvisioningService> {
+    let provisioning = config
+        .provisioning
+        .as_ref()
+        .expect("validated Control configuration has provisioning stores");
+    let signer_store = EncryptedFileStore::new(
+        provisioning.signer_store_root.clone(),
+        provisioning.signer_store_key.expose_copy(),
+    )
+    .expect("validated signer store configuration");
+    let secret_store = EncryptedFileStore::new(
+        provisioning.configuration_secret_store_root.clone(),
+        provisioning.configuration_secret_store_key.expose_copy(),
+    )
+    .expect("validated secret store configuration");
+    Arc::new(ProvisioningService::new(
+        Arc::new(PostgresProvisioningAdapter::new(
+            database,
+            config.runtime.external_base.clone(),
+            config.required_runtime_process_ids.clone(),
+            config.key_propagation_delay,
+            config.signing_verification_retention,
+        )),
+        ProvisioningInfrastructure::new(
+            signer_store,
+            secret_store,
+            SystemClock,
+            SystemEntropy,
+            Sha256RequestDigester,
+        ),
+    ))
+}
+
+fn build_runtime_auth_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<RuntimeAuthService> {
+    let stores = config
+        .provisioning
+        .as_ref()
+        .expect("validated Runtime configuration has signer and provider-secret stores");
+    let protection = config
+        .runtime_protection
+        .as_ref()
+        .expect("validated Runtime configuration has protection keys");
+    let signer_store = EncryptedFileStore::new(
+        stores.signer_store_root.clone(),
+        stores.signer_store_key.expose_copy(),
+    )
+    .expect("validated signer store configuration");
+    let secret_store = EncryptedFileStore::new(
+        stores.configuration_secret_store_root.clone(),
+        stores.configuration_secret_store_key.expose_copy(),
+    )
+    .expect("validated provider-secret store configuration");
+    let active = RuntimeKeyMaterial::new(
+        protection.active.digest_key.expose_copy(),
+        protection.active.protection_key.expose_copy(),
+    );
+    let retained = protection
+        .retained
+        .iter()
+        .map(|(version, keys)| {
+            (
+                *version,
+                RuntimeKeyMaterial::new(
+                    keys.digest_key.expose_copy(),
+                    keys.protection_key.expose_copy(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let protector = SoftwareRuntimeProtector::new(
+        config
+            .instance_id
+            .clone()
+            .expect("validated Runtime configuration has an instance ID"),
+        protection.active_version,
+        active,
+        retained,
+    )
+    .expect("validated Runtime protection configuration");
+    let provider = RestrictedOidcProviderClient::new(&config.provider_allowed_origins)
+        .expect("validated provider endpoint policy");
+    Arc::new(RuntimeAuthService::new(
+        Arc::new(PostgresAuthenticationRepository::new(database.clone())),
+        Arc::new(PostgresSessionAuthorityRepository::new(database.clone())),
+        Arc::new(PostgresRuntimeAuthorityRepository::new(database)),
+        Arc::new(protector),
+        Arc::new(EncryptedFileRuntimeSigner::new(signer_store)),
+        Arc::new(EncryptedFileProviderSecretResolver::new(secret_store)),
+        Arc::new(provider),
+        Arc::new(SystemClock),
+        config.runtime.external_base.clone(),
+    ))
+}
+
 fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &ServerConfig) -> Router {
-    let router = Router::new()
+    let public = Router::new()
         .route("/", get(runtime_root))
         .route("/auth/", get(runtime_shell))
         .route("/auth/assets/{*path}", get(runtime_asset))
@@ -212,16 +322,77 @@ fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &Serve
             "/projects/{project_public_id}/.well-known/jwks.json",
             get(project_jwks),
         )
-        .route_layer(middleware::from_fn(reject_runtime_authorization))
-        .with_state(state);
+        .route_layer(middleware::from_fn(reject_runtime_authorization));
+    let router = if FEDERATED_PROJECT_AUTH_AVAILABLE {
+        public.merge(federated_project_auth_router())
+    } else {
+        public
+    };
     mount_and_bound(
         listener,
-        router,
+        router.with_state(state),
         HttpPlane::Runtime,
         config.request_timeout,
         config.max_request_bytes,
         256,
     )
+}
+
+fn federated_project_auth_router() -> Router<RuntimeState> {
+    let public = Router::new()
+        .route(
+            "/v1/projects/{project_public_id}/auth/login/start",
+            post(start_login).options(runtime_preflight),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/handoff/exchange",
+            post(exchange_handoff).options(runtime_preflight),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/sessions/refresh",
+            post(refresh_session).options(runtime_preflight),
+        )
+        .route(
+            "/projects/{project_public_id}/auth/callback/{provider_key}",
+            get(provider_callback),
+        )
+        .route_layer(middleware::from_fn(reject_runtime_authorization));
+    let hosted = Router::new()
+        .route(
+            "/auth/interactions/{interaction}",
+            get(hosted_interaction_shell),
+        )
+        .route(
+            "/auth/browser-logout/{preparation}",
+            get(browser_logout_shell),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/method",
+            post(select_provider_method),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/session/reuse",
+            post(reuse_browser_session),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/browser-logout/{preparation}/confirm",
+            post(confirm_browser_logout),
+        )
+        .route_layer(middleware::from_fn(reject_runtime_authorization));
+    let bearer = Router::new()
+        .route(
+            "/v1/projects/{project_public_id}/auth/users/me",
+            get(current_user).options(runtime_preflight),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/sessions/logout",
+            post(logout_application_session).options(runtime_preflight),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/browser-logout/prepare",
+            post(prepare_browser_logout).options(runtime_preflight),
+        );
+    public.merge(hosted).merge(bearer)
 }
 
 fn control_router(listener: &ListenerConfig, state: ControlState, config: &ServerConfig) -> Router {
@@ -258,6 +429,10 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             get(list_signing_keys).post(create_signing_key),
         )
         .route(
+            "/projects/{project_id}/signing-keys/{key_id}/reconcile",
+            post(reconcile_signing_key),
+        )
+        .route(
             "/projects/{project_id}/signing-keys/{key_id}/activate",
             post(activate_signing_key),
         )
@@ -272,6 +447,10 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         .route(
             "/projects/{project_id}/providers",
             get(list_providers).post(create_provider),
+        )
+        .route(
+            "/projects/{project_id}/providers/{provider_id}/reconcile",
+            post(reconcile_provider),
         )
         .route(
             "/projects/{project_id}/providers/{provider_id}/disable",
@@ -371,6 +550,563 @@ async fn runtime_asset(Path(path): Path<String>, headers: HeaderMap) -> Response
     web_assets::asset(WebPlane::Runtime, &format!("assets/{path}"), &headers)
 }
 
+async fn runtime_preflight(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(Some(origin)) = request_origin(&headers) else {
+        return runtime_error_response(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "The request Origin is not allowed for this Project.",
+            &request_id,
+        );
+    };
+    let method = exact_header(&headers, "access-control-request-method");
+    if !matches!(method, Some("GET" | "POST"))
+        || !valid_preflight_headers(exact_header(&headers, "access-control-request-headers"))
+    {
+        return runtime_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_preflight",
+            "The CORS preflight request is invalid.",
+            &request_id,
+        );
+    }
+    let allowed = match runtime_auth(&state) {
+        Ok(service) => {
+            service
+                .project_origin_allowed(&project_public_id, &origin)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    match allowed {
+        Ok(true) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            apply_cors(&mut response, &origin, true);
+            response
+        }
+        Ok(false) | Err(ApplicationError::NotFound | ApplicationError::Disabled) => {
+            runtime_error_response(
+                StatusCode::FORBIDDEN,
+                "origin_not_allowed",
+                "The request Origin is not allowed for this Project.",
+                &request_id,
+            )
+        }
+        Err(error) => runtime_problem(error, &request_id),
+    }
+}
+
+async fn start_login(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::LoginStartRequest>,
+) -> Response {
+    let cors_origin = match application_cors_origin(
+        &state,
+        &headers,
+        &project_public_id,
+        &request.application_id,
+        &request.publishable_key,
+        &request_id,
+    )
+    .await
+    {
+        Ok(origin) => origin,
+        Err(response) => return response,
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service
+            .begin_login(BeginLogin {
+                project_public_id,
+                application_public_id: request.application_id,
+                publishable_key: request.publishable_key,
+                redirect_uri: request.redirect_uri,
+                pkce_challenge: request.pkce_challenge,
+                application_state: request.state,
+                presentation_hint: request.presentation_hint,
+            })
+            .await
+            .map(|pending| runtime_types::LoginStartResponse {
+                hosted_url: pending.hosted_url,
+                expires_at: pending.expires_at.to_string(),
+            }),
+        Err(error) => Err(error),
+    };
+    let mut response = runtime_status_json(StatusCode::CREATED, result, &request_id);
+    if let Some(origin) = cors_origin {
+        apply_cors(&mut response, &origin, false);
+    }
+    response
+}
+
+async fn hosted_interaction_shell(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(interaction): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_top_level_navigation(&headers) {
+        return runtime_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_navigation",
+            "Hosted authentication must start from a top-level document navigation.",
+            &request_id,
+        );
+    }
+    let Ok(cookie_name) = interaction_cookie_name(&interaction) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Ok(binding) = cookie_value(&headers, &cookie_name) else {
+        return invalid_cookie(&request_id);
+    };
+    let bootstrap = match runtime_auth(&state) {
+        Ok(service) => {
+            service
+                .bootstrap_interaction(&interaction, binding.as_deref())
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    let bootstrap = match bootstrap {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    let reuse_available = cookie_value(
+        &headers,
+        &project_session_cookie_name(&bootstrap.interaction.project_public_id),
+    )
+    .is_ok_and(|value| value.is_some());
+    let body = match hosted_interaction_response(&bootstrap, reuse_available) {
+        Ok(body) => body,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    let Ok(serialized) = serde_json::to_string(&body) else {
+        return runtime_problem(ApplicationError::Integrity, &request_id);
+    };
+    let mut response = web_assets::shell_with_context(
+        WebPlane::Runtime,
+        &state.probe.base_path,
+        &[
+            ("owlauth-runtime-flow", "interaction"),
+            ("owlauth-runtime-bootstrap", &serialized),
+        ],
+    );
+    append_cookie(
+        &mut response,
+        &cookie_name,
+        &bootstrap.browser_binding,
+        &state.cookie_path,
+        600,
+    );
+    response
+}
+
+async fn select_provider_method(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path((project_public_id, interaction)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::SelectProviderRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service
+            .select_provider(SelectProvider {
+                interaction,
+                browser_binding: binding,
+                csrf: request.csrf,
+                expected_revision: request.expected_revision,
+                provider_key: request.provider_key,
+            })
+            .await
+            .map(|url| runtime_types::NavigationResponse { url }),
+        Err(error) => Err(error),
+    };
+    let _ = project_public_id;
+    runtime_json(result, &request_id)
+}
+
+async fn reuse_browser_session(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path((project_public_id, interaction)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::ConfirmSessionReuseRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let Ok(Some(browser_session)) =
+        cookie_value(&headers, &project_session_cookie_name(&project_public_id))
+    else {
+        return invalid_cookie(&request_id);
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service
+            .confirm_session_reuse(ConfirmSessionReuse {
+                interaction,
+                browser_binding: binding,
+                csrf: request.csrf,
+                browser_session,
+                expected_revision: request.expected_revision,
+            })
+            .await
+            .and_then(|completion| {
+                if completion.project_public_id != project_public_id {
+                    return Err(ApplicationError::NotFound);
+                }
+                Ok(runtime_types::NavigationResponse {
+                    url: completion.redirect_url,
+                })
+            }),
+        Err(error) => Err(error),
+    };
+    runtime_json(result, &request_id)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCallbackQuery {
+    code: String,
+    state: String,
+}
+
+async fn provider_callback(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path((project_public_id, provider_key)): Path<(String, String)>,
+    Query(query): Query<ProviderCallbackQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(interaction_cookie) = interaction_cookie_name(&query.state) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Ok(Some(browser_binding)) = cookie_value(&headers, &interaction_cookie) else {
+        return invalid_cookie(&request_id);
+    };
+    let project_cookie = project_session_cookie_name(&project_public_id);
+    let Ok(existing_browser_session) = cookie_value(&headers, &project_cookie) else {
+        return invalid_cookie(&request_id);
+    };
+    let completion = match runtime_auth(&state) {
+        Ok(service) => {
+            service
+                .complete_provider_callback(ProviderCallback {
+                    project_public_id: project_public_id.clone(),
+                    provider_key,
+                    state: query.state,
+                    code: query.code,
+                    browser_binding,
+                    existing_browser_session,
+                })
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    let completion = match completion {
+        Ok(completion) => completion,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    if completion.project_public_id != project_public_id {
+        return runtime_problem(ApplicationError::NotFound, &request_id);
+    }
+    let mut response = Redirect::to(&completion.redirect_url).into_response();
+    append_cookie(
+        &mut response,
+        &project_cookie,
+        &completion.browser_session,
+        &state.cookie_path,
+        86_400,
+    );
+    clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+    response
+}
+
+async fn exchange_handoff(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::HandoffExchangeRequest>,
+) -> Response {
+    let cors_origin = match application_cors_origin(
+        &state,
+        &headers,
+        &project_public_id,
+        &request.application_id,
+        &request.publishable_key,
+        &request_id,
+    )
+    .await
+    {
+        Ok(origin) => origin,
+        Err(response) => return response,
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service
+            .exchange_handoff(ExchangeHandoff {
+                project_public_id,
+                application_public_id: request.application_id,
+                publishable_key: request.publishable_key,
+                handoff: request.handoff,
+                pkce_verifier: request.pkce_verifier,
+            })
+            .await
+            .map(credential_pair_response),
+        Err(error) => Err(error),
+    };
+    let mut response = runtime_json(result, &request_id);
+    if let Some(origin) = cors_origin {
+        apply_cors(&mut response, &origin, false);
+    }
+    response
+}
+
+async fn refresh_session(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::RefreshRequest>,
+) -> Response {
+    let cors_origin = match application_cors_origin(
+        &state,
+        &headers,
+        &project_public_id,
+        &request.application_id,
+        &request.publishable_key,
+        &request_id,
+    )
+    .await
+    {
+        Ok(origin) => origin,
+        Err(response) => return response,
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service
+            .refresh(RefreshSession {
+                project_public_id,
+                application_public_id: request.application_id,
+                publishable_key: request.publishable_key,
+                refresh_token: request.refresh_token,
+            })
+            .await
+            .map(credential_pair_response),
+        Err(error) => Err(error),
+    };
+    let mut response = runtime_json(result, &request_id);
+    if let Some(origin) = cors_origin {
+        apply_cors(&mut response, &origin, false);
+    }
+    response
+}
+
+async fn current_user(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let cors_origin =
+        match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
+            Ok(origin) => origin,
+            Err(response) => return response,
+        };
+    let Ok(token) = bearer_token(&headers) else {
+        return unauthorized_runtime(&request_id);
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service.current_user(&token).await.and_then(|current| {
+            if current.project_public_id != project_public_id {
+                return Err(ApplicationError::NotFound);
+            }
+            Ok(runtime_types::CurrentUserResponse {
+                project_id: current.project_public_id,
+                application_id: current.application_public_id,
+                user_id: current.user_public_id,
+                projection: current.projection_document,
+                projection_revision: current.projection_revision,
+                authenticated_at: current.authenticated_at.to_string(),
+                session_expires_at: current.absolute_expires_at.to_string(),
+            })
+        }),
+        Err(error) => Err(error),
+    };
+    let mut response = runtime_auth_json(StatusCode::OK, result, &request_id);
+    if let Some(origin) = cors_origin {
+        apply_cors(&mut response, &origin, false);
+    }
+    response
+}
+
+async fn logout_application_session(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let cors_origin =
+        match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
+            Ok(origin) => origin,
+            Err(response) => return response,
+        };
+    let Ok(token) = bearer_token(&headers) else {
+        return unauthorized_runtime(&request_id);
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => match service.current_user(&token).await {
+            Ok(current) if current.project_public_id == project_public_id => service
+                .logout_application(&token)
+                .await
+                .map(|()| runtime_types::CompletionResponse { completed: true }),
+            Ok(_) => Err(ApplicationError::NotFound),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    let mut response = runtime_auth_json(StatusCode::OK, result, &request_id);
+    if let Some(origin) = cors_origin {
+        apply_cors(&mut response, &origin, false);
+    }
+    response
+}
+
+async fn prepare_browser_logout(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let cors_origin =
+        match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
+            Ok(origin) => origin,
+            Err(response) => return response,
+        };
+    let Ok(token) = bearer_token(&headers) else {
+        return unauthorized_runtime(&request_id);
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => match service.current_user(&token).await {
+            Ok(current) if current.project_public_id == project_public_id => service
+                .prepare_browser_logout(&token)
+                .await
+                .map(|target| runtime_types::BrowserLogoutPreparationResponse {
+                    hosted_url: target.hosted_url,
+                    expires_at: target.expires_at.to_string(),
+                }),
+            Ok(_) => Err(ApplicationError::NotFound),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    let mut response = runtime_auth_json(StatusCode::CREATED, result, &request_id);
+    if let Some(origin) = cors_origin {
+        apply_cors(&mut response, &origin, false);
+    }
+    response
+}
+
+async fn browser_logout_shell(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path(preparation): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_top_level_navigation(&headers) {
+        return runtime_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_navigation",
+            "Browser logout confirmation requires a top-level document navigation.",
+            &request_id,
+        );
+    }
+    let service = match runtime_auth(&state) {
+        Ok(service) => service,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    let project_public_id = match service.browser_logout_project(&preparation).await {
+        Ok(project_public_id) => project_public_id,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    let Ok(Some(browser_session)) =
+        cookie_value(&headers, &project_session_cookie_name(&project_public_id))
+    else {
+        return invalid_cookie(&request_id);
+    };
+    let bound = match service
+        .bind_browser_logout(&preparation, &browser_session)
+        .await
+    {
+        Ok(bound) => bound,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    let bootstrap = runtime_types::BrowserLogoutResponse {
+        project_id: bound.project_public_id,
+        revision: bound.revision,
+        csrf: bound.csrf.to_string(),
+        expires_at: bound.expires_at.to_string(),
+    };
+    let Ok(serialized) = serde_json::to_string(&bootstrap) else {
+        return runtime_problem(ApplicationError::Integrity, &request_id);
+    };
+    web_assets::shell_with_context(
+        WebPlane::Runtime,
+        &state.probe.base_path,
+        &[
+            ("owlauth-runtime-flow", "browser-logout"),
+            ("owlauth-runtime-bootstrap", &serialized),
+        ],
+    )
+}
+
+async fn confirm_browser_logout(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Path((project_public_id, preparation)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::ConfirmBrowserLogoutRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    let cookie_name = project_session_cookie_name(&project_public_id);
+    let Ok(Some(browser_session)) = cookie_value(&headers, &cookie_name) else {
+        return invalid_cookie(&request_id);
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service
+            .confirm_browser_logout(ConfirmProjectBrowserLogout {
+                preparation,
+                browser_session,
+                csrf: request.csrf,
+                expected_revision: request.expected_revision,
+            })
+            .await
+            .map(|_| runtime_types::CompletionResponse { completed: true }),
+        Err(error) => Err(error),
+    };
+    let mut response = runtime_json(result, &request_id);
+    if response.status().is_success() {
+        clear_cookie(&mut response, &cookie_name, &state.cookie_path);
+    }
+    response
+}
+
 async fn control_root(State(state): State<ControlState>) -> Redirect {
     Redirect::temporary(&format!("{}console/", state.probe.base_path))
 }
@@ -414,10 +1150,7 @@ async fn service_descriptor(State(state): State<ControlState>) -> Json<ServiceDe
 }
 
 async fn system_capabilities() -> Json<SystemCapabilities> {
-    Json(SystemCapabilities {
-        product: "owlauth-server".to_owned(),
-        project_auth: true,
-    })
+    Json(control_types::get_system())
 }
 
 async fn reject_runtime_authorization(request: Request, next: Next) -> Response {
@@ -438,6 +1171,35 @@ async fn reject_runtime_authorization(request: Request, next: Next) -> Response 
             .into_response();
     }
     next.run(request).await
+}
+
+struct RuntimeJson<T>(T);
+
+impl<S, T> FromRequest<S> for RuntimeJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = request
+            .extensions()
+            .get::<String>()
+            .cloned()
+            .unwrap_or_else(|| "unavailable".to_owned());
+        Json::<T>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(|_| {
+                runtime_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_json",
+                    "The request body must be bounded JSON matching the operation schema.",
+                    &request_id,
+                )
+            })
+    }
 }
 
 struct ControlJson<T>(T);
@@ -504,6 +1266,10 @@ fn readiness(state: &RuntimeState) -> Result<&ReadinessService, ApplicationError
         .readiness
         .as_deref()
         .ok_or(ApplicationError::Persistence)
+}
+
+fn runtime_auth(state: &RuntimeState) -> Result<&RuntimeAuthService, ApplicationError> {
+    state.auth.as_deref().ok_or(ApplicationError::Persistence)
 }
 
 #[derive(Deserialize)]
@@ -913,6 +1679,33 @@ async fn create_signing_key(
     }
 }
 
+async fn reconcile_signing_key(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, key_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::ReconcileSigningKeyRequest>,
+) -> Response {
+    let (project_id, key_id) = match resource_pair(&project_id, &key_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .reconcile_signing_key(
+                project_id,
+                key_id,
+                body.expected_project_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(key) => control_json(control_signing_key(key), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
 async fn activate_signing_key(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -1047,6 +1840,34 @@ async fn create_provider(
                     idempotency_key,
                     expected_project_revision: body.expected_project_revision,
                 },
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(provider) => control_json(control_provider(provider), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn reconcile_provider(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, provider_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::ReconcileProviderRequest>,
+) -> Response {
+    let (project_id, provider_id) = match resource_pair(&project_id, &provider_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .reconcile_provider(
+                project_id,
+                provider_id,
+                zeroize::Zeroizing::new(body.client_secret),
+                body.expected_project_revision,
                 request_uuid(&request_id),
             )
             .await
@@ -1209,7 +2030,7 @@ async fn public_application_config(
                     application_display_name: config.application_display_name,
                     publishable_keys: config.publishable_keys,
                     providers,
-                    login_available: config.login_available,
+                    login_available: FEDERATED_PROJECT_AUTH_AVAILABLE && config.login_available,
                 }),
                 &request_id,
             )
@@ -1267,6 +2088,368 @@ where
         Ok(value) => Json(value).into_response(),
         Err(error) => runtime_problem(error, request_id),
     }
+}
+
+fn runtime_status_json<T>(
+    status: StatusCode,
+    result: Result<T, ApplicationError>,
+    request_id: &str,
+) -> Response
+where
+    T: Serialize,
+{
+    match result {
+        Ok(value) => (status, Json(value)).into_response(),
+        Err(error) => runtime_problem(error, request_id),
+    }
+}
+
+fn runtime_auth_json<T>(
+    success_status: StatusCode,
+    result: Result<T, ApplicationError>,
+    request_id: &str,
+) -> Response
+where
+    T: Serialize,
+{
+    match result {
+        Ok(value) => (success_status, Json(value)).into_response(),
+        Err(
+            ApplicationError::Integrity
+            | ApplicationError::Persistence
+            | ApplicationError::ExternalStore,
+        ) => runtime_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authority_unavailable",
+            "The Runtime authority is temporarily unavailable.",
+            request_id,
+        ),
+        Err(_) => unauthorized_runtime(request_id),
+    }
+}
+
+fn credential_pair_response(
+    pair: application::CredentialPair,
+) -> runtime_types::CredentialPairResponse {
+    runtime_types::CredentialPairResponse {
+        access_token: pair.access_token.to_string(),
+        refresh_token: pair.refresh_token.to_string(),
+        token_type: pair.token_type,
+        expires_in: pair.expires_in,
+        projection: pair.projection,
+        projection_revision: pair.projection_revision,
+        session_expires_at: pair.session_expires_at.to_string(),
+    }
+}
+
+fn hosted_interaction_response(
+    bootstrap: &application::HostedBootstrap,
+    session_reuse_available: bool,
+) -> Result<runtime_types::HostedInteractionResponse, ApplicationError> {
+    let status = match bootstrap.interaction.status.as_str() {
+        "awaiting_method_selection" => {
+            runtime_types::HostedInteractionStatus::AwaitingMethodSelection
+        }
+        "provider_authorization_started" => {
+            runtime_types::HostedInteractionStatus::ProviderAuthorizationStarted
+        }
+        "provider_exchange_in_progress" => {
+            runtime_types::HostedInteractionStatus::ProviderExchangeInProgress
+        }
+        "provider_exchange_failed" | "cancelled" => runtime_types::HostedInteractionStatus::Failed,
+        "authenticated" => runtime_types::HostedInteractionStatus::Authenticated,
+        "handoff_issued" => runtime_types::HostedInteractionStatus::HandoffIssued,
+        "completed" => runtime_types::HostedInteractionStatus::Completed,
+        "expired" => runtime_types::HostedInteractionStatus::Expired,
+        _ => return Err(ApplicationError::Integrity),
+    };
+    Ok(runtime_types::HostedInteractionResponse {
+        project_id: bootstrap.interaction.project_public_id.clone(),
+        project_display_name: bootstrap.interaction.project_display_name.clone(),
+        application_id: bootstrap.interaction.application_public_id.clone(),
+        application_display_name: bootstrap.interaction.application_display_name.clone(),
+        status,
+        revision: bootstrap.interaction.transaction_revision,
+        session_reuse_available,
+        presentation_hint: bootstrap.interaction.presentation_hint.clone(),
+        providers: bootstrap
+            .interaction
+            .providers
+            .iter()
+            .map(|provider| runtime_types::HostedProvider {
+                key: provider.key.clone(),
+                display_name: provider.display_name.clone(),
+            })
+            .collect(),
+        csrf: bootstrap.csrf.to_string(),
+        expires_at: bootstrap.interaction.expires_at.to_string(),
+    })
+}
+
+fn interaction_cookie_name(credential: &str) -> Result<String, ()> {
+    let id = credential.split('.').next().ok_or(())?;
+    let parsed = Uuid::parse_str(id).map_err(|_| ())?;
+    if parsed.to_string() != id {
+        return Err(());
+    }
+    Ok(format!("owl_interaction_{id}"))
+}
+
+fn project_session_cookie_name(project_public_id: &str) -> String {
+    let digest = Sha256::digest(project_public_id.as_bytes());
+    format!("owl_project_{}", URL_SAFE_NO_PAD.encode(&digest[..18]))
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
+    let values = headers.get_all(header::COOKIE);
+    let mut iter = values.iter();
+    let Some(header_value) = iter.next() else {
+        return Ok(None);
+    };
+    if iter.next().is_some() {
+        return Err(());
+    }
+    let value = header_value.to_str().map_err(|_| ())?;
+    let mut found = None;
+    for pair in value.split(';') {
+        let (candidate, value) = pair.trim().split_once('=').ok_or(())?;
+        if candidate == name {
+            if found.is_some()
+                || value.is_empty()
+                || value.len() > 512
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(());
+            }
+            found = Some(value.to_owned());
+        }
+    }
+    Ok(found)
+}
+
+fn required_interaction_cookie(headers: &HeaderMap, interaction: &str) -> Result<String, ()> {
+    cookie_value(headers, &interaction_cookie_name(interaction)?)?.ok_or(())
+}
+
+fn append_cookie(response: &mut Response, name: &str, value: &str, path: &str, max_age: i64) {
+    let value =
+        format!("{name}={value}; Path={path}; Max-Age={max_age}; Secure; HttpOnly; SameSite=Lax");
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+}
+
+fn clear_cookie(response: &mut Response, name: &str, path: &str) {
+    let value = format!("{name}=deleted; Path={path}; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+}
+
+async fn application_cors_origin(
+    state: &RuntimeState,
+    headers: &HeaderMap,
+    project_public_id: &str,
+    application_public_id: &str,
+    publishable_key: &str,
+    request_id: &str,
+) -> Result<Option<String>, Response> {
+    let origin = request_origin(headers).map_err(|()| {
+        runtime_error_response(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "The request Origin is not allowed for this Application.",
+            request_id,
+        )
+    })?;
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    let allowed = runtime_auth(state)
+        .map_err(|error| runtime_problem(error, request_id))?
+        .application_origin_allowed(
+            project_public_id,
+            application_public_id,
+            publishable_key,
+            &origin,
+        )
+        .await
+        .map_err(|error| runtime_problem(error, request_id))?;
+    if !allowed {
+        return Err(runtime_error_response(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "The request Origin is not allowed for this Application.",
+            request_id,
+        ));
+    }
+    Ok(Some(origin))
+}
+
+async fn project_cors_origin(
+    state: &RuntimeState,
+    headers: &HeaderMap,
+    project_public_id: &str,
+    request_id: &str,
+) -> Result<Option<String>, Response> {
+    let origin = request_origin(headers).map_err(|()| {
+        runtime_error_response(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "The request Origin is not allowed for this Project.",
+            request_id,
+        )
+    })?;
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    let allowed = runtime_auth(state)
+        .map_err(|error| runtime_problem(error, request_id))?
+        .project_origin_allowed(project_public_id, &origin)
+        .await
+        .map_err(|error| runtime_problem(error, request_id))?;
+    if !allowed {
+        return Err(runtime_error_response(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "The request Origin is not allowed for this Project.",
+            request_id,
+        ));
+    }
+    Ok(Some(origin))
+}
+
+fn request_origin(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    if !headers.contains_key(header::ORIGIN) {
+        return Ok(None);
+    }
+    let origin = exact_header(headers, "origin").ok_or(())?;
+    let parsed = url::Url::parse(origin).map_err(|_| ())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.host_str().is_none()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.origin().ascii_serialization() != origin
+    {
+        return Err(());
+    }
+    Ok(Some(origin.to_owned()))
+}
+
+fn valid_preflight_headers(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        let mut count = 0;
+        let valid = value.split(',').all(|header| {
+            count += 1;
+            matches!(
+                header.trim().to_ascii_lowercase().as_str(),
+                "authorization" | "content-type"
+            )
+        });
+        valid && count <= 2
+    })
+}
+
+fn apply_cors(response: &mut Response, origin: &str, preflight: bool) {
+    let Ok(origin) = HeaderValue::from_str(origin) else {
+        return;
+    };
+    response
+        .headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("Origin"));
+    if preflight {
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST"),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Authorization, Content-Type"),
+        );
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("600"),
+        );
+    }
+}
+
+fn exact_header<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    let values = headers.get_all(HeaderName::from_static(name));
+    let mut iter = values.iter();
+    let value = iter.next()?.to_str().ok()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    Some(value)
+}
+
+fn is_top_level_navigation(headers: &HeaderMap) -> bool {
+    exact_header(headers, "sec-fetch-dest") == Some("document")
+        && exact_header(headers, "sec-fetch-mode") == Some("navigate")
+}
+
+fn is_same_origin_mutation(headers: &HeaderMap, expected_origin: &str) -> bool {
+    exact_header(headers, "origin") == Some(expected_origin)
+        && exact_header(headers, "sec-fetch-site") == Some("same-origin")
+        && matches!(
+            exact_header(headers, "sec-fetch-mode"),
+            Some("cors" | "same-origin")
+        )
+        && exact_header(headers, "sec-fetch-dest") == Some("")
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<String, ()> {
+    let values = headers.get_all(header::AUTHORIZATION);
+    let mut iter = values.iter();
+    let value = iter.next().ok_or(())?.to_str().map_err(|_| ())?;
+    if iter.next().is_some() {
+        return Err(());
+    }
+    let token = value.strip_prefix("Bearer ").ok_or(())?;
+    if token.is_empty()
+        || token.len() > 16_384
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || !byte.is_ascii())
+    {
+        return Err(());
+    }
+    Ok(token.to_owned())
+}
+
+fn invalid_cookie(request_id: &str) -> Response {
+    runtime_error_response(
+        StatusCode::NOT_FOUND,
+        "invalid_browser_context",
+        "The browser context is missing or no longer valid.",
+        request_id,
+    )
+}
+
+fn forbidden_hosted_request(request_id: &str) -> Response {
+    runtime_error_response(
+        StatusCode::FORBIDDEN,
+        "forbidden_browser_request",
+        "The Hosted request failed same-origin browser checks.",
+        request_id,
+    )
+}
+
+fn unauthorized_runtime(request_id: &str) -> Response {
+    runtime_error_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "A single valid Project Bearer token is required.",
+        request_id,
+    )
 }
 
 fn control_project_policy(
@@ -1347,8 +2530,17 @@ fn control_signing_key(
         "abandoned" => control_types::SigningKeyState::Abandoned,
         _ => return Err(ApplicationError::Integrity),
     };
-    let public_jwk =
-        serde_json::from_value(key.public_jwk).map_err(|_| ApplicationError::Integrity)?;
+    let public_jwk = match (state, key.public_jwk == serde_json::json!({})) {
+        (
+            control_types::SigningKeyState::Provisioning
+            | control_types::SigningKeyState::Abandoned,
+            true,
+        ) => None,
+        (_, true) => return Err(ApplicationError::Integrity),
+        (_, false) => {
+            Some(serde_json::from_value(key.public_jwk).map_err(|_| ApplicationError::Integrity)?)
+        }
+    };
     Ok(control_types::SigningKey {
         id: key.id.to_string(),
         project_id: key.project_id.to_string(),
@@ -1497,19 +2689,39 @@ fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
         ApplicationError::NotFound | ApplicationError::Disabled => (
             StatusCode::NOT_FOUND,
             "not_found",
-            "The requested public resource was not found.",
+            "The requested Runtime resource was not found or is no longer available.",
         ),
         ApplicationError::InvalidInput => (
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "The public request is invalid.",
+            "The Runtime request is invalid.",
         ),
-        _ => (
+        ApplicationError::RevisionConflict
+        | ApplicationError::InvalidTransition
+        | ApplicationError::IdempotencyConflict
+        | ApplicationError::OperationInProgress
+        | ApplicationError::PublicationPending => (
+            StatusCode::CONFLICT,
+            "invalid_state",
+            "The Runtime operation is no longer valid in the current state.",
+        ),
+        ApplicationError::Integrity
+        | ApplicationError::Persistence
+        | ApplicationError::ExternalStore => (
             StatusCode::SERVICE_UNAVAILABLE,
             "authority_unavailable",
             "The Runtime authority is temporarily unavailable.",
         ),
     };
+    runtime_error_response(status, code, message, request_id)
+}
+
+fn runtime_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    request_id: &str,
+) -> Response {
     (
         status,
         Json(runtime_types::RuntimeError {
@@ -1667,6 +2879,44 @@ mod tests {
     use super::*;
     use crate::config::PlaneMode;
 
+    #[test]
+    fn control_signing_key_represents_only_valid_pre_material_states_without_a_jwk() {
+        let pre_material = application::SigningKeyRecord {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            kid: "kid_recovery".to_owned(),
+            algorithm: "EdDSA".to_owned(),
+            state: "provisioning".to_owned(),
+            ring_revision: 1,
+            signing_epoch: 1,
+            sign_not_before: None,
+            verify_not_after: None,
+            public_jwk: serde_json::json!({}),
+        };
+        assert_eq!(
+            control_signing_key(pre_material.clone())
+                .expect("a provisioning key may not have material yet")
+                .public_jwk,
+            None
+        );
+
+        let mut abandoned = pre_material.clone();
+        abandoned.state = "abandoned".to_owned();
+        assert_eq!(
+            control_signing_key(abandoned)
+                .expect("an abandoned pre-material key remains listable")
+                .public_jwk,
+            None
+        );
+
+        let mut invalid = pre_material;
+        invalid.state = "published".to_owned();
+        assert_eq!(
+            control_signing_key(invalid),
+            Err(ApplicationError::Integrity)
+        );
+    }
+
     fn test_config(mode: PlaneMode) -> ServerConfig {
         let key = format!("owl_ctrl_v1_{}", "A".repeat(43));
         let mut values = BTreeMap::from([
@@ -1678,23 +2928,20 @@ mod tests {
                 "OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
                 "http-test-runtime".to_owned(),
             ),
+            ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
+            (
+                "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
+                "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM".to_owned(),
+            ),
+            (
+                "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
+                "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
+            ),
+            (
+                "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
+                "https://accounts.example/".to_owned(),
+            ),
             ("OWLAUTH_CONTROL_API_KEY".to_owned(), key),
-            (
-                "OWLAUTH_SIGNER_STORE_ROOT".to_owned(),
-                "/tmp/owlauth-http-test-signers".to_owned(),
-            ),
-            (
-                "OWLAUTH_SIGNER_STORE_KEY".to_owned(),
-                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned(),
-            ),
-            (
-                "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT".to_owned(),
-                "/tmp/owlauth-http-test-secrets".to_owned(),
-            ),
-            (
-                "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY".to_owned(),
-                "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI".to_owned(),
-            ),
             (
                 "OWLAUTH_INSTANCE_ID".to_owned(),
                 "test-deployment".to_owned(),
@@ -1709,6 +2956,26 @@ mod tests {
                 .to_owned(),
             ),
         ]);
+        if mode.has_control() {
+            values.extend([
+                (
+                    "OWLAUTH_SIGNER_STORE_ROOT".to_owned(),
+                    "/tmp/owlauth-http-test-signers".to_owned(),
+                ),
+                (
+                    "OWLAUTH_SIGNER_STORE_KEY".to_owned(),
+                    "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned(),
+                ),
+                (
+                    "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT".to_owned(),
+                    "/tmp/owlauth-http-test-secrets".to_owned(),
+                ),
+                (
+                    "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY".to_owned(),
+                    "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI".to_owned(),
+                ),
+            ]);
+        }
         if mode == PlaneMode::All {
             values.insert(
                 "OWLAUTH_RUNTIME_BASE_URL".to_owned(),
@@ -1720,6 +2987,46 @@ mod tests {
             );
         }
         ServerConfig::from_values_for_test(&values).expect("test config should parse")
+    }
+
+    #[tokio::test]
+    async fn disabled_federated_auth_composes_only_block_a_runtime_infrastructure() {
+        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
+        let config = test_config(PlaneMode::Runtime);
+        assert!(config.provisioning.is_none());
+        let pools = DatabasePools {
+            runtime: Some(DatabaseConnection::default()),
+            control: None,
+        };
+        let mut routers = build_routers(&config, Some(&pools));
+        assert!(
+            routers.runtime_auth.is_none(),
+            "unavailable federated auth must not compose its service"
+        );
+        assert!(routers.control.is_none());
+
+        routers.mark_ready();
+        let runtime = routers.runtime.take().expect("Runtime router should exist");
+        let ready = runtime
+            .clone()
+            .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        let jwks = runtime
+            .oneshot(
+                Request::get("/projects/example/.well-known/jwks.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            jwks.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Block A JWKS must remain routed to its composed readiness service"
+        );
     }
 
     #[tokio::test]
@@ -1771,6 +3078,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(control.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn partial_federated_auth_routes_are_ordinary_not_found() {
+        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
+        let config = test_config(PlaneMode::Runtime);
+        let mut routers = build_routers(&config, None);
+        routers.mark_ready();
+        let runtime = routers.runtime.take().expect("Runtime router should exist");
+
+        for (method, path) in [
+            ("POST", "/v1/projects/example/auth/login/start"),
+            ("GET", "/auth/interactions/interaction"),
+            (
+                "POST",
+                "/v1/projects/example/auth/interactions/interaction/method",
+            ),
+            (
+                "POST",
+                "/v1/projects/example/auth/interactions/interaction/session/reuse",
+            ),
+            ("GET", "/projects/example/auth/callback/provider"),
+            ("POST", "/v1/projects/example/auth/handoff/exchange"),
+            ("POST", "/v1/projects/example/auth/sessions/refresh"),
+            ("GET", "/v1/projects/example/auth/users/me"),
+            ("POST", "/v1/projects/example/auth/sessions/logout"),
+            ("POST", "/v1/projects/example/auth/browser-logout/prepare"),
+            ("GET", "/auth/browser-logout/preparation"),
+            (
+                "POST",
+                "/v1/projects/example/auth/browser-logout/preparation/confirm",
+            ),
+        ] {
+            let response = runtime
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "partial Block B route was mounted: {method} {path}"
+            );
+            assert!(
+                to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "disabled route should use the ordinary router 404: {method} {path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1835,7 +3199,7 @@ mod tests {
         let body = to_bytes(accepted.into_body(), 1024).await.unwrap();
         assert_eq!(
             &body[..],
-            br#"{"product":"owlauth-server","project_auth":true}"#
+            br#"{"product":"owlauth-server","provisioning":true,"login_readiness":true,"federated_project_auth":false}"#
         );
 
         let noncanonical_id = control

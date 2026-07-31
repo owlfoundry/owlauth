@@ -1,11 +1,13 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::Router;
+use owlauth_types::FEDERATED_PROJECT_AUTH_AVAILABLE;
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::watch, task::JoinSet, time::timeout};
 
 use crate::{
     adapters::{migrations::prepare_schema, postgres::create_pools},
+    application::RuntimeAuthService,
     config::ServerConfig,
     http::{PlaneRouters, build_routers},
 };
@@ -98,6 +100,14 @@ async fn serve_until_shutdown(
     shutdown_timeout: Duration,
 ) -> Result<(), ServerError> {
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let recovery_worker = if should_spawn_provider_recovery(routers.runtime_auth.is_some()) {
+        routers
+            .runtime_auth
+            .clone()
+            .map(|service| tokio::spawn(run_runtime_recovery(service, shutdown_receiver.clone())))
+    } else {
+        None
+    };
     let mut servers = JoinSet::new();
     spawn_selected(
         &mut servers,
@@ -130,18 +140,60 @@ async fn serve_until_shutdown(
         "OwlAuth stopped business admission"
     );
 
+    let recovery_abort = recovery_worker
+        .as_ref()
+        .map(tokio::task::JoinHandle::abort_handle);
     let drained = timeout(shutdown_timeout, async {
         while servers.join_next().await.is_some() {}
+        if let Some(worker) = recovery_worker {
+            let _ = worker.await;
+        }
     })
     .await;
     if drained.is_err() {
         servers.abort_all();
+        if let Some(worker) = recovery_abort {
+            worker.abort();
+        }
         return Err(ServerError::ShutdownTimeout);
     }
     if unexpected_stop {
         return Err(ServerError::Serve);
     }
     Ok(())
+}
+
+const fn should_spawn_provider_recovery(runtime_auth_composed: bool) -> bool {
+    FEDERATED_PROJECT_AUTH_AVAILABLE && runtime_auth_composed
+}
+
+async fn run_runtime_recovery(
+    service: Arc<RuntimeAuthService>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                if service
+                    .recover_abandoned_exchanges(time::Duration::minutes(2), 100)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        event = "provider_exchange_recovery_failed",
+                        "Runtime provider-exchange recovery did not complete"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn spawn_selected(
@@ -170,4 +222,19 @@ async fn shutdown_signal() -> Result<(), ServerError> {
     tokio::signal::ctrl_c()
         .await
         .map_err(|_| ServerError::ShutdownSignal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_federated_auth_cannot_spawn_provider_recovery() {
+        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
+        assert!(!should_spawn_provider_recovery(false));
+        assert!(
+            !should_spawn_provider_recovery(true),
+            "the capability gate must dominate accidentally composed infrastructure"
+        );
+    }
 }

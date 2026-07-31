@@ -72,11 +72,16 @@ sequenceDiagram
     App->>Runtime: Begin generic login(project_id, application_id, redirect_to, PKCE challenge, app_state, optional method hint)
     Runtime->>Core: BeginLogin(command)
     Core->>PG: Validate active Project/Application and exact redirect, snapshot assigned methods, create transaction
-    PG-->>Core: unselected login transaction
+    PG-->>Core: awaiting_browser_binding transaction
     Core-->>Runtime: bounded hosted interaction URL
     Runtime-->>App: hosted authentication URL
     App-->>User: Navigate to hosted authentication
-    User->>Hosted: Open bound interaction and choose provider
+    User->>Hosted: First top-level GET of opaque interaction
+    Hosted->>Runtime: Bind fresh browser credential and issue CSRF state
+    Runtime->>Core: CAS-bind browser to transaction
+    Core->>PG: Move awaiting_browser_binding to awaiting_method_selection
+    Runtime-->>User: Set narrow Runtime interaction cookie and render admitted methods
+    User->>Hosted: Choose provider
     Hosted->>Runtime: Select method with CSRF and expected revision
     Runtime->>Core: CAS-select assigned provider and build authorization
     Core->>PG: Revalidate assignment and transition method once
@@ -102,9 +107,11 @@ sequenceDiagram
 - Project, Application, and redirect entry are active and belong to the same Project. Login start snapshots the bounded set and revisions of currently assigned active provider/email methods; it does not bind or start one method.
 - `redirect_to` is parsed safely and exact-match compared with the selected Application's registered value. Wildcards, prefixes, substring matching, user-info confusion, and redirect chaining are forbidden.
 - Web/native login handoff requires Application-generated PKCE S256. `plain` and omitted challenges are rejected.
-- The upstream provider adapter independently uses provider-side PKCE S256 when supported or required; its verifier is generated only after provider selection, transaction-bound, encrypted at rest, and never reused as the Application verifier.
+- The first restricted OIDC adapter requires provider-side PKCE S256. Its verifier is generated only after provider selection, transaction-bound, encrypted at rest, and never reused as the Application verifier. A future reviewed provider profile may omit provider-side PKCE only when that upstream protocol does not support it; this never makes the OIDC nonce optional.
 - Application-provided state is bounded and retained as integrity-bound ciphertext solely for return; it is never interpreted as authority. An optional method hint affects presentation only and cannot select, enable, or authorize a method.
-- Before selection, the transaction binds Project, Application, exact Application redirect, PKCE challenge, browser interaction, trusted external origin, allowed-method snapshot, CSRF state, and monotonic transaction revision. An explicit same-origin command compare-and-swaps one method from `unselected`; provider selection then binds exact provider configuration/callback/upstream state, while email selection permits address/challenge creation under spec 11.
+- Generic start creates `awaiting_browser_binding` and binds Project, Application, exact Application redirect, PKCE challenge, trusted external origin, allowed-method snapshot, optional presentation hint, and monotonic transaction revision, but no browser, CSRF state, or selected method. This supports both browser-direct and backend-custody Applications without accepting a caller-named browser identity.
+- Only the first top-level Hosted GET of the opaque interaction may compare-and-swap `awaiting_browser_binding` to `awaiting_method_selection`, bind a fresh Runtime-generated browser credential digest, issue same-origin CSRF state, and set the narrow interaction cookie. The bootstrap requires a top-level document navigation and rejects subresources, API fetches, and framed requests. Its navigation may legitimately be cross-origin from the Application; Fetch Metadata is used to distinguish navigation from cross-origin API/subresource traffic, not to require a same-origin initiator. Query values cannot replace the interaction or browser binding. A transaction already bound to another browser fails generically rather than rebinding. All later mutating commands require the bound cookie and same-origin CSRF protections.
+- After browser binding, the transaction binds Project, Application, exact Application redirect, PKCE challenge, browser interaction, trusted external origin, allowed-method snapshot, CSRF state, and monotonic transaction revision. An explicit same-origin command compare-and-swaps one method from `awaiting_method_selection`; provider selection then binds exact provider configuration/callback/upstream state, while email selection permits address/challenge creation under spec 11.
 - Method selection is one-way once provider exchange or email proof state starts. Changing method requires a new login transaction; query/page fields cannot mutate the stored selection.
 - A valid Project browser session may satisfy local authentication for another active Application in the same Project without another provider redirect, but only through the explicit reuse confirmation transition below. It never authenticates another Project.
 - Public identifiers and publishable keys may drive rate/quota policy but cannot bypass these checks.
@@ -127,10 +134,11 @@ Reuse is not an authentication method in the allowed provider/email snapshot and
 
 ### Provider-callback invariants
 
-- The callback route itself identifies the expected Project and provider configuration; callback parameters cannot select another Project/provider.
+- The stable callback route is exactly `projects/{project_public_id}/auth/callback/{provider_key}` relative to the configured Runtime base. The path identifies the expected Project and provider configuration; callback parameters cannot select another Project/provider, and no second alias is accepted.
 - OwlAuth validates upstream state digest, login transaction status, browser binding, provider ID, Project ID, exact callback URI, expiry, and one-use transition.
 - Before the external exchange, PostgreSQL atomically moves a provider-selected transaction from `provider_authorization_started` to `provider_exchange_in_progress`; concurrent callbacks cannot claim it.
-- Provider code exchange uses only the Project's configured client ID, secret reference, transaction-bound provider PKCE verifier where applicable, endpoint allowlist, TLS policy, and timeout. It is not automatically retried after an ambiguous outcome.
+- The OIDC adapter generates a fresh high-entropy nonce only when the provider method wins selection, sends it in the authorization request, stores only its purpose-keyed digest and key version, and requires an exact nonce match in the validated ID token. Missing, duplicate, mismatched, or replayed nonce is terminal; caller input cannot supply it.
+- Provider code exchange uses only the Project's configured client ID, secret reference, the transaction-bound provider PKCE verifier when required by that provider profile, the mandatory transaction-bound OIDC nonce for OIDC, endpoint allowlist, TLS policy, and timeout. The first restricted OIDC profile requires both PKCE S256 and nonce. Exchange is not automatically retried after an ambiguous outcome.
 - Explicit or ambiguous exchange failure moves the transaction to terminal `provider_exchange_failed`; the user starts a new login instead of replaying the provider code.
 - Provider issuer/signature/claims where applicable and stable provider subject are validated by the provider adapter.
 - Local identity lookup uses `(project_id, provider_issuer, provider_subject)`, never email, display name, login name, or avatar URL.
@@ -179,9 +187,28 @@ The final transaction:
 
 Binding/projection, session/family, optional initial event targets, ticket consumption, and audit either commit together or not at all. Signed output prepared from a stale snapshot is discarded. A losing exchange returns a generic expired/invalid handoff result and never receives token material.
 
+## Protocol expiry and revision bounds
+
+The v1 protocol profile uses the fixed server safety bounds below. Only browser-session reuse authentication age and Project access-token lifetime are Project-configurable, within their listed ranges and owning revisions:
+
+| Value | Bound | Authority and revision behavior |
+| --- | --- | --- |
+| Login transaction | 10 minutes from generic start | Captured at creation; no policy change may extend it |
+| Handoff ticket | At most 60 seconds from issue | `expires_at = min(issued_at + 60 seconds, login_transaction.expires_at)`; one-use and bound to current authoritative revisions |
+| Project browser-session idle lifetime | 8 hours | Current activity and Project/user/session-policy revisions are checked |
+| Project browser-session absolute lifetime | 24 hours from authentication | Never extended by activity |
+| Browser-session reuse authentication age | Project-configurable from 0 through 24 hours; default 8 hours | Owned by `session_revision`, captured at start and revalidated at confirmation |
+| Application session and refresh-family absolute lifetime | 30 days | Project/Application/user/browser-session and policy revisions are checked on every refresh |
+| Project access-token lifetime | Current Project claims policy from 60 through 3,600 seconds | Owned by `claims_revision`; exact value is captured for each issuance |
+| Allowed clock skew | Deployment safety bound; default 60 seconds | Applied consistently to provider, token, and protocol-expiry validation |
+| Logout preparation | 60 seconds from issue | Purpose-bound and one-use; cannot outlive the source Application/browser session |
+| Replay evidence | At least the owning session/family lifetime plus allowed skew | Cleanup cannot recreate permission to use an old one-use credential |
+
+A change to either configurable Project value invalidates stale pending work through the owning revision at its next authoritative decision but does not retroactively extend or silently rewrite an expiry. Fixed v1 bounds are not Project policy. A claims-policy reduction cannot shorten the verification overlap required by an access token validly issued under an older policy.
+
 ## Application and browser session model
 
-A Project browser session is bound to Project, user, browser credential, authentication time, and user/Project security revisions. It is intentionally independent of an Application so that multiple Applications in the same Project can share sign-in state.
+A Project browser session is bound to Project, user, browser credential, authentication time, and user/Project security revisions. It is intentionally independent of an Application so that multiple Applications in the same Project can share sign-in state. Authoritative activity is recorded only when fresh provider/email authentication creates or rotates the browser session, or when an explicit eligible browser-session reuse confirmation commits. The commit updates `last_activity_at` monotonically and sets `idle_expires_at` to the earlier of eight hours after that activity and `absolute_expires_at`. Passive Hosted reads, failed commands, Application handoff/current-user/refresh traffic, and background/backend traffic do not extend browser-session idle life.
 
 An Application session is bound to Project, Application, user, Project browser session where applicable, claims revision, and refresh family. Disabling one Application invalidates that Application's handoff tickets, Application sessions, and refresh families but does not log the user out of other Applications or terminate the Project browser session.
 
@@ -223,7 +250,11 @@ The handoff exchange and every successful refresh return the same versioned curr
 
 ## Logout and revocation
 
-- Application logout revokes the selected Application session and refresh family and clears Application-held credentials.
+Application logout and Project browser logout use different credential and DTO classes:
+
+- Application logout is a direct Project-qualified Runtime API command authenticated only by the current Project access token. Runtime derives the exact Project/Application/user/session from verified claims, revokes that Application session and refresh family idempotently, and never accepts a browser cookie or caller-named session as substitute authority. The caller then clears or quarantines its own credentials.
+- Project browser logout begins with a direct preparation command authenticated by the current Project access token. Runtime creates a short-lived, purpose-bound, one-use opaque preparation tied to the exact Project/Application/user/Application session and underlying Project browser session and returns only a top-level Hosted confirmation target.
+- The first eligible top-level Hosted confirmation GET validates the preparation against the matching hardened Project-session cookie, conditionally binds fresh CSRF state to that same browser, and renders no mutation. Its same-origin POST must return that CSRF proof and consumes the preparation in the same transaction that terminates the browser session. A missing/wrong cookie, browser, Project, session, CSRF proof, consumed preparation, or expiry fails generically. The access token is never placed in the Hosted URL, cookie, or page state, and the core SDK returns the target without navigating.
 - Project browser logout atomically marks the current Project browser session terminated. Derived Application access tokens retain offline expiry, but every refresh checks the referenced browser-session status/revision and fails after termination.
 - A user may choose Application-only logout without terminating other Applications in the Project.
 - User disablement invalidates all of that Project user's browser/Application sessions, handoff tickets, and refresh families through the user security revision.
