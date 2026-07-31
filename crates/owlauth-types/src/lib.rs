@@ -104,6 +104,79 @@ mod tests {
     }
 
     #[test]
+    fn every_runtime_rate_limit_response_requires_integer_retry_after_seconds() {
+        let runtime: Value = serde_json::from_str(
+            &export::to_pretty_json(export::OpenApiPlane::Runtime)
+                .expect("Runtime OpenAPI should serialize"),
+        )
+        .expect("exported Runtime OpenAPI should be JSON");
+        let operations = [
+            ("/v1/projects/{project_public_id}/auth/config", "get"),
+            ("/projects/{project_public_id}/.well-known/jwks.json", "get"),
+            ("/v1/projects/{project_public_id}/auth/login/start", "post"),
+            ("/auth/interactions/{interaction}", "get"),
+            (
+                "/v1/projects/{project_public_id}/auth/interactions/{interaction}/method",
+                "post",
+            ),
+            (
+                "/v1/projects/{project_public_id}/auth/interactions/{interaction}/session/reuse",
+                "post",
+            ),
+            (
+                "/projects/{project_public_id}/auth/callback/{provider_key}",
+                "get",
+            ),
+            (
+                "/v1/projects/{project_public_id}/auth/handoff/exchange",
+                "post",
+            ),
+            (
+                "/v1/projects/{project_public_id}/auth/sessions/refresh",
+                "post",
+            ),
+            ("/v1/projects/{project_public_id}/auth/users/me", "get"),
+            (
+                "/v1/projects/{project_public_id}/auth/sessions/logout",
+                "post",
+            ),
+            (
+                "/v1/projects/{project_public_id}/auth/browser-logout/prepare",
+                "post",
+            ),
+            ("/auth/browser-logout/{preparation}", "get"),
+            (
+                "/v1/projects/{project_public_id}/auth/browser-logout/{preparation}/confirm",
+                "post",
+            ),
+        ];
+
+        for (path, method) in operations {
+            let response = &runtime["paths"][path][method]["responses"]["429"];
+            assert!(
+                response.is_object(),
+                "429 response missing for {method} {path}"
+            );
+            let retry_after = &response["headers"]["Retry-After"];
+            assert_eq!(
+                retry_after["schema"]["type"], "integer",
+                "Retry-After must be integer seconds for {method} {path}"
+            );
+            assert_eq!(
+                retry_after["required"], true,
+                "Retry-After must be required for {method} {path}"
+            );
+            assert!(
+                retry_after["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("Required")
+                        && description.contains("whole seconds")),
+                "Retry-After must be documented as required whole seconds for {method} {path}"
+            );
+        }
+    }
+
+    #[test]
     fn public_contracts_are_bounded_and_reject_private_jwk_members() {
         let runtime =
             serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI should serialize");

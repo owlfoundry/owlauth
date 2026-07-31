@@ -4,12 +4,17 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-import { startControlledServices, type ControlledServices } from "./test-services";
+import {
+  startControlledServices,
+  typescriptSdkArtifactDigest,
+  type ControlledServices,
+} from "./test-services";
 
 const operatorKey = `owl_ctrl_v1_${"A".repeat(43)}`;
 
 export default async function globalSetup() {
   const repository = resolve(import.meta.dirname, "../../../..");
+  const typescriptSdkDigest = await typescriptSdkArtifactDigest(repository);
   const temporaryRoot = await mkdtemp(resolve(tmpdir(), "owlauth-browser-e2e-"));
   const runtimePort = await freePort();
   const controlPort = await freePort();
@@ -62,6 +67,7 @@ export default async function globalSetup() {
       OWLAUTH_RUNTIME_KEY_VERSION: "1",
       OWLAUTH_RUNTIME_DIGEST_KEY: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
       OWLAUTH_RUNTIME_PROTECTION_KEY: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+      OWLAUTH_ADMISSION_DIGEST_KEY: "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
       OWLAUTH_PROVIDER_ALLOWED_ORIGINS: services.providerOrigin,
       OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK: "true",
       OWLAUTH_RUNTIME_BASE_URL: runtimeBase,
@@ -99,6 +105,7 @@ export default async function globalSetup() {
     process.env["OWLAUTH_E2E_APPLICATION_ORIGIN"] = services.applicationOrigin;
     process.env["OWLAUTH_E2E_BROWSER_DRIVER_URL"] = services.browserDriverUrl;
     process.env["OWLAUTH_E2E_BROWSER_DRIVER_TOKEN"] = services.browserDriverToken;
+    process.env["OWLAUTH_E2E_TYPESCRIPT_SDK_DIGEST"] = typescriptSdkDigest;
   } catch (error) {
     runtimeServer?.kill("SIGTERM");
     controlServer?.kill("SIGTERM");

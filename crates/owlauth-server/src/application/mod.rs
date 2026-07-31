@@ -1,3 +1,4 @@
+mod admission;
 #[allow(
     dead_code,
     reason = "the HTTP-free authentication repository slice precedes Runtime composition"
@@ -17,6 +18,13 @@ mod runtime_security;
 mod session_authority;
 mod unit_of_work;
 
+#[cfg(test)]
+pub(crate) use admission::MonotonicClock;
+pub(crate) use admission::{
+    AdmissionBucket, AdmissionDecision, AdmissionDimension, AdmissionDimensionKind,
+    AdmissionEndpoint, AdmissionRejectionReason, AdmissionService, DistributedAdmissionCounter,
+    DistributedAdmissionError,
+};
 pub(crate) use authentication::{
     AdmittedProviderMethod, AuthenticationRepository, BindHostedBrowser, ClaimProviderCallback,
     ClaimedProviderExchange, CreateLoginTransaction, FailProviderExchange, LoginRevisionSnapshot,

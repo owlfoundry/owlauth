@@ -475,6 +475,16 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
         };
     };
     get_hosted_interaction: {
@@ -505,6 +515,16 @@ export interface operations {
             };
             409: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -554,6 +574,16 @@ export interface operations {
             };
             404: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -610,6 +640,16 @@ export interface operations {
             };
             409: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -695,6 +735,16 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
         };
     };
     prepare_browser_logout: {
@@ -718,6 +768,16 @@ export interface operations {
             };
             401: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -771,6 +831,16 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -814,6 +884,16 @@ export interface operations {
             };
             409: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -878,6 +958,16 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
         };
     };
     confirm_session_reuse: {
@@ -914,6 +1004,16 @@ export interface operations {
             };
             409: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -961,6 +1061,16 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -992,6 +1102,16 @@ export interface operations {
             };
             401: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1047,6 +1167,16 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -1078,6 +1208,16 @@ export interface operations {
             };
             401: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {

@@ -13,6 +13,7 @@ use reqwest::{Client, StatusCode};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
+use tokio::sync::Semaphore;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -45,6 +46,7 @@ const MAX_PICTURE_BYTES: usize = 2048;
 const MAX_AUDIENCES: usize = 8;
 const MAX_ID_TOKEN_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 const REQUIRED_CLOCK_SKEW_SECONDS: i64 = 60;
+const PROVIDER_EXCHANGE_CONCURRENCY_LIMIT: usize = 16;
 
 /// A deliberately narrow OIDC client. Every issuer and endpoint origin must be explicitly
 /// admitted when the client is constructed; the HTTP client follows no redirects and reads no
@@ -53,6 +55,7 @@ const REQUIRED_CLOCK_SKEW_SECONDS: i64 = 60;
 pub(crate) struct RestrictedOidcProviderClient {
     http: Client,
     endpoint_policy: Arc<EndpointPolicy>,
+    exchange_budget: Arc<Semaphore>,
 }
 
 impl RestrictedOidcProviderClient {
@@ -68,6 +71,7 @@ impl RestrictedOidcProviderClient {
             allowed_endpoint_origins,
             allow_http_loopback,
             REQUEST_TIMEOUT,
+            PROVIDER_EXCHANGE_CONCURRENCY_LIMIT,
         )
     }
 
@@ -75,6 +79,7 @@ impl RestrictedOidcProviderClient {
         allowed_endpoint_origins: I,
         allow_http_loopback: bool,
         request_timeout: Duration,
+        exchange_concurrency_limit: usize,
     ) -> Result<Self, ProviderExchangeError>
     where
         I: IntoIterator<Item = S>,
@@ -88,16 +93,25 @@ impl RestrictedOidcProviderClient {
             .no_proxy()
             .build()
             .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?;
+        if exchange_concurrency_limit == 0 {
+            return Err(ProviderExchangeError::UnavailableBeforeDispatch);
+        }
         Ok(Self {
             http,
             endpoint_policy: Arc::new(endpoint_policy),
+            exchange_budget: Arc::new(Semaphore::new(exchange_concurrency_limit)),
         })
     }
 
     #[cfg(test)]
     fn for_loopback_tests(origin: &str) -> Self {
-        Self::build([origin], true, Duration::from_millis(250))
-            .expect("loopback test origin must be valid")
+        Self::for_loopback_tests_with_exchange_limit(origin, PROVIDER_EXCHANGE_CONCURRENCY_LIMIT)
+    }
+
+    #[cfg(test)]
+    fn for_loopback_tests_with_exchange_limit(origin: &str, limit: usize) -> Self {
+        Self::build([origin], true, Duration::from_millis(250), limit)
+            .expect("loopback test origin and concurrency limit must be valid")
     }
 
     async fn discover(
@@ -293,6 +307,12 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
         request: ProviderCallbackRequest,
     ) -> Result<ProviderIdentity, ProviderExchangeError> {
         validate_callback_request(&request, &self.endpoint_policy)?;
+        // Provider exchange capacity is deliberately process-local and fail-fast. Waiting for a
+        // permit would create an unbounded queue behind a slow or unavailable provider.
+        let _permit = self
+            .exchange_budget
+            .try_acquire()
+            .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?;
         let discovery = self
             .discover(
                 &request.issuer,

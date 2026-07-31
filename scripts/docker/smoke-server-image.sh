@@ -36,13 +36,17 @@ docker run --detach \
   --env POSTGRES_PASSWORD=owlauth_smoke \
   "$postgres_image" >/dev/null
 
+# The official image's temporary initialization server accepts Unix-socket probes before
+# the final TCP server is ready. Probe TCP explicitly so OwlAuth cannot race that handoff.
 for _ in {1..60}; do
-  if docker exec "$database_container" pg_isready --username owlauth --dbname owlauth >/dev/null 2>&1; then
+  if docker exec "$database_container" \
+    pg_isready --host 127.0.0.1 --username owlauth --dbname owlauth >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-if ! docker exec "$database_container" pg_isready --username owlauth --dbname owlauth >/dev/null 2>&1; then
+if ! docker exec "$database_container" \
+  pg_isready --host 127.0.0.1 --username owlauth --dbname owlauth >/dev/null 2>&1; then
   printf 'smoke-test PostgreSQL did not become ready\n' >&2
   docker logs "$database_container" >&2
   exit 1
@@ -60,6 +64,7 @@ docker run --detach \
   --env OWLAUTH_RUNTIME_KEY_VERSION=1 \
   --env OWLAUTH_RUNTIME_DIGEST_KEY=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM \
   --env OWLAUTH_RUNTIME_PROTECTION_KEY=BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ \
+  --env OWLAUTH_ADMISSION_DIGEST_KEY=BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU \
   --env OWLAUTH_PROVIDER_ALLOWED_ORIGINS=https://provider.smoke.invalid/ \
   --env OWLAUTH_RUNTIME_PROCESS_ID=smoke-runtime \
   "$image" >/dev/null

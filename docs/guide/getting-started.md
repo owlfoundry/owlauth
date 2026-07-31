@@ -50,7 +50,7 @@ Start the disposable development infrastructure:
 make dev-up
 ```
 
-OwlAuth rejects unknown `OWLAUTH_*` variables and validates selected-plane database, listener, key-store, Runtime protection, provider egress, and Control credential configuration before binding. The complete variable reference and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration).
+OwlAuth rejects unknown `OWLAUTH_*` variables and validates selected-plane database, listener, key-store, Runtime protection, provider egress, admission, and Control credential configuration before binding. Runtime admission requires a stable admission-only digest key, uses optional Redis coordination, and gates every accepted request through a process-bounded local share; set `OWLAUTH_RUNTIME_MAX_PROCESSES` to a conservative deployment maximum rather than the current replica count. The complete variable reference, Redis namespace/deadline settings, and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration).
 
 For the fastest executable proof of a correctly provisioned topology, run:
 

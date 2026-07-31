@@ -7,11 +7,13 @@ import {
   verify,
   type KeyObject,
 } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { resolve, sep } from "node:path";
 
 import { chromium, firefox } from "@playwright/test";
+
+import { BrowserEvidence, type BrowserEvidenceSnapshot } from "./browser-evidence";
 
 const PROVIDER_CLIENT_ID = "owlauth-browser-e2e";
 const PROVIDER_CLIENT_SECRET = "controlled-provider-secret";
@@ -58,6 +60,37 @@ interface BackendSession {
   readonly runtimeBase: string;
 }
 
+interface BrowserDriverResult {
+  readonly callbackUrl: string;
+  readonly evidence: BrowserEvidenceSnapshot;
+  readonly runId: string;
+}
+
+export async function typescriptSdkArtifactDigest(repository: string): Promise<string> {
+  const root = resolve(repository, "sdks/typescript/dist");
+  const hash = createHash("sha256");
+
+  async function visit(directory: string, prefix: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await visit(resolve(directory, entry.name), relative);
+      } else if (entry.isFile()) {
+        const content = await readFile(resolve(directory, entry.name));
+        hash.update(`${relative}\0${String(content.byteLength)}\0`);
+        hash.update(content);
+      } else {
+        throw new Error(`unsupported TypeScript SDK artifact entry: ${relative}`);
+      }
+    }
+  }
+
+  await visit(root, "");
+  return hash.digest("hex");
+}
+
 export interface ControlledServices {
   readonly applicationOrigin: string;
   readonly browserDriverToken: string;
@@ -74,9 +107,12 @@ export async function startControlledServices(
   applicationPort: number,
   runtimePort: number,
 ): Promise<ControlledServices> {
-  const providerBase = `http://127.0.0.1:${String(providerPort)}`;
+  // Keep browser cookie sites distinct from Runtime's 127.0.0.1 host. Cookies do not
+  // honor port boundaries, so reusing that host would leak Runtime cookies to the
+  // controlled provider and Application despite their different origins.
+  const providerBase = `http://[::1]:${String(providerPort)}`;
   const providerIssuer = `${providerBase}/`;
-  const applicationOrigin = `http://127.0.0.1:${String(applicationPort)}`;
+  const applicationOrigin = `http://localhost:${String(applicationPort)}`;
   const runtimeOrigin = `http://127.0.0.1:${String(runtimePort)}`;
   const browserDriverToken = opaque(32);
   const provider = createControlledProvider(providerBase, providerIssuer);
@@ -86,7 +122,10 @@ export async function startControlledServices(
     browserDriverToken,
     runtimeOrigin,
   );
-  await Promise.all([listen(provider, providerPort), listen(application, applicationPort)]);
+  await Promise.all([
+    listen(provider, providerPort, "::1"),
+    listen(application, applicationPort, "localhost"),
+  ]);
   return {
     applicationOrigin,
     browserDriverToken,
@@ -104,6 +143,8 @@ function createControlledProvider(origin: string, issuer: string) {
   const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const publicJwk = publicKey.export({ format: "jwk" });
   const grants = new Map<string, AuthorizationGrant>();
+  let authorizationRequests = 0;
+  let tokenRequests = 0;
 
   return createServer((request, response) => {
     void (async () => {
@@ -139,7 +180,15 @@ function createControlledProvider(origin: string, issuer: string) {
           });
           return;
         }
+        if (request.method === "GET" && url.pathname === "/__e2e/request-counts") {
+          json(response, 200, {
+            authorization_requests: authorizationRequests,
+            token_requests: tokenRequests,
+          });
+          return;
+        }
         if (request.method === "GET" && url.pathname === "/authorize") {
+          authorizationRequests += 1;
           const parameters = requiredParameters(url, [
             "client_id",
             "code_challenge",
@@ -175,6 +224,7 @@ function createControlledProvider(origin: string, issuer: string) {
           return;
         }
         if (request.method === "POST" && url.pathname === "/token") {
+          tokenRequests += 1;
           const form = new URLSearchParams(await body(request));
           const code = form.get("code") ?? "";
           const grant = grants.get(code);
@@ -230,6 +280,7 @@ function createApplicationServer(
 ) {
   const pending = new Map<string, PendingBackendLogin>();
   const sessions = new Map<string, BackendSession>();
+  const sdkBrowserEvidence = new Map<string, BrowserEvidenceSnapshot[]>();
   const sdkRoot = resolve(repository, "sdks/typescript/dist");
 
   return createServer((request, response) => {
@@ -273,8 +324,25 @@ function createApplicationServer(
             json(response, 401, { error: "unauthorized" });
             return;
           }
-          const callbackUrl = await driveBrowserJourney(await body(request), origin, runtimeOrigin);
-          json(response, 200, { callbackUrl });
+          const driven = await driveBrowserJourney(await body(request), origin, runtimeOrigin);
+          const runEvidence = sdkBrowserEvidence.get(driven.runId) ?? [];
+          if (runEvidence.length >= 8) throw new Error("browser-driver evidence run is full");
+          runEvidence.push(driven.evidence);
+          sdkBrowserEvidence.set(driven.runId, runEvidence);
+          // Keep the SDK driver's public response contract deliberately unchanged.
+          json(response, 200, { callbackUrl: driven.callbackUrl });
+          return;
+        }
+        if (request.method === "POST" && url.pathname === "/sdk/browser-evidence/drain") {
+          if (request.headers.authorization !== `Bearer ${browserDriverToken}`) {
+            json(response, 401, { error: "unauthorized" });
+            return;
+          }
+          const document = parseObject(await body(request));
+          const runId = evidenceRunId(document["runId"]);
+          const evidence = sdkBrowserEvidence.get(runId) ?? [];
+          sdkBrowserEvidence.delete(runId);
+          json(response, 200, { evidence });
           return;
         }
         if (request.method === "GET" && url.pathname === "/backend/start") {
@@ -448,12 +516,9 @@ async function driveBrowserJourney(
   document: string,
   applicationOrigin: string,
   runtimeOrigin: string,
-): Promise<string> {
-  const parsed = JSON.parse(document) as unknown;
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("invalid browser-driver document");
-  }
-  const request = parsed as Record<string, unknown>;
+): Promise<BrowserDriverResult> {
+  const request = parseObject(document);
+  const runId = evidenceRunId(request["evidenceRunId"]);
   const hostedUrl = boundedUrl(request["hostedUrl"]);
   const redirectUri = boundedUrl(request["redirectUri"]);
   const providerKey = request["providerKey"];
@@ -471,6 +536,7 @@ async function driveBrowserJourney(
   const browser = await browserTypes[browserName].launch({ headless: true });
   try {
     const context = await browser.newContext();
+    const evidence = await BrowserEvidence.create(context);
     const page = await context.newPage();
     await page.goto(hostedUrl.href, { waitUntil: "networkidle" });
     const providerButton = page.getByRole("button", {
@@ -500,10 +566,25 @@ async function driveBrowserJourney(
     ) {
       throw new Error("invalid Application callback");
     }
-    return finalUrl.href;
+    return { callbackUrl: finalUrl.href, evidence: await evidence.snapshot(), runId };
   } finally {
     await browser.close();
   }
+}
+
+function parseObject(document: string): Record<string, unknown> {
+  const parsed = JSON.parse(document) as unknown;
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("invalid JSON object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function evidenceRunId(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{16,128}$/u.test(value)) {
+    throw new Error("invalid browser evidence run ID");
+  }
+  return value;
 }
 
 function boundedUrl(value: unknown): URL {
@@ -607,9 +688,11 @@ function browserApplication(): string {
 <body><main><h1>Browser-direct Application</h1><p id="status" role="status">Ready</p>
 <button id="start">Start browser sign-in</button><button id="current" disabled>Read current user</button>
 <button id="refresh" disabled>Refresh session</button><button id="logout" disabled>Application logout</button>
+<button id="browser-logout" disabled>Project browser logout</button>
+<button id="verify-browser-logout" disabled>Verify browser logout</button>
 <output id="result"></output></main>
 <script type="module">
-import { Client } from "/sdk/index.js";
+import { Client, OwlAuthError } from "/sdk/index.js";
 const parameters = new URL(location.href).searchParams;
 const client = new Client({
   baseUrl: parameters.get("runtime"), projectId: parameters.get("project"),
@@ -621,14 +704,33 @@ let credentials;
 const callbackChannel = new BroadcastChannel("owlauth-e2e-callback");
 const status = document.querySelector("#status");
 const result = document.querySelector("#result");
-const setEnabled = (enabled) => { for (const id of ["current", "refresh", "logout"]) document.querySelector("#" + id).disabled = !enabled; };
+const setSessionEnabled = (enabled) => {
+  for (const id of ["current", "refresh", "logout", "browser-logout"])
+    document.querySelector("#" + id).disabled = !enabled;
+};
+const assertCredentialsAreMemoryOnly = async (candidate) => {
+  const surfaces = [location.href, document.documentElement.outerHTML, localStorage, sessionStorage];
+  for (const storage of surfaces.slice(2)) {
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      surfaces.push(key ?? "", key === null ? "" : storage.getItem(key) ?? "");
+    }
+  }
+  const serialized = surfaces.slice(0, 2).join("\\n") + surfaces.slice(4).join("\\n");
+  for (const secret of [candidate.accessToken.expose(), candidate.refreshToken.expose()]) {
+    if (serialized.includes(secret)) throw new Error("credential escaped caller memory");
+  }
+  if ((await caches.keys()).length !== 0) throw new Error("credential cache is not empty");
+  if (typeof indexedDB.databases === "function" && (await indexedDB.databases()).length !== 0)
+    throw new Error("credential database is not empty");
+};
 document.querySelector("#start").addEventListener("click", async () => {
   const popup = window.open("about:blank", "owlauth-hosted", "popup,width=720,height=700");
   if (popup === null) throw new Error("popup unavailable");
   try {
     const configuration = await client.getPublicConfiguration();
     if (!configuration.loginAvailable || configuration.providers.length !== 1) throw new Error("login unavailable");
-    const started = await client.beginLogin({ redirectUri: location.origin + "/browser/callback", presentationHint: "controlled-provider" });
+    const started = await client.beginLogin({ redirectUri: location.origin + "/browser/callback" });
     pending = started.pending;
     status.textContent = "Waiting for Hosted Authentication";
     popup.location.replace(started.hostedUrl);
@@ -642,9 +744,10 @@ callbackChannel.addEventListener("message", async (event) => {
   credentials = await client.completeLogin(event.data.url, pending);
   pending = undefined;
   history.replaceState({}, "", location.pathname + location.search);
+  await assertCredentialsAreMemoryOnly(credentials);
   status.textContent = "Browser session ready";
   result.textContent = "generation " + credentials.refreshGeneration;
-  setEnabled(true);
+  setSessionEnabled(true);
 });
 document.querySelector("#current").addEventListener("click", async () => {
   const user = await client.currentUser(credentials.accessToken);
@@ -655,14 +758,44 @@ document.querySelector("#refresh").addEventListener("click", async () => {
   const successor = await client.refresh(credentials);
   if (successor.refreshGeneration <= credentials.refreshGeneration) throw new Error("refresh did not advance");
   credentials = successor;
+  await assertCredentialsAreMemoryOnly(credentials);
   status.textContent = "Credentials replaced atomically";
   result.textContent = "generation " + credentials.refreshGeneration;
 });
 document.querySelector("#logout").addEventListener("click", async () => {
   await client.logoutApplication(credentials.accessToken);
   credentials = undefined;
-  setEnabled(false);
+  setSessionEnabled(false);
   status.textContent = "Application session ended";
+  result.textContent = "";
+});
+document.querySelector("#browser-logout").addEventListener("click", async () => {
+  const popup = window.open("about:blank", "owlauth-browser-logout", "popup,width=720,height=700");
+  if (popup === null) throw new Error("popup unavailable");
+  try {
+    const prepared = await client.prepareBrowserLogout(credentials.accessToken);
+    await assertCredentialsAreMemoryOnly(credentials);
+    setSessionEnabled(false);
+    document.querySelector("#verify-browser-logout").disabled = false;
+    status.textContent = "Waiting for browser logout confirmation";
+    popup.location.replace(prepared.hostedUrl);
+  } catch (error) {
+    popup.close();
+    throw error;
+  }
+});
+document.querySelector("#verify-browser-logout").addEventListener("click", async () => {
+  if (credentials === undefined) throw new Error("caller credential state unavailable");
+  try {
+    await client.refresh(credentials);
+    throw new Error("refresh unexpectedly succeeded after browser logout");
+  } catch (error) {
+    if (!(error instanceof OwlAuthError) || error.operation !== "refresh" ||
+        error.category !== "Refresh" || error.action !== "invalidate_credentials") throw error;
+  }
+  credentials = undefined;
+  document.querySelector("#verify-browser-logout").disabled = true;
+  status.textContent = "Browser logout confirmed; refresh rejected; caller state cleared";
   result.textContent = "";
 });
 </script></body></html>`;
@@ -881,10 +1014,14 @@ function redirect(response: ServerResponse, location: string): void {
   response.end();
 }
 
-function listen(server: ReturnType<typeof createServer>, port: number): Promise<void> {
+function listen(
+  server: ReturnType<typeof createServer>,
+  port: number,
+  host: string,
+): Promise<void> {
   return new Promise((resolveListen, reject) => {
     server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolveListen);
+    server.listen(port, host, resolveListen);
   });
 }
 

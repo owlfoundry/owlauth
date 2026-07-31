@@ -21,6 +21,7 @@ hmac = "0.12.1"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
 owlauth-types = { version = "=0.0.2", path = "../owlauth-types" }
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "rustls", "stream"] }
+redis = { version = "0.32.7", default-features = false, features = ["connection-manager", "script", "tokio-rustls-comp"] }
 rust-embed = { version = "8.11.0", features = ["debug-embed", "include-exclude"] }
 sea-orm = { version = "2.0.0", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
 serde = { version = "1.0.229", features = ["derive"] }

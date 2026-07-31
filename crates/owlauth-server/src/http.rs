@@ -1,9 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -11,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
@@ -40,6 +41,7 @@ use crate::{
             runtime_authority::PostgresRuntimeAuthorityRepository,
             session_authority::PostgresSessionAuthorityRepository,
         },
+        redis_admission::RedisAdmissionCounter,
         runtime_security::{
             EncryptedFileProviderSecretResolver, EncryptedFileRuntimeSigner, RuntimeKeyMaterial,
             SoftwareRuntimeProtector,
@@ -48,11 +50,12 @@ use crate::{
         system::{Sha256RequestDigester, SystemClock, SystemEntropy},
     },
     application::{
-        self, ApplicationError, BeginLogin, ConfirmProjectBrowserLogout, ConfirmSessionReuse,
-        ControlLifecycleService, CreateApplication, CreateProject, CreateProvider, ExchangeHandoff,
-        ProviderCallback, ProvisioningInfrastructure, ProvisioningService, ReadinessService,
-        RefreshSession, ReplaceApplicationConfiguration, RuntimeAuthService, SelectProvider,
-        UpdateApplication, UpdateProject, UpdateProjectPolicy,
+        self, AdmissionDecision, AdmissionDimension, AdmissionDimensionKind, AdmissionEndpoint,
+        AdmissionService, ApplicationError, BeginLogin, ConfirmProjectBrowserLogout,
+        ConfirmSessionReuse, ControlLifecycleService, CreateApplication, CreateProject,
+        CreateProvider, ExchangeHandoff, ProviderCallback, ProvisioningInfrastructure,
+        ProvisioningService, ReadinessService, RefreshSession, ReplaceApplicationConfiguration,
+        RuntimeAuthService, SelectProvider, UpdateApplication, UpdateProject, UpdateProjectPolicy,
     },
     config::{ListenerConfig, OperatorApiKey, ServerConfig},
     domain::ApplicationType,
@@ -83,6 +86,8 @@ struct ProbeState {
 #[derive(Clone)]
 struct RuntimeState {
     probe: ProbeState,
+    admission: Arc<AdmissionService>,
+    verified_origins: Arc<VerifiedApplicationOrigins>,
     readiness: Option<Arc<ReadinessService>>,
     auth: Option<Arc<RuntimeAuthService>>,
     cookie_path: Arc<str>,
@@ -153,6 +158,8 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
                     base_path: Arc::from(config.runtime.external_base.path()),
                 },
                 readiness,
+                admission: build_runtime_admission(config),
+                verified_origins: Arc::new(VerifiedApplicationOrigins::default()),
                 auth: runtime_auth.clone(),
                 cookie_path: Arc::from(config.runtime.external_base.path()),
                 external_origin: Arc::from(
@@ -252,6 +259,25 @@ fn build_provisioning_service(
             Sha256RequestDigester,
             config.provider_allow_http_loopback,
         ),
+    ))
+}
+
+fn build_runtime_admission(config: &ServerConfig) -> Arc<AdmissionService> {
+    let admission = config
+        .admission
+        .as_ref()
+        .expect("validated Runtime configuration has admission settings");
+    let distributed = admission.redis_url.as_ref().map(|url| {
+        Arc::new(
+            RedisAdmissionCounter::new(url.expose(), admission.redis_timeout)
+                .expect("validated Redis admission URL"),
+        ) as Arc<dyn application::DistributedAdmissionCounter>
+    });
+    Arc::new(AdmissionService::new(
+        admission.namespace.clone(),
+        admission.digest_key.expose_copy(),
+        admission.maximum_processes.get(),
+        distributed,
     ))
 }
 
@@ -536,6 +562,18 @@ fn control_lifecycle_router() -> Router<ControlState> {
         )
 }
 
+#[derive(Clone)]
+struct ClientAddress(String);
+
+async fn attach_client_address(mut request: Request, next: Next) -> Response {
+    let address = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map_or_else(|| "127.0.0.1".to_owned(), |peer| peer.0.ip().to_string());
+    request.extensions_mut().insert(ClientAddress(address));
+    next.run(request).await
+}
+
 fn mount_and_bound(
     listener: &ListenerConfig,
     router: Router,
@@ -577,6 +615,7 @@ fn bound(
         ))
         .layer(ConcurrencyLimitLayer::new(concurrency))
         .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn(attach_client_address))
 }
 
 async fn runtime_root(State(state): State<RuntimeState>) -> Redirect {
@@ -597,6 +636,156 @@ fn runtime_document_error(state: &RuntimeState, title: &str, message: &str) -> R
             ("owlauth-runtime-bootstrap", &serialized),
         ],
     )
+}
+
+async fn admit_runtime(
+    state: &RuntimeState,
+    client: &ClientAddress,
+    endpoint: AdmissionEndpoint,
+    dimensions: &[AdmissionDimension<'_>],
+    request_id: &str,
+) -> Result<(), Response> {
+    match state.admission.admit(endpoint, &client.0, dimensions).await {
+        AdmissionDecision::Allowed => Ok(()),
+        AdmissionDecision::Rejected {
+            retry_after_seconds,
+            ..
+        } => {
+            let mut response = runtime_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "The Runtime request rate limit was exceeded.",
+                request_id,
+            );
+            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            Err(response)
+        }
+    }
+}
+
+const VERIFIED_ORIGIN_CAPACITY: usize = 1024;
+const VERIFIED_ORIGIN_TTL: Duration = Duration::from_mins(5);
+
+#[derive(Clone, Copy)]
+enum VerifiedOriginSubject<'a> {
+    Application {
+        project_public_id: &'a str,
+        application_public_id: &'a str,
+    },
+    Credential {
+        project_public_id: &'a str,
+        credential: &'a str,
+    },
+}
+
+struct VerifiedOriginEntry {
+    fingerprint: [u8; 32],
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct VerifiedApplicationOrigins {
+    entries: Mutex<VecDeque<VerifiedOriginEntry>>,
+}
+
+impl VerifiedApplicationOrigins {
+    fn remember(&self, subject: VerifiedOriginSubject<'_>, origin: &str) {
+        let fingerprint = verified_origin_fingerprint(subject, origin);
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| entry.expires_at > now && entry.fingerprint != fingerprint);
+        while entries.len() >= VERIFIED_ORIGIN_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back(VerifiedOriginEntry {
+            fingerprint,
+            expires_at: now + VERIFIED_ORIGIN_TTL,
+        });
+    }
+
+    fn contains(&self, subject: VerifiedOriginSubject<'_>, origin: &str) -> bool {
+        let fingerprint = verified_origin_fingerprint(subject, origin);
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|entry| entry.expires_at > now);
+        entries.iter().any(|entry| entry.fingerprint == fingerprint)
+    }
+}
+
+fn verified_origin_fingerprint(subject: VerifiedOriginSubject<'_>, origin: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    match subject {
+        VerifiedOriginSubject::Application {
+            project_public_id,
+            application_public_id,
+        } => {
+            digest.update(b"application\0");
+            update_length_prefixed(&mut digest, project_public_id);
+            update_length_prefixed(&mut digest, application_public_id);
+        }
+        VerifiedOriginSubject::Credential {
+            project_public_id,
+            credential,
+        } => {
+            digest.update(b"credential\0");
+            update_length_prefixed(&mut digest, project_public_id);
+            update_length_prefixed(&mut digest, credential);
+        }
+    }
+    update_length_prefixed(&mut digest, origin);
+    digest.finalize().into()
+}
+
+fn update_length_prefixed(digest: &mut Sha256, value: &str) {
+    digest.update(value.len().to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+async fn admit_runtime_with_verified_cors(
+    state: &RuntimeState,
+    client: &ClientAddress,
+    endpoint: AdmissionEndpoint,
+    dimensions: &[AdmissionDimension<'_>],
+    headers: &HeaderMap,
+    subject: VerifiedOriginSubject<'_>,
+    request_id: &str,
+) -> Result<(), Response> {
+    admit_runtime(state, client, endpoint, dimensions, request_id)
+        .await
+        .map_err(|response| {
+            apply_verified_admission_cors(&state.verified_origins, headers, subject, response)
+        })
+}
+
+fn apply_verified_admission_cors(
+    verified_origins: &VerifiedApplicationOrigins,
+    headers: &HeaderMap,
+    subject: VerifiedOriginSubject<'_>,
+    mut response: Response,
+) -> Response {
+    append_vary_origin(&mut response);
+    if let Ok(Some(origin)) = request_origin(headers)
+        && verified_origins.contains(subject, &origin)
+    {
+        apply_cors(&mut response, &origin, false);
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("Retry-After"),
+        );
+    }
+    response
+}
+
+fn admission_dimension(kind: AdmissionDimensionKind, value: &str) -> AdmissionDimension<'_> {
+    AdmissionDimension { kind, value }
 }
 
 async fn runtime_asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
@@ -657,10 +846,31 @@ async fn runtime_preflight(
 async fn start_login(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::LoginStartRequest>,
 ) -> Response {
+    if let Err(response) = admit_runtime_with_verified_cors(
+        &state,
+        &client,
+        AdmissionEndpoint::LoginStart,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Application, &request.application_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &request.publishable_key),
+        ],
+        &headers,
+        VerifiedOriginSubject::Application {
+            project_public_id: &project_public_id,
+            application_public_id: &request.application_id,
+        },
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let cors_origin = match application_cors_origin(
         &state,
         &headers,
@@ -702,6 +912,7 @@ async fn start_login(
 async fn hosted_interaction_shell(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(interaction): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -712,6 +923,20 @@ async fn hosted_interaction_shell(
             "Hosted authentication must start from a top-level document navigation.",
             &request_id,
         );
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::HostedInteraction,
+        &[admission_dimension(
+            AdmissionDimensionKind::Credential,
+            &interaction,
+        )],
+        &request_id,
+    )
+    .await
+    {
+        return response;
     }
     let Ok(interaction_cookie) = interaction_cookie_name(&interaction) else {
         return runtime_document_error(
@@ -794,12 +1019,28 @@ async fn hosted_interaction_shell(
 async fn select_provider_method(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::SelectProviderRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::ProviderSelection,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+            admission_dimension(AdmissionDimensionKind::Provider, &request.provider_key),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -824,12 +1065,27 @@ async fn select_provider_method(
 async fn reuse_browser_session(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::ConfirmSessionReuseRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::SessionReuse,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -873,10 +1129,27 @@ struct ProviderCallbackQuery {
 
 async fn provider_callback(
     State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, provider_key)): Path<(String, String)>,
     Query(query): Query<ProviderCallbackQuery>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::ProviderCallback,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Provider, &provider_key),
+            admission_dimension(AdmissionDimensionKind::Credential, &query.state),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let Ok(interaction_cookie) = interaction_cookie_name(&query.state) else {
         return runtime_document_error(
             &state,
@@ -943,10 +1216,31 @@ async fn provider_callback(
 async fn exchange_handoff(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::HandoffExchangeRequest>,
 ) -> Response {
+    if let Err(response) = admit_runtime_with_verified_cors(
+        &state,
+        &client,
+        AdmissionEndpoint::HandoffExchange,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Application, &request.application_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &request.handoff),
+        ],
+        &headers,
+        VerifiedOriginSubject::Application {
+            project_public_id: &project_public_id,
+            application_public_id: &request.application_id,
+        },
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let cors_origin = match application_cors_origin(
         &state,
         &headers,
@@ -983,10 +1277,31 @@ async fn exchange_handoff(
 async fn refresh_session(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::RefreshRequest>,
 ) -> Response {
+    if let Err(response) = admit_runtime_with_verified_cors(
+        &state,
+        &client,
+        AdmissionEndpoint::Refresh,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Application, &request.application_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &request.refresh_token),
+        ],
+        &headers,
+        VerifiedOriginSubject::Application {
+            project_public_id: &project_public_id,
+            application_public_id: &request.application_id,
+        },
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let cors_origin = match application_cors_origin(
         &state,
         &headers,
@@ -1022,17 +1337,37 @@ async fn refresh_session(
 async fn current_user(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let Ok(token) = bearer_token(&headers) else {
+        return unauthorized_runtime(&request_id);
+    };
+    if let Err(response) = admit_runtime_with_verified_cors(
+        &state,
+        &client,
+        AdmissionEndpoint::CurrentUser,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &token),
+        ],
+        &headers,
+        VerifiedOriginSubject::Credential {
+            project_public_id: &project_public_id,
+            credential: &token,
+        },
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let cors_origin =
         match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
             Ok(origin) => origin,
             Err(response) => return response,
         };
-    let Ok(token) = bearer_token(&headers) else {
-        return unauthorized_runtime(&request_id);
-    };
     let result = match runtime_auth(&state) {
         Ok(service) => match service.current_user(&token).await {
             Ok(current) => {
@@ -1051,6 +1386,12 @@ async fn current_user(
                 if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
                     Err(ApplicationError::NotFound)
                 } else {
+                    remember_verified_credential_origin(
+                        &state,
+                        &project_public_id,
+                        &token,
+                        cors_origin.as_deref(),
+                    );
                     user_projection(current.projection_document).map(|projection| {
                         runtime_types::CurrentUserResponse {
                             project_id: current.project_public_id,
@@ -1078,17 +1419,37 @@ async fn current_user(
 async fn logout_application_session(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let Ok(token) = bearer_token(&headers) else {
+        return unauthorized_runtime(&request_id);
+    };
+    if let Err(response) = admit_runtime_with_verified_cors(
+        &state,
+        &client,
+        AdmissionEndpoint::ApplicationLogout,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &token),
+        ],
+        &headers,
+        VerifiedOriginSubject::Credential {
+            project_public_id: &project_public_id,
+            credential: &token,
+        },
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let cors_origin =
         match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
             Ok(origin) => origin,
             Err(response) => return response,
         };
-    let Ok(token) = bearer_token(&headers) else {
-        return unauthorized_runtime(&request_id);
-    };
     let result = match runtime_auth(&state) {
         Ok(service) => match service.application_logout_target(&token).await {
             Ok(current) => {
@@ -1107,6 +1468,12 @@ async fn logout_application_session(
                 if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
                     Err(ApplicationError::NotFound)
                 } else {
+                    remember_verified_credential_origin(
+                        &state,
+                        &project_public_id,
+                        &token,
+                        cors_origin.as_deref(),
+                    );
                     service
                         .logout_application(current)
                         .await
@@ -1127,17 +1494,37 @@ async fn logout_application_session(
 async fn prepare_browser_logout(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let Ok(token) = bearer_token(&headers) else {
+        return unauthorized_runtime(&request_id);
+    };
+    if let Err(response) = admit_runtime_with_verified_cors(
+        &state,
+        &client,
+        AdmissionEndpoint::BrowserLogoutPrepare,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &token),
+        ],
+        &headers,
+        VerifiedOriginSubject::Credential {
+            project_public_id: &project_public_id,
+            credential: &token,
+        },
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let cors_origin =
         match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
             Ok(origin) => origin,
             Err(response) => return response,
         };
-    let Ok(token) = bearer_token(&headers) else {
-        return unauthorized_runtime(&request_id);
-    };
     let result = match runtime_auth(&state) {
         Ok(service) => match service.current_user(&token).await {
             Ok(current) => {
@@ -1156,6 +1543,12 @@ async fn prepare_browser_logout(
                 if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
                     Err(ApplicationError::NotFound)
                 } else {
+                    remember_verified_credential_origin(
+                        &state,
+                        &project_public_id,
+                        &token,
+                        cors_origin.as_deref(),
+                    );
                     service.prepare_browser_logout(&token).await.map(|target| {
                         runtime_types::BrowserLogoutPreparationResponse {
                             hosted_url: target.hosted_url,
@@ -1178,6 +1571,7 @@ async fn prepare_browser_logout(
 async fn browser_logout_shell(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(preparation): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1188,6 +1582,20 @@ async fn browser_logout_shell(
             "Browser logout confirmation requires a top-level document navigation.",
             &request_id,
         );
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::BrowserLogoutRead,
+        &[admission_dimension(
+            AdmissionDimensionKind::Credential,
+            &preparation,
+        )],
+        &request_id,
+    )
+    .await
+    {
+        return response;
     }
     let Ok(service) = runtime_auth(&state) else {
         return runtime_document_error(
@@ -1248,12 +1656,27 @@ async fn browser_logout_shell(
 async fn confirm_browser_logout(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, preparation)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::ConfirmBrowserLogoutRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::BrowserLogoutConfirm,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &preparation),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
     }
     let cookie_name = project_session_cookie_name(&project_public_id);
     let Ok(Some(browser_session)) = cookie_value(&headers, &cookie_name) else {
@@ -2438,6 +2861,7 @@ struct PublicConfigQuery {
 async fn public_application_config(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     query: Result<Query<PublicConfigQuery>, axum::extract::rejection::QueryRejection>,
@@ -2445,6 +2869,25 @@ async fn public_application_config(
     let Ok(Query(query)) = query else {
         return runtime_problem(ApplicationError::InvalidInput, &request_id);
     };
+    if let Err(response) = admit_runtime_with_verified_cors(
+        &state,
+        &client,
+        AdmissionEndpoint::PublicConfig,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Application, &query.application_id),
+        ],
+        &headers,
+        VerifiedOriginSubject::Application {
+            project_public_id: &project_public_id,
+            application_public_id: &query.application_id,
+        },
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let cors_origin = match public_application_cors_origin(
         &state,
         &headers,
@@ -2496,8 +2939,23 @@ async fn public_application_config(
 async fn project_jwks(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
 ) -> Response {
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::ProjectJwks,
+        &[admission_dimension(
+            AdmissionDimensionKind::Project,
+            &project_public_id,
+        )],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
     let service = match readiness(&state) {
         Ok(service) => service,
         Err(error) => return runtime_problem(error, &request_id),
@@ -2763,6 +3221,13 @@ async fn application_cors_origin(
             request_id,
         ));
     }
+    state.verified_origins.remember(
+        VerifiedOriginSubject::Application {
+            project_public_id,
+            application_public_id,
+        },
+        &origin,
+    );
     Ok(Some(origin))
 }
 
@@ -2797,7 +3262,31 @@ async fn public_application_cors_origin(
             request_id,
         ));
     }
+    state.verified_origins.remember(
+        VerifiedOriginSubject::Application {
+            project_public_id,
+            application_public_id,
+        },
+        &origin,
+    );
     Ok(Some(origin))
+}
+
+fn remember_verified_credential_origin(
+    state: &RuntimeState,
+    project_public_id: &str,
+    credential: &str,
+    origin: Option<&str>,
+) {
+    if let Some(origin) = origin {
+        state.verified_origins.remember(
+            VerifiedOriginSubject::Credential {
+                project_public_id,
+                credential,
+            },
+            origin,
+        );
+    }
 }
 
 async fn project_cors_origin(
@@ -2867,6 +3356,21 @@ fn valid_preflight_headers(value: Option<&str>) -> bool {
     })
 }
 
+fn append_vary_origin(response: &mut Response) {
+    let already_varies = response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim().eq_ignore_ascii_case("origin"));
+    if !already_varies {
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Origin"));
+    }
+}
+
 fn apply_cors(response: &mut Response, origin: &str, preflight: bool) {
     let Ok(origin) = HeaderValue::from_str(origin) else {
         return;
@@ -2874,9 +3378,7 @@ fn apply_cors(response: &mut Response, origin: &str, preflight: bool) {
     response
         .headers_mut()
         .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    response
-        .headers_mut()
-        .append(header::VARY, HeaderValue::from_static("Origin"));
+    append_vary_origin(response);
     if preflight {
         response.headers_mut().insert(
             header::ACCESS_CONTROL_ALLOW_METHODS,
@@ -3475,6 +3977,7 @@ mod tests {
                 "OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
                 "http-test-runtime".to_owned(),
             ),
+            ("OWLAUTH_RUNTIME_MAX_PROCESSES".to_owned(), "64".to_owned()),
             ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
             (
                 "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
@@ -3483,6 +3986,10 @@ mod tests {
             (
                 "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
                 "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
+            ),
+            (
+                "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
+                "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
             ),
             (
                 "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
@@ -3534,6 +4041,183 @@ mod tests {
             );
         }
         ServerConfig::from_values_for_test(&values).expect("test config should parse")
+    }
+
+    #[tokio::test]
+    async fn runtime_admission_returns_bounded_429_before_downstream_authority() {
+        let config = test_config(PlaneMode::Runtime);
+        let mut routers = build_routers(&config, None);
+        let router = routers.runtime.take().expect("Runtime router exists");
+        let uri = "/v1/projects/project/auth/config?application_id=application";
+
+        for _ in 0..9 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .header(header::ORIGIN, "https://unverified.example")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        let response = router
+            .oneshot(
+                Request::get(uri)
+                    .header(header::ORIGIN, "https://unverified.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!((1..=60).contains(&retry_after));
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "an unverified Origin must never be reflected"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .any(|value| value == "Origin"),
+            "admission responses must vary by Origin even when it is not reflected"
+        );
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let problem: runtime_types::RuntimeError = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem.code, "rate_limited");
+        assert_eq!(
+            problem.message,
+            "The Runtime request rate limit was exceeded."
+        );
+        assert!(!problem.request_id.is_empty());
+        assert!(problem.request_id.len() <= 128);
+    }
+
+    #[test]
+    fn admission_cors_reflects_only_a_previously_verified_exact_application_origin() {
+        let verified = VerifiedApplicationOrigins::default();
+        let allowed = "https://app.example";
+        let application = VerifiedOriginSubject::Application {
+            project_public_id: "project-a",
+            application_public_id: "application-a",
+        };
+        verified.remember(application, allowed);
+
+        let response_for = |subject, origin: &'static str| {
+            let headers =
+                HeaderMap::from_iter([(header::ORIGIN, HeaderValue::from_static(origin))]);
+            let mut response = runtime_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "The Runtime request rate limit was exceeded.",
+                "request-id",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+            apply_verified_admission_cors(&verified, &headers, subject, response)
+        };
+
+        let readable = response_for(application, allowed);
+        assert_eq!(readable.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            readable.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            allowed
+        );
+        assert_eq!(readable.headers()[header::RETRY_AFTER], "7");
+        assert_eq!(
+            readable.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+            "Retry-After"
+        );
+        assert!(
+            readable
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .any(|value| value == "Origin")
+        );
+
+        for rejected in [
+            response_for(application, "https://unknown.example"),
+            response_for(
+                VerifiedOriginSubject::Application {
+                    project_public_id: "project-a",
+                    application_public_id: "application-b",
+                },
+                allowed,
+            ),
+            response_for(
+                VerifiedOriginSubject::Application {
+                    project_public_id: "project-b",
+                    application_public_id: "application-a",
+                },
+                allowed,
+            ),
+        ] {
+            assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(
+                !rejected
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            );
+            assert!(
+                !rejected
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            );
+            assert_eq!(rejected.headers()[header::RETRY_AFTER], "7");
+            assert!(
+                rejected
+                    .headers()
+                    .get_all(header::VARY)
+                    .iter()
+                    .any(|value| value == "Origin")
+            );
+        }
+    }
+
+    #[test]
+    fn admission_cors_credential_verification_is_not_reusable_by_another_token() {
+        let verified = VerifiedApplicationOrigins::default();
+        let origin = "https://app.example";
+        let verified_subject = VerifiedOriginSubject::Credential {
+            project_public_id: "project-a",
+            credential: "token-a",
+        };
+        verified.remember(verified_subject, origin);
+        assert!(verified.contains(verified_subject, origin));
+        assert!(!verified.contains(
+            VerifiedOriginSubject::Credential {
+                project_public_id: "project-a",
+                credential: "token-b",
+            },
+            origin,
+        ));
+        assert!(!verified.contains(
+            VerifiedOriginSubject::Credential {
+                project_public_id: "project-b",
+                credential: "token-a",
+            },
+            origin,
+        ));
     }
 
     #[tokio::test]

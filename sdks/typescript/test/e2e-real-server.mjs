@@ -9,6 +9,7 @@ const required = [
   "OWLAUTH_E2E_PUBLISHABLE_KEY",
   "OWLAUTH_E2E_REDIRECT_URI",
   "OWLAUTH_E2E_BROWSER_DRIVER_URL",
+  "OWLAUTH_E2E_BROWSER_EVIDENCE_RUN_ID",
 ];
 
 for (const name of required) {
@@ -102,6 +103,7 @@ async function browserLogin(runtimeClient) {
       redirectUri: process.env.OWLAUTH_E2E_REDIRECT_URI,
       providerKey: process.env.OWLAUTH_E2E_PROVIDER_KEY ?? null,
       browserName: process.env.OWLAUTH_E2E_BROWSER_NAME,
+      evidenceRunId: process.env.OWLAUTH_E2E_BROWSER_EVIDENCE_RUN_ID,
     }),
   });
   assert.equal(driverResponse.status, 200, "real browser driver failed");

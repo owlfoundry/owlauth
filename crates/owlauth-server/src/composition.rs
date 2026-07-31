@@ -206,15 +206,18 @@ fn spawn_selected(
         return;
     };
     servers.spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                while !*shutdown.borrow() {
-                    if shutdown.changed().await.is_err() {
-                        break;
-                    }
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
                 }
-            })
-            .await
+            }
+        })
+        .await
     });
 }
 

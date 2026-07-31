@@ -11,6 +11,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use owlauth_types::FEDERATED_PROJECT_AUTH_AVAILABLE;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use url::Url;
@@ -42,6 +43,11 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
     "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK",
     "OWLAUTH_RUNTIME_PROCESS_ID",
+    "OWLAUTH_ADMISSION_REDIS_URL",
+    "OWLAUTH_ADMISSION_DIGEST_KEY",
+    "OWLAUTH_ADMISSION_NAMESPACE",
+    "OWLAUTH_ADMISSION_REDIS_TIMEOUT_MS",
+    "OWLAUTH_RUNTIME_MAX_PROCESSES",
     "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
     "OWLAUTH_PUBLICATION_LEASE_TTL_MS",
     "OWLAUTH_KEY_PROPAGATION_DELAY_MS",
@@ -250,6 +256,15 @@ pub struct RuntimeProtectionConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct AdmissionConfig {
+    pub redis_url: Option<SecretString>,
+    pub digest_key: StoreMasterKey,
+    pub namespace: String,
+    pub redis_timeout: Duration,
+    pub maximum_processes: NonZeroU32,
+}
+
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub mode: PlaneMode,
     pub instance_id: Option<String>,
@@ -262,6 +277,7 @@ pub struct ServerConfig {
     pub provider_allow_http_loopback: bool,
     pub runtime_process_id: String,
     pub required_runtime_process_ids: Vec<String>,
+    pub admission: Option<AdmissionConfig>,
     pub publication_lease_ttl: Duration,
     pub key_propagation_delay: Duration,
     pub signing_verification_retention: Duration,
@@ -398,6 +414,15 @@ impl ServerConfig {
                 reason: "must include this Runtime process's OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
             });
         }
+        let admission = parse_admission(
+            mode,
+            values,
+            instance_id
+                .as_deref()
+                .expect("validated configuration always has an instance ID"),
+            required_runtime_process_ids.len(),
+            runtime_protection.as_ref(),
+        )?;
 
         let serving_url = required(values, "OWLAUTH_POSTGRES_URL")?;
         let runtime_url = optional(values, "OWLAUTH_RUNTIME_POSTGRES_URL")
@@ -470,6 +495,7 @@ impl ServerConfig {
             provider_allow_http_loopback,
             runtime_process_id,
             required_runtime_process_ids,
+            admission,
             publication_lease_ttl,
             key_propagation_delay,
             signing_verification_retention,
@@ -536,6 +562,107 @@ fn reject_unknown_keys(values: &BTreeMap<String, String>) -> Result<(), ConfigEr
         return Err(ConfigError::Unknown(key.clone()));
     }
     Ok(())
+}
+
+fn parse_admission(
+    mode: PlaneMode,
+    values: &BTreeMap<String, String>,
+    instance_id: &str,
+    roster_size: usize,
+    runtime_protection: Option<&RuntimeProtectionConfig>,
+) -> Result<Option<AdmissionConfig>, ConfigError> {
+    if !mode.has_runtime() {
+        return Ok(None);
+    }
+    let digest_key = StoreMasterKey::parse(
+        "OWLAUTH_ADMISSION_DIGEST_KEY",
+        required(values, "OWLAUTH_ADMISSION_DIGEST_KEY")?,
+    )?;
+    if runtime_protection.into_iter().any(|protection| {
+        std::iter::once(&protection.active)
+            .chain(protection.retained.values())
+            .any(|key| {
+                digest_key.0.as_ref() == key.digest_key.0.as_ref()
+                    || digest_key.0.as_ref() == key.protection_key.0.as_ref()
+            })
+    }) {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_ADMISSION_DIGEST_KEY",
+            reason: "must be separate from every active or retained Runtime key".to_owned(),
+        });
+    }
+    let redis_url = optional(values, "OWLAUTH_ADMISSION_REDIS_URL")
+        .map(|value| {
+            let invalid_reason = || ConfigError::InvalidValue {
+                key: "OWLAUTH_ADMISSION_REDIS_URL",
+                reason: "must be an absolute redis or rediss URL with an optional numeric database path and no query or fragment".to_owned(),
+            };
+            let parsed = Url::parse(value).map_err(|_| invalid_reason())?;
+            let database_path_is_valid = matches!(parsed.path(), "" | "/")
+                || parsed.path().strip_prefix('/').is_some_and(|database| {
+                    !database.is_empty()
+                        && database.bytes().all(|byte| byte.is_ascii_digit())
+                        && database.parse::<u32>().is_ok()
+                });
+            if !matches!(parsed.scheme(), "redis" | "rediss")
+                || parsed.host_str().is_none()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || !database_path_is_valid
+            {
+                return Err(invalid_reason());
+            }
+            Ok(SecretString::new(value.to_owned()))
+        })
+        .transpose()?;
+    let namespace = if let Some(value) = optional(values, "OWLAUTH_ADMISSION_NAMESPACE") {
+        validate_admission_namespace(value)?
+    } else {
+        let digest = Sha256::digest(instance_id.as_bytes());
+        format!("owl_{}", URL_SAFE_NO_PAD.encode(&digest[..12]))
+    };
+    let redis_timeout = parse_millis(values, "OWLAUTH_ADMISSION_REDIS_TIMEOUT_MS", 100)?;
+    if !(Duration::from_millis(10)..=Duration::from_secs(2)).contains(&redis_timeout) {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_ADMISSION_REDIS_TIMEOUT_MS",
+            reason: "must be between 10 and 2000 milliseconds".to_owned(),
+        });
+    }
+    let default_processes = u32::try_from(roster_size).map_err(|_| ConfigError::InvalidValue {
+        key: "OWLAUTH_RUNTIME_MAX_PROCESSES",
+        reason: "must be between the required Runtime roster size and 64".to_owned(),
+    })?;
+    let maximum_processes =
+        parse_nonzero_u32(values, "OWLAUTH_RUNTIME_MAX_PROCESSES", default_processes)?;
+    if maximum_processes.get() > 64
+        || usize::try_from(maximum_processes.get()).unwrap_or(usize::MAX) < roster_size
+    {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_RUNTIME_MAX_PROCESSES",
+            reason: "must be between the required Runtime roster size and 64".to_owned(),
+        });
+    }
+    Ok(Some(AdmissionConfig {
+        redis_url,
+        digest_key,
+        namespace,
+        redis_timeout,
+        maximum_processes,
+    }))
+}
+
+fn validate_admission_namespace(value: &str) -> Result<String, ConfigError> {
+    if !(1..=64).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_ADMISSION_NAMESPACE",
+            reason: "must be 1 to 64 alphanumeric, underscore, or hyphen characters".to_owned(),
+        });
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_control_identity(
@@ -964,6 +1091,10 @@ mod tests {
                 "OWLAUTH_RUNTIME_PROTECTION_KEY",
                 "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
             ),
+            (
+                "OWLAUTH_ADMISSION_DIGEST_KEY",
+                "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
+            ),
         ])
     }
 
@@ -1005,6 +1136,83 @@ mod tests {
         assert!(!debug.contains("this value"));
         assert!(!debug.contains("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"));
         assert!(!debug.contains("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"));
+    }
+
+    #[test]
+    fn runtime_admission_configuration_is_bounded_and_redacted() {
+        let mut input = runtime_values();
+        input.extend(control_store_values());
+        input.insert(
+            "OWLAUTH_ADMISSION_REDIS_URL".to_owned(),
+            "rediss://admission-user:admission-secret@redis.example/0".to_owned(),
+        );
+        input.insert(
+            "OWLAUTH_ADMISSION_NAMESPACE".to_owned(),
+            "deployment_a".to_owned(),
+        );
+        input.insert("OWLAUTH_RUNTIME_MAX_PROCESSES".to_owned(), "4".to_owned());
+        let config = ServerConfig::from_values(&input).expect("admission config should parse");
+        let admission = config.admission.as_ref().expect("Runtime has admission");
+        assert_eq!(admission.namespace, "deployment_a");
+        assert_eq!(admission.maximum_processes.get(), 4);
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("admission-secret"));
+        assert!(!debug.contains("BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"));
+
+        input.insert(
+            "OWLAUTH_ADMISSION_REDIS_URL".to_owned(),
+            "https://redis.example/".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_ADMISSION_REDIS_URL",
+                ..
+            })
+        ));
+
+        input.insert(
+            "OWLAUTH_ADMISSION_REDIS_URL".to_owned(),
+            "redis://redis.example/not-a-database?unsafe=true".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_ADMISSION_REDIS_URL",
+                ..
+            })
+        ));
+
+        input.insert(
+            "OWLAUTH_ADMISSION_REDIS_URL".to_owned(),
+            "redis://redis.example/0".to_owned(),
+        );
+        input.insert(
+            "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
+            "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_ADMISSION_DIGEST_KEY",
+                ..
+            })
+        ));
+        input.insert(
+            "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
+            "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
+        );
+        input.insert(
+            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
+            "test-runtime,runtime-b,runtime-c,runtime-d,runtime-e".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_RUNTIME_MAX_PROCESSES",
+                ..
+            })
+        ));
     }
 
     #[test]

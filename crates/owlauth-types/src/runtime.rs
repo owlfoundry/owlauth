@@ -319,6 +319,7 @@ pub struct RuntimeError {
         (status = 200, body = PublicApplicationConfig),
         (status = 400, body = RuntimeError),
         (status = 404, body = RuntimeError),
+        (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
         (status = 503, body = RuntimeError)
     )
 )]
@@ -329,7 +330,7 @@ pub fn get_public_application_config() {}
     get,
     path = "/projects/{project_public_id}/.well-known/jwks.json",
     params(("project_public_id" = String, Path)),
-    responses((status = 200, body = JwksDocument), (status = 404, body = RuntimeError), (status = 503, body = RuntimeError))
+    responses((status = 200, body = JwksDocument), (status = 404, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn get_project_jwks() {}
@@ -339,7 +340,7 @@ pub fn get_project_jwks() {}
     path = "/v1/projects/{project_public_id}/auth/login/start",
     params(("project_public_id" = String, Path)),
     request_body = LoginStartRequest,
-    responses((status = 201, body = LoginStartResponse), (status = 400, body = RuntimeError), (status = 404, body = RuntimeError), (status = 503, body = RuntimeError))
+    responses((status = 201, body = LoginStartResponse), (status = 400, body = RuntimeError), (status = 404, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn start_login() {}
@@ -348,7 +349,7 @@ pub fn start_login() {}
     get,
     path = "/auth/interactions/{interaction}",
     params(("interaction" = String, Path)),
-    responses((status = 200, description = "Hosted Authentication HTML"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError))
+    responses((status = 200, description = "Hosted Authentication HTML"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn get_hosted_interaction() {}
@@ -358,7 +359,7 @@ pub fn get_hosted_interaction() {}
     path = "/v1/projects/{project_public_id}/auth/interactions/{interaction}/method",
     params(("project_public_id" = String, Path), ("interaction" = String, Path)),
     request_body = SelectProviderRequest,
-    responses((status = 200, body = NavigationResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError))
+    responses((status = 200, body = NavigationResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn select_provider() {}
@@ -368,7 +369,7 @@ pub fn select_provider() {}
     path = "/v1/projects/{project_public_id}/auth/interactions/{interaction}/session/reuse",
     params(("project_public_id" = String, Path), ("interaction" = String, Path)),
     request_body = ConfirmSessionReuseRequest,
-    responses((status = 200, body = NavigationResponse), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError))
+    responses((status = 200, body = NavigationResponse), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn confirm_session_reuse() {}
@@ -387,6 +388,7 @@ pub fn confirm_session_reuse() {}
         (status = 400, body = RuntimeError),
         (status = 404, body = RuntimeError),
         (status = 409, body = RuntimeError),
+        (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
         (status = 503, body = RuntimeError)
     )
 )]
@@ -398,7 +400,7 @@ pub fn complete_provider_callback() {}
     path = "/v1/projects/{project_public_id}/auth/handoff/exchange",
     params(("project_public_id" = String, Path)),
     request_body = HandoffExchangeRequest,
-    responses((status = 200, body = CredentialPairResponse), (status = 400, body = RuntimeError), (status = 409, body = RuntimeError), (status = 503, body = RuntimeError))
+    responses((status = 200, body = CredentialPairResponse), (status = 400, body = RuntimeError), (status = 409, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn exchange_handoff() {}
@@ -408,7 +410,7 @@ pub fn exchange_handoff() {}
     path = "/v1/projects/{project_public_id}/auth/sessions/refresh",
     params(("project_public_id" = String, Path)),
     request_body = RefreshRequest,
-    responses((status = 200, body = CredentialPairResponse), (status = 400, body = RuntimeError), (status = 409, body = RuntimeError), (status = 503, body = RuntimeError))
+    responses((status = 200, body = CredentialPairResponse), (status = 400, body = RuntimeError), (status = 409, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn refresh_session() {}
@@ -417,7 +419,7 @@ pub fn refresh_session() {}
     get,
     path = "/v1/projects/{project_public_id}/auth/users/me",
     params(("project_public_id" = String, Path)),
-    responses((status = 200, body = CurrentUserResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError)),
+    responses((status = 200, body = CurrentUserResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
     security(("project_bearer" = []))
 )]
 #[doc(hidden)]
@@ -427,7 +429,7 @@ pub fn get_current_user() {}
     post,
     path = "/v1/projects/{project_public_id}/auth/sessions/logout",
     params(("project_public_id" = String, Path)),
-    responses((status = 200, body = CompletionResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError)),
+    responses((status = 200, body = CompletionResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
     security(("project_bearer" = []))
 )]
 #[doc(hidden)]
@@ -437,7 +439,7 @@ pub fn logout_application_session() {}
     post,
     path = "/v1/projects/{project_public_id}/auth/browser-logout/prepare",
     params(("project_public_id" = String, Path)),
-    responses((status = 201, body = BrowserLogoutPreparationResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError)),
+    responses((status = 201, body = BrowserLogoutPreparationResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
     security(("project_bearer" = []))
 )]
 #[doc(hidden)]
@@ -447,7 +449,7 @@ pub fn prepare_browser_logout() {}
     get,
     path = "/auth/browser-logout/{preparation}",
     params(("preparation" = String, Path)),
-    responses((status = 200, description = "Hosted browser-logout confirmation HTML"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError))
+    responses((status = 200, description = "Hosted browser-logout confirmation HTML"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn get_browser_logout() {}
@@ -457,7 +459,7 @@ pub fn get_browser_logout() {}
     path = "/v1/projects/{project_public_id}/auth/browser-logout/{preparation}/confirm",
     params(("project_public_id" = String, Path), ("preparation" = String, Path)),
     request_body = ConfirmBrowserLogoutRequest,
-    responses((status = 200, body = CompletionResponse), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError))
+    responses((status = 200, body = CompletionResponse), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn confirm_browser_logout() {}

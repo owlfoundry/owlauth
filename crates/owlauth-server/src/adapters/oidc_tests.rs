@@ -423,6 +423,47 @@ async fn known_kid_invalid_proof_does_not_refresh_jwks() {
 }
 
 #[tokio::test]
+async fn provider_exchange_budget_is_shared_bounded_and_fail_fast() {
+    let provider = start_provider(TokenBehavior::Timeout, false).await;
+    let client =
+        RestrictedOidcProviderClient::for_loopback_tests_with_exchange_limit(&provider.origin, 2);
+    let first = {
+        let client = client.clone();
+        let origin = provider.origin.clone();
+        tokio::spawn(async move { client.exchange_code(callback_request(&origin)).await })
+    };
+    let second = {
+        let client = client.clone();
+        let origin = provider.origin.clone();
+        tokio::spawn(async move { client.exchange_code(callback_request(&origin)).await })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while provider.state.token_calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two provider exchanges must reach the controlled blocking endpoint");
+
+    assert_eq!(
+        client
+            .exchange_code(callback_request(&provider.origin))
+            .await,
+        Err(ProviderExchangeError::UnavailableBeforeDispatch)
+    );
+    assert_eq!(provider.state.token_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        first.await.unwrap(),
+        Err(ProviderExchangeError::AmbiguousAfterDispatch)
+    );
+    assert_eq!(
+        second.await.unwrap(),
+        Err(ProviderExchangeError::AmbiguousAfterDispatch)
+    );
+}
+
+#[tokio::test]
 async fn code_post_is_never_retried_and_errors_are_stage_classified() {
     for (behavior, expected) in [
         (TokenBehavior::Reject, ProviderExchangeError::Rejected),

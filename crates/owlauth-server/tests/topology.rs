@@ -20,6 +20,7 @@ use uuid::Uuid;
 const POSTGRES_PORT: u16 = 5432;
 const OPERATOR_KEY: &str = "owl_ctrl_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const DIGEST_KEY: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM";
+const ADMISSION_DIGEST_KEY: &str = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU";
 const PROTECTION_KEY: &str = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ";
 const SIGNER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const SECRET_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
@@ -207,6 +208,10 @@ fn runtime_environment(common: &Environment, port: u16) -> Environment {
         (
             "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
             PROTECTION_KEY.to_owned(),
+        ),
+        (
+            "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
+            ADMISSION_DIGEST_KEY.to_owned(),
         ),
         (
             "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),

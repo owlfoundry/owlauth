@@ -333,6 +333,10 @@ mod tests {
                 "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM".to_owned(),
             ),
             (
+                "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
+                "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
+            ),
+            (
                 "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
                 "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
             ),
@@ -2425,7 +2429,9 @@ mod tests {
             .project_jwks(&created_project.public_id)
             .await
             .expect("secondary Runtime should observe the new revision");
-        tokio::time::sleep(Duration::from_millis(1_050)).await;
+        // The lease timestamp is minted by PostgreSQL while this assertion reads the host clock.
+        // Leave a bounded skew margin for Docker Desktop's VM clock instead of racing at 50 ms.
+        tokio::time::sleep(Duration::from_secs(2)).await;
         let expired_primary_lease = runtime_publication_lease::Entity::find()
             .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
             .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-test-process"))
