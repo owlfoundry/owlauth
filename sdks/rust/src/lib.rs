@@ -1,34 +1,24 @@
 #![forbid(unsafe_code)]
 
-/// Client configuration for an `OwlAuth` server.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Client {
-    base_url: String,
-}
+//! Async, storage-free Project Auth protocol client for `OwlAuth` Runtime.
 
-impl Client {
-    /// Creates a client for an `OwlAuth` server.
-    #[must_use]
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
-        }
-    }
+mod client;
+mod error;
+mod models;
+mod transport;
 
-    /// Returns the configured server URL.
-    #[must_use]
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-}
+pub use client::{Client, ClientConfig, Clock, EntropySource};
+pub use error::{Error, ErrorCategory, LocalAction, RetryPolicy};
+pub use models::{
+    AccessToken, BrowserLogoutPreparation, CredentialPair, CurrentUser, JwksDocument, LoginStart,
+    PendingLogin, PublicConfiguration, PublicJwk, PublicProvider, RefreshToken, UserProjection,
+    ValidatedCallback,
+};
+pub use transport::{
+    HttpMethod, HttpRequest, HttpResponse, Transport, TransportFailure, TransportFailureKind,
+};
 
-#[cfg(test)]
-mod tests {
-    use super::Client;
-
-    #[test]
-    fn stores_base_url() {
-        let client = Client::new("https://auth.example.com");
-        assert_eq!(client.base_url(), "https://auth.example.com");
-    }
-}
+pub(crate) use models::{
+    CompletionResponse, CredentialPairWire, HandoffRequest, LoginStartRequest, LoginStartResponse,
+    RefreshRequest, RuntimeErrorWire,
+};

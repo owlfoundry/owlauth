@@ -1701,7 +1701,9 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        if session.status == "active" {
+        let session_changed = session.status == "active";
+        let family_changed = family.status == "active";
+        if session_changed {
             let mut active = session.into_active_model();
             active.status = Set("revoked".to_owned());
             active.session_revision = Set(active.session_revision.take().unwrap_or(1) + 1);
@@ -1709,7 +1711,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             active.updated_at = Set(command.now);
             active.update(&transaction).await.map_err(persistence)?;
         }
-        if family.status == "active" {
+        if family_changed {
             let mut active = family.into_active_model();
             active.status = Set("revoked".to_owned());
             active.family_revision = Set(active.family_revision.take().unwrap_or(1) + 1);
@@ -1718,16 +1720,18 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             active.updated_at = Set(command.now);
             active.update(&transaction).await.map_err(persistence)?;
         }
-        append_runtime_audit(
-            &transaction,
-            command.project_id,
-            "project_user",
-            "auth.application_session.logged_out",
-            "application_session",
-            Some(command.application_session_id),
-            command.application_session_id,
-        )
-        .await?;
+        if session_changed || family_changed {
+            append_runtime_audit(
+                &transaction,
+                command.project_id,
+                "project_user",
+                "auth.application_session.logged_out",
+                "application_session",
+                Some(command.application_session_id),
+                command.application_session_id,
+            )
+            .await?;
+        }
         transaction.commit().await.map_err(persistence)?;
         Ok(())
     }

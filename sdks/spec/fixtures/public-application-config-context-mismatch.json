@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "synthetic": true,
+  "responseStatus": 200,
+  "response": {
+    "project_public_id": "prj_other",
+    "project_display_name": "Other Project",
+    "application_public_id": "app_conformance",
+    "application_display_name": "Conformance Application",
+    "publishable_keys": ["owl_app_conformance"],
+    "providers": [],
+    "login_available": false
+  }
+}

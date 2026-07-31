@@ -153,6 +153,8 @@ pub(crate) enum ProviderExchangeError {
 
 #[async_trait]
 pub(crate) trait UpstreamProviderClient: Send + Sync {
+    fn issuer_allowed(&self, issuer: &str) -> bool;
+
     async fn authorization_url(
         &self,
         request: ProviderAuthorizationRequest,
@@ -195,6 +197,7 @@ pub(crate) struct HostedInteraction {
     pub application_id: Uuid,
     pub application_public_id: String,
     pub application_display_name: String,
+    pub application_type: crate::domain::ApplicationType,
     pub status: crate::domain::LoginTransactionStatus,
     pub transaction_revision: i64,
     pub csrf_key_version: Option<i32>,
@@ -213,6 +216,16 @@ pub(crate) struct ProviderRuntimeContext {
     pub client_id: String,
     pub callback_url: String,
     pub secret_ref: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AccessTokenSessionLookup {
+    pub project_id: Uuid,
+    pub application_public_id: String,
+    pub user_public_id: String,
+    pub application_session_id: Uuid,
+    pub claims_revision: i64,
+    pub now: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -279,6 +292,12 @@ pub(crate) trait RuntimeAuthorityRepository: Send + Sync {
         publishable_key: &str,
     ) -> Result<(Uuid, Uuid), ApplicationError>;
 
+    async fn resolve_public_application(
+        &self,
+        project_public_id: &str,
+        application_public_id: &str,
+    ) -> Result<(Uuid, Uuid), ApplicationError>;
+
     async fn exact_application_origin(
         &self,
         project_id: Uuid,
@@ -292,6 +311,13 @@ pub(crate) trait RuntimeAuthorityRepository: Send + Sync {
         origin: &str,
     ) -> Result<bool, ApplicationError>;
 
+    async fn browser_session_reuse_available(
+        &self,
+        project_id: Uuid,
+        browser_credential: &VersionedDigest,
+        now: OffsetDateTime,
+    ) -> Result<bool, ApplicationError>;
+
     async fn verification_key(
         &self,
         project_public_id: &str,
@@ -301,12 +327,8 @@ pub(crate) trait RuntimeAuthorityRepository: Send + Sync {
 
     async fn current_session(
         &self,
-        project_id: Uuid,
-        application_public_id: &str,
-        user_public_id: &str,
-        application_session_id: Uuid,
-        claims_revision: i64,
-        now: OffsetDateTime,
+        lookup: AccessTokenSessionLookup,
+        allow_revoked: bool,
     ) -> Result<CurrentSession, ApplicationError>;
 
     async fn browser_logout_context(

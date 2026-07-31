@@ -6,7 +6,7 @@ The official SDKs make OwlAuth Runtime Project Auth safer and idiomatic in TypeS
 
 They are not OAuth authorization servers, identity providers, policy engines, administrative clients, or substitutes for backend business authorization. OAuth/OIDC details belong between OwlAuth and the configured upstream provider. Downstream Applications use the Project Auth API rather than registering OAuth grants or receiving provider tokens from OwlAuth.
 
-The current packages only construct a client that stores a base URL. No transport, generated Runtime model layer, Project Auth flow, PKCE handling, or server-backed behavior exists yet. Every capability below is a target and acceptance gate unless explicitly marked implemented.
+The current TypeScript, Python, and Rust packages are pre-alpha Runtime Project Auth clients. They implement contract-aligned transport, public configuration and JWKS retrieval, caller-held PKCE pending state, callback validation and one-use handoff exchange, credential refresh, current-user queries, and logout, with real-server coverage. The requirements below describe their current safety contract and acceptance gates unless explicitly marked as future work.
 
 ## Public Project Auth concepts
 

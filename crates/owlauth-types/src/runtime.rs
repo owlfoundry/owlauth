@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
@@ -109,6 +108,13 @@ pub struct LoginStartResponse {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum HostedApplicationType {
+    Web,
+    Native,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum HostedInteractionStatus {
     AwaitingMethodSelection,
     ProviderAuthorizationStarted,
@@ -138,6 +144,7 @@ pub struct HostedInteractionResponse {
     pub application_id: String,
     #[schema(max_length = 128)]
     pub application_display_name: String,
+    pub application_type: HostedApplicationType,
     pub status: HostedInteractionStatus,
     pub revision: i64,
     pub session_reuse_available: bool,
@@ -199,21 +206,53 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UserProjection {
+    #[schema(max_length = 96)]
+    pub user_id: String,
+    pub user_revision: i64,
+    #[schema(max_length = 64)]
+    pub projection_schema: String,
+    pub projection_revision: i64,
+    #[schema(max_length = 128)]
+    pub display_name: Option<String>,
+    #[schema(max_length = 2048)]
+    pub picture_url: Option<String>,
+    #[schema(max_length = 32)]
+    pub status: String,
+    #[schema(max_length = 64)]
+    pub created_at: String,
+    #[schema(max_length = 64)]
+    pub updated_at: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialPairResponse {
+    #[schema(max_length = 96)]
+    pub project_id: String,
+    #[schema(max_length = 96)]
+    pub application_id: String,
+    #[schema(max_length = 96)]
+    pub user_id: String,
+    #[schema(max_length = 64)]
+    pub session_id: String,
+    pub refresh_generation: i64,
     #[schema(max_length = 16384)]
     pub access_token: String,
     #[schema(max_length = 256)]
     pub refresh_token: String,
     pub token_type: String,
     pub expires_in: i64,
-    pub projection: Value,
+    pub projection: UserProjection,
     pub projection_revision: i64,
     #[schema(max_length = 64)]
     pub session_expires_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentUserResponse {
     #[schema(max_length = 96)]
     pub project_id: String,
@@ -221,7 +260,7 @@ pub struct CurrentUserResponse {
     pub application_id: String,
     #[schema(max_length = 96)]
     pub user_id: String,
-    pub projection: Value,
+    pub projection: UserProjection,
     pub projection_revision: i64,
     #[schema(max_length = 64)]
     pub authenticated_at: String,
@@ -262,9 +301,13 @@ pub struct CompletionResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeError {
+    #[schema(max_length = 64)]
     pub code: String,
+    #[schema(max_length = 256)]
     pub message: String,
+    #[schema(max_length = 128)]
     pub request_id: String,
 }
 
@@ -329,6 +372,26 @@ pub fn select_provider() {}
 )]
 #[doc(hidden)]
 pub fn confirm_session_reuse() {}
+
+#[utoipa::path(
+    get,
+    path = "/projects/{project_public_id}/auth/callback/{provider_key}",
+    params(
+        ("project_public_id" = String, Path),
+        ("provider_key" = String, Path),
+        ("code" = String, Query),
+        ("state" = String, Query)
+    ),
+    responses(
+        (status = 303, description = "Redirect to the exact stored Application callback"),
+        (status = 400, body = RuntimeError),
+        (status = 404, body = RuntimeError),
+        (status = 409, body = RuntimeError),
+        (status = 503, body = RuntimeError)
+    )
+)]
+#[doc(hidden)]
+pub fn complete_provider_callback() {}
 
 #[utoipa::path(
     post,
@@ -435,6 +498,7 @@ struct RuntimeApiDoc;
         get_hosted_interaction,
         select_provider,
         confirm_session_reuse,
+        complete_provider_callback,
         exchange_handoff,
         refresh_session,
         get_current_user,
@@ -447,6 +511,7 @@ struct RuntimeApiDoc;
         schemas(
             LoginStartRequest,
             LoginStartResponse,
+            HostedApplicationType,
             HostedInteractionStatus,
             HostedProvider,
             HostedInteractionResponse,
@@ -455,6 +520,7 @@ struct RuntimeApiDoc;
             ConfirmSessionReuseRequest,
             HandoffExchangeRequest,
             RefreshRequest,
+            UserProjection,
             CredentialPairResponse,
             CurrentUserResponse,
             BrowserLogoutPreparationResponse,

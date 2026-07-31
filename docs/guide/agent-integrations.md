@@ -4,12 +4,12 @@ OwlAuth separates documentation assistance, remote administration, and future ag
 
 ## Current availability
 
-| Surface | Current status |
-| --- | --- |
-| `owlauth` CLI | Available with help/version output and checksum-verified self-update only |
-| Codex/Claude plugin | Repository-distributed integration skill and reference material only |
-| Remote Control commands | Planned; no Project/Application/provider/user commands exist yet |
-| MCP server/tools | Planned; no MCP transport or tools exist yet |
+| Surface                 | Current status                                                            |
+| ----------------------- | ------------------------------------------------------------------------- |
+| `owlauth` CLI           | Available with help/version output and checksum-verified self-update only |
+| Codex/Claude plugin     | Repository-distributed integration skill and reference material only      |
+| Remote Control commands | Planned; no Project/Application/provider/user commands exist yet          |
+| MCP server/tools        | Planned; no MCP transport or tools exist yet                              |
 
 The plugin does not bundle a server, launch a local MCP process, expose Project Auth operations, or create credentials. Treat it as documentation and guardrails for the pre-alpha repository.
 
@@ -17,8 +17,8 @@ The plugin does not bundle a server, launch a local MCP process, expose Project 
 
 The shared source under [`plugins/owlauth`](https://github.com/owlfoundry/owlauth/tree/main/plugins/owlauth) is packaged for Codex and Claude. Its integration skill should help an agent:
 
-- recognize the current scaffold and avoid inventing unavailable routes or commands;
-- select the TypeScript, Python, or Rust package identity without claiming implemented auth flows;
+- recognize the implemented pre-alpha Runtime, Control, and SDK boundaries and avoid inventing deferred routes or commands;
+- select the TypeScript, Python, or Rust SDK and preserve its explicit Application-owned navigation, storage, and refresh-coordination boundary;
 - distinguish downstream Project Auth from upstream OAuth/OIDC federation;
 - understand that Project/Application IDs and publishable keys are public identifiers, not Control credentials;
 - inspect generated OpenAPI as an ephemeral contract view;
@@ -63,10 +63,10 @@ Credentials come from a TTY prompt, protected file descriptor, OS credential sto
 
 OwlAuth defines two separate standards-conformant Streamable HTTP MCP servers:
 
-| Endpoint owner | Authentication | Authority |
-| --- | --- | --- |
-| self-hosted `owlauth-server` Control | `owl_ctrl_v1_...` operator Bearer key on every request | full deployment operator |
-| OwlAuth SaaS API | `owl_saas_v1_...` SaaS API key on every request | current tenant principal, Organization, scope, ownership, entitlement, and revisions |
+| Endpoint owner                       | Authentication                                         | Authority                                                                            |
+| ------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| self-hosted `owlauth-server` Control | `owl_ctrl_v1_...` operator Bearer key on every request | full deployment operator                                                             |
+| OwlAuth SaaS API                     | `owl_saas_v1_...` SaaS API key on every request        | current tenant principal, Organization, scope, ownership, entitlement, and revisions |
 
 Each endpoint exposes `mcp` relative to its administrative base URL. The MCP `initialize` exchange identifies `owlauth-server` or `owlauth-saas`, and `tools/list` returns the endpoint's current schemas. MCP clients therefore do not maintain an OwlAuth product-mode tool table. Tool discovery is not authorization; every invocation reauthenticates and reauthorizes.
 

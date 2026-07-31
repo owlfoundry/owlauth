@@ -56,12 +56,19 @@ pub(crate) struct RestrictedOidcProviderClient {
 }
 
 impl RestrictedOidcProviderClient {
-    pub(crate) fn new<I, S>(allowed_endpoint_origins: I) -> Result<Self, ProviderExchangeError>
+    pub(crate) fn new<I, S>(
+        allowed_endpoint_origins: I,
+        allow_http_loopback: bool,
+    ) -> Result<Self, ProviderExchangeError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Self::build(allowed_endpoint_origins, false, REQUEST_TIMEOUT)
+        Self::build(
+            allowed_endpoint_origins,
+            allow_http_loopback,
+            REQUEST_TIMEOUT,
+        )
     }
 
     fn build<I, S>(
@@ -263,6 +270,10 @@ impl RestrictedOidcProviderClient {
 
 #[async_trait]
 impl UpstreamProviderClient for RestrictedOidcProviderClient {
+    fn issuer_allowed(&self, issuer: &str) -> bool {
+        self.endpoint_policy.validate_issuer(issuer).is_ok()
+    }
+
     async fn authorization_url(
         &self,
         request: ProviderAuthorizationRequest,
@@ -371,7 +382,7 @@ impl EndpointPolicy {
         url.scheme() == "https"
             || (allow_http_loopback
                 && url.scheme() == "http"
-                && matches!(url.host_str(), Some("127.0.0.1" | "::1")))
+                && matches!(url.host_str(), Some("127.0.0.1" | "::1" | "[::1]")))
     }
 
     fn validate_issuer(&self, issuer: &str) -> Result<Url, ProviderExchangeError> {

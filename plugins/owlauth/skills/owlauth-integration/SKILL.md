@@ -5,7 +5,7 @@ description: Integrate applications and developer tooling with OwlAuth Project A
 
 # OwlAuth integration
 
-Treat OwlAuth as pre-alpha until published documentation says otherwise. The current SDKs expose only minimal base-URL configuration. The server exposes only health and generated OpenAPI scaffolding. The `owlauth` CLI provides help/version output and checksum-verified self-update. Do not invent Project Auth endpoints, deployment settings, Control commands, MCP tools, or stability guarantees.
+Treat OwlAuth as pre-alpha until published documentation says otherwise. The server implements one strict-OIDC Project Auth/session journey, provisioning and user/session lifecycle Control APIs, embedded Runtime/Control browser surfaces, PostgreSQL authority, and software signer/secret stores. The TypeScript, Python, and Rust SDKs implement the public Runtime protocol while leaving navigation, persistence, refresh coordination, framework sessions, and backend JWT verification to the Application. The `owlauth` CLI provides endpoint discovery, system inspection, and checksum-verified self-update but no resource-management commands. Do not invent deferred identity methods, CLI commands, MCP tools, or stability guarantees.
 
 ## Product model
 
@@ -16,11 +16,11 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
 ## Workflow
 
 1. Determine whether the request concerns Runtime Application integration, Control administration, an SDK, an agent plugin, or a proposed interface.
-2. Establish whether the user is asking about current code or target architecture. State unavailable current capabilities explicitly.
-3. When working from a source checkout, inspect the Rust public types and generate the current contract with:
+2. Establish whether the user is asking about implemented behavior or explicitly deferred architecture. State unavailable capabilities precisely.
+3. When working from a source checkout, inspect the Rust public types and generate separate current contracts with:
 
    ```bash
-   cargo run --package owlauth-server -- --openapi
+   make openapi
    ```
 
 4. Select the public Runtime client without coupling it to server internals:
@@ -28,16 +28,17 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
    - Python distribution: `owlauth-client`; import: `owlauth`
    - Rust crate: `owlauth-client`; import: `owlauth_client`
 
-   Read [SDK examples](references/sdk-examples.md) only when the user needs code for the current placeholder API.
-5. For target integrations, validate behavior against `sdks/spec/`, its fixtures, and conformance cases. Preserve Project/Application binding, exact redirects/origins, PKCE handoff, serialized refresh rotation, token verification, redaction, and stable errors.
-6. Keep Runtime SDK operations separate from privileged Control operations. Propose implementation work rather than fabricating unavailable APIs.
+   Read [SDK examples](references/sdk-examples.md) when the user needs current protocol setup examples.
+
+5. Validate integrations against `sdks/spec/`, its fixtures, conformance cases, and current package README. Preserve Project/Application binding, exact redirects/origins, PKCE handoff, serialized refresh rotation, backend token verification, redaction, and stable errors.
+6. Keep Runtime SDK operations separate from privileged Control operations. Do not imply that the core SDK owns browser navigation, history cleanup, persistence, refresh single-flight, backend sessions, or business authorization.
 
 ## Boundaries
 
 - Public `project_id`, `application_id`, and publishable configuration are identifiers, not secrets or Control credentials.
 - Do not add a path or package dependency from any SDK or CLI to `owlauth-server`.
-- Do not commit generated OpenAPI output. Generate it from `crates/owlauth-types` through `owlauth-server --openapi` when needed.
+- Do not commit generated OpenAPI output. Generate the plane-specific documents from `crates/owlauth-types` with `make openapi` when needed.
 - Treat self-hosted and SaaS MCP as future separate remote Streamable HTTP server adapters authenticated by operator and SaaS API keys respectively. The plugin never bundles, launches, downloads, supervises, or impersonates a local MCP process.
 - Treat all CLI commands other than help/version output and `update` as unimplemented. The target single CLI discovers/pins the endpoint product before selecting isolated self-hosted or SaaS clients; it never guesses from an authenticated failure or falls back across credentials.
 - Never request provider client secrets, registry tokens, Project access/refresh tokens, management credentials, signing keys, or Cloudflare credentials in chat. Use secure local prompts, secret stores, or trusted publishing.
-- Do not recommend the current scaffold for production authentication or authorization workloads.
+- Do not present the current pre-alpha implementation as production-supported authentication or authorization infrastructure.

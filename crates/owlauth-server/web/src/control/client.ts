@@ -8,6 +8,10 @@ export type ProjectPolicy = components["schemas"]["ProjectPolicy"];
 export type Application = components["schemas"]["Application"];
 export type SigningKey = components["schemas"]["SigningKey"];
 export type Provider = components["schemas"]["Provider"];
+export type ProjectUser = components["schemas"]["ProjectUser"];
+export type ProjectUserSessions = components["schemas"]["ProjectUserSessions"];
+export type ApplicationSession = components["schemas"]["ApplicationSession"];
+export type BrowserSession = components["schemas"]["BrowserSession"];
 export type ProblemDetails = components["schemas"]["ProblemDetails"];
 
 export interface DisposableControlClient {

@@ -114,7 +114,13 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::reconcile_provider,
         crate::control_resources::disable_provider,
         crate::control_resources::assign_provider,
-        crate::control_resources::unassign_provider
+        crate::control_resources::unassign_provider,
+        crate::control_resources::list_project_users,
+        crate::control_resources::get_project_user,
+        crate::control_resources::disable_project_user,
+        crate::control_resources::list_project_user_sessions,
+        crate::control_resources::revoke_application_session,
+        crate::control_resources::revoke_browser_session
     ),
     components(schemas(
         HealthResponse,
@@ -155,7 +161,15 @@ pub fn get_system() -> SystemCapabilities {
         CreateProviderRequest,
         ReconcileProviderRequest,
         ProviderRevisionRequest,
-        ProviderAssignmentRequest
+        ProviderAssignmentRequest,
+        ProjectUserStatus,
+        ManagedSessionStatus,
+        ProjectUser,
+        ProjectUserList,
+        ApplicationSession,
+        BrowserSession,
+        ProjectUserSessions,
+        ExpectedSessionRevision
     )),
     modifiers(&ControlSecurity)
 )]

@@ -1,8 +1,24 @@
-/** Client configuration for an OwlAuth server. */
-export class Client {
-  readonly baseUrl: string;
-
-  constructor(baseUrl: string) {
-    this.baseUrl = baseUrl;
-  }
-}
+export { Client, type BeginLoginOptions, type ClientOptions, type CryptoProvider } from "./client.js";
+export {
+  OwlAuthError,
+  type CallerAction,
+  type ClientErrorOptions,
+  type ErrorCategory,
+  type RetryDisposition,
+} from "./errors.js";
+export {
+  AccessToken,
+  type BrowserLogoutPreparation,
+  CredentialPair,
+  type CurrentUser,
+  type LoginStartResult,
+  type OperationOptions,
+  PendingLogin,
+  PkceVerifier,
+  type ProjectJwks,
+  type PublicApplicationConfiguration,
+  type PublicJwk,
+  type PublicProvider,
+  type UserProjection,
+  ValidatedCallback,
+} from "./types.js";

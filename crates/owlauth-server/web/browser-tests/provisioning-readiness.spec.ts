@@ -4,6 +4,7 @@ import { expect, test } from "@playwright/test";
 const controlBase = requiredEnvironment("OWLAUTH_E2E_CONTROL_BASE");
 const runtimeBase = requiredEnvironment("OWLAUTH_E2E_RUNTIME_BASE");
 const operatorKey = requiredEnvironment("OWLAUTH_E2E_OPERATOR_KEY");
+const providerOrigin = requiredEnvironment("OWLAUTH_E2E_PROVIDER_ORIGIN");
 
 test("fresh-database operator journey reaches exact Runtime readiness", async ({
   page,
@@ -59,7 +60,7 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
 
   await page.getByLabel("Provider key").fill(`provider-${suffix}`);
   await page.locator("#provider-name").fill(providerName);
-  await page.getByLabel("Canonical HTTPS issuer").fill("https://accounts.example/");
+  await page.getByLabel("Canonical HTTPS issuer").fill(providerOrigin);
   await page.getByLabel("Client ID").fill(`client-${suffix}`);
   await page.getByLabel("Client secret (write-only)").fill(providerSecret);
   await page.getByRole("button", { name: "Configure provider" }).click();
@@ -82,6 +83,19 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   expect(storage).toMatchObject({ local: 0, session: 0, caches: 0, databases: 0 });
   expect(storage.url).not.toContain(operatorKey);
 
+  const publicConfiguration = await page.request.get(
+    `${runtimeBase}v1/projects/${encodeURIComponent(projectPublicId)}/auth/config?application_id=${encodeURIComponent(applicationPublicId)}`,
+  );
+  expect(publicConfiguration.ok()).toBe(true);
+  await expect(publicConfiguration.json()).resolves.toMatchObject({
+    application_display_name: applicationName,
+    application_public_id: applicationPublicId,
+    login_available: true,
+    project_display_name: projectName,
+    project_public_id: projectPublicId,
+    providers: [{ display_name: providerName }],
+  });
+
   const runtimePage = await page.context().newPage();
   const runtimeAuthorizations: string[] = [];
   runtimePage.on("request", (request) => {
@@ -90,12 +104,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
       if (authorization !== undefined) runtimeAuthorizations.push(authorization);
     }
   });
-  await runtimePage.goto(
-    `${runtimeBase}auth/?project_id=${encodeURIComponent(projectPublicId)}&application_id=${encodeURIComponent(applicationPublicId)}`,
-  );
-  await expect(runtimePage.getByRole("heading", { name: applicationName })).toBeVisible();
-  await expect(runtimePage.getByRole("heading", { name: projectName })).toBeVisible();
-  await expect(runtimePage.getByText(/Login is not available/u)).toBeVisible();
+  await runtimePage.goto(`${runtimeBase}auth/`);
+  await expect(runtimePage.getByRole("heading", { name: "Hosted authentication" })).toBeVisible();
+  await expect(runtimePage.getByText(/No authentication interaction is active/u)).toBeVisible();
   await expect(runtimePage.getByRole("button")).toHaveCount(0);
   expect(runtimeAuthorizations).toEqual([]);
   const runtimeAccessibility = await new AxeBuilder({ page: runtimePage }).analyze();

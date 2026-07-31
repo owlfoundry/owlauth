@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "synthetic": true,
+  "responseStatus": 401,
+  "response": {
+    "code": "unauthorized",
+    "message": "Synthetic authentication rejection. SENTINEL_ACCESS_TOKEN_MUST_NOT_LEAK",
+    "request_id": "req_conformance_unauthorized"
+  },
+  "redactionSentinels": ["SENTINEL_ACCESS_TOKEN_MUST_NOT_LEAK"]
+}

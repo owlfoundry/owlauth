@@ -3,6 +3,7 @@
     reason = "the HTTP-free authentication repository slice precedes Runtime composition"
 )]
 mod authentication;
+mod control_lifecycle;
 mod error;
 mod infrastructure;
 mod provisioning;
@@ -20,6 +21,11 @@ pub(crate) use authentication::{
     AdmittedProviderMethod, AuthenticationRepository, BindHostedBrowser, ClaimProviderCallback,
     ClaimedProviderExchange, CreateLoginTransaction, FailProviderExchange, LoginRevisionSnapshot,
     LoginTransactionRecord, ProtectedValue, SelectProviderMethod, VersionedDigest,
+};
+pub(crate) use control_lifecycle::{
+    ApplicationSessionRecord, BrowserSessionRecord, ControlLifecyclePort, ControlLifecycleService,
+    DisableProjectUser, ManagedSessionStatus, ProjectUserRecord, ProjectUserSessions,
+    ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
 };
 pub(crate) use error::ApplicationError;
 pub(crate) use infrastructure::{
@@ -42,11 +48,11 @@ pub(crate) use runtime_auth::{
     HostedBootstrap, ProviderCallback, RefreshSession, RuntimeAuthService, SelectProvider,
 };
 pub(crate) use runtime_security::{
-    BrowserLogoutContext, CurrentSession, HostedInteraction, HostedProviderMethod,
-    LoginStartContext, OpaquePurpose, ProtectedPurpose, ProviderAuthorizationRequest,
-    ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity, ProviderRuntimeContext,
-    ProviderSecretResolver, RuntimeAuthorityRepository, RuntimeProtector, RuntimeSigner,
-    UpstreamProviderClient, VerificationKey,
+    AccessTokenSessionLookup, BrowserLogoutContext, CurrentSession, HostedInteraction,
+    HostedProviderMethod, LoginStartContext, OpaquePurpose, ProtectedPurpose,
+    ProviderAuthorizationRequest, ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity,
+    ProviderRuntimeContext, ProviderSecretResolver, RuntimeAuthorityRepository, RuntimeProtector,
+    RuntimeSigner, UpstreamProviderClient, VerificationKey,
 };
 #[allow(
     unused_imports,

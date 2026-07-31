@@ -1,11 +1,161 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "cases": [
     {
-      "name": "health response",
-      "fixture": "../fixtures/health-response.json",
+      "name": "public configuration preserves configured context",
+      "fixture": "../fixtures/public-application-config.json",
+      "required": true,
+      "capability": "public_configuration",
+      "operation": "public_configuration",
+      "minimumCorpusSchema": 2,
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
       "expected": {
-        "status": "ok"
+        "outcome": "success",
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "providerKeys": ["oidc-main"],
+        "loginAvailable": true
+      }
+    },
+    {
+      "name": "public configuration rejects context replacement",
+      "fixture": "../fixtures/public-application-config-context-mismatch.json",
+      "required": true,
+      "capability": "context_binding",
+      "operation": "public_configuration",
+      "minimumCorpusSchema": 2,
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "context_mismatch",
+        "retry": "never",
+        "action": "none"
+      }
+    },
+    {
+      "name": "handoff rejection discards pending state",
+      "fixture": "../fixtures/runtime-error-invalid-state.json",
+      "required": true,
+      "capability": "handoff",
+      "operation": "handoff",
+      "minimumCorpusSchema": 2,
+      "expected": {
+        "outcome": "error",
+        "category": "handoff",
+        "code": "invalid_state",
+        "retry": "never",
+        "action": "discard_pending"
+      }
+    },
+    {
+      "name": "refresh rejection invalidates credential family",
+      "fixture": "../fixtures/runtime-error-invalid-state.json",
+      "required": true,
+      "capability": "refresh",
+      "operation": "refresh",
+      "minimumCorpusSchema": 2,
+      "expected": {
+        "outcome": "error",
+        "category": "refresh",
+        "code": "invalid_state",
+        "retry": "never",
+        "action": "invalidate_credentials"
+      }
+    },
+    {
+      "name": "current user unauthorized requires reauthentication",
+      "fixture": "../fixtures/runtime-error-unauthorized.json",
+      "required": true,
+      "capability": "current_user",
+      "operation": "current_user",
+      "minimumCorpusSchema": 2,
+      "expected": {
+        "outcome": "error",
+        "category": "authentication",
+        "code": "unauthorized",
+        "retry": "never",
+        "action": "reauthenticate"
+      }
+    },
+    {
+      "name": "rate limit preserves bounded retry semantics",
+      "fixture": "../fixtures/runtime-error-rate-limited.json",
+      "required": true,
+      "capability": "errors",
+      "operation": "public_configuration",
+      "minimumCorpusSchema": 2,
+      "expected": {
+        "outcome": "error",
+        "category": "rate_limited",
+        "code": "rate_limited",
+        "retry": "safe_after_delay",
+        "action": "none"
+      }
+    },
+    {
+      "name": "unknown runtime code is conservative",
+      "fixture": "../fixtures/runtime-error-unknown.json",
+      "required": true,
+      "capability": "errors",
+      "operation": "public_configuration",
+      "minimumCorpusSchema": 2,
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "future_runtime_code",
+        "retry": "never",
+        "action": "none"
+      }
+    },
+    {
+      "name": "credential pair is atomic and redacted",
+      "fixture": "../fixtures/credential-pair.json",
+      "required": true,
+      "capability": "credentials",
+      "operation": "credential_response",
+      "minimumCorpusSchema": 2,
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "userId": "usr_conformance",
+        "refreshGeneration": 1,
+        "projectionRevision": 1,
+        "redacted": true
+      }
+    },
+    {
+      "name": "current user projection preserves context",
+      "fixture": "../fixtures/current-user.json",
+      "required": true,
+      "capability": "current_user",
+      "operation": "current_user_response",
+      "minimumCorpusSchema": 2,
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "userId": "usr_conformance",
+        "projectionRevision": 1
       }
     }
   ]

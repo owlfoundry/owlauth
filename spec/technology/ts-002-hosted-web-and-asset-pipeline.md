@@ -92,7 +92,7 @@ Docker uses cacheable Rust contract-export, Node/pnpm frozen web-build, and fina
 
 ### Test and security baseline
 
-Component tests use Vitest and Testing Library with accessible role/name queries and injected Fetch implementations. MSW is not selected initially. Real-browser Playwright tests start the Rust server and trusted test proxy and cover Chromium, Firefox, and WebKit; axe automation supplements, but does not replace, keyboard, focus, semantic, zoom, and human-informed accessibility review.
+Component tests use Vitest and Testing Library with accessible role/name queries and injected Fetch implementations. MSW is not selected initially. The current declared real-browser Playwright baseline starts the Rust server and trusted test proxy and covers Chromium and Firefox; WebKit and Safari support remains deferred until the same secure end-to-end gate is available for that engine family. Axe automation supplements, but does not replace, keyboard, focus, semantic, zoom, and human-informed accessibility review.
 
 Required static/browser integration coverage includes:
 

@@ -1,9 +1,9 @@
 # Getting started
 
-This guide helps contributors run and inspect the **current pre-alpha scaffold**. It is not a deployment guide for the target Project Auth architecture.
+This guide helps contributors run and inspect the current pre-alpha implementation. It is not a production deployment guide.
 
 ::: warning Current capability
-Today, `owlauth-server` binds one address and serves only `GET /health`. It can also print its generated OpenAPI document. The `owlauth` CLI provides help, version output, and checksum-verified self-update. Project/Application management, provider login, PostgreSQL/Redis, token issuance, Runtime/Control listeners, automatic migrations, SDK auth flows, and MCP are not implemented.
+`owlauth-server` provides isolated Runtime and Control listeners over PostgreSQL, automatic or verification-only embedded migrations, strict OIDC Project login, Hosted Authentication, PKCE handoff, Project JWT/session/refresh/logout behavior, provisioning and lifecycle Control APIs, and an embedded Management Console. Three pre-alpha SDKs consume the Runtime protocol. Passwordless email, managed profile synchronization, projection webhooks, SCIM/bulk directory, and remote MCP are not implemented.
 :::
 
 ## Prerequisites
@@ -27,7 +27,7 @@ cd owlauth
 make install
 ```
 
-`make install` fetches locked Rust dependencies and installs the locked Python and pnpm workspaces. It does not configure a Project or start an authentication service.
+`make install` fetches locked Rust dependencies and installs the locked Python and pnpm workspaces. It does not provision a Project or start OwlAuth.
 
 ## Run repository checks
 
@@ -40,39 +40,35 @@ make package-check
 
 The targets cover formatting and linting, Rust/Python/TypeScript unit tests, package metadata, release and installer checks, documentation, artifacts, and distribution contents. See the repository [`Makefile`](https://github.com/owlfoundry/owlauth/blob/main/Makefile) for the exact commands.
 
-Passing these checks validates the scaffold and packaging. It does not establish Project Auth interoperability or production readiness.
+These checks include unit, conformance, package, generated-asset, real PostgreSQL/provider/browser, and product-topology evidence. They do not constitute production certification for a particular deployment.
 
-## Run the current server
+## Run the development topology
 
-```bash
-cargo run --locked --package owlauth-server
-```
-
-The development binary listens on `127.0.0.1:8080` by default. Override the address with `OWLAUTH_ADDR`:
+Start the disposable development infrastructure:
 
 ```bash
-OWLAUTH_ADDR=127.0.0.1:9090 cargo run --locked --package owlauth-server
+make dev-up
 ```
 
-In another terminal:
+OwlAuth rejects unknown `OWLAUTH_*` variables and validates selected-plane database, listener, key-store, Runtime protection, provider egress, and Control credential configuration before binding. The complete variable reference and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration).
+
+For the fastest executable proof of a correctly provisioned topology, run:
 
 ```bash
-curl --fail http://127.0.0.1:8080/health
-# {"status":"ok"}
+make web-e2e
 ```
 
-`/health` reports process health only. There are no Project, Application, provider, login, session, token, Control, or MCP routes to call yet.
+That gate creates isolated PostgreSQL state, starts real Runtime and Control processes, provisions Project Auth resources, uses a controlled OIDC provider through the production adapter, and exercises browser-direct and backend-custody Application journeys. `/health` is liveness only; use `/ready` for selected-plane readiness.
 
-## Generate the current OpenAPI document
+## Generate OpenAPI documents
 
-Reviewed public Rust types in `crates/owlauth-types` generate OpenAPI on demand:
+Reviewed public Rust types in `crates/owlauth-types` generate complete, separate Runtime and Control OpenAPI documents without compiling the server:
 
 ```bash
-cargo run --locked --package owlauth-server -- --openapi \
-  > /tmp/owlauth-openapi.json
+make openapi
 ```
 
-The current document describes `/health` and the small scaffold type vocabulary. It does not describe the planned Runtime or Control surface. Generated OpenAPI is an ephemeral build input and must not be committed.
+The files are written to `target/openapi/runtime.json` and `target/openapi/control.json`. Generated OpenAPI is ephemeral; the hosted-web package commits only its derived plane-pure TypeScript contract files.
 
 ## Build the container
 
@@ -82,7 +78,7 @@ Build and smoke-test the current server image:
 make docker-build
 ```
 
-The image runs as a non-root user, exposes port `8080`, sets `OWLAUTH_ADDR=0.0.0.0:8080`, and checks `/health`. Those properties describe the scaffold image, not a production topology.
+The image runs as a non-root user with `tini` as PID 1 and is smoke-tested through `/health`. Runtime, Control, PostgreSQL, key stores, provider egress, TLS/reverse proxy, backup, and secret configuration remain deployment responsibilities.
 
 Published images use `ghcr.io/owlfoundry/owlauth`:
 
@@ -120,16 +116,16 @@ Do not expect `project`, `application`, `provider`, `user`, or other Control com
 
 Components use independent SemVer and tags:
 
-| Component | Package | Tag |
-| --- | --- | --- |
-| Server and public types | `owlauth-server`, `owlauth-types` | `server-v{version}` |
-| CLI | `owlauth-cli` | `cli-v{version}` |
-| TypeScript SDK | `@owlauth/client` | `typescript-v{version}` |
-| Python SDK | `owlauth-client` | `python-v{version}` |
-| Rust SDK | `owlauth-client` | `rust-v{version}` |
+| Component               | Package                           | Tag                     |
+| ----------------------- | --------------------------------- | ----------------------- |
+| Server and public types | `owlauth-server`, `owlauth-types` | `server-v{version}`     |
+| CLI                     | `owlauth-cli`                     | `cli-v{version}`        |
+| TypeScript SDK          | `@owlauth/client`                 | `typescript-v{version}` |
+| Python SDK              | `owlauth-client`                  | `python-v{version}`     |
+| Rust SDK                | `owlauth-client`                  | `rust-v{version}`       |
 
 Tags point at the selected `main` commit; release workflows materialize component versions in isolated workspaces rather than requiring version-bump commits. Matching version numbers do not imply server/SDK compatibility.
 
-## Follow the target design
+## Follow the architecture
 
-The architecture under [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec) is normative target design, not a command reference. Start with [Architecture](/guide/architecture) to understand the future Project Auth model and [Security](/guide/security) before implementing a surface.
+The architecture under [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec) is normative behavior, not a command reference. Start with [Architecture](/guide/architecture), [Security](/guide/security), and [SDKs](/guide/sdks). Explicitly deferred capabilities remain documented rather than implied by the implemented pre-alpha surface.

@@ -232,11 +232,11 @@ impl UpdateApplication {
 }
 
 impl CreateProvider {
-    fn normalize(mut self) -> Result<Self, ApplicationError> {
+    fn normalize(mut self, allow_http_loopback: bool) -> Result<Self, ApplicationError> {
         validate_idempotency_key(&self.idempotency_key)?;
         self.provider_key = ProviderKey::parse(self.provider_key)?.into_inner();
         self.display_name = DisplayName::parse(self.display_name)?.into_inner();
-        validate_https_url(&self.issuer)?;
+        validate_provider_issuer(&self.issuer, allow_http_loopback)?;
         if self.client_id.is_empty()
             || self.client_id.len() > 512
             || self.client_secret.is_empty()
@@ -278,9 +278,16 @@ fn external_store_alias(
     )
 }
 
-fn validate_https_url(value: &str) -> Result<(), ApplicationError> {
+fn validate_provider_issuer(
+    value: &str,
+    allow_http_loopback: bool,
+) -> Result<(), ApplicationError> {
     let url = url::Url::parse(value).map_err(|_| ApplicationError::InvalidInput)?;
-    if url.scheme() != "https"
+    let accepted_scheme = url.scheme() == "https"
+        || (allow_http_loopback
+            && url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "::1" | "[::1]")));
+    if !accepted_scheme
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -506,6 +513,7 @@ pub(crate) struct ProvisioningInfrastructure {
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn EntropySource>,
     digester: Arc<dyn RequestDigester>,
+    allow_http_loopback_provider: bool,
 }
 
 impl ProvisioningInfrastructure {
@@ -515,6 +523,7 @@ impl ProvisioningInfrastructure {
         clock: K,
         entropy: E,
         digester: D,
+        allow_http_loopback_provider: bool,
     ) -> Self
     where
         S: SignerStore + 'static,
@@ -529,6 +538,7 @@ impl ProvisioningInfrastructure {
             clock: Arc::new(clock),
             entropy: Arc::new(entropy),
             digester: Arc::new(digester),
+            allow_http_loopback_provider,
         }
     }
 }
@@ -963,7 +973,7 @@ async fn create_provider_workflow(
     command: CreateProvider,
     correlation_id: Uuid,
 ) -> Result<ProviderRecord, ApplicationError> {
-    let command = command.normalize()?;
+    let command = command.normalize(infrastructure.allow_http_loopback_provider)?;
     let secret_digest = infrastructure
         .secret_store
         .request_fingerprint(command.client_secret.as_bytes());
@@ -1494,6 +1504,7 @@ mod tests {
                 calls: entropy_calls,
             },
             Sha256RequestDigester,
+            false,
         )
     }
 
@@ -1526,6 +1537,25 @@ mod tests {
             idempotency_key: "provider-operation-12345678".to_owned(),
             expected_project_revision: 1,
         }
+    }
+
+    #[test]
+    fn provider_issuer_requires_https_unless_exact_loopback_is_enabled() {
+        assert!(validate_provider_issuer("https://accounts.example/", false).is_ok());
+        assert_eq!(
+            validate_provider_issuer("http://127.0.0.1:8080/", false),
+            Err(ApplicationError::InvalidInput)
+        );
+        assert!(validate_provider_issuer("http://127.0.0.1:8080/", true).is_ok());
+        assert!(validate_provider_issuer("http://[::1]:8080/", true).is_ok());
+        assert_eq!(
+            validate_provider_issuer("http://localhost:8080/", true),
+            Err(ApplicationError::InvalidInput)
+        );
+        assert_eq!(
+            validate_provider_issuer("http://192.0.2.1:8080/", true),
+            Err(ApplicationError::InvalidInput)
+        );
     }
 
     #[tokio::test]

@@ -112,7 +112,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
             .all(&transaction)
             .await
             .map_err(persistence)?;
-        if assignments.len() != command.admitted_providers.len() {
+        if command.admitted_providers.len() > assignments.len() {
             return Err(ApplicationError::RevisionConflict);
         }
 
@@ -136,6 +136,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
                 || provider.revision != method.provider_revision
                 || provider.provider_key != method.method_key
                 || provider.display_name != method.display_name
+                || provider.issuer != method.issuer
             {
                 return Err(ApplicationError::RevisionConflict);
             }
@@ -567,6 +568,8 @@ fn validate_revisions(revisions: &LoginRevisionSnapshot) -> Result<(), Applicati
 fn validate_admitted_provider(method: &AdmittedProviderMethod) -> Result<(), ApplicationError> {
     if method.method_key.is_empty()
         || method.display_name.is_empty()
+        || method.issuer.is_empty()
+        || method.issuer.len() > 2048
         || method.provider_revision <= 0
         || method.assignment_security_revision <= 0
     {
@@ -942,6 +945,7 @@ mod tests {
                     method_key: "oidc-main".to_owned(),
                     provider_id,
                     display_name: "OIDC".to_owned(),
+                    issuer: "https://issuer.example".to_owned(),
                     provider_revision: 1,
                     assignment_security_revision: 1,
                 }],

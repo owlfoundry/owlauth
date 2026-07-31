@@ -36,6 +36,7 @@ pub(crate) struct AdmittedProviderMethod {
     pub method_key: String,
     pub provider_id: Uuid,
     pub display_name: String,
+    pub issuer: String,
     pub provider_revision: i64,
     pub assignment_security_revision: i64,
 }

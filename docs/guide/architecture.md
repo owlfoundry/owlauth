@@ -2,23 +2,23 @@
 
 OwlAuth is designed as self-hostable, project-scoped authentication and identity infrastructure. It is a modular monolith: one Rust server artifact, one shared application/domain core, and two isolated transport planes.
 
-::: warning Design versus implementation
-This page summarizes the approved target architecture. The current pre-alpha server implements only `/health` and OpenAPI generation. It has no Project model, authentication flow, persistence, tokens, plane separation, migration runner, provider adapter, hosted authentication UI, Management Console, or key lifecycle yet.
+::: warning Current pre-alpha scope
+The repository currently implements PostgreSQL-backed Project, Application, provider, and signing-key provisioning; isolated Runtime and Control planes; embedded Hosted Authentication and Management Console surfaces; strict OIDC federation; PKCE handoff; Project JWT, session, refresh, and logout lifecycle; operational user and session controls; and TypeScript, Python, and Rust protocol SDKs. Passwordless email, managed provider renewal and profile synchronization, projection webhooks, SCIM or bulk directory behavior, and remote MCP remain target architecture. Interfaces and deployment requirements may still change.
 :::
 
 The normative details live in the repository [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec).
 
 ## Deployment, Project, and Application
 
-| Concept | Meaning |
-| --- | --- |
-| **Deployment** | One OwlAuth installation and administrative trust domain with one operator policy and PostgreSQL authority. |
-| **Project** | The isolation boundary for users, linked identities, provider configuration, browser sessions, Application sessions, refresh families, access tokens, policy, and signing keys. |
-| **Application** | A web, mobile, native, or server integration inside one Project, with a public ID, type, allowed origins, and exact post-login redirects. |
-| **Provider configuration** | A Project-owned upstream OAuth/OIDC client registration assigned to selected Applications. |
-| **Managed provider connection** | An optional server-only renewable credential lifecycle for bounded linked-identity profile synchronization; never a token vault for Applications. |
-| **Project user** | A stable local user in exactly one Project, linked to explicitly proven upstream and/or first-party email identities. |
-| **Application user projection** | A bounded revisioned view returned to one Application and optionally synchronized by signed durable webhooks after that Application has seen the user. |
+| Concept                         | Meaning                                                                                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Deployment**                  | One OwlAuth installation and administrative trust domain with one operator policy and PostgreSQL authority.                                                                     |
+| **Project**                     | The isolation boundary for users, linked identities, provider configuration, browser sessions, Application sessions, refresh families, access tokens, policy, and signing keys. |
+| **Application**                 | A web, mobile, native, or server integration inside one Project, with a public ID, type, allowed origins, and exact post-login redirects.                                       |
+| **Provider configuration**      | A Project-owned upstream OAuth/OIDC client registration assigned to selected Applications.                                                                                      |
+| **Managed provider connection** | An optional server-only renewable credential lifecycle for bounded linked-identity profile synchronization; never a token vault for Applications.                               |
+| **Project user**                | A stable local user in exactly one Project, linked to explicitly proven upstream and/or first-party email identities.                                                           |
+| **Application user projection** | A bounded revisioned view returned to one Application and optionally synchronized by signed durable webhooks after that Application has seen the user.                          |
 
 Applications inside one Project intentionally share its user directory and token trust boundary. `app_id` records which Application initiated a session, but the Project is the token issuer and audience boundary. Use separate Projects where Applications must not share users or token trust.
 
@@ -116,11 +116,11 @@ flowchart LR
 
 ### Runtime / Protocol Plane
 
-Runtime is public and latency-sensitive. The target surface covers the Hosted Authentication UI, public Project/Application methods, generic login start and method selection, provider/email proof completion, handoff exchange, current user, refresh, logout, and Project JWKS. Runtime-capable processes also execute lease-safe provider-profile, mail, and Application-webhook workers; these asynchronous jobs never make Control availability or webhook delivery part of login commit. Every operation is Project-qualified.
+Runtime is public and latency-sensitive. Its implemented surface covers the Hosted Authentication UI, public Project/Application configuration, generic login start and OIDC method selection, provider proof completion, handoff exchange, current user, refresh, logout, and Project JWKS. Runtime-capable processes own the worker executors for Runtime identity and Application behavior as those capabilities ship; asynchronous work must not make Control availability or webhook delivery part of a login commit. Every operation is Project-qualified.
 
 ### Control Plane
 
-Control serves the embedded Management Console, the credential-free origin-root `/.well-known/owlauth` CLI descriptor, and an optional remote Streamable HTTP MCP endpoint in addition to Project/Application/provider/user/session/policy/key/audit administration. It accepts only the deployment's `OWLAUTH_CONTROL_API_KEY`; a valid Bearer key has full deployment Control authority and is not stored in PostgreSQL. The Console keeps it only in active page memory. Public Project IDs, Application IDs, publishable keys, Project tokens, and provider credentials are never Control credentials.
+Control currently serves the embedded Management Console, the credential-free origin-root `/.well-known/owlauth` CLI descriptor, and the implemented Project, Application, provider, user, session, policy, and key APIs. A remote Streamable HTTP MCP endpoint and broader audit administration remain planned. Control accepts only the deployment's `OWLAUTH_CONTROL_API_KEY`; a valid Bearer key has full deployment Control authority and is not stored in PostgreSQL. The Console keeps it only in active page memory. Public Project IDs, Application IDs, publishable keys, Project tokens, and provider credentials are never Control credentials.
 
 The two routers remain isolated even in combined mode. Distinct Runtime and Control origins are recommended because they isolate the Console's in-memory operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary; routing by `Host` or path on one untrusted socket is not equivalent to the required internal listener separation.
 
@@ -141,7 +141,7 @@ flowchart TB
     Providers[Upstream provider adapters] --> Ports
 ```
 
-- `crates/owlauth-server` is the single server package. The target shared core, adapters, composition, and embedded migrations remain here.
+- `crates/owlauth-server` is the single server package. The shared core, adapters, composition, and embedded migrations remain here.
 - `crates/owlauth-types` owns public Runtime, Control, and health wire vocabulary plus OpenAPI derivation—not domain entities or database rows.
 - `crates/owlauth-cli` is one remote client with endpoint-discovered profiles pinned to product, instance, authority, API base, and credential class for self-hosted Control and SaaS. Discovery selects isolated clients before credential release; it cannot depend on either service implementation, access storage, load keys, or launch local MCP.
 - `sdks/*` consume the public Runtime Project Auth contract. The Rust SDK receives no privileged server dependency.
@@ -154,19 +154,19 @@ PostgreSQL is the sole transactional authority for Project ownership, identities
 
 Redis is non-authoritative. It may coordinate rate limits, cache public configuration/JWKS, and carry invalidation hints. Losing or flushing Redis must not change identity, grant duplicate credential use, undo revocation, activate a key, or cross a Project boundary.
 
-SeaORM 2 is selected for ordinary PostgreSQL repositories. SQLx 0.9 embeds migration files from `crates/owlauth-server/migrations/`, coordinates PostgreSQL startup migration locking, and verifies serving-schema compatibility. `MIGRATION_MODE` defaults to `auto`; `verify` performs no DDL. Serving pools have no DDL privilege, and SeaORM schema sync is disabled. This adapter and runner are target design and are not implemented today.
+SeaORM 2 implements ordinary PostgreSQL repositories. SQLx 0.9 embeds migration files from `crates/owlauth-server/migrations/`, coordinates PostgreSQL startup migration locking, and verifies exact serving-schema compatibility. `OWLAUTH_MIGRATION_MODE` defaults to `auto`; `verify` performs no DDL. Runtime and Control use independent serving pools, and SeaORM schema sync is disabled.
 
 ## Composition and deployment modes
 
-The target one-binary interface has three composition modes:
+The implemented one-binary interface selects one of three composition modes through configuration:
 
 ```text
-owlauth-server serve --plane=all
-owlauth-server serve --plane=runtime
-owlauth-server serve --plane=control
+OWLAUTH_MODE=all owlauth-server
+OWLAUTH_MODE=runtime owlauth-server
+OWLAUTH_MODE=control owlauth-server
 ```
 
-These commands are **not currently available**. `all` will bind both isolated listeners in one process; `runtime` and `control` will compose only their adapters. Every mode uses the same schema and domain rules. A split topology runs the same artifact against shared PostgreSQL; Runtime never calls Control for ordinary requests.
+`all` binds both isolated listeners in one process; `runtime` and `control` compose only the selected plane's adapters. The executable accepts no serving command arguments. Every mode uses the same schema and domain rules, and a split topology runs the same artifact against shared PostgreSQL without Runtime calling Control for ordinary requests.
 
 Physical separation is justified by scaling, private Control placement, resource quotas, region placement, or operational ownership—not by duplicating policy or creating independent authorities.
 

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "synthetic": true,
+  "responseStatus": 429,
+  "response": {
+    "code": "rate_limited",
+    "message": "Synthetic admission rejection.",
+    "request_id": "req_conformance_rate_limited"
+  }
+}

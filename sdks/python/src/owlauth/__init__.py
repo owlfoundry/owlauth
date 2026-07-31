@@ -1,6 +1,86 @@
-"""Official Python client for OwlAuth."""
+"""Official synchronous Python client for OwlAuth Project Auth."""
 
 from owlauth.client import Client
+from owlauth.conformance import ConformanceCase, ConformanceCorpus, load_conformance_corpus
+from owlauth.errors import (
+    AuthenticationError,
+    CancelledError,
+    ConfigurationError,
+    ErrorCategory,
+    HandoffError,
+    IndeterminateError,
+    LocalAction,
+    LoginError,
+    OwlAuthError,
+    OwlAuthTimeoutError,
+    ProtocolError,
+    RateLimitedError,
+    RefreshError,
+    RetryDisposition,
+    SessionError,
+    TransportError,
+)
+from owlauth.models import (
+    BrowserLogoutPreparation,
+    Completion,
+    CredentialPair,
+    CurrentUser,
+    JwksDocument,
+    LoginStart,
+    PendingLogin,
+    PublicApplicationConfig,
+    PublicJwk,
+    PublicProvider,
+    SecretValue,
+    UserProjection,
+    ValidatedCallback,
+)
+from owlauth.transport import (
+    FailureKind,
+    StdlibTransport,
+    Transport,
+    TransportFailure,
+    TransportResponse,
+)
 
-__all__ = ["Client"]
+__all__ = [
+    "AuthenticationError",
+    "BrowserLogoutPreparation",
+    "CancelledError",
+    "Client",
+    "Completion",
+    "ConfigurationError",
+    "ConformanceCase",
+    "ConformanceCorpus",
+    "CredentialPair",
+    "CurrentUser",
+    "ErrorCategory",
+    "FailureKind",
+    "HandoffError",
+    "IndeterminateError",
+    "JwksDocument",
+    "LocalAction",
+    "LoginError",
+    "LoginStart",
+    "OwlAuthError",
+    "OwlAuthTimeoutError",
+    "PendingLogin",
+    "ProtocolError",
+    "PublicApplicationConfig",
+    "PublicJwk",
+    "PublicProvider",
+    "RateLimitedError",
+    "RefreshError",
+    "RetryDisposition",
+    "SecretValue",
+    "SessionError",
+    "StdlibTransport",
+    "Transport",
+    "TransportError",
+    "TransportFailure",
+    "TransportResponse",
+    "UserProjection",
+    "ValidatedCallback",
+    "load_conformance_corpus",
+]
 __version__ = "0.0.1"

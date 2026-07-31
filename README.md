@@ -5,7 +5,7 @@ OwlAuth is self-hostable authentication and identity infrastructure for applicat
 OwlAuth federates with upstream OAuth/OIDC providers such as GitHub and Google and targets first-party passwordless email OTP/magic-link authentication through user-configured SMTP. Applications integrate through a Project Auth API, revisioned user projections, optional signed webhooks, and language SDKs; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server or provider-token broker.
 
 > [!IMPORTANT]
-> OwlAuth is pre-alpha. The repository currently contains architecture specifications, release infrastructure, placeholder SDKs, a checksum-verifying CLI updater, and production-shaped server foundations: PostgreSQL migrations/repositories, isolated Runtime and Control composition, health/readiness, plane-specific OpenAPI, and embedded browser shells. Project login, sessions, token issuance, provider integration, the full Control API, and MCP are not implemented. Do not use the current server for production authentication.
+> OwlAuth is pre-alpha. The repository implements PostgreSQL-backed Project/Application/provider/signing-key provisioning, isolated Runtime and Control planes, embedded Hosted Authentication and Management Console surfaces, strict OIDC federation, PKCE handoff, Project JWT/session/refresh/logout lifecycle, operational user/session controls, and three protocol SDKs. Passwordless email, managed provider credential renewal/profile synchronization, projection webhooks, SCIM/bulk directory, and remote MCP remain future work. Interfaces and operational requirements may change; do not treat the current release as production-supported.
 
 ## Product model
 
@@ -82,7 +82,7 @@ Start with:
 - [Contributing guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 
-The architecture and SDK specifications describe the required target behavior. They do not imply that the pre-alpha scaffold already implements it.
+The architecture and SDK specifications distinguish implemented pre-alpha behavior from explicitly deferred capabilities.
 
 ## Development
 
@@ -96,18 +96,15 @@ make build
 make package-check
 ```
 
-Start local PostgreSQL and Redis, export both OpenAPI documents, and run the Runtime listener:
+Start local PostgreSQL and Redis and export both OpenAPI documents:
 
 ```bash
 make dev-up
 make openapi
-OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_dev@127.0.0.1:5432/owlauth \
-  cargo run --package owlauth-server
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/ready
+make web-e2e
 ```
 
-Container-backed integration tests start isolated PostgreSQL and Redis instances and skip locally when Docker is unavailable; CI requires Docker execution:
+The browser end-to-end gate starts isolated PostgreSQL, OwlAuth Runtime and Control listeners, a controlled standards-compatible OIDC provider, and real Application actors. Container-backed Rust integration tests skip locally when Docker is unavailable; CI requires Docker execution:
 
 ```bash
 make test-containers
@@ -143,13 +140,13 @@ owlauth update
 
 The server, CLI, and each SDK follow independent SemVer. `owlauth-types` follows the server version.
 
-| Component | Package | Release tag |
-| --- | --- | --- |
-| Server | `owlauth-server`, `owlauth-types` | `server-v{version}` |
-| CLI | `owlauth-cli` | `cli-v{version}` |
-| TypeScript SDK | `@owlauth/client` | `typescript-v{version}` |
-| Python SDK | `owlauth-client` | `python-v{version}` |
-| Rust SDK | `owlauth-client` | `rust-v{version}` |
+| Component      | Package                           | Release tag             |
+| -------------- | --------------------------------- | ----------------------- |
+| Server         | `owlauth-server`, `owlauth-types` | `server-v{version}`     |
+| CLI            | `owlauth-cli`                     | `cli-v{version}`        |
+| TypeScript SDK | `@owlauth/client`                 | `typescript-v{version}` |
+| Python SDK     | `owlauth-client`                  | `python-v{version}`     |
+| Rust SDK       | `owlauth-client`                  | `rust-v{version}`       |
 
 A release tag points at the current `main` commit. Release workflows derive the version from the tag and materialize it only in isolated workflow workspaces, so releases do not require version-bump commits.
 

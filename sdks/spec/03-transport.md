@@ -2,7 +2,7 @@
 
 ## Current status
 
-No official SDK currently sends a network request. These rules apply when Runtime Project Auth transport is introduced.
+All three pre-alpha official SDKs implement the Runtime Project Auth network operations described here through their platform-appropriate injectable transports. The TypeScript package uses one Web-standard core in Node.js and supported browsers.
 
 ## TypeScript runtime portability
 

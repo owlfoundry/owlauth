@@ -14,8 +14,8 @@ use crate::domain::{
 };
 
 use super::{
-    ApplicationError, AuthenticationRepository, BindBrowserLogout, BindHostedBrowser,
-    BrowserLogoutRecord, ClaimProviderCallback, Clock, CommitHandoffExchange,
+    AccessTokenSessionLookup, ApplicationError, AuthenticationRepository, BindBrowserLogout,
+    BindHostedBrowser, BrowserLogoutRecord, ClaimProviderCallback, Clock, CommitHandoffExchange,
     CompleteProviderCallback, ConfirmBrowserLogout, ConfirmBrowserSessionReuse,
     CreateLoginTransaction, CurrentSession, FailProviderExchange, HandoffPreparation,
     HostedInteraction, LoginRevisionSnapshot, LogoutApplicationSession, OpaquePurpose,
@@ -87,6 +87,25 @@ impl RuntimeAuthService {
             .await
     }
 
+    pub(crate) async fn public_application_origin_allowed(
+        &self,
+        project_public_id: &str,
+        application_public_id: &str,
+        origin: &str,
+    ) -> Result<bool, ApplicationError> {
+        let (project_id, application_id) = self
+            .authority
+            .resolve_public_application(project_public_id, application_public_id)
+            .await?;
+        self.authority
+            .exact_application_origin(project_id, application_id, origin)
+            .await
+    }
+
+    pub(crate) fn provider_issuer_allowed(&self, issuer: &str) -> bool {
+        self.provider.issuer_allowed(issuer)
+    }
+
     pub(crate) async fn project_origin_allowed(
         &self,
         project_public_id: &str,
@@ -94,6 +113,32 @@ impl RuntimeAuthService {
     ) -> Result<bool, ApplicationError> {
         self.authority
             .project_origin_allowed(project_public_id, origin)
+            .await
+    }
+
+    pub(crate) async fn application_session_origin_allowed(
+        &self,
+        project_id: Uuid,
+        application_id: Uuid,
+        origin: &str,
+    ) -> Result<bool, ApplicationError> {
+        self.authority
+            .exact_application_origin(project_id, application_id, origin)
+            .await
+    }
+
+    pub(crate) async fn browser_session_reuse_available(
+        &self,
+        project_id: Uuid,
+        browser_session: &str,
+    ) -> Result<bool, ApplicationError> {
+        let credential = self.digest_credential(
+            OpaquePurpose::BrowserSession,
+            project_id.as_bytes(),
+            browser_session,
+        )?;
+        self.authority
+            .browser_session_reuse_available(project_id, &credential, self.clock.now())
             .await
     }
 
@@ -111,7 +156,7 @@ impl RuntimeAuthService {
         {
             return Err(ApplicationError::InvalidInput);
         }
-        let context = self
+        let mut context = self
             .authority
             .prepare_login_start(
                 &request.project_public_id,
@@ -120,6 +165,12 @@ impl RuntimeAuthService {
                 &request.redirect_uri,
             )
             .await?;
+        context
+            .admitted_providers
+            .retain(|provider| self.provider.issuer_allowed(&provider.issuer));
+        if context.admitted_providers.is_empty() {
+            return Err(ApplicationError::Disabled);
+        }
         let id = Uuid::new_v4();
         let interaction = self.credential_with_id(id)?;
         let digest = self.digest_id_credential(OpaquePurpose::Interaction, id, &interaction)?;
@@ -183,10 +234,9 @@ impl RuntimeAuthService {
         let (binding_value, interaction) = if initial.status
             == LoginTransactionStatus::AwaitingBrowserBinding
         {
-            let binding_value = match browser_binding {
-                Some(value) => Zeroizing::new(value.to_owned()),
-                None => self.opaque_credential(32)?,
-            };
+            // Never adopt a caller-supplied cookie when first binding an interaction. A fresh
+            // browser credential prevents pre-seeding from fixing another browser's binding.
+            let binding_value = self.opaque_credential(32)?;
             let binding_digest = self.binding_digest(transaction_id, &binding_value)?;
             let csrf_value = self.derived_credential(
                 OpaquePurpose::InteractionCsrf,
@@ -247,6 +297,9 @@ impl RuntimeAuthService {
                 self.clock.now(),
             )
             .await?;
+        if hosted.project_public_id != request.project_public_id {
+            return Err(ApplicationError::NotFound);
+        }
         if hosted.status != LoginTransactionStatus::AwaitingMethodSelection
             || hosted.transaction_revision != request.expected_revision
         {
@@ -471,6 +524,9 @@ impl RuntimeAuthService {
                 self.clock.now(),
             )
             .await?;
+        if hosted.project_public_id != request.project_public_id {
+            return Err(ApplicationError::NotFound);
+        }
         let session_digest = self.digest_credential(
             OpaquePurpose::BrowserSession,
             hosted.project_id.as_bytes(),
@@ -579,6 +635,11 @@ impl RuntimeAuthService {
             })
             .await?;
         Ok(CredentialPair {
+            project_public_id: preparation.project_public_id,
+            application_public_id: preparation.application_public_id,
+            user_public_id: preparation.user_public_id,
+            application_session_id: committed.application_session_id,
+            refresh_generation: committed.refresh_generation,
             access_token: Zeroizing::new(access_token),
             refresh_token: refresh_value,
             token_type: "Bearer".to_owned(),
@@ -641,7 +702,12 @@ impl RuntimeAuthService {
             })
             .await?
         {
-            RefreshRotationResult::Rotated { .. } => Ok(CredentialPair {
+            RefreshRotationResult::Rotated { generation, .. } => Ok(CredentialPair {
+                project_public_id: preparation.project_public_id,
+                application_public_id: preparation.application_public_id,
+                user_public_id: preparation.user_public_id,
+                application_session_id: preparation.application_session_id,
+                refresh_generation: generation,
                 access_token: Zeroizing::new(access_token),
                 refresh_token: successor_value,
                 token_type: "Bearer".to_owned(),
@@ -661,11 +727,18 @@ impl RuntimeAuthService {
         self.authenticate_access_token(access_token).await
     }
 
-    pub(crate) async fn logout_application(
+    pub(crate) async fn application_logout_target(
         &self,
         access_token: &str,
+    ) -> Result<CurrentSession, ApplicationError> {
+        self.authenticate_access_token_for_logout(access_token)
+            .await
+    }
+
+    pub(crate) async fn logout_application(
+        &self,
+        current: CurrentSession,
     ) -> Result<(), ApplicationError> {
-        let current = self.authenticate_access_token(access_token).await?;
         self.sessions
             .logout_application_session(LogoutApplicationSession {
                 project_id: current.project_id,
@@ -769,6 +842,9 @@ impl RuntimeAuthService {
             .authority
             .browser_logout_context(&preparation, self.clock.now())
             .await?;
+        if context.project_public_id != request.project_public_id {
+            return Err(ApplicationError::NotFound);
+        }
         self.sessions
             .confirm_browser_logout(ConfirmBrowserLogout {
                 preparation,
@@ -885,6 +961,21 @@ impl RuntimeAuthService {
         &self,
         token: &str,
     ) -> Result<CurrentSession, ApplicationError> {
+        self.authenticate_access_token_with_mode(token, false).await
+    }
+
+    async fn authenticate_access_token_for_logout(
+        &self,
+        token: &str,
+    ) -> Result<CurrentSession, ApplicationError> {
+        self.authenticate_access_token_with_mode(token, true).await
+    }
+
+    async fn authenticate_access_token_with_mode(
+        &self,
+        token: &str,
+        allow_revoked: bool,
+    ) -> Result<CurrentSession, ApplicationError> {
         if token.len() > MAX_ACCESS_TOKEN_BYTES {
             return Err(ApplicationError::InvalidInput);
         }
@@ -938,12 +1029,15 @@ impl RuntimeAuthService {
             .verify(&key.public_jwk, signing_input.as_bytes(), &signature)?;
         self.authority
             .current_session(
-                key.project_id,
-                &claims.app_id,
-                &claims.sub,
-                claims.sid,
-                claims.claims_rev,
-                self.clock.now(),
+                AccessTokenSessionLookup {
+                    project_id: key.project_id,
+                    application_public_id: claims.app_id,
+                    user_public_id: claims.sub,
+                    application_session_id: claims.sid,
+                    claims_revision: claims.claims_rev,
+                    now: self.clock.now(),
+                },
+                allow_revoked,
             )
             .await
     }
@@ -1059,6 +1153,7 @@ pub(crate) struct HostedBootstrap {
 }
 
 pub(crate) struct SelectProvider {
+    pub project_public_id: String,
     pub interaction: String,
     pub browser_binding: String,
     pub csrf: String,
@@ -1082,6 +1177,7 @@ pub(crate) struct ProviderCompletion {
 }
 
 pub(crate) struct ConfirmSessionReuse {
+    pub project_public_id: String,
     pub interaction: String,
     pub browser_binding: String,
     pub csrf: String,
@@ -1105,6 +1201,11 @@ pub(crate) struct RefreshSession {
 }
 
 pub(crate) struct CredentialPair {
+    pub project_public_id: String,
+    pub application_public_id: String,
+    pub user_public_id: String,
+    pub application_session_id: Uuid,
+    pub refresh_generation: i64,
     pub access_token: Zeroizing<String>,
     pub refresh_token: Zeroizing<String>,
     pub token_type: String,
@@ -1127,6 +1228,7 @@ pub(crate) struct BoundBrowserLogout {
 }
 
 pub(crate) struct ConfirmProjectBrowserLogout {
+    pub project_public_id: String,
     pub preparation: String,
     pub browser_session: String,
     pub csrf: String,

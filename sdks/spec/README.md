@@ -6,17 +6,9 @@ OwlAuth brokers authentication through Project-configured methods, including ups
 
 ## Current implementation status
 
-The SDK packages are currently pre-alpha scaffolds and package-name reservations. Their `Client` types only retain a base URL. They do not yet:
+The SDK packages are pre-alpha protocol clients for the implemented Runtime Project Auth surface. They fetch public Project/Application configuration and JWKS, create caller-held PKCE pending state, validate and exchange one-use handoffs, return atomic credential generations, refresh, query current user, prepare browser logout, perform Application logout, and map bounded Runtime/transport failures to stable redacted errors.
 
-- fetch public Project/Application configuration;
-- begin a generic Hosted Project login;
-- generate or retain PKCE material;
-- exchange a one-use handoff ticket;
-- issue, verify, refresh, or persist Project credentials;
-- call current-user or logout operations;
-- map Runtime errors or send HTTP requests.
-
-The specifications below are target behavior and release acceptance gates, not claims about the current packages.
+The core SDKs deliberately do not navigate, mutate browser history, persist pending or credential state, coordinate refresh, manage framework sessions, verify access tokens for an Application backend, or expose provider credentials. Applications retain those responsibilities. The specifications below define the release acceptance gates for these implemented operations and their future evolution.
 
 Reviewed Rust definitions in `crates/owlauth-types` are the source of public Runtime DTOs and generated OpenAPI. OpenAPI is emitted from the exact server revision under test and is not committed. Generated models remain subordinate to the handwritten protocol, transport, isolation, and security rules in this directory.
 
@@ -37,10 +29,10 @@ The normative server architecture is specified in [`../../spec/`](../../spec/), 
 
 ## Shared attachments
 
-- [`fixtures/`](fixtures/) contains reviewed machine-readable wire examples. The current corpus contains only [`health-response.json`](fixtures/health-response.json).
-- [`conformance/`](conformance/) contains language-neutral behavior cases. The current [`cases.json`](conformance/cases.json) asserts only the health fixture.
+- [`fixtures/`](fixtures/) contains reviewed machine-readable public configuration, credential/projection, and Runtime error examples plus the basic health response.
+- [`conformance/`](conformance/) contains required language-neutral context, error, retry/action, atomic credential, and redaction cases in [`cases.json`](conformance/cases.json).
 
-These attachments are not evidence of Project Auth implementation. They use synthetic, non-secret values and explicit schema versions.
+Attachments use synthetic, non-secret values and explicit schema versions. Passing fixture conformance complements but never substitutes for real-server end-to-end evidence.
 
 ## Cross-cutting invariants
 
@@ -55,7 +47,7 @@ These attachments are not evidence of Project Auth implementation. They use synt
 9. Automatic retry is limited to demonstrably replay-safe operations. Ambiguous handoff exchange or refresh rotation is never blindly replayed.
 10. Equivalent Runtime responses map to equivalent semantic outcomes in every official SDK.
 11. Each SDK versions and ships independently from the server and other SDKs. Numeric version equality never implies compatibility.
-12. Package, unit, fixture, and conformance checks remain distinct from future real-server end-to-end tests. A mock or health fixture is not Project Auth E2E.
+12. Package, unit, fixture, conformance, and real-server end-to-end checks remain distinct. A mock or static fixture is not Project Auth E2E.
 
 ## Normative language
 

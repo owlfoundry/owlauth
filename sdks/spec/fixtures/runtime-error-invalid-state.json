@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "synthetic": true,
+  "responseStatus": 409,
+  "response": {
+    "code": "invalid_state",
+    "message": "Synthetic runtime rejection. SENTINEL_RUNTIME_BODY_MUST_NOT_LEAK",
+    "request_id": "req_conformance_invalid_state"
+  },
+  "redactionSentinels": ["SENTINEL_RUNTIME_BODY_MUST_NOT_LEAK"]
+}

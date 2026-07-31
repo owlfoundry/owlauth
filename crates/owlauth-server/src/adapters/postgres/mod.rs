@@ -4,6 +4,7 @@ mod audit;
     reason = "the Runtime composition follows the HTTP-free authentication repository slice"
 )]
 pub(crate) mod authentication;
+pub(crate) mod control_lifecycle;
 pub(crate) mod entity;
 pub(crate) mod provisioning;
 pub(crate) mod readiness;
@@ -655,6 +656,7 @@ mod tests {
                 SystemClock,
                 SystemEntropy,
                 Sha256RequestDigester,
+                false,
             ),
         );
         let readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(
@@ -873,6 +875,7 @@ mod tests {
                 SystemClock,
                 SystemEntropy,
                 Sha256RequestDigester,
+                false,
             ),
         );
         assert_eq!(
@@ -923,6 +926,7 @@ mod tests {
                 SystemClock,
                 SystemEntropy,
                 Sha256RequestDigester,
+                false,
             ),
         );
         assert_eq!(
@@ -1097,6 +1101,7 @@ mod tests {
                 SystemClock,
                 SystemEntropy,
                 Sha256RequestDigester,
+                false,
             ),
         );
         let provider_fence_command = || CreateProvider {
@@ -1155,6 +1160,7 @@ mod tests {
                 SystemClock,
                 SystemEntropy,
                 Sha256RequestDigester,
+                false,
             ),
         );
         assert_eq!(
@@ -1552,6 +1558,7 @@ mod tests {
                 SystemClock,
                 SystemEntropy,
                 Sha256RequestDigester,
+                false,
             ),
         );
         let signing_key = restarted_provisioning
@@ -2042,11 +2049,40 @@ mod tests {
             .public_application_config(&created_project.public_id, &created_application.public_id)
             .await
             .expect("Runtime public configuration should resolve exact IDs");
-        assert!(!public_config.login_available);
+        assert!(public_config.login_available);
         assert_eq!(public_config.providers.len(), 1);
         assert_eq!(public_config.providers[0].key, "workforce");
         assert_eq!(public_config.publishable_keys.len(), 1);
         assert_eq!(assigned.revision, provider.revision + 1);
+
+        let mut blocked_egress_config = config.clone();
+        blocked_egress_config.provider_allowed_origins =
+            vec!["https://different-provider.example/".to_owned()];
+        let mut blocked_egress_routers = build_routers(&blocked_egress_config, Some(&pools));
+        blocked_egress_routers.mark_ready();
+        let blocked_egress_response = blocked_egress_routers
+            .runtime
+            .take()
+            .expect("Runtime router should be composed")
+            .oneshot(
+                Request::get(format!(
+                    "/v1/projects/{}/auth/config?application_id={}",
+                    created_project.public_id, created_application.public_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked_egress_response.status(), StatusCode::OK);
+        let blocked_egress_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(blocked_egress_response.into_body(), 1_000_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(blocked_egress_json["providers"], serde_json::json!([]));
+        assert_eq!(blocked_egress_json["login_available"], false);
 
         let snapshot_mutation = control
             .begin()

@@ -4,7 +4,7 @@ The server library and `owlauth-server` executable for [OwlAuth](https://github.
 
 OwlAuth isolates users, provider/email identities, managed profile connections, SMTP, Application projections/webhooks, sessions, tokens, and signing keys by Project. Applications and end users use the Runtime Project Auth API and Hosted Authentication UI, while operators use the separately exposed Control API and embedded Management Console. OAuth/OIDC is used only for upstream federation; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server.
 
-> OwlAuth is pre-alpha. The executable provides production-shaped configuration, PostgreSQL migrations and pools, isolated Runtime/Control listeners, embedded browser assets, and the Control provisioning and Runtime login-readiness surface. Operators can provision Projects, Applications, exact redirects/origins, policy, signing keys, and OIDC provider configuration, but Project login, provider authorization/code exchange, users, sessions, and token issuance are not implemented. Do not use it for production authentication.
+> OwlAuth is pre-alpha. The executable provides production-shaped configuration, PostgreSQL migrations and pools, isolated Runtime/Control listeners, embedded browser assets, Control provisioning and user/session lifecycle operations, and federated Runtime Project Auth with strict OIDC, PKCE handoff, refresh rotation, and logout. Interfaces and deployment requirements may still change; evaluate and harden the complete deployment before production use.
 
 ## Run locally
 
@@ -14,14 +14,25 @@ Start PostgreSQL and Redis from the repository root:
 make dev-up
 ```
 
-Run the Runtime listener with automatic embedded migrations:
+Create separate development-only software-store directories and run the Runtime listener with automatic embedded migrations:
 
 ```bash
+mkdir -p /tmp/owlauth-dev/signers /tmp/owlauth-dev/configuration-secrets
+OWLAUTH_INSTANCE_ID=local-development \
 OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_dev@127.0.0.1:5432/owlauth \
+OWLAUTH_RUNTIME_PROCESS_ID=local-runtime \
+OWLAUTH_SIGNER_STORE_ROOT=/tmp/owlauth-dev/signers \
+OWLAUTH_SIGNER_STORE_KEY=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE \
+OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT=/tmp/owlauth-dev/configuration-secrets \
+OWLAUTH_CONFIGURATION_SECRET_STORE_KEY=AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI \
+OWLAUTH_RUNTIME_KEY_VERSION=1 \
+OWLAUTH_RUNTIME_DIGEST_KEY=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM \
+OWLAUTH_RUNTIME_PROTECTION_KEY=BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ \
+OWLAUTH_PROVIDER_ALLOWED_ORIGINS=https://accounts.example/ \
   cargo run --package owlauth-server
 ```
 
-Runtime defaults to `http://127.0.0.1:8080/`. Its liveness and readiness endpoints are available at `/health` and `/ready`; the Hosted Authentication UI shell is available at `/auth/`.
+The fixed keys above are public development examples and must never be reused outside disposable local state. Runtime defaults to `http://127.0.0.1:8080/`. Its liveness and readiness endpoints are available at `/health` and `/ready`; the Hosted Authentication UI shell is available at `/auth/`.
 
 To compose both planes, configure independent listeners and a canonical operator key:
 
@@ -36,46 +47,56 @@ OWLAUTH_SIGNER_STORE_ROOT=/absolute/path/to/owlauth/signers \
 OWLAUTH_SIGNER_STORE_KEY='<43-character-base64url-wrapping-key>' \
 OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT=/absolute/path/to/owlauth/configuration-secrets \
 OWLAUTH_CONFIGURATION_SECRET_STORE_KEY='<different-43-character-base64url-wrapping-key>' \
+OWLAUTH_RUNTIME_KEY_VERSION=1 \
+OWLAUTH_RUNTIME_DIGEST_KEY='<43-character-base64url-digest-key>' \
+OWLAUTH_RUNTIME_PROTECTION_KEY='<different-43-character-base64url-protection-key>' \
+OWLAUTH_PROVIDER_ALLOWED_ORIGINS='https://accounts.example/' \
   cargo run --package owlauth-server
 ```
 
-The placeholder above must be replaced with exactly 43 unpadded base64url characters. Control defaults to `http://127.0.0.1:8081/`; its Management Console is at `/console/`. Control API calls require the configured key as an exact Bearer credential.
+Every key placeholder above must be replaced with exactly 43 unpadded base64url characters derived from 32 random bytes, and keys with different purposes must be distinct. Control defaults to `http://127.0.0.1:8081/`; its Management Console is at `/console/`. Control API calls require the configured key as an exact Bearer credential.
 
 ## Configuration
 
 The process rejects unknown `OWLAUTH_*` variables and validates all selected-plane configuration before binding a listener.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OWLAUTH_MODE` | `runtime` | `runtime`, `control`, or `all` composition |
-| `OWLAUTH_INSTANCE_ID` | required for Control | Stable public deployment identity returned by endpoint discovery |
-| `OWLAUTH_RUNTIME_ADDR` | `127.0.0.1:8080` | Runtime bind socket |
-| `OWLAUTH_RUNTIME_BASE_URL` | `http://127.0.0.1:8080/` | Canonical external Runtime base |
-| `OWLAUTH_CONTROL_ADDR` | `127.0.0.1:8081` | Control bind socket |
-| `OWLAUTH_CONTROL_BASE_URL` | `http://127.0.0.1:8081/` | Canonical external Control base |
-| `OWLAUTH_CONTROL_API_KEY` | required for Control | `owl_ctrl_v1_` plus 43 base64url characters |
-| `OWLAUTH_SIGNER_STORE_ROOT` | required for Control | Absolute root for versioned encrypted software signer material |
-| `OWLAUTH_SIGNER_STORE_KEY` | required for Control | 32-byte signer wrapping key encoded as 43 unpadded base64url characters |
-| `OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT` | required for Control | Separate absolute root for encrypted provider configuration secrets |
-| `OWLAUTH_CONFIGURATION_SECRET_STORE_KEY` | required for Control | Separate 32-byte wrapping key encoded as 43 unpadded base64url characters |
-| `OWLAUTH_RUNTIME_PROCESS_ID` | required when Runtime is selected | Stable URL-safe identity used by this Runtime process when publishing observation leases |
-| `OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS` | Runtime process ID; required in Control-only mode | Comma-separated deployment roster; every Runtime-capable process must include itself, every required member must lease the revision, and any additional live stale lease blocks activation |
-| `OWLAUTH_PUBLICATION_LEASE_TTL_MS` | `30000` | Runtime key-publication lease lifetime; draining stops renewal and waits for expiry |
-| `OWLAUTH_KEY_PROPAGATION_DELAY_MS` | `2000` | Minimum all-live-process observation interval and retirement propagation margin; maximum `86400000` |
-| `OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS` | `1200000` | Additional clock-skew and advertised JWKS-cache retention added to the 3600-second token maximum; maximum `86400000` |
-| `OWLAUTH_POSTGRES_URL` | required | Serving PostgreSQL URL and authority anchor |
-| `OWLAUTH_RUNTIME_POSTGRES_URL` | serving URL | Runtime pool URL on the same database authority |
-| `OWLAUTH_CONTROL_POSTGRES_URL` | serving URL | Control pool URL on the same database authority |
-| `OWLAUTH_MIGRATION_POSTGRES_URL` | serving URL | Dedicated migration connection URL on the same authority |
-| `OWLAUTH_MIGRATION_MODE` | `auto` | `auto` applies migrations; `verify` performs a DDL-free exact history check |
-| `OWLAUTH_MIGRATION_OWNER_ROLE` | unset | Validated PostgreSQL role selected for migration DDL |
-| `OWLAUTH_DATABASE_CONNECT_TIMEOUT_MS` | `5000` | Database connection deadline |
-| `OWLAUTH_MIGRATION_LOCK_TIMEOUT_MS` | `30000` | Advisory migration-lock deadline |
-| `OWLAUTH_RUNTIME_DATABASE_MAX_CONNECTIONS` | `20` | Runtime pool bound |
-| `OWLAUTH_CONTROL_DATABASE_MAX_CONNECTIONS` | `5` | Control pool bound |
-| `OWLAUTH_REQUEST_TIMEOUT_MS` | `10000` | HTTP request deadline |
-| `OWLAUTH_MAX_REQUEST_BYTES` | `1048576` | Request body limit |
-| `OWLAUTH_SHUTDOWN_TIMEOUT_MS` | `10000` | Graceful drain deadline |
+| Variable                                    | Default                                           | Purpose                                                                                                                                                                                    |
+| ------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `OWLAUTH_MODE`                              | `runtime`                                         | `runtime`, `control`, or `all` composition                                                                                                                                                 |
+| `OWLAUTH_INSTANCE_ID`                       | required for Control                              | Stable public deployment identity returned by endpoint discovery                                                                                                                           |
+| `OWLAUTH_RUNTIME_ADDR`                      | `127.0.0.1:8080`                                  | Runtime bind socket                                                                                                                                                                        |
+| `OWLAUTH_RUNTIME_BASE_URL`                  | `http://127.0.0.1:8080/`                          | Canonical external Runtime base                                                                                                                                                            |
+| `OWLAUTH_CONTROL_ADDR`                      | `127.0.0.1:8081`                                  | Control bind socket                                                                                                                                                                        |
+| `OWLAUTH_CONTROL_BASE_URL`                  | `http://127.0.0.1:8081/`                          | Canonical external Control base                                                                                                                                                            |
+| `OWLAUTH_CONTROL_API_KEY`                   | required for Control                              | `owl_ctrl_v1_` plus 43 base64url characters                                                                                                                                                |
+| `OWLAUTH_SIGNER_STORE_ROOT`                 | required for Control and federated Runtime auth   | Absolute root for versioned encrypted software signer material                                                                                                                             |
+| `OWLAUTH_SIGNER_STORE_KEY`                  | required for Control and federated Runtime auth   | 32-byte signer wrapping key encoded as 43 unpadded base64url characters                                                                                                                    |
+| `OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT`   | required for Control and federated Runtime auth   | Separate absolute root for encrypted provider configuration secrets                                                                                                                        |
+| `OWLAUTH_CONFIGURATION_SECRET_STORE_KEY`    | required for Control and federated Runtime auth   | Separate 32-byte wrapping key encoded as 43 unpadded base64url characters                                                                                                                  |
+| `OWLAUTH_RUNTIME_KEY_VERSION`               | required when Runtime is selected                 | Positive active version for Runtime digest/data-protection key material                                                                                                                    |
+| `OWLAUTH_RUNTIME_DIGEST_KEY`                | required when Runtime is selected                 | 32-byte active keyed-digest key encoded as 43 unpadded base64url characters                                                                                                                |
+| `OWLAUTH_RUNTIME_PROTECTION_KEY`            | required when Runtime is selected                 | Distinct 32-byte active data-protection key encoded as 43 unpadded base64url characters                                                                                                    |
+| `OWLAUTH_RUNTIME_RETAINED_KEYS`             | unset                                             | JSON map of retained older digest/protection key versions needed by unexpired protected state                                                                                              |
+| `OWLAUTH_PROVIDER_ALLOWED_ORIGINS`          | required when Runtime is selected                 | Comma-separated canonical HTTPS origins admitted for OIDC discovery and endpoints                                                                                                          |
+| `OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK`      | `false`                                           | Development-only opt-in for exact `127.0.0.1` or `::1` HTTP origins in the provider allowlist; never admits hostnames or non-loopback addresses                                            |
+| `OWLAUTH_RUNTIME_PROCESS_ID`                | required when Runtime is selected                 | Stable URL-safe identity used by this Runtime process when publishing observation leases                                                                                                   |
+| `OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS`      | Runtime process ID; required in Control-only mode | Comma-separated deployment roster; every Runtime-capable process must include itself, every required member must lease the revision, and any additional live stale lease blocks activation |
+| `OWLAUTH_PUBLICATION_LEASE_TTL_MS`          | `30000`                                           | Runtime key-publication lease lifetime; draining stops renewal and waits for expiry                                                                                                        |
+| `OWLAUTH_KEY_PROPAGATION_DELAY_MS`          | `2000`                                            | Minimum all-live-process observation interval and retirement propagation margin; maximum `86400000`                                                                                        |
+| `OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS` | `1200000`                                         | Additional clock-skew and advertised JWKS-cache retention added to the 3600-second token maximum; maximum `86400000`                                                                       |
+| `OWLAUTH_POSTGRES_URL`                      | required                                          | Serving PostgreSQL URL and authority anchor                                                                                                                                                |
+| `OWLAUTH_RUNTIME_POSTGRES_URL`              | serving URL                                       | Runtime pool URL on the same database authority                                                                                                                                            |
+| `OWLAUTH_CONTROL_POSTGRES_URL`              | serving URL                                       | Control pool URL on the same database authority                                                                                                                                            |
+| `OWLAUTH_MIGRATION_POSTGRES_URL`            | serving URL                                       | Dedicated migration connection URL on the same authority                                                                                                                                   |
+| `OWLAUTH_MIGRATION_MODE`                    | `auto`                                            | `auto` applies migrations; `verify` performs a DDL-free exact history check                                                                                                                |
+| `OWLAUTH_MIGRATION_OWNER_ROLE`              | unset                                             | Validated PostgreSQL role selected for migration DDL                                                                                                                                       |
+| `OWLAUTH_DATABASE_CONNECT_TIMEOUT_MS`       | `5000`                                            | Database connection deadline                                                                                                                                                               |
+| `OWLAUTH_MIGRATION_LOCK_TIMEOUT_MS`         | `30000`                                           | Advisory migration-lock deadline                                                                                                                                                           |
+| `OWLAUTH_RUNTIME_DATABASE_MAX_CONNECTIONS`  | `20`                                              | Runtime pool bound                                                                                                                                                                         |
+| `OWLAUTH_CONTROL_DATABASE_MAX_CONNECTIONS`  | `5`                                               | Control pool bound                                                                                                                                                                         |
+| `OWLAUTH_REQUEST_TIMEOUT_MS`                | `10000`                                           | HTTP request deadline                                                                                                                                                                      |
+| `OWLAUTH_MAX_REQUEST_BYTES`                 | `1048576`                                         | Request body limit                                                                                                                                                                         |
+| `OWLAUTH_SHUTDOWN_TIMEOUT_MS`               | `10000`                                           | Graceful drain deadline                                                                                                                                                                    |
 
 When Runtime and Control share an external origin, their configured base paths must be disjoint and non-root. Separate origins remain recommended.
 

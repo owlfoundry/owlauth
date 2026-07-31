@@ -2,9 +2,7 @@
 
 ## Current status
 
-Public configuration retrieval, generic Hosted Project login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout are not implemented in any official SDK. Current packages must not be presented as production authentication clients.
-
-This specification becomes applicable as each capability is implemented and validated against a real OwlAuth Runtime.
+Public configuration retrieval, generic Hosted Project login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout are implemented by the pre-alpha official SDKs against the current Runtime contract. The packages remain explicit protocol cores rather than persistence, navigation, framework-session, or backend-token-verification libraries, and they must not be presented as production-supported until their independently versioned release criteria are met.
 
 ## Lifecycle overview
 

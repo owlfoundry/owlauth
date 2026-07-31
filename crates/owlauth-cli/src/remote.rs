@@ -711,6 +711,6 @@ mod tests {
         assert_eq!(capabilities.product, "owlauth-server");
         assert!(capabilities.provisioning);
         assert!(capabilities.login_readiness);
-        assert!(!capabilities.federated_project_auth);
+        assert!(capabilities.federated_project_auth);
     }
 }

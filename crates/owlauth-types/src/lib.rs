@@ -10,12 +10,8 @@ pub mod runtime;
 
 pub use health::HealthResponse;
 
-/// Compile-time availability of the still-partial federated Project Auth surface.
-///
-/// Block A deliberately keeps this false so Runtime login and session handlers remain
-/// compiled without being advertised or mounted. Block B may flip this only after its
-/// complete public contract and end-to-end invariants are ready.
-pub const FEDERATED_PROJECT_AUTH_AVAILABLE: bool = false;
+/// Compile-time availability of the complete federated Project Auth surface.
+pub const FEDERATED_PROJECT_AUTH_AVAILABLE: bool = true;
 
 #[cfg(test)]
 mod tests {
@@ -39,11 +35,12 @@ mod tests {
         assert!(
             runtime["paths"]["/projects/{project_public_id}/.well-known/jwks.json"].is_object()
         );
-        for excluded in [
+        for required in [
             "/v1/projects/{project_public_id}/auth/login/start",
             "/auth/interactions/{interaction}",
             "/v1/projects/{project_public_id}/auth/interactions/{interaction}/method",
             "/v1/projects/{project_public_id}/auth/interactions/{interaction}/session/reuse",
+            "/projects/{project_public_id}/auth/callback/{provider_key}",
             "/v1/projects/{project_public_id}/auth/handoff/exchange",
             "/v1/projects/{project_public_id}/auth/sessions/refresh",
             "/v1/projects/{project_public_id}/auth/users/me",
@@ -53,8 +50,8 @@ mod tests {
             "/v1/projects/{project_public_id}/auth/browser-logout/{preparation}/confirm",
         ] {
             assert!(
-                runtime["paths"].get(excluded).is_none(),
-                "partial Block B path leaked into Runtime OpenAPI: {excluded}"
+                runtime["paths"][required].is_object(),
+                "federated authentication path is missing from Runtime OpenAPI: {required}"
             );
         }
         assert!(runtime["paths"].get("/v1/projects").is_none());
@@ -73,7 +70,7 @@ mod tests {
         let advertised = control::get_system();
         assert!(advertised.provisioning);
         assert!(advertised.login_readiness);
-        assert!(!advertised.federated_project_auth);
+        assert!(advertised.federated_project_auth);
         assert!(control["paths"]["/v1/projects"].is_object());
         assert!(
             control["paths"]["/v1/projects/{project_id}/signing-keys/{key_id}/reconcile"]

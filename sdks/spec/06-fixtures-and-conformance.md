@@ -4,25 +4,13 @@
 
 [`fixtures/`](fixtures/) stores reviewed wire examples; [`conformance/`](conformance/) stores language-neutral behavior cases. Attachments use relative paths, stable names, and an explicit `schemaVersion`.
 
-The current corpus is intentionally minimal:
+The schema-version 2 corpus contains synthetic reviewed examples for public Project/Application configuration, context mismatch, atomic credential and current-user projection shapes, Runtime error mapping, retry/action semantics, unknown-code conservatism, and redaction, in addition to the basic health response. [`conformance/cases.json`](conformance/cases.json) marks each required capability and configured context explicitly.
 
-- [`fixtures/health-response.json`](fixtures/health-response.json) contains only `{ "status": "ok" }`;
-- [`conformance/cases.json`](conformance/cases.json) asserts only that health response.
+The corpus exercises public protocol semantics through each language runner. It remains static conformance evidence, not proof of server interoperability; real-server tests below provide that separate evidence.
 
-It does not describe a public Project/Application configuration, provider login, PKCE, handoff, Project token, refresh, current-user, logout, or error case. It is not a Project Auth conformance suite and does not prove any SDK transport exists.
+## Fixture families
 
-## Future fixture families
-
-As Runtime capabilities become real, shared attachments should cover:
-
-- bounded public Project/Application auth configuration and provider display keys;
-- login-start inputs/results with synthetic exact redirects and S256 challenges;
-- successful and failed one-use handoff exchange;
-- bounded Project user/session and access/refresh response shapes;
-- strict refresh rotation, replay-family revocation, and ambiguous outcomes;
-- current-user and Application/Project-browser logout semantics;
-- cross-Project/Application mismatch rejection;
-- stable Project Auth error codes, retry classification, and redaction.
+Shared attachments cover the stable cross-language semantic core. Language-specific unit suites additionally cover deterministic S256 generation, callback consumption, transport ambiguity, logout targets, and runtime idioms that cannot be represented safely as static credential-bearing fixtures. Real-server suites cover authoritative one-use, refresh-replay, browser, provider, and disablement behavior.
 
 Fixtures describe public wire/semantic behavior only. They never copy internal rows, provider payloads, secret references, management DTOs, or a generated OpenAPI document.
 
@@ -57,11 +45,9 @@ A case passing in one language is not cross-language conformance. Every SDK clai
 
 ## Validation stages
 
-### Current checks
+### Package, unit, and conformance checks
 
-While SDKs are base-URL-only scaffolds, CI may run package builds, static checks, unit tests, generated OpenAPI checks, JSON attachment validation, and the one health case if a runner exists. These stages must not be called Project Auth conformance or E2E.
-
-Mock/fake transport tests introduced later are unit or contract tests. They may validate failure paths and coordination, but they do not establish interoperability.
+CI runs package builds, static checks, language-specific unit/contract tests, generated OpenAPI checks, strict JSON attachment validation, and every required schema-version 2 shared case. Mock/fake transport tests validate failure paths and coordination but do not establish interoperability.
 
 ### Real-server E2E
 

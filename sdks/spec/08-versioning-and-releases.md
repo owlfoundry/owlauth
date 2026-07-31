@@ -12,7 +12,7 @@ The server, CLI, and every official SDK have separate SemVer, tags, artifacts, c
 
 An SDK release never requires synchronized server/CLI/other-SDK versions. Equal version numbers do not imply compatibility. Each SDK release identifies the Runtime Project Auth contract/server range it has actually tested.
 
-Current SDK packages are pre-alpha scaffolds that expose only a base-URL holder. Pre-1.0 SemVer permits deliberate iteration but does not permit silent breaking changes or false claims that Project Auth, PKCE, handoff, refresh, current-user, or logout exists.
+Current SDK packages are pre-alpha protocol clients with Project/Application-bound configuration and JWKS retrieval, Hosted login start, PKCE callback/handoff, atomic credential refresh, current-user, and logout operations. Pre-1.0 SemVer permits deliberate iteration but does not permit silent breaking changes or claims of framework session management, persistent storage, navigation, backend JWT verification, or production support.
 
 ## TypeScript artifact and integration boundary
 

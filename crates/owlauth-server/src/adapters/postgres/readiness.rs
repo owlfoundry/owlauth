@@ -117,6 +117,18 @@ impl PostgresReadinessAdapter {
             }
             providers
         };
+        let active_signing_keys = project_signing_key::Entity::find()
+            .filter(project_signing_key::Column::ProjectId.eq(project.id))
+            .filter(project_signing_key::Column::State.eq("active"))
+            .order_by_asc(project_signing_key::Column::Kid)
+            .limit(2)
+            .lock_shared()
+            .all(&transaction)
+            .await
+            .map_err(persistence)?;
+        if active_signing_keys.len() > 1 {
+            return Err(ApplicationError::Integrity);
+        }
 
         let final_publishable_keys = application_publishable_key::Entity::find()
             .filter(application_publishable_key::Column::ProjectId.eq(project.id))
@@ -149,6 +161,14 @@ impl PostgresReadinessAdapter {
                 .await
                 .map_err(persistence)?
         };
+        let final_active_signing_keys = project_signing_key::Entity::find()
+            .filter(project_signing_key::Column::ProjectId.eq(project.id))
+            .filter(project_signing_key::Column::State.eq("active"))
+            .order_by_asc(project_signing_key::Column::Kid)
+            .limit(2)
+            .all(&transaction)
+            .await
+            .map_err(persistence)?;
         let final_project = project::Entity::find_by_id(project.id)
             .one(&transaction)
             .await
@@ -170,10 +190,13 @@ impl PostgresReadinessAdapter {
             || final_publishable_keys != publishable_keys
             || final_assignments != assignments
             || final_providers != providers
+            || final_active_signing_keys != active_signing_keys
         {
             return Err(ApplicationError::RevisionConflict);
         }
 
+        let login_available =
+            !publishable_keys.is_empty() && !providers.is_empty() && active_signing_keys.len() == 1;
         let result = PublicApplicationConfig {
             project_public_id: project.public_id,
             project_display_name: project.display_name,
@@ -189,9 +212,10 @@ impl PostgresReadinessAdapter {
                     key: provider.provider_key,
                     display_name: provider.display_name,
                     kind: provider.kind,
+                    issuer: provider.issuer,
                 })
                 .collect(),
-            login_available: false,
+            login_available,
         };
         transaction.commit().await.map_err(persistence)?;
         Ok(result)

@@ -229,12 +229,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unavailable_federated_auth_cannot_spawn_provider_recovery() {
-        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
+    fn provider_recovery_runs_only_when_runtime_auth_is_composed() {
+        const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
         assert!(!should_spawn_provider_recovery(false));
-        assert!(
-            !should_spawn_provider_recovery(true),
-            "the capability gate must dominate accidentally composed infrastructure"
-        );
+        assert!(should_spawn_provider_recovery(true));
     }
 }

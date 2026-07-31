@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "synthetic": true,
+  "responseStatus": 200,
+  "response": {
+    "project_public_id": "prj_conformance",
+    "project_display_name": "Conformance Project",
+    "application_public_id": "app_conformance",
+    "application_display_name": "Conformance Application",
+    "publishable_keys": ["owl_app_conformance"],
+    "providers": [
+      {
+        "key": "oidc-main",
+        "display_name": "Example identity",
+        "kind": "oidc"
+      }
+    ],
+    "login_available": true
+  }
+}

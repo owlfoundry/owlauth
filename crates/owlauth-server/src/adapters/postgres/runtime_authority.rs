@@ -4,14 +4,14 @@ use sea_orm::{
     TransactionTrait,
 };
 use subtle::ConstantTimeEq;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::{
     application::{
-        AdmittedProviderMethod, ApplicationError, BrowserLogoutContext, CurrentSession,
-        HostedInteraction, HostedProviderMethod, LoginStartContext, ProviderRuntimeContext,
-        RuntimeAuthorityRepository, VerificationKey, VersionedDigest,
+        AccessTokenSessionLookup, AdmittedProviderMethod, ApplicationError, BrowserLogoutContext,
+        CurrentSession, HostedInteraction, HostedProviderMethod, LoginStartContext,
+        ProviderRuntimeContext, RuntimeAuthorityRepository, VerificationKey, VersionedDigest,
     },
     domain::LoginTransactionStatus,
 };
@@ -129,6 +129,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                 method_key: provider.provider_key,
                 provider_id: provider.id,
                 display_name: provider.display_name,
+                issuer: provider.issuer,
                 provider_revision: provider.revision,
                 assignment_security_revision: assignment.security_revision,
             });
@@ -227,6 +228,11 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             application_id: login.application_id,
             application_public_id: application.public_id,
             application_display_name: application.display_name,
+            application_type: match application.application_type.as_str() {
+                "web" => crate::domain::ApplicationType::Web,
+                "native" => crate::domain::ApplicationType::Native,
+                _ => return Err(ApplicationError::Integrity),
+            },
             status,
             transaction_revision: login.transaction_revision,
             csrf_key_version: login.csrf_digest_key_version,
@@ -349,6 +355,29 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         Ok((project.id, application.id))
     }
 
+    async fn resolve_public_application(
+        &self,
+        project_public_id: &str,
+        application_public_id: &str,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        let project = project::Entity::find()
+            .filter(project::Column::PublicId.eq(project_public_id))
+            .filter(project::Column::Status.eq("active"))
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        let application = application::Entity::find()
+            .filter(application::Column::ProjectId.eq(project.id))
+            .filter(application::Column::PublicId.eq(application_public_id))
+            .filter(application::Column::Status.eq("active"))
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        Ok((project.id, application.id))
+    }
+
     async fn exact_application_origin(
         &self,
         project_id: Uuid,
@@ -386,6 +415,86 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .await
             .map_err(persistence)?
             .is_some())
+    }
+
+    async fn browser_session_reuse_available(
+        &self,
+        project_id: Uuid,
+        browser_credential: &VersionedDigest,
+        now: OffsetDateTime,
+    ) -> Result<bool, ApplicationError> {
+        if browser_credential.value.len() != 32 || browser_credential.key_version <= 0 {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let Some(session) = project_browser_session::Entity::find()
+            .filter(project_browser_session::Column::ProjectId.eq(project_id))
+            .filter(
+                project_browser_session::Column::CredentialDigest
+                    .eq(browser_credential.value.to_vec()),
+            )
+            .filter(
+                project_browser_session::Column::CredentialDigestKeyVersion
+                    .eq(browser_credential.key_version),
+            )
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+        else {
+            return Ok(false);
+        };
+        if !bool::from(
+            session
+                .credential_digest
+                .as_slice()
+                .ct_eq(browser_credential.value.as_slice()),
+        ) || session.status != "active"
+            || session.idle_expires_at <= now
+            || session.absolute_expires_at <= now
+            || now < session.authenticated_at
+        {
+            return Ok(false);
+        }
+        let Some(project) = project::Entity::find_by_id(project_id)
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+        else {
+            return Ok(false);
+        };
+        let Some(policy) = project_policy::Entity::find_by_id(project_id)
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+        else {
+            return Ok(false);
+        };
+        let Some(user) = project_user::Entity::find_by_id(session.user_id)
+            .filter(project_user::Column::ProjectId.eq(project_id))
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+        else {
+            return Ok(false);
+        };
+        let reuse_enabled = policy
+            .session_policy
+            .get("browser_session_reuse")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let reuse_max_age = policy
+            .session_policy
+            .get("browser_session_reuse_max_age_seconds")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| (0..=86_400).contains(value));
+        Ok(project.status == "active"
+            && user.status == "active"
+            && session.project_security_revision == project.security_revision
+            && session.user_security_revision == user.security_revision
+            && session.policy_session_revision == policy.session_revision
+            && reuse_enabled
+            && reuse_max_age.is_some_and(|seconds| {
+                now - session.authenticated_at <= Duration::seconds(seconds)
+            }))
     }
 
     async fn verification_key(
@@ -432,13 +541,17 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
 
     async fn current_session(
         &self,
-        project_id: Uuid,
-        application_public_id: &str,
-        user_public_id: &str,
-        application_session_id: Uuid,
-        claims_revision: i64,
-        now: OffsetDateTime,
+        lookup: AccessTokenSessionLookup,
+        allow_revoked: bool,
     ) -> Result<CurrentSession, ApplicationError> {
+        let AccessTokenSessionLookup {
+            project_id,
+            application_public_id,
+            user_public_id,
+            application_session_id,
+            claims_revision,
+            now,
+        } = lookup;
         let transaction = self.database.begin().await.map_err(persistence)?;
         let project = project::Entity::find_by_id(project_id)
             .filter(project::Column::Status.eq("active"))
@@ -482,7 +595,8 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        if session.status != "active"
+        if (!allow_revoked && session.status != "active")
+            || (allow_revoked && !matches!(session.status.as_str(), "active" | "revoked"))
             || session.absolute_expires_at <= now
             || session.project_security_revision != project.security_revision
             || session.application_security_revision != application.security_revision
@@ -504,12 +618,13 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        if browser.status != "active"
-            || browser.idle_expires_at <= now
-            || browser.absolute_expires_at <= now
-            || browser.project_security_revision != project.security_revision
-            || browser.user_security_revision != user.security_revision
-            || browser.policy_session_revision != policy.session_revision
+        if !allow_revoked
+            && (browser.status != "active"
+                || browser.idle_expires_at <= now
+                || browser.absolute_expires_at <= now
+                || browser.project_security_revision != project.security_revision
+                || browser.user_security_revision != user.security_revision
+                || browser.policy_session_revision != policy.session_revision)
         {
             return Err(ApplicationError::Disabled);
         }
@@ -522,7 +637,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        if family.status != "active" || family.absolute_expires_at <= now {
+        if !allow_revoked && (family.status != "active" || family.absolute_expires_at <= now) {
             return Err(ApplicationError::Disabled);
         }
         let binding = application_user_binding::Entity::find_by_id(session.binding_id)

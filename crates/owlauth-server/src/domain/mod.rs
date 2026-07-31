@@ -1,32 +1,32 @@
 mod application;
 #[allow(
     dead_code,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 mod identity;
 mod key;
 #[allow(
     dead_code,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 mod login;
 mod project;
 #[allow(
     dead_code,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 mod projection;
 mod provider;
 #[allow(
     dead_code,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 mod session;
 
 pub(crate) use application::{ApplicationStatus, ApplicationType, BrowserOrigin, RedirectUri};
 #[allow(
     unused_imports,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 pub(crate) use identity::{
     ProfileDisplayName, ProfilePictureUrl, ProjectUserStatus, ProviderIssuer, ProviderSubject,
@@ -35,7 +35,7 @@ pub(crate) use identity::{
 pub(crate) use key::SigningKeyState;
 #[allow(
     unused_imports,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 pub(crate) use login::LoginTransactionStatus;
 pub(crate) use project::{
@@ -44,7 +44,7 @@ pub(crate) use project::{
 };
 #[allow(
     unused_imports,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 pub(crate) use projection::{
     ProjectionRevision, USER_PROJECTION_SCHEMA_V1, UserProjection, UserProjectionSource,
@@ -52,7 +52,7 @@ pub(crate) use projection::{
 pub(crate) use provider::{ProviderKey, ProviderStatus};
 #[allow(
     unused_imports,
-    reason = "Block B application and persistence integration follows this domain-only slice"
+    reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 pub(crate) use session::{
     ApplicationSessionStatus, BrowserLogoutStatus, BrowserSessionStatus, HandoffStatus,

@@ -275,6 +275,114 @@ pub struct ProviderAssignmentRequest {
     pub expected_application_revision: i64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectUserStatus {
+    Active,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedSessionStatus {
+    Active,
+    Revoked,
+    Expired,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ProjectUser {
+    pub id: String,
+    pub project_id: String,
+    #[schema(max_length = 96)]
+    pub public_id: String,
+    pub status: ProjectUserStatus,
+    #[schema(minimum = 1)]
+    pub user_revision: i64,
+    #[schema(minimum = 1)]
+    pub security_revision: i64,
+    #[schema(max_length = 256)]
+    pub display_name: Option<String>,
+    #[schema(max_length = 2048)]
+    pub picture_url: Option<String>,
+    #[schema(max_length = 64)]
+    pub created_at: String,
+    #[schema(max_length = 64)]
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ProjectUserList {
+    #[schema(max_items = 100)]
+    pub items: Vec<ProjectUser>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ApplicationSession {
+    pub id: String,
+    pub project_id: String,
+    pub user_id: String,
+    pub application_id: String,
+    #[schema(max_length = 96)]
+    pub application_public_id: String,
+    #[schema(max_length = 128)]
+    pub application_display_name: String,
+    pub browser_session_id: Option<String>,
+    pub status: ManagedSessionStatus,
+    #[schema(minimum = 1)]
+    pub session_revision: i64,
+    #[schema(max_length = 64)]
+    pub authenticated_at: String,
+    #[schema(max_length = 64)]
+    pub absolute_expires_at: String,
+    #[schema(max_length = 64)]
+    pub revoked_at: Option<String>,
+    #[schema(max_length = 64)]
+    pub created_at: String,
+    #[schema(max_length = 64)]
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct BrowserSession {
+    pub id: String,
+    pub project_id: String,
+    pub user_id: String,
+    pub status: ManagedSessionStatus,
+    #[schema(minimum = 1)]
+    pub session_revision: i64,
+    #[schema(max_length = 64)]
+    pub authenticated_at: String,
+    #[schema(max_length = 64)]
+    pub last_activity_at: String,
+    #[schema(max_length = 64)]
+    pub idle_expires_at: String,
+    #[schema(max_length = 64)]
+    pub absolute_expires_at: String,
+    #[schema(max_length = 64)]
+    pub terminated_at: Option<String>,
+    #[schema(max_length = 64)]
+    pub created_at: String,
+    #[schema(max_length = 64)]
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ProjectUserSessions {
+    #[schema(max_items = 100)]
+    pub application_sessions: Vec<ApplicationSession>,
+    #[schema(max_items = 100)]
+    pub browser_sessions: Vec<BrowserSession>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ExpectedSessionRevision {
+    /// Exact current revision. A terminal session with this revision is returned unchanged;
+    /// a stale revision conflicts.
+    #[schema(minimum = 1)]
+    pub expected_session_revision: i64,
+}
+
 macro_rules! control_path {
     ($name:ident, $method:ident, $path:literal, $response:ty, $summary:literal $(, body = $body:ty)? $(, params($($params:tt)*))?) => {
         #[utoipa::path(
@@ -551,3 +659,89 @@ control_path!(
         ("application_id" = String, Path)
     )
 );
+
+control_path!(
+    list_project_users,
+    get,
+    "/v1/projects/{project_id}/users",
+    ProjectUserList,
+    "Project users",
+    params(("project_id" = String, Path))
+);
+control_path!(
+    get_project_user,
+    get,
+    "/v1/projects/{project_id}/users/{user_id}",
+    ProjectUser,
+    "Project user",
+    params(("project_id" = String, Path), ("user_id" = String, Path))
+);
+control_path!(
+    disable_project_user,
+    post,
+    "/v1/projects/{project_id}/users/{user_id}/disable",
+    ProjectUser,
+    "Disabled Project user",
+    body = ExpectedSecurityRevision,
+    params(("project_id" = String, Path), ("user_id" = String, Path))
+);
+control_path!(
+    list_project_user_sessions,
+    get,
+    "/v1/projects/{project_id}/users/{user_id}/sessions",
+    ProjectUserSessions,
+    "Project user sessions",
+    params(("project_id" = String, Path), ("user_id" = String, Path))
+);
+control_path!(
+    revoke_application_session,
+    post,
+    "/v1/projects/{project_id}/users/{user_id}/application-sessions/{session_id}/revoke",
+    ApplicationSession,
+    "Revoked Application session",
+    body = ExpectedSessionRevision,
+    params(
+        ("project_id" = String, Path),
+        ("user_id" = String, Path),
+        ("session_id" = String, Path)
+    )
+);
+control_path!(
+    revoke_browser_session,
+    post,
+    "/v1/projects/{project_id}/users/{user_id}/browser-sessions/{session_id}/revoke",
+    BrowserSession,
+    "Revoked Project browser session",
+    body = ExpectedSessionRevision,
+    params(
+        ("project_id" = String, Path),
+        ("user_id" = String, Path),
+        ("session_id" = String, Path)
+    )
+);
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn user_and_session_lifecycle_contract_is_bounded_and_control_only() {
+        let document = serde_json::to_value(crate::control::openapi())
+            .expect("Control OpenAPI should serialize");
+        for path in [
+            "/v1/projects/{project_id}/users",
+            "/v1/projects/{project_id}/users/{user_id}",
+            "/v1/projects/{project_id}/users/{user_id}/disable",
+            "/v1/projects/{project_id}/users/{user_id}/sessions",
+            "/v1/projects/{project_id}/users/{user_id}/application-sessions/{session_id}/revoke",
+            "/v1/projects/{project_id}/users/{user_id}/browser-sessions/{session_id}/revoke",
+        ] {
+            assert!(document["paths"][path].is_object(), "missing path: {path}");
+        }
+        let user = &document["components"]["schemas"]["ProjectUser"]["properties"];
+        assert!(user.get("provider_credentials").is_none());
+        assert!(user.get("source_payload").is_none());
+        assert_eq!(
+            document["components"]["schemas"]["ProjectUserList"]["properties"]["items"]["maxItems"],
+            100
+        );
+    }
+}

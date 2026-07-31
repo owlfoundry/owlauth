@@ -24,6 +24,7 @@ use owlauth_types::{
 };
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer};
 use tracing::info;
@@ -34,6 +35,7 @@ use crate::{
         oidc::RestrictedOidcProviderClient,
         postgres::{
             DatabasePools, authentication::PostgresAuthenticationRepository,
+            control_lifecycle::PostgresControlLifecycleRepository,
             provisioning::PostgresProvisioningAdapter, readiness::PostgresReadinessAdapter,
             runtime_authority::PostgresRuntimeAuthorityRepository,
             session_authority::PostgresSessionAuthorityRepository,
@@ -47,10 +49,10 @@ use crate::{
     },
     application::{
         self, ApplicationError, BeginLogin, ConfirmProjectBrowserLogout, ConfirmSessionReuse,
-        CreateApplication, CreateProject, CreateProvider, ExchangeHandoff, ProviderCallback,
-        ProvisioningInfrastructure, ProvisioningService, ReadinessService, RefreshSession,
-        ReplaceApplicationConfiguration, RuntimeAuthService, SelectProvider, UpdateApplication,
-        UpdateProject, UpdateProjectPolicy,
+        ControlLifecycleService, CreateApplication, CreateProject, CreateProvider, ExchangeHandoff,
+        ProviderCallback, ProvisioningInfrastructure, ProvisioningService, ReadinessService,
+        RefreshSession, ReplaceApplicationConfiguration, RuntimeAuthService, SelectProvider,
+        UpdateApplication, UpdateProject, UpdateProjectPolicy,
     },
     config::{ListenerConfig, OperatorApiKey, ServerConfig},
     domain::ApplicationType,
@@ -93,6 +95,7 @@ struct ControlState {
     operator_key: Arc<OperatorApiKey>,
     descriptor: Arc<ServiceDescriptor>,
     provisioning: Option<Arc<ProvisioningService>>,
+    lifecycle: Option<Arc<ControlLifecycleService>>,
 }
 
 pub(crate) struct PlaneRouters {
@@ -193,6 +196,14 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
                 provisioning: pools
                     .and_then(|pools| pools.control.clone())
                     .map(|database| build_provisioning_service(database, config)),
+                lifecycle: pools
+                    .and_then(|pools| pools.control.clone())
+                    .map(|database| {
+                        Arc::new(ControlLifecycleService::new(
+                            Arc::new(PostgresControlLifecycleRepository::new(database)),
+                            Arc::new(SystemClock),
+                        ))
+                    }),
             },
             config,
         )
@@ -239,6 +250,7 @@ fn build_provisioning_service(
             SystemClock,
             SystemEntropy,
             Sha256RequestDigester,
+            config.provider_allow_http_loopback,
         ),
     ))
 }
@@ -292,8 +304,11 @@ fn build_runtime_auth_service(
         retained,
     )
     .expect("validated Runtime protection configuration");
-    let provider = RestrictedOidcProviderClient::new(&config.provider_allowed_origins)
-        .expect("validated provider endpoint policy");
+    let provider = RestrictedOidcProviderClient::new(
+        &config.provider_allowed_origins,
+        config.provider_allow_http_loopback,
+    )
+    .expect("validated provider endpoint policy");
     Arc::new(RuntimeAuthService::new(
         Arc::new(PostgresAuthenticationRepository::new(database.clone())),
         Arc::new(PostgresSessionAuthorityRepository::new(database.clone())),
@@ -460,6 +475,7 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             "/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
             put(assign_provider).delete(unassign_provider),
         )
+        .merge(control_lifecycle_router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_operator,
@@ -493,6 +509,31 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         config.max_request_bytes,
         64,
     )
+}
+
+fn control_lifecycle_router() -> Router<ControlState> {
+    Router::new()
+        .route("/projects/{project_id}/users", get(list_project_users))
+        .route(
+            "/projects/{project_id}/users/{user_id}",
+            get(get_project_user),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/disable",
+            post(disable_project_user),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/sessions",
+            get(list_project_user_sessions),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/application-sessions/{session_id}/revoke",
+            post(revoke_application_session),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/browser-sessions/{session_id}/revoke",
+            post(revoke_browser_session),
+        )
 }
 
 fn mount_and_bound(
@@ -544,6 +585,18 @@ async fn runtime_root(State(state): State<RuntimeState>) -> Redirect {
 
 async fn runtime_shell(State(state): State<RuntimeState>) -> Response {
     web_assets::shell(WebPlane::Runtime, &state.probe.base_path)
+}
+
+fn runtime_document_error(state: &RuntimeState, title: &str, message: &str) -> Response {
+    let serialized = serde_json::json!({ "title": title, "message": message }).to_string();
+    web_assets::shell_with_context(
+        WebPlane::Runtime,
+        &state.probe.base_path,
+        &[
+            ("owlauth-runtime-flow", "error"),
+            ("owlauth-runtime-bootstrap", &serialized),
+        ],
+    )
 }
 
 async fn runtime_asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
@@ -635,7 +688,7 @@ async fn start_login(
             .await
             .map(|pending| runtime_types::LoginStartResponse {
                 hosted_url: pending.hosted_url,
-                expires_at: pending.expires_at.to_string(),
+                expires_at: timestamp(pending.expires_at),
             }),
         Err(error) => Err(error),
     };
@@ -660,11 +713,19 @@ async fn hosted_interaction_shell(
             &request_id,
         );
     }
-    let Ok(cookie_name) = interaction_cookie_name(&interaction) else {
-        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    let Ok(interaction_cookie) = interaction_cookie_name(&interaction) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
-    let Ok(binding) = cookie_value(&headers, &cookie_name) else {
-        return invalid_cookie(&request_id);
+    let Ok(binding) = cookie_value(&headers, &interaction_cookie) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
     let bootstrap = match runtime_auth(&state) {
         Ok(service) => {
@@ -674,21 +735,43 @@ async fn hosted_interaction_shell(
         }
         Err(error) => Err(error),
     };
-    let bootstrap = match bootstrap {
-        Ok(bootstrap) => bootstrap,
-        Err(error) => return runtime_problem(error, &request_id),
+    let Ok(bootstrap) = bootstrap else {
+        return runtime_document_error(
+            &state,
+            "Sign-in unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
-    let reuse_available = cookie_value(
+    let reuse_available = match cookie_value(
         &headers,
         &project_session_cookie_name(&bootstrap.interaction.project_public_id),
-    )
-    .is_ok_and(|value| value.is_some());
-    let body = match hosted_interaction_response(&bootstrap, reuse_available) {
-        Ok(body) => body,
-        Err(error) => return runtime_problem(error, &request_id),
+    ) {
+        Ok(Some(browser_session)) => match runtime_auth(&state) {
+            Ok(service) => match service
+                .browser_session_reuse_available(bootstrap.interaction.project_id, &browser_session)
+                .await
+            {
+                Ok(available) => available,
+                Err(ApplicationError::InvalidInput | ApplicationError::NotFound) => false,
+                Err(error) => return runtime_problem(error, &request_id),
+            },
+            Err(error) => return runtime_problem(error, &request_id),
+        },
+        Ok(None) | Err(()) => false,
+    };
+    let Ok(body) = hosted_interaction_response(&bootstrap, reuse_available) else {
+        return runtime_document_error(
+            &state,
+            "Sign-in unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
     let Ok(serialized) = serde_json::to_string(&body) else {
-        return runtime_problem(ApplicationError::Integrity, &request_id);
+        return runtime_document_error(
+            &state,
+            "Sign-in unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
     let mut response = web_assets::shell_with_context(
         WebPlane::Runtime,
@@ -700,7 +783,7 @@ async fn hosted_interaction_shell(
     );
     append_cookie(
         &mut response,
-        &cookie_name,
+        &interaction_cookie,
         &bootstrap.browser_binding,
         &state.cookie_path,
         600,
@@ -724,6 +807,7 @@ async fn select_provider_method(
     let result = match runtime_auth(&state) {
         Ok(service) => service
             .select_provider(SelectProvider {
+                project_public_id,
                 interaction,
                 browser_binding: binding,
                 csrf: request.csrf,
@@ -734,7 +818,6 @@ async fn select_provider_method(
             .map(|url| runtime_types::NavigationResponse { url }),
         Err(error) => Err(error),
     };
-    let _ = project_public_id;
     runtime_json(result, &request_id)
 }
 
@@ -756,9 +839,11 @@ async fn reuse_browser_session(
     else {
         return invalid_cookie(&request_id);
     };
+    let interaction_cookie = interaction_cookie_name(&interaction).ok();
     let result = match runtime_auth(&state) {
         Ok(service) => service
             .confirm_session_reuse(ConfirmSessionReuse {
+                project_public_id,
                 interaction,
                 browser_binding: binding,
                 csrf: request.csrf,
@@ -766,17 +851,17 @@ async fn reuse_browser_session(
                 expected_revision: request.expected_revision,
             })
             .await
-            .and_then(|completion| {
-                if completion.project_public_id != project_public_id {
-                    return Err(ApplicationError::NotFound);
-                }
-                Ok(runtime_types::NavigationResponse {
-                    url: completion.redirect_url,
-                })
+            .map(|completion| runtime_types::NavigationResponse {
+                url: completion.redirect_url,
             }),
         Err(error) => Err(error),
     };
-    runtime_json(result, &request_id)
+    let succeeded = result.is_ok();
+    let mut response = runtime_json(result, &request_id);
+    if succeeded && let Some(name) = interaction_cookie {
+        clear_cookie(&mut response, &name, &state.cookie_path);
+    }
+    response
 }
 
 #[derive(Deserialize)]
@@ -788,20 +873,31 @@ struct ProviderCallbackQuery {
 
 async fn provider_callback(
     State(state): State<RuntimeState>,
-    Extension(request_id): Extension<String>,
     Path((project_public_id, provider_key)): Path<(String, String)>,
     Query(query): Query<ProviderCallbackQuery>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(interaction_cookie) = interaction_cookie_name(&query.state) else {
-        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+        return runtime_document_error(
+            &state,
+            "Sign-in unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
     let Ok(Some(browser_binding)) = cookie_value(&headers, &interaction_cookie) else {
-        return invalid_cookie(&request_id);
+        return runtime_document_error(
+            &state,
+            "Sign-in unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
     let project_cookie = project_session_cookie_name(&project_public_id);
     let Ok(existing_browser_session) = cookie_value(&headers, &project_cookie) else {
-        return invalid_cookie(&request_id);
+        return runtime_document_error(
+            &state,
+            "Sign-in unavailable",
+            "Return to your Application and start sign-in again.",
+        );
     };
     let completion = match runtime_auth(&state) {
         Ok(service) => {
@@ -818,12 +914,19 @@ async fn provider_callback(
         }
         Err(error) => Err(error),
     };
-    let completion = match completion {
-        Ok(completion) => completion,
-        Err(error) => return runtime_problem(error, &request_id),
+    let Ok(completion) = completion else {
+        return runtime_document_error(
+            &state,
+            "Sign-in could not be completed",
+            "Return to your Application and start sign-in again.",
+        );
     };
     if completion.project_public_id != project_public_id {
-        return runtime_problem(ApplicationError::NotFound, &request_id);
+        return runtime_document_error(
+            &state,
+            "Sign-in could not be completed",
+            "Return to your Application and start sign-in again.",
+        );
     }
     let mut response = Redirect::to(&completion.redirect_url).into_response();
     append_cookie(
@@ -867,7 +970,7 @@ async fn exchange_handoff(
                 pkce_verifier: request.pkce_verifier,
             })
             .await
-            .map(credential_pair_response),
+            .and_then(credential_pair_response),
         Err(error) => Err(error),
     };
     let mut response = runtime_json(result, &request_id);
@@ -906,7 +1009,7 @@ async fn refresh_session(
                 refresh_token: request.refresh_token,
             })
             .await
-            .map(credential_pair_response),
+            .and_then(credential_pair_response),
         Err(error) => Err(error),
     };
     let mut response = runtime_json(result, &request_id);
@@ -931,20 +1034,38 @@ async fn current_user(
         return unauthorized_runtime(&request_id);
     };
     let result = match runtime_auth(&state) {
-        Ok(service) => service.current_user(&token).await.and_then(|current| {
-            if current.project_public_id != project_public_id {
-                return Err(ApplicationError::NotFound);
+        Ok(service) => match service.current_user(&token).await {
+            Ok(current) => {
+                let origin_allowed = match cors_origin.as_deref() {
+                    Some(origin) => {
+                        service
+                            .application_session_origin_allowed(
+                                current.project_id,
+                                current.application_id,
+                                origin,
+                            )
+                            .await
+                    }
+                    None => Ok(true),
+                };
+                if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
+                    Err(ApplicationError::NotFound)
+                } else {
+                    user_projection(current.projection_document).map(|projection| {
+                        runtime_types::CurrentUserResponse {
+                            project_id: current.project_public_id,
+                            application_id: current.application_public_id,
+                            user_id: current.user_public_id,
+                            projection,
+                            projection_revision: current.projection_revision,
+                            authenticated_at: timestamp(current.authenticated_at),
+                            session_expires_at: timestamp(current.absolute_expires_at),
+                        }
+                    })
+                }
             }
-            Ok(runtime_types::CurrentUserResponse {
-                project_id: current.project_public_id,
-                application_id: current.application_public_id,
-                user_id: current.user_public_id,
-                projection: current.projection_document,
-                projection_revision: current.projection_revision,
-                authenticated_at: current.authenticated_at.to_string(),
-                session_expires_at: current.absolute_expires_at.to_string(),
-            })
-        }),
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
     let mut response = runtime_auth_json(StatusCode::OK, result, &request_id);
@@ -969,12 +1090,29 @@ async fn logout_application_session(
         return unauthorized_runtime(&request_id);
     };
     let result = match runtime_auth(&state) {
-        Ok(service) => match service.current_user(&token).await {
-            Ok(current) if current.project_public_id == project_public_id => service
-                .logout_application(&token)
-                .await
-                .map(|()| runtime_types::CompletionResponse { completed: true }),
-            Ok(_) => Err(ApplicationError::NotFound),
+        Ok(service) => match service.application_logout_target(&token).await {
+            Ok(current) => {
+                let origin_allowed = match cors_origin.as_deref() {
+                    Some(origin) => {
+                        service
+                            .application_session_origin_allowed(
+                                current.project_id,
+                                current.application_id,
+                                origin,
+                            )
+                            .await
+                    }
+                    None => Ok(true),
+                };
+                if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
+                    Err(ApplicationError::NotFound)
+                } else {
+                    service
+                        .logout_application(current)
+                        .await
+                        .map(|()| runtime_types::CompletionResponse { completed: true })
+                }
+            }
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
@@ -1002,14 +1140,30 @@ async fn prepare_browser_logout(
     };
     let result = match runtime_auth(&state) {
         Ok(service) => match service.current_user(&token).await {
-            Ok(current) if current.project_public_id == project_public_id => service
-                .prepare_browser_logout(&token)
-                .await
-                .map(|target| runtime_types::BrowserLogoutPreparationResponse {
-                    hosted_url: target.hosted_url,
-                    expires_at: target.expires_at.to_string(),
-                }),
-            Ok(_) => Err(ApplicationError::NotFound),
+            Ok(current) => {
+                let origin_allowed = match cors_origin.as_deref() {
+                    Some(origin) => {
+                        service
+                            .application_session_origin_allowed(
+                                current.project_id,
+                                current.application_id,
+                                origin,
+                            )
+                            .await
+                    }
+                    None => Ok(true),
+                };
+                if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
+                    Err(ApplicationError::NotFound)
+                } else {
+                    service.prepare_browser_logout(&token).await.map(|target| {
+                        runtime_types::BrowserLogoutPreparationResponse {
+                            hosted_url: target.hosted_url,
+                            expires_at: timestamp(target.expires_at),
+                        }
+                    })
+                }
+            }
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
@@ -1035,34 +1189,51 @@ async fn browser_logout_shell(
             &request_id,
         );
     }
-    let service = match runtime_auth(&state) {
-        Ok(service) => service,
-        Err(error) => return runtime_problem(error, &request_id),
+    let Ok(service) = runtime_auth(&state) else {
+        return runtime_document_error(
+            &state,
+            "Sign-out unavailable",
+            "Close this page and return to your Application.",
+        );
     };
-    let project_public_id = match service.browser_logout_project(&preparation).await {
-        Ok(project_public_id) => project_public_id,
-        Err(error) => return runtime_problem(error, &request_id),
+    let Ok(project_public_id) = service.browser_logout_project(&preparation).await else {
+        return runtime_document_error(
+            &state,
+            "Sign-out unavailable",
+            "Close this page and return to your Application.",
+        );
     };
     let Ok(Some(browser_session)) =
         cookie_value(&headers, &project_session_cookie_name(&project_public_id))
     else {
-        return invalid_cookie(&request_id);
+        return runtime_document_error(
+            &state,
+            "Sign-out unavailable",
+            "Close this page and return to your Application.",
+        );
     };
-    let bound = match service
+    let Ok(bound) = service
         .bind_browser_logout(&preparation, &browser_session)
         .await
-    {
-        Ok(bound) => bound,
-        Err(error) => return runtime_problem(error, &request_id),
+    else {
+        return runtime_document_error(
+            &state,
+            "Sign-out unavailable",
+            "Close this page and return to your Application.",
+        );
     };
     let bootstrap = runtime_types::BrowserLogoutResponse {
         project_id: bound.project_public_id,
         revision: bound.revision,
         csrf: bound.csrf.to_string(),
-        expires_at: bound.expires_at.to_string(),
+        expires_at: timestamp(bound.expires_at),
     };
     let Ok(serialized) = serde_json::to_string(&bootstrap) else {
-        return runtime_problem(ApplicationError::Integrity, &request_id);
+        return runtime_document_error(
+            &state,
+            "Sign-out unavailable",
+            "Close this page and return to your Application.",
+        );
     };
     web_assets::shell_with_context(
         WebPlane::Runtime,
@@ -1091,6 +1262,7 @@ async fn confirm_browser_logout(
     let result = match runtime_auth(&state) {
         Ok(service) => service
             .confirm_browser_logout(ConfirmProjectBrowserLogout {
+                project_public_id,
                 preparation,
                 browser_session,
                 csrf: request.csrf,
@@ -1257,6 +1429,13 @@ async fn require_operator(
 fn provisioning(state: &ControlState) -> Result<&ProvisioningService, ApplicationError> {
     state
         .provisioning
+        .as_deref()
+        .ok_or(ApplicationError::Persistence)
+}
+
+fn control_lifecycle(state: &ControlState) -> Result<&ControlLifecycleService, ApplicationError> {
+    state
+        .lifecycle
         .as_deref()
         .ok_or(ApplicationError::Persistence)
 }
@@ -1447,6 +1626,263 @@ async fn disable_project(
             Err(error) => application_problem(error, &request_id),
         },
         Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn list_project_users(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service.list_project_users(project_id).await {
+            Ok(users) => Json(control_types::ProjectUserList {
+                items: users.into_iter().map(control_project_user).collect(),
+            })
+            .into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn get_project_user(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id)): Path<(String, String)>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let user_id = match resource_uuid(&user_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service.get_project_user(project_id, user_id).await {
+            Ok(user) => Json(control_project_user(user)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn disable_project_user(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::ExpectedSecurityRevision>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let user_id = match resource_uuid(&user_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service
+            .disable_project_user(
+                project_id,
+                user_id,
+                body.expected_security_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(user) => Json(control_project_user(user)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn list_project_user_sessions(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id)): Path<(String, String)>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let user_id = match resource_uuid(&user_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service
+            .list_project_user_sessions(project_id, user_id)
+            .await
+        {
+            Ok(sessions) => Json(control_types::ProjectUserSessions {
+                application_sessions: sessions
+                    .application_sessions
+                    .into_iter()
+                    .map(control_application_session)
+                    .collect(),
+                browser_sessions: sessions
+                    .browser_sessions
+                    .iter()
+                    .map(control_browser_session)
+                    .collect(),
+            })
+            .into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn revoke_application_session(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, session_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ExpectedSessionRevision>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let user_id = match resource_uuid(&user_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let session_id = match resource_uuid(&session_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service
+            .revoke_application_session(
+                project_id,
+                user_id,
+                session_id,
+                body.expected_session_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(session) => Json(control_application_session(session)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn revoke_browser_session(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, session_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ExpectedSessionRevision>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let user_id = match resource_uuid(&user_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let session_id = match resource_uuid(&session_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service
+            .revoke_browser_session(
+                project_id,
+                user_id,
+                session_id,
+                body.expected_session_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(session) => Json(control_browser_session(&session)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+fn timestamp(value: OffsetDateTime) -> String {
+    value
+        .format(&Rfc3339)
+        .expect("application timestamps must be representable as RFC 3339")
+}
+
+fn control_project_user(user: application::ProjectUserRecord) -> control_types::ProjectUser {
+    control_types::ProjectUser {
+        id: user.id.to_string(),
+        project_id: user.project_id.to_string(),
+        public_id: user.public_id,
+        status: match user.status {
+            application::ProjectUserStatus::Active => control_types::ProjectUserStatus::Active,
+            application::ProjectUserStatus::Disabled => control_types::ProjectUserStatus::Disabled,
+        },
+        user_revision: user.user_revision,
+        security_revision: user.security_revision,
+        display_name: user.display_name,
+        picture_url: user.picture_url,
+        created_at: timestamp(user.created_at),
+        updated_at: timestamp(user.updated_at),
+    }
+}
+
+fn control_session_status(
+    status: application::ManagedSessionStatus,
+) -> control_types::ManagedSessionStatus {
+    match status {
+        application::ManagedSessionStatus::Active => control_types::ManagedSessionStatus::Active,
+        application::ManagedSessionStatus::Revoked => control_types::ManagedSessionStatus::Revoked,
+        application::ManagedSessionStatus::Expired => control_types::ManagedSessionStatus::Expired,
+    }
+}
+
+fn control_application_session(
+    session: application::ApplicationSessionRecord,
+) -> control_types::ApplicationSession {
+    control_types::ApplicationSession {
+        id: session.id.to_string(),
+        project_id: session.project_id.to_string(),
+        user_id: session.user_id.to_string(),
+        application_id: session.application_id.to_string(),
+        application_public_id: session.application_public_id,
+        application_display_name: session.application_display_name,
+        browser_session_id: session.browser_session_id.map(|id| id.to_string()),
+        status: control_session_status(session.status),
+        session_revision: session.session_revision,
+        authenticated_at: timestamp(session.authenticated_at),
+        absolute_expires_at: timestamp(session.absolute_expires_at),
+        revoked_at: session.revoked_at.map(timestamp),
+        created_at: timestamp(session.created_at),
+        updated_at: timestamp(session.updated_at),
+    }
+}
+
+fn control_browser_session(
+    session: &application::BrowserSessionRecord,
+) -> control_types::BrowserSession {
+    control_types::BrowserSession {
+        id: session.id.to_string(),
+        project_id: session.project_id.to_string(),
+        user_id: session.user_id.to_string(),
+        status: control_session_status(session.status),
+        session_revision: session.session_revision,
+        authenticated_at: timestamp(session.authenticated_at),
+        last_activity_at: timestamp(session.last_activity_at),
+        idle_expires_at: timestamp(session.idle_expires_at),
+        absolute_expires_at: timestamp(session.absolute_expires_at),
+        terminated_at: session.terminated_at.map(timestamp),
+        created_at: timestamp(session.created_at),
+        updated_at: timestamp(session.updated_at),
     }
 }
 
@@ -2003,40 +2439,58 @@ async fn public_application_config(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
     Path(project_public_id): Path<String>,
+    headers: HeaderMap,
     query: Result<Query<PublicConfigQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Ok(Query(query)) = query else {
         return runtime_problem(ApplicationError::InvalidInput, &request_id);
     };
-    let service = match readiness(&state) {
-        Ok(service) => service,
-        Err(error) => return runtime_problem(error, &request_id),
-    };
-    match service
-        .public_application_config(&project_public_id, &query.application_id)
-        .await
+    let cors_origin = match public_application_cors_origin(
+        &state,
+        &headers,
+        &project_public_id,
+        &query.application_id,
+        &request_id,
+    )
+    .await
     {
-        Ok(config) => {
-            let providers = config
-                .providers
-                .into_iter()
-                .map(runtime_provider)
-                .collect::<Result<Vec<_>, _>>();
-            runtime_json(
+        Ok(origin) => origin,
+        Err(response) => return response,
+    };
+    let result = match (readiness(&state), runtime_auth(&state)) {
+        (Ok(readiness), Ok(auth)) => match readiness
+            .public_application_config(&project_public_id, &query.application_id)
+            .await
+        {
+            Ok(config) => {
+                let structurally_available = config.login_available;
+                let providers = config
+                    .providers
+                    .into_iter()
+                    .filter(|provider| auth.provider_issuer_allowed(&provider.issuer))
+                    .map(runtime_provider)
+                    .collect::<Result<Vec<_>, _>>();
                 providers.map(|providers| runtime_types::PublicApplicationConfig {
                     project_public_id: config.project_public_id,
                     project_display_name: config.project_display_name,
                     application_public_id: config.application_public_id,
                     application_display_name: config.application_display_name,
                     publishable_keys: config.publishable_keys,
+                    login_available: FEDERATED_PROJECT_AUTH_AVAILABLE
+                        && structurally_available
+                        && !providers.is_empty(),
                     providers,
-                    login_available: FEDERATED_PROJECT_AUTH_AVAILABLE && config.login_available,
-                }),
-                &request_id,
-            )
-        }
-        Err(error) => runtime_problem(error, &request_id),
+                })
+            }
+            Err(error) => Err(error),
+        },
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    };
+    let mut response = runtime_json(result, &request_id);
+    if let Some(origin) = cors_origin {
+        apply_cors(&mut response, &origin, false);
     }
+    response
 }
 
 async fn project_jwks(
@@ -2130,16 +2584,27 @@ where
 
 fn credential_pair_response(
     pair: application::CredentialPair,
-) -> runtime_types::CredentialPairResponse {
-    runtime_types::CredentialPairResponse {
+) -> Result<runtime_types::CredentialPairResponse, ApplicationError> {
+    Ok(runtime_types::CredentialPairResponse {
+        project_id: pair.project_public_id,
+        application_id: pair.application_public_id,
+        user_id: pair.user_public_id,
+        session_id: pair.application_session_id.to_string(),
+        refresh_generation: pair.refresh_generation,
         access_token: pair.access_token.to_string(),
         refresh_token: pair.refresh_token.to_string(),
         token_type: pair.token_type,
         expires_in: pair.expires_in,
-        projection: pair.projection,
+        projection: user_projection(pair.projection)?,
         projection_revision: pair.projection_revision,
-        session_expires_at: pair.session_expires_at.to_string(),
-    }
+        session_expires_at: timestamp(pair.session_expires_at),
+    })
+}
+
+fn user_projection(
+    document: serde_json::Value,
+) -> Result<runtime_types::UserProjection, ApplicationError> {
+    serde_json::from_value(document).map_err(|_| ApplicationError::Integrity)
 }
 
 fn hosted_interaction_response(
@@ -2168,6 +2633,10 @@ fn hosted_interaction_response(
         project_display_name: bootstrap.interaction.project_display_name.clone(),
         application_id: bootstrap.interaction.application_public_id.clone(),
         application_display_name: bootstrap.interaction.application_display_name.clone(),
+        application_type: match bootstrap.interaction.application_type {
+            ApplicationType::Web => runtime_types::HostedApplicationType::Web,
+            ApplicationType::Native => runtime_types::HostedApplicationType::Native,
+        },
         status,
         revision: bootstrap.interaction.transaction_revision,
         session_reuse_available,
@@ -2182,17 +2651,26 @@ fn hosted_interaction_response(
             })
             .collect(),
         csrf: bootstrap.csrf.to_string(),
-        expires_at: bootstrap.interaction.expires_at.to_string(),
+        expires_at: timestamp(bootstrap.interaction.expires_at),
     })
 }
 
-fn interaction_cookie_name(credential: &str) -> Result<String, ()> {
+fn validate_interaction_credential(credential: &str) -> Result<Uuid, ()> {
     let id = credential.split('.').next().ok_or(())?;
     let parsed = Uuid::parse_str(id).map_err(|_| ())?;
     if parsed.to_string() != id {
         return Err(());
     }
-    Ok(format!("owl_interaction_{id}"))
+    Ok(parsed)
+}
+
+fn interaction_cookie_name(credential: &str) -> Result<String, ()> {
+    let id = validate_interaction_credential(credential)?;
+    let digest = Sha256::digest(id.as_bytes());
+    Ok(format!(
+        "owl_runtime_{}",
+        URL_SAFE_NO_PAD.encode(&digest[..18])
+    ))
 }
 
 fn project_session_cookie_name(project_public_id: &str) -> String {
@@ -2275,6 +2753,40 @@ async fn application_cors_origin(
             publishable_key,
             &origin,
         )
+        .await
+        .map_err(|error| runtime_problem(error, request_id))?;
+    if !allowed {
+        return Err(runtime_error_response(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "The request Origin is not allowed for this Application.",
+            request_id,
+        ));
+    }
+    Ok(Some(origin))
+}
+
+async fn public_application_cors_origin(
+    state: &RuntimeState,
+    headers: &HeaderMap,
+    project_public_id: &str,
+    application_public_id: &str,
+    request_id: &str,
+) -> Result<Option<String>, Response> {
+    let origin = request_origin(headers).map_err(|()| {
+        runtime_error_response(
+            StatusCode::FORBIDDEN,
+            "origin_not_allowed",
+            "The request Origin is not allowed for this Application.",
+            request_id,
+        )
+    })?;
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    let allowed = runtime_auth(state)
+        .map_err(|error| runtime_problem(error, request_id))?
+        .public_application_origin_allowed(project_public_id, application_public_id, &origin)
         .await
         .map_err(|error| runtime_problem(error, request_id))?;
     if !allowed {
@@ -2403,7 +2915,7 @@ fn is_same_origin_mutation(headers: &HeaderMap, expected_origin: &str) -> bool {
             exact_header(headers, "sec-fetch-mode"),
             Some("cors" | "same-origin")
         )
-        && exact_header(headers, "sec-fetch-dest") == Some("")
+        && exact_header(headers, "sec-fetch-dest") == Some("empty")
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<String, ()> {
@@ -2549,8 +3061,8 @@ fn control_signing_key(
         state,
         ring_revision: key.ring_revision,
         signing_epoch: key.signing_epoch,
-        sign_not_before: key.sign_not_before.map(|value| value.to_string()),
-        verify_not_after: key.verify_not_after.map(|value| value.to_string()),
+        sign_not_before: key.sign_not_before.map(timestamp),
+        verify_not_after: key.verify_not_after.map(timestamp),
         public_jwk,
     })
 }
@@ -2880,6 +3392,41 @@ mod tests {
     use crate::config::PlaneMode;
 
     #[test]
+    fn interaction_binding_cookies_are_partitioned_by_canonical_transaction_id() {
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        let first = format!("{first_id}.1.first");
+        let same_transaction_state = format!("{first_id}.1.upstream");
+        let second = format!("{second_id}.1.second");
+        let first_name = interaction_cookie_name(&first).expect("first credential is canonical");
+        let second_name = interaction_cookie_name(&second).expect("second credential is canonical");
+        assert_eq!(
+            first_name,
+            interaction_cookie_name(&same_transaction_state)
+                .expect("provider state uses the same transaction ID")
+        );
+        assert_ne!(first_name, second_name);
+        assert!(interaction_cookie_name("not-a-canonical-credential").is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{first_name}=binding-one; {second_name}=binding-two"
+            ))
+            .expect("cookie fixture is valid"),
+        );
+        assert_eq!(
+            required_interaction_cookie(&headers, &first).as_deref(),
+            Ok("binding-one")
+        );
+        assert_eq!(
+            required_interaction_cookie(&headers, &second).as_deref(),
+            Ok("binding-two")
+        );
+    }
+
+    #[test]
     fn control_signing_key_represents_only_valid_pre_material_states_without_a_jwk() {
         let pre_material = application::SigningKeyRecord {
             id: Uuid::new_v4(),
@@ -2956,7 +3503,7 @@ mod tests {
                 .to_owned(),
             ),
         ]);
-        if mode.has_control() {
+        if mode.has_control() || (mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE) {
             values.extend([
                 (
                     "OWLAUTH_SIGNER_STORE_ROOT".to_owned(),
@@ -2990,18 +3537,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_federated_auth_composes_only_block_a_runtime_infrastructure() {
-        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
+    async fn runtime_composes_federated_auth_without_control_plane() {
+        const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
         let config = test_config(PlaneMode::Runtime);
-        assert!(config.provisioning.is_none());
+        assert!(config.provisioning.is_some());
         let pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
             control: None,
         };
         let mut routers = build_routers(&config, Some(&pools));
         assert!(
-            routers.runtime_auth.is_none(),
-            "unavailable federated auth must not compose its service"
+            routers.runtime_auth.is_some(),
+            "Runtime mode must compose the federated authentication service"
         );
         assert!(routers.control.is_none());
 
@@ -3025,7 +3572,7 @@ mod tests {
         assert_eq!(
             jwks.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "Block A JWKS must remain routed to its composed readiness service"
+            "JWKS must remain routed to its composed readiness service"
         );
     }
 
@@ -3081,8 +3628,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_federated_auth_routes_are_ordinary_not_found() {
-        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
+    async fn federated_auth_routes_are_mounted() {
+        const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
         let config = test_config(PlaneMode::Runtime);
         let mut routers = build_routers(&config, None);
         routers.mark_ready();
@@ -3122,17 +3669,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
+            assert_ne!(
                 response.status(),
                 StatusCode::NOT_FOUND,
-                "partial Block B route was mounted: {method} {path}"
-            );
-            assert!(
-                to_bytes(response.into_body(), 1024)
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "disabled route should use the ordinary router 404: {method} {path}"
+                "federated authentication route is not mounted: {method} {path}"
             );
         }
     }
@@ -3199,7 +3739,7 @@ mod tests {
         let body = to_bytes(accepted.into_body(), 1024).await.unwrap();
         assert_eq!(
             &body[..],
-            br#"{"product":"owlauth-server","provisioning":true,"login_readiness":true,"federated_project_auth":false}"#
+            br#"{"product":"owlauth-server","provisioning":true,"login_readiness":true,"federated_project_auth":true}"#
         );
 
         let noncanonical_id = control
@@ -3239,6 +3779,39 @@ mod tests {
             .expect("shell attribute should terminate")
             + start;
         document[start..end].to_owned()
+    }
+
+    #[test]
+    fn hosted_mutations_require_standard_same_origin_fetch_metadata() {
+        let headers = HeaderMap::from_iter([
+            (
+                header::ORIGIN,
+                HeaderValue::from_static("https://runtime.example"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-mode"),
+                HeaderValue::from_static("cors"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-dest"),
+                HeaderValue::from_static("empty"),
+            ),
+        ]);
+        assert!(is_same_origin_mutation(&headers, "https://runtime.example"));
+
+        let mut nonstandard = headers.clone();
+        nonstandard.insert(
+            HeaderName::from_static("sec-fetch-dest"),
+            HeaderValue::from_static(""),
+        );
+        assert!(!is_same_origin_mutation(
+            &nonstandard,
+            "https://runtime.example"
+        ));
     }
 
     #[tokio::test]

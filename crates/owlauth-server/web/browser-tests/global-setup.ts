@@ -4,6 +4,8 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
+import { startControlledServices, type ControlledServices } from "./test-services";
+
 const operatorKey = `owl_ctrl_v1_${"A".repeat(43)}`;
 
 export default async function globalSetup() {
@@ -11,6 +13,8 @@ export default async function globalSetup() {
   const temporaryRoot = await mkdtemp(resolve(tmpdir(), "owlauth-browser-e2e-"));
   const runtimePort = await freePort();
   const controlPort = await freePort();
+  const providerPort = await freePort();
+  const applicationPort = await freePort();
   const container = command("docker", [
     "run",
     "-d",
@@ -30,7 +34,14 @@ export default async function globalSetup() {
 
   let runtimeServer: ReturnType<typeof spawn> | undefined;
   let controlServer: ReturnType<typeof spawn> | undefined;
+  let services: ControlledServices | undefined;
   try {
+    services = await startControlledServices(
+      repository,
+      providerPort,
+      applicationPort,
+      runtimePort,
+    );
     await waitForHealthyContainer(container);
     const mapping = command("docker", ["port", container, "5432/tcp"]).trim();
     const postgresPort = mapping.slice(mapping.lastIndexOf(":") + 1);
@@ -51,7 +62,8 @@ export default async function globalSetup() {
       OWLAUTH_RUNTIME_KEY_VERSION: "1",
       OWLAUTH_RUNTIME_DIGEST_KEY: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
       OWLAUTH_RUNTIME_PROTECTION_KEY: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
-      OWLAUTH_PROVIDER_ALLOWED_ORIGINS: "https://accounts.example/",
+      OWLAUTH_PROVIDER_ALLOWED_ORIGINS: services.providerOrigin,
+      OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK: "true",
       OWLAUTH_RUNTIME_BASE_URL: runtimeBase,
       OWLAUTH_KEY_PROPAGATION_DELAY_MS: "100",
       OWLAUTH_PUBLICATION_LEASE_TTL_MS: "5000",
@@ -81,9 +93,16 @@ export default async function globalSetup() {
     process.env["OWLAUTH_E2E_RUNTIME_BASE"] = runtimeBase;
     process.env["OWLAUTH_E2E_CONTROL_BASE"] = controlBase;
     process.env["OWLAUTH_E2E_OPERATOR_KEY"] = operatorKey;
+    process.env["OWLAUTH_E2E_PROVIDER_ORIGIN"] = services.providerOrigin;
+    process.env["OWLAUTH_E2E_PROVIDER_CLIENT_ID"] = services.providerClientId;
+    process.env["OWLAUTH_E2E_PROVIDER_CLIENT_SECRET"] = services.providerClientSecret;
+    process.env["OWLAUTH_E2E_APPLICATION_ORIGIN"] = services.applicationOrigin;
+    process.env["OWLAUTH_E2E_BROWSER_DRIVER_URL"] = services.browserDriverUrl;
+    process.env["OWLAUTH_E2E_BROWSER_DRIVER_TOKEN"] = services.browserDriverToken;
   } catch (error) {
     runtimeServer?.kill("SIGTERM");
     controlServer?.kill("SIGTERM");
+    await services?.close();
     spawnSync("docker", ["rm", "-f", container], { stdio: "ignore" });
     await rm(temporaryRoot, { recursive: true, force: true });
     throw error;
@@ -92,7 +111,7 @@ export default async function globalSetup() {
   return async () => {
     runtimeServer.kill("SIGTERM");
     controlServer.kill("SIGTERM");
-    await Promise.all([waitForExit(runtimeServer), waitForExit(controlServer)]);
+    await Promise.all([waitForExit(runtimeServer), waitForExit(controlServer), services.close()]);
     spawnSync("docker", ["rm", "-f", container], { stdio: "ignore" });
     await rm(temporaryRoot, { recursive: true, force: true });
   };

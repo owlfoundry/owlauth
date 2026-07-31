@@ -93,9 +93,26 @@
   justify-content: flex-start;
 }
 
+.userGrid,
+.sessionColumns {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(12rem, 1fr) minmax(0, 3fr);
+}
+
+.sessionColumns {
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+}
+
 .danger {
   border-color: #a4262c;
   color: #8b1f24;
+}
+
+@media (max-width: 48rem) {
+  .userGrid {
+    grid-template-columns: 1fr;
+  }
 }
 
 code {

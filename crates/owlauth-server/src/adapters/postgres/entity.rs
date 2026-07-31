@@ -387,7 +387,7 @@ pub(crate) mod control_idempotency_record {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod project_user {
     use sea_orm::entity::prelude::*;
@@ -418,7 +418,7 @@ pub(crate) mod project_user {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod linked_identity {
     use sea_orm::entity::prelude::*;
@@ -450,7 +450,7 @@ pub(crate) mod linked_identity {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod login_transaction {
     use sea_orm::entity::prelude::*;
@@ -507,7 +507,7 @@ pub(crate) mod login_transaction {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod login_transaction_method {
     use sea_orm::entity::prelude::*;
@@ -537,7 +537,7 @@ pub(crate) mod login_transaction_method {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod project_browser_session {
     use sea_orm::entity::prelude::*;
@@ -573,7 +573,7 @@ pub(crate) mod project_browser_session {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod handoff_ticket {
     use sea_orm::entity::prelude::*;
@@ -617,7 +617,7 @@ pub(crate) mod handoff_ticket {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod application_user_binding {
     use sea_orm::entity::prelude::*;
@@ -644,7 +644,7 @@ pub(crate) mod application_user_binding {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod application_user_projection {
     use sea_orm::entity::prelude::*;
@@ -677,7 +677,7 @@ pub(crate) mod application_user_projection {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod application_session {
     use sea_orm::entity::prelude::*;
@@ -714,7 +714,7 @@ pub(crate) mod application_session {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod refresh_family {
     use sea_orm::entity::prelude::*;
@@ -747,7 +747,7 @@ pub(crate) mod refresh_family {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod refresh_token_generation {
     use sea_orm::entity::prelude::*;
@@ -779,7 +779,7 @@ pub(crate) mod refresh_token_generation {
 
 #[allow(
     dead_code,
-    reason = "Block B repositories follow the schema/entity slice"
+    reason = "authentication repositories follow the schema/entity slice"
 )]
 pub(crate) mod project_browser_logout_interaction {
     use sea_orm::entity::prelude::*;

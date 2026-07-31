@@ -101,8 +101,8 @@ Fixed bounds are not Project policy and cannot be lengthened or shortened per Pr
 - signer provider, Project key namespace, allowed algorithms, and opaque references;
 - a stable Runtime process identity plus publication-lease lifetime and minimum key-propagation interval;
 - data-protection provider and retained key versions;
-- provider endpoint allowlists and Project secret-store adapter;
-- for the bundled single-node software adapters, separate absolute signer/configuration-secret store roots and separate 32-byte wrapping keys supplied as protected configuration; Runtime-only mode does not load those Control provisioning secrets;
+- provider endpoint allowlists and Project secret-store adapter; provider endpoints require canonical HTTPS origins by default, while an explicit development-only option may admit exact `127.0.0.1` or `::1` HTTP origins and never hostnames or non-loopback addresses;
+- for the bundled single-node software adapters, separate absolute signer/configuration-secret store roots and separate 32-byte wrapping keys supplied as protected configuration; Runtime-only mode loads only the read authority needed for federated authentication and never loads the Control operator key;
 - production SMTP modes restricted to implicit TLS or mandatory STARTTLS with hostname/certificate validation and no downgrade; explicit plaintext development mode accepts loopback only and is never the default.
 
 Issuer, callback, and redirect decisions never derive from arbitrary `Host`, `Forwarded`, or `X-Forwarded-*`. Proxy headers are honored only from configured trusted proxies.

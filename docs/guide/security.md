@@ -3,7 +3,7 @@
 OwlAuth handles authentication state, provider credentials, sessions, and signing operations. Its target architecture is fail-closed and Project-scoped.
 
 ::: danger Pre-alpha
-Do not use the current scaffold for production authentication. The safeguards described below are architectural requirements, not implemented assurances. Today the server has only `/health` and OpenAPI generation; it has no Project Auth flow, persistence, token handling, Control API, key provider, or production configuration.
+The current implementation includes the federated Project Auth, persistence, token/session, Control, signer, secret-store, Hosted UI, and SDK safeguards described for its delivered scope, with real PostgreSQL/provider/browser validation. It is still pre-alpha rather than production-supported: operators must independently review deployment TLS/proxy, secret management, database roles, backup/restore, egress, observability, upgrades, and deferred identity methods before relying on it.
 :::
 
 Report suspected vulnerabilities through [GitHub private vulnerability reporting](https://github.com/owlfoundry/owlauth/security/advisories/new), not a public issue. Never include real credentials, tokens, provider callback values, or personal data in a report.

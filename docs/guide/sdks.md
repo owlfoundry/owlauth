@@ -1,9 +1,9 @@
 # SDKs
 
-OwlAuth maintains package identities for first-party TypeScript, Python, and Rust Runtime clients.
+OwlAuth maintains pre-alpha first-party TypeScript, Python, and Rust Runtime protocol clients.
 
-::: warning Placeholder packages
-The current SDKs contain only a `Client` that stores a base URL. They do not make HTTP requests, initialize a Project/Application, start login, process a handoff, issue or refresh tokens, persist sessions, or map Project Auth errors. The target APIs below are design direction, not callable examples.
+::: warning Pre-alpha API
+The SDKs implement public configuration and JWKS retrieval, generic Hosted login start, caller-held PKCE state, callback validation and handoff exchange, refresh, current user, Application logout, browser-logout preparation, and stable redacted errors. Interfaces may still change independently before production support is declared.
 :::
 
 ## Packages and compatibility
@@ -16,11 +16,11 @@ The current SDKs contain only a `Client` that stores a base URL. They do not mak
 
 Each SDK follows independent SemVer and release tags (`typescript-v{version}`, `python-v{version}`, and `rust-v{version}`). Server and SDK versions do not move in lockstep; compatibility must be expressed as tested Runtime contract ranges rather than matching numbers.
 
-TypeScript will continue to publish one package, `@owlauth/client`. Its implemented protocol API will use one Web-standard core for the declared browser and Node.js matrices; there is no separately published browser package and the initial scope defines no `@owlauth/client/browser` entry point. The current scaffold has only Node.js tests, so browser support is not claimed until real browser and Runtime validation lands.
+TypeScript publishes one package, `@owlauth/client`. Its protocol API uses the same Web-standard core in the declared browser and Node.js matrices; there is no separately published browser package or `@owlauth/client/browser` entry point.
 
-## Target client boundary
+## Client boundary
 
-An SDK will initialize from public Project/Application configuration:
+An SDK initializes from public Project/Application configuration:
 
 - trusted OwlAuth Runtime base URL;
 - public `project_id`;
@@ -41,12 +41,12 @@ flowchart LR
     Control --> Core
 ```
 
-## Target sign-in lifecycle
+## Sign-in lifecycle
 
-The planned explicit protocol flow is:
+The explicit protocol flow is:
 
 1. the SDK generates a fresh PKCE verifier/challenge, correlation state, and bound pending-transaction value with a CSPRNG;
-2. the SDK calls Runtime login start for the exact Project, Application, provider, and registered redirect;
+2. the SDK calls generic Runtime login start for the exact Project, Application, and registered redirect; Runtime and Hosted UI remain authoritative for the admitted method selection;
 3. the Application retains the pending transaction and explicitly navigates a browser or native user agent to the returned target;
 4. the Application captures the redirect, removes the ticket from browser history or equivalent platform state promptly, and supplies the callback plus retained transaction to the SDK;
 5. the SDK validates state, expiry, Project/Application context, and handoff success/error exclusivity;
@@ -63,7 +63,7 @@ Each Application still has its own redirects, origins, status, Application sessi
 
 ## Token lifecycle
 
-Target core SDK behavior includes:
+Core SDK behavior includes:
 
 - redacted secret wrappers where the language supports them;
 - short-lived access-token timing metadata with a documented skew window;
@@ -85,20 +85,18 @@ The three clients share semantic behavior while using native conventions such as
 
 ## Error semantics
 
-Target public errors distinguish configuration, protocol, login, handoff, authentication, session, refresh, rate limiting, transport, timeout, cancellation, and an **indeterminate** one-use operation. Errors include a stable safe code/category, optional correlation ID, and retry classification.
+Public errors distinguish configuration, protocol, login, handoff, authentication, session, refresh, rate limiting, transport, timeout, cancellation, and an **indeterminate** one-use operation. Errors include a stable safe code/category, optional correlation ID, and retry classification.
 
 Raw bodies, authorization headers, callback URLs, tokens, tickets, PKCE verifiers, cookies, provider details, and HTTP-library implementation exceptions are not stable public error data. Equivalent server responses map to equivalent semantic classes in every SDK.
 
 ## Validation stages
 
-Machine-readable fixtures and conformance cases live under [`sdks/spec/`](https://github.com/owlfoundry/owlauth/tree/main/sdks/spec). The current corpus is intentionally small and does not prove Project Auth behavior.
+Machine-readable fixtures and required schema-versioned conformance cases live under [`sdks/spec/`](https://github.com/owlfoundry/owlauth/tree/main/sdks/spec). Package builds, type/lint checks, unit tests, OpenAPI checks, and fixture conformance remain distinct from interoperability evidence.
 
-Current CI can truthfully run package builds, type/lint checks, unit tests, OpenAPI generation checks, and fixture/conformance tests. Mock transport tests are unit or contract tests—not end-to-end tests.
-
-When Runtime Project Auth is implemented, CI must start a real OwlAuth server with isolated PostgreSQL, Redis/key configuration as applicable, Projects, Applications, and provider test doubles or approved test providers. TypeScript, Python, and Rust clients must then exercise the same claimed flows. No placeholder suite should be labeled E2E before that exists.
+The real-server suite starts OwlAuth with isolated PostgreSQL and key/configuration stores, provisions Projects, Applications, an OIDC provider, and signing authority, and runs all three SDKs against that same Runtime. The TypeScript artifact additionally runs directly in a real browser. A separate Application-backend topology owns handoff and credential custody and verifies the full Project JWT trust namespace. Mock transport tests remain unit or contract tests, never end-to-end tests.
 
 ## Security expectations
 
 SDK logs, errors, debug output, snapshots, telemetry, and fixtures must redact provider callback values, handoff tickets, Project access/refresh tokens, PKCE verifiers, cookies, and client/provider secrets. Production transport requires HTTPS, certificate and hostname verification, bounded responses, deadlines, and origin-safe redirect policy.
 
-Read the language-neutral [SDK specifications](https://github.com/owlfoundry/owlauth/tree/main/sdks/spec) for the normative target behavior.
+Read the language-neutral [SDK specifications](https://github.com/owlfoundry/owlauth/tree/main/sdks/spec) for normative behavior and the exact Application-owned state boundary.

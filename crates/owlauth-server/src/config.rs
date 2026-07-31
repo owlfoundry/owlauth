@@ -40,6 +40,7 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_RUNTIME_PROTECTION_KEY",
     "OWLAUTH_RUNTIME_RETAINED_KEYS",
     "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
+    "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK",
     "OWLAUTH_RUNTIME_PROCESS_ID",
     "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
     "OWLAUTH_PUBLICATION_LEASE_TTL_MS",
@@ -258,6 +259,7 @@ pub struct ServerConfig {
     pub provisioning: Option<ProvisioningConfig>,
     pub runtime_protection: Option<RuntimeProtectionConfig>,
     pub provider_allowed_origins: Vec<String>,
+    pub provider_allow_http_loopback: bool,
     pub runtime_process_id: String,
     pub required_runtime_process_ids: Vec<String>,
     pub publication_lease_ttl: Duration,
@@ -272,9 +274,9 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Reads and validates the complete `OwlAuth` environment configuration.
     ///
-    /// Unknown `OWLAUTH_*` variables are rejected. Runtime-only mode deliberately does
-    /// not read Control operator or provisioning-store secrets while federated Project
-    /// authentication is unavailable.
+    /// Unknown `OWLAUTH_*` variables are rejected. Runtime-only mode loads the signer and
+    /// provider-secret read authority required for federated Project authentication, but it
+    /// deliberately does not load the Control operator credential.
     ///
     /// # Errors
     ///
@@ -353,7 +355,10 @@ impl ServerConfig {
         let (instance_id, control_api_key) = parse_control_identity(mode, values)?;
         let provisioning = parse_provisioning(mode, values)?;
         let runtime_protection = parse_runtime_protection(mode, values)?;
-        let provider_allowed_origins = parse_provider_allowed_origins(mode, values)?;
+        let provider_allow_http_loopback =
+            parse_boolean(values, "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK", false)?;
+        let provider_allowed_origins =
+            parse_provider_allowed_origins(mode, values, provider_allow_http_loopback)?;
         let configured_runtime_process_id = optional(values, "OWLAUTH_RUNTIME_PROCESS_ID")
             .map(validate_process_id)
             .transpose()?;
@@ -462,6 +467,7 @@ impl ServerConfig {
             provisioning,
             runtime_protection,
             provider_allowed_origins,
+            provider_allow_http_loopback,
             runtime_process_id,
             required_runtime_process_ids,
             publication_lease_ttl,
@@ -671,6 +677,7 @@ fn parse_runtime_key(
 fn parse_provider_allowed_origins(
     mode: PlaneMode,
     values: &BTreeMap<String, String>,
+    allow_http_loopback: bool,
 ) -> Result<Vec<String>, ConfigError> {
     if !mode.has_runtime() {
         return Ok(Vec::new());
@@ -679,11 +686,16 @@ fn parse_provider_allowed_origins(
     let origins = configured
         .split(',')
         .map(|value| {
-            let url = Url::parse(value).map_err(|_| ConfigError::InvalidValue {
+            let invalid = || ConfigError::InvalidValue {
                 key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-                reason: "must contain comma-separated canonical HTTPS origins".to_owned(),
-            })?;
-            if url.scheme() != "https"
+                reason: "must contain comma-separated canonical HTTPS origins or explicitly enabled HTTP loopback origins".to_owned(),
+            };
+            let url = Url::parse(value).map_err(|_| invalid())?;
+            let accepted_scheme = url.scheme() == "https"
+                || (allow_http_loopback
+                    && url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1" | "::1" | "[::1]")));
+            if !accepted_scheme
                 || url.username() != ""
                 || url.password().is_some()
                 || url.host_str().is_none()
@@ -692,10 +704,7 @@ fn parse_provider_allowed_origins(
                 || url.fragment().is_some()
                 || url.as_str() != value
             {
-                return Err(ConfigError::InvalidValue {
-                    key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-                    reason: "must contain comma-separated canonical HTTPS origins".to_owned(),
-                });
+                return Err(invalid());
             }
             Ok(value.to_owned())
         })
@@ -703,10 +712,26 @@ fn parse_provider_allowed_origins(
     if origins.is_empty() || origins.iter().collect::<BTreeSet<_>>().len() != origins.len() {
         return Err(ConfigError::InvalidValue {
             key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-            reason: "must contain unique canonical HTTPS origins".to_owned(),
+            reason: "must contain unique canonical provider origins".to_owned(),
         });
     }
     Ok(origins)
+}
+
+fn parse_boolean(
+    values: &BTreeMap<String, String>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match optional(values, key) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(ConfigError::InvalidValue {
+            key,
+            reason: "must be `true` or `false`".to_owned(),
+        }),
+    }
 }
 
 fn parse_store_root(key: &'static str, value: String) -> Result<PathBuf, ConfigError> {
@@ -961,33 +986,73 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mode_does_not_require_or_load_control_secrets() {
-        const { assert!(!FEDERATED_PROJECT_AUTH_AVAILABLE) };
-        let config =
-            ServerConfig::from_values(&runtime_values()).expect("Runtime config should parse");
+    fn runtime_mode_loads_read_authority_stores_without_control_credentials() {
+        const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
+        assert!(ServerConfig::from_values(&runtime_values()).is_err());
+
+        let mut input = runtime_values();
+        input.extend(control_store_values());
+        input.insert(
+            "OWLAUTH_CONTROL_API_KEY".to_owned(),
+            "this value must not be loaded".to_owned(),
+        );
+        let config = ServerConfig::from_values(&input)
+            .expect("Runtime auth requires signer and provider-secret store access");
         assert_eq!(config.mode, PlaneMode::Runtime);
         assert!(config.control_api_key.is_none());
-        assert!(config.provisioning.is_none());
-
-        let mut ignored = runtime_values();
-        ignored.extend(values(&[
-            ("OWLAUTH_CONTROL_API_KEY", "this value must not be loaded"),
-            ("OWLAUTH_SIGNER_STORE_ROOT", "not-an-absolute-path"),
-            ("OWLAUTH_SIGNER_STORE_KEY", "not-base64"),
-            (
-                "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
-                "also-not-an-absolute-path",
-            ),
-            ("OWLAUTH_CONFIGURATION_SECRET_STORE_KEY", "also-not-base64"),
-        ]));
-        let config = ServerConfig::from_values(&ignored)
-            .expect("Runtime must ignore unavailable Control capabilities");
-        assert!(config.control_api_key.is_none());
-        assert!(config.provisioning.is_none());
+        assert!(config.provisioning.is_some());
         let debug = format!("{config:?}");
         assert!(!debug.contains("this value"));
-        assert!(!debug.contains("not-base64"));
+        assert!(!debug.contains("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"));
         assert!(!debug.contains("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"));
+    }
+
+    #[test]
+    fn provider_http_requires_explicit_loopback_only_development_policy() {
+        let mut input = runtime_values();
+        input.extend(control_store_values());
+        input.insert(
+            "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
+            "http://127.0.0.1:8090/".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
+                ..
+            })
+        ));
+
+        input.insert(
+            "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK".to_owned(),
+            "true".to_owned(),
+        );
+        let config = ServerConfig::from_values(&input)
+            .expect("explicit development policy should admit canonical loopback HTTP");
+        assert!(config.provider_allow_http_loopback);
+
+        input.insert(
+            "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
+            "http://localhost:8090/".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
+                ..
+            })
+        ));
+        input.insert(
+            "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK".to_owned(),
+            "yes".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1058,6 +1123,7 @@ mod tests {
         ));
 
         let mut input = runtime_values();
+        input.extend(control_store_values());
         input.insert(
             "OWLAUTH_RUNTIME_POSTGRES_URL".to_owned(),
             "postgres://runtime:secret@other.example/owlauth".to_owned(),
@@ -1070,6 +1136,7 @@ mod tests {
         ));
 
         let mut input = runtime_values();
+        input.extend(control_store_values());
         input.insert(
             "OWLAUTH_RUNTIME_POSTGRES_URL".to_owned(),
             "postgres://runtime:secret@database.example/owlauth?sslmode=verify-full".to_owned(),
@@ -1081,6 +1148,7 @@ mod tests {
     #[test]
     fn runtime_process_must_be_present_in_its_required_roster() {
         let mut input = runtime_values();
+        input.extend(control_store_values());
         input.insert(
             "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
             "other-runtime".to_owned(),
@@ -1108,6 +1176,7 @@ mod tests {
     #[test]
     fn rejects_propagation_delay_beyond_the_upgrade_safety_bound() {
         let mut input = runtime_values();
+        input.extend(control_store_values());
         input.insert(
             "OWLAUTH_KEY_PROPAGATION_DELAY_MS".to_owned(),
             "86400001".to_owned(),
@@ -1124,6 +1193,7 @@ mod tests {
     #[test]
     fn rejects_verification_retention_beyond_the_safety_bound() {
         let mut input = runtime_values();
+        input.extend(control_store_values());
         input.insert(
             "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS".to_owned(),
             "86400001".to_owned(),

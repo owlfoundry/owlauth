@@ -209,11 +209,19 @@ fn malformed_signature_duplicate_json_and_collection_bounds_are_rejected() {
 #[test]
 fn production_policy_rejects_plain_http_and_non_origin_allowlist_entries() {
     assert_eq!(
-        RestrictedOidcProviderClient::new(["http://127.0.0.1:9999"]).err(),
+        RestrictedOidcProviderClient::new(["http://127.0.0.1:9999"], false).err(),
+        Some(ProviderExchangeError::UnavailableBeforeDispatch)
+    );
+    assert!(
+        RestrictedOidcProviderClient::new(["http://127.0.0.1:9999"], true).is_ok(),
+        "explicit development policy should admit an exact loopback IP"
+    );
+    assert_eq!(
+        RestrictedOidcProviderClient::new(["http://localhost:9999"], true).err(),
         Some(ProviderExchangeError::UnavailableBeforeDispatch)
     );
     assert_eq!(
-        RestrictedOidcProviderClient::new(["https://issuer.example/not-an-origin"]).err(),
+        RestrictedOidcProviderClient::new(["https://issuer.example/not-an-origin"], false).err(),
         Some(ProviderExchangeError::UnavailableBeforeDispatch)
     );
 }

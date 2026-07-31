@@ -5,12 +5,13 @@
 SDK generation consumes an OpenAPI document emitted from the exact OwlAuth server revision under validation:
 
 ```bash
-cargo run --package owlauth-server -- --openapi > <temporary-build-path>/owlauth-openapi.json
+cargo run --locked --package owlauth-types --bin export-openapi -- \
+  runtime <temporary-build-path>/runtime-openapi.json
 ```
 
 The OpenAPI file is derived from reviewed public DTOs in `crates/owlauth-types` and is never committed. CI/release provenance records the source revision, server version, generator version/configuration, and contract digest.
 
-The current server and SDKs remain scaffolds. A generated health operation or model is not evidence that Project Auth login, handoff, session, refresh, current-user, or logout behavior exists.
+The current pre-alpha SDKs implement the reviewed Runtime Project Auth operations through handwritten protocol-safety layers over the public wire contract. Generated models alone are still not evidence of correct PKCE custody, one-use handoff/refresh behavior, context isolation, redaction, or server interoperability.
 
 ## Surface separation
 

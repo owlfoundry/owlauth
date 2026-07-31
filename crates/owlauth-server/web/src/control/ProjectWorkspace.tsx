@@ -15,6 +15,7 @@ import {
 } from "./client";
 import { ProviderPanel } from "./ProviderPanel";
 import { SigningKeyPanel } from "./SigningKeyPanel";
+import { UserSessionPanel } from "./UserSessionPanel";
 
 interface ProjectWorkspaceProps {
   readonly session: DisposableControlClient;
@@ -313,6 +314,12 @@ export function ProjectWorkspace({
         )}
       </section>
 
+      <UserSessionPanel
+        session={session}
+        project={project}
+        onError={handleMutationError}
+        setMessage={setMessage}
+      />
       <SigningKeyPanel
         session={session}
         project={project}

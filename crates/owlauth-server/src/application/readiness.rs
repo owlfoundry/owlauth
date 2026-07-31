@@ -11,6 +11,7 @@ pub(crate) struct PublicProvider {
     pub key: String,
     pub display_name: String,
     pub kind: String,
+    pub issuer: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

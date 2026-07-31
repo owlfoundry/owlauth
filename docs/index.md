@@ -13,7 +13,7 @@ hero:
       text: Understand OwlAuth
       link: /guide/architecture
     - theme: alt
-      text: Develop the scaffold
+      text: Develop OwlAuth
       link: /guide/getting-started
     - theme: alt
       text: View on GitHub
@@ -41,7 +41,7 @@ features:
 ---
 
 ::: danger Pre-alpha implementation
-The repository is **not a working Project Auth service yet**. The current server exposes only `GET /health` and generated OpenAPI for that scaffold. Project login, hosted authentication pages, the Management Console, upstream-provider integration, persistence, sessions, token issuance, Runtime and Control APIs, migrations, and MCP are not implemented. The SDKs currently store only a base URL. Do not use this release for production authentication.
+OwlAuth now implements one complete strict-OIDC Project Auth and session journey, isolated Runtime and Control APIs, PostgreSQL authority, embedded Hosted Authentication and Management Console surfaces, signing and configuration-secret stores, and TypeScript/Python/Rust protocol SDKs. It remains pre-alpha rather than production-supported. Passwordless email, managed provider synchronization, projection webhooks, SCIM/bulk directory, and remote MCP remain deferred.
 :::
 
 ## The product model
@@ -73,7 +73,7 @@ A Project access token is an OwlAuth application-session JWT. It is not an upstr
 ## Read next
 
 - [Architecture](/guide/architecture) — Projects, Applications, authentication flow, logical planes, storage, and deployment.
-- [Getting started](/guide/getting-started) — build and inspect the current scaffold without confusing it with the target design.
-- [SDKs](/guide/sdks) — current package status and the planned Project Auth client boundary.
-- [CLI and agent integrations](/guide/agent-integrations) — the updater-only CLI, endpoint-discovered self-hosted/SaaS target design, documentation plugin, and future remote HTTP MCP boundaries.
+- [Getting started](/guide/getting-started) — build, validate, and inspect the current pre-alpha implementation.
+- [SDKs](/guide/sdks) — implemented protocol operations and the explicit Application-owned state boundary.
+- [CLI and agent integrations](/guide/agent-integrations) — endpoint-discovered CLI boundaries, documentation plugin, and deferred remote HTTP MCP capabilities.
 - [Security](/guide/security) — target invariants, operational trust boundaries, and vulnerability reporting.
