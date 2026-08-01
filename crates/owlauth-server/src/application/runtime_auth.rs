@@ -14,16 +14,17 @@ use crate::domain::{
 };
 
 use super::{
-    AccessTokenSessionLookup, ApplicationError, AuthenticationRepository, BindBrowserLogout,
-    BindHostedBrowser, BrowserLogoutRecord, ClaimProviderCallback, Clock, CommitHandoffExchange,
-    CompleteProviderCallback, ConfirmBrowserLogout, ConfirmBrowserSessionReuse,
-    CreateLoginTransaction, CurrentSession, FailProviderExchange, HandoffPreparation,
-    HostedInteraction, LoginRevisionSnapshot, LogoutApplicationSession, OpaquePurpose,
-    PrepareBrowserLogout, PrepareHandoffExchange, PrepareRefreshRotation, ProtectedPurpose,
-    ProviderAuthorizationRequest, ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity,
-    ProviderSecretResolver, RecoverProviderExchanges, RefreshPreparation, RefreshPreparationResult,
-    RefreshRotationResult, RotateRefreshToken, RuntimeAuthorityRepository, RuntimeProtector,
-    RuntimeSigner, SelectProviderMethod, SessionAuthorityRepository, UpstreamProviderClient,
+    AccessTokenSessionLookup, ApplicationError, AuthenticatedIdentityEvidence,
+    AuthenticationRepository, BindBrowserLogout, BindHostedBrowser, BrowserLogoutRecord,
+    ClaimProviderCallback, Clock, CommitHandoffExchange, CompleteAuthenticatedIdentity,
+    ConfirmBrowserLogout, ConfirmBrowserSessionReuse, CreateLoginTransaction, CurrentSession,
+    FailProviderExchange, HandoffPreparation, HostedInteraction, LoginRevisionSnapshot,
+    LogoutApplicationSession, OpaquePurpose, PrepareBrowserLogout, PrepareHandoffExchange,
+    PrepareRefreshRotation, ProtectedPurpose, ProviderAuthorizationRequest,
+    ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity, ProviderSecretResolver,
+    RecoverProviderExchanges, RefreshPreparation, RefreshPreparationResult, RefreshRotationResult,
+    RotateRefreshToken, RuntimeAuthorityRepository, RuntimeProtector, RuntimeSigner,
+    SelectProviderMethod, SessionAuthorityRepository, UpstreamProviderClient,
     VerifiedProviderIdentity,
 };
 
@@ -473,11 +474,13 @@ impl RuntimeAuthService {
         )?;
         let issued = self
             .sessions
-            .complete_provider_callback(CompleteProviderCallback {
+            .complete_authenticated_identity(CompleteAuthenticatedIdentity {
                 project_id: claimed.transaction.project_id,
                 transaction_id,
                 expected_transaction_revision: claimed.transaction.transaction_revision,
-                identity: verified_provider_identity(identity)?,
+                evidence: AuthenticatedIdentityEvidence::Provider(verified_provider_identity(
+                    identity,
+                )?),
                 new_user_id: Uuid::new_v4(),
                 new_user_public_id: generated_public_id("usr"),
                 new_identity_id: Uuid::new_v4(),
@@ -1273,6 +1276,7 @@ fn verified_provider_identity(
             .picture_url
             .map(ProfilePictureUrl::parse)
             .transpose()?,
+        locale: None,
     })
 }
 

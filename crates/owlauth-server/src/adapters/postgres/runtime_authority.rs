@@ -653,11 +653,20 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         let projection = application_user_projection::Entity::find()
             .filter(application_user_projection::Column::ProjectId.eq(project_id))
             .filter(application_user_projection::Column::BindingId.eq(binding.id))
-            .lock_shared()
+            .lock_exclusive()
             .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
+        let (projection, _) = super::projection::repair_projection(
+            &transaction,
+            projection,
+            &user,
+            policy.projection_revision,
+            application.projection_revision,
+            now,
+        )
+        .await?;
         let result = CurrentSession {
             project_id,
             project_public_id: project.public_id,

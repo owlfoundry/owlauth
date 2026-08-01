@@ -45,6 +45,118 @@ impl ProfileDisplayName {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProfileLocale(String);
+
+impl ProfileLocale {
+    pub(crate) fn parse(value: String) -> Result<Self, DomainError> {
+        if !(2..=35).contains(&value.len())
+            || value.starts_with('-')
+            || value.ends_with('-')
+            || value.contains("--")
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(DomainError::InvalidCharacters);
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdentitySourceKind {
+    Provider,
+    Email,
+}
+
+impl IdentitySourceKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Email => "email",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalProfileField<T> {
+    pub(crate) is_set: bool,
+    pub(crate) value: Option<T>,
+}
+
+impl<T> LocalProfileField<T> {
+    pub(crate) const fn inherited() -> Self {
+        Self {
+            is_set: false,
+            value: None,
+        }
+    }
+
+    pub(crate) const fn explicitly(value: Option<T>) -> Self {
+        Self {
+            is_set: true,
+            value,
+        }
+    }
+
+    pub(crate) fn resolve(self, source: Option<T>) -> Option<T> {
+        if self.is_set { self.value } else { source }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundedProviderProfile {
+    pub(crate) display_name: Option<ProfileDisplayName>,
+    pub(crate) picture_url: Option<ProfilePictureUrl>,
+    pub(crate) locale: Option<ProfileLocale>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserProfileInputs {
+    pub(crate) primary_source_kind: IdentitySourceKind,
+    pub(crate) local_display_name: LocalProfileField<ProfileDisplayName>,
+    pub(crate) local_picture_url: LocalProfileField<ProfilePictureUrl>,
+    pub(crate) local_locale: LocalProfileField<ProfileLocale>,
+    pub(crate) primary_provider: Option<BoundedProviderProfile>,
+    pub(crate) verified_email: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MaterializedUserProfile {
+    pub(crate) display_name: Option<ProfileDisplayName>,
+    pub(crate) picture_url: Option<ProfilePictureUrl>,
+    pub(crate) locale: Option<ProfileLocale>,
+    pub(crate) verified_email: Option<String>,
+}
+
+impl UserProfileInputs {
+    pub(crate) fn materialize(self) -> Result<MaterializedUserProfile, DomainError> {
+        if self.verified_email.as_ref().is_some_and(|value| {
+            !(3..=320).contains(&value.len()) || value.chars().any(char::is_control)
+        }) {
+            return Err(DomainError::InvalidCharacters);
+        }
+        let provider = match self.primary_source_kind {
+            IdentitySourceKind::Provider => self.primary_provider,
+            IdentitySourceKind::Email => None,
+        };
+        let (display_name, picture_url, locale) = provider.map_or((None, None, None), |profile| {
+            (profile.display_name, profile.picture_url, profile.locale)
+        });
+        Ok(MaterializedUserProfile {
+            display_name: self.local_display_name.resolve(display_name),
+            picture_url: self.local_picture_url.resolve(picture_url),
+            locale: self.local_locale.resolve(locale),
+            verified_email: self.verified_email,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProfilePictureUrl(String);
 
 impl ProfilePictureUrl {
@@ -173,6 +285,75 @@ mod tests {
             assert_eq!(
                 ProfilePictureUrl::parse(value.to_owned()),
                 Err(DomainError::InvalidUrl)
+            );
+        }
+    }
+
+    #[test]
+    fn local_profile_values_override_only_their_owned_fields() {
+        let profile = UserProfileInputs {
+            primary_source_kind: IdentitySourceKind::Provider,
+            local_display_name: LocalProfileField::explicitly(Some(
+                ProfileDisplayName::parse("Local Ada".to_owned()).unwrap(),
+            )),
+            local_picture_url: LocalProfileField::explicitly(None),
+            local_locale: LocalProfileField::inherited(),
+            primary_provider: Some(BoundedProviderProfile {
+                display_name: Some(ProfileDisplayName::parse("Provider Ada".to_owned()).unwrap()),
+                picture_url: Some(
+                    ProfilePictureUrl::parse("https://cdn.example/provider.png".to_owned())
+                        .unwrap(),
+                ),
+                locale: Some(ProfileLocale::parse("en-GB".to_owned()).unwrap()),
+            }),
+            verified_email: Some("ada@example.test".to_owned()),
+        }
+        .materialize()
+        .unwrap();
+
+        assert_eq!(
+            profile
+                .display_name
+                .map(ProfileDisplayName::into_inner)
+                .as_deref(),
+            Some("Local Ada")
+        );
+        assert!(profile.picture_url.is_none());
+        assert_eq!(
+            profile.locale.map(ProfileLocale::into_inner).as_deref(),
+            Some("en-GB")
+        );
+        assert_eq!(profile.verified_email.as_deref(), Some("ada@example.test"));
+    }
+
+    #[test]
+    fn email_primary_source_does_not_import_provider_display_fields() {
+        let profile = UserProfileInputs {
+            primary_source_kind: IdentitySourceKind::Email,
+            local_display_name: LocalProfileField::inherited(),
+            local_picture_url: LocalProfileField::inherited(),
+            local_locale: LocalProfileField::inherited(),
+            primary_provider: Some(BoundedProviderProfile {
+                display_name: Some(ProfileDisplayName::parse("Provider Ada".to_owned()).unwrap()),
+                picture_url: None,
+                locale: None,
+            }),
+            verified_email: Some("ada@example.test".to_owned()),
+        }
+        .materialize()
+        .unwrap();
+
+        assert!(profile.display_name.is_none());
+        assert_eq!(profile.verified_email.as_deref(), Some("ada@example.test"));
+    }
+
+    #[test]
+    fn locale_is_bounded_and_structural() {
+        assert!(ProfileLocale::parse("zh-Hans-CN".to_owned()).is_ok());
+        for invalid in ["e", "-en", "en-", "en--US", "en_US"] {
+            assert_eq!(
+                ProfileLocale::parse(invalid.to_owned()),
+                Err(DomainError::InvalidCharacters)
             );
         }
     }

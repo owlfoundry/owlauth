@@ -733,6 +733,8 @@ pub(super) fn parse_login_status(value: &str) -> Result<LoginTransactionStatus, 
     match value {
         "awaiting_browser_binding" => Ok(LoginTransactionStatus::AwaitingBrowserBinding),
         "awaiting_method_selection" => Ok(LoginTransactionStatus::AwaitingMethodSelection),
+        "email_address_entry" => Ok(LoginTransactionStatus::EmailAddressEntry),
+        "email_challenge_pending" => Ok(LoginTransactionStatus::EmailChallengePending),
         "provider_authorization_started" => {
             Ok(LoginTransactionStatus::ProviderAuthorizationStarted)
         }

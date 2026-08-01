@@ -12,15 +12,19 @@ use uuid::Uuid;
 
 use super::{
     authentication::PostgresAuthenticationRepository,
+    control_lifecycle::PostgresControlLifecycleRepository,
+    runtime_authority::PostgresRuntimeAuthorityRepository,
     session_authority::PostgresSessionAuthorityRepository,
 };
 use crate::{
     application::{
-        AdmittedProviderMethod, AuthenticationRepository, BindBrowserLogout, BindHostedBrowser,
-        ClaimProviderCallback, CommitHandoffExchange, CompleteProviderCallback,
-        ConfirmBrowserLogout, CreateLoginTransaction, LoginRevisionSnapshot, PrepareBrowserLogout,
-        PrepareHandoffExchange, PrepareRefreshRotation, ProtectedValue, RecoverProviderExchanges,
-        RefreshPreparationResult, RefreshRotationResult, RotateRefreshToken, SelectProviderMethod,
+        AccessTokenSessionLookup, AdmittedProviderMethod, AuthenticatedIdentityEvidence,
+        AuthenticationRepository, BindBrowserLogout, BindHostedBrowser, ClaimProviderCallback,
+        CommitHandoffExchange, CompleteAuthenticatedIdentity, ConfirmBrowserLogout,
+        ControlLifecyclePort, CreateLoginTransaction, DisableProjectUser, LoginRevisionSnapshot,
+        PrepareBrowserLogout, PrepareHandoffExchange, PrepareRefreshRotation, ProtectedValue,
+        RecoverProviderExchanges, RefreshPreparationResult, RefreshRotationResult,
+        RotateRefreshToken, RuntimeAuthorityRepository, SelectProviderMethod,
         SessionAuthorityRepository, VerifiedProviderIdentity, VersionedDigest,
     },
     domain::{ProfileDisplayName, ProfilePictureUrl, ProviderIssuer, ProviderSubject},
@@ -296,17 +300,18 @@ fn completion_command(
     claimed: &crate::application::ClaimedProviderExchange,
     seed: u8,
     now: OffsetDateTime,
-) -> CompleteProviderCallback {
-    CompleteProviderCallback {
+) -> CompleteAuthenticatedIdentity {
+    CompleteAuthenticatedIdentity {
         project_id: seeded.project_id,
         transaction_id: claimed.transaction.id,
         expected_transaction_revision: claimed.transaction.transaction_revision,
-        identity: VerifiedProviderIdentity {
+        evidence: AuthenticatedIdentityEvidence::Provider(VerifiedProviderIdentity {
             issuer: ProviderIssuer::parse("https://issuer.example".to_owned()).expect("issuer"),
             subject: ProviderSubject::parse("shared-subject".to_owned()).expect("subject"),
             display_name: Some(ProfileDisplayName::parse("Ada".to_owned()).expect("display name")),
             picture_url: None,
-        },
+            locale: None,
+        }),
         new_user_id: Uuid::new_v4(),
         new_user_public_id: format!("usr_identity{seed:02}"),
         new_identity_id: Uuid::new_v4(),
@@ -414,11 +419,11 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     let browser_session_id = Uuid::new_v4();
     let handoff_id = Uuid::new_v4();
     let issued = sessions
-        .complete_provider_callback(CompleteProviderCallback {
+        .complete_authenticated_identity(CompleteAuthenticatedIdentity {
             project_id: seeded.project_id,
             transaction_id: login.id,
             expected_transaction_revision: claimed.transaction.transaction_revision,
-            identity: VerifiedProviderIdentity {
+            evidence: AuthenticatedIdentityEvidence::Provider(VerifiedProviderIdentity {
                 issuer: ProviderIssuer::parse("https://issuer.example".to_owned()).expect("issuer"),
                 subject: ProviderSubject::parse("subject-1".to_owned()).expect("subject"),
                 display_name: Some(
@@ -428,7 +433,8 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
                     ProfilePictureUrl::parse("https://cdn.example/ada.png".to_owned())
                         .expect("picture URL"),
                 ),
-            },
+                locale: None,
+            }),
             new_user_id: Uuid::new_v4(),
             new_user_public_id: "usr_session01".to_owned(),
             new_identity_id: Uuid::new_v4(),
@@ -610,6 +616,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     assert_eq!(fresh_preparation.project_projection_revision, 2);
     assert_eq!(fresh_preparation.application_projection_revision, 2);
     assert_eq!(fresh_preparation.signing_epoch, 2);
+    let expected_projection = fresh_preparation.projection_document.clone();
     let exchange = CommitHandoffExchange {
         preparation: fresh_preparation,
         binding_id: Uuid::new_v4(),
@@ -652,6 +659,35 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     .await
     .expect("load Application projection");
     assert_eq!(projection_application, seeded.application_id);
+
+    sqlx::query(
+        "UPDATE application_user_projections
+         SET document = '{\"stale\":true}'::jsonb, canonical_digest = $2
+         WHERE binding_id = $1",
+    )
+    .bind(session.binding_id)
+    .bind(vec![3_u8; 32])
+    .execute(&pool)
+    .await
+    .expect("corrupt stored projection before current-user read");
+    let runtime = PostgresRuntimeAuthorityRepository::new(database.clone());
+    let current = runtime
+        .current_session(
+            AccessTokenSessionLookup {
+                project_id: seeded.project_id,
+                application_public_id: "app_session01".to_owned(),
+                user_public_id: issued.user_public_id.clone(),
+                application_session_id: session.application_session_id,
+                claims_revision: 1,
+                now: exchange_at,
+            },
+            false,
+        )
+        .await
+        .expect("current-user read lazily repairs projection material");
+    assert_eq!(current.projection_revision, session.projection_revision);
+    assert_eq!(current.projection_document, expected_projection);
+
     let (family_expires_at, initial_retain_until): (OffsetDateTime, OffsetDateTime) =
         sqlx::query_as(
             "SELECT families.absolute_expires_at, generations.retain_until
@@ -669,6 +705,15 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     );
 
     let refresh_at = exchange_at + Duration::seconds(1);
+    sqlx::query(
+        "UPDATE application_user_projections
+         SET document = '{\"stale_document_only\":true}'::jsonb
+         WHERE binding_id = $1",
+    )
+    .bind(session.binding_id)
+    .execute(&pool)
+    .await
+    .expect("corrupt only projection document before refresh");
     let refresh_preparation = sessions
         .prepare_refresh_rotation(PrepareRefreshRotation {
             project_id: seeded.project_id,
@@ -682,11 +727,60 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         panic!("current refresh token must prepare for rotation");
     };
     assert_eq!(refresh_preparation.generation, 1);
+    assert_eq!(refresh_preparation.projection_document, expected_projection);
+    assert_eq!(
+        refresh_preparation.projection_revision,
+        current.projection_revision
+    );
+
+    sqlx::query(
+        "ALTER TABLE application_user_projections
+         DISABLE TRIGGER application_user_projections_source_base_digest_fill",
+    )
+    .execute(&pool)
+    .await
+    .expect("disable compatibility trigger for legacy-null fixture");
+    sqlx::query(
+        "UPDATE application_user_projections
+         SET source_base_profile_digest = NULL
+         WHERE binding_id = $1",
+    )
+    .bind(session.binding_id)
+    .execute(&pool)
+    .await
+    .expect("simulate legacy projection without source digest");
+    sqlx::query(
+        "ALTER TABLE application_user_projections
+         ENABLE TRIGGER application_user_projections_source_base_digest_fill",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore projection compatibility trigger");
+    let source_digest_repair = sessions
+        .prepare_refresh_rotation(PrepareRefreshRotation {
+            project_id: seeded.project_id,
+            application_id: seeded.application_id,
+            presented_token: digest(12),
+            now: refresh_at,
+        })
+        .await
+        .expect("repair source digest during refresh preparation");
+    let RefreshPreparationResult::Ready(source_digest_repair) = source_digest_repair else {
+        panic!("current refresh token must remain eligible during storage repair");
+    };
+    assert_eq!(
+        source_digest_repair.projection_revision,
+        current.projection_revision
+    );
+    assert_eq!(
+        source_digest_repair.projection_document,
+        expected_projection
+    );
     let refresh_a = RotateRefreshToken {
         project_id: seeded.project_id,
         application_id: seeded.application_id,
         presented_token: digest(12),
-        preparation: *refresh_preparation,
+        preparation: *source_digest_repair,
         successor_generation_id: Uuid::new_v4(),
         successor_token: digest(13),
         now: refresh_at,
@@ -791,6 +885,29 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
             .await
             .expect("load browser session");
     assert_eq!(browser_status, "terminated");
+
+    let control = PostgresControlLifecycleRepository::new(database.clone());
+    let disabled = control
+        .disable_project_user(DisableProjectUser {
+            project_id: seeded.project_id,
+            user_id: issued.user_id,
+            expected_security_revision: 1,
+            correlation_id: Uuid::new_v4(),
+            now: refresh_at + Duration::seconds(4),
+        })
+        .await
+        .expect("disable user and fan out the authoritative projection");
+    assert_eq!(disabled.user_revision, 3);
+    let disabled_projection: (i64, i64, String) = sqlx::query_as(
+        "SELECT projection_revision, source_user_revision, document->>'status'
+         FROM application_user_projections WHERE binding_id = $1",
+    )
+    .bind(session.binding_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load disabled projection");
+    assert_eq!(disabled_projection, (2, 3, "disabled".to_owned()));
+
     let audit_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_events
          WHERE project_id = $1 AND action LIKE 'auth.%' AND safe_context = '{}'::jsonb",
@@ -834,13 +951,13 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
     let other_project_claim = claim_provider_login(&authentication, &second_project, 61, now).await;
 
     let (first, competing) = tokio::join!(
-        sessions.complete_provider_callback(completion_command(
+        sessions.complete_authenticated_identity(completion_command(
             &first_project,
             &first_claim,
             21,
             now,
         )),
-        sessions.complete_provider_callback(completion_command(
+        sessions.complete_authenticated_identity(completion_command(
             &first_project,
             &competing_claim,
             41,
@@ -852,7 +969,7 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
     assert_eq!(first.user_id, competing.user_id);
 
     let other_project = sessions
-        .complete_provider_callback(completion_command(
+        .complete_authenticated_identity(completion_command(
             &second_project,
             &other_project_claim,
             61,
@@ -957,8 +1074,8 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
         "INSERT INTO application_user_projections
             (id, project_id, binding_id, application_id, user_id, schema_name,
              projection_revision, source_user_revision, project_policy_revision,
-             application_policy_revision, canonical_digest, document)
-         VALUES ($1, $2, $3, $4, $5, 'owlauth.user.v1', 1, 1, 1, 1, $6, $7)",
+             application_policy_revision, canonical_digest, source_base_profile_digest, document)
+         VALUES ($1, $2, $3, $4, $5, 'owlauth.user.v1', 1, 1, 1, 1, $6, $6, $7)",
     )
     .bind(Uuid::new_v4())
     .bind(first_project.project_id)
@@ -974,10 +1091,11 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
         claim_provider_login(&authentication, &secondary_registration, 81, now).await;
     let mut profile_change =
         completion_command(&secondary_registration, &profile_change_claim, 81, now);
-    profile_change.identity.display_name =
+    let AuthenticatedIdentityEvidence::Provider(profile) = &mut profile_change.evidence;
+    profile.display_name =
         Some(ProfileDisplayName::parse("Grace".to_owned()).expect("changed display name"));
     sessions
-        .complete_provider_callback(profile_change)
+        .complete_authenticated_identity(profile_change)
         .await
         .expect("complete primary-profile change");
     let (
@@ -1042,11 +1160,82 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
         .await
         .expect("prepare digest-only stale projection repair");
     assert_eq!(digest_only_repair.user_revision, 2);
-    assert_eq!(digest_only_repair.projection_revision, 3);
+    assert_eq!(
+        digest_only_repair.projection_revision, 2,
+        "storage-only repair must not invent an Application-visible revision"
+    );
     assert_eq!(
         digest_only_repair.projection_document["display_name"],
         "Grace"
     );
+
+    let before_digest_repair: (i64, i64, i64, OffsetDateTime, OffsetDateTime) = sqlx::query_as(
+        "SELECT identities.identity_revision, users.user_revision,
+                    projections.projection_revision, users.updated_at, identities.updated_at
+             FROM linked_identities AS identities
+             JOIN project_users AS users
+               ON users.project_id = identities.project_id AND users.id = identities.user_id
+             JOIN application_user_projections AS projections
+               ON projections.project_id = users.project_id AND projections.user_id = users.id
+             WHERE identities.project_id = $1 AND identities.subject = 'shared-subject'",
+    )
+    .bind(first_project.project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load revisions before digest-only repair");
+    sqlx::query(
+        "ALTER TABLE linked_identities
+         DISABLE TRIGGER linked_identities_source_profile_digest_fill",
+    )
+    .execute(&pool)
+    .await
+    .expect("disable compatibility trigger for legacy-null fixture");
+    sqlx::query(
+        "UPDATE linked_identities SET source_profile_digest = NULL
+         WHERE project_id = $1 AND subject = 'shared-subject'",
+    )
+    .bind(first_project.project_id)
+    .execute(&pool)
+    .await
+    .expect("simulate legacy provider source without digest");
+    sqlx::query(
+        "ALTER TABLE linked_identities
+         ENABLE TRIGGER linked_identities_source_profile_digest_fill",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore provider-source compatibility trigger");
+    sqlx::query("UPDATE project_users SET base_profile_digest = $2 WHERE id = $1")
+        .bind(first.user_id)
+        .bind(vec![6_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("corrupt only user base digest");
+    let repair_claim =
+        claim_provider_login(&authentication, &secondary_registration, 91, now).await;
+    let mut repair_command = completion_command(&secondary_registration, &repair_claim, 91, now);
+    let AuthenticatedIdentityEvidence::Provider(repair_profile) = &mut repair_command.evidence;
+    repair_profile.display_name =
+        Some(ProfileDisplayName::parse("Grace".to_owned()).expect("same display name"));
+    sessions
+        .complete_authenticated_identity(repair_command)
+        .await
+        .expect("provider completion repairs digest-only corruption");
+    let after_digest_repair: (i64, i64, i64, OffsetDateTime, OffsetDateTime) = sqlx::query_as(
+        "SELECT identities.identity_revision, users.user_revision,
+                    projections.projection_revision, users.updated_at, identities.updated_at
+             FROM linked_identities AS identities
+             JOIN project_users AS users
+               ON users.project_id = identities.project_id AND users.id = identities.user_id
+             JOIN application_user_projections AS projections
+               ON projections.project_id = users.project_id AND projections.user_id = users.id
+             WHERE identities.project_id = $1 AND identities.subject = 'shared-subject'",
+    )
+    .bind(first_project.project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load revisions after digest-only repair");
+    assert_eq!(after_digest_repair, before_digest_repair);
 
     let orphan_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
@@ -1092,7 +1281,7 @@ async fn claimed_provider_failures_are_terminal_and_abandoned_claims_are_recover
     let mut invalid = completion_command(&seeded, &claimed, 101, now);
     invalid.browser_credential.key_version = 0;
     let error = sessions
-        .complete_provider_callback(invalid)
+        .complete_authenticated_identity(invalid)
         .await
         .expect_err("invalid post-claim credential must fail terminally");
     assert_eq!(error, crate::application::ApplicationError::InvalidInput);
@@ -1109,7 +1298,7 @@ async fn claimed_provider_failures_are_terminal_and_abandoned_claims_are_recover
     let mut stale_revision = completion_command(&seeded, &revision_claimed, 111, now);
     stale_revision.expected_transaction_revision += 1;
     let revision_error = sessions
-        .complete_provider_callback(stale_revision)
+        .complete_authenticated_identity(stale_revision)
         .await
         .expect_err("prepared revision mismatch must fail terminally");
     assert_eq!(

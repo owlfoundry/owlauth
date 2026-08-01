@@ -4,6 +4,8 @@ use super::DomainError;
 pub(crate) enum LoginTransactionStatus {
     AwaitingBrowserBinding,
     AwaitingMethodSelection,
+    EmailAddressEntry,
+    EmailChallengePending,
     ProviderAuthorizationStarted,
     ProviderExchangeInProgress,
     ProviderExchangeFailed,
@@ -19,6 +21,8 @@ impl LoginTransactionStatus {
         match self {
             Self::AwaitingBrowserBinding => "awaiting_browser_binding",
             Self::AwaitingMethodSelection => "awaiting_method_selection",
+            Self::EmailAddressEntry => "email_address_entry",
+            Self::EmailChallengePending => "email_challenge_pending",
             Self::ProviderAuthorizationStarted => "provider_authorization_started",
             Self::ProviderExchangeInProgress => "provider_exchange_in_progress",
             Self::ProviderExchangeFailed => "provider_exchange_failed",
@@ -36,6 +40,14 @@ impl LoginTransactionStatus {
 
     pub(crate) fn select_provider(&mut self) -> Result<(), DomainError> {
         self.transition(Self::ProviderAuthorizationStarted)
+    }
+
+    pub(crate) fn select_email(&mut self) -> Result<(), DomainError> {
+        self.transition(Self::EmailAddressEntry)
+    }
+
+    pub(crate) fn begin_email_challenge(&mut self) -> Result<(), DomainError> {
+        self.transition(Self::EmailChallengePending)
     }
 
     pub(crate) fn confirm_session_reuse(&mut self) -> Result<(), DomainError> {
@@ -79,9 +91,16 @@ impl LoginTransactionStatus {
             ) | (
                 Self::AwaitingMethodSelection,
                 Self::ProviderAuthorizationStarted
+                    | Self::EmailAddressEntry
                     | Self::HandoffIssued
                     | Self::Expired
                     | Self::Cancelled
+            ) | (
+                Self::EmailAddressEntry,
+                Self::EmailChallengePending | Self::Expired | Self::Cancelled
+            ) | (
+                Self::EmailChallengePending,
+                Self::Authenticated | Self::Expired | Self::Cancelled
             ) | (
                 Self::ProviderAuthorizationStarted,
                 Self::ProviderExchangeInProgress | Self::Expired | Self::Cancelled
@@ -115,6 +134,20 @@ mod tests {
 
         assert_eq!(status, LoginTransactionStatus::Completed);
         assert_eq!(status.expire(), Err(DomainError::InvalidTransition));
+    }
+
+    #[test]
+    fn email_selection_is_one_way_and_converges_on_authentication() {
+        let mut status = LoginTransactionStatus::AwaitingMethodSelection;
+        status.select_email().unwrap();
+        status.begin_email_challenge().unwrap();
+        status.authenticate().unwrap();
+        status.issue_handoff().unwrap();
+        assert_eq!(status, LoginTransactionStatus::HandoffIssued);
+        assert_eq!(
+            status.select_provider(),
+            Err(DomainError::InvalidTransition)
+        );
     }
 
     #[test]

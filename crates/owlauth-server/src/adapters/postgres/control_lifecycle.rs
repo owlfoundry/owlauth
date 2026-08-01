@@ -91,6 +91,8 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
                 active.security_revision = Set(next_revision(active.security_revision.take())?);
                 active.updated_at = Set(command.now);
                 let updated = active.update(&transaction).await.map_err(persistence)?;
+                super::projection::fan_out_user_projections(&transaction, &updated, command.now)
+                    .await?;
                 append_runtime_audit(
                     &transaction,
                     command.project_id,

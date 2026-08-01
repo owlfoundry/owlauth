@@ -4,19 +4,19 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
     IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::Value;
 use subtle::ConstantTimeEq;
-use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime};
 
 use crate::{
     application::{
-        ApplicationError, BindBrowserLogout, BrowserLogoutRecord, CommitHandoffExchange,
-        CompleteProviderCallback, ConfirmBrowserLogout, ConfirmBrowserSessionReuse,
-        HandoffPreparation, HandoffSessionRecord, IssuedHandoff, LogoutApplicationSession,
-        PrepareBrowserLogout, PrepareHandoffExchange, PrepareRefreshRotation, ProtectedValue,
-        RecoverProviderExchanges, RefreshPreparation, RefreshPreparationResult,
-        RefreshRotationResult, RotateRefreshToken, SessionAuthorityRepository, VersionedDigest,
+        ApplicationError, AuthenticatedIdentityEvidence, BindBrowserLogout, BrowserLogoutRecord,
+        CommitHandoffExchange, CompleteAuthenticatedIdentity, ConfirmBrowserLogout,
+        ConfirmBrowserSessionReuse, HandoffPreparation, HandoffSessionRecord, IssuedHandoff,
+        LogoutApplicationSession, PrepareBrowserLogout, PrepareHandoffExchange,
+        PrepareRefreshRotation, ProtectedValue, RecoverProviderExchanges, RefreshPreparation,
+        RefreshPreparationResult, RefreshRotationResult, RotateRefreshToken,
+        SessionAuthorityRepository, VersionedDigest,
     },
     domain::{
         LoginTransactionStatus, ProfileDisplayName, ProfilePictureUrl, PublicId,
@@ -59,15 +59,24 @@ impl PostgresSessionAuthorityRepository {
     reason = "each method keeps one security-sensitive PostgreSQL transaction visible"
 )]
 impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
-    async fn complete_provider_callback(
+    async fn complete_authenticated_identity(
         &self,
-        command: CompleteProviderCallback,
+        command: CompleteAuthenticatedIdentity,
     ) -> Result<IssuedHandoff, ApplicationError> {
-        let identity = command.identity.clone();
+        let AuthenticatedIdentityEvidence::Provider(identity) = command.evidence.clone();
         let issuer = identity.issuer.into_inner();
         let subject = identity.subject.into_inner();
         let display_name = identity.display_name.map(ProfileDisplayName::into_inner);
         let picture_url = identity.picture_url.map(ProfilePictureUrl::into_inner);
+        let locale = identity
+            .locale
+            .map(crate::domain::ProfileLocale::into_inner);
+        let source_profile_digest = base_profile_digest(
+            display_name.as_deref(),
+            picture_url.as_deref(),
+            locale.as_deref(),
+            None,
+        )?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
         let login = login_transaction::Entity::find_by_id(command.transaction_id)
@@ -106,13 +115,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         if let Err(error) = digest_validation {
             return fail_provider_completion(transaction, &login, command.now, error).await;
         }
-        let canonical_base_digest =
-            match base_profile_digest(display_name.as_deref(), picture_url.as_deref()) {
-                Ok(digest) => digest,
-                Err(error) => {
-                    return fail_provider_completion(transaction, &login, command.now, error).await;
-                }
-            };
         let Some(provider_id) = login.provider_configuration_id else {
             return fail_provider_completion(
                 transaction,
@@ -216,15 +218,28 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     .await;
                 }
                 let identity_id = identity.id;
-                let profile_changed =
-                    identity.display_name != display_name || identity.picture_url != picture_url;
+                let profile_changed = identity.display_name != display_name
+                    || identity.picture_url != picture_url
+                    || identity.locale != locale;
+                let source_digest_changed =
+                    identity
+                        .source_profile_digest
+                        .as_deref()
+                        .is_none_or(|digest| {
+                            !bool::from(digest.ct_eq(source_profile_digest.as_slice()))
+                        });
                 let mut identity_active = identity.into_active_model();
                 if profile_changed {
                     identity_active.identity_revision =
                         Set(identity_active.identity_revision.take().unwrap_or(1) + 1);
                     identity_active.display_name = Set(display_name.clone());
                     identity_active.picture_url = Set(picture_url.clone());
+                    identity_active.locale = Set(locale.clone());
                     identity_active.updated_at = Set(command.now);
+                }
+                if profile_changed || source_digest_changed {
+                    identity_active.source_profile_digest =
+                        Set(Some(source_profile_digest.clone()));
                 }
                 identity_active.observed_at = Set(command.now);
                 identity_active
@@ -233,25 +248,59 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     .map_err(persistence)?;
 
                 let mut user_active = user.clone().into_active_model();
-                if user.primary_profile_identity_id == Some(identity_id)
-                    && !bool::from(
-                        user.base_profile_digest
-                            .as_slice()
-                            .ct_eq(canonical_base_digest.as_slice()),
-                    )
-                {
-                    user_active.user_revision =
-                        Set(user_active.user_revision.take().unwrap_or(1) + 1);
-                    user_active.base_profile_digest = Set(canonical_base_digest.clone());
-                    user_active.display_name = Set(display_name.clone());
-                    user_active.picture_url = Set(picture_url.clone());
-                    user_active.updated_at = Set(command.now);
+                let primary_provider = user.primary_source_kind == "provider"
+                    && user.primary_profile_identity_id == Some(identity_id);
+                let effective_display_name = if user.local_display_name_set {
+                    user.local_display_name.clone()
+                } else if primary_provider {
+                    display_name.clone()
+                } else {
+                    user.display_name.clone()
+                };
+                let effective_picture_url = if user.local_picture_url_set {
+                    user.local_picture_url.clone()
+                } else if primary_provider {
+                    picture_url.clone()
+                } else {
+                    user.picture_url.clone()
+                };
+                let effective_locale = if user.local_locale_set {
+                    user.local_locale.clone()
+                } else if primary_provider {
+                    locale.clone()
+                } else {
+                    user.locale.clone()
+                };
+                let canonical_base_digest = base_profile_digest(
+                    effective_display_name.as_deref(),
+                    effective_picture_url.as_deref(),
+                    effective_locale.as_deref(),
+                    None,
+                )?;
+                let materialized_profile_changed = user.display_name != effective_display_name
+                    || user.picture_url != effective_picture_url
+                    || user.locale != effective_locale;
+                let base_digest_changed = !bool::from(
+                    user.base_profile_digest
+                        .as_slice()
+                        .ct_eq(canonical_base_digest.as_slice()),
+                );
+                if primary_provider && (materialized_profile_changed || base_digest_changed) {
+                    user_active.base_profile_digest = Set(canonical_base_digest);
+                    if materialized_profile_changed {
+                        user_active.user_revision =
+                            Set(user_active.user_revision.take().unwrap_or(1) + 1);
+                        user_active.display_name = Set(effective_display_name);
+                        user_active.picture_url = Set(effective_picture_url);
+                        user_active.locale = Set(effective_locale);
+                        user_active.updated_at = Set(command.now);
+                    }
                     (
                         user_active
                             .update(&transaction)
                             .await
                             .map_err(persistence)?,
-                        true,
+                        materialized_profile_changed,
                     )
                 } else {
                     (user, false)
@@ -267,6 +316,12 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     )
                     .await;
                 };
+                let canonical_base_digest = base_profile_digest(
+                    display_name.as_deref(),
+                    picture_url.as_deref(),
+                    locale.as_deref(),
+                    None,
+                )?;
                 let user = project_user::ActiveModel {
                     id: Set(command.new_user_id),
                     project_id: Set(command.project_id),
@@ -275,9 +330,17 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     user_revision: Set(1),
                     security_revision: Set(1),
                     primary_profile_identity_id: Set(None),
+                    primary_source_kind: Set("provider".to_owned()),
                     base_profile_digest: Set(canonical_base_digest),
+                    local_display_name_set: Set(false),
+                    local_display_name: Set(None),
+                    local_picture_url_set: Set(false),
+                    local_picture_url: Set(None),
+                    local_locale_set: Set(false),
+                    local_locale: Set(None),
                     display_name: Set(display_name.clone()),
                     picture_url: Set(picture_url.clone()),
+                    locale: Set(locale.clone()),
                     created_at: Set(command.now),
                     updated_at: Set(command.now),
                 }
@@ -293,8 +356,12 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     subject: Set(subject.clone()),
                     status: Set("active".to_owned()),
                     identity_revision: Set(1),
+                    source_kind: Set("provider".to_owned()),
+                    source_schema: Set("owlauth.provider-profile.v1".to_owned()),
+                    source_profile_digest: Set(Some(source_profile_digest)),
                     display_name: Set(display_name.clone()),
                     picture_url: Set(picture_url.clone()),
+                    locale: Set(locale),
                     observed_at: Set(command.now),
                     created_at: Set(command.now),
                     updated_at: Set(command.now),
@@ -993,26 +1060,16 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         }
         let projection = match existing_projection {
             Some(projection) => {
-                let changed = projection.projection_revision != projection_revision
-                    || !bool::from(
-                        projection
-                            .canonical_digest
-                            .as_slice()
-                            .ct_eq(projection_digest.as_slice()),
-                    );
-                if changed {
-                    let mut active = projection.into_active_model();
-                    active.projection_revision = Set(projection_revision);
-                    active.source_user_revision = Set(user.user_revision);
-                    active.project_policy_revision = Set(policy.projection_revision);
-                    active.application_policy_revision = Set(application.projection_revision);
-                    active.canonical_digest = Set(projection_digest.clone());
-                    active.document = Set(projection_document.clone());
-                    active.updated_at = Set(command.now);
-                    active.update(&transaction).await.map_err(persistence)?
-                } else {
-                    projection
-                }
+                super::projection::repair_projection(
+                    &transaction,
+                    projection,
+                    &user,
+                    policy.projection_revision,
+                    application.projection_revision,
+                    command.now,
+                )
+                .await?
+                .0
             }
             None => application_user_projection::ActiveModel {
                 id: Set(command.projection_id),
@@ -1026,6 +1083,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 project_policy_revision: Set(policy.projection_revision),
                 application_policy_revision: Set(application.projection_revision),
                 canonical_digest: Set(projection_digest),
+                source_base_profile_digest: Set(Some(user.base_profile_digest.clone())),
                 document: Set(projection_document),
                 created_at: Set(command.now),
                 updated_at: Set(command.now),
@@ -1304,31 +1362,17 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (projection_revision, projection_document, projection_digest) =
-            authoritative_projection_material(
-                Some(&projection),
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-            )?;
-        if projection.projection_revision != projection_revision
-            || !bool::from(
-                projection
-                    .canonical_digest
-                    .as_slice()
-                    .ct_eq(projection_digest.as_slice()),
-            )
-        {
-            let mut active = projection.into_active_model();
-            active.projection_revision = Set(projection_revision);
-            active.source_user_revision = Set(user.user_revision);
-            active.project_policy_revision = Set(policy.projection_revision);
-            active.application_policy_revision = Set(application.projection_revision);
-            active.canonical_digest = Set(projection_digest);
-            active.document = Set(projection_document.clone());
-            active.updated_at = Set(command.now);
-            active.update(&transaction).await.map_err(persistence)?;
-        }
+        let (_, projection_material) = super::projection::repair_projection(
+            &transaction,
+            projection,
+            &user,
+            policy.projection_revision,
+            application.projection_revision,
+            command.now,
+        )
+        .await?;
+        let projection_revision = projection_material.revision;
+        let projection_document = projection_material.document;
         let signing =
             active_signing_snapshot(&transaction, command.project_id, command.now).await?;
         let preparation = RefreshPreparation {
@@ -1527,7 +1571,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (projection_document, projection_digest) = projection_material(
+        let (projection_document, projection_digest) = super::projection::projection_material(
             &user,
             command.preparation.projection_revision,
             policy.projection_revision,
@@ -1537,6 +1581,10 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             || projection.source_user_revision != user.user_revision
             || projection.project_policy_revision != policy.projection_revision
             || projection.application_policy_revision != application.projection_revision
+            || projection
+                .source_base_profile_digest
+                .as_deref()
+                .is_none_or(|digest| !bool::from(digest.ct_eq(user.base_profile_digest.as_slice())))
             || projection.document != projection_document
             || projection_document != command.preparation.projection_document
             || !bool::from(
@@ -2036,7 +2084,7 @@ async fn lock_identity_namespace(
 )]
 async fn rotate_or_create_browser_session(
     transaction: &sea_orm::DatabaseTransaction,
-    command: &CompleteProviderCallback,
+    command: &CompleteAuthenticatedIdentity,
     login: &login_transaction::Model,
     user: &project_user::Model,
 ) -> Result<project_browser_session::Model, ApplicationError> {
@@ -2291,58 +2339,7 @@ async fn fan_out_user_projections(
     user: &project_user::Model,
     now: OffsetDateTime,
 ) -> Result<(), ApplicationError> {
-    let policy = project_policy::Entity::find_by_id(user.project_id)
-        .lock_shared()
-        .one(transaction)
-        .await
-        .map_err(persistence)?
-        .ok_or(ApplicationError::Integrity)?;
-    let bindings = application_user_binding::Entity::find()
-        .filter(application_user_binding::Column::ProjectId.eq(user.project_id))
-        .filter(application_user_binding::Column::UserId.eq(user.id))
-        .filter(application_user_binding::Column::Status.eq("active"))
-        .order_by_asc(application_user_binding::Column::ApplicationId)
-        .limit((MAX_APPLICATION_BINDINGS_PER_USER + 1) as u64)
-        .lock_exclusive()
-        .all(transaction)
-        .await
-        .map_err(persistence)?;
-    if bindings.len() > MAX_APPLICATION_BINDINGS_PER_USER {
-        return Err(ApplicationError::Integrity);
-    }
-    for binding in bindings {
-        let application = application::Entity::find_by_id(binding.application_id)
-            .filter(application::Column::ProjectId.eq(user.project_id))
-            .lock_shared()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let projection = application_user_projection::Entity::find()
-            .filter(application_user_projection::Column::ProjectId.eq(user.project_id))
-            .filter(application_user_projection::Column::BindingId.eq(binding.id))
-            .lock_exclusive()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let (revision, document, digest) = authoritative_projection_material(
-            Some(&projection),
-            user,
-            policy.projection_revision,
-            application.projection_revision,
-        )?;
-        let mut active = projection.into_active_model();
-        active.projection_revision = Set(revision);
-        active.source_user_revision = Set(user.user_revision);
-        active.project_policy_revision = Set(policy.projection_revision);
-        active.application_policy_revision = Set(application.projection_revision);
-        active.canonical_digest = Set(digest);
-        active.document = Set(document);
-        active.updated_at = Set(now);
-        active.update(transaction).await.map_err(persistence)?;
-    }
-    Ok(())
+    super::projection::fan_out_user_projections(transaction, user, now).await
 }
 
 struct SigningSnapshot {
@@ -2404,40 +2401,10 @@ fn access_token_lifetime(policy: &project_policy::Model) -> Result<i64, Applicat
 fn base_profile_digest(
     display_name: Option<&str>,
     picture_url: Option<&str>,
+    locale: Option<&str>,
+    verified_email: Option<&str>,
 ) -> Result<Vec<u8>, ApplicationError> {
-    let canonical = serde_json::to_vec(&json!({
-        "display_name": display_name,
-        "picture_url": picture_url,
-    }))
-    .map_err(|_| ApplicationError::Integrity)?;
-    Ok(Sha256::digest(canonical).to_vec())
-}
-
-fn projection_material(
-    user: &project_user::Model,
-    projection_revision: i64,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
-) -> Result<(Value, Vec<u8>), ApplicationError> {
-    if projection_revision <= 0
-        || project_projection_revision <= 0
-        || application_projection_revision <= 0
-    {
-        return Err(ApplicationError::Integrity);
-    }
-    let document = json!({
-        "display_name": user.display_name,
-        "picture_url": user.picture_url,
-        "projection_revision": projection_revision,
-        "projection_schema": USER_PROJECTION_SCHEMA_V1,
-        "status": user.status,
-        "user_id": user.public_id,
-        "user_revision": user.user_revision,
-        "created_at": user.created_at.format(&Rfc3339).map_err(|_| ApplicationError::Integrity)?,
-        "updated_at": user.updated_at.format(&Rfc3339).map_err(|_| ApplicationError::Integrity)?,
-    });
-    let canonical = serde_json::to_vec(&document).map_err(|_| ApplicationError::Integrity)?;
-    Ok((document, Sha256::digest(canonical).to_vec()))
+    super::projection::base_profile_digest(display_name, picture_url, locale, verified_email)
 }
 
 fn authoritative_projection_material(
@@ -2446,49 +2413,13 @@ fn authoritative_projection_material(
     project_projection_revision: i64,
     application_projection_revision: i64,
 ) -> Result<(i64, Value, Vec<u8>), ApplicationError> {
-    let Some(existing) = projection else {
-        let (document, digest) = projection_material(
-            user,
-            1,
-            project_projection_revision,
-            application_projection_revision,
-        )?;
-        return Ok((1, document, digest));
-    };
-    let (current_document, current_digest) = projection_material(
+    let material = super::projection::authoritative_projection_material(
+        projection,
         user,
-        existing.projection_revision,
         project_projection_revision,
         application_projection_revision,
     )?;
-    if existing.source_user_revision == user.user_revision
-        && existing.project_policy_revision == project_projection_revision
-        && existing.application_policy_revision == application_projection_revision
-        && existing.document == current_document
-        && bool::from(
-            existing
-                .canonical_digest
-                .as_slice()
-                .ct_eq(current_digest.as_slice()),
-        )
-    {
-        return Ok((
-            existing.projection_revision,
-            current_document,
-            current_digest,
-        ));
-    }
-    let revision = existing
-        .projection_revision
-        .checked_add(1)
-        .ok_or(ApplicationError::Integrity)?;
-    let (document, digest) = projection_material(
-        user,
-        revision,
-        project_projection_revision,
-        application_projection_revision,
-    )?;
-    Ok((revision, document, digest))
+    Ok((material.revision, material.document, material.digest))
 }
 
 async fn lock_signing_epoch(

@@ -3,7 +3,9 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::domain::{ProfileDisplayName, ProfilePictureUrl, ProviderIssuer, ProviderSubject};
+use crate::domain::{
+    ProfileDisplayName, ProfileLocale, ProfilePictureUrl, ProviderIssuer, ProviderSubject,
+};
 
 use super::{ApplicationError, ProtectedValue, VersionedDigest};
 
@@ -13,14 +15,20 @@ pub(crate) struct VerifiedProviderIdentity {
     pub subject: ProviderSubject,
     pub display_name: Option<ProfileDisplayName>,
     pub picture_url: Option<ProfilePictureUrl>,
+    pub locale: Option<ProfileLocale>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CompleteProviderCallback {
+pub(crate) enum AuthenticatedIdentityEvidence {
+    Provider(VerifiedProviderIdentity),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompleteAuthenticatedIdentity {
     pub project_id: Uuid,
     pub transaction_id: Uuid,
     pub expected_transaction_revision: i64,
-    pub identity: VerifiedProviderIdentity,
+    pub evidence: AuthenticatedIdentityEvidence,
     pub new_user_id: Uuid,
     pub new_user_public_id: String,
     pub new_identity_id: Uuid,
@@ -252,9 +260,9 @@ pub(crate) struct BrowserLogoutRecord {
 
 #[async_trait]
 pub(crate) trait SessionAuthorityRepository: Send + Sync {
-    async fn complete_provider_callback(
+    async fn complete_authenticated_identity(
         &self,
-        command: CompleteProviderCallback,
+        command: CompleteAuthenticatedIdentity,
     ) -> Result<IssuedHandoff, ApplicationError>;
 
     async fn confirm_browser_session_reuse(

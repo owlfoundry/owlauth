@@ -29,8 +29,9 @@ pub(crate) use application::{ApplicationStatus, ApplicationType, BrowserOrigin, 
     reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 pub(crate) use identity::{
-    ProfileDisplayName, ProfilePictureUrl, ProjectUserStatus, ProviderIssuer, ProviderSubject,
-    UserRevision,
+    BoundedProviderProfile, IdentitySourceKind, LocalProfileField, MaterializedUserProfile,
+    ProfileDisplayName, ProfileLocale, ProfilePictureUrl, ProjectUserStatus, ProviderIssuer,
+    ProviderSubject, UserProfileInputs, UserRevision,
 };
 pub(crate) use key::SigningKeyState;
 #[allow(

@@ -67,11 +67,11 @@ pub(crate) use runtime_security::{
     reason = "the HTTP-free session authority precedes Runtime composition"
 )]
 pub(crate) use session_authority::{
-    BindBrowserLogout, BrowserLogoutRecord, CommitHandoffExchange, CompleteProviderCallback,
-    ConfirmBrowserLogout, ConfirmBrowserSessionReuse, HandoffPreparation, HandoffSessionRecord,
-    IssuedHandoff, LogoutApplicationSession, PrepareBrowserLogout, PrepareHandoffExchange,
-    PrepareRefreshRotation, RecoverProviderExchanges, RefreshPreparation, RefreshPreparationResult,
-    RefreshRotationResult, RotateRefreshToken, SessionAuthorityRepository,
-    VerifiedProviderIdentity,
+    AuthenticatedIdentityEvidence, BindBrowserLogout, BrowserLogoutRecord, CommitHandoffExchange,
+    CompleteAuthenticatedIdentity, ConfirmBrowserLogout, ConfirmBrowserSessionReuse,
+    HandoffPreparation, HandoffSessionRecord, IssuedHandoff, LogoutApplicationSession,
+    PrepareBrowserLogout, PrepareHandoffExchange, PrepareRefreshRotation, RecoverProviderExchanges,
+    RefreshPreparation, RefreshPreparationResult, RefreshRotationResult, RotateRefreshToken,
+    SessionAuthorityRepository, VerifiedProviderIdentity,
 };
 pub(crate) use unit_of_work::{CompleteIdempotency, NewProject, ProjectUnitOfWork};

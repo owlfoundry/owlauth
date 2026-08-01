@@ -6,6 +6,9 @@ mod audit;
 pub(crate) mod authentication;
 pub(crate) mod control_lifecycle;
 pub(crate) mod entity;
+#[cfg(test)]
+mod identity_projection_migration_tests;
+mod projection;
 pub(crate) mod provisioning;
 pub(crate) mod readiness;
 pub(crate) mod runtime_authority;
