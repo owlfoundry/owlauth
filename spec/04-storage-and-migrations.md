@@ -130,6 +130,7 @@ erDiagram
         enum status
         jsonb profile_attributes
         bigint security_revision
+        bigint user_revision
         timestamptz created_at
         timestamptz updated_at
     }
@@ -141,6 +142,7 @@ erDiagram
         text provider_issuer
         text provider_subject
         jsonb profile_attributes
+        bigint identity_revision
         timestamptz linked_at
     }
     LOGIN_TRANSACTIONS {
@@ -291,6 +293,9 @@ erDiagram
         uuid project_id FK
         text request_digest
         uuid result_resource_id
+        text purpose_bound_result_ciphertext
+        integer result_protector_key_version
+        timestamptz result_erase_at
         timestamptz expires_at
     }
     MCP_CONFIRMATION_CAPABILITIES {
@@ -327,7 +332,15 @@ erDiagram
     PROJECT_USERS ||--o{ EMAIL_IDENTITIES : proves
     EMAIL_IDENTITIES ||--|{ EMAIL_IDENTITY_LOOKUPS : indexes
     LINKED_IDENTITIES ||--o| MANAGED_PROVIDER_CONNECTIONS : manages
+    MANAGED_PROVIDER_CONNECTIONS ||--|{ MANAGED_PROVIDER_CREDENTIALS : versions
     MANAGED_PROVIDER_CONNECTIONS ||--o{ MANAGED_CREDENTIAL_RENEWALS : fences
+    PROJECTS ||--o{ MANAGED_REAUTHORIZATION_INTERACTIONS : owns
+    PROJECT_USERS ||--o{ MANAGED_REAUTHORIZATION_INTERACTIONS : reauthorizes
+    LINKED_IDENTITIES ||--o{ MANAGED_REAUTHORIZATION_INTERACTIONS : proves
+    MANAGED_PROVIDER_CONNECTIONS ||--o{ MANAGED_REAUTHORIZATION_INTERACTIONS : replaces
+    APPLICATIONS ||--o{ MANAGED_REAUTHORIZATION_INTERACTIONS : authorizes
+    PROVIDER_CONFIGURATIONS ||--o{ MANAGED_REAUTHORIZATION_INTERACTIONS : exchanges
+    CONTROL_IDEMPOTENCY_RECORDS ||--o| MANAGED_REAUTHORIZATION_INTERACTIONS : creates_or_replays
     PROJECTS ||--o{ IDENTITY_MUTATION_INTENTS : owns
     IDENTITY_MUTATION_INTENTS ||--|{ IDENTITY_MUTATION_PROOF_SLOTS : requires
     APPLICATIONS ||--o{ IDENTITY_MUTATION_PROOF_SLOTS : authorizes
@@ -373,24 +386,74 @@ erDiagram
         uuid linked_identity_id FK
         uuid provider_configuration_id FK
         enum state
+        bigint revision
         bigint generation
-        integer credential_aead_key_version
-        text credential_ciphertext
+        bigint credential_generation
         jsonb bounded_source_profile
         text source_profile_digest
         timestamptz next_sync_at
         timestamptz lease_expires_at
     }
+    MANAGED_PROVIDER_CREDENTIALS {
+        uuid project_id FK
+        uuid managed_connection_id FK
+        bigint connection_generation
+        bigint credential_generation
+        integer credential_aead_key_version
+        text credential_ciphertext
+        timestamptz superseded_at
+        timestamptz destroyed_at
+    }
     MANAGED_CREDENTIAL_RENEWALS {
         uuid id PK
         uuid project_id FK
         uuid managed_connection_id FK
-        bigint expected_generation
-        bigint successor_generation
+        bigint expected_connection_generation
+        bigint expected_credential_generation
+        bigint successor_connection_generation
+        bigint successor_credential_generation
         text adapter_attempt_id
         enum status
         timestamptz submitted_at
         timestamptz lease_expires_at
+    }
+    MANAGED_REAUTHORIZATION_INTERACTIONS {
+        uuid id PK
+        uuid project_id FK
+        uuid user_id FK
+        uuid linked_identity_id FK
+        uuid managed_connection_id FK
+        uuid application_id FK
+        uuid provider_configuration_id FK
+        bigint expected_connection_generation
+        bigint expected_credential_generation
+        bigint expected_connection_revision
+        bigint expected_user_revision
+        bigint expected_project_security_revision
+        bigint expected_user_security_revision
+        bigint expected_identity_revision
+        bigint expected_application_security_revision
+        bigint provider_revision
+        bigint assignment_revision
+        bigint capability_revision
+        text callback_uri
+        jsonb managed_scopes
+        boolean provider_pkce_required
+        bigint interaction_revision
+        enum status
+        text hosted_handle_digest
+        integer hosted_handle_digest_key_version
+        text upstream_state_digest
+        integer upstream_state_digest_key_version
+        text browser_binding_digest
+        integer browser_binding_digest_key_version
+        text csrf_digest
+        integer csrf_digest_key_version
+        text pkce_verifier_ciphertext
+        integer pkce_protector_key_version
+        text oidc_nonce_digest
+        integer oidc_nonce_digest_key_version
+        timestamptz expires_at
     }
     IDENTITY_MUTATION_INTENTS {
         uuid id PK
@@ -569,7 +632,7 @@ erDiagram
     }
 ```
 
-`project_users` additionally carries monotonic `user_revision`, a canonical materialized-base-profile digest, and an optional same-user designated primary profile identity reference/discriminator that names one exact provider or email identity rather than only an identity kind. The Project email-auth policy—not a possibly absent SMTP configuration row—stores explicit deployment-default opt-in. Nullable SMTP relationships are constrained by `smtp_selection_kind`: Project selection requires the same-Project configuration ID/generation/revision and no default generation; deployment-default selection requires no Project configuration ID and an existing deployment registry generation/revision. `projection_expansion_operations.application_id` is null only for a Project-wide projection-policy revision and otherwise identifies one same-Project Application. A new `login_transaction` is `awaiting_browser_binding` with no selected provider/method or browser/CSRF binding: it snapshots admitted methods and revisions, the first eligible top-level Hosted GET conditionally binds one browser and advances to `awaiting_method_selection`, then one CSRF/browser-bound expected-revision command selects provider or email. `provider_configuration_id` and upstream fields are null unless provider is selected. Credential/payload columns are purpose-bound versioned ciphertext or opaque secret references according to spec 11; specifically, v1 managed renewable credentials are PostgreSQL AEAD ciphertext so replacement is one authoritative database transition, while provider/SMTP/webhook configuration secrets remain opaque external references.
+`project_users` additionally carries monotonic `user_revision`, a canonical materialized-base-profile digest, and an optional same-user designated primary profile identity reference/discriminator that names one exact provider or email identity rather than only an identity kind. The Project email-auth policy—not a possibly absent SMTP configuration row—stores explicit deployment-default opt-in. Nullable SMTP relationships are constrained by `smtp_selection_kind`: Project selection requires the same-Project configuration ID/generation/revision and no default generation; deployment-default selection requires no Project configuration ID and an existing deployment registry generation/revision. `projection_expansion_operations.application_id` is null only for a Project-wide projection-policy revision and otherwise identifies one same-Project Application. A new `login_transaction` is `awaiting_browser_binding` with no selected provider/method or browser/CSRF binding: it snapshots admitted methods and revisions, the first eligible top-level Hosted GET conditionally binds one browser and advances to `awaiting_method_selection`, then one CSRF/browser-bound expected-revision command selects provider or email. `provider_configuration_id` and upstream fields are null unless provider is selected. A managed connection has distinct monotonic counters: `generation` fences connection lifecycle and remote work, while `credential_generation` names the current versioned renewable ciphertext. Credential replacement advances both; a destructive lifecycle transition may advance the connection fence while destroying the current credential without inventing a ciphertext successor. Managed reauthorization and renewal therefore capture both expected generations and both successor generations where a successor exists. Credential/payload columns are purpose-bound versioned ciphertext or opaque secret references according to spec 11; specifically, v1 managed renewable credentials are PostgreSQL AEAD ciphertext so replacement is one authoritative database transition, while provider/SMTP/webhook configuration secrets remain opaque external references.
 
 ## Project isolation constraints
 
@@ -616,8 +679,9 @@ erDiagram
 ### Managed connections, email, and delivery state
 
 - A linked provider identity has at most one managed connection. `(project_id, linked_identity_id)` is unique; generation and state guards reject sync output prepared before credential replacement, reauthorization, unlink, disconnect, provider disablement, or user disablement.
-- V1 recoverable provider credentials are versioned AEAD ciphertext in PostgreSQL and bind deployment/Project/provider/identity/connection generation/purpose as authenticated context. Every replacement advances generation and makes its predecessor inaccessible in the same commit. Redis, external generic secret storage, and ordinary profile JSON never contain them. Disconnect/unlink atomically advances/terminalizes the generation and destroys access to active ciphertext.
-- A credential renewal creates a durable operation under the expected connection generation. Its states are `prepared`, `submitted`, `successor_committed`, `reauth_required`, and `abandoned`. `submitted` commits before external invocation; a crash while only `prepared` may be reclaimed, but any non-idempotent lost/ambiguous outcome or lease loss after `submitted` cannot reuse the predecessor. The guarded resolution advances generation and moves the connection to `reauth_required`. An adapter-declared idempotent replay reuses the same operation/attempt ID. A received successor ciphertext commits before an optional profile fetch.
+- V1 recoverable provider credentials are versioned AEAD ciphertext in PostgreSQL and bind deployment/Project/provider/identity/connection generation/credential generation/purpose as authenticated context. Every replacement advances both generations and makes its predecessor inaccessible in the same commit. Redis, external generic secret storage, and ordinary profile JSON never contain them. Disconnect/unlink atomically advances/terminalizes the connection generation and destroys access to active ciphertext without inventing a credential successor.
+- A credential renewal creates a durable operation under the expected connection and credential generations. Its states are `prepared`, `submitted`, `successor_committed`, `reauth_required`, and `abandoned`. `submitted` commits before external invocation; a crash while only `prepared` may be reclaimed, but any non-idempotent lost/ambiguous outcome or lease loss after `submitted` cannot reuse the predecessor. The guarded resolution advances the connection fence, destroys predecessor accessibility, and moves the connection to `reauth_required`. An adapter-declared idempotent replay reuses the same operation/attempt ID. Received successor connection and credential generations commit before an optional profile fetch.
+- `managed_reauthorization_interactions` is a third typed callback owner distinct from login and identity mutation. It stores the exact same-Project connection/user/provider identity row, expected connection/credential generations, connection revision, and relevant user/identity/provider/assignment authority revisions, one exact active Application/provider assignment and managed-capability revision, callback/scope/PKCE-requirement snapshot, purpose-keyed Hosted/browser/CSRF material, and monotonic interaction revision, exact status, ten-minute expiry, and terminal timestamps. Upstream-state digest, conditional PKCE verifier ciphertext, and mandatory OIDC nonce digest/version are null before fixed-provider start; that one CAS generates and stores them while returning the redirect, after which they are immutable. Its opaque Hosted target is retained only in purpose-bound Control idempotency result ciphertext through expiry for identical lost-response replay; later reads never return it. Exact composite FKs and XOR/class constraints prevent a login, mutation slot, or another connection from owning its state.
 - Email identities carry one or more versioned lookup aliases. `(project_id, canonicalization_version, digest_key_version, lookup_digest)` is unique, rotation backfills and checks the new alias before write cutover, and create/lookup checks every accepted version under the same email-namespace serialization rule. Recoverable email is encrypted/protected separately and is never the linking key for a provider identity.
 - Email challenge families identify one typed owner through an XOR constraint: `owner_kind = login` requires one same-Project login transaction and null mutation references; `owner_kind = identity_mutation` requires one same-Project `(intent_id, proof_slot_id)` and null login reference. Both permit only the newest pending generation and may own separate OTP and magic-link proof rows. Proof digests, OTP attempt increments, expiry, and parent `consumed_at` are authoritative; exactly one conditional parent transition invalidates sibling proofs. Login ownership may create the user/browser-session/handoff result; mutation ownership can create only immutable candidate/existing-identity evidence, one slot receipt, and an intent revision/readiness transition.
 - Email challenge creation and its mail-outbox item commit together. Both rows immutably pin Project-versus-deployment-default selection, nullable Project SMTP configuration ID, and exact generation plus security-eligibility revision; `message_id` is stable across retries and encrypted payload retention is bounded. `(project_id, generation)` is unique for Project SMTP history; Project email-auth policy owns explicit deployment-default opt-in. Deployment-default generations have a deployment-scoped PostgreSQL status/revision registry whose safe fingerprint must match process configuration; no SMTP secret bytes enter it. Replacement never retargets existing rows.
@@ -679,10 +743,14 @@ erDiagram
 | Operation | Rows/aggregates serialized together | Commit invariant |
 | --- | --- | --- |
 | Bind Hosted browser | Project/login transaction revision and allowed-method snapshot, fresh browser credential digest and CSRF state | one eligible top-level Hosted GET moves `awaiting_browser_binding` to `awaiting_method_selection`; another browser cannot rebind it |
+| Create managed reauthorization | Control idempotency record and purpose-bound create-result ciphertext, exact Project/user/identity/managed connection plus connection/credential generations and revisions, current Application/provider assignment plus capability/revisions, fixed callback/scopes and PKCE/OIDC requirements, fresh Hosted handle, audit | one identical deployment-operator request creates or replays one ten-minute `awaiting_browser_binding` interaction and raw Hosted target through expiry; provider authorization values remain null until fixed-provider start, a request-digest mismatch conflicts, and no ordinary login is created |
+| Bind managed-reauthorization browser | exact interaction revision/status/expiry and frozen authority, fresh browser credential digest and CSRF state | one eligible top-level Hosted GET moves `awaiting_browser_binding` to `awaiting_provider_start`; another browser cannot rebind or inspect it |
+| Start managed reauthorization | exact interaction revision in `awaiting_provider_start`, matching browser/CSRF, current Project/user/identity/connection and credential generations, provider/Application assignment and capability revisions, stored callback/scope/PKCE/OIDC requirements | one same-origin CAS generates and stores fresh upstream-state digest, conditional PKCE verifier ciphertext, and mandatory OIDC nonce digest, moves to `provider_authorization_started`, and immediately returns only the fixed provider redirect carrying those exact generated values; later requests cannot regenerate them and no authority or proof value is caller-selected |
+| Cancel or expire managed reauthorization | exact interaction revision/status/deadline, Control idempotency when operator-cancelled, purpose-bound target/result material, audit where required | a pending interaction becomes terminal exactly once, its raw-target replay material is erased by the bounded deadline, and it cannot reopen or affect the managed connection |
 | Select login method | Project/login transaction revision and allowed-method snapshot, current Application method/provider assignment revision, browser/CSRF binding; exact callback/upstream-state/provider-PKCE/OIDC-nonce facts for OIDC | exactly one assigned current provider/email method moves `awaiting_method_selection` to its first method-specific state; method cannot be switched |
 | Confirm browser-session reuse | Project/login transaction revision, exact Application/redirect/PKCE, current Project user and browser-session status/security/auth-age/reuse-policy revisions, monotonic activity/idle-expiry update clamped to absolute expiry, browser/CSRF binding, handoff, audit | one eligible same-Project browser session moves `awaiting_method_selection` directly to `handoff_issued`; concurrent reuse/method selection loses and no caller-selected identity is accepted |
-| Claim provider callback | upstream state resolves exactly one typed owner: Project/provider-selected login transaction or exact identity-mutation intent/slot; captured provider/Application-assignment revisions and owner state | before provider I/O, exactly one callback compare-and-swaps its typed owner from `provider_authorization_started` to `provider_exchange_in_progress`; class, Project, callback, conditional provider-PKCE, and OIDC nonce facts cannot be substituted; no fallback or automatic retry after ambiguous exchange |
-| Complete provider callback | typed claimed login-or-mutation owner, exact adapter-validated issuer/subject plus provider-profile-required proof including mandatory nonce for OIDC, and captured provider/Application-assignment revisions plus owner-specific rows | identity proof resolves only after every reviewed provider-profile check and within one Project; login may commit linked identity, optional protected managed successor, Project user/browser session/handoff; mutation may commit only immutable candidate/existing-identity evidence and one intent-slot receipt, never managed credential, user/session/handoff, or ownership mutation; failure cannot fall back across interaction classes |
+| Claim provider callback | upstream state resolves exactly one typed owner: Project/provider-selected login transaction, exact identity-mutation intent/slot, or exact managed-reauthorization interaction; captured provider/Application-assignment revisions and owner state | before provider I/O, exactly one callback compare-and-swaps its typed owner from `provider_authorization_started` to `provider_exchange_in_progress`; class, Project, callback, conditional provider-PKCE, OIDC nonce, proof slot, and managed connection facts cannot be substituted; a losing duplicate is read-only and cannot terminalize the winner; no fallback or automatic retry after ambiguous exchange |
+| Complete provider callback | typed claimed login/mutation/managed-reauthorization owner, exact adapter-validated issuer/subject plus provider-profile-required proof including mandatory nonce for OIDC, and captured provider/Application-assignment revisions plus owner-specific rows | identity proof resolves only after every reviewed provider-profile check and within one Project; login may commit linked identity, optional protected managed successor, Project user/browser session/handoff; mutation may commit only immutable candidate/existing-identity evidence and one intent-slot receipt, never managed credential, user/session/handoff, or ownership mutation; managed reauthorization requires the frozen existing identity plus exact managed scopes/renewable successor and first commits only the generation-fenced connection/credential successor, `active` state, interaction completion, and audit; failure cannot fall back across classes |
 | Exchange handoff | ticket, Project/Application/user/projection-policy revisions, provider assignment when applicable, Application-user binding/materialized projection, optional eligible initial event/targets, Application session, refresh family/token, signing epoch, audit | one successful consumer; binding/projection exists from first handoff; session and projection commit together |
 | Rotate refresh token | family, Application session, referenced browser session, presented/successor token, Project/Application/user/policy revisions, signing epoch, audit | at most one successor; terminated browser session denies refresh; detected reuse revokes family |
 | Application logout/revoke | verified Project access-token claims, selected Application session/family and audit | direct idempotent revocation affects only the exact Application session; selected credentials cannot become active again |
@@ -699,8 +767,8 @@ erDiagram
 | Begin email challenge | typed email-selected owner: login transaction/revision or exact identity-mutation intent/slot/revision; current captured Application email assignment/policy, browser/CSRF binding, newest challenge/proofs, pinned SMTP selection/configuration/generation/eligibility revision, mail outbox | one generic accepted command compare-and-swaps only its typed owner and commits newest proof plus exact delivery generation/revision together or neither; mutation ownership cannot borrow login redirect/PKCE/handoff authority |
 | Disable/compromise SMTP generation | exact Project SMTP configuration or deployment-default registry generation status/eligibility revision, audit | after commit every mail claim and proof completion pinned to the prior revision fails closed; bounded cleanup may follow |
 | Complete email challenge | typed login-or-mutation owner, newest challenge generation, pinned SMTP selection/configuration/generation plus current eligibility status/revision, and owner-specific rows | only a still-eligible exact SMTP generation can back one newest proof; login resolves one Project user/browser session/handoff without email-based provider linking and waits for handoff exchange to bind the Application; mutation stores only exact candidate/existing-identity evidence and one intent-slot receipt, never a user/session/handoff or ownership change |
-| Resolve managed credential renewal | durable renewal operation, expected managed-connection generation/state, successor AEAD ciphertext or destructive reauth transition, audit where required | successor generation commits before optional profile fetch; ambiguous non-replayable submission cannot reuse predecessor |
-| Commit provider profile sync | current managed connection generation, provider/user revisions, source profile, user revision, bound Application projections/installed-contract events, audit where required | stale remote output cannot overwrite a newer credential/identity/user state |
+| Resolve managed credential renewal | durable renewal operation, expected connection/credential generations and state, successor generations plus AEAD ciphertext or destructive reauth transition, audit where required | both successor generations commit before optional profile fetch; destructive resolution advances the connection fence and removes credential accessibility without inventing a successor; ambiguous non-replayable submission cannot reuse the predecessor |
+| Commit provider profile sync | current managed connection generation, provider/user revisions, source profile, user revision, bound Application projections/installed-contract events, audit where required | optional provider I/O occurs only after any successor commit; already validated callback claims may avoid another provider call, but every result uses this separate guarded transaction and stale remote output cannot overwrite a newer credential/identity/user state |
 | Materialize user projection change | Project user/base revision, bounded affected binding projection/policy revisions, immutable events/deliveries, audit | every targeted Application sees one immutable snapshot for its committed monotonic projection revision |
 | Change projection policy | Project/Application policy revision, durable expansion operation, Control idempotency, audit | new Runtime reads cannot return the old policy and webhook convergence has one resumable bounded cursor |
 | Expand projection policy | claimed expansion cursor, one bounded binding batch, projection revisions, immutable events/deliveries | each binding advances atomically at most once for the target policy revision; crash resumes after committed cursor |
