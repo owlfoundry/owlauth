@@ -1,7 +1,14 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
+
+fn deserialize_required_nullable<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
 
 macro_rules! secret_string {
     ($name:ident, $label:literal) => {
@@ -40,6 +47,10 @@ pub struct PublicProvider {
 
 /// Public Project/Application login configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the public wire contract exposes orthogonal current capability facts"
+)]
 pub struct PublicConfiguration {
     pub project_public_id: String,
     pub project_display_name: String,
@@ -47,6 +58,9 @@ pub struct PublicConfiguration {
     pub application_display_name: String,
     pub publishable_keys: Vec<String>,
     pub providers: Vec<PublicProvider>,
+    pub email_available: bool,
+    pub email_otp_enabled: bool,
+    pub email_magic_link_enabled: bool,
     pub login_available: bool,
 }
 
@@ -72,13 +86,20 @@ pub struct JwksDocument {
 
 /// Deterministic bounded Application user projection.
 #[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct UserProjection {
     pub user_id: String,
     pub user_revision: i64,
     pub projection_schema: String,
     pub projection_revision: i64,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub display_name: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub picture_url: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub locale: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub verified_email: Option<String>,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,

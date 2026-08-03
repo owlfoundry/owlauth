@@ -148,6 +148,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/applications/{application_id}/email-method": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["assign_email_method"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/disable": {
         parameters: {
             query?: never;
@@ -158,6 +174,86 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["disable_project"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/email-method": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_email_method_policy"];
+        put: operations["update_email_method_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/identity-mutation-intents": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_identity_mutation_intent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/identity-mutation-intents/{intent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_identity_mutation_intent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/identity-mutation-intents/{intent_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_identity_mutation_intent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/identity-mutation-intents/{intent_id}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["confirm_identity_mutation_intent"];
         delete?: never;
         options?: never;
         head?: never;
@@ -324,6 +420,102 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/smtp-configurations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_smtp_configurations"];
+        put?: never;
+        post: operations["create_smtp_configuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["activate_smtp_configuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/compromise": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["compromise_smtp_configuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["disable_smtp_configuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["test_smtp_configuration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/tests/{operation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_smtp_test_operation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/users": {
         parameters: {
             query?: never;
@@ -404,6 +596,134 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/users/{user_id}/identities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_project_user_identities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_managed_provider_connections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/disconnect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["disconnect_managed_provider_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["create_managed_reauthorization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations/{interaction_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_managed_reauthorization"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations/{interaction_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["cancel_managed_reauthorization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["revoke_managed_provider_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/synchronize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["synchronize_managed_provider_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/users/{user_id}/sessions": {
         parameters: {
             query?: never;
@@ -430,6 +750,54 @@ export interface paths {
         get: operations["get_system"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/system/smtp-default-generations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_deployment_smtp_generations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/system/smtp-default-generations/{generation}/compromise": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["compromise_deployment_smtp_generation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/system/smtp-default-generations/{generation}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["disable_deployment_smtp_generation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -497,9 +865,85 @@ export interface components {
             updated_at: string;
             user_id: string;
         };
+        CancelIdentityMutationIntentRequest: {
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        CancelManagedReauthorizationRequest: {
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        ConfirmIdentityMutationIntentRequest: {
+            confirmation: components["schemas"]["LinkIdentityMutationConfirmation"];
+            /** Format: int64 */
+            expected_revision: number;
+            /** @enum {string} */
+            operation_kind: "link";
+        } | {
+            confirmation: components["schemas"]["UnlinkIdentityMutationConfirmation"];
+            /** Format: int64 */
+            expected_revision: number;
+            /** @enum {string} */
+            operation_kind: "unlink";
+        } | {
+            confirmation: components["schemas"]["MergeIdentityMutationConfirmation"];
+            /** Format: int64 */
+            expected_revision: number;
+            /** @enum {string} */
+            operation_kind: "merge";
+        };
         CreateApplicationRequest: {
             application_type: components["schemas"]["ApplicationType"];
             display_name: string;
+        };
+        /**
+         * @description A typed identity mutation plan. Mandatory proof slots and all authority revisions are derived
+         *     by the server; callers can neither provide slots nor override their purposes.
+         */
+        CreateIdentityMutationIntentRequest: {
+            candidate_identity_kind: components["schemas"]["IdentityKind"];
+            candidate_proof_authority: components["schemas"]["IdentityMutationProofAuthority"];
+            destination: components["schemas"]["IdentityMutationUserTarget"];
+            destination_identity: components["schemas"]["ExistingIdentityReference"];
+            destination_proof_authority: components["schemas"]["IdentityMutationProofAuthority"];
+            /** @enum {string} */
+            operation_kind: "link";
+        } | {
+            identity: components["schemas"]["ExistingIdentityReference"];
+            /** @enum {string} */
+            operation_kind: "unlink";
+            owner: components["schemas"]["IdentityMutationUserTarget"];
+            primary_source_disposition: components["schemas"]["UnlinkPrimarySourceDisposition"];
+            proof_authority: components["schemas"]["IdentityMutationProofAuthority"];
+        } | {
+            bindings_disposition: components["schemas"]["MergeBindingsDisposition"];
+            loser: components["schemas"]["IdentityMutationUserTarget"];
+            loser_identity: components["schemas"]["ExistingIdentityReference"];
+            loser_proof_authority: components["schemas"]["IdentityMutationProofAuthority"];
+            /** @enum {string} */
+            operation_kind: "merge";
+            primary_source: components["schemas"]["MergePrimarySource"];
+            sessions_disposition: components["schemas"]["MergeSessionsDisposition"];
+            winner: components["schemas"]["IdentityMutationUserTarget"];
+            winner_identity: components["schemas"]["ExistingIdentityReference"];
+            winner_proof_authority: components["schemas"]["IdentityMutationProofAuthority"];
+        };
+        CreateIdentityMutationIntentResponse: components["schemas"]["IdentityMutationIntent"] & {
+            /** @description Present only on create or identical idempotency replay through effective expiry. */
+            hosted_target?: string | null;
+        };
+        CreateManagedReauthorizationRequest: {
+            application_id: string;
+            /** Format: int64 */
+            expected_connection_generation: number;
+            /** Format: int64 */
+            expected_connection_revision: number;
+            /** Format: int64 */
+            expected_credential_generation: number;
+        };
+        CreateManagedReauthorizationResponse: components["schemas"]["ManagedReauthorization"] & {
+            /** @description Present only on create or identical idempotency replay through expiry. */
+            hosted_target?: string | null;
         };
         CreateProjectRequest: {
             belongs_to?: string | null;
@@ -512,11 +956,88 @@ export interface components {
             /** Format: int64 */
             expected_project_revision: number;
             issuer: string;
+            /** @description Enables only adapter-declared fixed least scopes; callers cannot supply scopes. */
+            managed_profile_enabled?: boolean;
             provider_key: string;
         };
         CreateSigningKeyRequest: {
             /** Format: int64 */
             expected_project_revision: number;
+        };
+        CreateSmtpConfigurationRequest: {
+            credential: string;
+            /** Format: int64 */
+            expected_project_security_revision: number;
+            host: string;
+            /** Format: int32 */
+            port: number;
+            reply_to?: string | null;
+            sender_address: string;
+            sender_name?: string | null;
+            tls_mode: components["schemas"]["SmtpTlsMode"];
+        };
+        DeploymentSmtpGeneration: {
+            explicitly_allowed_private_ips: string[];
+            /** Format: int32 */
+            generation: number;
+            host: string;
+            /** Format: int32 */
+            port: number;
+            retained_until?: string | null;
+            /** Format: int64 */
+            revision: number;
+            safe_fingerprint: string;
+            /** Format: int64 */
+            security_eligibility_revision: number;
+            sender_address: string;
+            status: components["schemas"]["SmtpGenerationStatus"];
+            tls_mode: components["schemas"]["SmtpTlsMode"];
+        };
+        DeploymentSmtpGenerationList: {
+            items: components["schemas"]["DeploymentSmtpGeneration"][];
+        };
+        EmailAssignmentRequest: {
+            enabled: boolean;
+            /** Format: int64 */
+            expected_application_security_revision: number;
+        };
+        EmailMethodPolicy: {
+            allow_deployment_default: boolean;
+            enabled: boolean;
+            magic_link_enabled: boolean;
+            /** Format: int32 */
+            magic_validity_seconds: number;
+            /** Format: int32 */
+            max_generations: number;
+            /** Format: int32 */
+            otp_digits: number;
+            otp_enabled: boolean;
+            /** Format: int32 */
+            otp_max_attempts: number;
+            /** Format: int32 */
+            otp_validity_seconds: number;
+            /** Format: int64 */
+            policy_revision: number;
+            project_id: string;
+            /** Format: int32 */
+            resend_after_seconds: number;
+            /** Format: int64 */
+            security_revision: number;
+            signup_enabled: boolean;
+            transferred_magic_link_enabled: boolean;
+        };
+        ExistingIdentityReference: {
+            /** Format: int64 */
+            expected_identity_revision: number;
+            identity_id: string;
+            /** @enum {string} */
+            identity_kind: "provider";
+        } | {
+            /** Format: int64 */
+            expected_identity_revision: number;
+            identity_id: string;
+            /** @enum {string} */
+            identity_kind: "email";
         };
         ExpectedSecurityRevision: {
             /** Format: int64 */
@@ -536,6 +1057,50 @@ export interface components {
             status: string;
         };
         /** @enum {string} */
+        IdentityKind: "provider" | "email";
+        IdentityMutationIntent: {
+            effective_expires_at: string;
+            id: string;
+            operation_kind: components["schemas"]["IdentityMutationOperationKind"];
+            project_id: string;
+            /** Format: int64 */
+            revision: number;
+            slots: components["schemas"]["IdentityMutationProofSlot"][];
+            status: components["schemas"]["IdentityMutationIntentStatus"];
+        };
+        /** @enum {string} */
+        IdentityMutationIntentStatus: "pending_proof" | "ready" | "completed" | "expired" | "cancelled";
+        /** @enum {string} */
+        IdentityMutationMethodKind: "provider" | "email";
+        /** @enum {string} */
+        IdentityMutationOperationKind: "link" | "unlink" | "merge";
+        IdentityMutationProofAuthority: {
+            application_id: string;
+            /** @enum {string} */
+            method_kind: "provider";
+            provider_id: string;
+        } | {
+            application_id: string;
+            /** @enum {string} */
+            method_kind: "email";
+        };
+        /** @enum {string} */
+        IdentityMutationProofRole: "destination_owner" | "candidate_identity" | "identity_owner" | "winner_owner" | "loser_owner";
+        IdentityMutationProofSlot: {
+            id: string;
+            identity_kind: components["schemas"]["IdentityKind"];
+            method_kind: components["schemas"]["IdentityMutationMethodKind"];
+            proved: boolean;
+            role: components["schemas"]["IdentityMutationProofRole"];
+        };
+        IdentityMutationUserTarget: {
+            /** Format: int64 */
+            expected_user_revision: number;
+            /** Format: int64 */
+            expected_user_security_revision: number;
+            user_id: string;
+        };
+        /** @enum {string} */
         JwkCurve: "Ed25519";
         /** @enum {string} */
         JwkKeyType: "OKP";
@@ -546,7 +1111,80 @@ export interface components {
             expected_ring_revision: number;
         };
         /** @enum {string} */
+        LinkIdentityMutationConfirmation: "link_identity";
+        ManagedProviderConnection: {
+            capability_key: string;
+            /** Format: int32 */
+            consecutive_failures: number;
+            /** Format: int64 */
+            credential_generation: number;
+            /** Format: int64 */
+            generation: number;
+            id: string;
+            identity_id: string;
+            last_safe_outcome: string;
+            last_synchronized_at?: string | null;
+            next_renewal_at?: string | null;
+            next_synchronize_at?: string | null;
+            project_id: string;
+            provider_id: string;
+            reauthorization_application_ids: string[];
+            required_scopes: string[];
+            /** Format: int64 */
+            revision: number;
+            source_schema: string;
+            state: components["schemas"]["ManagedProviderConnectionState"];
+            supports_revocation: boolean;
+            user_id: string;
+        };
+        ManagedProviderConnectionActionRequest: {
+            /** @description Required for destructive disconnect/revoke actions. */
+            confirm?: boolean;
+            /** Format: int64 */
+            expected_generation: number;
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        ManagedProviderConnectionList: {
+            items: components["schemas"]["ManagedProviderConnection"][];
+        };
+        /** @enum {string} */
+        ManagedProviderConnectionState: "active" | "reauth_required" | "revoked" | "disconnected";
+        ManagedReauthorization: {
+            application_id: string;
+            connection_id: string;
+            expires_at: string;
+            id: string;
+            project_id: string;
+            provider_key: string;
+            /** Format: int64 */
+            revision: number;
+            status: components["schemas"]["ManagedReauthorizationStatus"];
+            user_id: string;
+        };
+        /** @enum {string} */
+        ManagedReauthorizationStatus: "awaiting_browser_binding" | "awaiting_provider_start" | "provider_authorization_started" | "provider_exchange_in_progress" | "completed" | "provider_exchange_failed" | "expired" | "cancelled";
+        /** @enum {string} */
         ManagedSessionStatus: "active" | "revoked" | "expired";
+        /** @enum {string} */
+        MergeBindingsDisposition: "winner_preferred";
+        /** @enum {string} */
+        MergeIdentityMutationConfirmation: "merge_users";
+        MergePrimarySource: {
+            /** Format: int64 */
+            expected_identity_revision: number;
+            identity_id: string;
+            /** @enum {string} */
+            identity_kind: "provider";
+        } | {
+            /** Format: int64 */
+            expected_identity_revision: number;
+            identity_id: string;
+            /** @enum {string} */
+            identity_kind: "email";
+        };
+        /** @enum {string} */
+        MergeSessionsDisposition: "loser_revoked";
         ProblemDetails: {
             code: string;
             detail: string;
@@ -596,6 +1234,36 @@ export interface components {
             /** Format: int64 */
             user_revision: number;
         };
+        ProjectUserIdentity: components["schemas"]["ProjectUserIdentityPresentation"] & {
+            created_at: string;
+            id: string;
+            /** Format: int64 */
+            identity_revision: number;
+            is_primary_source: boolean;
+            project_id: string;
+            status: components["schemas"]["ProjectUserIdentityStatus"];
+            updated_at: string;
+            user_id: string;
+            verified_or_observed_at: string;
+        };
+        ProjectUserIdentityList: {
+            items: components["schemas"]["ProjectUserIdentity"][];
+        };
+        /**
+         * @description Safe presentation only. `provider_key` is immutable creation provenance, not current provider
+         *     authority. Email presentation is a fixed marker and never an address or reversible material.
+         */
+        ProjectUserIdentityPresentation: {
+            /** @enum {string} */
+            identity_kind: "provider";
+            provider_key: string;
+        } | {
+            address: components["schemas"]["RedactedEmailMarker"];
+            /** @enum {string} */
+            identity_kind: "email";
+        };
+        /** @enum {string} */
+        ProjectUserIdentityStatus: "active" | "disabled";
         ProjectUserList: {
             items: components["schemas"]["ProjectUser"][];
         };
@@ -604,7 +1272,7 @@ export interface components {
             browser_sessions: components["schemas"]["BrowserSession"][];
         };
         /** @enum {string} */
-        ProjectUserStatus: "active" | "disabled";
+        ProjectUserStatus: "active" | "disabled" | "merged";
         Provider: {
             assigned_application_ids: string[];
             callback_url: string;
@@ -613,6 +1281,7 @@ export interface components {
             id: string;
             issuer: string;
             kind: components["schemas"]["ProviderKind"];
+            managed_profile: components["schemas"]["ProviderManagedProfileCapability"];
             project_id: string;
             provider_key: string;
             /** Format: int64 */
@@ -627,6 +1296,15 @@ export interface components {
         ProviderKind: "oidc";
         ProviderList: {
             items: components["schemas"]["Provider"][];
+        };
+        ProviderManagedProfileCapability: {
+            enabled: boolean;
+            exact_scopes: string[];
+            profile_schema: string;
+            read_retry_safe: boolean;
+            renewal_idempotent_replay: boolean;
+            supported: boolean;
+            supports_revocation: boolean;
         };
         ProviderRevisionRequest: {
             /** Format: int64 */
@@ -651,6 +1329,8 @@ export interface components {
             /** Format: int64 */
             expected_project_revision: number;
         };
+        /** @enum {string} */
+        RedactedEmailMarker: "redacted";
         ReplaceApplicationConfigurationRequest: {
             allowed_origins: string[];
             /** Format: int64 */
@@ -695,6 +1375,46 @@ export interface components {
         };
         /** @enum {string} */
         SigningKeyState: "provisioning" | "published" | "active" | "retiring" | "retired" | "revoked" | "abandoned";
+        SmtpConfiguration: {
+            /** Format: int32 */
+            generation: number;
+            host: string;
+            id: string;
+            /** Format: int32 */
+            port: number;
+            project_id: string;
+            reply_to?: string | null;
+            retained_until?: string | null;
+            /** Format: int64 */
+            revision: number;
+            safe_fingerprint: string;
+            /** Format: int64 */
+            security_eligibility_revision: number;
+            sender_address: string;
+            sender_name?: string | null;
+            status: components["schemas"]["SmtpGenerationStatus"];
+            tls_mode: components["schemas"]["SmtpTlsMode"];
+        };
+        SmtpConfigurationList: {
+            items: components["schemas"]["SmtpConfiguration"][];
+        };
+        /** @enum {string} */
+        SmtpGenerationStatus: "reconciled" | "pending" | "active" | "retained" | "disabled" | "compromised" | "retired";
+        SmtpRevisionRequest: {
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        SmtpTestOperation: {
+            completed_at?: string | null;
+            created_at: string;
+            id: string;
+            outcome?: string | null;
+            project_id: string;
+            smtp_configuration_id: string;
+            status: string;
+        };
+        /** @enum {string} */
+        SmtpTlsMode: "implicit_tls" | "starttls_required";
         /** @description Bounded capabilities returned after Control operator authentication. */
         SystemCapabilities: {
             /** @description Whether end-user federated login, handoff, and session operations are implemented. */
@@ -706,10 +1426,60 @@ export interface components {
             /** @description Whether Project, Application, key, and provider provisioning is implemented. */
             provisioning: boolean;
         };
+        TestSmtpConfigurationRequest: {
+            /** Format: int64 */
+            expected_revision: number;
+            recipient: string;
+        };
+        /** @enum {string} */
+        UnlinkIdentityMutationConfirmation: "unlink_identity";
+        UnlinkPrimarySourceDisposition: {
+            /** @enum {string} */
+            disposition: "preserve";
+        } | {
+            /** @enum {string} */
+            disposition: "clear";
+        } | {
+            /** @enum {string} */
+            disposition: "provider";
+            /** Format: int64 */
+            expected_identity_revision: number;
+            identity_id: string;
+        } | {
+            /** @enum {string} */
+            disposition: "email";
+            /** Format: int64 */
+            expected_identity_revision: number;
+            identity_id: string;
+        };
         UpdateApplicationRequest: {
             display_name: string;
             /** Format: int64 */
             expected_metadata_revision: number;
+        };
+        UpdateEmailMethodPolicyRequest: {
+            allow_deployment_default: boolean;
+            enabled: boolean;
+            /** Format: int64 */
+            expected_policy_revision: number;
+            /** Format: int64 */
+            expected_security_revision: number;
+            magic_link_enabled: boolean;
+            /** Format: int32 */
+            magic_validity_seconds: number;
+            /** Format: int32 */
+            max_generations: number;
+            /** Format: int32 */
+            otp_digits: number;
+            otp_enabled: boolean;
+            /** Format: int32 */
+            otp_max_attempts: number;
+            /** Format: int32 */
+            otp_validity_seconds: number;
+            /** Format: int32 */
+            resend_after_seconds: number;
+            signup_enabled: boolean;
+            transferred_magic_link_enabled: boolean;
         };
         UpdateProjectPolicyRequest: {
             /** Format: int32 */
@@ -1594,6 +2364,87 @@ export interface operations {
             };
         };
     };
+    assign_email_method: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                application_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmailAssignmentRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated Application email assignment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailMethodPolicy"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     disable_project: {
         parameters: {
             query?: never;
@@ -1616,6 +2467,483 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Project"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_email_method_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Passwordless email policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailMethodPolicy"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    update_email_method_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateEmailMethodPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated passwordless email policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailMethodPolicy"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_identity_mutation_intent: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateIdentityMutationIntentRequest"];
+            };
+        };
+        responses: {
+            /** @description Created one typed identity mutation intent */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateIdentityMutationIntentResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_identity_mutation_intent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read safe identity mutation intent readiness */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMutationIntent"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    cancel_identity_mutation_intent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CancelIdentityMutationIntentRequest"];
+            };
+        };
+        responses: {
+            /** @description Cancelled one current identity mutation intent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMutationIntent"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    confirm_identity_mutation_intent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfirmIdentityMutationIntentRequest"];
+            };
+        };
+        responses: {
+            /** @description Confirmed one ready identity mutation intent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMutationIntent"];
                 };
             };
             /** @description Invalid request */
@@ -2796,6 +4124,568 @@ export interface operations {
             };
         };
     };
+    list_smtp_configurations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description SMTP generations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SmtpConfigurationList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_smtp_configuration: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSmtpConfigurationRequest"];
+            };
+        };
+        responses: {
+            /** @description Created pending SMTP generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SmtpConfiguration"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    activate_smtp_configuration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                smtp_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SmtpRevisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Activated SMTP generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SmtpConfiguration"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    compromise_smtp_configuration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                smtp_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SmtpRevisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Marked SMTP generation compromised */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SmtpConfiguration"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    disable_smtp_configuration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                smtp_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SmtpRevisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Disabled SMTP generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SmtpConfiguration"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    test_smtp_configuration: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                project_id: string;
+                smtp_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TestSmtpConfigurationRequest"];
+            };
+        };
+        responses: {
+            /** @description Enqueued bounded SMTP test */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SmtpTestOperation"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_smtp_test_operation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                operation_id: string;
+                project_id: string;
+                smtp_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description SMTP test operation status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SmtpTestOperation"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_project_users: {
         parameters: {
             query?: never;
@@ -3194,6 +5084,652 @@ export interface operations {
             };
         };
     };
+    list_project_user_identities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded safe mixed provider and email identity inventory */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectUserIdentityList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_managed_provider_connections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Safe managed provider connection metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedProviderConnectionList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    disconnect_managed_provider_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManagedProviderConnectionActionRequest"];
+            };
+        };
+        responses: {
+            /** @description Locally disconnected and destroyed renewable credential */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedProviderConnection"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_managed_reauthorization: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                connection_id: string;
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateManagedReauthorizationRequest"];
+            };
+        };
+        responses: {
+            /** @description Created one exact managed reauthorization interaction */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateManagedReauthorizationResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_managed_reauthorization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                interaction_id: string;
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Read bounded managed reauthorization status without Hosted target */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedReauthorization"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    cancel_managed_reauthorization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                interaction_id: string;
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CancelManagedReauthorizationRequest"];
+            };
+        };
+        responses: {
+            /** @description Cancelled one current managed reauthorization interaction */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedReauthorization"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_managed_provider_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManagedProviderConnectionActionRequest"];
+            };
+        };
+        responses: {
+            /** @description Provider revocation when the adapter can prove it */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedProviderConnection"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    synchronize_managed_provider_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+                project_id: string;
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ManagedProviderConnectionActionRequest"];
+            };
+        };
+        responses: {
+            /** @description Scheduled guarded profile synchronization */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ManagedProviderConnection"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_project_user_sessions: {
         parameters: {
             query?: never;
@@ -3295,6 +5831,240 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_deployment_smtp_generations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deployment SMTP generations */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentSmtpGenerationList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    compromise_deployment_smtp_generation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                generation: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SmtpRevisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Compromised deployment SMTP generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentSmtpGeneration"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    disable_deployment_smtp_generation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                generation: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SmtpRevisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Disabled deployment SMTP generation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeploymentSmtpGeneration"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
             };
         };
     };

@@ -42,6 +42,8 @@ let login = client
 // The Application explicitly navigates to login.hosted_url and retains login.pending.
 let credentials = client.complete_login(callback, login.pending).await?;
 let user = client.current_user(credentials.access_token()).await?;
+// Exact `owlauth.user.v1`; None means the Application projection has no admitted value.
+let (_locale, _verified_email) = (&user.projection.locale, &user.projection.verified_email);
 let successor = client.refresh(&credentials).await?;
 client.logout_application(successor.access_token()).await?;
 # let _ = user;

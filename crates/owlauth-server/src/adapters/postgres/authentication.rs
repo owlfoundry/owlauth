@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    IntoActiveModel, QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
 };
 use subtle::ConstantTimeEq;
 
@@ -9,8 +9,8 @@ use crate::{
     application::{
         AdmittedProviderMethod, ApplicationError, AuthenticationRepository, BindHostedBrowser,
         ClaimProviderCallback, ClaimedProviderExchange, CreateLoginTransaction,
-        FailProviderExchange, LoginRevisionSnapshot, LoginTransactionRecord, ProtectedValue,
-        SelectProviderMethod, VersionedDigest,
+        DenyProviderCallback, FailProviderExchange, LoginRevisionSnapshot, LoginTransactionRecord,
+        ProtectedValue, SelectProviderMethod, VersionedDigest,
     },
     domain::LoginTransactionStatus,
 };
@@ -21,16 +21,36 @@ use super::{
         application, application_provider_assignment, application_redirect, login_transaction,
         login_transaction_method, project, project_policy, provider_configuration,
     },
+    runtime_incarnation::RuntimeIncarnationFence,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresAuthenticationRepository {
     database: DatabaseConnection,
+    runtime_incarnation: RuntimeIncarnationFence,
 }
 
 impl PostgresAuthenticationRepository {
+    #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self { database }
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::test_default(),
+        }
+    }
+
+    pub(crate) fn new_with_runtime_identity(
+        database: DatabaseConnection,
+        runtime_process_id: String,
+        runtime_incarnation: uuid::Uuid,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::new(
+                runtime_process_id,
+                runtime_incarnation,
+            ),
+        }
     }
 }
 
@@ -46,6 +66,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
     ) -> Result<LoginTransactionRecord, ApplicationError> {
         validate_login_command(&command)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
 
         let project = project::Entity::find_by_id(command.project_id)
             .lock_shared()
@@ -142,6 +163,77 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
             }
         }
 
+        if let Some(email) = &command.admitted_email {
+            validate_admitted_email(email)?;
+            let current = transaction
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT policy.policy_revision, policy.security_revision, assignment.security_revision AS assignment_security_revision FROM project_email_policies policy JOIN application_email_assignments assignment ON assignment.project_id = policy.project_id WHERE policy.project_id = $1 AND assignment.application_id = $2 AND policy.status = 'enabled' AND assignment.status = 'active' FOR SHARE",
+                    [command.project_id.into(), command.application_id.into()],
+                ))
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::RevisionConflict)?;
+            if current
+                .try_get::<i64>("", "policy_revision")
+                .map_err(persistence)?
+                != email.policy_revision
+                || current
+                    .try_get::<i64>("", "security_revision")
+                    .map_err(persistence)?
+                    != email.security_revision
+                || current
+                    .try_get::<i64>("", "assignment_security_revision")
+                    .map_err(persistence)?
+                    != email.assignment_security_revision
+            {
+                return Err(ApplicationError::RevisionConflict);
+            }
+            let smtp_eligible = if email.smtp_selection_kind == "project" {
+                transaction
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT 1 FROM project_smtp_configurations
+                         WHERE project_id=$1 AND id=$2 AND generation=$3
+                           AND security_eligibility_revision=$4
+                           AND (status='active' OR (status='retained' AND retained_until>$5))
+                         FOR SHARE",
+                        vec![
+                            command.project_id.into(),
+                            email.smtp_configuration_id.into(),
+                            email.smtp_generation.into(),
+                            email.smtp_security_eligibility_revision.into(),
+                            command.created_at.into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(persistence)?
+                    .is_some()
+            } else if email.smtp_selection_kind == "deployment_default" {
+                transaction
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT 1 FROM deployment_smtp_generations
+                         WHERE generation=$1 AND security_eligibility_revision=$2
+                           AND (status='active' OR (status='retained' AND retained_until>$3))
+                         FOR SHARE",
+                        vec![
+                            email.smtp_generation.into(),
+                            email.smtp_security_eligibility_revision.into(),
+                            command.created_at.into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(persistence)?
+                    .is_some()
+            } else {
+                false
+            };
+            if !smtp_eligible {
+                return Err(ApplicationError::Disabled);
+            }
+        }
+
         let model = login_transaction::ActiveModel {
             id: Set(command.id),
             project_id: Set(command.project_id),
@@ -211,6 +303,19 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
             .map_err(persistence)?;
         }
 
+        if let Some(email) = command.admitted_email {
+            transaction.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO login_transaction_methods (project_id, transaction_id, method_key, method_kind, display_name, created_at) VALUES ($1, $2, 'email', 'email', 'Email', $3)",
+                [model.project_id.into(), model.id.into(), command.created_at.into()],
+            )).await.map_err(persistence)?;
+            transaction.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO login_email_method_snapshots (project_id, transaction_id, application_id, method_policy_revision, method_security_revision, assignment_security_revision, otp_enabled, magic_link_enabled, otp_digits, otp_validity_seconds, otp_max_attempts, resend_after_seconds, max_generations, magic_validity_seconds, signup_enabled, transferred_magic_link_enabled, smtp_selection_kind, smtp_configuration_id, smtp_generation, smtp_security_eligibility_revision, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
+                vec![model.project_id.into(), model.id.into(), model.application_id.into(), email.policy_revision.into(), email.security_revision.into(), email.assignment_security_revision.into(), email.otp_enabled.into(), email.magic_link_enabled.into(), email.otp_digits.into(), email.otp_validity_seconds.into(), email.otp_max_attempts.into(), email.resend_after_seconds.into(), email.max_generations.into(), email.magic_validity_seconds.into(), email.signup_enabled.into(), email.transferred_magic_link_enabled.into(), email.smtp_selection_kind.into(), email.smtp_configuration_id.into(), email.smtp_generation.into(), email.smtp_security_eligibility_revision.into(), command.created_at.into()],
+            )).await.map_err(persistence)?;
+        }
+
         append_runtime_audit(
             &transaction,
             model.project_id,
@@ -233,6 +338,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         validate_digest(&command.browser_binding)?;
         validate_digest(&command.csrf)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find()
             .filter(
                 login_transaction::Column::InteractionDigest.eq(command.interaction.value.to_vec()),
@@ -291,6 +397,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         validate_digest(&command.oidc_nonce)?;
         validate_protected(&command.provider_pkce)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -364,6 +471,21 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         active.assignment_security_revision = Set(method.assignment_security_revision);
         active.updated_at = Set(command.now);
         let updated = active.update(&transaction).await.map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO provider_callback_owners
+                    (state_id, project_id, provider_configuration_id, owner_kind,
+                     login_transaction_id)
+                 VALUES ($1, $2, $3, 'login', $1)",
+                [
+                    updated.id.into(),
+                    updated.project_id.into(),
+                    command.provider_id.into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?;
         append_runtime_audit(
             &transaction,
             updated.project_id,
@@ -403,7 +525,8 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
             .ok_or(ApplicationError::NotFound)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        let model = login_transaction::Entity::find()
+        self.runtime_incarnation.lock(&transaction).await?;
+        let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(project.id))
             .filter(login_transaction::Column::ProviderConfigurationId.eq(provider.id))
             .filter(
@@ -431,6 +554,23 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         ) {
             return Err(ApplicationError::NotFound);
         }
+        let oidc_nonce_key_version = model
+            .oidc_nonce_digest_key_version
+            .ok_or(ApplicationError::Integrity)?;
+        let provider_pkce_key_version = model
+            .provider_pkce_key_version
+            .ok_or(ApplicationError::Integrity)?;
+        if !command
+            .readable_key_versions
+            .contains(&oidc_nonce_key_version)
+            || !command
+                .readable_key_versions
+                .contains(&provider_pkce_key_version)
+        {
+            // The immutable Runtime key ring cannot finish this exchange. Roll back without
+            // status, revision, or audit mutation; bounded restoration cleanup owns terminality.
+            return Err(ApplicationError::Integrity);
+        }
         let mut status = parse_login_status(&model.status)?;
         status
             .claim_provider_callback()
@@ -453,18 +593,14 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
             .ok_or(ApplicationError::Integrity)?;
         let oidc_nonce = VersionedDigest {
             value: digest_array(model.oidc_nonce_digest.as_deref())?,
-            key_version: model
-                .oidc_nonce_digest_key_version
-                .ok_or(ApplicationError::Integrity)?,
+            key_version: oidc_nonce_key_version,
         };
         let provider_pkce = ProtectedValue {
             ciphertext: model
                 .provider_pkce_ciphertext
                 .clone()
                 .ok_or(ApplicationError::Integrity)?,
-            key_version: model
-                .provider_pkce_key_version
-                .ok_or(ApplicationError::Integrity)?,
+            key_version: provider_pkce_key_version,
         };
         let next_revision = model.transaction_revision + 1;
         let mut active = model.into_active_model();
@@ -492,11 +628,124 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         })
     }
 
+    async fn deny_provider_callback(
+        &self,
+        command: DenyProviderCallback,
+    ) -> Result<LoginTransactionRecord, ApplicationError> {
+        validate_digest(&command.upstream_state)?;
+        validate_digest(&command.browser_binding)?;
+        if command.safe_outcome.is_empty() || command.safe_outcome.len() > 64 {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let project = project::Entity::find()
+            .filter(project::Column::PublicId.eq(command.project_public_id))
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        let provider = provider_configuration::Entity::find()
+            .filter(provider_configuration::Column::ProjectId.eq(project.id))
+            .filter(provider_configuration::Column::ProviderKey.eq(command.provider_key))
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        let model = login_transaction::Entity::find_by_id(command.transaction_id)
+            .filter(login_transaction::Column::ProjectId.eq(project.id))
+            .filter(login_transaction::Column::ProviderConfigurationId.eq(provider.id))
+            .filter(
+                login_transaction::Column::UpstreamStateDigest
+                    .eq(command.upstream_state.value.to_vec()),
+            )
+            .filter(
+                login_transaction::Column::UpstreamStateDigestKeyVersion
+                    .eq(command.upstream_state.key_version),
+            )
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        if model.expires_at <= command.now {
+            expire_login(&transaction, model, command.now).await?;
+            transaction.commit().await.map_err(persistence)?;
+            return Err(ApplicationError::InvalidTransition);
+        }
+        if !optional_digest_matches(
+            model.browser_binding_digest.as_deref(),
+            model.browser_binding_digest_key_version,
+            &command.browser_binding,
+        ) {
+            return Err(ApplicationError::NotFound);
+        }
+        if parse_login_status(&model.status)?
+            != LoginTransactionStatus::ProviderAuthorizationStarted
+        {
+            return Err(ApplicationError::InvalidTransition);
+        }
+        let method = login_transaction_method::Entity::find_by_id((
+            model.project_id,
+            model.id,
+            provider.provider_key.clone(),
+        ))
+        .lock_shared()
+        .one(&transaction)
+        .await
+        .map_err(persistence)?
+        .ok_or(ApplicationError::Integrity)?;
+        revalidate_login_owners(&transaction, &model, provider.id, &method).await?;
+        let project_id = model.project_id;
+        let login_id = model.id;
+        let next_revision = model.transaction_revision + 1;
+        let mut active = model.into_active_model();
+        active.status = Set(LoginTransactionStatus::ProviderExchangeFailed
+            .as_str()
+            .to_owned());
+        active.transaction_revision = Set(next_revision);
+        active.browser_binding_digest = Set(None);
+        active.browser_binding_digest_key_version = Set(None);
+        active.csrf_digest = Set(None);
+        active.csrf_digest_key_version = Set(None);
+        active.upstream_state_digest = Set(None);
+        active.upstream_state_digest_key_version = Set(None);
+        active.oidc_nonce_digest = Set(None);
+        active.oidc_nonce_digest_key_version = Set(None);
+        active.provider_pkce_ciphertext = Set(None);
+        active.provider_pkce_key_version = Set(None);
+        active.terminal_at = Set(Some(command.now));
+        active.updated_at = Set(command.now);
+        let updated = active.update(&transaction).await.map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "DELETE FROM provider_callback_owners
+                  WHERE state_id = $1 AND owner_kind = 'login'
+                    AND login_transaction_id = $1",
+                [login_id.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        append_runtime_audit(
+            &transaction,
+            project_id,
+            "system",
+            command.safe_outcome,
+            "login_transaction",
+            Some(login_id),
+            login_id,
+        )
+        .await?;
+        transaction.commit().await.map_err(persistence)?;
+        login_record(&updated)
+    }
+
     async fn fail_provider_exchange(
         &self,
         command: FailProviderExchange,
     ) -> Result<LoginTransactionRecord, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -538,7 +787,7 @@ fn validate_login_command(command: &CreateLoginTransaction) -> Result<(), Applic
     validate_revisions(&command.revisions)?;
     if !is_pkce_s256_challenge(&command.application_pkce_challenge)
         || command.redirect_uri.len() < 8
-        || command.admitted_providers.is_empty()
+        || (command.admitted_providers.is_empty() && command.admitted_email.is_none())
         || command.expires_at != command.created_at + time::Duration::minutes(10)
     {
         return Err(ApplicationError::InvalidInput);
@@ -559,6 +808,32 @@ fn validate_revisions(revisions: &LoginRevisionSnapshot) -> Result<(), Applicati
         || revisions.application_security_revision <= 0
         || revisions.claims_revision <= 0
         || revisions.session_revision <= 0
+    {
+        return Err(ApplicationError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_admitted_email(
+    method: &crate::application::AdmittedEmailMethod,
+) -> Result<(), ApplicationError> {
+    if method.policy_revision <= 0
+        || method.security_revision <= 0
+        || method.assignment_security_revision <= 0
+        || (!method.otp_enabled && !method.magic_link_enabled)
+        || !(6..=10).contains(&method.otp_digits)
+        || !(30..=600).contains(&method.otp_validity_seconds)
+        || !(1..=5).contains(&method.otp_max_attempts)
+        || !(30..=600).contains(&method.resend_after_seconds)
+        || !(1..=5).contains(&method.max_generations)
+        || !(30..=600).contains(&method.magic_validity_seconds)
+        || !matches!(
+            method.smtp_selection_kind.as_str(),
+            "project" | "deployment_default"
+        )
+        || (method.smtp_selection_kind == "project") != method.smtp_configuration_id.is_some()
+        || method.smtp_generation <= 0
+        || method.smtp_security_eligibility_revision <= 0
     {
         return Err(ApplicationError::InvalidInput);
     }
@@ -758,7 +1033,7 @@ mod tests {
     use std::env;
 
     use sea_orm::Database;
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::{PgPool, postgres::PgPoolOptions};
     use testcontainers::{
         GenericImage, ImageExt,
         core::{IntoContainerPort, WaitFor, wait::LogWaitStrategy},
@@ -789,6 +1064,30 @@ mod tests {
             ciphertext: vec![value; 32],
             key_version: 1,
         }
+    }
+
+    async fn wait_for_backend_blocked_by(pool: &PgPool, blocker_pid: i32, label: &str) -> i32 {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(blocked_pid) = sqlx::query_scalar::<_, i32>(
+                    "SELECT blocked.pid FROM pg_stat_activity blocked
+                     WHERE blocked.datname=current_database()
+                       AND blocked.wait_event_type='Lock'
+                       AND $1=ANY(pg_blocking_pids(blocked.pid))
+                     ORDER BY blocked.pid LIMIT 1",
+                )
+                .bind(blocker_pid)
+                .fetch_optional(pool)
+                .await
+                .expect("observe PostgreSQL lock wait")
+                {
+                    return blocked_pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label} did not establish the required PostgreSQL lock wait"))
     }
 
     async fn start_postgres() -> Option<(testcontainers::ContainerAsync<GenericImage>, String)> {
@@ -919,6 +1218,14 @@ mod tests {
         .await
         .expect("seed assignment");
 
+        sqlx::query(
+            "INSERT INTO runtime_process_incarnations
+             (process_id, process_incarnation, started_at) VALUES ('runtime-1', $1, NOW())",
+        )
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .expect("claim exact test Runtime incarnation");
         let database = Database::connect(&url).await.expect("SeaORM test pool");
         let repository = PostgresAuthenticationRepository::new(database.clone());
         let created_at = OffsetDateTime::now_utc()
@@ -951,6 +1258,7 @@ mod tests {
                     provider_revision: 1,
                     assignment_security_revision: 1,
                 }],
+                admitted_email: None,
             })
             .await
             .expect("create generic login");
@@ -1024,10 +1332,12 @@ mod tests {
         };
 
         let callback = ClaimProviderCallback {
+            transaction_id: created.id,
             project_public_id: "prj_test01".to_owned(),
             provider_key: "oidc-main".to_owned(),
             upstream_state,
             browser_binding,
+            readable_key_versions: [1].into_iter().collect(),
             now: created_at + Duration::seconds(3),
         };
         let (claimed_a, claimed_b) = tokio::join!(
@@ -1070,6 +1380,162 @@ mod tests {
                 .is_err(),
             "terminal exchange failure must not be replayed"
         );
+
+        let mut project_blocker = pool.begin().await.expect("begin Project lock blocker");
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *project_blocker)
+            .await
+            .expect("load blocker backend pid");
+        sqlx::query("SELECT 1 FROM projects WHERE id=$1 FOR UPDATE")
+            .bind(project_id)
+            .execute(&mut *project_blocker)
+            .await
+            .expect("block the login Project row");
+        let operation_repository = repository.clone();
+        let operation = tokio::spawn(async move {
+            operation_repository
+                .create_login_transaction(CreateLoginTransaction {
+                    id: Uuid::new_v4(),
+                    project_id,
+                    application_id,
+                    interaction: digest(21),
+                    redirect_uri: "https://app.example/callback".to_owned(),
+                    application_pkce_challenge: "A".repeat(43),
+                    application_state: protected(22),
+                    presentation_hint: None,
+                    revisions: LoginRevisionSnapshot {
+                        project_metadata_revision: 1,
+                        project_security_revision: 1,
+                        application_security_revision: 1,
+                        claims_revision: 1,
+                        session_revision: 1,
+                    },
+                    created_at: created_at + Duration::seconds(6),
+                    expires_at: created_at + Duration::minutes(10) + Duration::seconds(6),
+                    admitted_providers: vec![AdmittedProviderMethod {
+                        method_key: "oidc-main".to_owned(),
+                        provider_id,
+                        display_name: "OIDC".to_owned(),
+                        issuer: "https://issuer.example".to_owned(),
+                        provider_revision: 1,
+                        assignment_security_revision: 1,
+                    }],
+                    admitted_email: None,
+                })
+                .await
+        });
+        let operation_pid =
+            wait_for_backend_blocked_by(&pool, blocker_pid, "fenced login creation").await;
+        let replacement_pool = pool.clone();
+        let replacement_incarnation = Uuid::new_v4();
+        let replacement = tokio::spawn(async move {
+            sqlx::query(
+                "INSERT INTO runtime_process_incarnations
+                 (process_id, process_incarnation, started_at) VALUES ('runtime-1', $1, NOW())
+                 ON CONFLICT (process_id) DO UPDATE SET
+                   process_incarnation=EXCLUDED.process_incarnation,
+                   started_at=EXCLUDED.started_at",
+            )
+            .bind(replacement_incarnation)
+            .execute(&replacement_pool)
+            .await
+        });
+        let replacement_pid = wait_for_backend_blocked_by(
+            &pool,
+            operation_pid,
+            "Runtime replacement behind fenced login creation",
+        )
+        .await;
+        assert_ne!(replacement_pid, operation_pid);
+        project_blocker
+            .commit()
+            .await
+            .expect("release Project lock blocker");
+        operation
+            .await
+            .expect("join login creation")
+            .expect("operation-first login creation commits");
+        replacement
+            .await
+            .expect("join Runtime replacement")
+            .expect("replacement proceeds after login commit");
+
+        let current_repository = PostgresAuthenticationRepository::new_with_runtime_identity(
+            database.clone(),
+            "runtime-1".to_owned(),
+            replacement_incarnation,
+        );
+        let login_count_before_stale: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM login_transactions")
+                .fetch_one(&pool)
+                .await
+                .expect("count logins before replacement-first race");
+        let mut replacement_blocker = pool.begin().await.expect("begin replacement blocker");
+        let replacement_blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *replacement_blocker)
+            .await
+            .expect("load replacement backend pid");
+        sqlx::query(
+            "UPDATE runtime_process_incarnations
+             SET process_incarnation=$1, started_at=NOW() WHERE process_id='runtime-1'",
+        )
+        .bind(Uuid::new_v4())
+        .execute(&mut *replacement_blocker)
+        .await
+        .expect("replace Runtime before predecessor operation");
+        let stale_operation = tokio::spawn(async move {
+            current_repository
+                .create_login_transaction(CreateLoginTransaction {
+                    id: Uuid::new_v4(),
+                    project_id,
+                    application_id,
+                    interaction: digest(23),
+                    redirect_uri: "https://app.example/callback".to_owned(),
+                    application_pkce_challenge: "A".repeat(43),
+                    application_state: protected(24),
+                    presentation_hint: None,
+                    revisions: LoginRevisionSnapshot {
+                        project_metadata_revision: 1,
+                        project_security_revision: 1,
+                        application_security_revision: 1,
+                        claims_revision: 1,
+                        session_revision: 1,
+                    },
+                    created_at: created_at + Duration::seconds(7),
+                    expires_at: created_at + Duration::minutes(10) + Duration::seconds(7),
+                    admitted_providers: vec![AdmittedProviderMethod {
+                        method_key: "oidc-main".to_owned(),
+                        provider_id,
+                        display_name: "OIDC".to_owned(),
+                        issuer: "https://issuer.example".to_owned(),
+                        provider_revision: 1,
+                        assignment_security_revision: 1,
+                    }],
+                    admitted_email: None,
+                })
+                .await
+        });
+        let stale_pid = wait_for_backend_blocked_by(
+            &pool,
+            replacement_blocker_pid,
+            "replacement-first stale login creation",
+        )
+        .await;
+        assert_ne!(stale_pid, replacement_blocker_pid);
+        replacement_blocker
+            .commit()
+            .await
+            .expect("commit replacement before stale operation");
+        assert_eq!(
+            stale_operation.await.expect("join stale login creation"),
+            Err(ApplicationError::Disabled)
+        );
+        let login_count_after_stale: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM login_transactions")
+                .fetch_one(&pool)
+                .await
+                .expect("count logins after replacement-first race");
+        assert_eq!(login_count_after_stale, login_count_before_stale);
 
         database.close().await.expect("close SeaORM pool");
         pool.close().await;

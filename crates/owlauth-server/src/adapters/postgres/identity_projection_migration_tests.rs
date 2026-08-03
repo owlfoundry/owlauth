@@ -1,5 +1,6 @@
-use std::env;
+use std::{collections::BTreeMap, env};
 
+use sea_orm::{Database, EntityTrait, TransactionTrait};
 use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -14,7 +15,8 @@ fn docker_is_required() -> bool {
     env::var("OWLAUTH_REQUIRE_DOCKER").is_ok_and(|value| value == "1")
 }
 
-async fn prior_schema_pool() -> Option<(testcontainers::ContainerAsync<GenericImage>, PgPool)> {
+async fn prior_schema_pool()
+-> Option<(testcontainers::ContainerAsync<GenericImage>, PgPool, String)> {
     let wait = WaitFor::log(LogWaitStrategy::stderr(
         "database system is ready to accept connections",
     ));
@@ -42,11 +44,11 @@ async fn prior_schema_pool() -> Option<(testcontainers::ContainerAsync<GenericIm
         .get_host_port_ipv4(POSTGRES_PORT)
         .await
         .expect("container port");
+    let database_url =
+        format!("postgres://owlauth:owlauth_test@{host}:{port}/owlauth_migration_test");
     let pool = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&format!(
-            "postgres://owlauth:owlauth_test@{host}:{port}/owlauth_migration_test"
-        ))
+        .connect(&database_url)
         .await
         .expect("connect migration test database");
     for migration in [
@@ -60,7 +62,7 @@ async fn prior_schema_pool() -> Option<(testcontainers::ContainerAsync<GenericIm
             .await
             .expect("apply prior released migration");
     }
-    Some((container, pool))
+    Some((container, pool, database_url))
 }
 
 #[tokio::test]
@@ -69,7 +71,7 @@ async fn prior_schema_pool() -> Option<(testcontainers::ContainerAsync<GenericIm
     reason = "the upgrade fixture keeps one complete pre-migration authority graph visible"
 )]
 async fn provider_users_upgrade_without_revision_or_projection_churn() {
-    let Some((_container, pool)) = prior_schema_pool().await else {
+    let Some((_container, pool, database_url)) = prior_schema_pool().await else {
         return;
     };
     let project_id = Uuid::new_v4();
@@ -378,4 +380,476 @@ async fn provider_users_upgrade_without_revision_or_projection_churn() {
             .expect("canonical Rust locale digest")
     );
     assert_eq!(overlap.4, vec![9_u8; 32]);
+
+    for migration in [
+        include_str!("../../../migrations/20260801010000_passwordless_email.sql"),
+        include_str!("../../../migrations/20260801020000_managed_provider_connections.sql"),
+        include_str!("../../../migrations/20260801030000_identity_lifecycle_and_projection.sql"),
+    ] {
+        pool.execute(sqlx::raw_sql(migration))
+            .await
+            .expect("upgrade populated release N-1 schema");
+    }
+
+    let lifecycle_projection: serde_json::Value =
+        sqlx::query_scalar("SELECT document FROM application_user_projections WHERE id=$1")
+            .bind(projection_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load lifecycle-upgraded projection document");
+    assert_eq!(
+        lifecycle_projection, projection,
+        "expand migration must not rewrite the populated projection directory"
+    );
+    let safe_document_constraint_validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint
+          WHERE conrelid='application_user_projections'::regclass
+            AND conname='application_user_projections_safe_document_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect safe-document expansion constraint");
+    assert!(!safe_document_constraint_validated);
+
+    let projection_email_authority: (i64, i32, Vec<i32>, Option<i32>) = sqlx::query_as(
+        "SELECT authority_revision,write_version,accepted_versions,target_version
+           FROM projection_email_key_authority WHERE singleton=TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load populated-upgrade projection email key authority");
+    assert_eq!(projection_email_authority, (1, 1, vec![1], None));
+    let empty_acceptance = sqlx::query(
+        "UPDATE projection_email_key_authority SET accepted_versions=ARRAY[]::INTEGER[]
+          WHERE singleton=TRUE",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("authority cannot lose its activated write version");
+    assert_eq!(
+        empty_acceptance
+            .as_database_error()
+            .and_then(|error| error.code().map(std::borrow::Cow::into_owned))
+            .as_deref(),
+        Some("23514")
+    );
+    let malformed_observation = sqlx::query(
+        "INSERT INTO projection_email_runtime_observations
+         (process_id,process_incarnation,authority_revision,readable_versions,observed_at,lease_expires_at)
+         VALUES ('runtime-a',$1,1,ARRAY[]::INTEGER[],clock_timestamp(),clock_timestamp()+INTERVAL '1 minute')",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect_err("Runtime observation inventory cannot be empty");
+    assert_eq!(
+        malformed_observation
+            .as_database_error()
+            .and_then(|error| error.code().map(std::borrow::Cow::into_owned))
+            .as_deref(),
+        Some("23514")
+    );
+
+    // A release N-1 writer remains legal after schema N is installed. It may rewrite an existing
+    // row to the exact old non-email shape or insert one for a newly observed Application.
+    sqlx::query(
+        "UPDATE application_user_projections
+            SET document=$1,canonical_digest=$2,source_base_profile_digest=NULL
+          WHERE id=$3",
+    )
+    .bind(&projection)
+    .bind(&digest)
+    .bind(projection_id)
+    .execute(&pool)
+    .await
+    .expect("release N-1 projection update remains overlap-compatible after schema N");
+    let overlap_application_id = Uuid::new_v4();
+    let overlap_post_migration_binding_id = Uuid::new_v4();
+    let overlap_post_migration_projection_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO applications
+            (id,project_id,public_id,display_name,application_type,status,
+             revision,metadata_revision,security_revision)
+         VALUES ($1,$2,'app_overlap02','Overlap App','web','active',1,1,1)",
+    )
+    .bind(overlap_application_id)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .expect("insert overlap Application after schema N");
+    sqlx::query(
+        "INSERT INTO application_user_bindings
+            (id,project_id,application_id,user_id,status,binding_revision)
+         VALUES ($1,$2,$3,$4,'active',1)",
+    )
+    .bind(overlap_post_migration_binding_id)
+    .bind(project_id)
+    .bind(overlap_application_id)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("insert overlap binding after schema N");
+    sqlx::query(
+        "INSERT INTO application_user_projections
+            (id,project_id,binding_id,application_id,user_id,schema_name,
+             projection_revision,source_user_revision,project_policy_revision,
+             application_policy_revision,canonical_digest,document)
+         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',3,4,1,1,$6,$7)",
+    )
+    .bind(overlap_post_migration_projection_id)
+    .bind(project_id)
+    .bind(overlap_post_migration_binding_id)
+    .bind(overlap_application_id)
+    .bind(user_id)
+    .bind(&digest)
+    .bind(&projection)
+    .execute(&pool)
+    .await
+    .expect("release N-1 projection insert remains overlap-compatible after schema N");
+
+    let mut old_shape_with_null_schema = projection.clone();
+    old_shape_with_null_schema["projection_schema"] = serde_json::Value::Null;
+    let old_shape_error =
+        sqlx::query("UPDATE application_user_projections SET document=$1 WHERE id=$2")
+            .bind(&old_shape_with_null_schema)
+            .bind(projection_id)
+            .execute(&pool)
+            .await
+            .expect_err("old projection shape with null schema must fail");
+    match old_shape_error {
+        sqlx::Error::Database(database) => {
+            assert_eq!(database.code().as_deref(), Some("23514"));
+        }
+        other => panic!("expected old-shape check violation, got {other:?}"),
+    }
+
+    let mut current_shape_with_null_schema = projection.clone();
+    current_shape_with_null_schema["projection_schema"] = serde_json::Value::Null;
+    current_shape_with_null_schema["locale"] = serde_json::Value::Null;
+    current_shape_with_null_schema["verified_email"] = serde_json::Value::Null;
+    let current_shape_error =
+        sqlx::query("UPDATE application_user_projections SET document=$1 WHERE id=$2")
+            .bind(&current_shape_with_null_schema)
+            .bind(projection_id)
+            .execute(&pool)
+            .await
+            .expect_err("current projection shape with null schema must fail");
+    match current_shape_error {
+        sqlx::Error::Database(database) => {
+            assert_eq!(database.code().as_deref(), Some("23514"));
+        }
+        other => panic!("expected current-shape check violation, got {other:?}"),
+    }
+
+    // Exercise the production PostgreSQL lazy-repair operation. It must persist the canonical N
+    // digest/document before delivery without treating storage normalization as a semantic change.
+    let database = Database::connect(&database_url)
+        .await
+        .expect("connect SeaORM repair database");
+    let transaction = database.begin().await.expect("begin projection repair");
+    let user = super::entity::project_user::Entity::find_by_id(user_id)
+        .one(&transaction)
+        .await
+        .expect("load repair user")
+        .expect("repair user exists");
+    let stored = super::entity::application_user_projection::Entity::find_by_id(projection_id)
+        .one(&transaction)
+        .await
+        .expect("load stale overlap projection")
+        .expect("stale overlap projection exists");
+    let stale_digest = stored.canonical_digest.clone();
+    let (repaired_model, repair) = super::projection::repair_projection(
+        &transaction,
+        stored,
+        &user,
+        1,
+        1,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .expect("repair N-1 projection through production repository path");
+    transaction
+        .commit()
+        .await
+        .expect("commit projection repair");
+    assert!(repair.storage_repair_required);
+    assert_eq!(repair.revision, 3);
+    assert_ne!(repair.digest, stale_digest);
+    assert_eq!(repaired_model.projection_revision, 3);
+    assert_eq!(repaired_model.canonical_digest, repair.digest);
+    assert_eq!(repaired_model.document, repair.storage_document);
+    assert_eq!(
+        repaired_model.source_base_profile_digest,
+        Some(user.base_profile_digest)
+    );
+
+    // Exercise staged write authority, exact current-incarnation observations, stale-writer
+    // rejection, referenced-version retirement, and restart-safe retirement authorization.
+    let runtime_a = Uuid::new_v4();
+    let runtime_b = Uuid::new_v4();
+    for (process_id, incarnation) in [("runtime-a", runtime_a), ("runtime-b", runtime_b)] {
+        sqlx::query(
+            "INSERT INTO runtime_process_incarnations(process_id,process_incarnation,started_at)
+             VALUES ($1,$2,clock_timestamp())",
+        )
+        .bind(process_id)
+        .bind(incarnation)
+        .execute(&pool)
+        .await
+        .expect("seed required Runtime incarnation");
+    }
+    let projection_protector =
+        crate::adapters::runtime_security::SoftwareProjectionVerifiedEmailProtector::new(
+            "migration-projection-authority".to_owned(),
+            2,
+            crate::adapters::runtime_security::RuntimeKeyMaterial::new([51; 32], [52; 32]),
+            BTreeMap::from([(
+                1,
+                crate::adapters::runtime_security::RuntimeKeyMaterial::new([41; 32], [42; 32]),
+            )]),
+        )
+        .expect("rotated projection protector");
+    let authority = super::projection::PostgresProjectionEmailKeyAuthority::new(database.clone());
+    let now = time::OffsetDateTime::now_utc();
+    let required = vec!["runtime-a".to_owned(), "runtime-b".to_owned()];
+    for invalid_retention in [
+        time::Duration::microseconds(1),
+        time::Duration::microseconds(1_500),
+        time::Duration::milliseconds(86_400_001),
+    ] {
+        assert_eq!(
+            authority
+                .reconcile(
+                    &required,
+                    &projection_protector,
+                    Some(2),
+                    None,
+                    invalid_retention,
+                )
+                .await,
+            Err(crate::application::ApplicationError::InvalidInput),
+            "retention must be a positive whole-millisecond duration bounded to one day"
+        );
+    }
+    assert_eq!(
+        authority
+            .reconcile(
+                &required,
+                &projection_protector,
+                Some(2),
+                None,
+                time::Duration::milliseconds(200),
+            )
+            .await,
+        Err(crate::application::ApplicationError::Disabled),
+        "first rollout stages but cannot cut over without observations"
+    );
+    for invalid_lease in [
+        time::Duration::ZERO,
+        time::Duration::microseconds(1_500),
+        time::Duration::milliseconds(86_400_001),
+    ] {
+        assert_eq!(
+            authority
+                .observe_runtime("runtime-a", runtime_a, &projection_protector, invalid_lease,)
+                .await,
+            Err(crate::application::ApplicationError::InvalidInput),
+            "authority leases must be positive whole-millisecond durations bounded to one day"
+        );
+    }
+    let database_before_observation: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .expect("read PostgreSQL clock before observation");
+    // There is deliberately no legacy observed-at/expiry argument to skew: the only temporal
+    // input is a bounded duration, and PostgreSQL authors both absolute timestamps.
+    authority
+        .observe_runtime(
+            "runtime-a",
+            runtime_a,
+            &projection_protector,
+            time::Duration::minutes(1),
+        )
+        .await
+        .expect("first Runtime observes staged authority");
+    let database_after_observation: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .expect("read PostgreSQL clock after observation");
+    let (observed_at, lease_expires_at): (time::OffsetDateTime, time::OffsetDateTime) =
+        sqlx::query_as(
+            "SELECT observed_at,lease_expires_at
+               FROM projection_email_runtime_observations
+              WHERE process_id='runtime-a' AND process_incarnation=$1",
+        )
+        .bind(runtime_a)
+        .fetch_one(&pool)
+        .await
+        .expect("read database-authored observation timestamps");
+    assert!(observed_at >= database_before_observation);
+    assert!(observed_at <= database_after_observation);
+    assert_eq!(
+        lease_expires_at - observed_at,
+        time::Duration::minutes(1),
+        "PostgreSQL must derive expiry solely from the validated duration"
+    );
+    assert_eq!(
+        authority
+            .reconcile(
+                &required,
+                &projection_protector,
+                Some(2),
+                None,
+                time::Duration::milliseconds(200),
+            )
+            .await,
+        Err(crate::application::ApplicationError::Disabled),
+        "one missing required Runtime blocks cutover"
+    );
+    authority
+        .observe_runtime(
+            "runtime-b",
+            runtime_b,
+            &projection_protector,
+            time::Duration::minutes(1),
+        )
+        .await
+        .expect("second Runtime observes staged authority");
+    authority
+        .reconcile(
+            &required,
+            &projection_protector,
+            Some(2),
+            None,
+            time::Duration::milliseconds(200),
+        )
+        .await
+        .expect("all required Runtime observations permit cutover");
+
+    let stale_writer =
+        crate::adapters::runtime_security::SoftwareProjectionVerifiedEmailProtector::new(
+            "migration-projection-authority".to_owned(),
+            1,
+            crate::adapters::runtime_security::RuntimeKeyMaterial::new([41; 32], [42; 32]),
+            BTreeMap::new(),
+        )
+        .expect("stale projection writer");
+    let stale_transaction = database.begin().await.expect("begin stale writer check");
+    assert_eq!(
+        super::projection::assert_projection_write_authority(&stale_transaction, &stale_writer,)
+            .await,
+        Err(crate::application::ApplicationError::Disabled)
+    );
+    stale_transaction
+        .rollback()
+        .await
+        .expect("rollback stale writer check");
+    for (process_id, incarnation) in [("runtime-a", runtime_a), ("runtime-b", runtime_b)] {
+        authority
+            .observe_runtime(
+                process_id,
+                incarnation,
+                &projection_protector,
+                time::Duration::minutes(1),
+            )
+            .await
+            .expect("Runtime observes activated write authority");
+    }
+
+    let retained_email_identity_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO email_identities
+         (id,project_id,user_id,status,identity_revision,canonicalization_version,
+          address_ciphertext,address_key_version,verified_at,created_at,updated_at)
+         VALUES ($1,$2,$3,'active',1,1,$4,1,$5,$5,$5)",
+    )
+    .bind(retained_email_identity_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(vec![8_u8; 41])
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed retained durable email source");
+    sqlx::query(
+        "UPDATE application_user_projections
+            SET verified_email_source_identity_id=$1,
+                verified_email_ciphertext=$2,verified_email_key_version=1
+          WHERE id=$3",
+    )
+    .bind(retained_email_identity_id)
+    .bind(vec![9_u8; 40])
+    .bind(projection_id)
+    .execute(&pool)
+    .await
+    .expect("seed retained-version projection reference");
+    assert_eq!(
+        authority
+            .reconcile(
+                &required,
+                &projection_protector,
+                None,
+                Some(1),
+                time::Duration::milliseconds(200),
+            )
+            .await,
+        Err(crate::application::ApplicationError::Disabled),
+        "referenced projection key cannot enter retirement"
+    );
+    sqlx::query(
+        "UPDATE application_user_projections
+            SET verified_email_source_identity_id=NULL,
+                verified_email_ciphertext=NULL,verified_email_key_version=NULL
+          WHERE id=$1",
+    )
+    .bind(projection_id)
+    .execute(&pool)
+    .await
+    .expect("eliminate retained-version projection reference");
+    assert_eq!(
+        authority
+            .reconcile(
+                &required,
+                &projection_protector,
+                None,
+                Some(1),
+                time::Duration::milliseconds(200),
+            )
+            .await,
+        Err(crate::application::ApplicationError::Disabled),
+        "retirement authorization must survive its safety interval"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    authority
+        .reconcile(
+            &required,
+            &projection_protector,
+            None,
+            Some(1),
+            time::Duration::milliseconds(200),
+        )
+        .await
+        .expect("unreferenced retained version retires after PostgreSQL-measured safety interval");
+    let retired_authority: (i32, Vec<i32>) = sqlx::query_as(
+        "SELECT write_version,accepted_versions FROM projection_email_key_authority
+          WHERE singleton=TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load retired projection authority");
+    assert_eq!(retired_authority, (2, vec![2]));
+
+    let post_migration_overlap_keys: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM application_user_projections AS projection,
+                LATERAL jsonb_object_keys(projection.document)
+          WHERE projection.id=$1",
+    )
+    .bind(overlap_post_migration_projection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load post-migration N-1 projection");
+    assert_eq!(post_migration_overlap_keys, 9);
 }

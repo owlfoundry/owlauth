@@ -8,10 +8,21 @@ export type ProjectPolicy = components["schemas"]["ProjectPolicy"];
 export type Application = components["schemas"]["Application"];
 export type SigningKey = components["schemas"]["SigningKey"];
 export type Provider = components["schemas"]["Provider"];
+export type EmailMethodPolicy = components["schemas"]["EmailMethodPolicy"];
+export type SmtpConfiguration = components["schemas"]["SmtpConfiguration"];
 export type ProjectUser = components["schemas"]["ProjectUser"];
 export type ProjectUserSessions = components["schemas"]["ProjectUserSessions"];
 export type ApplicationSession = components["schemas"]["ApplicationSession"];
 export type BrowserSession = components["schemas"]["BrowserSession"];
+export type ManagedProviderConnection = components["schemas"]["ManagedProviderConnection"];
+export type ProjectUserIdentity = components["schemas"]["ProjectUserIdentity"];
+export type IdentityMutationIntent = components["schemas"]["IdentityMutationIntent"];
+export type CreateIdentityMutationIntentRequest =
+  components["schemas"]["CreateIdentityMutationIntentRequest"];
+export type ConfirmIdentityMutationIntentRequest =
+  components["schemas"]["ConfirmIdentityMutationIntentRequest"];
+export type IdentityMutationProofAuthority =
+  components["schemas"]["IdentityMutationProofAuthority"];
 export type ProblemDetails = components["schemas"]["ProblemDetails"];
 
 export interface DisposableControlClient {

@@ -23,6 +23,9 @@ owlauth-types = { version = "=0.0.2", path = "../owlauth-types" }
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "rustls", "stream"] }
 redis = { version = "0.32.7", default-features = false, features = ["connection-manager", "script", "tokio-rustls-comp"] }
 rust-embed = { version = "8.11.0", features = ["debug-embed", "include-exclude"] }
+rustls = "0.23.42"
+tokio-rustls = "0.26.4"
+webpki-roots = "1.0.9"
 sea-orm = { version = "2.0.0", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -39,6 +42,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "jso
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.21.0", features = ["v4"] }
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
+hickory-resolver = { version = "0.25.2", features = ["tokio"] }
 
 [lints]
 workspace = true
@@ -50,5 +54,6 @@ sha2 = "0.10.9"
 
 [dev-dependencies]
 crc = "3.4.0"
+rcgen = "0.13.2"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto", "use_pem"] }
 testcontainers = "0.27.3"

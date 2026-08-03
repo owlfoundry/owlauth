@@ -9,7 +9,9 @@ import {
 } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Server } from "node:net";
 import { resolve, sep } from "node:path";
+import { createServer as createTlsServer } from "node:tls";
 
 import { chromium, firefox } from "@playwright/test";
 
@@ -23,6 +25,7 @@ const MAX_BODY_BYTES = 64 * 1024;
 interface AuthorizationGrant {
   readonly challenge: string;
   readonly clientId: string;
+  readonly managed: boolean;
   readonly nonce: string;
   readonly redirectUri: string;
 }
@@ -98,6 +101,7 @@ export interface ControlledServices {
   readonly providerClientId: string;
   readonly providerClientSecret: string;
   readonly providerOrigin: string;
+  readonly mailCaptureUrl: string;
   close(): Promise<void>;
 }
 
@@ -106,6 +110,9 @@ export async function startControlledServices(
   providerPort: number,
   applicationPort: number,
   runtimePort: number,
+  smtpPort: number,
+  smtpCertificateFile: string,
+  smtpKeyFile: string,
 ): Promise<ControlledServices> {
   // Keep browser cookie sites distinct from Runtime's 127.0.0.1 host. Cookies do not
   // honor port boundaries, so reusing that host would leak Runtime cookies to the
@@ -116,15 +123,25 @@ export async function startControlledServices(
   const runtimeOrigin = `http://127.0.0.1:${String(runtimePort)}`;
   const browserDriverToken = opaque(32);
   const provider = createControlledProvider(providerBase, providerIssuer);
+  const capturedMail: string[] = [];
+  const smtp = createSmtpCapture(
+    await readFile(smtpCertificateFile),
+    await readFile(smtpKeyFile),
+    capturedMail,
+  );
   const application = createApplicationServer(
     repository,
     applicationOrigin,
     browserDriverToken,
     runtimeOrigin,
+    capturedMail,
   );
   await Promise.all([
     listen(provider, providerPort, "::1"),
     listen(application, applicationPort, "localhost"),
+    // `IpAddr`'s stable ordering pins localhost's IPv4 address first. Bind the capture to that
+    // exact address so the journey exercises the same resolve-all/validate-all/pin-one path.
+    listen(smtp, smtpPort, "127.0.0.1"),
   ]);
   return {
     applicationOrigin,
@@ -133,8 +150,9 @@ export async function startControlledServices(
     providerClientId: PROVIDER_CLIENT_ID,
     providerClientSecret: PROVIDER_CLIENT_SECRET,
     providerOrigin: providerIssuer,
+    mailCaptureUrl: `${applicationOrigin}/__e2e/mail`,
     async close() {
-      await Promise.all([close(provider), close(application)]);
+      await Promise.all([close(provider), close(application), close(smtp)]);
     },
   };
 }
@@ -145,6 +163,13 @@ function createControlledProvider(origin: string, issuer: string) {
   const grants = new Map<string, AuthorizationGrant>();
   let authorizationRequests = 0;
   let tokenRequests = 0;
+  let revocationRequests = 0;
+  let userInfoRequests = 0;
+  let tokenConfinementViolations = 0;
+  let denyNextAuthorization = false;
+  let rejectNextCodeExchange = false;
+  const renewableTokens = new Set<string>();
+  const accessTokens = new Set<string>();
 
   return createServer((request, response) => {
     void (async () => {
@@ -155,12 +180,14 @@ function createControlledProvider(origin: string, issuer: string) {
             issuer,
             authorization_endpoint: `${origin}/authorize`,
             token_endpoint: `${origin}/token`,
+            userinfo_endpoint: `${origin}/userinfo`,
+            revocation_endpoint: `${origin}/revoke`,
             jwks_uri: `${origin}/jwks`,
             response_types_supported: ["code"],
             response_modes_supported: ["query"],
             subject_types_supported: ["public"],
             id_token_signing_alg_values_supported: ["RS256"],
-            scopes_supported: ["openid", "profile"],
+            scopes_supported: ["offline_access", "openid", "profile"],
             code_challenge_methods_supported: ["S256"],
           });
           return;
@@ -180,10 +207,23 @@ function createControlledProvider(origin: string, issuer: string) {
           });
           return;
         }
+        if (request.method === "POST" && url.pathname === "/__e2e/deny-next-authorization") {
+          denyNextAuthorization = true;
+          json(response, 200, { armed: true });
+          return;
+        }
+        if (request.method === "POST" && url.pathname === "/__e2e/reject-next-code-exchange") {
+          rejectNextCodeExchange = true;
+          json(response, 200, { armed: true });
+          return;
+        }
         if (request.method === "GET" && url.pathname === "/__e2e/request-counts") {
           json(response, 200, {
             authorization_requests: authorizationRequests,
             token_requests: tokenRequests,
+            revocation_requests: revocationRequests,
+            userinfo_requests: userInfoRequests,
+            token_confinement_violations: tokenConfinementViolations,
           });
           return;
         }
@@ -205,19 +245,33 @@ function createControlledProvider(origin: string, issuer: string) {
           const nonce = stringField(parameters, "nonce");
           const redirectUri = stringField(parameters, "redirect_uri");
           const state = stringField(parameters, "state");
+          const scope = parameters["scope"];
+          const managed = scope === "offline_access openid profile";
           if (
             clientId !== PROVIDER_CLIENT_ID ||
             parameters["code_challenge_method"] !== "S256" ||
             parameters["response_mode"] !== "query" ||
             parameters["response_type"] !== "code" ||
-            parameters["scope"] !== "openid profile"
+            (!managed && scope !== "openid profile")
           ) {
             text(response, 400, "Invalid authorization request");
             return;
           }
-          const code = opaque(24);
-          grants.set(code, { challenge, clientId, nonce, redirectUri });
           const callback = new URL(redirectUri);
+          if (denyNextAuthorization) {
+            denyNextAuthorization = false;
+            callback.searchParams.set("error", "access_denied");
+            callback.searchParams.set(
+              "error_description",
+              "controlled raw denial prose must never cross OwlAuth authority",
+            );
+            callback.searchParams.set("error_uri", `${origin}/private-upstream-error`);
+            callback.searchParams.set("state", state);
+            redirect(response, callback.href);
+            return;
+          }
+          const code = opaque(24);
+          grants.set(code, { challenge, clientId, managed, nonce, redirectUri });
           callback.searchParams.set("code", code);
           callback.searchParams.set("state", state);
           redirect(response, callback.href);
@@ -226,6 +280,27 @@ function createControlledProvider(origin: string, issuer: string) {
         if (request.method === "POST" && url.pathname === "/token") {
           tokenRequests += 1;
           const form = new URLSearchParams(await body(request));
+          if (form.get("grant_type") === "refresh_token") {
+            const predecessor = form.get("refresh_token") ?? "";
+            const valid =
+              form.get("client_id") === PROVIDER_CLIENT_ID &&
+              form.get("client_secret") === PROVIDER_CLIENT_SECRET &&
+              renewableTokens.delete(predecessor);
+            if (!valid) {
+              json(response, 400, { error: "invalid_grant" });
+              return;
+            }
+            const accessToken = `managed-access-${opaque(24)}`;
+            const refreshToken = `managed-refresh-${opaque(24)}`;
+            accessTokens.add(accessToken);
+            renewableTokens.add(refreshToken);
+            json(response, 200, {
+              access_token: accessToken,
+              refresh_token: refreshToken,
+              token_type: "Bearer",
+            });
+            return;
+          }
           const code = form.get("code") ?? "";
           const grant = grants.get(code);
           grants.delete(code);
@@ -237,7 +312,8 @@ function createControlledProvider(origin: string, issuer: string) {
             form.get("client_secret") === PROVIDER_CLIENT_SECRET &&
             form.get("redirect_uri") === grant.redirectUri &&
             base64Url(createHash("sha256").update(verifier).digest()) === grant.challenge;
-          if (!valid) {
+          if (!valid || rejectNextCodeExchange) {
+            rejectNextCodeExchange = false;
             json(response, 400, { error: "invalid_grant" });
             return;
           }
@@ -257,10 +333,49 @@ function createControlledProvider(origin: string, issuer: string) {
               sub: "controlled-subject-1",
             },
           );
+          const accessToken = `managed-access-${opaque(24)}`;
+          accessTokens.add(accessToken);
+          const refreshToken = `managed-refresh-${opaque(24)}`;
+          if (grant.managed) renewableTokens.add(refreshToken);
           json(response, 200, {
-            access_token: "provider-material-must-be-discarded",
+            access_token: accessToken,
             id_token: idToken,
+            ...(grant.managed ? { refresh_token: refreshToken } : {}),
             token_type: "Bearer",
+          });
+          return;
+        }
+        if (request.method === "POST" && url.pathname === "/revoke") {
+          revocationRequests += 1;
+          const form = new URLSearchParams(await body(request));
+          const token = form.get("token") ?? "";
+          const valid =
+            form.size === 4 &&
+            form.get("token_type_hint") === "refresh_token" &&
+            form.get("client_id") === PROVIDER_CLIENT_ID &&
+            form.get("client_secret") === PROVIDER_CLIENT_SECRET &&
+            renewableTokens.delete(token);
+          if (!valid) {
+            json(response, 400, { error: "invalid_request" });
+            return;
+          }
+          json(response, 200, {});
+          return;
+        }
+        if (request.method === "GET" && url.pathname === "/userinfo") {
+          userInfoRequests += 1;
+          const authorization = request.headers.authorization ?? "";
+          const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+          if (renewableTokens.has(bearer)) tokenConfinementViolations += 1;
+          if (!accessTokens.delete(bearer)) {
+            json(response, 401, { error: "invalid_token" });
+            return;
+          }
+          json(response, 200, {
+            locale: "en-GB",
+            name: "Ada Managed Integration",
+            picture: "https://images.example/ada-managed.png",
+            sub: "controlled-subject-1",
           });
           return;
         }
@@ -272,11 +387,50 @@ function createControlledProvider(origin: string, issuer: string) {
   });
 }
 
+function createSmtpCapture(certificate: Buffer, key: Buffer, capturedMail: string[]) {
+  return createTlsServer({ cert: certificate, key }, (socket) => {
+    let buffer = "";
+    let dataMode = false;
+    socket.setEncoding("utf8");
+    socket.write("220 owlauth-e2e ESMTP\r\n");
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      for (;;) {
+        if (dataMode) {
+          const end = buffer.indexOf("\r\n.\r\n");
+          if (end < 0) return;
+          capturedMail.push(buffer.slice(0, end + 2));
+          buffer = buffer.slice(end + 5);
+          dataMode = false;
+          socket.write("250 queued\r\n");
+          continue;
+        }
+        const end = buffer.indexOf("\r\n");
+        if (end < 0) return;
+        const command = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        const verb = command.split(" ", 1)[0]?.toUpperCase();
+        if (verb === "EHLO") socket.write("250-owlauth-e2e\r\n250 AUTH PLAIN\r\n");
+        else if (verb === "AUTH") socket.write("235 authenticated\r\n");
+        else if (verb === "MAIL" || verb === "RCPT") socket.write("250 ok\r\n");
+        else if (verb === "DATA") {
+          dataMode = true;
+          socket.write("354 end with dot\r\n");
+        } else if (verb === "QUIT") {
+          socket.end("221 bye\r\n");
+          return;
+        } else socket.write("250 ok\r\n");
+      }
+    });
+  });
+}
+
 function createApplicationServer(
   repository: string,
   origin: string,
   browserDriverToken: string,
   runtimeOrigin: string,
+  capturedMail: string[],
 ) {
   const pending = new Map<string, PendingBackendLogin>();
   const sessions = new Map<string, BackendSession>();
@@ -287,6 +441,15 @@ function createApplicationServer(
     void (async () => {
       try {
         const url = requestUrl(request, origin);
+        if (request.method === "GET" && url.pathname === "/__e2e/mail") {
+          json(response, 200, { messages: capturedMail });
+          return;
+        }
+        if (request.method === "DELETE" && url.pathname === "/__e2e/mail") {
+          capturedMail.splice(0, capturedMail.length);
+          response.writeHead(204).end();
+          return;
+        }
         if (
           request.method === "GET" &&
           url.pathname.startsWith("/sdk/") &&
@@ -1014,18 +1177,14 @@ function redirect(response: ServerResponse, location: string): void {
   response.end();
 }
 
-function listen(
-  server: ReturnType<typeof createServer>,
-  port: number,
-  host: string,
-): Promise<void> {
+function listen(server: Server, port: number, host: string): Promise<void> {
   return new Promise((resolveListen, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolveListen);
   });
 }
 
-function close(server: ReturnType<typeof createServer>): Promise<void> {
+function close(server: Server): Promise<void> {
   return new Promise((resolveClose, reject) => {
     server.close((error) => {
       if (error === undefined) resolveClose();

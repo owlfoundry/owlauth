@@ -52,6 +52,9 @@ export interface PublicApplicationConfiguration {
   readonly applicationDisplayName: string;
   readonly publishableKeys: readonly string[];
   readonly providers: readonly PublicProvider[];
+  readonly emailAvailable: boolean;
+  readonly emailOtpEnabled: boolean;
+  readonly emailMagicLinkEnabled: boolean;
   readonly loginAvailable: boolean;
 }
 
@@ -77,6 +80,8 @@ export interface UserProjection {
   readonly projectionRevision: number;
   readonly displayName: string | null;
   readonly pictureUrl: string | null;
+  readonly locale: string | null;
+  readonly verifiedEmail: string | null;
   readonly status: string;
   readonly createdAt: string;
   readonly updatedAt: string;

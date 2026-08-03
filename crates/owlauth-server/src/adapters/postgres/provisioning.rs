@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, DbErr, EntityTrait, FromQueryResult, IntoActiveModel, QueryFilter,
-    QueryOrder, QuerySelect, RuntimeErr, Statement, TransactionTrait,
+    DatabaseTransaction, DbBackend, DbErr, EntityTrait, FromQueryResult, IntoActiveModel,
+    QueryFilter, QueryOrder, QuerySelect, RuntimeErr, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -128,6 +128,7 @@ impl PostgresProvisioningAdapter {
             claims_revision: Set(1),
             session_revision: Set(1),
             projection_revision: Set(1),
+            projection_verified_email_enabled: Set(false),
             claims_policy: Set(json!({ "access_token_lifetime_seconds": 900 })),
             session_policy: Set(json!({
                 "browser_session_reuse": false,
@@ -1113,6 +1114,43 @@ impl PostgresProvisioningAdapter {
     ) -> Result<SigningKeyRecord, ApplicationError> {
         let candidate = find_signing_key(&self.database, project_id, key_id).await?;
         let transaction = self.database.begin().await.map_err(persistence)?;
+        // Match Runtime's global lock order: exact incarnation rows are always acquired before
+        // Project/ring/publication rows. Holding these shared locks through activation also makes
+        // predecessor leases atomically unusable when a replacement startup claims the ID.
+        let current_incarnations = transaction
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT current.process_id,current.process_incarnation
+                 FROM runtime_process_incarnations current
+                 WHERE current.process_id IN (
+                   SELECT required.process_id
+                   FROM jsonb_array_elements_text($1::jsonb) required(process_id)
+                   UNION
+                   SELECT lease.process_id FROM runtime_publication_leases lease
+                   WHERE lease.project_id=$2 AND lease.ring_id=$3
+                     AND lease.expires_at>transaction_timestamp())
+                 ORDER BY current.process_id LIMIT 65 FOR SHARE OF current",
+                vec![
+                    serde_json::json!(self.required_runtime_process_ids).into(),
+                    project_id.into(),
+                    candidate.ring_id.into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String>("", "process_id")
+                        .map_err(persistence)?,
+                    row.try_get::<Uuid>("", "process_incarnation")
+                        .map_err(persistence)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ApplicationError>>()?;
+        if current_incarnations.len() > 64 {
+            return Err(ApplicationError::Integrity);
+        }
         active_project(&transaction, project_id).await?;
         let ring = project_key_ring::Entity::find_by_id(candidate.ring_id)
             .filter(project_key_ring::Column::ProjectId.eq(project_id))
@@ -1151,12 +1189,22 @@ impl PostgresProvisioningAdapter {
             .await
             .map_err(persistence)?;
         let required_roster_present = self.required_runtime_process_ids.iter().all(|process_id| {
-            current_leases
+            current_incarnations
                 .iter()
-                .any(|lease| &lease.process_id == process_id)
+                .find(|(current_id, _)| current_id == process_id)
+                .is_some_and(|(_, incarnation)| {
+                    current_leases.iter().any(|lease| {
+                        &lease.process_id == process_id && lease.process_incarnation == *incarnation
+                    })
+                })
         });
         let every_live_process_qualified = current_leases.iter().all(|lease| {
-            lease.loaded_revision >= candidate.ring_revision
+            current_incarnations
+                .iter()
+                .any(|(process_id, incarnation)| {
+                    process_id == &lease.process_id && *incarnation == lease.process_incarnation
+                })
+                && lease.loaded_revision >= candidate.ring_revision
                 && lease.first_observed_at <= minimum_observation
         });
         if current_leases.is_empty() || !required_roster_present || !every_live_process_qualified {
@@ -1461,6 +1509,8 @@ impl PostgresProvisioningAdapter {
             secret_ref: Set(None),
             status: Set("provisioning".to_owned()),
             revision: Set(1),
+            managed_profile_enabled: Set(command.managed_profile_enabled),
+            managed_profile_revision: Set(1),
         }
         .insert(&transaction)
         .await
@@ -1665,6 +1715,7 @@ impl PostgresProvisioningAdapter {
             display_name: provider.display_name,
             issuer: provider.issuer,
             client_id: provider.client_id,
+            managed_profile_enabled: provider.managed_profile_enabled,
         })
     }
 
@@ -1892,6 +1943,8 @@ impl PostgresProvisioningAdapter {
             callback_url: provider.callback_url,
             status: provider.status,
             revision: provider.revision,
+            managed_profile_enabled: provider.managed_profile_enabled,
+            managed_profile_revision: provider.managed_profile_revision,
             assigned_application_ids: assignments,
         })
     }
@@ -2200,7 +2253,7 @@ async fn insert_key_state_event(
     Ok(())
 }
 
-async fn insert_audit(
+pub(super) async fn insert_audit(
     transaction: &DatabaseTransaction,
     project_id: Option<Uuid>,
     action: &str,

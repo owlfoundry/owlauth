@@ -22,6 +22,14 @@ const OPERATOR_KEY: &str = "owl_ctrl_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 const DIGEST_KEY: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM";
 const ADMISSION_DIGEST_KEY: &str = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU";
 const PROTECTION_KEY: &str = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ";
+const MANAGED_REAUTHORIZATION_DIGEST_KEY: &str = "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo";
+const MANAGED_REAUTHORIZATION_PROTECTION_KEY: &str = "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws";
+const IDENTITY_MUTATION_EVIDENCE_DIGEST_KEY: &str = "EBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBA";
+const IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY: &str =
+    "ERERERERERERERERERERERERERERERERERERERERERE";
+const PROJECTION_EMAIL_DIGEST_KEY: &str = "RkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkY";
+const PROJECTION_EMAIL_PROTECTION_KEY: &str = "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c";
+const MANAGED_CREDENTIAL_KEY: &str = "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY";
 const SIGNER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const SECRET_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
 
@@ -91,6 +99,42 @@ impl TemporaryStores {
                 "5000".to_owned(),
             ),
             ("OWLAUTH_SHUTDOWN_TIMEOUT_MS".to_owned(), "1000".to_owned()),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_DIGEST_KEY".to_owned(),
+                MANAGED_REAUTHORIZATION_DIGEST_KEY.to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_PROTECTION_KEY".to_owned(),
+                MANAGED_REAUTHORIZATION_PROTECTION_KEY.to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_DIGEST_KEY".to_owned(),
+                IDENTITY_MUTATION_EVIDENCE_DIGEST_KEY.to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY".to_owned(),
+                IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY.to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY".to_owned(),
+                PROJECTION_EMAIL_DIGEST_KEY.to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY".to_owned(),
+                PROJECTION_EMAIL_PROTECTION_KEY.to_owned(),
+            ),
         ]
     }
 }
@@ -184,10 +228,44 @@ fn control_environment(common: &Environment, port: u16) -> Environment {
     result
 }
 
+fn assert_control_key_custody(environment: &Environment) {
+    assert!(
+        environment
+            .iter()
+            .all(|(key, _)| !key.starts_with("OWLAUTH_RUNTIME_KEY_")
+                && key != "OWLAUTH_RUNTIME_DIGEST_KEY"
+                && key != "OWLAUTH_RUNTIME_PROTECTION_KEY"),
+        "split Control receives no generic Runtime protection roots"
+    );
+    assert!(
+        environment
+            .iter()
+            .any(|(key, _)| key == "OWLAUTH_MANAGED_REAUTHORIZATION_KEY_VERSION"),
+        "split Control receives the purpose-limited target issuer"
+    );
+}
+
 fn runtime_environment(common: &Environment, port: u16) -> Environment {
     let mut result = common.clone();
     result.extend([
         ("OWLAUTH_MODE".to_owned(), "runtime".to_owned()),
+        ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
+        (
+            "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
+            DIGEST_KEY.to_owned(),
+        ),
+        (
+            "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
+            PROTECTION_KEY.to_owned(),
+        ),
+        (
+            "OWLAUTH_MANAGED_CREDENTIAL_KEY_VERSION".to_owned(),
+            "1".to_owned(),
+        ),
+        (
+            "OWLAUTH_MANAGED_CREDENTIAL_KEY".to_owned(),
+            MANAGED_CREDENTIAL_KEY.to_owned(),
+        ),
         (
             "OWLAUTH_RUNTIME_ADDR".to_owned(),
             format!("127.0.0.1:{port}"),
@@ -200,14 +278,17 @@ fn runtime_environment(common: &Environment, port: u16) -> Environment {
             "OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
             "topology-runtime".to_owned(),
         ),
-        ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
         (
-            "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
-            DIGEST_KEY.to_owned(),
+            "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION".to_owned(),
+            "1".to_owned(),
         ),
         (
-            "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
-            PROTECTION_KEY.to_owned(),
+            "OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY".to_owned(),
+            "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0".to_owned(),
+        ),
+        (
+            "OWLAUTH_EMAIL_IDENTITY_PROTECTION_KEY".to_owned(),
+            "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4".to_owned(),
         ),
         (
             "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
@@ -442,6 +523,7 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
     let control_base = format!("http://127.0.0.1:{control_port}/");
     let mut runtime = ServerProcess::spawn(&runtime_environment(&common, runtime_port));
     let control_configuration = control_environment(&common, control_port);
+    assert_control_key_custody(&control_configuration);
     let mut control = ServerProcess::spawn(&control_configuration);
     wait_for_ready(&client, &runtime_base, &mut runtime).await;
     wait_for_ready(&client, &control_base, &mut control).await;

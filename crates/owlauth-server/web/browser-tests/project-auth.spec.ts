@@ -102,7 +102,35 @@ interface MutationResult {
 
 interface ProviderRequestCounts {
   readonly authorization_requests: number;
+  readonly token_confinement_violations: number;
   readonly token_requests: number;
+  readonly revocation_requests: number;
+  readonly userinfo_requests: number;
+}
+
+interface ProjectUserList {
+  readonly items: readonly { readonly id: string }[];
+}
+
+interface ManagedConnection {
+  readonly credential_generation: number;
+  readonly generation: number;
+  readonly id: string;
+  readonly last_safe_outcome: string;
+  readonly last_synchronized_at?: string | null;
+  readonly revision: number;
+  readonly state: string;
+}
+
+interface ManagedConnectionList {
+  readonly items: readonly ManagedConnection[];
+}
+
+interface ManagedReauthorization {
+  readonly hosted_target?: string;
+  readonly id: string;
+  readonly revision: number;
+  readonly status: string;
 }
 
 test("same SDK artifact completes browser-direct and backend-custody Project Auth", async ({
@@ -166,6 +194,31 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   await assertEvidenceConfinement([selectionEvidence]);
   await selectionRaceContext.close();
 
+  // A standards-shaped provider denial is owned and terminalized by the exact ordinary-login
+  // interaction. Raw upstream description/URI never become rendered or persisted output, and a
+  // duplicate callback replay cannot reactivate the terminal interaction.
+  const denialContext = await browser.newContext();
+  const denialPage = await denialContext.newPage();
+  await denialPage.goto(await startInteraction(`ordinary-denial-${browserName}`));
+  await expect(denialPage.getByRole("heading", { name: "E2E Application" })).toBeVisible();
+  const countsBeforeOrdinaryDenial = await providerRequestCounts(page.request);
+  await armProviderDenial(page.request);
+  await denialPage
+    .getByRole("button", { name: "Continue with Controlled Provider", exact: true })
+    .click();
+  await expect(
+    denialPage.getByRole("heading", { name: "Provider authorization was not approved" }),
+  ).toBeVisible();
+  await expect(denialPage.locator("body")).not.toContainText("controlled raw denial prose");
+  await expect(denialPage.locator("body")).not.toContainText("private-upstream-error");
+  const deniedCallback = denialPage.url();
+  const countsAfterOrdinaryDenial = await providerRequestCounts(page.request);
+  expect(countsAfterOrdinaryDenial.token_requests).toBe(countsBeforeOrdinaryDenial.token_requests);
+  await denialPage.goto(deniedCallback);
+  await expect(denialPage.getByRole("heading", { name: "Sign-in unavailable" })).toBeVisible();
+  await denialContext.close();
+
+  const countsBeforeBrowserSignIn = await providerRequestCounts(page.request);
   const browserParameters = new URLSearchParams({
     application: context.application.public_id,
     key: publishableKey ?? "",
@@ -205,8 +258,489 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   await expect(page.locator("#status")).toHaveText("Browser session ready");
 
   await page.getByRole("button", { name: "Read current user" }).click();
+  // A successful SDK read already verifies the Project, Application, user, and projection
+  // bindings. The immediate managed sync may legitimately update the callback profile first.
   await expect(page.locator("#status")).toHaveText("Current user verified");
-  await expect(page.locator("output")).toHaveText("Ada Integration");
+
+  // Control creates a fixed-provider, single-connection reauthorization. It is a separate
+  // top-level journey: no Application sign-in or browser-session reuse is offered.
+  const users = await controlGet<ProjectUserList>(
+    page.request,
+    `projects/${context.project.id}/users`,
+  );
+  expect(users.items).toHaveLength(1);
+  const userId = users.items[0]?.id;
+  if (userId === undefined) throw new Error("managed user was not materialized");
+  const managedBefore = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  expect(managedBefore.items).toHaveLength(1);
+  const predecessor = managedBefore.items[0];
+  if (predecessor === undefined) throw new Error("managed connection was not materialized");
+  expect(predecessor.state).toBe("active");
+  await expect
+    .poll(
+      async () => {
+        const counts = await providerRequestCounts(page.request);
+        return (
+          counts.token_confinement_violations === 0 &&
+          counts.token_requests >= countsBeforeBrowserSignIn.token_requests + 2 &&
+          counts.userinfo_requests > countsBeforeBrowserSignIn.userinfo_requests
+        );
+      },
+      { timeout: 45_000 },
+    )
+    .toBe(true);
+  // This Control outcome becomes visible only with the profile transaction commit. Requiring
+  // successor generations prevents an earlier read outcome from satisfying the barrier.
+  let reauthorizationPredecessor: ManagedConnection | undefined;
+  await expect
+    .poll(
+      async () => {
+        const managed = await controlGet<ManagedConnectionList>(
+          page.request,
+          `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+        );
+        const current = managed.items.find(({ id }) => id === predecessor.id);
+        const synchronizedAt = current?.last_synchronized_at;
+        const profileCommitted =
+          current?.state === "active" &&
+          current.generation > predecessor.generation &&
+          current.credential_generation > predecessor.credential_generation &&
+          current.last_safe_outcome === "read_succeeded" &&
+          typeof synchronizedAt === "string" &&
+          !Number.isNaN(Date.parse(synchronizedAt));
+        if (profileCommitted) reauthorizationPredecessor = current;
+        return profileCommitted;
+      },
+      { timeout: 45_000 },
+    )
+    .toBe(true);
+  if (reauthorizationPredecessor === undefined) {
+    throw new Error("background-synchronized managed connection was not visible");
+  }
+  expect(reauthorizationPredecessor.state).toBe("active");
+  expect(reauthorizationPredecessor.generation).toBeGreaterThan(predecessor.generation);
+  expect(reauthorizationPredecessor.credential_generation).toBeGreaterThan(
+    predecessor.credential_generation,
+  );
+  expect(reauthorizationPredecessor.last_safe_outcome).toBe("read_succeeded");
+  expect(Date.parse(reauthorizationPredecessor.last_synchronized_at ?? "")).not.toBeNaN();
+  await page.getByRole("button", { name: "Read current user" }).click();
+  await expect(page.locator("output")).toHaveText("Ada Managed Integration");
+
+  const deniedReauthorization = await control<ManagedReauthorization>(
+    page.request,
+    "POST",
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections/${predecessor.id}/reauthorizations`,
+    {
+      application_id: context.application.id,
+      expected_connection_generation: reauthorizationPredecessor.generation,
+      expected_connection_revision: reauthorizationPredecessor.revision,
+      expected_credential_generation: reauthorizationPredecessor.credential_generation,
+    },
+    `managed-denial-${browserName}-${Date.now().toString(36)}`,
+  );
+  if (deniedReauthorization.hosted_target === undefined) {
+    throw new Error("managed denial omitted its create-only hosted target");
+  }
+  const managedDenialPage = await browserContext.newPage();
+  const managedDenialSetCookies: string[] = [];
+  const managedDenialHeaderReads: Promise<void>[] = [];
+  managedDenialPage.on("response", (response) => {
+    if (!response.url().startsWith(runtimeBase)) return;
+    managedDenialHeaderReads.push(
+      response.headersArray().then((headers) => {
+        for (const { name, value } of headers) {
+          if (name.toLowerCase() === "set-cookie") managedDenialSetCookies.push(value);
+        }
+      }),
+    );
+  });
+  await managedDenialPage.goto(deniedReauthorization.hosted_target);
+  await armProviderDenial(page.request);
+  await managedDenialPage
+    .getByRole("button", { name: "Continue with controlled-provider" })
+    .click();
+  await expect(
+    managedDenialPage.getByRole("heading", { name: "Provider authorization was not approved" }),
+  ).toBeVisible();
+  await Promise.all(managedDenialHeaderReads);
+  const managedInteractionCookieWrites = managedDenialSetCookies
+    .map(parseSetCookie)
+    .filter(({ name }) => runtimeCookieKind(name) === "interaction");
+  const issuedManagedInteractionCookies = managedInteractionCookieWrites.filter(
+    ({ attributes, value }) => value !== "" && attributes.get("max-age") !== "0",
+  );
+  expect(issuedManagedInteractionCookies).toHaveLength(1);
+  const managedInteractionCookieName = issuedManagedInteractionCookies[0]?.name;
+  expect(
+    managedInteractionCookieWrites.some(
+      ({ attributes, name, value }) =>
+        name === managedInteractionCookieName &&
+        value === "deleted" &&
+        attributes.get("max-age") === "0",
+    ),
+  ).toBe(true);
+  const cookiesAfterManagedDenial = await browserContext.cookies(
+    deniedReauthorization.hosted_target,
+  );
+  expect(cookiesAfterManagedDenial.some(({ name }) => name === managedInteractionCookieName)).toBe(
+    false,
+  );
+  await expect(managedDenialPage.locator("body")).not.toContainText("controlled raw denial prose");
+  await expect
+    .poll(
+      async () => {
+        const current = await controlGet<ManagedReauthorization>(
+          page.request,
+          `projects/${context.project.id}/users/${userId}/managed-provider-connections/${predecessor.id}/reauthorizations/${deniedReauthorization.id}`,
+        );
+        return current.status;
+      },
+      { timeout: 30_000 },
+    )
+    .toBe("provider_exchange_failed");
+  await managedDenialPage.close();
+
+  const afterManagedDenial = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  expect(afterManagedDenial.items.find(({ id }) => id === predecessor.id)).toMatchObject({
+    generation: reauthorizationPredecessor.generation,
+    credential_generation: reauthorizationPredecessor.credential_generation,
+    revision: reauthorizationPredecessor.revision,
+    state: "active",
+  });
+
+  const rejectedReauthorization = await control<ManagedReauthorization>(
+    page.request,
+    "POST",
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections/${predecessor.id}/reauthorizations`,
+    {
+      application_id: context.application.id,
+      expected_connection_generation: reauthorizationPredecessor.generation,
+      expected_connection_revision: reauthorizationPredecessor.revision,
+      expected_credential_generation: reauthorizationPredecessor.credential_generation,
+    },
+    `managed-rejection-${browserName}-${Date.now().toString(36)}`,
+  );
+  if (rejectedReauthorization.hosted_target === undefined) {
+    throw new Error("managed rejection omitted its create-only hosted target");
+  }
+  const rejectedManagedPage = await browserContext.newPage();
+  const rejectedManagedSetCookies: string[] = [];
+  const rejectedManagedHeaderReads: Promise<void>[] = [];
+  rejectedManagedPage.on("response", (response) => {
+    if (!response.url().startsWith(runtimeBase)) return;
+    rejectedManagedHeaderReads.push(
+      response.headersArray().then((headers) => {
+        for (const { name, value } of headers) {
+          if (name.toLowerCase() === "set-cookie") rejectedManagedSetCookies.push(value);
+        }
+      }),
+    );
+  });
+  await rejectedManagedPage.goto(rejectedReauthorization.hosted_target);
+  const countsBeforeManagedRejection = await providerRequestCounts(page.request);
+  await armProviderCodeRejection(page.request);
+  await rejectedManagedPage
+    .getByRole("button", { name: "Continue with controlled-provider" })
+    .click();
+  await expect(
+    rejectedManagedPage.getByRole("heading", { name: "Reauthorization could not be completed" }),
+  ).toBeVisible();
+  const rejectedTerminalUrl = rejectedManagedPage.url();
+  await Promise.all(rejectedManagedHeaderReads);
+  const rejectedManagedCookieWrites = rejectedManagedSetCookies
+    .map(parseSetCookie)
+    .filter(({ name }) => runtimeCookieKind(name) === "interaction");
+  const issuedRejectedManagedCookies = rejectedManagedCookieWrites.filter(
+    ({ attributes, value }) => value !== "" && attributes.get("max-age") !== "0",
+  );
+  expect(issuedRejectedManagedCookies).toHaveLength(1);
+  const rejectedBindingCookie = issuedRejectedManagedCookies[0];
+  if (rejectedBindingCookie === undefined) throw new Error("rejected callback cookie missing");
+  const rejectedManagedCookieName = rejectedBindingCookie.name;
+  expect(
+    rejectedManagedCookieWrites.some(
+      ({ attributes, name, value }) =>
+        name === rejectedManagedCookieName &&
+        value === "deleted" &&
+        attributes.get("max-age") === "0",
+    ),
+  ).toBe(true);
+  const cookiesAfterManagedRejection = await browserContext.cookies(
+    rejectedReauthorization.hosted_target,
+  );
+  expect(cookiesAfterManagedRejection.some(({ name }) => name === rejectedManagedCookieName)).toBe(
+    false,
+  );
+  const countsAfterManagedRejection = await providerRequestCounts(page.request);
+  expect(countsAfterManagedRejection.token_requests).toBe(
+    countsBeforeManagedRejection.token_requests + 1,
+  );
+  const afterManagedRejection = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  expect(afterManagedRejection.items.find(({ id }) => id === predecessor.id)).toMatchObject({
+    generation: reauthorizationPredecessor.generation,
+    credential_generation: reauthorizationPredecessor.credential_generation,
+    revision: reauthorizationPredecessor.revision,
+    state: "active",
+  });
+  await expect
+    .poll(
+      async () => {
+        const current = await controlGet<ManagedReauthorization>(
+          page.request,
+          `projects/${context.project.id}/users/${userId}/managed-provider-connections/${predecessor.id}/reauthorizations/${rejectedReauthorization.id}`,
+        );
+        return current.status;
+      },
+      { timeout: 30_000 },
+    )
+    .toBe("provider_exchange_failed");
+  await rejectedManagedPage.close();
+
+  const reauthorization = await control<ManagedReauthorization>(
+    page.request,
+    "POST",
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections/${predecessor.id}/reauthorizations`,
+    {
+      application_id: context.application.id,
+      expected_connection_generation: reauthorizationPredecessor.generation,
+      expected_connection_revision: reauthorizationPredecessor.revision,
+      expected_credential_generation: reauthorizationPredecessor.credential_generation,
+    },
+    `managed-reauthorization-${browserName}-${Date.now().toString(36)}`,
+  );
+  expect(reauthorization.status).toBe("awaiting_browser_binding");
+  if (reauthorization.hosted_target === undefined) {
+    throw new Error("managed reauthorization omitted its create-only hosted target");
+  }
+  const successfulManagedContext = await browser.newContext();
+  const managedPage = await successfulManagedContext.newPage();
+  const successfulManagedSetCookies: string[] = [];
+  const successfulManagedHeaderReads: Promise<void>[] = [];
+  managedPage.on("response", (response) => {
+    if (!response.url().startsWith(runtimeBase)) return;
+    successfulManagedHeaderReads.push(
+      response.headersArray().then((headers) => {
+        for (const { name, value } of headers) {
+          if (name.toLowerCase() === "set-cookie") successfulManagedSetCookies.push(value);
+        }
+      }),
+    );
+  });
+  await managedPage.goto(reauthorization.hosted_target);
+  await expect(
+    managedPage.getByRole("heading", { name: "Reauthorize managed connection", exact: true }),
+  ).toBeVisible();
+  await expect(managedPage.getByText("does not sign you in to an Application")).toBeVisible();
+  await expect(managedPage.getByRole("button")).toHaveCount(1);
+  await managedPage.getByRole("button", { name: "Continue with controlled-provider" }).click();
+  await expect
+    .poll(
+      async () => {
+        const current = await controlGet<ManagedReauthorization>(
+          page.request,
+          `projects/${context.project.id}/users/${userId}/managed-provider-connections/${predecessor.id}/reauthorizations/${reauthorization.id}`,
+        );
+        return current.status;
+      },
+      { timeout: 30_000 },
+    )
+    .toBe("completed");
+  const successfulTerminalUrl = managedPage.url();
+  await Promise.all(successfulManagedHeaderReads);
+  const issuedSuccessfulManagedCookies = successfulManagedSetCookies
+    .map(parseSetCookie)
+    .filter(
+      ({ attributes, name, value }) =>
+        runtimeCookieKind(name) === "interaction" &&
+        value !== "" &&
+        attributes.get("max-age") !== "0",
+    );
+  expect(issuedSuccessfulManagedCookies).toHaveLength(1);
+  const successfulBindingCookie = issuedSuccessfulManagedCookies[0];
+  if (successfulBindingCookie === undefined) throw new Error("successful callback cookie missing");
+  const managedAfter = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  const successor = managedAfter.items.find(({ id }) => id === predecessor.id);
+  expect(successor?.state).toBe("active");
+  expect(successor?.generation).toBe(reauthorizationPredecessor.generation + 1);
+  expect(successor?.credential_generation).toBe(
+    reauthorizationPredecessor.credential_generation + 1,
+  );
+  if (successor === undefined) throw new Error("managed successor was not visible");
+  const countsBeforeSuccessfulRetry = await providerRequestCounts(page.request);
+  const successfulRetryContext = await browser.newContext();
+  const successfulRetryResponse = await successfulRetryContext.request.get(successfulTerminalUrl, {
+    headers: {
+      cookie: `${successfulBindingCookie.name}=${successfulBindingCookie.value}`,
+    },
+  });
+  expect(successfulRetryResponse.ok()).toBe(true);
+  expect(await successfulRetryResponse.text()).toContain("managed_reauthorization");
+  const successfulRetrySetCookies = successfulRetryResponse
+    .headersArray()
+    .filter(({ name }) => name.toLowerCase() === "set-cookie")
+    .map(({ value }) => parseSetCookie(value));
+  await successfulRetryContext.close();
+  expect(await providerRequestCounts(page.request)).toEqual(countsBeforeSuccessfulRetry);
+  const afterSuccessfulRetry = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  expect(afterSuccessfulRetry.items.find(({ id }) => id === successor.id)).toMatchObject({
+    generation: successor.generation,
+    credential_generation: successor.credential_generation,
+    revision: successor.revision,
+    state: "active",
+  });
+  expect(
+    successfulRetrySetCookies.some(
+      ({ attributes, name }) =>
+        name === successfulBindingCookie.name && attributes.get("max-age") === "0",
+    ),
+  ).toBe(true);
+
+  // Retry the earlier failed terminal callback only after successful completion evidence has been
+  // captured. The isolated client restores exactly its HttpOnly binding, receives the bounded
+  // failure and deletion header, and cannot replay provider or connection effects.
+  const countsBeforeRejectedRetry = await providerRequestCounts(page.request);
+  const beforeRejectedRetry = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  const rejectedRetryContext = await browser.newContext();
+  const rejectedRetryResponse = await rejectedRetryContext.request.get(rejectedTerminalUrl, {
+    headers: {
+      cookie: `${rejectedBindingCookie.name}=${rejectedBindingCookie.value}`,
+    },
+  });
+  expect(rejectedRetryResponse.ok()).toBe(true);
+  expect(await rejectedRetryResponse.text()).toContain("Reauthorization could not be completed");
+  const rejectedRetrySetCookies = rejectedRetryResponse
+    .headersArray()
+    .filter(({ name }) => name.toLowerCase() === "set-cookie")
+    .map(({ value }) => parseSetCookie(value));
+  await rejectedRetryContext.close();
+  expect(await providerRequestCounts(page.request)).toEqual(countsBeforeRejectedRetry);
+  const afterRejectedRetry = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  expect(afterRejectedRetry.items.find(({ id }) => id === predecessor.id)).toEqual(
+    beforeRejectedRetry.items.find(({ id }) => id === predecessor.id),
+  );
+  expect(
+    rejectedRetrySetCookies.some(
+      ({ attributes, name }) =>
+        name === rejectedBindingCookie.name && attributes.get("max-age") === "0",
+    ),
+  ).toBe(true);
+  await successfulManagedContext.close();
+
+  const revocationRequested = await control<ManagedConnection>(
+    page.request,
+    "POST",
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections/${successor.id}/revoke`,
+    {
+      confirm: true,
+      expected_generation: successor.generation,
+      expected_revision: successor.revision,
+    },
+  );
+  expect(revocationRequested.state).toBe("active");
+  await expect
+    .poll(
+      async () => {
+        const list = await controlGet<ManagedConnectionList>(
+          page.request,
+          `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+        );
+        return list.items.find(({ id }) => id === successor.id);
+      },
+      { timeout: 45_000 },
+    )
+    .toMatchObject({ state: "revoked" });
+  const revokedList = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  const revokedConnection = revokedList.items.find(({ id }) => id === successor.id);
+  if (revokedConnection === undefined) throw new Error("revoked connection disappeared");
+  const disconnected = await control<ManagedConnection>(
+    page.request,
+    "POST",
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections/${successor.id}/disconnect`,
+    {
+      confirm: true,
+      expected_generation: revokedConnection.generation,
+      expected_revision: revokedConnection.revision,
+    },
+  );
+  expect(disconnected.state).toBe("disconnected");
+
+  // Disconnection destroys the predecessor material but intentionally leaves explicit Hosted
+  // reauthorization available. Only that exact successor transaction may return the connection
+  // to active, with both lifecycle generations advanced.
+  const disconnectedRecovery = await control<ManagedReauthorization>(
+    page.request,
+    "POST",
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections/${successor.id}/reauthorizations`,
+    {
+      application_id: context.application.id,
+      expected_connection_generation: disconnected.generation,
+      expected_connection_revision: disconnected.revision,
+      expected_credential_generation: disconnected.credential_generation,
+    },
+    `managed-disconnected-recovery-${browserName}-${Date.now().toString(36)}`,
+  );
+  expect(disconnectedRecovery.status).toBe("awaiting_browser_binding");
+  if (disconnectedRecovery.hosted_target === undefined) {
+    throw new Error("disconnected recovery omitted its create-only Hosted target");
+  }
+  const disconnectedRecoveryPage = await browserContext.newPage();
+  await disconnectedRecoveryPage.goto(disconnectedRecovery.hosted_target);
+  await expect(
+    disconnectedRecoveryPage.getByRole("heading", {
+      name: "Reauthorize managed connection",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await disconnectedRecoveryPage
+    .getByRole("button", { name: "Continue with controlled-provider" })
+    .click();
+  await expect
+    .poll(
+      async () => {
+        const current = await controlGet<ManagedReauthorization>(
+          page.request,
+          `projects/${context.project.id}/users/${userId}/managed-provider-connections/${successor.id}/reauthorizations/${disconnectedRecovery.id}`,
+        );
+        return current.status;
+      },
+      { timeout: 30_000 },
+    )
+    .toBe("completed");
+  const recoveredConnections = await controlGet<ManagedConnectionList>(
+    page.request,
+    `projects/${context.project.id}/users/${userId}/managed-provider-connections`,
+  );
+  const recovered = recoveredConnections.items.find(({ id }) => id === successor.id);
+  expect(recovered).toMatchObject({ state: "active" });
+  expect(recovered?.generation).toBe(disconnected.generation + 1);
+  expect(recovered?.credential_generation).toBe(disconnected.credential_generation + 1);
+  await disconnectedRecoveryPage.close();
+
   await page.getByRole("button", { name: "Refresh session" }).click();
   await expect(page.locator("#status")).toHaveText("Credentials replaced atomically");
   await expect(page.locator("output")).toHaveText("generation 2");
@@ -351,6 +885,10 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   const sdkBrowserSnapshots = await runSdkE2Es(context, publishableKey ?? "", browserName);
   expect(sdkBrowserSnapshots).toHaveLength(2);
   await assertEvidenceConfinement([evidence], sdkBrowserSnapshots);
+  const finalProviderCounts = await providerRequestCounts(page.request);
+  expect(finalProviderCounts.token_confinement_violations).toBe(0);
+  expect(finalProviderCounts.revocation_requests).toBeGreaterThan(0);
+  expect(finalProviderCounts.userinfo_requests).toBeGreaterThan(0);
   expect(await typescriptSdkArtifactDigest(repository)).toBe(frozenTypescriptSdkDigest);
 });
 
@@ -487,6 +1025,16 @@ function cookieFixtureSnapshot(
     ],
     storageState: '{"cookies":[],"origins":[]}',
   };
+}
+
+async function armProviderDenial(request: APIRequestContext): Promise<void> {
+  const response = await request.post(`${providerOrigin}__e2e/deny-next-authorization`);
+  expect(response.ok()).toBe(true);
+}
+
+async function armProviderCodeRejection(request: APIRequestContext): Promise<void> {
+  const response = await request.post(`${providerOrigin}__e2e/reject-next-code-exchange`);
+  expect(response.ok()).toBe(true);
 }
 
 async function providerRequestCounts(request: APIRequestContext): Promise<ProviderRequestCounts> {
@@ -834,7 +1382,12 @@ function isRuntimeCookieRoute(
 ): boolean {
   const providerCallback = /^projects\/[^/]+\/auth\/callback\/[^/]+$/u;
   if (kind === "interaction" && disposition === "issuance") {
-    return isRuntimeRecord(record, url, "GET", /^auth\/interactions\/[^/]+$/u);
+    return isRuntimeRecord(
+      record,
+      url,
+      "GET",
+      /^auth\/(?:interactions|managed-reauthorizations)\/[^/]+$/u,
+    );
   }
   if (kind === "interaction") {
     return (
@@ -1516,6 +2069,7 @@ async function provision(request: APIRequestContext, suffix: string): Promise<Pr
       display_name: "Controlled Provider",
       expected_project_revision: project.metadata_revision,
       issuer: providerOrigin,
+      managed_profile_enabled: true,
       provider_key: "controlled-provider",
     },
     `provider-${suffix}`,

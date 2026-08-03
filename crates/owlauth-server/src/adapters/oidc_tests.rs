@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Form, State};
-use axum::http::{Response, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::{get, post};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
@@ -113,6 +113,7 @@ fn callback_request(issuer: &str) -> ProviderCallbackRequest {
         expected_nonce: Zeroizing::new("nonce-123".to_owned()),
         now: OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
         allowed_clock_skew_seconds: 60,
+        profile: ProviderRequestProfile::Login,
     }
 }
 
@@ -168,6 +169,27 @@ fn pure_jwt_validation_accepts_only_the_fixed_profile() {
         validate_id_token(&sign(&multi_audience, TEST_KID), &jwk(TEST_KID), &request),
         Err(ProviderExchangeError::InvalidProof)
     );
+}
+
+#[test]
+fn provider_display_name_uses_the_durable_128_character_boundary() {
+    let issuer = "https://issuer.example";
+    let request = callback_request(issuer);
+    for name in ["a".repeat(128), "猫".repeat(128)] {
+        let mut boundary = claims(issuer);
+        boundary.name = name.clone();
+        let identity = validate_id_token(&sign(&boundary, TEST_KID), &jwk(TEST_KID), &request)
+            .expect("128-character provider name is admissible");
+        assert_eq!(identity.display_name.as_deref(), Some(name.as_str()));
+    }
+    for name in ["a".repeat(129), "猫".repeat(129)] {
+        let mut overlong = claims(issuer);
+        overlong.name = name;
+        assert_eq!(
+            validate_id_token(&sign(&overlong, TEST_KID), &jwk(TEST_KID), &request),
+            Err(ProviderExchangeError::InvalidProof)
+        );
+    }
 }
 
 #[test]
@@ -235,16 +257,21 @@ enum TokenBehavior {
     Malformed,
     Oversized,
     BadProof,
+    NoRevocation,
 }
 
 struct ProviderState {
     origin: String,
     token: String,
     token_behavior: TokenBehavior,
+    token_scope: Option<String>,
     token_calls: AtomicUsize,
     jwks_calls: AtomicUsize,
     rotate_jwks: bool,
     submitted_form: std::sync::Mutex<Option<HashMap<String, String>>>,
+    renewal_attempt: std::sync::Mutex<Option<String>>,
+    revocation_form: std::sync::Mutex<Option<HashMap<String, String>>>,
+    userinfo_bearer: std::sync::Mutex<Option<String>>,
 }
 
 struct TestProvider {
@@ -260,29 +287,67 @@ impl Drop for TestProvider {
 }
 
 async fn discovery(State(state): State<Arc<ProviderState>>) -> Response<Body> {
-    json_response(
-        StatusCode::OK,
-        json!({
-            "issuer": state.origin,
-            "authorization_endpoint": format!("{}/authorize", state.origin),
-            "token_endpoint": format!("{}/token", state.origin),
-            "jwks_uri": format!("{}/jwks", state.origin),
-            "response_types_supported": ["code"],
-            "response_modes_supported": ["query"],
-            "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["RS256"],
-            "scopes_supported": ["openid", "profile"],
-            "code_challenge_methods_supported": ["S256"]
-        })
-        .to_string(),
-    )
+    let mut document = json!({
+        "issuer": state.origin,
+        "authorization_endpoint": format!("{}/authorize", state.origin),
+        "token_endpoint": format!("{}/token", state.origin),
+        "userinfo_endpoint": format!("{}/userinfo", state.origin),
+        "revocation_endpoint": format!("{}/revoke", state.origin),
+        "jwks_uri": format!("{}/jwks", state.origin),
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "scopes_supported": ["offline_access", "openid", "profile"],
+        "code_challenge_methods_supported": ["S256"]
+    });
+    if matches!(state.token_behavior, TokenBehavior::NoRevocation) {
+        document
+            .as_object_mut()
+            .expect("discovery object")
+            .remove("revocation_endpoint");
+    }
+    json_response(StatusCode::OK, document.to_string())
 }
 
 async fn token(
     State(state): State<Arc<ProviderState>>,
+    headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response<Body> {
     state.token_calls.fetch_add(1, Ordering::SeqCst);
+    *state.renewal_attempt.lock().unwrap() = headers
+        .get("owlAuth-renewal-attempt")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+        let valid = form.get("refresh_token").map(String::as_str) == Some("stored-refresh")
+            && form.get("client_id").map(String::as_str) == Some("client-123")
+            && form.get("client_secret").map(String::as_str) == Some("secret-123")
+            && form.len() == 4;
+        *state.submitted_form.lock().unwrap() = Some(form);
+        return if valid && matches!(state.token_behavior, TokenBehavior::Oversized) {
+            oversized_chunked_response()
+        } else if valid {
+            let mut document = json!({
+                "access_token": "memory-only-access",
+                "refresh_token": "rotated-refresh",
+                "token_type": "Bearer"
+            });
+            if let Some(scope) = &state.token_scope {
+                document
+                    .as_object_mut()
+                    .expect("renewal response object")
+                    .insert("scope".to_owned(), json!(scope));
+            }
+            json_response(StatusCode::OK, document.to_string())
+        } else {
+            json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "invalid_grant"}).to_string(),
+            )
+        };
+    }
     let pkce_matches = form
         .get("code_verifier")
         .is_some_and(|value| value == &"v".repeat(43));
@@ -294,11 +359,21 @@ async fn token(
         );
     }
     match state.token_behavior {
-        TokenBehavior::Success => json_response(
-            StatusCode::OK,
-            json!({"id_token": state.token, "access_token": "discard-me", "token_type": "Bearer"})
-                .to_string(),
-        ),
+        TokenBehavior::Success | TokenBehavior::NoRevocation => {
+            let mut document = json!({
+                "id_token": state.token,
+                "access_token": "discard-me",
+                "refresh_token": "renewable-secret",
+                "token_type": "Bearer"
+            });
+            if let Some(scope) = &state.token_scope {
+                document
+                    .as_object_mut()
+                    .expect("authorization-code response object")
+                    .insert("scope".to_owned(), json!(scope));
+            }
+            json_response(StatusCode::OK, document.to_string())
+        }
         TokenBehavior::Reject => json_response(
             StatusCode::BAD_REQUEST,
             json!({"error": "invalid_grant", "vendor_secret": "not surfaced"}).to_string(),
@@ -312,12 +387,63 @@ async fn token(
             json_response(StatusCode::OK, json!({"id_token": state.token}).to_string())
         }
         TokenBehavior::Malformed => json_response(StatusCode::OK, "{".to_owned()),
-        TokenBehavior::Oversized => json_response(StatusCode::OK, "x".repeat(TOKEN_BODY_LIMIT + 1)),
+        TokenBehavior::Oversized => oversized_chunked_response(),
         TokenBehavior::BadProof => json_response(
             StatusCode::OK,
             json!({"id_token": format!("{}x", state.token)}).to_string(),
         ),
     }
+}
+
+async fn revoke_token(
+    State(state): State<Arc<ProviderState>>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response<Body> {
+    let valid = form.get("token").map(String::as_str) == Some("stored-refresh")
+        && form.get("token_type_hint").map(String::as_str) == Some("refresh_token")
+        && form.get("client_id").map(String::as_str) == Some("client-123")
+        && form.get("client_secret").map(String::as_str) == Some("secret-123")
+        && form.len() == 4;
+    *state.revocation_form.lock().unwrap() = Some(form);
+    if !valid {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "invalid_request"}).to_string(),
+        );
+    }
+    match state.token_behavior {
+        TokenBehavior::Success => json_response(StatusCode::OK, "{}".to_owned()),
+        TokenBehavior::NoRevocation | TokenBehavior::Reject => {
+            json_response(StatusCode::NOT_FOUND, "{}".to_owned())
+        }
+        TokenBehavior::Oversized => oversized_chunked_response(),
+        _ => json_response(StatusCode::INTERNAL_SERVER_ERROR, "{}".to_owned()),
+    }
+}
+
+async fn userinfo(State(state): State<Arc<ProviderState>>, headers: HeaderMap) -> Response<Body> {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    *state.userinfo_bearer.lock().unwrap() = Some(bearer.clone());
+    if bearer != "Bearer memory-only-access" {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "invalid_token"}).to_string(),
+        );
+    }
+    json_response(
+        StatusCode::OK,
+        json!({
+            "sub": "subject-123",
+            "name": "Ada Managed",
+            "picture": "https://images.example/managed.png",
+            "locale": "en-GB"
+        })
+        .to_string(),
+    )
 }
 
 async fn jwks(State(state): State<Arc<ProviderState>>) -> Response<Body> {
@@ -333,6 +459,18 @@ async fn jwks(State(state): State<Arc<ProviderState>>) -> Response<Body> {
     )
 }
 
+fn oversized_chunked_response() -> Response<Body> {
+    let stream = futures_util::stream::iter([
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![b'x'; TOKEN_BODY_LIMIT])),
+        Ok(Bytes::from_static(b"overflow")),
+    ]);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
 fn json_response(status: StatusCode, body: String) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -342,20 +480,34 @@ fn json_response(status: StatusCode, body: String) -> Response<Body> {
 }
 
 async fn start_provider(behavior: TokenBehavior, rotate_jwks: bool) -> TestProvider {
+    start_provider_with_scope(behavior, rotate_jwks, None).await
+}
+
+async fn start_provider_with_scope(
+    behavior: TokenBehavior,
+    rotate_jwks: bool,
+    token_scope: Option<&str>,
+) -> TestProvider {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let state = Arc::new(ProviderState {
         token: sign(&claims(&origin), TEST_KID),
         origin: origin.clone(),
         token_behavior: behavior,
+        token_scope: token_scope.map(str::to_owned),
         token_calls: AtomicUsize::new(0),
         jwks_calls: AtomicUsize::new(0),
         rotate_jwks,
         submitted_form: std::sync::Mutex::new(None),
+        renewal_attempt: std::sync::Mutex::new(None),
+        revocation_form: std::sync::Mutex::new(None),
+        userinfo_bearer: std::sync::Mutex::new(None),
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/token", post(token))
+        .route("/revoke", post(revoke_token))
+        .route("/userinfo", get(userinfo))
         .route("/jwks", get(jwks))
         .with_state(Arc::clone(&state));
     let task = tokio::spawn(async move {
@@ -377,6 +529,7 @@ async fn controlled_provider_success_refreshes_unknown_kid_once_and_discards_tok
         .await
         .unwrap();
     assert_eq!(identity.subject, "subject-123");
+    assert!(identity.renewable_credential.is_none());
     assert_eq!(provider.state.token_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.state.jwks_calls.load(Ordering::SeqCst), 2);
     let form = provider.state.submitted_form.lock().unwrap();
@@ -392,6 +545,289 @@ async fn controlled_provider_success_refreshes_unknown_kid_once_and_discards_tok
     );
     assert!(!form.contains_key("scope"));
     assert!(!form.contains_key("refresh_token"));
+}
+
+#[tokio::test]
+async fn identity_proof_uses_nonrenewable_scopes_and_discards_provider_material() {
+    let provider = start_provider(TokenBehavior::Success, false).await;
+    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+    let mut request = callback_request(&provider.origin);
+    request.profile = ProviderRequestProfile::IdentityProof;
+    let identity = client.exchange_code(request).await.unwrap();
+    assert_eq!(identity.subject, "subject-123");
+    assert!(identity.renewable_credential.is_none());
+    assert_eq!(provider.state.token_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn managed_callback_retains_only_exact_adapter_declared_scopes() {
+    let provider = start_provider(TokenBehavior::Success, false).await;
+    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+    let mut request = callback_request(&provider.origin);
+    request.profile = ProviderRequestProfile::ManagedProfile;
+    let identity = client.exchange_code(request).await.unwrap();
+    let credential = identity
+        .renewable_credential
+        .expect("explicit managed policy and exact scopes retain renewable credential");
+    assert_eq!(credential.value.as_slice(), b"renewable-secret");
+    assert_eq!(
+        credential.granted_scopes,
+        ["offline_access", "openid", "profile"].map(str::to_owned)
+    );
+}
+
+#[tokio::test]
+async fn managed_callback_scope_omission_and_explicit_exact_set_are_strict() {
+    for (scope, accepted) in [
+        (None, true),
+        (Some("profile offline_access openid"), true),
+        (Some("openid profile"), false),
+        (Some("offline_access openid profile email"), false),
+        (Some("offline_access openid profile profile"), false),
+    ] {
+        let provider = start_provider_with_scope(TokenBehavior::Success, false, scope).await;
+        let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+        let mut request = callback_request(&provider.origin);
+        request.profile = ProviderRequestProfile::ManagedProfile;
+        let result = client.exchange_code(request).await;
+        if accepted {
+            let credential = result
+                .expect("omitted or reordered exact managed scope is valid")
+                .renewable_credential
+                .expect("valid managed response retains renewable credential");
+            assert_eq!(
+                credential.granted_scopes,
+                ["offline_access", "openid", "profile"].map(str::to_owned)
+            );
+        } else {
+            assert_eq!(result, Err(ProviderExchangeError::InvalidProof));
+        }
+        assert_eq!(provider.state.token_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn managed_connection_records_discovered_revocation_as_optional_provider_truth() {
+    let provider = start_provider(TokenBehavior::NoRevocation, false).await;
+    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+    let mut request = callback_request(&provider.origin);
+    request.profile = ProviderRequestProfile::ManagedProfile;
+    let credential = client
+        .exchange_code(request)
+        .await
+        .expect("revocation is optional for renewable managed credentials")
+        .renewable_credential
+        .expect("managed response retains renewable material");
+    assert!(!credential.supports_revocation);
+    assert_eq!(provider.state.token_calls.load(Ordering::SeqCst), 1);
+}
+
+struct TestSecretResolver;
+
+#[async_trait::async_trait]
+impl ProviderSecretResolver for TestSecretResolver {
+    async fn resolve(
+        &self,
+        secret_ref: &str,
+    ) -> Result<Zeroizing<String>, crate::application::ApplicationError> {
+        if secret_ref != "secret://managed-test" {
+            return Err(crate::application::ApplicationError::NotFound);
+        }
+        Ok(Zeroizing::new("secret-123".to_owned()))
+    }
+}
+
+fn managed_guard(origin: &str) -> ConnectionGuard {
+    ConnectionGuard {
+        connection_id: uuid::Uuid::new_v4(),
+        project_id: uuid::Uuid::new_v4(),
+        provider_configuration_id: uuid::Uuid::new_v4(),
+        linked_identity_id: uuid::Uuid::new_v4(),
+        user_id: uuid::Uuid::new_v4(),
+        connection_revision: 1,
+        connection_generation: 1,
+        credential_generation: 1,
+        project_security_revision: 1,
+        provider_revision: 1,
+        managed_profile_revision: 1,
+        adapter_key: "controlled_oidc_profile_v1".to_owned(),
+        adapter_capability_revision: 1,
+        required_scopes: ["offline_access", "openid", "profile"]
+            .map(str::to_owned)
+            .to_vec(),
+        user_security_revision: 1,
+        identity_revision: 1,
+        consecutive_failures: 0,
+        issuer: origin.to_owned(),
+        subject: "subject-123".to_owned(),
+        client_id: "client-123".to_owned(),
+        secret_ref: "secret://managed-test".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn managed_refresh_body_attempt_header_and_userinfo_token_are_confined() {
+    let provider = start_provider(TokenBehavior::Success, false).await;
+    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+    let adapter = RestrictedOidcManagedProfileAdapter::new(client, Arc::new(TestSecretResolver));
+    let guard = managed_guard(&provider.origin);
+    let attempt = uuid::Uuid::new_v4();
+    let ProviderRenewalResult::Success(renewed) = adapter
+        .renew(&guard, Zeroizing::new(b"stored-refresh".to_vec()), attempt)
+        .await
+    else {
+        panic!("controlled refresh must succeed")
+    };
+    assert_eq!(renewed.renewable.as_slice(), b"rotated-refresh");
+    assert_eq!(renewed.access.as_slice(), b"memory-only-access");
+    {
+        let captured_form = provider.state.submitted_form.lock().unwrap();
+        let form = captured_form.as_ref().expect("refresh form captured");
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            form.get("refresh_token").map(String::as_str),
+            Some("stored-refresh")
+        );
+        assert!(!form.contains_key("code"));
+    }
+    let expected_attempt = attempt.to_string();
+    assert_eq!(
+        provider.state.renewal_attempt.lock().unwrap().as_deref(),
+        Some(expected_attempt.as_str())
+    );
+
+    let profile = adapter
+        .fetch_profile(&guard, renewed.access)
+        .await
+        .expect("memory-only access token reads UserInfo");
+    assert_eq!(
+        profile.profile.display_name,
+        Some(ProfileDisplayName::parse("Ada Managed".to_owned()).unwrap())
+    );
+    assert_eq!(
+        provider.state.userinfo_bearer.lock().unwrap().as_deref(),
+        Some("Bearer memory-only-access")
+    );
+    assert_ne!(
+        provider.state.userinfo_bearer.lock().unwrap().as_deref(),
+        Some("Bearer stored-refresh")
+    );
+}
+
+#[tokio::test]
+async fn managed_renewal_scope_omission_uses_only_the_frozen_exact_grant() {
+    for (scope, accepted) in [
+        (None, true),
+        (Some("profile offline_access openid"), true),
+        (Some("openid profile"), false),
+        (Some("offline_access openid profile email"), false),
+        (Some("offline_access openid profile profile"), false),
+    ] {
+        let provider = start_provider_with_scope(TokenBehavior::Success, false, scope).await;
+        let adapter = RestrictedOidcManagedProfileAdapter::new(
+            RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
+            Arc::new(TestSecretResolver),
+        );
+        let result = adapter
+            .renew(
+                &managed_guard(&provider.origin),
+                Zeroizing::new(b"stored-refresh".to_vec()),
+                uuid::Uuid::new_v4(),
+            )
+            .await;
+        if accepted {
+            let ProviderRenewalResult::Success(renewed) = result else {
+                panic!("omitted or reordered exact renewal scope must succeed")
+            };
+            assert_eq!(
+                renewed.granted_scopes,
+                ["offline_access", "openid", "profile"].map(str::to_owned)
+            );
+        } else {
+            assert!(matches!(result, ProviderRenewalResult::ScopeLost));
+        }
+        assert_eq!(provider.state.token_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn managed_revocation_is_capability_aware_and_body_confined() {
+    for (behavior, expected) in [
+        (TokenBehavior::Success, ProviderRevocationResult::Confirmed),
+        (TokenBehavior::Reject, ProviderRevocationResult::Unsupported),
+        (TokenBehavior::Fail, ProviderRevocationResult::Ambiguous),
+        (
+            TokenBehavior::Oversized,
+            ProviderRevocationResult::Ambiguous,
+        ),
+    ] {
+        let provider = start_provider(behavior, false).await;
+        let adapter = RestrictedOidcManagedProfileAdapter::new(
+            RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
+            Arc::new(TestSecretResolver),
+        );
+        assert_eq!(
+            adapter
+                .revoke(
+                    &managed_guard(&provider.origin),
+                    Zeroizing::new(b"stored-refresh".to_vec()),
+                )
+                .await,
+            expected
+        );
+        let captured = provider.state.revocation_form.lock().unwrap();
+        let form = captured.as_ref().expect("revocation form captured");
+        assert_eq!(
+            form.get("token").map(String::as_str),
+            Some("stored-refresh")
+        );
+        assert_eq!(
+            form.get("token_type_hint").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(form.len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn managed_revocation_endpoint_removal_is_unsupported_without_token_dispatch() {
+    let provider = start_provider(TokenBehavior::NoRevocation, false).await;
+    let adapter = RestrictedOidcManagedProfileAdapter::new(
+        RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
+        Arc::new(TestSecretResolver),
+    );
+    assert_eq!(
+        adapter
+            .revoke(
+                &managed_guard(&provider.origin),
+                Zeroizing::new(b"stored-refresh".to_vec()),
+            )
+            .await,
+        ProviderRevocationResult::Unsupported
+    );
+    assert!(provider.state.revocation_form.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn managed_renewal_rejects_oversized_chunked_response_without_buffering_it() {
+    let provider = start_provider(TokenBehavior::Oversized, false).await;
+    let adapter = RestrictedOidcManagedProfileAdapter::new(
+        RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
+        Arc::new(TestSecretResolver),
+    );
+    assert!(matches!(
+        adapter
+            .renew(
+                &managed_guard(&provider.origin),
+                Zeroizing::new(b"stored-refresh".to_vec()),
+                uuid::Uuid::new_v4(),
+            )
+            .await,
+        ProviderRenewalResult::AmbiguousAfterDispatch
+    ));
 }
 
 #[tokio::test]
@@ -509,10 +945,11 @@ async fn authorization_request_has_only_the_fixed_oidc_profile() {
             state: "state-123".to_owned(),
             nonce: "nonce-123".to_owned(),
             pkce_challenge: "c".repeat(43),
+            profile: ProviderRequestProfile::Login,
         })
         .await
         .unwrap();
-    let url = Url::parse(&url).unwrap();
+    let url = Url::parse(&url.url).unwrap();
     assert_eq!(url.path(), "/authorize");
     let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
     assert_eq!(query.len(), 9);
@@ -567,6 +1004,7 @@ async fn redirects_oversized_documents_and_endpoint_mismatch_fail_before_dispatc
                 state: "state".to_owned(),
                 nonce: "nonce".to_owned(),
                 pkce_challenge: "c".repeat(43),
+                profile: ProviderRequestProfile::Login,
             })
             .await
             .unwrap_err();

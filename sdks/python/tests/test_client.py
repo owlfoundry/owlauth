@@ -99,6 +99,8 @@ def projection(revision: int = 1) -> dict[str, object]:
         "projection_revision": revision,
         "display_name": "A User",
         "picture_url": "https://images.example/avatar.png",
+        "locale": "en-GB",
+        "verified_email": None,
         "status": "active",
         "created_at": NOW.isoformat(),
         "updated_at": NOW.isoformat(),
@@ -445,6 +447,9 @@ def test_public_config_jwks_and_malformed_or_mismatched_responses() -> None:
                 "application_display_name": "Application",
                 "publishable_keys": [PUBLISHABLE],
                 "providers": [{"key": "oidc", "display_name": "OIDC", "kind": "oidc"}],
+                "email_available": False,
+                "email_otp_enabled": False,
+                "email_magic_link_enabled": False,
                 "login_available": True,
             },
         ),
@@ -516,3 +521,46 @@ def test_secret_value_requires_explicit_reveal() -> None:
     assert token.reveal() == "recognizable-secret"
     assert "recognizable-secret" not in str(token)
     assert "recognizable-secret" not in repr(token)
+
+
+def test_user_projection_requires_exact_schema_and_explicit_nullable_fields() -> None:
+    def current_response(wire_projection: dict[str, object]) -> TransportResponse:
+        return response(
+            200,
+            {
+                "project_id": PROJECT,
+                "application_id": APPLICATION,
+                "user_id": "usr_public",
+                "projection": wire_projection,
+                "projection_revision": 1,
+                "authenticated_at": NOW.isoformat(),
+                "session_expires_at": (NOW + timedelta(days=30)).isoformat(),
+            },
+        )
+
+    nullable = projection()
+    nullable["locale"] = None
+    nullable["verified_email"] = None
+    accepted = make_client(FakeTransport(current_response(nullable))).current_user(
+        SecretValue("access", "access token")
+    )
+    assert accepted.projection.locale is None
+    assert accepted.projection.verified_email is None
+
+    fixture_path = (
+        Path(__file__).parents[2] / "spec" / "fixtures" / "user-projection-invalid-values.json"
+    )
+    fixture = json.loads(fixture_path.read_text())
+    fixture_invalid = [
+        {**fixture["projection"], patch["field"]: patch["value"]}
+        for patch in fixture["invalidPatches"]
+    ]
+    wrong_schema = {**projection(), "projection_schema": "owlauth.project_user.v1"}
+    missing_locale = projection()
+    del missing_locale["locale"]
+    unknown_field = {**projection(), "unexpected": True}
+    for invalid in (wrong_schema, missing_locale, unknown_field, *fixture_invalid):
+        with pytest.raises(ProtocolError):
+            make_client(FakeTransport(current_response(invalid))).current_user(
+                SecretValue("access", "access token")
+            )

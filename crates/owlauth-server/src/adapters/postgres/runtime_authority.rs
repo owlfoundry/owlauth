@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
@@ -11,7 +13,8 @@ use crate::{
     application::{
         AccessTokenSessionLookup, AdmittedProviderMethod, ApplicationError, BrowserLogoutContext,
         CurrentSession, HostedInteraction, HostedProviderMethod, LoginStartContext,
-        ProviderRuntimeContext, RuntimeAuthorityRepository, VerificationKey, VersionedDigest,
+        ProviderRuntimeContext, RuntimeAuthorityRepository, RuntimeProtector, VerificationKey,
+        VersionedDigest,
     },
     domain::LoginTransactionStatus,
 };
@@ -26,16 +29,85 @@ use super::{
         project_browser_session, project_key_ring, project_policy, project_signing_key,
         project_user, provider_configuration, refresh_family,
     },
+    runtime_incarnation::RuntimeIncarnationFence,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PostgresRuntimeAuthorityRepository {
     database: DatabaseConnection,
+    runtime_incarnation: RuntimeIncarnationFence,
+    required_runtime_process_ids: Vec<String>,
+    runtime_protector: Option<Arc<dyn RuntimeProtector>>,
 }
 
 impl PostgresRuntimeAuthorityRepository {
+    #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self { database }
+        Self::new_with_runtime_identity(
+            database,
+            "runtime-1".to_owned(),
+            Uuid::nil(),
+            vec!["runtime-1".to_owned()],
+        )
+    }
+
+    #[allow(
+        dead_code,
+        reason = "tests and non-HTTP compositions may omit projection PII authority"
+    )]
+    pub(crate) fn new_with_runtime_identity(
+        database: DatabaseConnection,
+        runtime_process_id: String,
+        runtime_incarnation: Uuid,
+        required_runtime_process_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::new(
+                runtime_process_id,
+                runtime_incarnation,
+            ),
+            required_runtime_process_ids,
+            runtime_protector: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_runtime_protector(
+        database: DatabaseConnection,
+        runtime_protector: Arc<dyn RuntimeProtector>,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::test_default(),
+            required_runtime_process_ids: vec!["runtime-1".to_owned()],
+            runtime_protector: Some(runtime_protector),
+        }
+    }
+
+    pub(crate) fn new_with_runtime_identity_and_protector(
+        database: DatabaseConnection,
+        runtime_process_id: String,
+        runtime_incarnation: Uuid,
+        required_runtime_process_ids: Vec<String>,
+        runtime_protector: Arc<dyn RuntimeProtector>,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::new(
+                runtime_process_id,
+                runtime_incarnation,
+            ),
+            required_runtime_process_ids,
+            runtime_protector: Some(runtime_protector),
+        }
+    }
+
+    async fn lock_local_runtime_incarnation<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+    ) -> Result<(), ApplicationError> {
+        self.runtime_incarnation.lock(connection).await
     }
 }
 
@@ -53,6 +125,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         redirect_uri: &str,
     ) -> Result<LoginStartContext, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
@@ -105,12 +178,8 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .all(&transaction)
             .await
             .map_err(persistence)?;
-        if assignments.is_empty() || assignments.len() > 50 {
-            return Err(if assignments.is_empty() {
-                ApplicationError::Disabled
-            } else {
-                ApplicationError::Integrity
-            });
+        if assignments.len() > 50 {
+            return Err(ApplicationError::Integrity);
         }
         let mut admitted_providers = Vec::with_capacity(assignments.len());
         for assignment in assignments {
@@ -134,6 +203,45 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                 assignment_security_revision: assignment.security_revision,
             });
         }
+        let admitted_email = transaction
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT policy.policy_revision, policy.security_revision, assignment.security_revision AS assignment_security_revision, policy.otp_enabled, policy.magic_link_enabled, policy.otp_digits, policy.otp_validity_seconds, policy.otp_max_attempts, policy.resend_after_seconds, policy.max_generations, policy.magic_validity_seconds, policy.signup_enabled, policy.transferred_magic_link_enabled, CASE WHEN smtp.id IS NOT NULL THEN 'project' ELSE 'deployment_default' END AS smtp_selection_kind, smtp.id AS smtp_configuration_id, COALESCE(smtp.generation, deployment.generation) AS smtp_generation, COALESCE(smtp.security_eligibility_revision, deployment.security_eligibility_revision) AS smtp_security_eligibility_revision FROM project_email_policies policy JOIN application_email_assignments assignment ON assignment.project_id = policy.project_id AND assignment.application_id = $2 LEFT JOIN project_smtp_configurations smtp ON smtp.project_id = policy.project_id AND smtp.status = 'active' LEFT JOIN deployment_smtp_generations deployment ON deployment.status = 'active' AND policy.allow_deployment_default AND smtp.id IS NULL WHERE policy.project_id = $1 AND policy.status = 'enabled' AND assignment.status = 'active' AND EXISTS (SELECT 1 FROM runtime_process_incarnations local_runtime WHERE local_runtime.process_id=$4 AND local_runtime.process_incarnation=$5) AND EXISTS (SELECT 1 FROM email_protection_runtime_readiness protection JOIN runtime_process_incarnations protection_current ON protection_current.process_id=protection.process_id AND protection_current.process_incarnation=protection.process_incarnation WHERE protection.process_id=$4 AND protection.process_incarnation=$5 AND protection.state='ready' AND protection.lease_expires_at>transaction_timestamp()) AND ((smtp.id IS NOT NULL AND NOT EXISTS (SELECT required.process_id FROM jsonb_array_elements_text($3::jsonb) AS required(process_id) WHERE NOT EXISTS (SELECT 1 FROM project_smtp_runtime_readiness readiness WHERE readiness.project_id=smtp.project_id AND readiness.configuration_id=smtp.id AND readiness.generation=smtp.generation AND readiness.process_id=required.process_id AND readiness.state='ready' AND readiness.lease_expires_at>transaction_timestamp() AND EXISTS (SELECT 1 FROM runtime_process_incarnations current WHERE current.process_id=readiness.process_id AND current.process_incarnation=readiness.process_incarnation)))) OR (smtp.id IS NULL AND deployment.generation IS NOT NULL))",
+                vec![
+                    project.id.into(),
+                    application.id.into(),
+                    serde_json::json!(self.required_runtime_process_ids).into(),
+                    self.runtime_incarnation.process_id().to_owned().into(),
+                    self.runtime_incarnation.incarnation().into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?
+            .map(|row| -> Result<crate::application::AdmittedEmailMethod, ApplicationError> {
+                Ok(crate::application::AdmittedEmailMethod {
+                    policy_revision: row.try_get("", "policy_revision").map_err(persistence)?,
+                    security_revision: row.try_get("", "security_revision").map_err(persistence)?,
+                    assignment_security_revision: row.try_get("", "assignment_security_revision").map_err(persistence)?,
+                    otp_enabled: row.try_get("", "otp_enabled").map_err(persistence)?,
+                    magic_link_enabled: row.try_get("", "magic_link_enabled").map_err(persistence)?,
+                    otp_digits: row.try_get("", "otp_digits").map_err(persistence)?,
+                    otp_validity_seconds: row.try_get("", "otp_validity_seconds").map_err(persistence)?,
+                    otp_max_attempts: row.try_get("", "otp_max_attempts").map_err(persistence)?,
+                    resend_after_seconds: row.try_get("", "resend_after_seconds").map_err(persistence)?,
+                    max_generations: row.try_get("", "max_generations").map_err(persistence)?,
+                    magic_validity_seconds: row.try_get("", "magic_validity_seconds").map_err(persistence)?,
+                    signup_enabled: row.try_get("", "signup_enabled").map_err(persistence)?,
+                    transferred_magic_link_enabled: row.try_get("", "transferred_magic_link_enabled").map_err(persistence)?,
+                    smtp_selection_kind: row.try_get("", "smtp_selection_kind").map_err(persistence)?,
+                    smtp_configuration_id: row.try_get("", "smtp_configuration_id").map_err(persistence)?,
+                    smtp_generation: row.try_get("", "smtp_generation").map_err(persistence)?,
+                    smtp_security_eligibility_revision: row.try_get("", "smtp_security_eligibility_revision").map_err(persistence)?,
+                })
+            })
+            .transpose()?;
+        if admitted_providers.is_empty() && admitted_email.is_none() {
+            return Err(ApplicationError::Disabled);
+        }
         let result = LoginStartContext {
             project_id: project.id,
             project_public_id: project.public_id,
@@ -147,6 +255,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             claims_revision: policy.claims_revision,
             session_revision: policy.session_revision,
             admitted_providers,
+            admitted_email,
         };
         transaction.commit().await.map_err(persistence)?;
         Ok(result)
@@ -159,6 +268,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         now: OffsetDateTime,
     ) -> Result<HostedInteraction, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let login = login_transaction::Entity::find()
             .filter(login_transaction::Column::InteractionDigest.eq(interaction.value.to_vec()))
             .filter(
@@ -211,7 +321,6 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         let methods = login_transaction_method::Entity::find()
             .filter(login_transaction_method::Column::ProjectId.eq(login.project_id))
             .filter(login_transaction_method::Column::TransactionId.eq(login.id))
-            .filter(login_transaction_method::Column::MethodKind.eq("provider"))
             .order_by_asc(login_transaction_method::Column::MethodKey)
             .limit(51)
             .all(&transaction)
@@ -219,6 +328,79 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .map_err(persistence)?;
         if methods.is_empty() || methods.len() > 50 {
             return Err(ApplicationError::Integrity);
+        }
+        let email_method_recorded = methods.iter().any(|method| method.method_kind == "email");
+        let (email_available, email_otp_enabled, email_magic_link_enabled) =
+            if email_method_recorded {
+                let snapshot = transaction
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT snapshot.otp_enabled,snapshot.magic_link_enabled,
+                                CASE WHEN snapshot.smtp_selection_kind='deployment_default' THEN TRUE
+                                     ELSE NOT EXISTS (
+                                       SELECT required.process_id
+                                       FROM jsonb_array_elements_text($3::jsonb) AS required(process_id)
+                                       WHERE NOT EXISTS (
+                                         SELECT 1 FROM project_smtp_runtime_readiness readiness
+                                         WHERE readiness.project_id=snapshot.project_id
+                                           AND readiness.configuration_id=snapshot.smtp_configuration_id
+                                           AND readiness.generation=snapshot.smtp_generation
+                                           AND readiness.process_id=required.process_id
+                                           AND readiness.state='ready'
+                                           AND readiness.lease_expires_at>$4
+                                           AND EXISTS (
+                                             SELECT 1 FROM runtime_process_incarnations current
+                                             WHERE current.process_id=readiness.process_id
+                                               AND current.process_incarnation=readiness.process_incarnation)))
+                                     AND EXISTS (
+                                       SELECT 1 FROM runtime_process_incarnations local_runtime
+                                       WHERE local_runtime.process_id=$5
+                                         AND local_runtime.process_incarnation=$6)
+                                     AND EXISTS (
+                                       SELECT 1 FROM email_protection_runtime_readiness protection
+                                       JOIN runtime_process_incarnations protection_current
+                                         ON protection_current.process_id=protection.process_id
+                                        AND protection_current.process_incarnation=protection.process_incarnation
+                                       WHERE protection.process_id=$5
+                                         AND protection.process_incarnation=$6
+                                         AND protection.state='ready'
+                                         AND protection.lease_expires_at>$4) END AS smtp_ready
+                         FROM login_email_method_snapshots snapshot
+                         WHERE snapshot.project_id=$1 AND snapshot.transaction_id=$2",
+                        vec![
+                            login.project_id.into(),
+                            login.id.into(),
+                            serde_json::json!(self.required_runtime_process_ids).into(),
+                            now.into(),
+                            self.runtime_incarnation.process_id().to_owned().into(),
+                            self.runtime_incarnation.incarnation().into()
+                        ],
+                    ))
+                    .await
+                    .map_err(persistence)?
+                    .ok_or(ApplicationError::Integrity)?;
+                let smtp_ready: bool = snapshot.try_get("", "smtp_ready").map_err(persistence)?;
+                let otp: bool = snapshot.try_get("", "otp_enabled").map_err(persistence)?;
+                let magic: bool = snapshot
+                    .try_get("", "magic_link_enabled")
+                    .map_err(persistence)?;
+                (smtp_ready, smtp_ready && otp, smtp_ready && magic)
+            } else {
+                (false, false, false)
+            };
+        if email_method_recorded
+            && !email_otp_enabled
+            && !email_magic_link_enabled
+            && email_available
+        {
+            return Err(ApplicationError::Integrity);
+        }
+        if !email_available
+            && !methods
+                .iter()
+                .any(|method| method.method_kind == "provider")
+        {
+            return Err(ApplicationError::Disabled);
         }
         let result = HostedInteraction {
             transaction_id: login.id,
@@ -239,11 +421,15 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             presentation_hint: login.presentation_hint,
             providers: methods
                 .into_iter()
+                .filter(|method| method.method_kind == "provider")
                 .map(|method| HostedProviderMethod {
                     key: method.method_key,
                     display_name: method.display_name,
                 })
                 .collect(),
+            email_available,
+            email_otp_enabled,
+            email_magic_link_enabled,
             expires_at: login.expires_at,
         };
         transaction.commit().await.map_err(persistence)?;
@@ -257,6 +443,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         provider_key: &str,
     ) -> Result<ProviderRuntimeContext, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let login = login_transaction::Entity::find_by_id(transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(project_id))
             .lock_shared()
@@ -317,6 +504,8 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             client_id: provider.client_id,
             callback_url: provider.callback_url,
             secret_ref: provider.secret_ref.ok_or(ApplicationError::Integrity)?,
+            managed_profile_enabled: provider.managed_profile_enabled,
+            managed_profile_revision: provider.managed_profile_revision,
         };
         transaction.commit().await.map_err(persistence)?;
         Ok(result)
@@ -328,10 +517,13 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         application_public_id: &str,
         publishable_key: &str,
     ) -> Result<(Uuid, Uuid), ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -339,7 +531,8 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .filter(application::Column::ProjectId.eq(project.id))
             .filter(application::Column::PublicId.eq(application_public_id))
             .filter(application::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -348,11 +541,14 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .filter(application_publishable_key::Column::ApplicationId.eq(application.id))
             .filter(application_publishable_key::Column::PublicId.eq(publishable_key))
             .filter(application_publishable_key::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        Ok((project.id, application.id))
+        let result = (project.id, application.id);
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 
     async fn resolve_public_application(
@@ -360,10 +556,13 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         project_public_id: &str,
         application_public_id: &str,
     ) -> Result<(Uuid, Uuid), ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -371,11 +570,14 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .filter(application::Column::ProjectId.eq(project.id))
             .filter(application::Column::PublicId.eq(application_public_id))
             .filter(application::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        Ok((project.id, application.id))
+        let result = (project.id, application.id);
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 
     async fn exact_application_origin(
@@ -384,7 +586,28 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         application_id: Uuid,
         origin: &str,
     ) -> Result<bool, ApplicationError> {
-        exact_application_origin(&self.database, project_id, application_id, origin).await
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
+        let project = project::Entity::find_by_id(project_id)
+            .filter(project::Column::Status.eq("active"))
+            .lock_shared()
+            .one(&transaction)
+            .await
+            .map_err(persistence)?;
+        let application = application::Entity::find_by_id(application_id)
+            .filter(application::Column::ProjectId.eq(project_id))
+            .filter(application::Column::Status.eq("active"))
+            .lock_shared()
+            .one(&transaction)
+            .await
+            .map_err(persistence)?;
+        let result = if project.is_some() && application.is_some() {
+            exact_application_origin(&transaction, project_id, application_id, origin).await?
+        } else {
+            false
+        };
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 
     async fn project_origin_allowed(
@@ -392,29 +615,37 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         project_public_id: &str,
         origin: &str,
     ) -> Result<bool, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        let Some(origin) = application_origin::Entity::find()
-            .filter(application_origin::Column::ProjectId.eq(project.id))
-            .filter(application_origin::Column::Origin.eq(origin))
-            .one(&self.database)
+        // Origins are not globally unique within a Project. Authorize when any exact owner is
+        // active; never route through an arbitrary disabled sibling application.
+        let result = transaction
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT application.id
+                 FROM applications application
+                 JOIN application_origins origin
+                   ON origin.project_id=application.project_id
+                  AND origin.application_id=application.id
+                 WHERE application.project_id=$1 AND application.status='active'
+                   AND origin.origin=$2
+                 ORDER BY application.id LIMIT 1
+                 FOR SHARE OF application,origin",
+                vec![project.id.into(), origin.to_owned().into()],
+            ))
             .await
             .map_err(persistence)?
-        else {
-            return Ok(false);
-        };
-        Ok(application::Entity::find_by_id(origin.application_id)
-            .filter(application::Column::ProjectId.eq(project.id))
-            .filter(application::Column::Status.eq("active"))
-            .one(&self.database)
-            .await
-            .map_err(persistence)?
-            .is_some())
+            .is_some();
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 
     async fn browser_session_reuse_available(
@@ -426,6 +657,26 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         if browser_credential.value.len() != 32 || browser_credential.key_version <= 0 {
             return Err(ApplicationError::InvalidInput);
         }
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
+        let Some(project) = project::Entity::find_by_id(project_id)
+            .lock_shared()
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+        else {
+            transaction.commit().await.map_err(persistence)?;
+            return Ok(false);
+        };
+        let Some(policy) = project_policy::Entity::find_by_id(project_id)
+            .lock_shared()
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+        else {
+            transaction.commit().await.map_err(persistence)?;
+            return Ok(false);
+        };
         let Some(session) = project_browser_session::Entity::find()
             .filter(project_browser_session::Column::ProjectId.eq(project_id))
             .filter(
@@ -436,10 +687,12 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                 project_browser_session::Column::CredentialDigestKeyVersion
                     .eq(browser_credential.key_version),
             )
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
         else {
+            transaction.commit().await.map_err(persistence)?;
             return Ok(false);
         };
         if !bool::from(
@@ -452,28 +705,17 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             || session.absolute_expires_at <= now
             || now < session.authenticated_at
         {
+            transaction.commit().await.map_err(persistence)?;
             return Ok(false);
         }
-        let Some(project) = project::Entity::find_by_id(project_id)
-            .one(&self.database)
-            .await
-            .map_err(persistence)?
-        else {
-            return Ok(false);
-        };
-        let Some(policy) = project_policy::Entity::find_by_id(project_id)
-            .one(&self.database)
-            .await
-            .map_err(persistence)?
-        else {
-            return Ok(false);
-        };
         let Some(user) = project_user::Entity::find_by_id(session.user_id)
             .filter(project_user::Column::ProjectId.eq(project_id))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
         else {
+            transaction.commit().await.map_err(persistence)?;
             return Ok(false);
         };
         let reuse_enabled = policy
@@ -486,7 +728,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .get("browser_session_reuse_max_age_seconds")
             .and_then(serde_json::Value::as_i64)
             .filter(|value| (0..=86_400).contains(value));
-        Ok(project.status == "active"
+        let result = project.status == "active"
             && user.status == "active"
             && session.project_security_revision == project.security_revision
             && session.user_security_revision == user.security_revision
@@ -494,7 +736,9 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             && reuse_enabled
             && reuse_max_age.is_some_and(|seconds| {
                 now - session.authenticated_at <= Duration::seconds(seconds)
-            }))
+            });
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 
     async fn verification_key(
@@ -503,10 +747,13 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         kid: &str,
         now: OffsetDateTime,
     ) -> Result<VerificationKey, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -514,7 +761,8 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .filter(project_key_ring::Column::ProjectId.eq(project.id))
             .filter(project_key_ring::Column::Purpose.eq("application_tokens"))
             .filter(project_key_ring::Column::Algorithm.eq("EdDSA"))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -522,7 +770,8 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .filter(project_signing_key::Column::ProjectId.eq(project.id))
             .filter(project_signing_key::Column::RingId.eq(ring.id))
             .filter(project_signing_key::Column::Kid.eq(kid))
-            .one(&self.database)
+            .lock_shared()
+            .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
@@ -531,12 +780,14 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         if !usable {
             return Err(ApplicationError::Disabled);
         }
-        Ok(VerificationKey {
+        let result = VerificationKey {
             project_id: project.id,
             project_public_id: project.public_id,
             issuer: ring.issuer,
             public_jwk: key.public_jwk,
-        })
+        };
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 
     async fn current_session(
@@ -553,6 +804,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             now,
         } = lookup;
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         let project = project::Entity::find_by_id(project_id)
             .filter(project::Column::Status.eq("active"))
             .lock_shared()
@@ -658,15 +910,31 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (projection, _) = super::projection::repair_projection(
-            &transaction,
-            projection,
-            &user,
-            policy.projection_revision,
-            application.projection_revision,
-            now,
-        )
-        .await?;
+        let (_projection, material) = if let Some(protector) = self.runtime_protector.as_deref() {
+            super::projection::repair_runtime_projection(
+                &transaction,
+                projection,
+                application.id,
+                &user,
+                policy.projection_revision,
+                application.projection_revision,
+                policy.projection_verified_email_enabled,
+                application.projection_verified_email_enabled,
+                protector,
+                now,
+            )
+            .await?
+        } else {
+            super::projection::repair_projection(
+                &transaction,
+                projection,
+                &user,
+                policy.projection_revision,
+                application.projection_revision,
+                now,
+            )
+            .await?
+        };
         let result = CurrentSession {
             project_id,
             project_public_id: project.public_id,
@@ -677,8 +945,8 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             application_session_id,
             browser_session_id,
             claims_revision,
-            projection_revision: projection.projection_revision,
-            projection_document: projection.document,
+            projection_revision: material.revision,
+            projection_document: material.document,
             authenticated_at: session.authenticated_at,
             absolute_expires_at: session.absolute_expires_at,
         };
@@ -691,7 +959,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         preparation: &VersionedDigest,
         now: OffsetDateTime,
     ) -> Result<BrowserLogoutContext, ApplicationError> {
-        let interaction = project_browser_logout_interaction::Entity::find()
+        let routed_interaction = project_browser_logout_interaction::Entity::find()
             .filter(
                 project_browser_logout_interaction::Column::PreparationDigest
                     .eq(preparation.value.to_vec()),
@@ -702,8 +970,36 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             )
             .one(&self.database)
             .await
+            .map_err(persistence)?;
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
+        let routed_interaction = routed_interaction.ok_or(ApplicationError::NotFound)?;
+        let project = project::Entity::find_by_id(routed_interaction.project_id)
+            .filter(project::Column::Status.eq("active"))
+            .lock_shared()
+            .one(&transaction)
+            .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
+        let interaction =
+            project_browser_logout_interaction::Entity::find_by_id(routed_interaction.id)
+                .filter(
+                    project_browser_logout_interaction::Column::ProjectId
+                        .eq(routed_interaction.project_id),
+                )
+                .filter(
+                    project_browser_logout_interaction::Column::PreparationDigest
+                        .eq(preparation.value.to_vec()),
+                )
+                .filter(
+                    project_browser_logout_interaction::Column::PreparationDigestKeyVersion
+                        .eq(preparation.key_version),
+                )
+                .lock_shared()
+                .one(&transaction)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::NotFound)?;
         if interaction.expires_at <= now
             || !matches!(interaction.status.as_str(), "prepared" | "csrf_bound")
             || interaction.preparation_digest.len() != preparation.value.len()
@@ -716,29 +1012,26 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        let project = project::Entity::find_by_id(interaction.project_id)
-            .filter(project::Column::Status.eq("active"))
-            .one(&self.database)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        Ok(BrowserLogoutContext {
+        let result = BrowserLogoutContext {
             project_id: project.id,
             project_public_id: project.public_id,
             interaction_revision: interaction.interaction_revision,
             expires_at: interaction.expires_at,
-        })
+        };
+        transaction.commit().await.map_err(persistence)?;
+        Ok(result)
     }
 }
 
-pub(crate) async fn exact_application_origin(
-    database: &DatabaseConnection,
+pub(crate) async fn exact_application_origin<C: ConnectionTrait>(
+    connection: &C,
     project_id: Uuid,
     application_id: Uuid,
     origin: &str,
 ) -> Result<bool, ApplicationError> {
     application_origin::Entity::find_by_id((project_id, application_id, origin.to_owned()))
-        .one(database)
+        .lock_shared()
+        .one(connection)
         .await
         .map_err(persistence)
         .map(|row| row.is_some())

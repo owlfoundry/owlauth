@@ -805,8 +805,7 @@ fn valid_projection(value: &crate::UserProjection) -> bool {
     !value.user_id.is_empty()
         && value.user_id.len() <= 96
         && value.user_revision > 0
-        && !value.projection_schema.is_empty()
-        && value.projection_schema.len() <= 64
+        && value.projection_schema == "owlauth.user.v1"
         && value.projection_revision > 0
         && value
             .display_name
@@ -816,8 +815,19 @@ fn valid_projection(value: &crate::UserProjection) -> bool {
             .picture_url
             .as_ref()
             .is_none_or(|url| url.len() <= 2048)
-        && !value.status.is_empty()
-        && value.status.len() <= 32
+        && value.locale.as_ref().is_none_or(|locale| {
+            (2..=35).contains(&locale.len())
+                && !locale.starts_with('-')
+                && !locale.ends_with('-')
+                && !locale.contains("--")
+                && locale
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        && value.verified_email.as_ref().is_none_or(|email| {
+            (3..=320).contains(&email.len()) && !email.chars().any(char::is_control)
+        })
+        && value.status == "active"
         && parse_time(&value.created_at, "projection").is_ok()
         && parse_time(&value.updated_at, "projection").is_ok()
 }

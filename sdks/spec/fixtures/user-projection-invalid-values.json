@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 2,
+  "synthetic": true,
+  "projection": {
+    "user_id": "usr_conformance",
+    "user_revision": 1,
+    "projection_schema": "owlauth.user.v1",
+    "projection_revision": 1,
+    "display_name": null,
+    "picture_url": null,
+    "locale": null,
+    "verified_email": null,
+    "status": "active",
+    "created_at": "2099-01-01T00:00:00Z",
+    "updated_at": "2099-01-01T00:00:00Z"
+  },
+  "invalidPatches": [
+    { "name": "non-canonical-status", "field": "status", "value": "disabled" },
+    { "name": "short-locale", "field": "locale", "value": "e" },
+    { "name": "structurally-invalid-locale", "field": "locale", "value": "en_US" },
+    { "name": "short-email", "field": "verified_email", "value": "ab" },
+    { "name": "control-character-email", "field": "verified_email", "value": "bad\u0007@example.test" }
+  ]
+}

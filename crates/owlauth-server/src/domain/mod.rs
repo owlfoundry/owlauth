@@ -1,15 +1,30 @@
 mod application;
 #[allow(
     dead_code,
+    reason = "email lane domain is exercised through Runtime and PostgreSQL"
+)]
+mod email;
+#[allow(
+    dead_code,
     reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 mod identity;
+#[allow(
+    dead_code,
+    reason = "identity mutation application and persistence integration follows this domain slice"
+)]
+mod identity_mutation;
 mod key;
 #[allow(
     dead_code,
     reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 mod login;
+#[allow(
+    dead_code,
+    reason = "domain transition matrix is exercised directly and persistence enforces the same states"
+)]
+mod managed_connection;
 mod project;
 #[allow(
     dead_code,
@@ -24,6 +39,11 @@ mod provider;
 mod session;
 
 pub(crate) use application::{ApplicationStatus, ApplicationType, BrowserOrigin, RedirectUri};
+#[allow(unused_imports, reason = "email lane is integrated incrementally")]
+pub(crate) use email::{
+    CanonicalEmail, EmailChallengeState, EmailChallengeStatus, EmailProofPolicy,
+    EmailValidationError, generate_decimal_otp,
+};
 #[allow(
     unused_imports,
     reason = "authentication application and persistence integration follows this domain-only slice"
@@ -33,12 +53,34 @@ pub(crate) use identity::{
     ProfileDisplayName, ProfileLocale, ProfilePictureUrl, ProjectUserStatus, ProviderIssuer,
     ProviderSubject, UserProfileInputs, UserRevision,
 };
+#[allow(
+    unused_imports,
+    reason = "identity mutation application and persistence integration follows this domain slice"
+)]
+pub(crate) use identity_mutation::{
+    ExistingIdentitySnapshot, IdentityKind, IdentityMutationEffect, IdentityMutationIntent,
+    IdentityMutationKind, IdentityMutationPlan, IdentityMutationProofSlot,
+    IdentityMutationSlotRole, IdentityMutationSlotState, IdentityMutationSlotTarget,
+    IdentityMutationStatus, IdentityProofEvidence, IdentityProofReceiptSnapshot,
+    IdentityProofReceiptStatus, InteractionBrowserBinding, ProofMethodAuthority,
+    ProviderProofCapabilitySnapshot, RestoredIdentityMutationIntent,
+    RestoredIdentityMutationProofSlot, RestoredIdentityProofReceipt,
+    TrustedRuntimeProviderCallback,
+};
 pub(crate) use key::SigningKeyState;
 #[allow(
     unused_imports,
     reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 pub(crate) use login::LoginTransactionStatus;
+#[allow(
+    unused_imports,
+    reason = "managed connection application lane uses this domain contract"
+)]
+pub(crate) use managed_connection::{
+    ManagedConnectionEvent, ManagedConnectionLifecycle, ManagedConnectionState,
+    ManagedProfileCapability, RenewalReplay,
+};
 pub(crate) use project::{
     DisplayName, MAX_ACCESS_TOKEN_LIFETIME_SECONDS, MIN_ACCESS_TOKEN_LIFETIME_SECONDS, OpaqueOwner,
     ProjectStatus, PublicId,
@@ -74,4 +116,6 @@ pub(crate) enum DomainError {
     InvalidUrl,
     #[error("state transition is not allowed")]
     InvalidTransition,
+    #[error("value is outside the supported bounds")]
+    InvalidValue,
 }

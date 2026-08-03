@@ -46,6 +46,7 @@ export function ProviderPanel({
       issuer: fieldText(fields, "issuer"),
       client_id: fieldText(fields, "client_id"),
       client_secret: fieldText(fields, "client_secret"),
+      managed_profile_enabled: fields.get("managed_profile_enabled") === "on",
       expected_project_revision: project.metadata_revision,
     };
     try {
@@ -215,6 +216,9 @@ export function ProviderPanel({
           autoComplete="new-password"
           maxLength={4096}
         />
+        <label>
+          <input name="managed_profile_enabled" type="checkbox" /> Enable managed profile sync
+        </label>
         <button type="submit" disabled={project.status !== "active"}>
           Configure provider
         </button>
@@ -230,6 +234,18 @@ export function ProviderPanel({
                   <strong>{provider.display_name}</strong> — {provider.status}
                   <p>
                     Key: {provider.provider_key}; callback: <code>{provider.callback_url}</code>
+                  </p>
+                  <p>
+                    Managed profile: {provider.managed_profile.enabled ? "enabled" : "disabled"};
+                    capability: {provider.managed_profile.supported ? "supported" : "unsupported"};
+                    scopes: {provider.managed_profile.exact_scopes.join(" ") || "none"}; source:{" "}
+                    {provider.managed_profile.profile_schema}; read retry:{" "}
+                    {provider.managed_profile.read_retry_safe ? "safe" : "unsafe"}; renewal replay:{" "}
+                    {provider.managed_profile.renewal_idempotent_replay
+                      ? "supported"
+                      : "unsupported"}
+                    ; revoke:{" "}
+                    {provider.managed_profile.supports_revocation ? "supported" : "unsupported"}
                   </p>
                 </div>
                 {provider.status === "active" ? (

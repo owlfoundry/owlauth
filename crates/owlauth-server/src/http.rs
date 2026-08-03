@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
@@ -33,29 +34,59 @@ use uuid::Uuid;
 
 use crate::{
     adapters::{
-        oidc::RestrictedOidcProviderClient,
+        oidc::{RestrictedOidcManagedProfileAdapter, RestrictedOidcProviderClient},
         postgres::{
-            DatabasePools, authentication::PostgresAuthenticationRepository,
+            DatabasePools,
+            authentication::PostgresAuthenticationRepository,
             control_lifecycle::PostgresControlLifecycleRepository,
-            provisioning::PostgresProvisioningAdapter, readiness::PostgresReadinessAdapter,
+            email::PostgresPasswordlessEmailRepository,
+            email_control::PostgresEmailControlRepository,
+            identity_mutation::{
+                PostgresControlIdentityMutationRepository,
+                PostgresRuntimeIdentityMutationRepository,
+            },
+            managed_connection::PostgresManagedConnectionRepository,
+            managed_reauthorization::PostgresManagedReauthorizationRepository,
+            projection::PostgresIdentityProjectionMaterializer,
+            provider_callback::PostgresProviderCallbackOwnerResolver,
+            provisioning::PostgresProvisioningAdapter,
+            readiness::PostgresReadinessAdapter,
             runtime_authority::PostgresRuntimeAuthorityRepository,
             session_authority::PostgresSessionAuthorityRepository,
         },
         redis_admission::RedisAdmissionCounter,
         runtime_security::{
-            EncryptedFileProviderSecretResolver, EncryptedFileRuntimeSigner, RuntimeKeyMaterial,
-            SoftwareRuntimeProtector,
+            EncryptedFileProviderSecretResolver, EncryptedFileRuntimeSigner,
+            ManagedCredentialKeyMaterial, RuntimeKeyMaterial, SoftwareDurableEmailAddressReader,
+            SoftwareIdentityMutationCandidateVerifier,
+            SoftwareIdentityMutationDurableEmailProtector,
+            SoftwareIdentityMutationProofMaterialProtector, SoftwareIdentityMutationTargetIssuer,
+            SoftwareIdentityMutationTargetVerifier, SoftwareManagedCredentialProtector,
+            SoftwareManagedReauthorizationTargetIssuer,
+            SoftwareManagedReauthorizationTargetVerifier, SoftwareProjectionVerifiedEmailProtector,
+            SoftwareRuntimeProtector, SplitRuntimeProtector, UnavailableDurableEmailAddressReader,
         },
-        software_store::EncryptedFileStore,
+        smtp::{ForbiddenSmtpDestinations, SafeSmtpTransport},
+        software_store::{EncryptedFileStore, WriteOnlyEncryptedFileProvisioner},
         system::{Sha256RequestDigester, SystemClock, SystemEntropy},
     },
     application::{
         self, AdmissionDecision, AdmissionDimension, AdmissionDimensionKind, AdmissionEndpoint,
-        AdmissionService, ApplicationError, BeginLogin, ConfirmProjectBrowserLogout,
-        ConfirmSessionReuse, ControlLifecycleService, CreateApplication, CreateProject,
-        CreateProvider, ExchangeHandoff, ProviderCallback, ProvisioningInfrastructure,
+        AdmissionService, ApplicationError, BeginEmailChallenge, BeginLogin, Clock,
+        ConfirmProjectBrowserLogout, ConfirmSessionReuse, ControlLifecycleService,
+        CreateApplication, CreateManagedReauthorization, CreateProject, CreateProvider,
+        CreateSmtpConfiguration, DurableEmailAddressReader, EmailControlService, ExchangeHandoff,
+        IdentityMutationControlService, IdentityMutationProviderCapability,
+        IdentityMutationRuntimeService, MailWorker, ManagedConnectionMetadata,
+        ManagedConnectionRepository, ManagedConnectionService, ManagedInteractionCleanupService,
+        ManagedReauthorizationCallback, ManagedReauthorizationCallbackOutcome,
+        ManagedReauthorizationControlService, ManagedReauthorizationDenial,
+        ManagedReauthorizationRuntimeService, ManagedReauthorizationTargetVerifier,
+        ProjectionVerifiedEmailProtector, ProviderCallback, ProviderCallbackDenial,
+        ProviderCallbackOwner, ProviderCallbackOwnerResolver, ProvisioningInfrastructure,
         ProvisioningService, ReadinessService, RefreshSession, ReplaceApplicationConfiguration,
-        RuntimeAuthService, SelectProvider, UpdateApplication, UpdateProject, UpdateProjectPolicy,
+        RuntimeAuthService, RuntimeProtector, SelectEmail, SelectProvider, SubmitEmailProof,
+        UpdateApplication, UpdateProject, UpdateProjectPolicy,
     },
     config::{ListenerConfig, OperatorApiKey, ServerConfig},
     domain::ApplicationType,
@@ -83,6 +114,122 @@ struct ProbeState {
     base_path: Arc<str>,
 }
 
+#[async_trait]
+trait IdentityMutationRuntimeAuthority: Send + Sync {
+    async fn bootstrap(
+        &self,
+        interaction: &str,
+        browser_binding: Option<&str>,
+    ) -> Result<application::IdentityMutationBootstrap, ApplicationError>;
+
+    async fn establish_magic_transfer_context(
+        &self,
+        challenge_id: Uuid,
+    ) -> Result<application::IdentityMutationMagicTransferGate, ApplicationError>;
+
+    async fn start_method(
+        &self,
+        command: application::StartIdentityMutationMethod,
+    ) -> Result<application::StartedIdentityMutationMethod, ApplicationError>;
+
+    async fn begin_email_challenge(
+        &self,
+        request: application::BeginIdentityMutationEmailChallenge,
+    ) -> Result<application::IdentityMutationEmailChallengeAccepted, ApplicationError>;
+
+    async fn verify_email_proof(
+        &self,
+        request: application::VerifyRawIdentityMutationEmailProof,
+    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError>;
+
+    async fn verify_magic_transfer(
+        &self,
+        request: application::VerifyIdentityMutationMagicTransferProof,
+    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError>;
+
+    async fn confirm_ready(
+        &self,
+        command: application::ConfirmIdentityMutationReady,
+    ) -> Result<application::IdentityMutationView, ApplicationError>;
+
+    async fn deny_provider_callback(
+        &self,
+        denial: application::IdentityMutationProviderDenial,
+    ) -> Result<application::IdentityMutationView, ApplicationError>;
+
+    async fn complete_provider_callback(
+        &self,
+        callback: application::IdentityMutationProviderCallback,
+    ) -> Result<application::IdentityMutationCallbackOutcome, ApplicationError>;
+}
+
+#[async_trait]
+impl IdentityMutationRuntimeAuthority for IdentityMutationRuntimeService {
+    async fn bootstrap(
+        &self,
+        interaction: &str,
+        browser_binding: Option<&str>,
+    ) -> Result<application::IdentityMutationBootstrap, ApplicationError> {
+        self.bootstrap(interaction, browser_binding).await
+    }
+
+    async fn establish_magic_transfer_context(
+        &self,
+        challenge_id: Uuid,
+    ) -> Result<application::IdentityMutationMagicTransferGate, ApplicationError> {
+        self.establish_magic_transfer_context(challenge_id).await
+    }
+
+    async fn start_method(
+        &self,
+        command: application::StartIdentityMutationMethod,
+    ) -> Result<application::StartedIdentityMutationMethod, ApplicationError> {
+        self.start_method(command).await
+    }
+
+    async fn begin_email_challenge(
+        &self,
+        request: application::BeginIdentityMutationEmailChallenge,
+    ) -> Result<application::IdentityMutationEmailChallengeAccepted, ApplicationError> {
+        self.begin_email_challenge(request).await
+    }
+
+    async fn verify_email_proof(
+        &self,
+        request: application::VerifyRawIdentityMutationEmailProof,
+    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError> {
+        self.verify_email_proof(request).await
+    }
+
+    async fn verify_magic_transfer(
+        &self,
+        request: application::VerifyIdentityMutationMagicTransferProof,
+    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError> {
+        self.verify_magic_transfer(request).await
+    }
+
+    async fn confirm_ready(
+        &self,
+        command: application::ConfirmIdentityMutationReady,
+    ) -> Result<application::IdentityMutationView, ApplicationError> {
+        self.confirm_ready(command).await
+    }
+
+    async fn deny_provider_callback(
+        &self,
+        denial: application::IdentityMutationProviderDenial,
+    ) -> Result<application::IdentityMutationView, ApplicationError> {
+        self.deny_provider_callback(denial).await
+    }
+
+    async fn complete_provider_callback(
+        &self,
+        callback: application::IdentityMutationProviderCallback,
+    ) -> Result<application::IdentityMutationCallbackOutcome, ApplicationError> {
+        self.complete_provider_callback(callback).await
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeState {
     probe: ProbeState,
@@ -90,8 +237,11 @@ struct RuntimeState {
     verified_origins: Arc<VerifiedApplicationOrigins>,
     readiness: Option<Arc<ReadinessService>>,
     auth: Option<Arc<RuntimeAuthService>>,
+    callback_owners: Option<Arc<dyn ProviderCallbackOwnerResolver>>,
+    managed_reauthorization: Option<Arc<ManagedReauthorizationRuntimeService>>,
     cookie_path: Arc<str>,
     external_origin: Arc<str>,
+    identity_mutations: Option<Arc<dyn IdentityMutationRuntimeAuthority>>,
 }
 
 #[derive(Clone)]
@@ -101,12 +251,27 @@ struct ControlState {
     descriptor: Arc<ServiceDescriptor>,
     provisioning: Option<Arc<ProvisioningService>>,
     lifecycle: Option<Arc<ControlLifecycleService>>,
+    email_control: Option<Arc<EmailControlService>>,
+    managed_connections: Option<Arc<PostgresManagedConnectionRepository>>,
+    managed_reauthorization: Option<Arc<ManagedReauthorizationControlService>>,
+    identity_mutations: Option<Arc<IdentityMutationControlService>>,
 }
 
 pub(crate) struct PlaneRouters {
     pub runtime: Option<Router>,
     pub control: Option<Router>,
     pub runtime_auth: Option<Arc<RuntimeAuthService>>,
+    pub managed_sync: Option<Arc<ManagedConnectionService>>,
+    #[allow(
+        dead_code,
+        reason = "test and worker composition inspection uses this named service"
+    )]
+    pub(crate) runtime_identity_mutations: Option<Arc<IdentityMutationRuntimeService>>,
+    #[allow(
+        dead_code,
+        reason = "test and worker composition inspection uses this named service"
+    )]
+    pub(crate) control_identity_mutations: Option<Arc<IdentityMutationControlService>>,
     runtime_ready: Arc<AtomicBool>,
     control_ready: Arc<AtomicBool>,
 }
@@ -127,16 +292,62 @@ impl PlaneRouters {
     }
 }
 
+#[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "composition keeps plane-specific dependencies and worker capabilities visible"
+)]
 pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>) -> PlaneRouters {
+    build_routers_with_runtime_incarnation(config, pools, Uuid::nil())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "composition keeps plane-specific dependencies and worker capabilities visible"
+)]
+pub(crate) fn build_routers_with_runtime_incarnation(
+    config: &ServerConfig,
+    pools: Option<&DatabasePools>,
+    runtime_incarnation: Uuid,
+) -> PlaneRouters {
     let runtime_ready = Arc::new(AtomicBool::new(false));
     let control_ready = Arc::new(AtomicBool::new(false));
-    let runtime_auth = (config.mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE)
+    let runtime_identity_mutations = config
+        .mode
+        .has_runtime()
         .then(|| {
             pools
                 .and_then(|pools| pools.runtime.clone())
-                .map(|database| build_runtime_auth_service(database, config))
+                .map(|database| {
+                    build_identity_mutation_runtime_service(database, config, runtime_incarnation)
+                })
         })
         .flatten();
+    let control_identity_mutations = config
+        .mode
+        .has_control()
+        .then(|| {
+            pools
+                .and_then(|pools| pools.control.clone())
+                .map(|database| build_identity_mutation_control_service(database, config))
+        })
+        .flatten();
+    let runtime_components = (config.mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE)
+        .then(|| {
+            pools
+                .and_then(|pools| pools.runtime.clone())
+                .map(|database| build_runtime_auth_service(database, config, runtime_incarnation))
+        })
+        .flatten();
+    let runtime_auth = runtime_components
+        .as_ref()
+        .map(|(auth, _, _)| Arc::clone(auth));
+    let managed_sync = runtime_components
+        .as_ref()
+        .map(|(_, sync, _)| Arc::clone(sync));
+    let runtime_reauthorization = runtime_components
+        .as_ref()
+        .map(|(_, _, reauthorization)| Arc::clone(reauthorization));
 
     let runtime = config.mode.has_runtime().then(|| {
         let readiness = pools
@@ -146,6 +357,8 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
                     PostgresReadinessAdapter::new(
                         database,
                         config.runtime_process_id.clone(),
+                        runtime_incarnation,
+                        config.required_runtime_process_ids.clone(),
                         config.publication_lease_ttl,
                     ),
                 )))
@@ -161,10 +374,20 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
                 admission: build_runtime_admission(config),
                 verified_origins: Arc::new(VerifiedApplicationOrigins::default()),
                 auth: runtime_auth.clone(),
+                callback_owners: pools
+                    .and_then(|pools| pools.runtime.clone())
+                    .map(|database| {
+                        Arc::new(PostgresProviderCallbackOwnerResolver::new(database))
+                            as Arc<dyn ProviderCallbackOwnerResolver>
+                    }),
+                managed_reauthorization: runtime_reauthorization,
                 cookie_path: Arc::from(config.runtime.external_base.path()),
                 external_origin: Arc::from(
                     config.runtime.external_base.origin().ascii_serialization(),
                 ),
+                identity_mutations: runtime_identity_mutations
+                    .clone()
+                    .map(|service| service as Arc<dyn IdentityMutationRuntimeAuthority>),
             },
             config,
         )
@@ -211,6 +434,17 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
                             Arc::new(SystemClock),
                         ))
                     }),
+                email_control: pools
+                    .and_then(|pools| pools.control.clone())
+                    .map(|database| build_email_control_service(database, config)),
+                managed_connections: pools
+                    .and_then(|pools| pools.control.clone())
+                    .map(PostgresManagedConnectionRepository::new)
+                    .map(Arc::new),
+                managed_reauthorization: pools
+                    .and_then(|pools| pools.control.clone())
+                    .map(|database| build_managed_reauthorization_service(database, config)),
+                identity_mutations: control_identity_mutations.clone(),
             },
             config,
         )
@@ -220,6 +454,9 @@ pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>
         runtime,
         control,
         runtime_auth,
+        managed_sync,
+        runtime_identity_mutations,
+        control_identity_mutations,
         runtime_ready,
         control_ready,
     }
@@ -262,6 +499,38 @@ fn build_provisioning_service(
     ))
 }
 
+fn build_email_control_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<EmailControlService> {
+    let provisioning = config
+        .provisioning
+        .as_ref()
+        .expect("validated Control configuration has provisioning stores");
+    let secret_store = WriteOnlyEncryptedFileProvisioner::new(
+        provisioning.configuration_secret_store_root.clone(),
+        provisioning.configuration_secret_store_key.expose_copy(),
+    )
+    .expect("validated write-only secret provisioner configuration");
+    Arc::new(EmailControlService::new(
+        Arc::new(PostgresEmailControlRepository::new_with_runtime_roster(
+            database,
+            config.required_runtime_process_ids.clone(),
+        )),
+        Arc::new(secret_store),
+        Arc::new(SystemClock),
+        Arc::new(Sha256RequestDigester),
+    ))
+}
+
+fn forbidden_smtp_listener_destinations(config: &ServerConfig) -> ForbiddenSmtpDestinations {
+    let mut forbidden = ForbiddenSmtpDestinations::default();
+    for bind in [config.runtime.bind, config.control.bind] {
+        forbidden.insert_listener_bind(bind);
+    }
+    forbidden
+}
+
 fn build_runtime_admission(config: &ServerConfig) -> Arc<AdmissionService> {
     let admission = config
         .admission
@@ -281,10 +550,273 @@ fn build_runtime_admission(config: &ServerConfig) -> Arc<AdmissionService> {
     ))
 }
 
+fn build_projection_materializer_capabilities(
+    config: &ServerConfig,
+) -> (
+    Arc<dyn DurableEmailAddressReader>,
+    Arc<dyn ProjectionVerifiedEmailProtector>,
+) {
+    let deployment = config
+        .instance_id
+        .clone()
+        .expect("validated configuration has an instance ID");
+    let build_material =
+        |active: &crate::config::RuntimeKeyConfig,
+         retained: &BTreeMap<i32, crate::config::RuntimeKeyConfig>| {
+            let active = RuntimeKeyMaterial::new(
+                active.digest_key.expose_copy(),
+                active.protection_key.expose_copy(),
+            );
+            let retained = retained
+                .iter()
+                .map(|(version, keys)| {
+                    (
+                        *version,
+                        RuntimeKeyMaterial::new(
+                            keys.digest_key.expose_copy(),
+                            keys.protection_key.expose_copy(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            (active, retained)
+        };
+    let source_reader: Arc<dyn DurableEmailAddressReader> =
+        match config.email_identity_protection.as_ref() {
+            Some(email) => {
+                let (active, retained) = build_material(&email.active, &email.retained);
+                Arc::new(
+                    SoftwareDurableEmailAddressReader::new(
+                        deployment.clone(),
+                        email.active_version,
+                        active,
+                        retained,
+                    )
+                    .expect("validated durable email identity protection configuration"),
+                )
+            }
+            None => Arc::new(UnavailableDurableEmailAddressReader),
+        };
+    let projection = &config.projection_email_protection;
+    let (active, retained) = build_material(&projection.active, &projection.retained);
+    let projection_protector = Arc::new(
+        SoftwareProjectionVerifiedEmailProtector::new(
+            deployment,
+            projection.active_version,
+            active,
+            retained,
+        )
+        .expect("validated projection verified-email protection configuration"),
+    );
+    (source_reader, projection_protector)
+}
+
+fn protection_material(
+    protection: &crate::config::RuntimeProtectionConfig,
+) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
+    let active = RuntimeKeyMaterial::new(
+        protection.active.digest_key.expose_copy(),
+        protection.active.protection_key.expose_copy(),
+    );
+    let retained = protection
+        .retained
+        .iter()
+        .map(|(version, keys)| {
+            (
+                *version,
+                RuntimeKeyMaterial::new(
+                    keys.digest_key.expose_copy(),
+                    keys.protection_key.expose_copy(),
+                ),
+            )
+        })
+        .collect();
+    (protection.active_version, active, retained)
+}
+
+fn identity_mutation_target_material(
+    config: &ServerConfig,
+) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
+    // The reviewed short-lived target material is shared only as raw roots. Identity target
+    // facades apply their own cryptographic deployment domain and expose disjoint capabilities.
+    protection_material(&config.managed_reauthorization_target_protection)
+}
+
+fn identity_mutation_evidence_material(
+    config: &ServerConfig,
+) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
+    protection_material(&config.identity_mutation_evidence_protection)
+}
+
+fn build_identity_runtime_protector(config: &ServerConfig) -> Arc<SplitRuntimeProtector> {
+    let deployment = config
+        .instance_id
+        .as_deref()
+        .expect("validated instance ID");
+    let build = |protection: &crate::config::RuntimeProtectionConfig| {
+        let (version, active, retained) = protection_material(protection);
+        SoftwareRuntimeProtector::new(deployment.to_owned(), version, active, retained)
+            .expect("validated protection ring")
+    };
+    let runtime = config
+        .runtime_protection
+        .as_ref()
+        .expect("Runtime-only identity service requires generic Runtime protection");
+    let email = config.email_identity_protection.as_ref().map(|protection| {
+        let runtime_shape = crate::config::RuntimeProtectionConfig {
+            active_version: protection.active_version,
+            active: protection.active.clone(),
+            retained: protection.retained.clone(),
+        };
+        build(&runtime_shape)
+    });
+    let projection = &config.projection_email_protection;
+    let projection_shape = crate::config::RuntimeProtectionConfig {
+        active_version: projection.active_version,
+        active: projection.active.clone(),
+        retained: projection.retained.clone(),
+    };
+    Arc::new(SplitRuntimeProtector::new_with_projection_email(
+        build(runtime),
+        email,
+        build(&projection_shape),
+    ))
+}
+
+fn build_identity_mutation_control_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<IdentityMutationControlService> {
+    let deployment = config
+        .instance_id
+        .as_deref()
+        .expect("validated instance ID");
+    let (target_version, target_active, target_retained) =
+        identity_mutation_target_material(config);
+    let target = Arc::new(
+        SoftwareIdentityMutationTargetIssuer::new(
+            deployment,
+            target_version,
+            target_active,
+            target_retained,
+        )
+        .expect("validated identity mutation target issuer"),
+    );
+    let (evidence_version, evidence_active, evidence_retained) =
+        identity_mutation_evidence_material(config);
+    let evidence = Arc::new(
+        SoftwareIdentityMutationCandidateVerifier::new(
+            deployment,
+            evidence_version,
+            evidence_active,
+            evidence_retained,
+        )
+        .expect("validated identity mutation evidence verifier"),
+    );
+    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
+    let repository = Arc::new(PostgresControlIdentityMutationRepository::new(
+        database,
+        Arc::new(PostgresIdentityProjectionMaterializer::new(
+            source_reader,
+            projection_protector,
+        )),
+        config.required_runtime_process_ids.clone(),
+    ));
+    Arc::new(
+        IdentityMutationControlService::new(
+            repository,
+            target,
+            evidence,
+            Arc::new(SystemClock),
+            config.runtime.external_base.clone(),
+            IdentityMutationProviderCapability::controlled_oidc(),
+        )
+        .expect("validated identity mutation Control service"),
+    )
+}
+
+fn build_identity_mutation_runtime_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+    runtime_incarnation: Uuid,
+) -> Arc<IdentityMutationRuntimeService> {
+    let deployment = config
+        .instance_id
+        .as_deref()
+        .expect("validated instance ID");
+    let protector = build_identity_runtime_protector(config);
+    let (target_version, target_active, target_retained) =
+        identity_mutation_target_material(config);
+    let target = Arc::new(
+        SoftwareIdentityMutationTargetVerifier::new(
+            deployment,
+            target_version,
+            target_active,
+            target_retained,
+        )
+        .expect("validated identity mutation target verifier"),
+    );
+    let (evidence_version, evidence_active, evidence_retained) =
+        identity_mutation_evidence_material(config);
+    let evidence = Arc::new(
+        SoftwareIdentityMutationProofMaterialProtector::new(
+            deployment,
+            evidence_version,
+            evidence_active,
+            evidence_retained,
+        )
+        .expect("validated identity mutation evidence producer"),
+    );
+    let stores = config
+        .provisioning
+        .as_ref()
+        .expect("validated Runtime provider secret store");
+    let secret_store = EncryptedFileStore::new(
+        stores.configuration_secret_store_root.clone(),
+        stores.configuration_secret_store_key.expose_copy(),
+    )
+    .expect("validated provider secret store");
+    let provider = Arc::new(
+        RestrictedOidcProviderClient::new(
+            &config.provider_allowed_origins,
+            config.provider_allow_http_loopback,
+        )
+        .expect("validated provider endpoint policy"),
+    );
+    Arc::new(IdentityMutationRuntimeService::new(
+        Arc::new(PostgresRuntimeIdentityMutationRepository::new(
+            database,
+            config.runtime_process_id.clone(),
+            runtime_incarnation,
+            config.required_runtime_process_ids.clone(),
+        )),
+        protector.clone(),
+        target,
+        evidence,
+        Arc::new(SoftwareIdentityMutationDurableEmailProtector::new(
+            protector.clone(),
+        )),
+        provider,
+        Arc::new(EncryptedFileProviderSecretResolver::new(secret_store)),
+        Arc::new(SystemClock),
+        config.runtime.external_base.clone(),
+        IdentityMutationProviderCapability::controlled_oidc(),
+    ))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Runtime composition keeps one process incarnation and physically distinct short-term, email identity, projection email, managed target, and managed credential custody visible"
+)]
 fn build_runtime_auth_service(
     database: DatabaseConnection,
     config: &ServerConfig,
-) -> Arc<RuntimeAuthService> {
+    runtime_incarnation: Uuid,
+) -> (
+    Arc<RuntimeAuthService>,
+    Arc<ManagedConnectionService>,
+    Arc<ManagedReauthorizationRuntimeService>,
+) {
     let stores = config
         .provisioning
         .as_ref()
@@ -303,6 +835,215 @@ fn build_runtime_auth_service(
         stores.configuration_secret_store_key.expose_copy(),
     )
     .expect("validated provider-secret store configuration");
+    let deployment_context = config
+        .instance_id
+        .clone()
+        .expect("validated Runtime configuration has an instance ID");
+    let build_ring =
+        |active_version: i32,
+         active: &crate::config::RuntimeKeyConfig,
+         retained: &BTreeMap<i32, crate::config::RuntimeKeyConfig>| {
+            let active = RuntimeKeyMaterial::new(
+                active.digest_key.expose_copy(),
+                active.protection_key.expose_copy(),
+            );
+            let retained = retained
+                .iter()
+                .map(|(version, keys)| {
+                    (
+                        *version,
+                        RuntimeKeyMaterial::new(
+                            keys.digest_key.expose_copy(),
+                            keys.protection_key.expose_copy(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            SoftwareRuntimeProtector::new(
+                deployment_context.clone(),
+                active_version,
+                active,
+                retained,
+            )
+            .expect("validated Runtime protection configuration")
+        };
+    let projection_email = &config.projection_email_protection;
+    let protector = SplitRuntimeProtector::new_with_projection_email(
+        build_ring(
+            protection.active_version,
+            &protection.active,
+            &protection.retained,
+        ),
+        config
+            .email_identity_protection
+            .as_ref()
+            .map(|email_identity| {
+                build_ring(
+                    email_identity.active_version,
+                    &email_identity.active,
+                    &email_identity.retained,
+                )
+            }),
+        build_ring(
+            projection_email.active_version,
+            &projection_email.active,
+            &projection_email.retained,
+        ),
+    );
+    let interaction_readable_key_versions = protector.readable_key_versions();
+    let protector = Arc::new(protector);
+
+    let managed_protection = config
+        .managed_credential_protection
+        .as_ref()
+        .expect("validated Runtime managed credential key ring");
+    let managed_retained = managed_protection
+        .retained
+        .iter()
+        .map(|(version, key)| {
+            (
+                *version,
+                ManagedCredentialKeyMaterial::new(key.expose_copy()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let managed_protector = Arc::new(
+        SoftwareManagedCredentialProtector::new(
+            deployment_context,
+            managed_protection.active_version,
+            ManagedCredentialKeyMaterial::new(managed_protection.active_key.expose_copy()),
+            managed_retained,
+        )
+        .expect("validated managed credential protection configuration"),
+    );
+
+    let provider = RestrictedOidcProviderClient::new(
+        &config.provider_allowed_origins,
+        config.provider_allow_http_loopback,
+    )
+    .expect("validated provider endpoint policy");
+    let secret_resolver = Arc::new(EncryptedFileProviderSecretResolver::new(secret_store));
+    let email = Arc::new(
+        PostgresPasswordlessEmailRepository::new_with_runtime_identity(
+            database.clone(),
+            config.runtime_process_id.clone(),
+            runtime_incarnation,
+            config.required_runtime_process_ids.clone(),
+            time::Duration::seconds(
+                i64::try_from(
+                    config
+                        .publication_lease_ttl
+                        .as_secs()
+                        .max(5)
+                        .saturating_mul(2),
+                )
+                .expect("validated Runtime publication lease duration"),
+            ),
+        ),
+    );
+    let mail_worker = Arc::new(
+        MailWorker::new(
+            email.clone(),
+            Arc::new(SafeSmtpTransport::with_egress_policy(
+                forbidden_smtp_listener_destinations(config),
+                config.smtp_extra_root_cert_der.as_deref(),
+                config
+                    .deployment_smtp
+                    .as_ref()
+                    .map_or(&[], |smtp| smtp.explicitly_allowed_private_ips.as_slice()),
+            )),
+            secret_resolver.clone(),
+            protector.clone(),
+            config.runtime_process_id.clone(),
+        )
+        .expect("validated mail worker configuration"),
+    );
+
+    let managed_reauthorization_target_verifier =
+        build_managed_reauthorization_target_verifier(config);
+    let target_readable_key_versions =
+        managed_reauthorization_target_verifier.readable_key_versions();
+    let managed_adapter = Arc::new(RestrictedOidcManagedProfileAdapter::new(
+        provider.clone(),
+        secret_resolver.clone(),
+    ));
+    let managed_repository = Arc::new(PostgresManagedConnectionRepository::new(database.clone()));
+    let interaction_cleanup = Arc::new(
+        ManagedInteractionCleanupService::new(
+            managed_repository.clone(),
+            interaction_readable_key_versions,
+            target_readable_key_versions,
+            Arc::new(SystemClock),
+        )
+        .expect("validated Runtime short-term readable key inventory"),
+    );
+    let managed_sync = Arc::new(
+        ManagedConnectionService::new(
+            managed_repository.clone(),
+            managed_protector.clone(),
+            interaction_cleanup,
+            managed_adapter,
+            Arc::new(SystemClock),
+        )
+        .expect("validated managed provider adapter capability"),
+    );
+    let managed_reauthorization = Arc::new(
+        ManagedReauthorizationRuntimeService::new(
+            Arc::new(PostgresManagedReauthorizationRepository::new(
+                database.clone(),
+            )),
+            managed_repository,
+            protector.clone(),
+            managed_reauthorization_target_verifier,
+            managed_protector.clone(),
+            Arc::new(provider.clone()),
+            secret_resolver.clone(),
+            Arc::new(SystemClock),
+            crate::adapters::oidc::controlled_oidc_managed_capability(),
+        )
+        .expect("validated managed reauthorization capability"),
+    );
+    let auth = Arc::new(RuntimeAuthService::new(
+        Arc::new(PostgresAuthenticationRepository::new_with_runtime_identity(
+            database.clone(),
+            config.runtime_process_id.clone(),
+            runtime_incarnation,
+        )),
+        Arc::new(
+            PostgresSessionAuthorityRepository::new_with_runtime_identity_and_managed_protector(
+                database.clone(),
+                config.runtime_process_id.clone(),
+                runtime_incarnation,
+                managed_protector,
+                protector.clone(),
+            ),
+        ),
+        Arc::new(
+            PostgresRuntimeAuthorityRepository::new_with_runtime_identity_and_protector(
+                database,
+                config.runtime_process_id.clone(),
+                runtime_incarnation,
+                config.required_runtime_process_ids.clone(),
+                protector.clone(),
+            ),
+        ),
+        email,
+        mail_worker,
+        protector,
+        Arc::new(EncryptedFileRuntimeSigner::new(signer_store)),
+        secret_resolver,
+        Arc::new(provider),
+        crate::adapters::oidc::controlled_oidc_managed_capability(),
+        Arc::new(SystemClock),
+        config.runtime.external_base.clone(),
+    ));
+    (auth, managed_sync, managed_reauthorization)
+}
+
+fn managed_reauthorization_target_material(
+    config: &ServerConfig,
+) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
+    let protection = &config.managed_reauthorization_target_protection;
     let active = RuntimeKeyMaterial::new(
         protection.active.digest_key.expose_copy(),
         protection.active.protection_key.expose_copy(),
@@ -320,32 +1061,60 @@ fn build_runtime_auth_service(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let protector = SoftwareRuntimeProtector::new(
-        config
-            .instance_id
-            .clone()
-            .expect("validated Runtime configuration has an instance ID"),
-        protection.active_version,
-        active,
-        retained,
+    (protection.active_version, active, retained)
+}
+
+fn build_managed_reauthorization_target_verifier(
+    config: &ServerConfig,
+) -> Arc<SoftwareManagedReauthorizationTargetVerifier> {
+    let (active_version, active, retained) = managed_reauthorization_target_material(config);
+    Arc::new(
+        SoftwareManagedReauthorizationTargetVerifier::new(
+            config
+                .instance_id
+                .as_deref()
+                .expect("validated instance ID"),
+            active_version,
+            active,
+            retained,
+        )
+        .expect("validated managed reauthorization target verifier configuration"),
     )
-    .expect("validated Runtime protection configuration");
-    let provider = RestrictedOidcProviderClient::new(
-        &config.provider_allowed_origins,
-        config.provider_allow_http_loopback,
+}
+
+fn build_managed_reauthorization_target_issuer(
+    config: &ServerConfig,
+) -> Arc<SoftwareManagedReauthorizationTargetIssuer> {
+    let (active_version, active, retained) = managed_reauthorization_target_material(config);
+    Arc::new(
+        SoftwareManagedReauthorizationTargetIssuer::new(
+            config
+                .instance_id
+                .as_deref()
+                .expect("validated instance ID"),
+            active_version,
+            active,
+            retained,
+        )
+        .expect("validated managed reauthorization target issuer configuration"),
     )
-    .expect("validated provider endpoint policy");
-    Arc::new(RuntimeAuthService::new(
-        Arc::new(PostgresAuthenticationRepository::new(database.clone())),
-        Arc::new(PostgresSessionAuthorityRepository::new(database.clone())),
-        Arc::new(PostgresRuntimeAuthorityRepository::new(database)),
-        Arc::new(protector),
-        Arc::new(EncryptedFileRuntimeSigner::new(signer_store)),
-        Arc::new(EncryptedFileProviderSecretResolver::new(secret_store)),
-        Arc::new(provider),
-        Arc::new(SystemClock),
-        config.runtime.external_base.clone(),
-    ))
+}
+
+fn build_managed_reauthorization_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<ManagedReauthorizationControlService> {
+    let target_issuer = build_managed_reauthorization_target_issuer(config);
+    Arc::new(
+        ManagedReauthorizationControlService::new(
+            Arc::new(PostgresManagedReauthorizationRepository::new(database)),
+            target_issuer,
+            Arc::new(SystemClock),
+            config.runtime.external_base.clone(),
+            crate::adapters::oidc::controlled_oidc_managed_capability(),
+        )
+        .expect("validated managed reauthorization capability"),
+    )
 }
 
 fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &ServerConfig) -> Router {
@@ -379,6 +1148,10 @@ fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &Serve
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the Runtime route inventory stays explicit and plane-local"
+)]
 fn federated_project_auth_router() -> Router<RuntimeState> {
     let public = Router::new()
         .route(
@@ -404,12 +1177,72 @@ fn federated_project_auth_router() -> Router<RuntimeState> {
             get(hosted_interaction_shell),
         )
         .route(
+            "/auth/managed-reauthorizations/{interaction}",
+            get(managed_reauthorization_shell),
+        )
+        .route(
+            "/auth/identity-mutations/{interaction}",
+            get(identity_mutation_shell),
+        )
+        .route(
+            "/auth/identity-mutations/email/confirm/{challenge_id}",
+            get(identity_mutation_magic_shell),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/managed-reauthorizations/{interaction}/start",
+            post(start_managed_reauthorization),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/method",
+            post(select_identity_mutation_method),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/email/challenges",
+            post(begin_identity_mutation_email_challenge),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/email/otp/verify",
+            post(verify_identity_mutation_email_otp),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/email/link/verify",
+            post(verify_identity_mutation_email_link),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/confirm",
+            post(confirm_identity_mutation_ready),
+        )
+        .route(
             "/auth/browser-logout/{preparation}",
             get(browser_logout_shell),
         )
         .route(
+            "/auth/email/confirm/{challenge_id}",
+            get(email_magic_confirmation_shell),
+        )
+        .route(
             "/v1/projects/{project_public_id}/auth/interactions/{interaction}/method",
             post(select_provider_method),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/select",
+            post(select_email_method),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/challenges",
+            post(begin_email_challenge),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/resend",
+            post(resend_email_challenge),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/otp/verify",
+            post(verify_email_otp),
+        )
+        .route(
+            "/v1/projects/{project_public_id}/auth/email/magic/confirm",
+            post(confirm_email_magic),
         )
         .route(
             "/v1/projects/{project_public_id}/auth/interactions/{interaction}/session/reuse",
@@ -436,6 +1269,10 @@ fn federated_project_auth_router() -> Router<RuntimeState> {
     public.merge(hosted).merge(bearer)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the Control route inventory is intentionally explicit and plane-local"
+)]
 fn control_router(listener: &ListenerConfig, state: ControlState, config: &ServerConfig) -> Router {
     let protected = Router::new()
         .route("/system", get(system_capabilities))
@@ -501,7 +1338,67 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             "/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
             put(assign_provider).delete(unassign_provider),
         )
+        .route(
+            "/projects/{project_id}/email-method",
+            get(get_email_method_policy).put(update_email_method_policy),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/email-method",
+            put(assign_email_method),
+        )
+        .route(
+            "/projects/{project_id}/smtp-configurations",
+            get(list_smtp_configurations).post(create_smtp_configuration),
+        )
+        .route(
+            "/system/smtp-default-generations",
+            get(list_deployment_smtp_generations),
+        )
+        .route(
+            "/system/smtp-default-generations/{generation}/disable",
+            post(disable_deployment_smtp_generation),
+        )
+        .route(
+            "/system/smtp-default-generations/{generation}/compromise",
+            post(compromise_deployment_smtp_generation),
+        )
+        .route(
+            "/projects/{project_id}/smtp-configurations/{smtp_id}/test",
+            post(test_smtp_configuration),
+        )
+        .route(
+            "/projects/{project_id}/smtp-configurations/{smtp_id}/tests/{operation_id}",
+            get(get_smtp_test_operation),
+        )
+        .route(
+            "/projects/{project_id}/smtp-configurations/{smtp_id}/activate",
+            post(activate_smtp_configuration),
+        )
+        .route(
+            "/projects/{project_id}/smtp-configurations/{smtp_id}/disable",
+            post(disable_smtp_configuration),
+        )
+        .route(
+            "/projects/{project_id}/smtp-configurations/{smtp_id}/compromise",
+            post(compromise_smtp_configuration),
+        )
         .merge(control_lifecycle_router())
+        .route(
+            "/projects/{project_id}/identity-mutation-intents",
+            post(create_identity_mutation_intent),
+        )
+        .route(
+            "/projects/{project_id}/identity-mutation-intents/{intent_id}",
+            get(get_identity_mutation_intent),
+        )
+        .route(
+            "/projects/{project_id}/identity-mutation-intents/{intent_id}/cancel",
+            post(cancel_identity_mutation_intent),
+        )
+        .route(
+            "/projects/{project_id}/identity-mutation-intents/{intent_id}/confirm",
+            post(confirm_identity_mutation_intent),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_operator,
@@ -545,6 +1442,10 @@ fn control_lifecycle_router() -> Router<ControlState> {
             get(get_project_user),
         )
         .route(
+            "/projects/{project_id}/users/{user_id}/identities",
+            get(list_project_user_identities),
+        )
+        .route(
             "/projects/{project_id}/users/{user_id}/disable",
             post(disable_project_user),
         )
@@ -559,6 +1460,34 @@ fn control_lifecycle_router() -> Router<ControlState> {
         .route(
             "/projects/{project_id}/users/{user_id}/browser-sessions/{session_id}/revoke",
             post(revoke_browser_session),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/managed-provider-connections",
+            get(list_managed_provider_connections),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/synchronize",
+            post(synchronize_managed_provider_connection),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations",
+            post(create_managed_reauthorization),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations/{interaction_id}",
+            get(get_managed_reauthorization),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations/{interaction_id}/cancel",
+            post(cancel_managed_reauthorization),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/revoke",
+            post(revoke_managed_provider_connection),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/disconnect",
+            post(disconnect_managed_provider_connection),
         )
 }
 
@@ -650,19 +1579,24 @@ async fn admit_runtime(
         AdmissionDecision::Rejected {
             retry_after_seconds,
             ..
-        } => {
-            let mut response = runtime_error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "The Runtime request rate limit was exceeded.",
-                request_id,
-            );
-            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, value);
-            }
-            Err(response)
-        }
+        } => Err(runtime_rate_limited_response(
+            retry_after_seconds,
+            request_id,
+        )),
     }
+}
+
+fn runtime_rate_limited_response(retry_after_seconds: u64, request_id: &str) -> Response {
+    let mut response = runtime_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "The Runtime request rate limit was exceeded.",
+        request_id,
+    );
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 const VERIFIED_ORIGIN_CAPACITY: usize = 1024;
@@ -785,7 +1719,23 @@ fn apply_verified_admission_cors(
 }
 
 fn admission_dimension(kind: AdmissionDimensionKind, value: &str) -> AdmissionDimension<'_> {
-    AdmissionDimension { kind, value }
+    AdmissionDimension {
+        kind,
+        value,
+        email_scope: None,
+    }
+}
+
+fn scoped_email_admission_dimension<'a>(
+    value: &'a str,
+    project_id: &'a str,
+    application_id: &'a str,
+) -> AdmissionDimension<'a> {
+    AdmissionDimension {
+        kind: AdmissionDimensionKind::Email,
+        value,
+        email_scope: Some((project_id, application_id)),
+    }
 }
 
 async fn runtime_asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
@@ -1016,6 +1966,823 @@ async fn hosted_interaction_shell(
     response
 }
 
+#[derive(Serialize)]
+struct IdentityMutationHostedBootstrap {
+    project_public_id: String,
+    operation_kind: &'static str,
+    status: &'static str,
+    revision: i64,
+    csrf: String,
+    expires_at: String,
+    slots: Vec<IdentityMutationHostedSlot>,
+}
+
+#[derive(Serialize)]
+struct IdentityMutationHostedSlot {
+    id: String,
+    role: &'static str,
+    identity_kind: &'static str,
+    method_kind: &'static str,
+    state: &'static str,
+    next_action: Option<&'static str>,
+    proved: bool,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Hosted bootstrap maps only the reviewed safe intent and slot fields explicitly"
+)]
+async fn identity_mutation_shell(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path(interaction): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_top_level_navigation(&headers) {
+        return runtime_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_navigation",
+            "Identity verification must start from a top-level document navigation.",
+            &request_id,
+        );
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::HostedInteraction,
+        &[admission_dimension(
+            AdmissionDimensionKind::Credential,
+            &interaction,
+        )],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(cookie_name) = interaction_cookie_name(&interaction) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Ask the operator to create a new identity-management request.",
+        );
+    };
+    let Ok(binding) = cookie_value(&headers, &cookie_name) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Ask the operator to create a new identity-management request.",
+        );
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Identity management is unavailable.",
+        );
+    };
+    let Ok(bootstrap) = service.bootstrap(&interaction, binding.as_deref()).await else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Ask the operator to create a new identity-management request.",
+        );
+    };
+    let body = IdentityMutationHostedBootstrap {
+        project_public_id: bootstrap.intent.project_public_id,
+        operation_kind: identity_mutation_kind_str(bootstrap.intent.kind),
+        status: identity_mutation_status_str(bootstrap.intent.status),
+        revision: bootstrap.intent.revision,
+        csrf: bootstrap.csrf.to_string(),
+        expires_at: timestamp(bootstrap.intent.expires_at),
+        slots: bootstrap
+            .intent
+            .slots
+            .into_iter()
+            .map(|slot| IdentityMutationHostedSlot {
+                id: slot.id.to_string(),
+                role: match slot.role {
+                    crate::domain::IdentityMutationSlotRole::DestinationOwner => {
+                        "destination_owner"
+                    }
+                    crate::domain::IdentityMutationSlotRole::CandidateIdentity => {
+                        "candidate_identity"
+                    }
+                    crate::domain::IdentityMutationSlotRole::IdentityOwner => "identity_owner",
+                    crate::domain::IdentityMutationSlotRole::WinnerOwner => "winner_owner",
+                    crate::domain::IdentityMutationSlotRole::LoserOwner => "loser_owner",
+                },
+                identity_kind: match slot.identity_kind {
+                    crate::domain::IdentityKind::Provider => "provider",
+                    crate::domain::IdentityKind::Email => "email",
+                },
+                method_kind: match slot.method_kind {
+                    application::IdentityMutationProofMethodKind::Provider => "provider",
+                    application::IdentityMutationProofMethodKind::Email => "email",
+                },
+                state: identity_mutation_slot_state_str(slot.state),
+                next_action: identity_mutation_slot_next_action(slot.state),
+                proved: slot.proved,
+            })
+            .collect(),
+    };
+    let Ok(serialized) = serde_json::to_string(&body) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Identity management is unavailable.",
+        );
+    };
+    let mut response = web_assets::shell_with_context(
+        WebPlane::Runtime,
+        &state.probe.base_path,
+        &[
+            ("owlauth-runtime-flow", "identity_mutation"),
+            ("owlauth-runtime-bootstrap", &serialized),
+        ],
+    );
+    append_cookie(
+        &mut response,
+        &cookie_name,
+        &bootstrap.browser_binding,
+        &state.cookie_path,
+        600,
+    );
+    response
+}
+
+async fn identity_mutation_magic_shell(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path(challenge_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_top_level_navigation(&headers) {
+        return runtime_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_navigation",
+            "Open the verification link in a top-level browser window.",
+            &request_id,
+        );
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::EmailMagicRead,
+        &[admission_dimension(
+            AdmissionDimensionKind::Credential,
+            &challenge_id,
+        )],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(challenge_id) = Uuid::parse_str(&challenge_id) else {
+        return runtime_document_error(
+            &state,
+            "Link unavailable",
+            "Return to the originating identity verification and request a new link.",
+        );
+    };
+    // This call creates only a challenge-scoped transfer gate. It never receives, validates, or
+    // consumes the fragment proof, so scanners and GET navigation cannot win proof authority.
+    let gate = match state.identity_mutations.as_deref() {
+        Some(service) => service
+            .establish_magic_transfer_context(challenge_id)
+            .await
+            .ok(),
+        None => None,
+    };
+    let mut response = if let Some(gate) = gate.as_ref() {
+        let generation = gate.generation.to_string();
+        let revision = gate.expected_revision.to_string();
+        let slot = gate.proof_slot_id.to_string();
+        web_assets::shell_with_context(
+            WebPlane::Runtime,
+            &state.probe.base_path,
+            &[
+                ("owlauth-runtime-flow", "identity_mutation_magic"),
+                ("owlauth-identity-magic-csrf", gate.csrf.as_str()),
+                ("owlauth-identity-magic-project", &gate.project_public_id),
+                ("owlauth-identity-magic-slot", &slot),
+                ("owlauth-identity-magic-generation", &generation),
+                ("owlauth-identity-magic-revision", &revision),
+            ],
+        )
+    } else {
+        web_assets::shell_with_context(
+            WebPlane::Runtime,
+            &state.probe.base_path,
+            &[("owlauth-runtime-flow", "identity_mutation_magic")],
+        )
+    };
+    if let Some(gate) = gate {
+        append_cookie(
+            &mut response,
+            &identity_mutation_magic_transfer_cookie_name(challenge_id),
+            gate.context.as_str(),
+            &state.cookie_path,
+            300,
+        );
+    }
+    response
+}
+
+async fn select_identity_mutation_method(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path((project_public_id, interaction, proof_slot)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::SelectIdentityMutationMethodRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::ProviderSelection,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+            admission_dimension(AdmissionDimensionKind::Credential, &proof_slot),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let Ok(proof_slot_id) = Uuid::parse_str(&proof_slot) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let asserted_method = match request.method_kind {
+        runtime_types::IdentityMutationMethodKind::Provider => {
+            application::IdentityMutationProofMethodKind::Provider
+        }
+        runtime_types::IdentityMutationMethodKind::Email => {
+            application::IdentityMutationProofMethodKind::Email
+        }
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return runtime_problem(ApplicationError::Persistence, &request_id);
+    };
+    match service
+        .start_method(application::StartIdentityMutationMethod {
+            project_public_id,
+            interaction,
+            proof_slot_id,
+            asserted_method,
+            browser_binding: binding.clone(),
+            csrf: request.csrf,
+            expected_revision: request.expected_revision,
+        })
+        .await
+    {
+        Ok(application::StartedIdentityMutationMethod::ProviderNavigation {
+            url,
+            proof_slot_id,
+        }) => {
+            let mut response = runtime_json(
+                Ok(runtime_types::IdentityMutationMethodResponse::Provider(
+                    runtime_types::NavigationResponse { url },
+                )),
+                &request_id,
+            );
+            append_cookie(
+                &mut response,
+                &identity_proof_slot_cookie_name(proof_slot_id),
+                &binding,
+                &state.cookie_path,
+                600,
+            );
+            response
+        }
+        Ok(application::StartedIdentityMutationMethod::EmailAddressEntry(intent)) => runtime_json(
+            Ok(runtime_types::IdentityMutationMethodResponse::Email(
+                runtime_types::IdentityMutationProofStateResponse {
+                    revision: intent.revision,
+                    state: runtime_types::IdentityMutationProofState::EmailAddressEntry,
+                },
+            )),
+            &request_id,
+        ),
+        Err(error) => runtime_problem(error, &request_id),
+    }
+}
+
+async fn begin_identity_mutation_email_challenge(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path((project_public_id, interaction, proof_slot)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::BeginIdentityMutationEmailChallengeRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::EmailChallenge,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let Ok(proof_slot_id) = Uuid::parse_str(&proof_slot) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return runtime_problem(ApplicationError::Persistence, &request_id);
+    };
+    runtime_status_json(
+        StatusCode::ACCEPTED,
+        service
+            .begin_email_challenge(application::BeginIdentityMutationEmailChallenge {
+                project_public_id,
+                interaction,
+                proof_slot_id,
+                browser_binding: binding,
+                csrf: request.csrf,
+                expected_revision: request.expected_revision,
+                email: request.email,
+            })
+            .await
+            .map(
+                |accepted| runtime_types::IdentityMutationEmailChallengeResponse {
+                    accepted: true,
+                    revision: accepted.revision,
+                    challenge_id: accepted.challenge_id.to_string(),
+                    generation: accepted.generation,
+                    proof_modes: email_proof_modes(
+                        accepted.otp_enabled,
+                        accepted.magic_link_enabled,
+                    ),
+                    expires_at: timestamp(accepted.expires_at),
+                },
+            ),
+        &request_id,
+    )
+}
+
+async fn verify_identity_mutation_email_otp(
+    state: State<RuntimeState>,
+    request_id: Extension<String>,
+    client: Extension<ClientAddress>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::VerifyIdentityMutationEmailOtpRequest>,
+) -> Response {
+    verify_identity_mutation_email(
+        state.0,
+        request_id.0,
+        client.0,
+        path.0,
+        headers,
+        request.expected_revision,
+        request.csrf,
+        request.challenge_id,
+        request.generation,
+        application::EmailProofKind::Otp,
+        request.otp,
+    )
+    .await
+}
+
+async fn verify_identity_mutation_email_link(
+    state: State<RuntimeState>,
+    request_id: Extension<String>,
+    client: Extension<ClientAddress>,
+    path: Path<(String, String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::VerifyIdentityMutationEmailLinkRequest>,
+) -> Response {
+    verify_identity_mutation_email(
+        state.0,
+        request_id.0,
+        client.0,
+        path.0,
+        headers,
+        request.expected_revision,
+        request.csrf,
+        request.challenge_id,
+        request.generation,
+        application::EmailProofKind::MagicLink,
+        request.token,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the shared OTP/magic handler keeps admission, same-browser, and transfer-cookie authority explicit"
+)]
+async fn verify_identity_mutation_email(
+    state: RuntimeState,
+    request_id: String,
+    client: ClientAddress,
+    (project_public_id, interaction, proof_slot): (String, String, String),
+    headers: HeaderMap,
+    expected_revision: i64,
+    csrf: String,
+    challenge_id: String,
+    generation: i16,
+    proof_kind: application::EmailProofKind,
+    proof: String,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    let endpoint = match proof_kind {
+        application::EmailProofKind::Otp => AdmissionEndpoint::EmailOtpVerify,
+        application::EmailProofKind::MagicLink => AdmissionEndpoint::EmailMagicConfirm,
+    };
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        endpoint,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let binding = required_interaction_cookie(&headers, &interaction).ok();
+    let (Ok(proof_slot_id), Ok(challenge_id)) =
+        (Uuid::parse_str(&proof_slot), Uuid::parse_str(&challenge_id))
+    else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let transfer_cookie = (proof_kind == application::EmailProofKind::MagicLink)
+        .then(|| {
+            cookie_value(
+                &headers,
+                &identity_mutation_magic_transfer_cookie_name(challenge_id),
+            )
+            .ok()
+            .flatten()
+        })
+        .flatten();
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return runtime_problem(ApplicationError::Persistence, &request_id);
+    };
+    let transferred =
+        proof_kind == application::EmailProofKind::MagicLink && transfer_cookie.is_some();
+    let result = if let Some(transfer_context) = transfer_cookie {
+        service
+            .verify_magic_transfer(application::VerifyIdentityMutationMagicTransferProof {
+                project_public_id,
+                interaction,
+                proof_slot_id,
+                challenge_id,
+                generation,
+                csrf,
+                expected_revision,
+                proof: zeroize::Zeroizing::new(proof),
+                transfer_context,
+                browser_binding: binding,
+            })
+            .await
+    } else {
+        let Some(binding) = binding else {
+            return invalid_cookie(&request_id);
+        };
+        service
+            .verify_email_proof(application::VerifyRawIdentityMutationEmailProof {
+                project_public_id,
+                interaction,
+                proof_slot_id,
+                browser_binding: binding,
+                csrf,
+                expected_revision,
+                challenge_id,
+                generation,
+                proof_kind,
+                proof: zeroize::Zeroizing::new(proof),
+            })
+            .await
+    };
+    let clear_transfer = transferred && result.is_ok();
+    let mut response = match result {
+        Ok(application::IdentityMutationEmailCompletionDecision::Completed(intent)) => {
+            runtime_json(
+                Ok(runtime_types::IdentityMutationProofStateResponse {
+                    revision: intent.revision,
+                    state: runtime_types::IdentityMutationProofState::Proved,
+                }),
+                &request_id,
+            )
+        }
+        Ok(application::IdentityMutationEmailCompletionDecision::Invalid) => {
+            runtime_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_proof",
+                "The proof could not be verified.",
+                &request_id,
+            )
+        }
+        Err(error) => runtime_problem(error, &request_id),
+    };
+    if clear_transfer {
+        clear_cookie(
+            &mut response,
+            &identity_mutation_magic_transfer_cookie_name(challenge_id),
+            &state.cookie_path,
+        );
+    }
+    response
+}
+
+async fn confirm_identity_mutation_ready(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path((project_public_id, interaction)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::ConfirmHostedIdentityMutationRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::HostedInteraction,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return runtime_problem(ApplicationError::Persistence, &request_id);
+    };
+    runtime_json(
+        service
+            .confirm_ready(application::ConfirmIdentityMutationReady {
+                project_public_id,
+                interaction,
+                browser_binding: binding,
+                csrf: request.csrf,
+                expected_revision: request.expected_revision,
+            })
+            .await
+            .map(|intent| runtime_types::HostedIdentityMutationResponse {
+                revision: intent.revision,
+                status: match intent.status {
+                    crate::domain::IdentityMutationStatus::PendingProof => {
+                        runtime_types::HostedIdentityMutationStatus::PendingProof
+                    }
+                    crate::domain::IdentityMutationStatus::Ready
+                    | crate::domain::IdentityMutationStatus::Completed => {
+                        runtime_types::HostedIdentityMutationStatus::Ready
+                    }
+                    crate::domain::IdentityMutationStatus::Expired => {
+                        runtime_types::HostedIdentityMutationStatus::Expired
+                    }
+                    crate::domain::IdentityMutationStatus::Cancelled => {
+                        runtime_types::HostedIdentityMutationStatus::Cancelled
+                    }
+                },
+            }),
+        &request_id,
+    )
+}
+
+const fn identity_mutation_kind_str(kind: crate::domain::IdentityMutationKind) -> &'static str {
+    match kind {
+        crate::domain::IdentityMutationKind::Link => "link",
+        crate::domain::IdentityMutationKind::Unlink => "unlink",
+        crate::domain::IdentityMutationKind::Merge => "merge",
+    }
+}
+
+const fn identity_mutation_slot_state_str(
+    state: crate::domain::IdentityMutationSlotState,
+) -> &'static str {
+    match state {
+        crate::domain::IdentityMutationSlotState::Pending => "unselected",
+        crate::domain::IdentityMutationSlotState::ProviderAuthorizationStarted => {
+            "provider_started"
+        }
+        crate::domain::IdentityMutationSlotState::ProviderExchangeInProgress => "provider_exchange",
+        crate::domain::IdentityMutationSlotState::ProviderExchangeFailed => "provider_failed",
+        crate::domain::IdentityMutationSlotState::EmailAddressEntry => "email_address_entry",
+        crate::domain::IdentityMutationSlotState::EmailChallengePending => {
+            "email_challenge_pending"
+        }
+        crate::domain::IdentityMutationSlotState::Proved => "proved",
+        crate::domain::IdentityMutationSlotState::Expired => "expired",
+    }
+}
+
+const fn identity_mutation_slot_next_action(
+    state: crate::domain::IdentityMutationSlotState,
+) -> Option<&'static str> {
+    match state {
+        crate::domain::IdentityMutationSlotState::Pending => Some("select_method"),
+        crate::domain::IdentityMutationSlotState::EmailAddressEntry => Some("enter_email"),
+        crate::domain::IdentityMutationSlotState::EmailChallengePending => Some("verify_email"),
+        crate::domain::IdentityMutationSlotState::ProviderAuthorizationStarted
+        | crate::domain::IdentityMutationSlotState::ProviderExchangeInProgress => {
+            Some("await_provider")
+        }
+        crate::domain::IdentityMutationSlotState::ProviderExchangeFailed => {
+            Some("restart_provider")
+        }
+        crate::domain::IdentityMutationSlotState::Proved
+        | crate::domain::IdentityMutationSlotState::Expired => None,
+    }
+}
+
+const fn identity_mutation_status_str(
+    status: crate::domain::IdentityMutationStatus,
+) -> &'static str {
+    match status {
+        crate::domain::IdentityMutationStatus::PendingProof => "pending_proof",
+        crate::domain::IdentityMutationStatus::Ready => "ready",
+        crate::domain::IdentityMutationStatus::Completed => "completed",
+        crate::domain::IdentityMutationStatus::Expired => "expired",
+        crate::domain::IdentityMutationStatus::Cancelled => "cancelled",
+    }
+}
+
+#[derive(Serialize)]
+struct ManagedReauthorizationHostedBootstrap {
+    project_public_id: String,
+    provider_key: String,
+    status: String,
+    revision: i64,
+    csrf: String,
+    expires_at: String,
+}
+
+async fn managed_reauthorization_shell(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path(interaction): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_top_level_navigation(&headers) {
+        return runtime_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_navigation",
+            "Managed reauthorization must start from a top-level document navigation.",
+            &request_id,
+        );
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::HostedInteraction,
+        &[admission_dimension(
+            AdmissionDimensionKind::Credential,
+            &interaction,
+        )],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(cookie_name) = interaction_cookie_name(&interaction) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Ask the operator to create a new reauthorization.",
+        );
+    };
+    let Ok(binding) = cookie_value(&headers, &cookie_name) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Ask the operator to create a new reauthorization.",
+        );
+    };
+    let Some(service) = state.managed_reauthorization.as_deref() else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Managed reauthorization is unavailable.",
+        );
+    };
+    let Ok(bootstrap) = service.bootstrap(&interaction, binding.as_deref()).await else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Ask the operator to create a new reauthorization.",
+        );
+    };
+    let body = ManagedReauthorizationHostedBootstrap {
+        project_public_id: bootstrap.interaction.project_public_id,
+        provider_key: bootstrap.interaction.provider_key,
+        status: bootstrap.interaction.status.as_str().to_owned(),
+        revision: bootstrap.interaction.revision,
+        csrf: bootstrap.csrf.to_string(),
+        expires_at: timestamp(bootstrap.interaction.expires_at),
+    };
+    let Ok(serialized) = serde_json::to_string(&body) else {
+        return runtime_document_error(
+            &state,
+            "Request unavailable",
+            "Managed reauthorization is unavailable.",
+        );
+    };
+    let mut response = web_assets::shell_with_context(
+        WebPlane::Runtime,
+        &state.probe.base_path,
+        &[
+            ("owlauth-runtime-flow", "managed_reauthorization"),
+            ("owlauth-runtime-bootstrap", &serialized),
+        ],
+    );
+    append_cookie(
+        &mut response,
+        &cookie_name,
+        &bootstrap.browser_binding,
+        &state.cookie_path,
+        600,
+    );
+    response
+}
+
+async fn start_managed_reauthorization(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path((project_public_id, interaction)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::StartManagedReauthorizationRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::ManagedReauthorizationStart,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let Some(service) = state.managed_reauthorization.as_deref() else {
+        return runtime_problem(ApplicationError::Persistence, &request_id);
+    };
+    runtime_json(
+        service
+            .start(application::StartManagedReauthorization {
+                project_public_id,
+                interaction,
+                browser_binding: binding,
+                csrf: request.csrf,
+                expected_revision: request.expected_revision,
+            })
+            .await
+            .map(|url| runtime_types::NavigationResponse { url }),
+        &request_id,
+    )
+}
+
 async fn select_provider_method(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
@@ -1060,6 +2827,442 @@ async fn select_provider_method(
         Err(error) => Err(error),
     };
     runtime_json(result, &request_id)
+}
+
+async fn select_email_method(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path((project_public_id, interaction)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::SelectEmailRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::EmailSelection,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let result = match runtime_auth(&state) {
+        Ok(service) => service
+            .select_email(SelectEmail {
+                project_public_id,
+                interaction,
+                browser_binding: binding,
+                csrf: request.csrf,
+                expected_revision: request.expected_revision,
+            })
+            .await
+            .map(|()| runtime_types::CompletionResponse { completed: true }),
+        Err(error) => Err(error),
+    };
+    runtime_json(result, &request_id)
+}
+
+async fn begin_email_challenge(
+    state: State<RuntimeState>,
+    request_id: Extension<String>,
+    client: Extension<ClientAddress>,
+    path: Path<(String, String)>,
+    headers: HeaderMap,
+    request: RuntimeJson<runtime_types::BeginEmailChallengeRequest>,
+) -> Response {
+    email_challenge(state, request_id, client, path, headers, request, false).await
+}
+
+async fn resend_email_challenge(
+    state: State<RuntimeState>,
+    request_id: Extension<String>,
+    client: Extension<ClientAddress>,
+    path: Path<(String, String)>,
+    headers: HeaderMap,
+    request: RuntimeJson<runtime_types::BeginEmailChallengeRequest>,
+) -> Response {
+    email_challenge(state, request_id, client, path, headers, request, true).await
+}
+
+async fn after_email_pre_authority<T, E, F, Fut>(
+    admission: &AdmissionService,
+    endpoint: AdmissionEndpoint,
+    client_address: &str,
+    interaction: &str,
+    authority: F,
+) -> Result<Result<T, E>, u64>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    match admission
+        .admit_email_pre_authority(endpoint, client_address, interaction)
+        .await
+    {
+        AdmissionDecision::Allowed => Ok(authority().await),
+        AdmissionDecision::Rejected {
+            retry_after_seconds,
+            ..
+        } => Err(retry_after_seconds),
+    }
+}
+
+async fn email_challenge(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path((project_public_id, interaction)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::BeginEmailChallengeRequest>,
+    resend: bool,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    let Ok(canonical_email) = crate::domain::CanonicalEmail::parse_v1(&request.email) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let endpoint = if resend {
+        AdmissionEndpoint::EmailResend
+    } else {
+        AdmissionEndpoint::EmailChallenge
+    };
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let service = match runtime_auth(&state) {
+        Ok(service) => service,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    // This hard gate uses only request-derived, purpose-separated digests. The authority closure
+    // cannot run until it passes, making the no-PostgreSQL-on-rejection invariant testable.
+    let scope =
+        match after_email_pre_authority(&state.admission, endpoint, &client.0, &interaction, || {
+            service.email_admission_scope(&project_public_id, &interaction, &binding)
+        })
+        .await
+        {
+            Ok(Ok(scope)) => scope,
+            Ok(Err(error)) => return runtime_problem(error, &request_id),
+            Err(retry_after_seconds) => {
+                return runtime_rate_limited_response(retry_after_seconds, &request_id);
+            }
+        };
+    // Project and Application scope come from persisted interaction authority, never request
+    // dimensions. This second stage consumes only authoritative owner/address buckets: request
+    // client and opaque interaction quota were consumed exactly once by the hard pre-gate.
+    let authoritative_project = scope.project_id.to_string();
+    let authoritative_application = scope.application_id.to_string();
+    let dimensions = [
+        admission_dimension(AdmissionDimensionKind::Project, &authoritative_project),
+        admission_dimension(
+            AdmissionDimensionKind::Application,
+            &authoritative_application,
+        ),
+        scoped_email_admission_dimension(
+            canonical_email.expose(),
+            &authoritative_project,
+            &authoritative_application,
+        ),
+    ];
+    let suppress_delivery = match state
+        .admission
+        .admit_email_authoritative(endpoint, &dimensions)
+        .await
+    {
+        AdmissionDecision::Allowed => false,
+        AdmissionDecision::Rejected {
+            reason: application::AdmissionRejectionReason::Quota,
+            suppression_eligible: true,
+            ..
+        } => true,
+        AdmissionDecision::Rejected {
+            retry_after_seconds,
+            ..
+        } => return runtime_rate_limited_response(retry_after_seconds, &request_id),
+    };
+    let result = service
+        .begin_email_challenge(BeginEmailChallenge {
+            project_public_id,
+            interaction,
+            browser_binding: binding,
+            csrf: request.csrf,
+            expected_revision: request.expected_revision,
+            email: request.email,
+            suppress_delivery,
+        })
+        .await
+        .map(|accepted| runtime_types::EmailChallengeAcceptedResponse {
+            accepted: accepted.accepted,
+            revision: accepted.revision,
+            challenge_id: accepted.challenge_id.to_string(),
+            generation: accepted.generation,
+            proof_modes: email_proof_modes(accepted.otp_enabled, accepted.magic_link_enabled),
+            expires_at: timestamp(accepted.expires_at),
+        });
+    runtime_status_json(StatusCode::ACCEPTED, result, &request_id)
+}
+
+async fn verify_email_otp(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path((project_public_id, interaction)): Path<(String, String)>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::VerifyEmailOtpRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    if !(6..=10).contains(&request.otp.len())
+        || !request.otp.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::EmailOtpVerify,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
+        return invalid_cookie(&request_id);
+    };
+    let Ok(challenge_id) = Uuid::parse_str(&request.challenge_id) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let existing_browser_session =
+        cookie_value(&headers, &project_session_cookie_name(&project_public_id))
+            .ok()
+            .flatten();
+    let result = match runtime_auth(&state) {
+        Ok(service) => {
+            service
+                .verify_email_proof(SubmitEmailProof {
+                    project_public_id,
+                    interaction,
+                    challenge_id,
+                    generation: request.generation,
+                    browser_binding: Some(binding),
+                    existing_browser_session,
+                    csrf: request.csrf,
+                    expected_revision: request.expected_revision,
+                    kind: application::EmailProofKind::Otp,
+                    proof: zeroize::Zeroizing::new(request.otp),
+                })
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    email_completion_response(&state, result, &request_id)
+}
+
+async fn confirm_email_magic(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path(project_public_id): Path<String>,
+    headers: HeaderMap,
+    RuntimeJson(request): RuntimeJson<runtime_types::ConfirmEmailMagicRequest>,
+) -> Response {
+    if !is_same_origin_mutation(&headers, &state.external_origin) {
+        return forbidden_hosted_request(&request_id);
+    }
+    let canonical_magic_proof = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&request.proof)
+        .is_ok_and(|decoded| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(decoded) == request.proof
+        });
+    if !(22..=128).contains(&request.proof.len()) || !canonical_magic_proof {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::EmailMagicConfirm,
+        &[
+            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
+            admission_dimension(AdmissionDimensionKind::Credential, &request.challenge_id),
+        ],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(challenge_id) = Uuid::parse_str(&request.challenge_id) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Ok(transaction_id) = Uuid::parse_str(&request.transaction_id) else {
+        return runtime_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Ok(Some(transfer_context)) =
+        cookie_value(&headers, &magic_transfer_cookie_name(challenge_id))
+    else {
+        return invalid_cookie(&request_id);
+    };
+    let browser_binding = cookie_value(&headers, &interaction_cookie_name_from_id(transaction_id))
+        .ok()
+        .flatten();
+    let existing_browser_session =
+        cookie_value(&headers, &project_session_cookie_name(&project_public_id))
+            .ok()
+            .flatten();
+    let result = match runtime_auth(&state) {
+        Ok(service) => {
+            service
+                .verify_magic_transfer(application::SubmitMagicTransferProof {
+                    project_public_id,
+                    transaction_id,
+                    challenge_id,
+                    generation: request.generation,
+                    browser_binding,
+                    existing_browser_session,
+                    transfer_context: zeroize::Zeroizing::new(transfer_context),
+                    csrf: zeroize::Zeroizing::new(request.csrf),
+                    expected_revision: request.expected_revision,
+                    proof: zeroize::Zeroizing::new(request.proof),
+                })
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    // A purpose-bound transfer context may have been established while another browser won the
+    // one-use parent. Its later explicit POST is indistinguishable from any other invalid proof;
+    // absence of the now-terminal authority must not become a resource oracle.
+    let result = match result {
+        Err(ApplicationError::NotFound) => Ok(application::EmailCompletion::Invalid),
+        result => result,
+    };
+    email_completion_response(&state, result, &request_id)
+}
+
+fn email_completion_response(
+    state: &RuntimeState,
+    result: Result<application::EmailCompletion, ApplicationError>,
+    request_id: &str,
+) -> Response {
+    match result {
+        Ok(application::EmailCompletion::Invalid) => runtime_json(
+            Ok(runtime_types::EmailProofResponse {
+                completed: false,
+                redirect_url: None,
+                application_type: None,
+            }),
+            request_id,
+        ),
+        Ok(application::EmailCompletion::Completed(completion)) => {
+            let project_cookie = project_session_cookie_name(&completion.project_public_id);
+            let mut response = runtime_json(
+                Ok(runtime_types::EmailProofResponse {
+                    completed: true,
+                    redirect_url: Some(completion.redirect_url),
+                    application_type: completion.application_type.map(|application_type| {
+                        match application_type {
+                            ApplicationType::Web => runtime_types::HostedApplicationType::Web,
+                            ApplicationType::Native => runtime_types::HostedApplicationType::Native,
+                        }
+                    }),
+                }),
+                request_id,
+            );
+            append_cookie(
+                &mut response,
+                &project_cookie,
+                &completion.browser_session,
+                &state.cookie_path,
+                86_400,
+            );
+            response
+        }
+        Err(error) => runtime_problem(error, request_id),
+    }
+}
+
+async fn email_magic_confirmation_shell(
+    State(state): State<RuntimeState>,
+    Extension(request_id): Extension<String>,
+    Extension(client): Extension<ClientAddress>,
+    Path(challenge_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_top_level_navigation(&headers) {
+        return runtime_document_error(
+            &state,
+            "Link unavailable",
+            "Open this link in a browser to continue.",
+        );
+    }
+    if let Err(response) = admit_runtime(
+        &state,
+        &client,
+        AdmissionEndpoint::EmailMagicRead,
+        &[],
+        &request_id,
+    )
+    .await
+    {
+        return response;
+    }
+    let Ok(challenge_id) = Uuid::parse_str(&challenge_id) else {
+        return runtime_document_error(
+            &state,
+            "Link unavailable",
+            "Return to your Application and start sign-in again.",
+        );
+    };
+    let gate = match runtime_auth(&state) {
+        Ok(service) => service
+            .establish_magic_transfer_context(challenge_id)
+            .await
+            .ok(),
+        Err(_) => None,
+    };
+    let mut response = if let Some(gate) = gate.as_ref() {
+        web_assets::shell_with_context(
+            WebPlane::Runtime,
+            &state.probe.base_path,
+            &[
+                ("owlauth-runtime-flow", "email-magic"),
+                ("owlauth-magic-csrf", gate.csrf.as_str()),
+            ],
+        )
+    } else {
+        web_assets::shell_with_context(
+            WebPlane::Runtime,
+            &state.probe.base_path,
+            &[("owlauth-runtime-flow", "email-magic")],
+        )
+    };
+    if let Some(gate) = gate {
+        append_cookie(
+            &mut response,
+            &magic_transfer_cookie_name(challenge_id),
+            gate.context.as_str(),
+            &state.cookie_path,
+            300,
+        );
+    }
+    response
 }
 
 async fn reuse_browser_session(
@@ -1123,10 +3326,82 @@ async fn reuse_browser_session(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderCallbackQuery {
-    code: String,
+    code: Option<String>,
     state: String,
+    error: Option<String>,
+    error_description: Option<String>,
+    error_uri: Option<String>,
 }
 
+enum ProviderCallbackPayload {
+    Success {
+        state: String,
+        code: String,
+    },
+    Denial {
+        state: String,
+        safe_outcome: &'static str,
+    },
+}
+
+fn classify_provider_callback(
+    query: ProviderCallbackQuery,
+) -> Result<ProviderCallbackPayload, ApplicationError> {
+    if query.state.is_empty()
+        || query.state.len() > 256
+        || query
+            .code
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 4_096)
+        || query
+            .error
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 128)
+        || query
+            .error_description
+            .as_ref()
+            .is_some_and(|value| value.len() > 1_024)
+        || query
+            .error_uri
+            .as_ref()
+            .is_some_and(|value| value.len() > 2_048)
+    {
+        return Err(ApplicationError::InvalidInput);
+    }
+    match (query.code, query.error) {
+        (Some(code), None) if query.error_description.is_none() && query.error_uri.is_none() => {
+            Ok(ProviderCallbackPayload::Success {
+                state: query.state,
+                code,
+            })
+        }
+        (None, Some(error)) => Ok(ProviderCallbackPayload::Denial {
+            state: query.state,
+            safe_outcome: safe_provider_denial_outcome(&error),
+        }),
+        _ => Err(ApplicationError::InvalidInput),
+    }
+}
+
+fn safe_provider_denial_outcome(error: &str) -> &'static str {
+    match error {
+        "access_denied" => "auth.callback.denied_access",
+        "interaction_required" | "login_required" | "consent_required" => {
+            "auth.callback.denied_interaction"
+        }
+        "server_error" | "temporarily_unavailable" => "auth.callback.denied_unavailable",
+        _ => "auth.callback.denied_other",
+    }
+}
+
+fn should_clear_identity_callback_alias<T>(result: &Result<T, ApplicationError>) -> bool {
+    result.is_ok()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the shared callback keeps typed success/denial ownership and cookie effects explicit"
+)]
 async fn provider_callback(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
@@ -1135,6 +3410,14 @@ async fn provider_callback(
     Query(query): Query<ProviderCallbackQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let callback = match classify_provider_callback(query) {
+        Ok(callback) => callback,
+        Err(error) => return runtime_problem(error, &request_id),
+    };
+    let callback_state = match &callback {
+        ProviderCallbackPayload::Success { state, .. }
+        | ProviderCallbackPayload::Denial { state, .. } => state,
+    };
     if let Err(response) = admit_runtime(
         &state,
         &client,
@@ -1142,7 +3425,7 @@ async fn provider_callback(
         &[
             admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
             admission_dimension(AdmissionDimensionKind::Provider, &provider_key),
-            admission_dimension(AdmissionDimensionKind::Credential, &query.state),
+            admission_dimension(AdmissionDimensionKind::Credential, callback_state),
         ],
         &request_id,
     )
@@ -1150,20 +3433,315 @@ async fn provider_callback(
     {
         return response;
     }
-    let Ok(interaction_cookie) = interaction_cookie_name(&query.state) else {
+    // Classify exactly one typed owner before reading any class-specific cookie. There is no
+    // probing or fallback after this authority decision, and no provider transport has run yet.
+    let Ok(state_id) = validate_interaction_credential(callback_state) else {
         return runtime_document_error(
             &state,
             "Sign-in unavailable",
-            "Return to your Application and start sign-in again.",
+            "Return to the originating interaction and start again.",
         );
+    };
+    let callback_owner = match state.callback_owners.as_deref() {
+        Some(resolver) => {
+            resolver
+                .resolve(state_id, &project_public_id, &provider_key)
+                .await
+        }
+        None => Err(ApplicationError::NotFound),
+    };
+    let Ok(callback_owner) = callback_owner else {
+        return runtime_document_error(
+            &state,
+            "Sign-in unavailable",
+            "Return to the originating interaction and start again.",
+        );
+    };
+    let interaction_cookie = match callback_owner {
+        ProviderCallbackOwner::Login { .. }
+        | ProviderCallbackOwner::ManagedReauthorization { .. } => {
+            interaction_cookie_name_from_id(state_id)
+        }
+        ProviderCallbackOwner::IdentityMutation { proof_slot_id, .. } => {
+            if proof_slot_id != state_id {
+                return runtime_document_error(
+                    &state,
+                    "Identity proof could not be completed",
+                    "Return to the identity-management interaction and start this proof again.",
+                );
+            }
+            identity_proof_slot_cookie_name(proof_slot_id)
+        }
     };
     let Ok(Some(browser_binding)) = cookie_value(&headers, &interaction_cookie) else {
         return runtime_document_error(
             &state,
             "Sign-in unavailable",
-            "Return to your Application and start sign-in again.",
+            "Return to the originating interaction and start again.",
         );
     };
+
+    if let ProviderCallbackOwner::IdentityMutation {
+        intent_id,
+        proof_slot_id,
+    } = callback_owner
+    {
+        let Some(service) = state.identity_mutations.as_deref() else {
+            return runtime_document_error(
+                &state,
+                "Identity proof could not be completed",
+                "Return to the identity-management interaction and start this proof again.",
+            );
+        };
+        let result = match callback {
+            ProviderCallbackPayload::Denial {
+                state: callback_state,
+                safe_outcome,
+            } => service
+                .deny_provider_callback(application::IdentityMutationProviderDenial {
+                    intent_id,
+                    proof_slot_id,
+                    project_public_id: project_public_id.clone(),
+                    provider_key: provider_key.clone(),
+                    state: callback_state,
+                    browser_binding,
+                    safe_outcome,
+                })
+                .await
+                .map(|_| None),
+            ProviderCallbackPayload::Success {
+                state: callback_state,
+                code,
+            } => service
+                .complete_provider_callback(application::IdentityMutationProviderCallback {
+                    intent_id,
+                    proof_slot_id,
+                    project_public_id: project_public_id.clone(),
+                    provider_key: provider_key.clone(),
+                    state: callback_state,
+                    code,
+                    browser_binding,
+                })
+                .await
+                .map(|outcome| match outcome {
+                    application::IdentityMutationCallbackOutcome::Proved {
+                        continuation, ..
+                    } => Some(continuation.to_string()),
+                    application::IdentityMutationCallbackOutcome::Duplicate(_)
+                    | application::IdentityMutationCallbackOutcome::TerminalizedFailure(_)
+                    | application::IdentityMutationCallbackOutcome::TerminalizedStaleAuthority => {
+                        None
+                    }
+                }),
+        };
+        let clear_alias = should_clear_identity_callback_alias(&result);
+        let mut response = match result {
+            Ok(Some(continuation)) => {
+                // Continuation is the original opaque intent handle. It is kept out of response
+                // metadata and used only to reconstruct the local same-origin Hosted path.
+                Redirect::to(&format!(
+                    "{}auth/identity-mutations/{continuation}",
+                    state.probe.base_path
+                ))
+                .into_response()
+            }
+            Ok(None) => runtime_document_error(
+                &state,
+                "Identity proof was not completed",
+                "Return to the identity-management interaction and continue or start this proof again.",
+            ),
+            Err(_) => runtime_document_error(
+                &state,
+                "Identity proof could not be completed",
+                "Return to the identity-management interaction and start this proof again.",
+            ),
+        };
+        // Clear only terminal/consumed state-to-slot aliases. Infrastructure failures retain the
+        // alias because the authoritative slot may still be retryable. The intent binding cookie
+        // remains until Hosted or Control reaches its final transition.
+        if clear_alias {
+            clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+        }
+        return response;
+    }
+
+    if let ProviderCallbackPayload::Denial {
+        state: callback_state,
+        safe_outcome,
+    } = &callback
+    {
+        if matches!(
+            callback_owner,
+            ProviderCallbackOwner::ManagedReauthorization { .. }
+        ) {
+            let Some(service) = state.managed_reauthorization.as_deref() else {
+                return runtime_document_error(
+                    &state,
+                    "Reauthorization could not be completed",
+                    "Ask the operator to inspect this interaction or create a new one.",
+                );
+            };
+            match service
+                .deny_callback(ManagedReauthorizationDenial {
+                    project_public_id: project_public_id.clone(),
+                    provider_key: provider_key.clone(),
+                    state: callback_state.clone(),
+                    browser_binding: browser_binding.clone(),
+                    safe_outcome,
+                })
+                .await
+            {
+                Ok(_) => {
+                    let mut response = runtime_document_error(
+                        &state,
+                        "Provider authorization was not approved",
+                        "Ask the operator to create a new managed reauthorization interaction if access is still required.",
+                    );
+                    clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+                    return response;
+                }
+                Err(_) => {
+                    return runtime_document_error(
+                        &state,
+                        "Reauthorization could not be completed",
+                        "Ask the operator to inspect this interaction or create a new one.",
+                    );
+                }
+            }
+        }
+        let denied = match runtime_auth(&state) {
+            Ok(service) => {
+                service
+                    .deny_provider_callback(ProviderCallbackDenial {
+                        project_public_id: project_public_id.clone(),
+                        provider_key,
+                        state: callback_state.clone(),
+                        browser_binding,
+                        safe_outcome,
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if denied.is_err() {
+            return runtime_document_error(
+                &state,
+                "Sign-in could not be completed",
+                "Return to your Application and start sign-in again.",
+            );
+        }
+        let mut response = runtime_document_error(
+            &state,
+            "Provider authorization was not approved",
+            "Return to your Application and start sign-in again if access is still required.",
+        );
+        clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+        return response;
+    }
+
+    let ProviderCallbackPayload::Success {
+        state: callback_state,
+        code,
+    } = callback
+    else {
+        unreachable!()
+    };
+    if matches!(
+        callback_owner,
+        ProviderCallbackOwner::ManagedReauthorization { .. }
+    ) {
+        let Some(service) = state.managed_reauthorization.as_deref() else {
+            return runtime_document_error(
+                &state,
+                "Reauthorization could not be completed",
+                "Ask the operator to inspect this interaction or create a new one.",
+            );
+        };
+        match service
+            .complete_callback(ManagedReauthorizationCallback {
+                project_public_id: project_public_id.clone(),
+                provider_key: provider_key.clone(),
+                state: callback_state.clone(),
+                code: code.clone(),
+                browser_binding: browser_binding.clone(),
+            })
+            .await
+        {
+            Ok(ManagedReauthorizationCallbackOutcome::TerminalizedFailure(interaction)) => {
+                if !interaction.status.terminal() {
+                    return runtime_document_error(
+                        &state,
+                        "Reauthorization could not be completed",
+                        "Ask the operator to inspect this interaction or create a new one.",
+                    );
+                }
+                let mut response = runtime_document_error(
+                    &state,
+                    "Reauthorization could not be completed",
+                    "Ask the operator to inspect this interaction or create a new one.",
+                );
+                clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+                return response;
+            }
+            Ok(ManagedReauthorizationCallbackOutcome::TerminalizedStaleAuthority) => {
+                let mut response = runtime_document_error(
+                    &state,
+                    "Reauthorization could not be completed",
+                    "Ask the operator to inspect this interaction or create a new one.",
+                );
+                clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+                return response;
+            }
+            Ok(outcome) => {
+                let interaction = match outcome {
+                    ManagedReauthorizationCallbackOutcome::Completed(value)
+                    | ManagedReauthorizationCallbackOutcome::Duplicate(value) => value,
+                    ManagedReauthorizationCallbackOutcome::TerminalizedFailure(_)
+                    | ManagedReauthorizationCallbackOutcome::TerminalizedStaleAuthority => {
+                        unreachable!()
+                    }
+                };
+                if interaction.status.terminal()
+                    && interaction.status != application::ManagedReauthorizationStatus::Completed
+                {
+                    let mut response = runtime_document_error(
+                        &state,
+                        "Reauthorization could not be completed",
+                        "Ask the operator to inspect this interaction or create a new one.",
+                    );
+                    clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+                    return response;
+                }
+                let payload = serde_json::json!({
+                    "project_public_id": interaction.project_public_id,
+                    "provider_key": interaction.provider_key,
+                    "status": interaction.status.as_str(),
+                    "revision": interaction.revision,
+                    "expires_at": timestamp(interaction.expires_at),
+                });
+                let serialized = payload.to_string();
+                let mut response = web_assets::shell_with_context(
+                    WebPlane::Runtime,
+                    &state.probe.base_path,
+                    &[
+                        ("owlauth-runtime-flow", "managed_reauthorization"),
+                        ("owlauth-runtime-bootstrap", &serialized),
+                    ],
+                );
+                if interaction.status.terminal() {
+                    clear_cookie(&mut response, &interaction_cookie, &state.cookie_path);
+                }
+                return response;
+            }
+            Err(_) => {
+                return runtime_document_error(
+                    &state,
+                    "Reauthorization could not be completed",
+                    "Ask the operator to inspect this interaction or create a new one.",
+                );
+            }
+        }
+    }
     let project_cookie = project_session_cookie_name(&project_public_id);
     let Ok(existing_browser_session) = cookie_value(&headers, &project_cookie) else {
         return runtime_document_error(
@@ -1178,8 +3756,8 @@ async fn provider_callback(
                 .complete_provider_callback(ProviderCallback {
                     project_public_id: project_public_id.clone(),
                     provider_key,
-                    state: query.state,
-                    code: query.code,
+                    state: callback_state,
+                    code,
                     browser_binding,
                     existing_browser_session,
                 })
@@ -1392,16 +3970,20 @@ async fn current_user(
                         &token,
                         cors_origin.as_deref(),
                     );
-                    user_projection(current.projection_document).map(|projection| {
-                        runtime_types::CurrentUserResponse {
+                    user_projection(current.projection_document).and_then(|projection| {
+                        let projection_revision = projection.projection_revision;
+                        if current.projection_revision != projection_revision {
+                            return Err(ApplicationError::Integrity);
+                        }
+                        Ok(runtime_types::CurrentUserResponse {
                             project_id: current.project_public_id,
                             application_id: current.application_public_id,
                             user_id: current.user_public_id,
                             projection,
-                            projection_revision: current.projection_revision,
+                            projection_revision,
                             authenticated_at: timestamp(current.authenticated_at),
                             session_expires_at: timestamp(current.absolute_expires_at),
-                        }
+                        })
                     })
                 }
             }
@@ -1856,9 +4438,383 @@ fn provisioning(state: &ControlState) -> Result<&ProvisioningService, Applicatio
         .ok_or(ApplicationError::Persistence)
 }
 
+async fn list_managed_provider_connections(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id)): Path<(String, String)>,
+) -> Response {
+    let (project_id, user_id) = match (
+        resource_uuid(&project_id, &request_id),
+        resource_uuid(&user_id, &request_id),
+    ) {
+        (Ok(project_id), Ok(user_id)) => (project_id, user_id),
+        (Err(response), _) | (_, Err(response)) => return response,
+    };
+    let Some(repository) = state.managed_connections.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    let result = repository
+        .list_metadata(project_id, user_id, 100)
+        .await
+        .and_then(|items| {
+            items
+                .into_iter()
+                .map(managed_connection_response)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map(|items| control_types::ManagedProviderConnectionList { items });
+    control_json(result, &request_id)
+}
+
+#[derive(Clone, Copy)]
+enum ManagedControlAction {
+    Synchronize,
+    Revoke,
+    Disconnect,
+}
+
+fn managed_owner_preflight(result: Result<(), ApplicationError>) -> Result<(), ApplicationError> {
+    result
+}
+
+async fn managed_provider_connection_action(
+    state: &ControlState,
+    request_id: &str,
+    project_id: String,
+    user_id: String,
+    connection_id: String,
+    body: control_types::ManagedProviderConnectionActionRequest,
+    action: ManagedControlAction,
+) -> Response {
+    let (project_id, user_id, connection_id) = match (
+        resource_uuid(&project_id, request_id),
+        resource_uuid(&user_id, request_id),
+        resource_uuid(&connection_id, request_id),
+    ) {
+        (Ok(project_id), Ok(user_id), Ok(connection_id)) => (project_id, user_id, connection_id),
+        (Err(response), _, _) | (_, Err(response), _) | (_, _, Err(response)) => return response,
+    };
+    if body.expected_revision <= 0
+        || body.expected_generation <= 0
+        || (matches!(
+            action,
+            ManagedControlAction::Disconnect | ManagedControlAction::Revoke
+        ) && !body.confirm)
+    {
+        return application_problem(ApplicationError::InvalidInput, request_id);
+    }
+    let Some(repository) = state.managed_connections.as_deref() else {
+        return application_problem(ApplicationError::Persistence, request_id);
+    };
+    if let Err(error) = managed_owner_preflight(
+        repository
+            .metadata_for_owner(project_id, user_id, connection_id)
+            .await
+            .map(drop),
+    ) {
+        return application_problem(error, request_id);
+    }
+    let now = SystemClock.now();
+    let result = match action {
+        ManagedControlAction::Synchronize => {
+            repository
+                .request_synchronize(
+                    project_id,
+                    user_id,
+                    connection_id,
+                    body.expected_revision,
+                    body.expected_generation,
+                    now,
+                )
+                .await
+        }
+        ManagedControlAction::Revoke => {
+            repository
+                .request_revocation(
+                    project_id,
+                    user_id,
+                    connection_id,
+                    body.expected_revision,
+                    body.expected_generation,
+                    request_uuid(request_id),
+                    now,
+                )
+                .await
+        }
+        ManagedControlAction::Disconnect => {
+            repository
+                .disconnect(
+                    project_id,
+                    user_id,
+                    connection_id,
+                    body.expected_revision,
+                    body.expected_generation,
+                    now,
+                )
+                .await
+        }
+    }
+    .and_then(managed_connection_response);
+    control_json(result, request_id)
+}
+
+async fn synchronize_managed_provider_connection(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, connection_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ManagedProviderConnectionActionRequest>,
+) -> Response {
+    managed_provider_connection_action(
+        &state,
+        &request_id,
+        project_id,
+        user_id,
+        connection_id,
+        body,
+        ManagedControlAction::Synchronize,
+    )
+    .await
+}
+
+async fn create_managed_reauthorization(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, connection_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::CreateManagedReauthorizationRequest>,
+) -> Response {
+    let (project_id, user_id, connection_id, application_id) = match (
+        resource_uuid(&project_id, &request_id),
+        resource_uuid(&user_id, &request_id),
+        resource_uuid(&connection_id, &request_id),
+        resource_uuid(&body.application_id, &request_id),
+    ) {
+        (Ok(project), Ok(user), Ok(connection), Ok(application)) => {
+            (project, user, connection, application)
+        }
+        (Err(response), _, _, _)
+        | (_, Err(response), _, _)
+        | (_, _, Err(response), _)
+        | (_, _, _, Err(response)) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let Some(service) = state.managed_reauthorization.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    let result = service
+        .create(CreateManagedReauthorization {
+            project_id,
+            user_id,
+            connection_id,
+            application_id,
+            expected_connection_revision: body.expected_connection_revision,
+            expected_connection_generation: body.expected_connection_generation,
+            expected_credential_generation: body.expected_credential_generation,
+            idempotency_key,
+            correlation_id: request_uuid(&request_id),
+        })
+        .await
+        .map(
+            |created| control_types::CreateManagedReauthorizationResponse {
+                interaction: managed_reauthorization_response(created.interaction),
+                hosted_target: created.hosted_target,
+            },
+        );
+    control_json(result, &request_id)
+}
+
+async fn get_managed_reauthorization(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, connection_id, interaction_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Response {
+    let ids = (
+        resource_uuid(&project_id, &request_id),
+        resource_uuid(&user_id, &request_id),
+        resource_uuid(&connection_id, &request_id),
+        resource_uuid(&interaction_id, &request_id),
+    );
+    let (Ok(project_id), Ok(user_id), Ok(connection_id), Ok(interaction_id)) = ids else {
+        return application_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Some(service) = state.managed_reauthorization.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    control_json(
+        service
+            .read(project_id, user_id, connection_id, interaction_id)
+            .await
+            .map(managed_reauthorization_response),
+        &request_id,
+    )
+}
+
+async fn cancel_managed_reauthorization(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, connection_id, interaction_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    ControlJson(body): ControlJson<control_types::CancelManagedReauthorizationRequest>,
+) -> Response {
+    let ids = (
+        resource_uuid(&project_id, &request_id),
+        resource_uuid(&user_id, &request_id),
+        resource_uuid(&connection_id, &request_id),
+        resource_uuid(&interaction_id, &request_id),
+    );
+    let (Ok(project_id), Ok(user_id), Ok(connection_id), Ok(interaction_id)) = ids else {
+        return application_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Some(service) = state.managed_reauthorization.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    control_json(
+        service
+            .cancel(
+                project_id,
+                user_id,
+                connection_id,
+                interaction_id,
+                body.expected_revision,
+                request_uuid(&request_id),
+            )
+            .await
+            .map(managed_reauthorization_response),
+        &request_id,
+    )
+}
+
+fn managed_reauthorization_response(
+    value: application::ManagedReauthorizationView,
+) -> control_types::ManagedReauthorization {
+    use application::ManagedReauthorizationStatus as Source;
+    let status = match value.status {
+        Source::AwaitingBrowserBinding => {
+            control_types::ManagedReauthorizationStatus::AwaitingBrowserBinding
+        }
+        Source::AwaitingProviderStart => {
+            control_types::ManagedReauthorizationStatus::AwaitingProviderStart
+        }
+        Source::ProviderAuthorizationStarted => {
+            control_types::ManagedReauthorizationStatus::ProviderAuthorizationStarted
+        }
+        Source::ProviderExchangeInProgress => {
+            control_types::ManagedReauthorizationStatus::ProviderExchangeInProgress
+        }
+        Source::Completed => control_types::ManagedReauthorizationStatus::Completed,
+        Source::ProviderExchangeFailed => {
+            control_types::ManagedReauthorizationStatus::ProviderExchangeFailed
+        }
+        Source::Expired => control_types::ManagedReauthorizationStatus::Expired,
+        Source::Cancelled => control_types::ManagedReauthorizationStatus::Cancelled,
+    };
+    control_types::ManagedReauthorization {
+        id: value.id.to_string(),
+        project_id: value.project_id.to_string(),
+        user_id: value.user_id.to_string(),
+        connection_id: value.connection_id.to_string(),
+        provider_key: value.provider_key,
+        application_id: value.application_id.to_string(),
+        status,
+        revision: value.revision,
+        expires_at: timestamp(value.expires_at),
+    }
+}
+
+async fn disconnect_managed_provider_connection(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, connection_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ManagedProviderConnectionActionRequest>,
+) -> Response {
+    managed_provider_connection_action(
+        &state,
+        &request_id,
+        project_id,
+        user_id,
+        connection_id,
+        body,
+        ManagedControlAction::Disconnect,
+    )
+    .await
+}
+
+async fn revoke_managed_provider_connection(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id, connection_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ManagedProviderConnectionActionRequest>,
+) -> Response {
+    managed_provider_connection_action(
+        &state,
+        &request_id,
+        project_id,
+        user_id,
+        connection_id,
+        body,
+        ManagedControlAction::Revoke,
+    )
+    .await
+}
+
+fn managed_connection_response(
+    connection: ManagedConnectionMetadata,
+) -> Result<control_types::ManagedProviderConnection, ApplicationError> {
+    let state = match connection.state.as_str() {
+        "active" => control_types::ManagedProviderConnectionState::Active,
+        "reauth_required" => control_types::ManagedProviderConnectionState::ReauthRequired,
+        "revoked" => control_types::ManagedProviderConnectionState::Revoked,
+        "disconnected" => control_types::ManagedProviderConnectionState::Disconnected,
+        _ => return Err(ApplicationError::Integrity),
+    };
+    Ok(control_types::ManagedProviderConnection {
+        id: connection.id.to_string(),
+        project_id: connection.project_id.to_string(),
+        provider_id: connection.provider_configuration_id.to_string(),
+        identity_id: connection.linked_identity_id.to_string(),
+        user_id: connection.user_id.to_string(),
+        state,
+        revision: connection.revision,
+        generation: connection.generation,
+        credential_generation: connection.credential_generation,
+        capability_key: connection.capability_key,
+        required_scopes: connection.required_scopes,
+        source_schema: connection.source_schema,
+        supports_revocation: connection.supports_revocation,
+        reauthorization_application_ids: connection
+            .reauthorization_application_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        last_safe_outcome: connection.last_safe_outcome,
+        last_synchronized_at: connection.last_synchronized_at.map(timestamp),
+        next_synchronize_at: connection.next_synchronize_at.map(timestamp),
+        next_renewal_at: connection.next_renewal_at.map(timestamp),
+        consecutive_failures: connection.consecutive_failures,
+    })
+}
+
 fn control_lifecycle(state: &ControlState) -> Result<&ControlLifecycleService, ApplicationError> {
     state
         .lifecycle
+        .as_deref()
+        .ok_or(ApplicationError::Persistence)
+}
+
+fn email_control(state: &ControlState) -> Result<&EmailControlService, ApplicationError> {
+    state
+        .email_control
         .as_deref()
         .ok_or(ApplicationError::Persistence)
 }
@@ -2052,6 +5008,932 @@ async fn disable_project(
     }
 }
 
+async fn get_email_method_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service
+            .get_policy(project_id)
+            .await
+            .map(control_email_policy),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn update_email_method_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::UpdateEmailMethodPolicyRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service
+            .update_policy(
+                project_id,
+                application::UpdateEmailPolicy {
+                    enabled: body.enabled,
+                    otp_enabled: body.otp_enabled,
+                    magic_link_enabled: body.magic_link_enabled,
+                    otp_digits: body.otp_digits,
+                    otp_validity_seconds: body.otp_validity_seconds,
+                    otp_max_attempts: body.otp_max_attempts,
+                    resend_after_seconds: body.resend_after_seconds,
+                    max_generations: body.max_generations,
+                    magic_validity_seconds: body.magic_validity_seconds,
+                    signup_enabled: body.signup_enabled,
+                    transferred_magic_link_enabled: body.transferred_magic_link_enabled,
+                    allow_deployment_default: body.allow_deployment_default,
+                    expected_policy_revision: body.expected_policy_revision,
+                    expected_security_revision: body.expected_security_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+            .map(control_email_policy),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn assign_email_method(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::EmailAssignmentRequest>,
+) -> Response {
+    let (project_id, application_id) =
+        match resource_pair(&project_id, &application_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match email_control(&state) {
+        Ok(service) => match service
+            .assign(
+                project_id,
+                application_id,
+                body.enabled,
+                body.expected_application_security_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(()) => service
+                .get_policy(project_id)
+                .await
+                .map(control_email_policy),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn list_smtp_configurations(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let result =
+        match email_control(&state) {
+            Ok(service) => service.list_smtp(project_id).await.map(|items| {
+                control_types::SmtpConfigurationList {
+                    items: items.into_iter().map(control_smtp).collect(),
+                }
+            }),
+            Err(error) => Err(error),
+        };
+    control_json(result, &request_id)
+}
+
+async fn list_deployment_smtp_generations(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+) -> Response {
+    let result = match email_control(&state) {
+        Ok(service) => service.list_deployment_smtp().await.map(|items| {
+            control_types::DeploymentSmtpGenerationList {
+                items: items.into_iter().map(control_deployment_smtp).collect(),
+            }
+        }),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn disable_deployment_smtp_generation(
+    state: State<ControlState>,
+    request_id: Extension<String>,
+    path: Path<String>,
+    body: ControlJson<control_types::SmtpRevisionRequest>,
+) -> Response {
+    mutate_deployment_smtp(state, request_id, path, body, false).await
+}
+
+async fn compromise_deployment_smtp_generation(
+    state: State<ControlState>,
+    request_id: Extension<String>,
+    path: Path<String>,
+    body: ControlJson<control_types::SmtpRevisionRequest>,
+) -> Response {
+    mutate_deployment_smtp(state, request_id, path, body, true).await
+}
+
+async fn mutate_deployment_smtp(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(generation): Path<String>,
+    ControlJson(body): ControlJson<control_types::SmtpRevisionRequest>,
+    compromised: bool,
+) -> Response {
+    let Ok(generation) = generation.parse::<i32>() else {
+        return control_json::<control_types::DeploymentSmtpGeneration>(
+            Err(ApplicationError::InvalidInput),
+            &request_id,
+        );
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service
+            .terminate_deployment_smtp(
+                generation,
+                body.expected_revision,
+                compromised,
+                request_uuid(&request_id),
+            )
+            .await
+            .map(control_deployment_smtp),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn create_smtp_configuration(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::CreateSmtpConfigurationRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let tls_mode = match body.tls_mode {
+        control_types::SmtpTlsMode::ImplicitTls => application::SmtpControlTlsMode::ImplicitTls,
+        control_types::SmtpTlsMode::StarttlsRequired => {
+            application::SmtpControlTlsMode::StarttlsRequired
+        }
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service
+            .create_smtp(
+                project_id,
+                CreateSmtpConfiguration {
+                    host: body.host,
+                    port: body.port,
+                    tls_mode,
+                    sender_address: body.sender_address,
+                    sender_name: body.sender_name,
+                    reply_to: body.reply_to,
+                    credential: zeroize::Zeroizing::new(body.credential),
+                    idempotency_key,
+                    expected_project_security_revision: body.expected_project_security_revision,
+                    correlation_id: request_uuid(&request_id),
+                },
+            )
+            .await
+            .map(control_smtp),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn test_smtp_configuration(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, smtp_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::TestSmtpConfigurationRequest>,
+) -> Response {
+    let (project_id, smtp_id) = match resource_pair(&project_id, &smtp_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service
+            .test_smtp(
+                project_id,
+                smtp_id,
+                &body.recipient,
+                body.expected_revision,
+                idempotency_key,
+                request_uuid(&request_id),
+            )
+            .await
+            .map(|record| control_smtp_test(&record)),
+        Err(error) => Err(error),
+    };
+    let operation_id = result.as_ref().ok().map(|operation| operation.id.clone());
+    let mut response = control_json(result, &request_id);
+    if let Some(operation_id) = operation_id {
+        *response.status_mut() = StatusCode::ACCEPTED;
+        if let Ok(value) = HeaderValue::from_str(&format!(
+            "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/tests/{operation_id}"
+        )) {
+            response.headers_mut().insert(header::LOCATION, value);
+        }
+    }
+    response
+}
+
+async fn get_smtp_test_operation(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, smtp_id, operation_id)): Path<(String, String, String)>,
+) -> Response {
+    let Ok(project_id) = Uuid::parse_str(&project_id) else {
+        return control_json::<()>(Err(ApplicationError::InvalidInput), &request_id);
+    };
+    let Ok(smtp_id) = Uuid::parse_str(&smtp_id) else {
+        return control_json::<()>(Err(ApplicationError::InvalidInput), &request_id);
+    };
+    let Ok(operation_id) = Uuid::parse_str(&operation_id) else {
+        return control_json::<()>(Err(ApplicationError::InvalidInput), &request_id);
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service
+            .get_smtp_test(project_id, operation_id)
+            .await
+            .and_then(|record| {
+                if record.configuration_id == smtp_id {
+                    Ok(control_smtp_test(&record))
+                } else {
+                    Err(ApplicationError::NotFound)
+                }
+            }),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn activate_smtp_configuration(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, smtp_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::SmtpRevisionRequest>,
+) -> Response {
+    mutate_smtp(
+        state,
+        request_id,
+        project_id,
+        smtp_id,
+        body.expected_revision,
+        0,
+    )
+    .await
+}
+
+async fn disable_smtp_configuration(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, smtp_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::SmtpRevisionRequest>,
+) -> Response {
+    mutate_smtp(
+        state,
+        request_id,
+        project_id,
+        smtp_id,
+        body.expected_revision,
+        1,
+    )
+    .await
+}
+
+async fn compromise_smtp_configuration(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, smtp_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::SmtpRevisionRequest>,
+) -> Response {
+    mutate_smtp(
+        state,
+        request_id,
+        project_id,
+        smtp_id,
+        body.expected_revision,
+        2,
+    )
+    .await
+}
+
+async fn mutate_smtp(
+    state: ControlState,
+    request_id: String,
+    project_id: String,
+    smtp_id: String,
+    expected_revision: i64,
+    action: u8,
+) -> Response {
+    let (project_id, smtp_id) = match resource_pair(&project_id, &smtp_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let result = match email_control(&state) {
+        Ok(service) => match action {
+            0 => {
+                service
+                    .activate_smtp(
+                        project_id,
+                        smtp_id,
+                        expected_revision,
+                        request_uuid(&request_id),
+                    )
+                    .await
+            }
+            1 => {
+                service
+                    .terminate_smtp(
+                        project_id,
+                        smtp_id,
+                        expected_revision,
+                        false,
+                        request_uuid(&request_id),
+                    )
+                    .await
+            }
+            _ => {
+                service
+                    .terminate_smtp(
+                        project_id,
+                        smtp_id,
+                        expected_revision,
+                        true,
+                        request_uuid(&request_id),
+                    )
+                    .await
+            }
+        }
+        .map(control_smtp),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+fn control_email_policy(
+    record: application::EmailPolicyRecord,
+) -> control_types::EmailMethodPolicy {
+    control_types::EmailMethodPolicy {
+        project_id: record.project_id.to_string(),
+        enabled: record.enabled,
+        policy_revision: record.policy_revision,
+        security_revision: record.security_revision,
+        otp_enabled: record.otp_enabled,
+        magic_link_enabled: record.magic_link_enabled,
+        otp_digits: record.otp_digits,
+        otp_validity_seconds: record.otp_validity_seconds,
+        otp_max_attempts: record.otp_max_attempts,
+        resend_after_seconds: record.resend_after_seconds,
+        max_generations: record.max_generations,
+        magic_validity_seconds: record.magic_validity_seconds,
+        signup_enabled: record.signup_enabled,
+        transferred_magic_link_enabled: record.transferred_magic_link_enabled,
+        allow_deployment_default: record.allow_deployment_default,
+    }
+}
+
+fn control_smtp_test(
+    record: &application::SmtpTestOperationRecord,
+) -> control_types::SmtpTestOperation {
+    control_types::SmtpTestOperation {
+        id: record.id.to_string(),
+        project_id: record.project_id.to_string(),
+        smtp_configuration_id: record.configuration_id.to_string(),
+        status: match record.state {
+            application::SmtpTestState::Preparing => "preparing",
+            application::SmtpTestState::Pending => "pending",
+            application::SmtpTestState::Submitting => "submitting",
+            application::SmtpTestState::Delivered => "delivered",
+            application::SmtpTestState::Failed => "failed",
+            application::SmtpTestState::Ambiguous => "ambiguous",
+        }
+        .to_owned(),
+        outcome: record.outcome.map(|outcome| {
+            match outcome {
+                application::MailTransportOutcome::Delivered => "delivered",
+                application::MailTransportOutcome::Transient => "transient",
+                application::MailTransportOutcome::Permanent => "permanent",
+                application::MailTransportOutcome::Ambiguous => "ambiguous",
+                application::MailTransportOutcome::PolicyDenied => "policy_denied",
+            }
+            .to_owned()
+        }),
+        created_at: record.created_at.format(&Rfc3339).unwrap_or_default(),
+        completed_at: record
+            .completed_at
+            .map(|value| value.format(&Rfc3339).unwrap_or_default()),
+    }
+}
+
+fn control_smtp(record: application::SmtpConfigurationRecord) -> control_types::SmtpConfiguration {
+    let status = match record.status {
+        application::SmtpControlStatus::Reconciled => {
+            control_types::SmtpGenerationStatus::Reconciled
+        }
+        application::SmtpControlStatus::Pending => control_types::SmtpGenerationStatus::Pending,
+        application::SmtpControlStatus::Active => control_types::SmtpGenerationStatus::Active,
+        application::SmtpControlStatus::Retained => control_types::SmtpGenerationStatus::Retained,
+        application::SmtpControlStatus::Disabled => control_types::SmtpGenerationStatus::Disabled,
+        application::SmtpControlStatus::Compromised => {
+            control_types::SmtpGenerationStatus::Compromised
+        }
+        application::SmtpControlStatus::Retired => control_types::SmtpGenerationStatus::Retired,
+    };
+    let tls_mode = match record.tls_mode {
+        application::SmtpControlTlsMode::ImplicitTls => control_types::SmtpTlsMode::ImplicitTls,
+        application::SmtpControlTlsMode::StarttlsRequired => {
+            control_types::SmtpTlsMode::StarttlsRequired
+        }
+    };
+    control_types::SmtpConfiguration {
+        id: record.id.to_string(),
+        project_id: record.project_id.to_string(),
+        generation: record.generation,
+        revision: record.revision,
+        security_eligibility_revision: record.security_eligibility_revision,
+        status,
+        host: record.host,
+        port: record.port,
+        tls_mode,
+        sender_address: record.sender_address,
+        sender_name: record.sender_name,
+        reply_to: record.reply_to,
+        retained_until: record.retained_until.map(timestamp),
+        safe_fingerprint: URL_SAFE_NO_PAD.encode(record.safe_fingerprint),
+    }
+}
+
+fn control_deployment_smtp(
+    record: application::DeploymentSmtpGenerationRecord,
+) -> control_types::DeploymentSmtpGeneration {
+    let status = match record.status {
+        application::SmtpControlStatus::Reconciled => {
+            control_types::SmtpGenerationStatus::Reconciled
+        }
+        application::SmtpControlStatus::Pending => control_types::SmtpGenerationStatus::Pending,
+        application::SmtpControlStatus::Active => control_types::SmtpGenerationStatus::Active,
+        application::SmtpControlStatus::Retained => control_types::SmtpGenerationStatus::Retained,
+        application::SmtpControlStatus::Disabled => control_types::SmtpGenerationStatus::Disabled,
+        application::SmtpControlStatus::Compromised => {
+            control_types::SmtpGenerationStatus::Compromised
+        }
+        application::SmtpControlStatus::Retired => control_types::SmtpGenerationStatus::Retired,
+    };
+    let tls_mode = match record.tls_mode {
+        application::SmtpControlTlsMode::ImplicitTls => control_types::SmtpTlsMode::ImplicitTls,
+        application::SmtpControlTlsMode::StarttlsRequired => {
+            control_types::SmtpTlsMode::StarttlsRequired
+        }
+    };
+    control_types::DeploymentSmtpGeneration {
+        generation: record.generation,
+        revision: record.revision,
+        security_eligibility_revision: record.security_eligibility_revision,
+        status,
+        host: record.host,
+        port: record.port,
+        tls_mode,
+        sender_address: record.sender_address,
+        retained_until: record.retained_until.map(timestamp),
+        safe_fingerprint: URL_SAFE_NO_PAD.encode(record.safe_fingerprint),
+        explicitly_allowed_private_ips: record
+            .explicitly_allowed_private_ips
+            .into_iter()
+            .map(|address| address.to_string())
+            .collect(),
+    }
+}
+
+fn parse_identity_user_target(
+    target: &control_types::IdentityMutationUserTarget,
+) -> Result<application::ExpectedUser, ApplicationError> {
+    Ok(application::ExpectedUser {
+        user_id: Uuid::parse_str(&target.user_id).map_err(|_| ApplicationError::InvalidInput)?,
+        expected_user_revision: target.expected_user_revision,
+        expected_user_security_revision: target.expected_user_security_revision,
+    })
+}
+
+fn parse_identity_reference(
+    reference: control_types::ExistingIdentityReference,
+) -> Result<application::ExpectedIdentity, ApplicationError> {
+    let (identity_kind, identity_id, expected_identity_revision) = match reference {
+        control_types::ExistingIdentityReference::Provider {
+            identity_id,
+            expected_identity_revision,
+        } => (
+            crate::domain::IdentityKind::Provider,
+            identity_id,
+            expected_identity_revision,
+        ),
+        control_types::ExistingIdentityReference::Email {
+            identity_id,
+            expected_identity_revision,
+        } => (
+            crate::domain::IdentityKind::Email,
+            identity_id,
+            expected_identity_revision,
+        ),
+    };
+    Ok(application::ExpectedIdentity {
+        identity_kind,
+        identity_id: Uuid::parse_str(&identity_id).map_err(|_| ApplicationError::InvalidInput)?,
+        expected_identity_revision,
+    })
+}
+
+fn parse_identity_authority(
+    authority: control_types::IdentityMutationProofAuthority,
+) -> Result<application::IdentityMutationProofAuthoritySelection, ApplicationError> {
+    match authority {
+        control_types::IdentityMutationProofAuthority::Provider {
+            application_id,
+            provider_id,
+        } => Ok(
+            application::IdentityMutationProofAuthoritySelection::Provider {
+                application_id: Uuid::parse_str(&application_id)
+                    .map_err(|_| ApplicationError::InvalidInput)?,
+                provider_configuration_id: Uuid::parse_str(&provider_id)
+                    .map_err(|_| ApplicationError::InvalidInput)?,
+            },
+        ),
+        control_types::IdentityMutationProofAuthority::Email { application_id } => Ok(
+            application::IdentityMutationProofAuthoritySelection::Email {
+                application_id: Uuid::parse_str(&application_id)
+                    .map_err(|_| ApplicationError::InvalidInput)?,
+            },
+        ),
+    }
+}
+
+fn parse_unlink_primary(
+    disposition: control_types::UnlinkPrimarySourceDisposition,
+) -> Result<application::IdentityMutationPrimarySourceDisposition, ApplicationError> {
+    match disposition {
+        control_types::UnlinkPrimarySourceDisposition::Preserve => {
+            Ok(application::IdentityMutationPrimarySourceDisposition::Preserve)
+        }
+        control_types::UnlinkPrimarySourceDisposition::Clear => {
+            Ok(application::IdentityMutationPrimarySourceDisposition::Clear)
+        }
+        control_types::UnlinkPrimarySourceDisposition::Provider {
+            identity_id,
+            expected_identity_revision,
+        } => Ok(
+            application::IdentityMutationPrimarySourceDisposition::Provider(
+                application::ExpectedIdentity {
+                    identity_kind: crate::domain::IdentityKind::Provider,
+                    identity_id: Uuid::parse_str(&identity_id)
+                        .map_err(|_| ApplicationError::InvalidInput)?,
+                    expected_identity_revision,
+                },
+            ),
+        ),
+        control_types::UnlinkPrimarySourceDisposition::Email {
+            identity_id,
+            expected_identity_revision,
+        } => Ok(
+            application::IdentityMutationPrimarySourceDisposition::Email(
+                application::ExpectedIdentity {
+                    identity_kind: crate::domain::IdentityKind::Email,
+                    identity_id: Uuid::parse_str(&identity_id)
+                        .map_err(|_| ApplicationError::InvalidInput)?,
+                    expected_identity_revision,
+                },
+            ),
+        ),
+    }
+}
+
+fn parse_merge_primary(
+    source: control_types::MergePrimarySource,
+) -> Result<application::IdentityMutationPrimarySourceDisposition, ApplicationError> {
+    match source {
+        control_types::MergePrimarySource::Provider {
+            identity_id,
+            expected_identity_revision,
+        } => Ok(
+            application::IdentityMutationPrimarySourceDisposition::Provider(
+                application::ExpectedIdentity {
+                    identity_kind: crate::domain::IdentityKind::Provider,
+                    identity_id: Uuid::parse_str(&identity_id)
+                        .map_err(|_| ApplicationError::InvalidInput)?,
+                    expected_identity_revision,
+                },
+            ),
+        ),
+        control_types::MergePrimarySource::Email {
+            identity_id,
+            expected_identity_revision,
+        } => Ok(
+            application::IdentityMutationPrimarySourceDisposition::Email(
+                application::ExpectedIdentity {
+                    identity_kind: crate::domain::IdentityKind::Email,
+                    identity_id: Uuid::parse_str(&identity_id)
+                        .map_err(|_| ApplicationError::InvalidInput)?,
+                    expected_identity_revision,
+                },
+            ),
+        ),
+    }
+}
+
+fn parse_identity_operation(
+    request: control_types::CreateIdentityMutationIntentRequest,
+) -> Result<application::IdentityMutationCreateOperation, ApplicationError> {
+    match request {
+        control_types::CreateIdentityMutationIntentRequest::Link {
+            destination,
+            destination_identity,
+            candidate_identity_kind,
+            destination_proof_authority,
+            candidate_proof_authority,
+        } => Ok(application::IdentityMutationCreateOperation::Link {
+            destination: parse_identity_user_target(&destination)?,
+            destination_identity: parse_identity_reference(destination_identity)?,
+            candidate_kind: match candidate_identity_kind {
+                runtime_types::IdentityKind::Provider => crate::domain::IdentityKind::Provider,
+                runtime_types::IdentityKind::Email => crate::domain::IdentityKind::Email,
+            },
+            destination_authority: parse_identity_authority(destination_proof_authority)?,
+            candidate_authority: parse_identity_authority(candidate_proof_authority)?,
+        }),
+        control_types::CreateIdentityMutationIntentRequest::Unlink {
+            owner,
+            identity,
+            proof_authority,
+            primary_source_disposition,
+        } => Ok(application::IdentityMutationCreateOperation::Unlink {
+            owner: parse_identity_user_target(&owner)?,
+            identity: parse_identity_reference(identity)?,
+            authority: parse_identity_authority(proof_authority)?,
+            primary_source: parse_unlink_primary(primary_source_disposition)?,
+        }),
+        control_types::CreateIdentityMutationIntentRequest::Merge {
+            winner,
+            winner_identity,
+            winner_proof_authority,
+            loser,
+            loser_identity,
+            loser_proof_authority,
+            primary_source,
+            sessions_disposition: _,
+            bindings_disposition: _,
+        } => Ok(application::IdentityMutationCreateOperation::Merge {
+            winner: parse_identity_user_target(&winner)?,
+            winner_identity: parse_identity_reference(winner_identity)?,
+            loser: parse_identity_user_target(&loser)?,
+            loser_identity: parse_identity_reference(loser_identity)?,
+            winner_authority: parse_identity_authority(winner_proof_authority)?,
+            loser_authority: parse_identity_authority(loser_proof_authority)?,
+            primary_source: parse_merge_primary(primary_source)?,
+            sessions: application::IdentityMutationSessionsDisposition::LoserRevoked,
+            bindings: application::IdentityMutationBindingsDisposition::WinnerPreferred,
+        }),
+    }
+}
+
+async fn create_identity_mutation_intent(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::CreateIdentityMutationIntentRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let operation = match parse_identity_operation(body) {
+        Ok(operation) => operation,
+        Err(error) => return application_problem(error, &request_id),
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    match service
+        .create(application::CreateIdentityMutation {
+            project_id,
+            operation,
+            idempotency_key,
+            correlation_id: request_uuid(&request_id),
+        })
+        .await
+    {
+        Ok(created) => (
+            StatusCode::CREATED,
+            Json(control_types::CreateIdentityMutationIntentResponse {
+                intent: control_identity_mutation_view(created.intent),
+                hosted_target: created.hosted_target,
+            }),
+        )
+            .into_response(),
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn get_identity_mutation_intent(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, intent_id)): Path<(String, String)>,
+) -> Response {
+    let (project_id, intent_id) = match resource_pair(&project_id, &intent_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    control_json(
+        service
+            .read(project_id, intent_id)
+            .await
+            .map(control_identity_mutation_view),
+        &request_id,
+    )
+}
+
+async fn cancel_identity_mutation_intent(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, intent_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::CancelIdentityMutationIntentRequest>,
+) -> Response {
+    let (project_id, intent_id) = match resource_pair(&project_id, &intent_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    control_json(
+        service
+            .cancel(
+                project_id,
+                intent_id,
+                body.expected_revision,
+                request_uuid(&request_id),
+            )
+            .await
+            .map(control_identity_mutation_view),
+        &request_id,
+    )
+}
+
+async fn confirm_identity_mutation_intent(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, intent_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::ConfirmIdentityMutationIntentRequest>,
+) -> Response {
+    let (project_id, intent_id) = match resource_pair(&project_id, &intent_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    let (expected_revision, expected_kind) = match body {
+        control_types::ConfirmIdentityMutationIntentRequest::Link {
+            expected_revision, ..
+        } => (expected_revision, crate::domain::IdentityMutationKind::Link),
+        control_types::ConfirmIdentityMutationIntentRequest::Unlink {
+            expected_revision, ..
+        } => (
+            expected_revision,
+            crate::domain::IdentityMutationKind::Unlink,
+        ),
+        control_types::ConfirmIdentityMutationIntentRequest::Merge {
+            expected_revision, ..
+        } => (
+            expected_revision,
+            crate::domain::IdentityMutationKind::Merge,
+        ),
+    };
+    let Some(service) = state.identity_mutations.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    control_json(
+        service
+            .confirm(
+                project_id,
+                intent_id,
+                expected_revision,
+                expected_kind,
+                request_uuid(&request_id),
+            )
+            .await
+            .map(control_identity_mutation_view),
+        &request_id,
+    )
+}
+
+fn control_identity_mutation_view(
+    view: application::IdentityMutationView,
+) -> control_types::IdentityMutationIntent {
+    control_types::IdentityMutationIntent {
+        id: view.id.to_string(),
+        project_id: view.project_id.to_string(),
+        operation_kind: match view.kind {
+            crate::domain::IdentityMutationKind::Link => {
+                control_types::IdentityMutationOperationKind::Link
+            }
+            crate::domain::IdentityMutationKind::Unlink => {
+                control_types::IdentityMutationOperationKind::Unlink
+            }
+            crate::domain::IdentityMutationKind::Merge => {
+                control_types::IdentityMutationOperationKind::Merge
+            }
+        },
+        status: match view.status {
+            crate::domain::IdentityMutationStatus::PendingProof => {
+                control_types::IdentityMutationIntentStatus::PendingProof
+            }
+            crate::domain::IdentityMutationStatus::Ready => {
+                control_types::IdentityMutationIntentStatus::Ready
+            }
+            crate::domain::IdentityMutationStatus::Completed => {
+                control_types::IdentityMutationIntentStatus::Completed
+            }
+            crate::domain::IdentityMutationStatus::Expired => {
+                control_types::IdentityMutationIntentStatus::Expired
+            }
+            crate::domain::IdentityMutationStatus::Cancelled => {
+                control_types::IdentityMutationIntentStatus::Cancelled
+            }
+        },
+        revision: view.revision,
+        effective_expires_at: timestamp(view.expires_at),
+        slots: view
+            .slots
+            .into_iter()
+            .map(|slot| control_types::IdentityMutationProofSlot {
+                id: slot.id.to_string(),
+                role: match slot.role {
+                    crate::domain::IdentityMutationSlotRole::DestinationOwner => {
+                        control_types::IdentityMutationProofRole::DestinationOwner
+                    }
+                    crate::domain::IdentityMutationSlotRole::CandidateIdentity => {
+                        control_types::IdentityMutationProofRole::CandidateIdentity
+                    }
+                    crate::domain::IdentityMutationSlotRole::IdentityOwner => {
+                        control_types::IdentityMutationProofRole::IdentityOwner
+                    }
+                    crate::domain::IdentityMutationSlotRole::WinnerOwner => {
+                        control_types::IdentityMutationProofRole::WinnerOwner
+                    }
+                    crate::domain::IdentityMutationSlotRole::LoserOwner => {
+                        control_types::IdentityMutationProofRole::LoserOwner
+                    }
+                },
+                identity_kind: match slot.identity_kind {
+                    crate::domain::IdentityKind::Provider => runtime_types::IdentityKind::Provider,
+                    crate::domain::IdentityKind::Email => runtime_types::IdentityKind::Email,
+                },
+                method_kind: match slot.method_kind {
+                    application::IdentityMutationProofMethodKind::Provider => {
+                        runtime_types::IdentityMutationMethodKind::Provider
+                    }
+                    application::IdentityMutationProofMethodKind::Email => {
+                        runtime_types::IdentityMutationMethodKind::Email
+                    }
+                },
+                proved: slot.proved,
+            })
+            .collect(),
+    }
+}
+
 async fn list_project_users(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -2089,6 +5971,33 @@ async fn get_project_user(
     match control_lifecycle(&state) {
         Ok(service) => match service.get_project_user(project_id, user_id).await {
             Ok(user) => Json(control_project_user(user)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn list_project_user_identities(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id)): Path<(String, String)>,
+) -> Response {
+    let (project_id, user_id) = match resource_pair(&project_id, &user_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service
+            .list_project_user_identities(project_id, user_id)
+            .await
+        {
+            Ok(identities) => Json(control_types::ProjectUserIdentityList {
+                items: identities
+                    .into_iter()
+                    .map(control_project_user_identity)
+                    .collect(),
+            })
+            .into_response(),
             Err(error) => application_problem(error, &request_id),
         },
         Err(error) => application_problem(error, &request_id),
@@ -2241,6 +6150,44 @@ fn timestamp(value: OffsetDateTime) -> String {
         .expect("application timestamps must be representable as RFC 3339")
 }
 
+fn control_project_user_identity(
+    identity: application::ProjectUserIdentityRecord,
+) -> control_types::ProjectUserIdentity {
+    let presentation = match identity.kind {
+        application::ProjectUserIdentityKind::Provider => {
+            control_types::ProjectUserIdentityPresentation::Provider {
+                provider_key: identity
+                    .provider_key
+                    .expect("validated provider inventory has creation provenance"),
+            }
+        }
+        application::ProjectUserIdentityKind::Email => {
+            control_types::ProjectUserIdentityPresentation::Email {
+                address: control_types::RedactedEmailMarker::Redacted,
+            }
+        }
+    };
+    control_types::ProjectUserIdentity {
+        id: identity.id.to_string(),
+        project_id: identity.project_id.to_string(),
+        user_id: identity.user_id.to_string(),
+        status: match identity.status {
+            application::ProjectUserIdentityStatus::Active => {
+                control_types::ProjectUserIdentityStatus::Active
+            }
+            application::ProjectUserIdentityStatus::Disabled => {
+                control_types::ProjectUserIdentityStatus::Disabled
+            }
+        },
+        identity_revision: identity.identity_revision,
+        is_primary_source: identity.is_primary_source,
+        presentation,
+        verified_or_observed_at: timestamp(identity.verified_or_observed_at),
+        created_at: timestamp(identity.created_at),
+        updated_at: timestamp(identity.updated_at),
+    }
+}
+
 fn control_project_user(user: application::ProjectUserRecord) -> control_types::ProjectUser {
     control_types::ProjectUser {
         id: user.id.to_string(),
@@ -2249,6 +6196,7 @@ fn control_project_user(user: application::ProjectUserRecord) -> control_types::
         status: match user.status {
             application::ProjectUserStatus::Active => control_types::ProjectUserStatus::Active,
             application::ProjectUserStatus::Disabled => control_types::ProjectUserStatus::Disabled,
+            application::ProjectUserStatus::Merged => control_types::ProjectUserStatus::Merged,
         },
         user_revision: user.user_revision,
         security_revision: user.security_revision,
@@ -2696,6 +6644,7 @@ async fn create_provider(
                     issuer: body.issuer,
                     client_id: body.client_id,
                     client_secret: zeroize::Zeroizing::new(body.client_secret),
+                    managed_profile_enabled: body.managed_profile_enabled,
                     idempotency_key,
                     expected_project_revision: body.expected_project_revision,
                 },
@@ -2919,9 +6868,12 @@ async fn public_application_config(
                     application_public_id: config.application_public_id,
                     application_display_name: config.application_display_name,
                     publishable_keys: config.publishable_keys,
+                    email_available: config.email_available,
+                    email_otp_enabled: config.email_otp_enabled,
+                    email_magic_link_enabled: config.email_magic_link_enabled,
                     login_available: FEDERATED_PROJECT_AUTH_AVAILABLE
                         && structurally_available
-                        && !providers.is_empty(),
+                        && (!providers.is_empty() || config.email_available),
                     providers,
                 })
             }
@@ -3043,6 +6995,11 @@ where
 fn credential_pair_response(
     pair: application::CredentialPair,
 ) -> Result<runtime_types::CredentialPairResponse, ApplicationError> {
+    let projection = user_projection(pair.projection)?;
+    let projection_revision = projection.projection_revision;
+    if pair.projection_revision != projection_revision {
+        return Err(ApplicationError::Integrity);
+    }
     Ok(runtime_types::CredentialPairResponse {
         project_id: pair.project_public_id,
         application_id: pair.application_public_id,
@@ -3053,8 +7010,8 @@ fn credential_pair_response(
         refresh_token: pair.refresh_token.to_string(),
         token_type: pair.token_type,
         expires_in: pair.expires_in,
-        projection: user_projection(pair.projection)?,
-        projection_revision: pair.projection_revision,
+        projection,
+        projection_revision,
         session_expires_at: timestamp(pair.session_expires_at),
     })
 }
@@ -3062,7 +7019,12 @@ fn credential_pair_response(
 fn user_projection(
     document: serde_json::Value,
 ) -> Result<runtime_types::UserProjection, ApplicationError> {
-    serde_json::from_value(document).map_err(|_| ApplicationError::Integrity)
+    let projection: runtime_types::UserProjection =
+        serde_json::from_value(document).map_err(|_| ApplicationError::Integrity)?;
+    if projection.projection_schema != crate::domain::USER_PROJECTION_SCHEMA_V1 {
+        return Err(ApplicationError::Integrity);
+    }
+    Ok(projection)
 }
 
 fn hosted_interaction_response(
@@ -3073,6 +7035,8 @@ fn hosted_interaction_response(
         "awaiting_method_selection" => {
             runtime_types::HostedInteractionStatus::AwaitingMethodSelection
         }
+        "email_address_entry" => runtime_types::HostedInteractionStatus::EmailAddressEntry,
+        "email_challenge_pending" => runtime_types::HostedInteractionStatus::EmailChallengePending,
         "provider_authorization_started" => {
             runtime_types::HostedInteractionStatus::ProviderAuthorizationStarted
         }
@@ -3108,9 +7072,24 @@ fn hosted_interaction_response(
                 display_name: provider.display_name.clone(),
             })
             .collect(),
+        email_available: bootstrap.interaction.email_available,
+        email_proof_modes: email_proof_modes(
+            bootstrap.interaction.email_otp_enabled,
+            bootstrap.interaction.email_magic_link_enabled,
+        ),
         csrf: bootstrap.csrf.to_string(),
         expires_at: timestamp(bootstrap.interaction.expires_at),
     })
+}
+
+fn email_proof_modes(otp: bool, magic_link: bool) -> Vec<runtime_types::EmailProofMode> {
+    [
+        otp.then_some(runtime_types::EmailProofMode::Otp),
+        magic_link.then_some(runtime_types::EmailProofMode::MagicLink),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn validate_interaction_credential(credential: &str) -> Result<Uuid, ()> {
@@ -3124,11 +7103,35 @@ fn validate_interaction_credential(credential: &str) -> Result<Uuid, ()> {
 
 fn interaction_cookie_name(credential: &str) -> Result<String, ()> {
     let id = validate_interaction_credential(credential)?;
+    Ok(interaction_cookie_name_from_id(id))
+}
+
+fn interaction_cookie_name_from_id(id: Uuid) -> String {
     let digest = Sha256::digest(id.as_bytes());
-    Ok(format!(
-        "owl_runtime_{}",
+    format!("owl_runtime_{}", URL_SAFE_NO_PAD.encode(&digest[..18]))
+}
+
+fn identity_proof_slot_cookie_name(proof_slot_id: Uuid) -> String {
+    let mut context = b"owlauth-identity-proof-slot-cookie-v1\0".to_vec();
+    context.extend_from_slice(proof_slot_id.as_bytes());
+    let digest = Sha256::digest(context);
+    format!(
+        "owl_identity_slot_{}",
         URL_SAFE_NO_PAD.encode(&digest[..18])
-    ))
+    )
+}
+
+fn magic_transfer_cookie_name(challenge_id: Uuid) -> String {
+    let digest = Sha256::digest(challenge_id.as_bytes());
+    format!("owl_magic_{}", URL_SAFE_NO_PAD.encode(&digest[..18]))
+}
+
+fn identity_mutation_magic_transfer_cookie_name(challenge_id: Uuid) -> String {
+    let digest = Sha256::digest(challenge_id.as_bytes());
+    format!(
+        "owl_identity_magic_{}",
+        URL_SAFE_NO_PAD.encode(&digest[..18])
+    )
 }
 
 fn project_session_cookie_name(project_public_id: &str) -> String {
@@ -3582,6 +7585,7 @@ fn control_provider(
         "disabled" => control_types::ProviderStatus::Disabled,
         _ => return Err(ApplicationError::Integrity),
     };
+    let managed = crate::adapters::oidc::controlled_oidc_managed_capability();
     Ok(control_types::Provider {
         id: provider.id.to_string(),
         project_id: provider.project_id.to_string(),
@@ -3593,6 +7597,22 @@ fn control_provider(
         callback_url: provider.callback_url,
         status,
         revision: provider.revision,
+        managed_profile: control_types::ProviderManagedProfileCapability {
+            supported: true,
+            enabled: provider.managed_profile_enabled,
+            exact_scopes: managed
+                .exact_scopes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            profile_schema: managed.profile_schema.to_owned(),
+            read_retry_safe: managed.read_retry_safe,
+            renewal_idempotent_replay: matches!(
+                managed.renewal_replay,
+                crate::domain::RenewalReplay::StableAttemptId
+            ),
+            supports_revocation: managed.supports_revocation,
+        },
         assigned_application_ids: provider
             .assigned_application_ids
             .into_iter()
@@ -3881,8 +7901,11 @@ async fn response_policy(plane: HttpPlane, mut request: Request, next: Next) -> 
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
+pub(crate) mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
         body::{Body, to_bytes},
@@ -3892,6 +7915,786 @@ mod tests {
 
     use super::*;
     use crate::config::PlaneMode;
+
+    const TEST_PROJECT: &str = "prj_http_identity";
+    const TEST_BINDING: &str = "browser-binding";
+    const TEST_CSRF: &str = "csrf-value";
+
+    #[derive(Clone, Copy)]
+    enum CallbackBehavior {
+        Proved,
+        Denied,
+        PersistenceFailure,
+    }
+
+    struct TestIdentityMutationAuthority {
+        calls: AtomicUsize,
+        callback_behavior: CallbackBehavior,
+    }
+
+    impl TestIdentityMutationAuthority {
+        fn posts() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                callback_behavior: CallbackBehavior::Proved,
+            }
+        }
+
+        fn callback(callback_behavior: CallbackBehavior) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                callback_behavior,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn record_call(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn test_identity_view(
+        revision: i64,
+        status: crate::domain::IdentityMutationStatus,
+    ) -> application::IdentityMutationView {
+        application::IdentityMutationView {
+            id: Uuid::from_u128(0x125),
+            project_id: Uuid::from_u128(0x126),
+            project_public_id: TEST_PROJECT.to_owned(),
+            kind: crate::domain::IdentityMutationKind::Link,
+            status,
+            revision,
+            expires_at: OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("test timestamp"),
+            slots: Vec::new(),
+        }
+    }
+
+    #[async_trait]
+    impl IdentityMutationRuntimeAuthority for TestIdentityMutationAuthority {
+        async fn bootstrap(
+            &self,
+            _interaction: &str,
+            _browser_binding: Option<&str>,
+        ) -> Result<application::IdentityMutationBootstrap, ApplicationError> {
+            unreachable!("POST/callback fixture does not bootstrap Hosted")
+        }
+
+        async fn establish_magic_transfer_context(
+            &self,
+            _challenge_id: Uuid,
+        ) -> Result<application::IdentityMutationMagicTransferGate, ApplicationError> {
+            unreachable!("POST/callback fixture does not stage a magic GET")
+        }
+
+        async fn start_method(
+            &self,
+            command: application::StartIdentityMutationMethod,
+        ) -> Result<application::StartedIdentityMutationMethod, ApplicationError> {
+            self.record_call();
+            assert_eq!(command.project_public_id, TEST_PROJECT);
+            assert_eq!(command.interaction, test_identity_interaction());
+            assert_eq!(command.proof_slot_id, test_proof_slot());
+            assert_eq!(
+                command.asserted_method,
+                application::IdentityMutationProofMethodKind::Provider
+            );
+            assert_eq!(command.browser_binding, TEST_BINDING);
+            assert_eq!(command.csrf, TEST_CSRF);
+            assert_eq!(command.expected_revision, 7);
+            Ok(
+                application::StartedIdentityMutationMethod::ProviderNavigation {
+                    url: "https://accounts.example/authorize".to_owned(),
+                    proof_slot_id: command.proof_slot_id,
+                },
+            )
+        }
+
+        async fn begin_email_challenge(
+            &self,
+            request: application::BeginIdentityMutationEmailChallenge,
+        ) -> Result<application::IdentityMutationEmailChallengeAccepted, ApplicationError> {
+            self.record_call();
+            assert_eq!(request.project_public_id, TEST_PROJECT);
+            assert_eq!(request.interaction, test_identity_interaction());
+            assert_eq!(request.proof_slot_id, test_proof_slot());
+            assert_eq!(request.browser_binding, TEST_BINDING);
+            assert_eq!(request.csrf, TEST_CSRF);
+            assert_eq!(request.expected_revision, 8);
+            assert_eq!(request.email, "person@example.com");
+            Ok(application::IdentityMutationEmailChallengeAccepted {
+                revision: 9,
+                challenge_id: test_challenge(),
+                generation: 2,
+                otp_enabled: true,
+                magic_link_enabled: true,
+                expires_at: OffsetDateTime::from_unix_timestamp(1_900_000_000)
+                    .expect("test timestamp"),
+            })
+        }
+
+        async fn verify_email_proof(
+            &self,
+            request: application::VerifyRawIdentityMutationEmailProof,
+        ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError>
+        {
+            self.record_call();
+            assert_eq!(request.project_public_id, TEST_PROJECT);
+            assert_eq!(request.interaction, test_identity_interaction());
+            assert_eq!(request.proof_slot_id, test_proof_slot());
+            assert_eq!(request.browser_binding, TEST_BINDING);
+            assert_eq!(request.csrf, TEST_CSRF);
+            assert_eq!(request.expected_revision, 9);
+            assert_eq!(request.challenge_id, test_challenge());
+            assert_eq!(request.generation, 2);
+            assert_eq!(request.proof_kind, application::EmailProofKind::Otp);
+            assert_eq!(request.proof.as_str(), "12345678");
+            Ok(
+                application::IdentityMutationEmailCompletionDecision::Completed(
+                    test_identity_view(10, crate::domain::IdentityMutationStatus::Ready),
+                ),
+            )
+        }
+
+        async fn verify_magic_transfer(
+            &self,
+            request: application::VerifyIdentityMutationMagicTransferProof,
+        ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError>
+        {
+            self.record_call();
+            assert_eq!(request.project_public_id, TEST_PROJECT);
+            assert_eq!(request.interaction, test_identity_interaction());
+            assert_eq!(request.proof_slot_id, test_proof_slot());
+            assert_eq!(request.challenge_id, test_challenge());
+            assert_eq!(request.generation, 2);
+            assert_eq!(request.csrf, "transfer-csrf");
+            assert_eq!(request.expected_revision, 9);
+            assert_eq!(request.proof.as_str(), "abcdefghijklmnopqrstuv");
+            assert_eq!(request.transfer_context, "transfer-context");
+            assert_eq!(request.browser_binding, None);
+            Ok(
+                application::IdentityMutationEmailCompletionDecision::Completed(
+                    test_identity_view(10, crate::domain::IdentityMutationStatus::Ready),
+                ),
+            )
+        }
+
+        async fn confirm_ready(
+            &self,
+            command: application::ConfirmIdentityMutationReady,
+        ) -> Result<application::IdentityMutationView, ApplicationError> {
+            self.record_call();
+            assert_eq!(command.project_public_id, TEST_PROJECT);
+            assert_eq!(command.interaction, test_identity_interaction());
+            assert_eq!(command.browser_binding, TEST_BINDING);
+            assert_eq!(command.csrf, TEST_CSRF);
+            assert_eq!(command.expected_revision, 10);
+            Ok(test_identity_view(
+                11,
+                crate::domain::IdentityMutationStatus::Ready,
+            ))
+        }
+
+        async fn deny_provider_callback(
+            &self,
+            denial: application::IdentityMutationProviderDenial,
+        ) -> Result<application::IdentityMutationView, ApplicationError> {
+            self.record_call();
+            assert_identity_callback_fields(
+                denial.intent_id,
+                denial.proof_slot_id,
+                &denial.project_public_id,
+                &denial.provider_key,
+                &denial.state,
+                &denial.browser_binding,
+            );
+            assert_eq!(denial.safe_outcome, "auth.callback.denied_access");
+            match self.callback_behavior {
+                CallbackBehavior::Denied => Ok(test_identity_view(
+                    8,
+                    crate::domain::IdentityMutationStatus::PendingProof,
+                )),
+                CallbackBehavior::PersistenceFailure => Err(ApplicationError::Persistence),
+                CallbackBehavior::Proved => {
+                    unreachable!("proved fixture receives success callback")
+                }
+            }
+        }
+
+        async fn complete_provider_callback(
+            &self,
+            callback: application::IdentityMutationProviderCallback,
+        ) -> Result<application::IdentityMutationCallbackOutcome, ApplicationError> {
+            self.record_call();
+            assert_identity_callback_fields(
+                callback.intent_id,
+                callback.proof_slot_id,
+                &callback.project_public_id,
+                &callback.provider_key,
+                &callback.state,
+                &callback.browser_binding,
+            );
+            assert_eq!(callback.code, "authorization-code");
+            match self.callback_behavior {
+                CallbackBehavior::Proved => {
+                    Ok(application::IdentityMutationCallbackOutcome::Proved {
+                        intent: test_identity_view(8, crate::domain::IdentityMutationStatus::Ready),
+                        continuation: zeroize::Zeroizing::new(test_identity_interaction()),
+                    })
+                }
+                CallbackBehavior::PersistenceFailure => Err(ApplicationError::Persistence),
+                CallbackBehavior::Denied => unreachable!("denial fixture receives denial callback"),
+            }
+        }
+    }
+
+    fn test_identity_interaction() -> String {
+        format!("{}.opaque-interaction", Uuid::from_u128(0x125))
+    }
+
+    fn test_proof_slot() -> Uuid {
+        Uuid::from_u128(0x127)
+    }
+
+    fn test_challenge() -> Uuid {
+        Uuid::from_u128(0x128)
+    }
+
+    fn assert_identity_callback_fields(
+        intent_id: Uuid,
+        proof_slot_id: Uuid,
+        project_public_id: &str,
+        provider_key: &str,
+        state: &str,
+        browser_binding: &str,
+    ) {
+        assert_eq!(intent_id, Uuid::from_u128(0x125));
+        assert_eq!(proof_slot_id, test_proof_slot());
+        assert_eq!(project_public_id, TEST_PROJECT);
+        assert_eq!(provider_key, "workforce");
+        assert_eq!(state, test_callback_state());
+        assert_eq!(browser_binding, TEST_BINDING);
+    }
+
+    fn test_callback_state() -> String {
+        format!("{}.1.state-secret", test_proof_slot())
+    }
+
+    struct TestIdentityCallbackOwnerResolver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProviderCallbackOwnerResolver for TestIdentityCallbackOwnerResolver {
+        async fn resolve(
+            &self,
+            state_id: Uuid,
+            project_public_id: &str,
+            provider_key: &str,
+        ) -> Result<ProviderCallbackOwner, ApplicationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(state_id, test_proof_slot());
+            assert_eq!(project_public_id, TEST_PROJECT);
+            assert_eq!(provider_key, "workforce");
+            Ok(ProviderCallbackOwner::IdentityMutation {
+                intent_id: Uuid::from_u128(0x125),
+                proof_slot_id: test_proof_slot(),
+            })
+        }
+    }
+
+    fn test_identity_runtime_state(
+        authority: Arc<dyn IdentityMutationRuntimeAuthority>,
+        callback_owners: Option<Arc<dyn ProviderCallbackOwnerResolver>>,
+    ) -> RuntimeState {
+        RuntimeState {
+            probe: ProbeState {
+                ready: Arc::new(AtomicBool::new(true)),
+                base_path: Arc::from("/runtime/"),
+            },
+            admission: Arc::new(AdmissionService::new(
+                format!("identity-http-{}", Uuid::new_v4()),
+                [77; 32],
+                1,
+                None,
+            )),
+            verified_origins: Arc::new(VerifiedApplicationOrigins::default()),
+            readiness: None,
+            auth: None,
+            callback_owners,
+            managed_reauthorization: None,
+            cookie_path: Arc::from("/runtime/"),
+            external_origin: Arc::from("https://identity.example"),
+            identity_mutations: Some(authority),
+        }
+    }
+
+    fn same_origin_headers(cookie: Option<String>) -> HeaderMap {
+        let mut headers = HeaderMap::from_iter([
+            (
+                header::ORIGIN,
+                HeaderValue::from_static("https://identity.example"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-mode"),
+                HeaderValue::from_static("cors"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-dest"),
+                HeaderValue::from_static("empty"),
+            ),
+        ]);
+        if let Some(cookie) = cookie {
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&cookie).expect("valid test cookie"),
+            );
+        }
+        headers
+    }
+
+    fn interaction_cookie() -> String {
+        format!(
+            "{}={TEST_BINDING}",
+            interaction_cookie_name(&test_identity_interaction()).expect("valid interaction")
+        )
+    }
+
+    fn response_cookies(response: &Response) -> Vec<String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("ASCII cookie").to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn identity_mutation_post_handlers_forward_exact_authority_and_cookie_context() {
+        let authority = Arc::new(TestIdentityMutationAuthority::posts());
+        let state = test_identity_runtime_state(authority.clone(), None);
+        let request_id = || Extension("identity-handler-test".to_owned());
+        let client = || Extension(ClientAddress("203.0.113.125".to_owned()));
+        let proof_path = || {
+            Path((
+                TEST_PROJECT.to_owned(),
+                test_identity_interaction(),
+                test_proof_slot().to_string(),
+            ))
+        };
+
+        let response = select_identity_mutation_method(
+            State(state.clone()),
+            request_id(),
+            client(),
+            proof_path(),
+            same_origin_headers(Some(interaction_cookie())),
+            RuntimeJson(runtime_types::SelectIdentityMutationMethodRequest {
+                expected_revision: 7,
+                csrf: TEST_CSRF.to_owned(),
+                method_kind: runtime_types::IdentityMutationMethodKind::Provider,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookies = response_cookies(&response);
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(
+            cookies[0],
+            format!(
+                "{}={TEST_BINDING}; Path=/runtime/; Max-Age=600; Secure; HttpOnly; SameSite=Lax",
+                identity_proof_slot_cookie_name(test_proof_slot())
+            )
+        );
+
+        let response = begin_identity_mutation_email_challenge(
+            State(state.clone()),
+            request_id(),
+            client(),
+            proof_path(),
+            same_origin_headers(Some(interaction_cookie())),
+            RuntimeJson(runtime_types::BeginIdentityMutationEmailChallengeRequest {
+                expected_revision: 8,
+                csrf: TEST_CSRF.to_owned(),
+                email: "person@example.com".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = verify_identity_mutation_email_otp(
+            State(state.clone()),
+            request_id(),
+            client(),
+            proof_path(),
+            same_origin_headers(Some(interaction_cookie())),
+            RuntimeJson(runtime_types::VerifyIdentityMutationEmailOtpRequest {
+                expected_revision: 9,
+                csrf: TEST_CSRF.to_owned(),
+                challenge_id: test_challenge().to_string(),
+                generation: 2,
+                otp: "12345678".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response_cookies(&response).is_empty());
+
+        let transfer_cookie_name = identity_mutation_magic_transfer_cookie_name(test_challenge());
+        let response = verify_identity_mutation_email_link(
+            State(state.clone()),
+            request_id(),
+            client(),
+            proof_path(),
+            same_origin_headers(Some(format!("{transfer_cookie_name}=transfer-context"))),
+            RuntimeJson(runtime_types::VerifyIdentityMutationEmailLinkRequest {
+                expected_revision: 9,
+                csrf: "transfer-csrf".to_owned(),
+                challenge_id: test_challenge().to_string(),
+                generation: 2,
+                token: "abcdefghijklmnopqrstuv".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_cookies(&response),
+            vec![format!(
+                "{transfer_cookie_name}=deleted; Path=/runtime/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
+            )]
+        );
+
+        let response = confirm_identity_mutation_ready(
+            State(state),
+            request_id(),
+            client(),
+            Path((TEST_PROJECT.to_owned(), test_identity_interaction())),
+            same_origin_headers(Some(interaction_cookie())),
+            RuntimeJson(runtime_types::ConfirmHostedIdentityMutationRequest {
+                expected_revision: 10,
+                csrf: TEST_CSRF.to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(authority.call_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn identity_callback_dispatch_clears_only_terminal_slot_alias() {
+        for (behavior, denial, clears_alias) in [
+            (CallbackBehavior::Proved, false, true),
+            (CallbackBehavior::Denied, true, true),
+            (CallbackBehavior::PersistenceFailure, true, false),
+        ] {
+            let authority = Arc::new(TestIdentityMutationAuthority::callback(behavior));
+            let owners = Arc::new(TestIdentityCallbackOwnerResolver {
+                calls: AtomicUsize::new(0),
+            });
+            let state = test_identity_runtime_state(authority.clone(), Some(owners.clone()));
+            let query = if denial {
+                ProviderCallbackQuery {
+                    code: None,
+                    state: test_callback_state(),
+                    error: Some("access_denied".to_owned()),
+                    error_description: None,
+                    error_uri: None,
+                }
+            } else {
+                ProviderCallbackQuery {
+                    code: Some("authorization-code".to_owned()),
+                    state: test_callback_state(),
+                    error: None,
+                    error_description: None,
+                    error_uri: None,
+                }
+            };
+            let alias = identity_proof_slot_cookie_name(test_proof_slot());
+            let response = provider_callback(
+                State(state),
+                Extension("identity-callback-test".to_owned()),
+                Extension(ClientAddress("203.0.113.126".to_owned())),
+                Path((TEST_PROJECT.to_owned(), "workforce".to_owned())),
+                Query(query),
+                HeaderMap::from_iter([(
+                    header::COOKIE,
+                    HeaderValue::from_str(&format!("{alias}={TEST_BINDING}"))
+                        .expect("valid callback cookie"),
+                )]),
+            )
+            .await;
+            assert_eq!(owners.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(authority.call_count(), 1);
+            let cookies = response_cookies(&response);
+            if clears_alias {
+                assert_eq!(
+                    cookies,
+                    vec![format!(
+                        "{alias}=deleted; Path=/runtime/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
+                    )]
+                );
+            } else {
+                assert!(cookies.is_empty(), "retryable failure must retain alias");
+            }
+            assert!(
+                cookies
+                    .iter()
+                    .all(|cookie| !cookie.starts_with("owl_runtime_")),
+                "callback must leave the intent browser binding untouched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_email_pre_gate_never_invokes_authority_for_challenge_or_resend() {
+        for endpoint in [
+            AdmissionEndpoint::EmailChallenge,
+            AdmissionEndpoint::EmailResend,
+        ] {
+            let admission =
+                AdmissionService::new(format!("pre-gate-{endpoint:?}"), [19; 32], 1, None);
+            let authority_calls = AtomicUsize::new(0);
+            for _ in 0..256 {
+                assert!(
+                    after_email_pre_authority(
+                        &admission,
+                        endpoint,
+                        "203.0.113.44",
+                        "opaque-interaction",
+                        || async {
+                            authority_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .await
+                    .expect("pre-gate allows reviewed quota")
+                    .is_ok()
+                );
+            }
+            let before = authority_calls.load(Ordering::SeqCst);
+            assert!(
+                after_email_pre_authority(
+                    &admission,
+                    endpoint,
+                    "203.0.113.44",
+                    "opaque-interaction",
+                    || async {
+                        authority_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, ()>(())
+                    },
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                authority_calls.load(Ordering::SeqCst),
+                before,
+                "an exhausted pre-gate must not invoke PostgreSQL authority"
+            );
+        }
+    }
+
+    #[test]
+    fn email_proof_mode_contract_is_truthful_for_every_admitted_set() {
+        assert_eq!(
+            email_proof_modes(true, false),
+            vec![runtime_types::EmailProofMode::Otp]
+        );
+        assert_eq!(
+            email_proof_modes(false, true),
+            vec![runtime_types::EmailProofMode::MagicLink]
+        );
+        assert_eq!(
+            email_proof_modes(true, true),
+            vec![
+                runtime_types::EmailProofMode::Otp,
+                runtime_types::EmailProofMode::MagicLink,
+            ]
+        );
+        assert!(email_proof_modes(false, false).is_empty());
+    }
+
+    #[test]
+    fn managed_target_composition_uses_distinct_control_and_runtime_facades() {
+        let config = test_config(PlaneMode::All);
+        let issuer = build_managed_reauthorization_target_issuer(&config);
+        let verifier = build_managed_reauthorization_target_verifier(&config);
+        let interaction_id = Uuid::new_v4();
+        let handle =
+            application::ManagedReauthorizationTargetIssuer::random_handle(issuer.as_ref(), 32)
+                .expect("Control issuer generates a target handle");
+        let digest = application::ManagedReauthorizationTargetIssuer::digest_handle(
+            issuer.as_ref(),
+            interaction_id,
+            handle.as_bytes(),
+        )
+        .expect("Control issuer digests with the active target key");
+        assert_eq!(
+            application::ManagedReauthorizationTargetVerifier::digest_handle_at(
+                verifier.as_ref(),
+                interaction_id,
+                handle.as_bytes(),
+                digest.key_version,
+            )
+            .expect("Runtime verifier accepts the frozen target key version"),
+            digest
+        );
+        assert!(
+            application::ManagedReauthorizationTargetVerifier::readable_key_versions(
+                verifier.as_ref(),
+            )
+            .contains(&digest.key_version)
+        );
+        let _: Arc<ManagedReauthorizationControlService> =
+            build_managed_reauthorization_service(DatabaseConnection::default(), &config);
+    }
+
+    #[test]
+    fn managed_owner_preflight_preserves_typed_failures() {
+        let not_found = managed_owner_preflight(Err(ApplicationError::NotFound))
+            .expect_err("wrong owner is hidden as NotFound");
+        assert_eq!(
+            application_problem(not_found, "request").status(),
+            StatusCode::NOT_FOUND
+        );
+        for error in [ApplicationError::Persistence, ApplicationError::Integrity] {
+            let error = managed_owner_preflight(Err(error))
+                .expect_err("infrastructure or integrity preflight must fail");
+            let response = application_problem(error, "request");
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "non-ownership failures must not be collapsed into 404"
+            );
+        }
+        assert!(managed_owner_preflight(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn identity_callback_alias_is_retained_only_for_retryable_failures() {
+        assert!(should_clear_identity_callback_alias(&Ok::<
+            _,
+            ApplicationError,
+        >(())));
+        assert!(!should_clear_identity_callback_alias(&Err::<(), _>(
+            ApplicationError::ExternalStore
+        )));
+        assert!(!should_clear_identity_callback_alias(&Err::<(), _>(
+            ApplicationError::Persistence
+        )));
+    }
+
+    #[test]
+    fn provider_callback_parser_is_bounded_and_tags_success_or_safe_denial() {
+        let state = format!("{}.1.state-secret", Uuid::new_v4());
+        assert!(matches!(
+            classify_provider_callback(ProviderCallbackQuery {
+                code: Some("authorization-code".to_owned()),
+                state: state.clone(),
+                error: None,
+                error_description: None,
+                error_uri: None,
+            }),
+            Ok(ProviderCallbackPayload::Success { .. })
+        ));
+        let denial = classify_provider_callback(ProviderCallbackQuery {
+            code: None,
+            state: state.clone(),
+            error: Some("access_denied".to_owned()),
+            // Accepted only to interoperate with the standard callback; neither raw value is
+            // carried into the tagged payload, logs, persistence, or rendered output.
+            error_description: Some("raw upstream prose must disappear".to_owned()),
+            error_uri: Some("https://upstream.example/private-error".to_owned()),
+        })
+        .expect("tag bounded denial");
+        assert!(matches!(
+            denial,
+            ProviderCallbackPayload::Denial {
+                safe_outcome: "auth.callback.denied_access",
+                ..
+            }
+        ));
+        assert!(
+            classify_provider_callback(ProviderCallbackQuery {
+                code: Some("code".to_owned()),
+                state: state.clone(),
+                error: Some("access_denied".to_owned()),
+                error_description: None,
+                error_uri: None,
+            })
+            .is_err()
+        );
+        assert!(
+            classify_provider_callback(ProviderCallbackQuery {
+                code: None,
+                state,
+                error: Some("x".repeat(129)),
+                error_description: None,
+                error_uri: None,
+            })
+            .is_err()
+        );
+        assert_eq!(
+            safe_provider_denial_outcome("provider-specific-raw-value"),
+            "auth.callback.denied_other"
+        );
+    }
+
+    #[test]
+    fn control_provider_managed_capability_matches_the_reviewed_adapter() {
+        let record = application::ProviderRecord {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            provider_key: "workforce".to_owned(),
+            kind: "oidc".to_owned(),
+            display_name: "Workforce".to_owned(),
+            issuer: "https://issuer.example".to_owned(),
+            client_id: "client".to_owned(),
+            callback_url: "https://runtime.example/callback".to_owned(),
+            status: "active".to_owned(),
+            revision: 1,
+            managed_profile_enabled: true,
+            managed_profile_revision: 1,
+            assigned_application_ids: Vec::new(),
+        };
+        let public = control_provider(record).expect("map reviewed OIDC capability");
+        let reviewed = crate::adapters::oidc::controlled_oidc_managed_capability();
+        assert_eq!(
+            public.managed_profile.exact_scopes,
+            reviewed
+                .exact_scopes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            public.managed_profile.profile_schema,
+            reviewed.profile_schema
+        );
+        assert_eq!(
+            public.managed_profile.read_retry_safe,
+            reviewed.read_retry_safe
+        );
+        assert_eq!(
+            public.managed_profile.renewal_idempotent_replay,
+            matches!(
+                reviewed.renewal_replay,
+                crate::domain::RenewalReplay::StableAttemptId
+            )
+        );
+        assert_eq!(
+            public.managed_profile.supports_revocation,
+            reviewed.supports_revocation
+        );
+        assert!(public.managed_profile.supports_revocation);
+    }
 
     #[test]
     fn interaction_binding_cookies_are_partitioned_by_canonical_transaction_id() {
@@ -3966,7 +8769,48 @@ mod tests {
         );
     }
 
-    fn test_config(mode: PlaneMode) -> ServerConfig {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "HTTP fixture enumerates complete Runtime and Control security configuration"
+    )]
+    pub(crate) fn test_config(mode: PlaneMode) -> ServerConfig {
+        test_config_with_identity_material(
+            mode,
+            "http-test-runtime",
+            "test-deployment",
+            "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0",
+            "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
+            "RkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkY",
+            "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c",
+        )
+    }
+
+    pub(crate) fn identity_mutation_composition_config(mode: PlaneMode) -> ServerConfig {
+        test_config_with_identity_material(
+            mode,
+            "identity-mutation-test",
+            "identity-mutation-test",
+            "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws",
+            "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw",
+            "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0",
+            "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the real-composition fixture injects the complete physically distinct identity key configuration"
+    )]
+    fn test_config_with_identity_material(
+        mode: PlaneMode,
+        runtime_process_id: &str,
+        instance_id: &str,
+        email_digest_key: &str,
+        email_protection_key: &str,
+        projection_digest_key: &str,
+        projection_protection_key: &str,
+    ) -> ServerConfig {
         let key = format!("owl_ctrl_v1_{}", "A".repeat(43));
         let mut values = BTreeMap::from([
             (
@@ -3975,7 +8819,11 @@ mod tests {
             ),
             (
                 "OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
-                "http-test-runtime".to_owned(),
+                runtime_process_id.to_owned(),
+            ),
+            (
+                "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
+                runtime_process_id.to_owned(),
             ),
             ("OWLAUTH_RUNTIME_MAX_PROCESSES".to_owned(), "64".to_owned()),
             ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
@@ -3988,6 +8836,54 @@ mod tests {
                 "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
             ),
             (
+                "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY".to_owned(),
+                email_digest_key.to_owned(),
+            ),
+            (
+                "OWLAUTH_EMAIL_IDENTITY_PROTECTION_KEY".to_owned(),
+                email_protection_key.to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY".to_owned(),
+                projection_digest_key.to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY".to_owned(),
+                projection_protection_key.to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_DIGEST_KEY".to_owned(),
+                "DQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_PROTECTION_KEY".to_owned(),
+                "Dg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4".to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_DIGEST_KEY".to_owned(),
+                "EBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBA".to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY".to_owned(),
+                "ERERERERERERERERERERERERERERERERERERERERERE".to_owned(),
+            ),
+            (
                 "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
                 "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
             ),
@@ -3996,10 +8892,7 @@ mod tests {
                 "https://accounts.example/".to_owned(),
             ),
             ("OWLAUTH_CONTROL_API_KEY".to_owned(), key),
-            (
-                "OWLAUTH_INSTANCE_ID".to_owned(),
-                "test-deployment".to_owned(),
-            ),
+            ("OWLAUTH_INSTANCE_ID".to_owned(), instance_id.to_owned()),
             (
                 "OWLAUTH_MODE".to_owned(),
                 match mode {
@@ -4010,6 +8903,18 @@ mod tests {
                 .to_owned(),
             ),
         ]);
+        if mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE {
+            values.extend([
+                (
+                    "OWLAUTH_MANAGED_CREDENTIAL_KEY_VERSION".to_owned(),
+                    "1".to_owned(),
+                ),
+                (
+                    "OWLAUTH_MANAGED_CREDENTIAL_KEY".to_owned(),
+                    "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY".to_owned(),
+                ),
+            ]);
+        }
         if mode.has_control() || (mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE) {
             values.extend([
                 (
@@ -4109,6 +9014,73 @@ mod tests {
         );
         assert!(!problem.request_id.is_empty());
         assert!(problem.request_id.len() <= 128);
+    }
+
+    #[tokio::test]
+    async fn managed_reauthorization_start_rejects_concurrency_before_runtime_services() {
+        let config = test_config(PlaneMode::Runtime);
+        let origin = config.runtime.external_base.origin().ascii_serialization();
+        // Compose the real PostgreSQL repository and OIDC discovery client around a disconnected
+        // database sentinel. Touching either downstream path would fail instead of yielding 429.
+        let pools = DatabasePools {
+            runtime: Some(DatabaseConnection::default()),
+            control: None,
+        };
+        let mut routers = build_routers(&config, Some(&pools));
+        assert!(routers.runtime_auth.is_some());
+        let router = routers.runtime.take().expect("Runtime router exists");
+        let interaction = "opaque-interaction".to_owned();
+        let base_path = config.runtime.external_base.path().trim_end_matches('/');
+        let uri = format!(
+            "{base_path}/v1/projects/project/auth/managed-reauthorizations/{interaction}/start"
+        );
+        let request = || {
+            Request::post(&uri)
+                .header(header::ORIGIN, &origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("sec-fetch-mode", "cors")
+                .header("sec-fetch-dest", "empty")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"expected_revision":1,"csrf":"opaque"}"#))
+                .unwrap()
+        };
+
+        // This endpoint's reviewed local policy permits one request per process/window when the
+        // deployment is configured for its maximum process count. The admitted probe stops at the
+        // missing opaque cookie before touching the composed PostgreSQL/provider services.
+        let admitted = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::NOT_FOUND);
+
+        // Every concurrent retry must be rejected by admission. If admission moved below cookie
+        // validation, PostgreSQL, or provider discovery, these requests would not return bounded
+        // 429 responses with the disconnected PostgreSQL sentinel.
+        let mut attempts = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let router = router.clone();
+            let request = request();
+            attempts.spawn(async move { router.oneshot(request).await.unwrap() });
+        }
+        while let Some(response) = attempts.join_next().await {
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .expect("admission rejection carries Retry-After")
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert!((1..=60).contains(&retry_after));
+            let problem: runtime_types::RuntimeError =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(problem.code, "rate_limited");
+            assert_eq!(
+                problem.message,
+                "The Runtime request rate limit was exceeded."
+            );
+        }
     }
 
     #[test]
@@ -4220,6 +9192,41 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn identity_mutation_facades_and_key_custody_follow_plane_mode() {
+        let control_config = test_config(PlaneMode::Control);
+        assert!(control_config.runtime_protection.is_none());
+        assert!(control_config.email_identity_protection.is_some());
+        let control_pools = DatabasePools {
+            runtime: None,
+            control: Some(DatabaseConnection::default()),
+        };
+        let control = build_routers(&control_config, Some(&control_pools));
+        assert!(control.control_identity_mutations.is_some());
+        assert!(control.runtime_identity_mutations.is_none());
+        assert!(control.runtime_auth.is_none());
+
+        let runtime_config = test_config(PlaneMode::Runtime);
+        assert!(runtime_config.runtime_protection.is_some());
+        assert!(runtime_config.control_api_key.is_none());
+        let runtime_pools = DatabasePools {
+            runtime: Some(DatabaseConnection::default()),
+            control: None,
+        };
+        let runtime = build_routers(&runtime_config, Some(&runtime_pools));
+        assert!(runtime.runtime_identity_mutations.is_some());
+        assert!(runtime.control_identity_mutations.is_none());
+
+        let all_config = test_config(PlaneMode::All);
+        let all_pools = DatabasePools {
+            runtime: Some(DatabaseConnection::default()),
+            control: Some(DatabaseConnection::default()),
+        };
+        let all = build_routers(&all_config, Some(&all_pools));
+        assert!(all.runtime_identity_mutations.is_some());
+        assert!(all.control_identity_mutations.is_some());
+    }
+
     #[tokio::test]
     async fn runtime_composes_federated_auth_without_control_plane() {
         const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
@@ -4235,6 +9242,14 @@ mod tests {
             "Runtime mode must compose the federated authentication service"
         );
         assert!(routers.control.is_none());
+        assert!(
+            !routers
+                .managed_sync
+                .as_ref()
+                .expect("Runtime managed capability should be composed")
+                .managed_claims_ready(),
+            "managed credential readiness starts degraded independently of the listener"
+        );
 
         routers.mark_ready();
         let runtime = routers.runtime.take().expect("Runtime router should exist");
@@ -4594,5 +9609,79 @@ mod tests {
         assert!(
             attribute(&control_document, "src").starts_with("/control/console/assets/control-")
         );
+    }
+
+    #[tokio::test]
+    async fn identity_public_routes_are_plane_local_authenticated_and_hosted_guarded() {
+        let config = test_config(PlaneMode::All);
+        let routers = build_routers(&config, None);
+        let control = routers.control.expect("Control router");
+        let runtime = routers.runtime.expect("Runtime router");
+        let project = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        let inventory = format!("/control/v1/projects/{project}/users/{user}/identities");
+        let unauthenticated = control
+            .clone()
+            .oneshot(Request::get(&inventory).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let authenticated = control
+            .clone()
+            .oneshot(
+                Request::get(&inventory)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer owl_ctrl_v1_{}", "A".repeat(43)),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(authenticated.status(), StatusCode::NOT_FOUND);
+
+        let interaction = format!("{}.{}", Uuid::new_v4(), "A".repeat(43));
+        let shell = runtime
+            .clone()
+            .oneshot(
+                Request::get(format!("/runtime/auth/identity-mutations/{interaction}"))
+                    .header("sec-fetch-site", "same-origin")
+                    .header("sec-fetch-mode", "navigate")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shell.status(), StatusCode::OK);
+
+        let mutation_path =
+            format!("/runtime/v1/projects/project/auth/identity-mutations/{interaction}/confirm");
+        let authorization_rejected = runtime
+            .clone()
+            .oneshot(
+                Request::post(&mutation_path)
+                    .header(header::AUTHORIZATION, "Bearer forbidden")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"expected_revision":1,"csrf":"csrf"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorization_rejected.status(), StatusCode::BAD_REQUEST);
+        let cross_site_rejected = runtime
+            .oneshot(
+                Request::post(&mutation_path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("sec-fetch-site", "cross-site")
+                    .header("sec-fetch-mode", "cors")
+                    .header("sec-fetch-dest", "empty")
+                    .body(Body::from(r#"{"expected_revision":1,"csrf":"csrf"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_site_rejected.status(), StatusCode::FORBIDDEN);
     }
 }

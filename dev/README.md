@@ -7,6 +7,20 @@
 
 The services bind to loopback by default and use named Docker volumes. The default credentials are intentionally development-only.
 
+To run the complete OwlAuth application from the repository root:
+
+```bash
+cp .env.example .env
+make dev
+```
+
+`make dev` rebuilds the embedded web assets, starts this infrastructure, creates ignored local
+software-store directories, and runs the combined Runtime and Control process in the foreground.
+Application configuration lives in the ignored root `.env`; the committed root `.env.example`
+contains public disposable development values only.
+
+Infrastructure can also be managed independently:
+
 ```bash
 make dev-up
 make dev-status
@@ -16,7 +30,7 @@ make dev-down
 
 `make dev-reset` removes the containers and both data volumes before starting healthy empty services again. It is intentionally destructive to local development data.
 
-Optional overrides can be placed in `dev/.env`:
+Optional Compose-only overrides can be placed in `dev/.env`:
 
 ```bash
 cp dev/.env.example dev/.env

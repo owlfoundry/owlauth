@@ -209,18 +209,54 @@ async function readBounded(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
 }
 
+function validProjectionLocale(value: unknown): value is string | null {
+  return (
+    value === null ||
+    (typeof value === "string" &&
+      new TextEncoder().encode(value).byteLength >= 2 &&
+      new TextEncoder().encode(value).byteLength <= 35 &&
+      /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/u.test(value))
+  );
+}
+
+function validProjectionEmail(value: unknown): value is string | null {
+  if (value === null) return true;
+  if (typeof value !== "string" || /\p{Cc}/u.test(value)) return false;
+  const length = new TextEncoder().encode(value).byteLength;
+  return length >= 3 && length <= 320;
+}
+
 function parseProjection(value: unknown): UserProjection {
   if (!isObject(value)) throw new Error("invalid_projection");
+  const fields = [
+    "user_id",
+    "user_revision",
+    "projection_schema",
+    "projection_revision",
+    "display_name",
+    "picture_url",
+    "locale",
+    "verified_email",
+    "status",
+    "created_at",
+    "updated_at",
+  ] as const;
   const displayName = value["display_name"];
   const pictureUrl = value["picture_url"];
+  const locale = value["locale"];
+  const verifiedEmail = value["verified_email"];
   if (
+    Object.keys(value).length !== fields.length ||
+    !fields.every((field) => Object.hasOwn(value, field)) ||
     !boundedString(value["user_id"], 96) ||
     !positiveInteger(value["user_revision"]) ||
-    !boundedString(value["projection_schema"], 64) ||
+    value["projection_schema"] !== "owlauth.user.v1" ||
     !positiveInteger(value["projection_revision"]) ||
     !(displayName === null || boundedString(displayName, 128)) ||
     !(pictureUrl === null || boundedString(pictureUrl, 2_048)) ||
-    !boundedString(value["status"], 32) ||
+    !validProjectionLocale(locale) ||
+    !validProjectionEmail(verifiedEmail) ||
+    value["status"] !== "active" ||
     !validDate(value["created_at"]) ||
     !validDate(value["updated_at"])
   ) {
@@ -233,6 +269,8 @@ function parseProjection(value: unknown): UserProjection {
     projectionRevision: value["projection_revision"],
     displayName,
     pictureUrl,
+    locale,
+    verifiedEmail,
     status: value["status"],
     createdAt: value["created_at"],
     updatedAt: value["updated_at"],
@@ -302,6 +340,9 @@ export class Client {
       !keys.includes(this.publishableKey) ||
       !Array.isArray(providers) ||
       providers.length > 50 ||
+      typeof value["email_available"] !== "boolean" ||
+      typeof value["email_otp_enabled"] !== "boolean" ||
+      typeof value["email_magic_link_enabled"] !== "boolean" ||
       typeof value["login_available"] !== "boolean"
     ) {
       throw this.#protocol("context_mismatch", "get_public_configuration");
@@ -324,6 +365,9 @@ export class Client {
       applicationDisplayName: value["application_display_name"],
       publishableKeys: [...keys],
       providers: mappedProviders,
+      emailAvailable: value["email_available"],
+      emailOtpEnabled: value["email_otp_enabled"],
+      emailMagicLinkEnabled: value["email_magic_link_enabled"],
       loginAvailable: value["login_available"],
     };
   }

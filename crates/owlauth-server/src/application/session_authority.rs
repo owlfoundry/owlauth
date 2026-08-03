@@ -4,10 +4,38 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::{
-    ProfileDisplayName, ProfileLocale, ProfilePictureUrl, ProviderIssuer, ProviderSubject,
+    ManagedProfileCapability, ProfileDisplayName, ProfileLocale, ProfilePictureUrl, ProviderIssuer,
+    ProviderSubject,
 };
 
-use super::{ApplicationError, ProtectedValue, VersionedDigest};
+use super::{ApplicationError, ProtectedValue, RenewableProviderCredential, VersionedDigest};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedCredentialCapability {
+    pub adapter_key: String,
+    pub adapter_revision: i64,
+    pub exact_scopes: Vec<String>,
+    pub supports_revocation: bool,
+}
+
+impl ManagedCredentialCapability {
+    pub(crate) fn from_adapter(
+        capability: &ManagedProfileCapability,
+        supports_revocation: bool,
+    ) -> Result<Self, ApplicationError> {
+        capability.validate().map_err(ApplicationError::from)?;
+        Ok(Self {
+            adapter_key: capability.adapter_key.to_owned(),
+            adapter_revision: capability.adapter_revision,
+            exact_scopes: capability
+                .exact_scopes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            supports_revocation: capability.supports_revocation && supports_revocation,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VerifiedProviderIdentity {
@@ -16,6 +44,10 @@ pub(crate) struct VerifiedProviderIdentity {
     pub display_name: Option<ProfileDisplayName>,
     pub picture_url: Option<ProfilePictureUrl>,
     pub locale: Option<ProfileLocale>,
+    pub renewable_credential: Option<RenewableProviderCredential>,
+    /// Exact adapter-owned capability validated by Runtime for this callback. Repositories may
+    /// freeze this snapshot but must never manufacture capability constants of their own.
+    pub managed_capability: Option<ManagedCredentialCapability>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

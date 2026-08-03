@@ -78,6 +78,34 @@
   margin-top: 1.5rem;
 }
 
+.proofSlots {
+  display: grid;
+  gap: 1rem;
+  list-style-position: inside;
+  margin: 1.5rem 0;
+  padding: 0;
+}
+
+.proofSlots > li {
+  border: 1px solid color-mix(in srgb, var(--owl-muted) 45%, transparent);
+  border-radius: 0.65rem;
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+}
+
+.proofSlots form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.proofSlots input {
+  border: 1px solid var(--owl-muted);
+  border-radius: 0.375rem;
+  font: inherit;
+  padding: 0.625rem 0.75rem;
+}
+
 .focusTarget:focus {
   outline: none;
 }

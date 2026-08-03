@@ -6,6 +6,8 @@
 
 The schema-version 2 corpus contains synthetic reviewed examples for public Project/Application configuration, context mismatch, atomic credential and current-user projection shapes, Runtime error mapping, retry/action semantics, unknown-code conservatism, and redaction, in addition to the basic health response. [`conformance/cases.json`](conformance/cases.json) marks each required capability and configured context explicitly.
 
+The canonical flat projection schema is exactly `owlauth.user.v1`. Its `display_name`, `picture_url`, `locale`, and `verified_email` keys are always present and nullable: `null` means that the authoritative Application projection has no admitted value, not that an SDK omitted or failed to parse the field. `verified_email` is non-null only when both Project and Application policy admit it. Handoff, refresh, and current-user carry the same projection semantics and repeat its authoritative `projection_revision` only as matching envelope metadata. SDK parsers reject another schema identifier, missing nullable keys, and unknown projection fields.
+
 The corpus exercises public protocol semantics through each language runner. It remains static conformance evidence, not proof of server interoperability; real-server tests below provide that separate evidence.
 
 ## Fixture families

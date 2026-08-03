@@ -43,6 +43,8 @@ const credentials = await owlauth.completeLogin(window.location.href, pending);
 
 ```typescript
 const current = await owlauth.currentUser(credentials.accessToken);
+// Exact `owlauth.user.v1`; null means the Application projection has no admitted value.
+const { locale, verifiedEmail } = current.projection;
 
 // The Application must serialize refresh per family and atomically replace the pair.
 const successor = await owlauth.refresh(credentials);

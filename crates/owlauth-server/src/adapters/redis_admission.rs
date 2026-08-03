@@ -19,6 +19,8 @@ const ATOMIC_FIXED_WINDOW: &str = r"
 local server_time = redis.call('TIME')
 local now = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
 local retry = 0
+local saturated_scoped_email = false
+local saturated_other = false
 local window_keys = {}
 local ttls = {}
 for index, base_key in ipairs(KEYS) do
@@ -30,18 +32,29 @@ for index, base_key in ipairs(KEYS) do
   window_keys[index] = key
   ttls[index] = ttl
   local current = tonumber(redis.call('GET', key) or '0')
-  if current >= limit and ttl > retry then
-    retry = ttl
+  if current >= limit then
+    if ttl > retry then
+      retry = ttl
+    end
+    if string.find(base_key, ':email_admission_v1:', 1, true) then
+      saturated_scoped_email = true
+    else
+      saturated_other = true
+    end
   end
 end
 if retry > 0 then
-  return {0, retry}
+  local suppression_eligible = 0
+  if saturated_scoped_email and not saturated_other then
+    suppression_eligible = 1
+  end
+  return {0, retry, suppression_eligible}
 end
 for index, key in ipairs(window_keys) do
   redis.call('INCR', key)
   redis.call('PEXPIRE', key, ttls[index])
 end
-return {1, 0}
+return {1, 0, 0}
 ";
 
 const MANAGER_RECOVERY_RETRIES: usize = 2;
@@ -184,14 +197,17 @@ impl DistributedAdmissionCounter for RedisAdmissionCounter {
 
 fn parse_response(response: &[i64]) -> Result<AdmissionDecision, DistributedAdmissionError> {
     match response {
-        [1, 0] => Ok(AdmissionDecision::Allowed),
-        [0, retry] if *retry > 0 => Ok(AdmissionDecision::Rejected {
-            retry_after_seconds: u64::try_from(*retry)
-                .map_err(|_| DistributedAdmissionError)?
-                .div_ceil(1_000)
-                .clamp(1, 60),
-            reason: AdmissionRejectionReason::Quota,
-        }),
+        [1, 0, 0] => Ok(AdmissionDecision::Allowed),
+        [0, retry, suppression] if *retry > 0 && matches!(suppression, 0 | 1) => {
+            Ok(AdmissionDecision::Rejected {
+                retry_after_seconds: u64::try_from(*retry)
+                    .map_err(|_| DistributedAdmissionError)?
+                    .div_ceil(1_000)
+                    .clamp(1, 60),
+                reason: AdmissionRejectionReason::Quota,
+                suppression_eligible: *suppression == 1,
+            })
+        }
         _ => Err(DistributedAdmissionError),
     }
 }
@@ -513,6 +529,7 @@ mod tests {
             AdmissionDecision::Rejected {
                 retry_after_seconds: 59,
                 reason: AdmissionRejectionReason::Quota,
+                suppression_eligible: false,
             }
         );
     }
@@ -521,8 +538,10 @@ mod tests {
     fn malformed_script_responses_fail_closed() {
         assert_eq!(parse_response(&[]), Err(DistributedAdmissionError));
         assert_eq!(parse_response(&[1, 1]), Err(DistributedAdmissionError));
-        assert_eq!(parse_response(&[0, 0]), Err(DistributedAdmissionError));
-        assert_eq!(parse_response(&[0, -1]), Err(DistributedAdmissionError));
+        assert_eq!(parse_response(&[1, 0, 1]), Err(DistributedAdmissionError));
+        assert_eq!(parse_response(&[0, 0, 0]), Err(DistributedAdmissionError));
+        assert_eq!(parse_response(&[0, -1, 0]), Err(DistributedAdmissionError));
+        assert_eq!(parse_response(&[0, 1, 2]), Err(DistributedAdmissionError));
     }
 
     #[tokio::test]

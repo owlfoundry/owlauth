@@ -39,6 +39,7 @@ pub(crate) mod application {
         pub metadata_revision: i64,
         pub security_revision: i64,
         pub projection_revision: i64,
+        pub projection_verified_email_enabled: bool,
         pub created_at: TimeDateTimeWithTimeZone,
         pub updated_at: TimeDateTimeWithTimeZone,
     }
@@ -177,6 +178,7 @@ pub(crate) mod project_policy {
         pub claims_revision: i64,
         pub session_revision: i64,
         pub projection_revision: i64,
+        pub projection_verified_email_enabled: bool,
         pub claims_policy: Json,
         pub session_policy: Json,
     }
@@ -256,6 +258,8 @@ pub(crate) mod provider_configuration {
         pub secret_ref: Option<String>,
         pub status: String,
         pub revision: i64,
+        pub managed_profile_enabled: bool,
+        pub managed_profile_revision: i64,
     }
 
     #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
@@ -324,6 +328,7 @@ pub(crate) mod runtime_publication_lease {
         pub ring_id: Uuid,
         #[sea_orm(primary_key, auto_increment = false)]
         pub process_id: String,
+        pub process_incarnation: Uuid,
         pub loaded_revision: i64,
         pub first_observed_at: TimeDateTimeWithTimeZone,
         pub last_observed_at: TimeDateTimeWithTimeZone,
@@ -400,9 +405,11 @@ pub(crate) mod project_user {
         pub project_id: Uuid,
         pub public_id: String,
         pub status: String,
+        pub merged_into_user_id: Option<Uuid>,
         pub user_revision: i64,
         pub security_revision: i64,
         pub primary_profile_identity_id: Option<Uuid>,
+        pub primary_email_identity_id: Option<Uuid>,
         pub primary_source_kind: String,
         pub base_profile_digest: Vec<u8>,
         pub local_display_name_set: bool,
@@ -644,6 +651,8 @@ pub(crate) mod application_user_binding {
         pub user_id: Uuid,
         pub status: String,
         pub binding_revision: i64,
+        pub merged_into_binding_id: Option<Uuid>,
+        pub merged_at: Option<TimeDateTimeWithTimeZone>,
         pub created_at: TimeDateTimeWithTimeZone,
         pub updated_at: TimeDateTimeWithTimeZone,
     }
@@ -677,6 +686,9 @@ pub(crate) mod application_user_projection {
         pub application_policy_revision: i64,
         pub canonical_digest: Vec<u8>,
         pub source_base_profile_digest: Option<Vec<u8>>,
+        pub verified_email_source_identity_id: Option<Uuid>,
+        pub verified_email_ciphertext: Option<Vec<u8>>,
+        pub verified_email_key_version: Option<i32>,
         pub document: Json,
         pub created_at: TimeDateTimeWithTimeZone,
         pub updated_at: TimeDateTimeWithTimeZone,

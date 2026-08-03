@@ -15,12 +15,29 @@ const LOCAL_CAPACITY: usize = 8_192;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "identity mutation endpoint policies precede their HTTP composition"
+)]
 pub(crate) enum AdmissionEndpoint {
     PublicConfig,
     ProjectJwks,
     LoginStart,
     HostedInteraction,
+    HostedIdentityMutation,
+    ManagedReauthorizationStart,
+    IdentityMutationMethod,
+    IdentityMutationEmailChallenge,
+    IdentityMutationEmailOtpVerify,
+    IdentityMutationEmailMagicConfirm,
+    IdentityMutationConfirm,
     ProviderSelection,
+    EmailSelection,
+    EmailChallenge,
+    EmailResend,
+    EmailOtpVerify,
+    EmailMagicRead,
+    EmailMagicConfirm,
     SessionReuse,
     ProviderCallback,
     HandoffExchange,
@@ -34,12 +51,25 @@ pub(crate) enum AdmissionEndpoint {
 
 impl AdmissionEndpoint {
     #[cfg(test)]
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 27] = [
         Self::PublicConfig,
         Self::ProjectJwks,
         Self::LoginStart,
         Self::HostedInteraction,
+        Self::HostedIdentityMutation,
+        Self::ManagedReauthorizationStart,
+        Self::IdentityMutationMethod,
+        Self::IdentityMutationEmailChallenge,
+        Self::IdentityMutationEmailOtpVerify,
+        Self::IdentityMutationEmailMagicConfirm,
+        Self::IdentityMutationConfirm,
         Self::ProviderSelection,
+        Self::EmailSelection,
+        Self::EmailChallenge,
+        Self::EmailResend,
+        Self::EmailOtpVerify,
+        Self::EmailMagicRead,
+        Self::EmailMagicConfirm,
         Self::SessionReuse,
         Self::ProviderCallback,
         Self::HandoffExchange,
@@ -57,7 +87,20 @@ impl AdmissionEndpoint {
             Self::ProjectJwks => "project_jwks",
             Self::LoginStart => "login_start",
             Self::HostedInteraction => "hosted_interaction",
+            Self::HostedIdentityMutation => "hosted_identity_mutation",
+            Self::ManagedReauthorizationStart => "managed_reauthorization_start",
+            Self::IdentityMutationMethod => "identity_mutation_method",
+            Self::IdentityMutationEmailChallenge => "identity_mutation_email_challenge",
+            Self::IdentityMutationEmailOtpVerify => "identity_mutation_email_otp_verify",
+            Self::IdentityMutationEmailMagicConfirm => "identity_mutation_email_magic_confirm",
+            Self::IdentityMutationConfirm => "identity_mutation_confirm",
             Self::ProviderSelection => "provider_selection",
+            Self::EmailSelection => "email_selection",
+            Self::EmailChallenge => "email_challenge",
+            Self::EmailResend => "email_resend",
+            Self::EmailOtpVerify => "email_otp_verify",
+            Self::EmailMagicRead => "email_magic_read",
+            Self::EmailMagicConfirm => "email_magic_confirm",
             Self::SessionReuse => "session_reuse",
             Self::ProviderCallback => "provider_callback",
             Self::HandoffExchange => "handoff_exchange",
@@ -73,11 +116,23 @@ impl AdmissionEndpoint {
     const fn policy(self) -> AdmissionPolicy {
         let limit = match self {
             Self::PublicConfig | Self::ProjectJwks | Self::CurrentUser => 600,
-            Self::HostedInteraction => 300,
+            Self::HostedInteraction | Self::HostedIdentityMutation => 300,
             Self::Refresh => 240,
+            Self::EmailSelection
+            | Self::EmailChallenge
+            | Self::EmailResend
+            | Self::IdentityMutationEmailChallenge => 256,
             Self::LoginStart | Self::BrowserLogoutPrepare => 120,
             Self::ProviderCallback | Self::HandoffExchange | Self::ApplicationLogout => 96,
-            Self::ProviderSelection
+            Self::ManagedReauthorizationStart
+            | Self::IdentityMutationMethod
+            | Self::IdentityMutationEmailOtpVerify
+            | Self::IdentityMutationEmailMagicConfirm
+            | Self::IdentityMutationConfirm
+            | Self::ProviderSelection
+            | Self::EmailOtpVerify
+            | Self::EmailMagicRead
+            | Self::EmailMagicConfirm
             | Self::SessionReuse
             | Self::BrowserLogoutRead
             | Self::BrowserLogoutConfirm => 64,
@@ -95,6 +150,7 @@ pub(crate) enum AdmissionDimensionKind {
     Application,
     Credential,
     Provider,
+    Email,
 }
 
 impl AdmissionDimensionKind {
@@ -104,6 +160,7 @@ impl AdmissionDimensionKind {
             Self::Application => "application",
             Self::Credential => "credential",
             Self::Provider => "provider",
+            Self::Email => "email_admission_v1",
         }
     }
 }
@@ -112,6 +169,9 @@ impl AdmissionDimensionKind {
 pub(crate) struct AdmissionDimension<'a> {
     pub kind: AdmissionDimensionKind,
     pub value: &'a str,
+    /// Email quotas are keyed inside the authoritative Project/Application boundary. Ordinary
+    /// dimensions deliberately carry no scope and retain their existing derivation.
+    pub email_scope: Option<(&'a str, &'a str)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +208,10 @@ pub(crate) enum AdmissionDecision {
     Rejected {
         retry_after_seconds: u64,
         reason: AdmissionRejectionReason,
+        /// True only when the sole saturated quota class is the server-derived, scoped email
+        /// address bucket. HTTP may persist an indistinguishable non-delivery challenge for this
+        /// case; client/Project/Application/interaction quotas and capacity failures remain 429.
+        suppression_eligible: bool,
     },
 }
 
@@ -199,18 +263,23 @@ impl LocalCounters {
             }
         }
 
-        let retry_millis = buckets
+        let saturated = buckets
             .iter()
             .filter_map(|bucket| {
                 let entry = self.entries.get(&bucket.key)?;
-                (entry.accepted_at.len() >= bucket.limit as usize)
-                    .then(|| entry_retry_millis(entry, now_millis, window_millis))
+                (entry.accepted_at.len() >= bucket.limit as usize).then(|| {
+                    (
+                        entry_retry_millis(entry, now_millis, window_millis),
+                        bucket.key.contains(":email_admission_v1:"),
+                    )
+                })
             })
-            .max();
-        if let Some(retry_millis) = retry_millis {
+            .collect::<Vec<_>>();
+        if let Some(retry_millis) = saturated.iter().map(|(retry, _)| *retry).max() {
             return AdmissionDecision::Rejected {
                 retry_after_seconds: retry_seconds(retry_millis),
                 reason: AdmissionRejectionReason::Quota,
+                suppression_eligible: saturated.iter().all(|(_, scoped_email)| *scoped_email),
             };
         }
 
@@ -225,6 +294,7 @@ impl LocalCounters {
             return AdmissionDecision::Rejected {
                 retry_after_seconds: retry_seconds(retry_millis),
                 reason: AdmissionRejectionReason::LocalCapacity,
+                suppression_eligible: false,
             };
         }
 
@@ -396,6 +466,48 @@ impl AdmissionService {
         client_address: &str,
         dimensions: &[AdmissionDimension<'_>],
     ) -> AdmissionDecision {
+        self.admit_stage(endpoint, Some(client_address), dimensions, "combined")
+            .await
+    }
+
+    /// Hard request-derived gate for email challenge authority. This stage is deliberately
+    /// limited to dimensions available without `PostgreSQL`: the transport client and the opaque
+    /// interaction credential. Its purpose-separated keys cannot consume or replenish the later
+    /// owner-scoped quota.
+    pub(crate) async fn admit_email_pre_authority(
+        &self,
+        endpoint: AdmissionEndpoint,
+        client_address: &str,
+        interaction: &str,
+    ) -> AdmissionDecision {
+        let dimensions = [AdmissionDimension {
+            kind: AdmissionDimensionKind::Credential,
+            value: interaction,
+            email_scope: None,
+        }];
+        self.admit_stage(endpoint, Some(client_address), &dimensions, "pre_authority")
+            .await
+    }
+
+    /// Owner-scoped second stage after interaction authority has established Project and
+    /// Application ownership. Client and interaction buckets are intentionally not charged a
+    /// second time; both stages must pass, so splitting them cannot grant additional quota.
+    pub(crate) async fn admit_email_authoritative(
+        &self,
+        endpoint: AdmissionEndpoint,
+        dimensions: &[AdmissionDimension<'_>],
+    ) -> AdmissionDecision {
+        self.admit_stage(endpoint, None, dimensions, "authoritative")
+            .await
+    }
+
+    async fn admit_stage(
+        &self,
+        endpoint: AdmissionEndpoint,
+        client_address: Option<&str>,
+        dimensions: &[AdmissionDimension<'_>],
+        stage: &str,
+    ) -> AdmissionDecision {
         let policy = endpoint.policy();
         let local_limit = policy.limit / self.maximum_processes;
         debug_assert!(local_limit > 0);
@@ -405,6 +517,7 @@ impl AdmissionService {
             dimensions,
             policy.limit,
             policy.window_millis,
+            stage,
         );
         let local_buckets = self.buckets(
             endpoint,
@@ -412,6 +525,7 @@ impl AdmissionService {
             dimensions,
             local_limit,
             policy.window_millis,
+            stage,
         );
         let attempt_started_millis = self.monotonic.elapsed_millis();
         let fallback_is_sticky = attempt_started_millis
@@ -471,6 +585,7 @@ impl AdmissionService {
         if let AdmissionDecision::Rejected {
             retry_after_seconds,
             reason,
+            ..
         } = decision
         {
             tracing::warn!(
@@ -538,30 +653,80 @@ impl AdmissionService {
     fn buckets(
         &self,
         endpoint: AdmissionEndpoint,
-        client_address: &str,
+        client_address: Option<&str>,
         dimensions: &[AdmissionDimension<'_>],
         limit: u32,
         window_millis: u64,
+        stage: &str,
     ) -> Vec<AdmissionBucket> {
-        std::iter::once(("client", client_address))
-            .chain(
-                dimensions
-                    .iter()
-                    .map(|dimension| (dimension.kind.as_str(), dimension.value)),
-            )
-            .map(|(kind, value)| AdmissionBucket {
+        let mut buckets =
+            Vec::with_capacity(dimensions.len() + usize::from(client_address.is_some()));
+        if let Some(client_address) = client_address {
+            buckets.push(AdmissionBucket {
                 key: format!(
-                    "{}:{}:{}:{}:{}",
+                    "{}:{}:{}:{}:client:{}",
                     self.namespace,
                     SCHEMA_VERSION,
                     endpoint.as_str(),
-                    kind,
-                    self.digest(kind, value),
+                    stage,
+                    self.digest("client", client_address),
                 ),
                 limit,
                 window_millis,
-            })
-            .collect()
+            });
+        }
+        buckets.extend(dimensions.iter().map(|dimension| {
+            let kind = dimension.kind.as_str();
+            let digest = if dimension.kind == AdmissionDimensionKind::Email {
+                self.scoped_email_digest(dimension)
+            } else {
+                self.digest(kind, dimension.value)
+            };
+            AdmissionBucket {
+                key: format!(
+                    "{}:{}:{}:{}:{}:{}",
+                    self.namespace,
+                    SCHEMA_VERSION,
+                    endpoint.as_str(),
+                    stage,
+                    kind,
+                    digest,
+                ),
+                // Challenge/resend use a reviewed 4:1 owner/client-to-address ratio. The scoped
+                // address bucket can therefore saturate alone; process-local division remains
+                // conservative because both 256 and 64 cover the maximum 64-process roster.
+                limit: if dimension.kind == AdmissionDimensionKind::Email {
+                    limit / 4
+                } else {
+                    limit
+                },
+                window_millis,
+            }
+        }));
+        buckets
+    }
+
+    fn scoped_email_digest(&self, dimension: &AdmissionDimension<'_>) -> String {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.digest_key).expect("HMAC accepts any key size");
+        mac.update(b"owlauth/runtime-admission/scoped-email/v1");
+        let Some((project_id, application_id)) = dimension.email_scope else {
+            // Only server-resolved interaction authority constructs Email dimensions. Retain a
+            // fail-closed domain if an internal caller violates that contract.
+            mac.update(b"\0missing-authoritative-scope");
+            return URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        };
+        for (label, value) in [
+            (b"project".as_slice(), project_id),
+            (b"application".as_slice(), application_id),
+            (b"canonical-email".as_slice(), dimension.value),
+        ] {
+            mac.update(&[0]);
+            mac.update(label);
+            mac.update(&[0]);
+            mac.update(value.as_bytes());
+        }
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
     fn digest(&self, kind: &str, value: &str) -> String {
@@ -691,6 +856,47 @@ mod tests {
     }
 
     #[test]
+    fn every_endpoint_has_a_unique_stable_name() {
+        let names = AdmissionEndpoint::ALL.map(AdmissionEndpoint::as_str);
+        assert_eq!(
+            names,
+            [
+                "public_config",
+                "project_jwks",
+                "login_start",
+                "hosted_interaction",
+                "hosted_identity_mutation",
+                "managed_reauthorization_start",
+                "identity_mutation_method",
+                "identity_mutation_email_challenge",
+                "identity_mutation_email_otp_verify",
+                "identity_mutation_email_magic_confirm",
+                "identity_mutation_confirm",
+                "provider_selection",
+                "email_selection",
+                "email_challenge",
+                "email_resend",
+                "email_otp_verify",
+                "email_magic_read",
+                "email_magic_confirm",
+                "session_reuse",
+                "provider_callback",
+                "handoff_exchange",
+                "refresh",
+                "current_user",
+                "application_logout",
+                "browser_logout_prepare",
+                "browser_logout_read",
+                "browser_logout_confirm",
+            ]
+        );
+        assert_eq!(
+            names.into_iter().collect::<BTreeSet<_>>().len(),
+            names.len()
+        );
+    }
+
+    #[test]
     fn every_endpoint_has_a_reviewed_policy_that_supports_the_process_bound() {
         for endpoint in AdmissionEndpoint::ALL {
             let policy = endpoint.policy();
@@ -700,24 +906,223 @@ mod tests {
     }
 
     #[test]
+    fn scoped_email_keys_are_atomic_and_isolated_by_authoritative_owners() {
+        let service = service(Arc::new(TestClock::new(10)), 1);
+        let dimensions = |project, application| {
+            vec![
+                AdmissionDimension {
+                    kind: AdmissionDimensionKind::Project,
+                    value: project,
+                    email_scope: None,
+                },
+                AdmissionDimension {
+                    kind: AdmissionDimensionKind::Application,
+                    value: application,
+                    email_scope: None,
+                },
+                AdmissionDimension {
+                    kind: AdmissionDimensionKind::Credential,
+                    value: "interaction",
+                    email_scope: None,
+                },
+                AdmissionDimension {
+                    kind: AdmissionDimensionKind::Email,
+                    value: "equal@example.test",
+                    email_scope: Some((project, application)),
+                },
+            ]
+        };
+        let first = service.buckets(
+            AdmissionEndpoint::EmailChallenge,
+            Some("203.0.113.10"),
+            &dimensions("project-a", "application-a"),
+            64,
+            60_000,
+            "combined",
+        );
+        let other_application = service.buckets(
+            AdmissionEndpoint::EmailChallenge,
+            Some("203.0.113.10"),
+            &dimensions("project-a", "application-b"),
+            64,
+            60_000,
+            "combined",
+        );
+        let other_project = service.buckets(
+            AdmissionEndpoint::EmailChallenge,
+            Some("203.0.113.10"),
+            &dimensions("project-b", "application-a"),
+            64,
+            60_000,
+            "combined",
+        );
+        assert_eq!(first.len(), 5);
+        for kind in [
+            "client",
+            "project",
+            "application",
+            "credential",
+            "email_admission_v1",
+        ] {
+            assert_eq!(
+                first
+                    .iter()
+                    .filter(|bucket| bucket.key.contains(&format!(":{kind}:")))
+                    .count(),
+                1,
+                "one atomic evaluation increments {kind} exactly once"
+            );
+        }
+        let email_key = |buckets: &[AdmissionBucket]| {
+            buckets
+                .iter()
+                .find(|bucket| bucket.key.contains(":email_admission_v1:"))
+                .expect("scoped email bucket")
+                .key
+                .clone()
+        };
+        assert_ne!(email_key(&first), email_key(&other_application));
+        assert_ne!(email_key(&first), email_key(&other_project));
+    }
+
+    #[tokio::test]
+    async fn email_pre_authority_gate_is_hard_and_purpose_separated() {
+        let service = service(Arc::new(TestClock::new(10)), 1);
+        for _ in 0..256 {
+            assert_eq!(
+                service
+                    .admit_email_pre_authority(
+                        AdmissionEndpoint::EmailChallenge,
+                        "203.0.113.10",
+                        "opaque-interaction",
+                    )
+                    .await,
+                AdmissionDecision::Allowed
+            );
+        }
+        assert!(matches!(
+            service
+                .admit_email_pre_authority(
+                    AdmissionEndpoint::EmailChallenge,
+                    "203.0.113.10",
+                    "opaque-interaction",
+                )
+                .await,
+            AdmissionDecision::Rejected {
+                reason: AdmissionRejectionReason::Quota,
+                suppression_eligible: false,
+                ..
+            }
+        ));
+
+        // The authoritative stage neither grants another pre-authority attempt nor double-charges
+        // its client/credential dimensions. It has independent owner-scoped keys and must also pass.
+        assert_eq!(
+            service
+                .admit_email_authoritative(
+                    AdmissionEndpoint::EmailChallenge,
+                    &[AdmissionDimension {
+                        kind: AdmissionDimensionKind::Project,
+                        value: "server-resolved-project",
+                        email_scope: None,
+                    }],
+                )
+                .await,
+            AdmissionDecision::Allowed
+        );
+        assert!(matches!(
+            service
+                .admit_email_pre_authority(
+                    AdmissionEndpoint::EmailChallenge,
+                    "203.0.113.10",
+                    "opaque-interaction",
+                )
+                .await,
+            AdmissionDecision::Rejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn scoped_email_quota_does_not_cross_project_or_application() {
+        let service = service(Arc::new(TestClock::new(10)), 1);
+        for request in 0..64 {
+            let client = format!("203.0.113.{request}");
+            assert_eq!(
+                service
+                    .admit(
+                        AdmissionEndpoint::EmailChallenge,
+                        &client,
+                        &[AdmissionDimension {
+                            kind: AdmissionDimensionKind::Email,
+                            value: "equal@example.test",
+                            email_scope: Some(("project-a", "application-a")),
+                        }],
+                    )
+                    .await,
+                AdmissionDecision::Allowed
+            );
+        }
+        assert!(matches!(
+            service
+                .admit(
+                    AdmissionEndpoint::EmailChallenge,
+                    "198.51.100.1",
+                    &[AdmissionDimension {
+                        kind: AdmissionDimensionKind::Email,
+                        value: "equal@example.test",
+                        email_scope: Some(("project-a", "application-a")),
+                    }],
+                )
+                .await,
+            AdmissionDecision::Rejected {
+                reason: AdmissionRejectionReason::Quota,
+                suppression_eligible: true,
+                ..
+            }
+        ));
+        for scope in [
+            ("project-a", "application-b"),
+            ("project-b", "application-a"),
+        ] {
+            assert_eq!(
+                service
+                    .admit(
+                        AdmissionEndpoint::EmailChallenge,
+                        "198.51.100.2",
+                        &[AdmissionDimension {
+                            kind: AdmissionDimensionKind::Email,
+                            value: "equal@example.test",
+                            email_scope: Some(scope),
+                        }],
+                    )
+                    .await,
+                AdmissionDecision::Allowed
+            );
+        }
+    }
+
+    #[test]
     fn keys_do_not_contain_raw_dimensions() {
         let clock = Arc::new(TestClock::new(10));
         let service = service(clock, 1);
         let buckets = service.buckets(
             AdmissionEndpoint::Refresh,
-            "203.0.113.9",
+            Some("203.0.113.9"),
             &[
                 AdmissionDimension {
                     kind: AdmissionDimensionKind::Project,
                     value: "project-secret",
+                    email_scope: None,
                 },
                 AdmissionDimension {
                     kind: AdmissionDimensionKind::Credential,
                     value: "refresh-secret",
+                    email_scope: None,
                 },
             ],
             10,
             60_000,
+            "combined",
         );
         let joined = buckets
             .iter()
@@ -758,6 +1163,7 @@ mod tests {
             AdmissionDecision::Rejected {
                 retry_after_seconds: 60,
                 reason: AdmissionRejectionReason::Quota,
+                suppression_eligible: false,
             }
         );
         clock.set(61);
@@ -973,6 +1379,42 @@ mod tests {
     }
 
     #[test]
+    fn suppression_requires_only_the_scoped_email_bucket_to_be_saturated() {
+        let mut local = LocalCounters::new(8);
+        let bucket = |key: &str| AdmissionBucket {
+            key: key.to_owned(),
+            limit: 1,
+            window_millis: 60_000,
+        };
+        let email = bucket("test:v1:email_challenge:email_admission_v1:digest");
+        let project = bucket("test:v1:email_challenge:project:digest");
+        assert_eq!(
+            local.evaluate(std::slice::from_ref(&email), 0, 60_000),
+            AdmissionDecision::Allowed
+        );
+        assert!(matches!(
+            local.evaluate(std::slice::from_ref(&email), 1, 60_000),
+            AdmissionDecision::Rejected {
+                suppression_eligible: true,
+                ..
+            }
+        ));
+
+        let mut mixed = LocalCounters::new(8);
+        assert_eq!(
+            mixed.evaluate(&[email.clone(), project.clone()], 0, 60_000),
+            AdmissionDecision::Allowed
+        );
+        assert!(matches!(
+            mixed.evaluate(&[email, project], 1, 60_000),
+            AdmissionDecision::Rejected {
+                suppression_eligible: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn local_multi_bucket_rejection_does_not_partially_increment() {
         let mut local = LocalCounters::new(8);
         let bucket = |key: &str, limit| AdmissionBucket {
@@ -1059,6 +1501,7 @@ mod tests {
             AdmissionDecision::Rejected {
                 retry_after_seconds: 30,
                 reason: AdmissionRejectionReason::LocalCapacity,
+                suppression_eligible: false,
             }
         );
         assert_eq!(local.expiration_index.len(), local.entries.len());

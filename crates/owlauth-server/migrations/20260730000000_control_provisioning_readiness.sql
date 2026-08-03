@@ -143,10 +143,21 @@ CREATE TABLE key_provisioning_operations (
     CHECK ((state = 'completed' AND completed_at IS NOT NULL) OR state <> 'completed')
 );
 
+-- Runtime owns the current startup incarnation for each configured stable process ID. All
+-- Runtime-authored transactions lock this exact row first, so a replacement startup fences
+-- every predecessor capability, including public readiness and publication observations.
+CREATE TABLE runtime_process_incarnations (
+    process_id TEXT PRIMARY KEY CHECK (process_id ~ '^[a-zA-Z0-9._:-]{1,128}$'),
+    process_incarnation UUID NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (process_id, process_incarnation)
+);
+
 CREATE TABLE runtime_publication_leases (
     project_id UUID NOT NULL,
     ring_id UUID NOT NULL,
     process_id TEXT NOT NULL,
+    process_incarnation UUID NOT NULL,
     loaded_revision BIGINT NOT NULL CHECK (loaded_revision > 0),
     first_observed_at TIMESTAMPTZ NOT NULL,
     last_observed_at TIMESTAMPTZ NOT NULL,

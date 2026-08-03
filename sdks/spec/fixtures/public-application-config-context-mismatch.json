@@ -9,6 +9,9 @@
     "application_display_name": "Conformance Application",
     "publishable_keys": ["owl_app_conformance"],
     "providers": [],
+    "email_available": false,
+    "email_otp_enabled": false,
+    "email_magic_link_enabled": false,
     "login_available": false
   }
 }

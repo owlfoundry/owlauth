@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use std::sync::Arc;
+
 use sea_orm::sea_query::{LockBehavior, LockType};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
@@ -13,10 +15,11 @@ use crate::{
         ApplicationError, AuthenticatedIdentityEvidence, BindBrowserLogout, BrowserLogoutRecord,
         CommitHandoffExchange, CompleteAuthenticatedIdentity, ConfirmBrowserLogout,
         ConfirmBrowserSessionReuse, HandoffPreparation, HandoffSessionRecord, IssuedHandoff,
-        LogoutApplicationSession, PrepareBrowserLogout, PrepareHandoffExchange,
-        PrepareRefreshRotation, ProtectedValue, RecoverProviderExchanges, RefreshPreparation,
-        RefreshPreparationResult, RefreshRotationResult, RotateRefreshToken,
-        SessionAuthorityRepository, VersionedDigest,
+        LogoutApplicationSession, ManagedCredentialContext, ManagedCredentialProtector,
+        PrepareBrowserLogout, PrepareHandoffExchange, PrepareRefreshRotation, ProtectedValue,
+        RecoverProviderExchanges, RefreshPreparation, RefreshPreparationResult,
+        RefreshRotationResult, RotateRefreshToken, RuntimeProtector, SessionAuthorityRepository,
+        VersionedDigest,
     },
     domain::{
         LoginTransactionStatus, ProfileDisplayName, ProfilePictureUrl, PublicId,
@@ -39,16 +42,99 @@ use super::{
         project_browser_session, project_key_ring, project_policy, project_signing_key,
         project_user, provider_configuration, refresh_family, refresh_token_generation,
     },
+    runtime_incarnation::RuntimeIncarnationFence,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PostgresSessionAuthorityRepository {
     database: DatabaseConnection,
+    runtime_incarnation: RuntimeIncarnationFence,
+    managed_protector: Option<Arc<dyn ManagedCredentialProtector>>,
+    runtime_protector: Option<Arc<dyn RuntimeProtector>>,
+}
+
+impl std::fmt::Debug for PostgresSessionAuthorityRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresSessionAuthorityRepository")
+            .field("database", &self.database)
+            .field("runtime_incarnation", &self.runtime_incarnation)
+            .field("managed_protector", &self.managed_protector.is_some())
+            .field("runtime_protector", &self.runtime_protector.is_some())
+            .finish()
+    }
 }
 
 impl PostgresSessionAuthorityRepository {
+    #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self { database }
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::test_default(),
+            managed_protector: None,
+            runtime_protector: None,
+        }
+    }
+
+    pub(crate) fn new_with_runtime_identity(
+        database: DatabaseConnection,
+        runtime_process_id: String,
+        runtime_incarnation: uuid::Uuid,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::new(
+                runtime_process_id,
+                runtime_incarnation,
+            ),
+            managed_protector: None,
+            runtime_protector: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_managed_protector(
+        database: DatabaseConnection,
+        managed_protector: Arc<dyn ManagedCredentialProtector>,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::test_default(),
+            managed_protector: Some(managed_protector),
+            runtime_protector: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_protectors(
+        database: DatabaseConnection,
+        managed_protector: Arc<dyn ManagedCredentialProtector>,
+        runtime_protector: Arc<dyn RuntimeProtector>,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::test_default(),
+            managed_protector: Some(managed_protector),
+            runtime_protector: Some(runtime_protector),
+        }
+    }
+
+    pub(crate) fn new_with_runtime_identity_and_managed_protector(
+        database: DatabaseConnection,
+        runtime_process_id: String,
+        runtime_incarnation: uuid::Uuid,
+        managed_protector: Arc<dyn ManagedCredentialProtector>,
+        runtime_protector: Arc<dyn RuntimeProtector>,
+    ) -> Self {
+        Self {
+            database,
+            runtime_incarnation: RuntimeIncarnationFence::new(
+                runtime_process_id,
+                runtime_incarnation,
+            ),
+            managed_protector: Some(managed_protector),
+            runtime_protector: Some(runtime_protector),
+        }
     }
 }
 
@@ -71,6 +157,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         let locale = identity
             .locale
             .map(crate::domain::ProfileLocale::into_inner);
+        let renewable_credential = identity.renewable_credential;
+        let managed_capability = identity.managed_capability;
         let source_profile_digest = base_profile_digest(
             display_name.as_deref(),
             picture_url.as_deref(),
@@ -79,6 +167,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         )?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, command.project_id).await?;
         let login = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -174,26 +264,19 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         }
 
         lock_identity_namespace(&transaction, command.project_id, &issuer, &subject).await?;
-        let (user, user_projection_changed) = match linked_identity::Entity::find()
+        // Resolve the owner without a row lock, then take the canonical subject lock order:
+        // project_user -> linked_identity. Re-locking and comparing the identity closes the
+        // resolution race without ever inverting managed profile/reauthorization commits.
+        let identity_owner = linked_identity::Entity::find()
             .filter(linked_identity::Column::ProjectId.eq(command.project_id))
             .filter(linked_identity::Column::Issuer.eq(&issuer))
             .filter(linked_identity::Column::Subject.eq(&subject))
-            .lock_exclusive()
             .one(&transaction)
             .await
-            .map_err(persistence)?
-        {
-            Some(identity) => {
-                if identity.status != "active" {
-                    return fail_provider_completion(
-                        transaction,
-                        &login,
-                        command.now,
-                        ApplicationError::Disabled,
-                    )
-                    .await;
-                }
-                let user = project_user::Entity::find_by_id(identity.user_id)
+            .map_err(persistence)?;
+        let (user, user_projection_changed, resolved_identity_id) = match identity_owner {
+            Some(owner_hint) => {
+                let user = project_user::Entity::find_by_id(owner_hint.user_id)
                     .filter(project_user::Column::ProjectId.eq(command.project_id))
                     .lock_exclusive()
                     .one(&transaction)
@@ -208,6 +291,41 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     )
                     .await;
                 };
+                let identity = linked_identity::Entity::find()
+                    .filter(linked_identity::Column::ProjectId.eq(command.project_id))
+                    .filter(linked_identity::Column::Issuer.eq(&issuer))
+                    .filter(linked_identity::Column::Subject.eq(&subject))
+                    .lock_exclusive()
+                    .one(&transaction)
+                    .await
+                    .map_err(persistence)?;
+                let Some(identity) = identity else {
+                    return fail_provider_completion(
+                        transaction,
+                        &login,
+                        command.now,
+                        ApplicationError::Integrity,
+                    )
+                    .await;
+                };
+                if identity.id != owner_hint.id || identity.user_id != owner_hint.user_id {
+                    return fail_provider_completion(
+                        transaction,
+                        &login,
+                        command.now,
+                        ApplicationError::RevisionConflict,
+                    )
+                    .await;
+                }
+                if identity.status != "active" {
+                    return fail_provider_completion(
+                        transaction,
+                        &login,
+                        command.now,
+                        ApplicationError::Disabled,
+                    )
+                    .await;
+                }
                 if user.status != "active" {
                     return fail_provider_completion(
                         transaction,
@@ -301,9 +419,10 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                             .await
                             .map_err(persistence)?,
                         materialized_profile_changed,
+                        identity_id,
                     )
                 } else {
-                    (user, false)
+                    (user, false, identity_id)
                 }
             }
             None => {
@@ -327,9 +446,11 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     project_id: Set(command.project_id),
                     public_id: Set(public_id.to_string()),
                     status: Set("active".to_owned()),
+                    merged_into_user_id: Set(None),
                     user_revision: Set(1),
                     security_revision: Set(1),
                     primary_profile_identity_id: Set(None),
+                    primary_email_identity_id: Set(None),
                     primary_source_kind: Set("provider".to_owned()),
                     base_profile_digest: Set(canonical_base_digest),
                     local_display_name_set: Set(false),
@@ -374,15 +495,53 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 (
                     active.update(&transaction).await.map_err(persistence)?,
                     false,
+                    command.new_identity_id,
                 )
             }
         };
         if user_projection_changed {
             fan_out_user_projections(&transaction, &user, command.now).await?;
         }
+        if let (Some(credential), Some(capability)) = (renewable_credential, managed_capability) {
+            if !provider.managed_profile_enabled
+                || credential.granted_scopes != capability.exact_scopes
+            {
+                // Login-only/disabled policy deliberately drops the renewable material.
+            } else {
+                let protector = self
+                    .managed_protector
+                    .as_ref()
+                    .ok_or(ApplicationError::Integrity)?;
+                upsert_managed_connection(
+                    &transaction,
+                    protector.as_ref(),
+                    &provider,
+                    resolved_identity_id,
+                    &user,
+                    login.project_security_revision,
+                    &capability,
+                    credential.value.as_ref(),
+                    command.now,
+                )
+                .await?;
+            }
+        }
 
-        let browser_session =
-            rotate_or_create_browser_session(&transaction, &command, &login, &user).await?;
+        let browser_session = rotate_or_create_browser_session(
+            &transaction,
+            BrowserSessionCompletion {
+                project_id: command.project_id,
+                user_id: user.id,
+                user_security_revision: user.security_revision,
+                browser_session_id: command.browser_session_id,
+                existing_browser_credential: command.existing_browser_credential.as_ref(),
+                browser_credential: &command.browser_credential,
+                project_security_revision: login.project_security_revision,
+                policy_session_revision: login.session_revision,
+                now: command.now,
+            },
+        )
+        .await?;
         let expires_at = std::cmp::min(command.now + Duration::seconds(60), login.expires_at);
         if expires_at <= command.now {
             return Err(ApplicationError::InvalidTransition);
@@ -470,6 +629,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .ok_or(ApplicationError::NotFound)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, command.project_id).await?;
         let login = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -630,6 +791,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
         let ticket = handoff_ticket::Entity::find()
             .filter(handoff_ticket::Column::ProjectId.eq(command.project_id))
             .filter(handoff_ticket::Column::ApplicationId.eq(command.application_id))
@@ -776,12 +938,35 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         if binding.is_some() && projection.is_none() {
             return Err(ApplicationError::Integrity);
         }
-        let (projection_revision, projection_document, _) = authoritative_projection_material(
-            projection.as_ref(),
-            &user,
-            policy.projection_revision,
-            application.projection_revision,
-        )?;
+        let (projection_revision, projection_document) = if policy.projection_verified_email_enabled
+            && application.projection_verified_email_enabled
+        {
+            let protector = self
+                .runtime_protector
+                .as_deref()
+                .ok_or(ApplicationError::Integrity)?;
+            let material = super::projection::authoritative_runtime_projection_material(
+                &transaction,
+                projection.as_ref(),
+                application.id,
+                &user,
+                policy.projection_revision,
+                application.projection_revision,
+                true,
+                true,
+                protector,
+            )
+            .await?;
+            (material.revision, material.document)
+        } else {
+            let (revision, document, _) = authoritative_projection_material(
+                projection.as_ref(),
+                &user,
+                policy.projection_revision,
+                application.projection_revision,
+            )?;
+            (revision, document)
+        };
         let signing =
             active_signing_snapshot(&transaction, command.project_id, command.now).await?;
         let preparation = HandoffPreparation {
@@ -828,6 +1013,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         }
 
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, command.project_id).await?;
         let ticket = handoff_ticket::Entity::find()
             .filter(handoff_ticket::Column::ProjectId.eq(command.project_id))
             .filter(handoff_ticket::Column::ApplicationId.eq(command.application_id))
@@ -1031,6 +1218,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     user_id: Set(user.id),
                     status: Set("active".to_owned()),
                     binding_revision: Set(1),
+                    merged_into_binding_id: Set(None),
+                    merged_at: Set(None),
                     created_at: Set(command.now),
                     updated_at: Set(command.now),
                 }
@@ -1046,19 +1235,51 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .one(&transaction)
             .await
             .map_err(persistence)?;
-        let (projection_revision, projection_document, projection_digest) =
-            authoritative_projection_material(
+        let material = if let Some(protector) = self.runtime_protector.as_deref() {
+            super::projection::authoritative_runtime_projection_material(
+                &transaction,
+                existing_projection.as_ref(),
+                application.id,
+                &user,
+                policy.projection_revision,
+                application.projection_revision,
+                policy.projection_verified_email_enabled,
+                application.projection_verified_email_enabled,
+                protector,
+            )
+            .await?
+        } else {
+            super::projection::authoritative_projection_material(
                 existing_projection.as_ref(),
                 &user,
                 policy.projection_revision,
                 application.projection_revision,
-            )?;
-        if projection_revision != command.preparation.projection_revision
-            || projection_document != command.preparation.projection_document
+            )?
+        };
+        if material.revision != command.preparation.projection_revision
+            || material.document != command.preparation.projection_document
         {
             return Err(ApplicationError::RevisionConflict);
         }
         let projection = match existing_projection {
+            Some(projection) if self.runtime_protector.is_some() => {
+                super::projection::repair_runtime_projection(
+                    &transaction,
+                    projection,
+                    application.id,
+                    &user,
+                    policy.projection_revision,
+                    application.projection_revision,
+                    policy.projection_verified_email_enabled,
+                    application.projection_verified_email_enabled,
+                    self.runtime_protector
+                        .as_deref()
+                        .ok_or(ApplicationError::Integrity)?,
+                    command.now,
+                )
+                .await?
+                .0
+            }
             Some(projection) => {
                 super::projection::repair_projection(
                     &transaction,
@@ -1078,13 +1299,16 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 application_id: Set(command.application_id),
                 user_id: Set(user.id),
                 schema_name: Set(USER_PROJECTION_SCHEMA_V1.to_owned()),
-                projection_revision: Set(projection_revision),
+                projection_revision: Set(material.revision),
                 source_user_revision: Set(user.user_revision),
                 project_policy_revision: Set(policy.projection_revision),
                 application_policy_revision: Set(application.projection_revision),
-                canonical_digest: Set(projection_digest),
+                canonical_digest: Set(material.digest),
                 source_base_profile_digest: Set(Some(user.base_profile_digest.clone())),
-                document: Set(projection_document),
+                verified_email_source_identity_id: Set(material.verified_email_source_identity_id),
+                verified_email_ciphertext: Set(material.verified_email_ciphertext),
+                verified_email_key_version: Set(material.verified_email_key_version),
+                document: Set(material.storage_document),
                 created_at: Set(command.now),
                 updated_at: Set(command.now),
             }
@@ -1231,6 +1455,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, command.project_id).await?;
         let session = application_session::Entity::find_by_id(routed_family.application_session_id)
             .filter(application_session::Column::ProjectId.eq(command.project_id))
             .filter(application_session::Column::ApplicationId.eq(command.application_id))
@@ -1362,15 +1588,31 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (_, projection_material) = super::projection::repair_projection(
-            &transaction,
-            projection,
-            &user,
-            policy.projection_revision,
-            application.projection_revision,
-            command.now,
-        )
-        .await?;
+        let (_, projection_material) = if let Some(protector) = self.runtime_protector.as_deref() {
+            super::projection::repair_runtime_projection(
+                &transaction,
+                projection,
+                application.id,
+                &user,
+                policy.projection_revision,
+                application.projection_revision,
+                policy.projection_verified_email_enabled,
+                application.projection_verified_email_enabled,
+                protector,
+                command.now,
+            )
+            .await?
+        } else {
+            super::projection::repair_projection(
+                &transaction,
+                projection,
+                &user,
+                policy.projection_revision,
+                application.projection_revision,
+                command.now,
+            )
+            .await?
+        };
         let projection_revision = projection_material.revision;
         let projection_document = projection_material.document;
         let signing =
@@ -1440,6 +1682,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .ok_or(ApplicationError::NotFound)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, command.project_id).await?;
         let session = application_session::Entity::find_by_id(routed_family.application_session_id)
             .filter(application_session::Column::ProjectId.eq(command.project_id))
             .filter(application_session::Column::ApplicationId.eq(command.application_id))
@@ -1571,12 +1815,26 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (projection_document, projection_digest) = super::projection::projection_material(
-            &user,
-            command.preparation.projection_revision,
-            policy.projection_revision,
-            application.projection_revision,
-        )?;
+        let (projection_document, projection_digest) =
+            if let Some(protector) = self.runtime_protector.as_deref() {
+                if projection.verified_email_ciphertext.is_some() {
+                    super::projection::assert_projection_crypto_authority(&transaction, protector)
+                        .await?;
+                }
+                (
+                    super::projection::wire_projection_document(&projection, protector)?,
+                    projection.canonical_digest.clone(),
+                )
+            } else {
+                super::projection::projection_material(
+                    &user,
+                    command.preparation.projection_revision,
+                    policy.projection_revision,
+                    application.projection_revision,
+                )?
+            };
+        let projection_storage_document =
+            super::projection::safe_projection_document(&projection_document)?;
         if projection.projection_revision != command.preparation.projection_revision
             || projection.source_user_revision != user.user_revision
             || projection.project_policy_revision != policy.projection_revision
@@ -1585,7 +1843,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 .source_base_profile_digest
                 .as_deref()
                 .is_none_or(|digest| !bool::from(digest.ct_eq(user.base_profile_digest.as_slice())))
-            || projection.document != projection_document
+            || projection.document != projection_storage_document
             || projection_document != command.preparation.projection_document
             || !bool::from(
                 projection
@@ -1689,6 +1947,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
         let abandoned = login_transaction::Entity::find()
             .filter(
                 login_transaction::Column::Status
@@ -1732,6 +1991,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         command: LogoutApplicationSession,
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, command.project_id).await?;
         let session = application_session::Entity::find_by_id(command.application_session_id)
             .filter(application_session::Column::ProjectId.eq(command.project_id))
             .filter(application_session::Column::ApplicationId.eq(command.application_id))
@@ -1790,6 +2051,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
     ) -> Result<BrowserLogoutRecord, ApplicationError> {
         validate_digest(&command.preparation)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, command.project_id).await?;
         let owners = lock_logout_owners(
             &transaction,
             command.project_id,
@@ -1874,8 +2137,9 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         validate_digest(&command.preparation)?;
         validate_digest(&command.browser_credential)?;
         validate_digest(&command.csrf)?;
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let interaction = project_browser_logout_interaction::Entity::find()
+        // The opaque preparation digest only routes to a candidate. It grants no authority:
+        // after taking the Project graph lock, re-read the exact interaction with a row lock.
+        let routed_interaction = project_browser_logout_interaction::Entity::find()
             .filter(
                 project_browser_logout_interaction::Column::PreparationDigest
                     .eq(command.preparation.value.to_vec()),
@@ -1884,11 +2148,28 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 project_browser_logout_interaction::Column::PreparationDigestKeyVersion
                     .eq(command.preparation.key_version),
             )
-            .lock_exclusive()
-            .one(&transaction)
+            .one(&self.database)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, routed_interaction.project_id).await?;
+        let interaction =
+            project_browser_logout_interaction::Entity::find_by_id(routed_interaction.id)
+                .filter(
+                    project_browser_logout_interaction::Column::PreparationDigest
+                        .eq(command.preparation.value.to_vec()),
+                )
+                .filter(
+                    project_browser_logout_interaction::Column::PreparationDigestKeyVersion
+                        .eq(command.preparation.key_version),
+                )
+                .lock_exclusive()
+                .one(&transaction)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::NotFound)?;
         if interaction.expires_at <= command.now {
             let expired = expire_browser_logout(&transaction, &interaction, command.now).await?;
             transaction.commit().await.map_err(persistence)?;
@@ -1965,8 +2246,9 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         validate_digest(&command.preparation)?;
         validate_digest(&command.browser_credential)?;
         validate_digest(&command.csrf)?;
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let interaction = project_browser_logout_interaction::Entity::find()
+        // The opaque preparation digest only routes to a candidate. It grants no authority:
+        // after taking the Project graph lock, re-read the exact interaction with a row lock.
+        let routed_interaction = project_browser_logout_interaction::Entity::find()
             .filter(
                 project_browser_logout_interaction::Column::PreparationDigest
                     .eq(command.preparation.value.to_vec()),
@@ -1975,11 +2257,28 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 project_browser_logout_interaction::Column::PreparationDigestKeyVersion
                     .eq(command.preparation.key_version),
             )
-            .lock_exclusive()
-            .one(&transaction)
+            .one(&self.database)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        self.runtime_incarnation.lock(&transaction).await?;
+        lock_project_identity_graph(&transaction, routed_interaction.project_id).await?;
+        let interaction =
+            project_browser_logout_interaction::Entity::find_by_id(routed_interaction.id)
+                .filter(
+                    project_browser_logout_interaction::Column::PreparationDigest
+                        .eq(command.preparation.value.to_vec()),
+                )
+                .filter(
+                    project_browser_logout_interaction::Column::PreparationDigestKeyVersion
+                        .eq(command.preparation.key_version),
+                )
+                .lock_exclusive()
+                .one(&transaction)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::NotFound)?;
         if interaction.expires_at <= command.now {
             expire_browser_logout(&transaction, &interaction, command.now).await?;
             transaction.commit().await.map_err(persistence)?;
@@ -2060,6 +2359,21 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
     }
 }
 
+pub(super) async fn lock_project_identity_graph(
+    transaction: &sea_orm::DatabaseTransaction,
+    project_id: uuid::Uuid,
+) -> Result<(), ApplicationError> {
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended('owlauth-project-identity-graph:' || $1::TEXT, 0))",
+            [project_id.into()],
+        ))
+        .await
+        .map_err(persistence)?;
+    Ok(())
+}
+
 async fn lock_identity_namespace(
     transaction: &sea_orm::DatabaseTransaction,
     project_id: uuid::Uuid,
@@ -2078,17 +2392,27 @@ async fn lock_identity_namespace(
     Ok(())
 }
 
+pub(super) struct BrowserSessionCompletion<'a> {
+    pub project_id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub user_security_revision: i64,
+    pub browser_session_id: uuid::Uuid,
+    pub existing_browser_credential: Option<&'a VersionedDigest>,
+    pub browser_credential: &'a VersionedDigest,
+    pub project_security_revision: i64,
+    pub policy_session_revision: i64,
+    pub now: OffsetDateTime,
+}
+
 #[allow(
     clippy::collapsible_if,
     reason = "the outer credential option and inner locked lookup have distinct semantics"
 )]
-async fn rotate_or_create_browser_session(
+pub(super) async fn rotate_or_create_browser_session(
     transaction: &sea_orm::DatabaseTransaction,
-    command: &CompleteAuthenticatedIdentity,
-    login: &login_transaction::Model,
-    user: &project_user::Model,
+    command: BrowserSessionCompletion<'_>,
 ) -> Result<project_browser_session::Model, ApplicationError> {
-    if let Some(existing_credential) = &command.existing_browser_credential {
+    if let Some(existing_credential) = command.existing_browser_credential {
         if let Some(existing) = project_browser_session::Entity::find()
             .filter(
                 project_browser_session::Column::CredentialDigest
@@ -2108,16 +2432,16 @@ async fn rotate_or_create_browser_session(
                 existing.credential_digest_key_version,
                 existing_credential,
             ) && existing.project_id == command.project_id
-                && existing.user_id == user.id
+                && existing.user_id == command.user_id
                 && existing.status == "active"
             {
                 let mut active = existing.into_active_model();
                 active.credential_digest = Set(command.browser_credential.value.to_vec());
                 active.credential_digest_key_version = Set(command.browser_credential.key_version);
                 active.session_revision = Set(active.session_revision.take().unwrap_or(1) + 1);
-                active.project_security_revision = Set(login.project_security_revision);
-                active.user_security_revision = Set(user.security_revision);
-                active.policy_session_revision = Set(login.session_revision);
+                active.project_security_revision = Set(command.project_security_revision);
+                active.user_security_revision = Set(command.user_security_revision);
+                active.policy_session_revision = Set(command.policy_session_revision);
                 active.authenticated_at = Set(command.now);
                 active.last_activity_at = Set(command.now);
                 active.idle_expires_at = Set(command.now + Duration::hours(8));
@@ -2139,14 +2463,14 @@ async fn rotate_or_create_browser_session(
     project_browser_session::ActiveModel {
         id: Set(command.browser_session_id),
         project_id: Set(command.project_id),
-        user_id: Set(user.id),
+        user_id: Set(command.user_id),
         credential_digest: Set(command.browser_credential.value.to_vec()),
         credential_digest_key_version: Set(command.browser_credential.key_version),
         status: Set("active".to_owned()),
         session_revision: Set(1),
-        project_security_revision: Set(login.project_security_revision),
-        user_security_revision: Set(user.security_revision),
-        policy_session_revision: Set(login.session_revision),
+        project_security_revision: Set(command.project_security_revision),
+        user_security_revision: Set(command.user_security_revision),
+        policy_session_revision: Set(command.policy_session_revision),
         authenticated_at: Set(command.now),
         last_activity_at: Set(command.now),
         idle_expires_at: Set(command.now + Duration::hours(8)),
@@ -2161,7 +2485,7 @@ async fn rotate_or_create_browser_session(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn insert_handoff(
+pub(super) async fn insert_handoff(
     transaction: &sea_orm::DatabaseTransaction,
     id: uuid::Uuid,
     digest: &VersionedDigest,
@@ -2220,7 +2544,7 @@ async fn insert_handoff(
     .map_err(persistence)
 }
 
-async fn lock_login_application_owners(
+pub(super) async fn lock_login_application_owners(
     transaction: &sea_orm::DatabaseTransaction,
     login: &login_transaction::Model,
 ) -> Result<(project::Model, application::Model, project_policy::Model), ApplicationError> {
@@ -2334,7 +2658,7 @@ async fn record_refresh_replay(
     .await
 }
 
-async fn fan_out_user_projections(
+pub(super) async fn fan_out_user_projections(
     transaction: &sea_orm::DatabaseTransaction,
     user: &project_user::Model,
     now: OffsetDateTime,
@@ -2398,7 +2722,7 @@ fn access_token_lifetime(policy: &project_policy::Model) -> Result<i64, Applicat
         .ok_or(ApplicationError::Integrity)
 }
 
-fn base_profile_digest(
+pub(super) fn base_profile_digest(
     display_name: Option<&str>,
     picture_url: Option<&str>,
     locale: Option<&str>,
@@ -2572,4 +2896,254 @@ fn digest_matches(stored: &[u8], stored_key_version: i32, supplied: &VersionedDi
     stored_key_version == supplied.key_version
         && stored.len() == supplied.value.len()
         && bool::from(stored.ct_eq(supplied.value.as_slice()))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "callback connection replacement keeps protect, authority snapshots, fences, destruction, and insert atomic"
+)]
+async fn upsert_managed_connection(
+    transaction: &sea_orm::DatabaseTransaction,
+    protector: &dyn ManagedCredentialProtector,
+    provider: &provider_configuration::Model,
+    identity_id: uuid::Uuid,
+    user: &project_user::Model,
+    project_security_revision: i64,
+    capability: &crate::application::ManagedCredentialCapability,
+    renewable_credential: &[u8],
+    now: OffsetDateTime,
+) -> Result<(), ApplicationError> {
+    if renewable_credential.is_empty() || renewable_credential.len() > 8192 {
+        return Err(ApplicationError::InvalidInput);
+    }
+    let identity = linked_identity::Entity::find_by_id(identity_id)
+        .filter(linked_identity::Column::ProjectId.eq(provider.project_id))
+        .filter(linked_identity::Column::UserId.eq(user.id))
+        .lock_shared()
+        .one(transaction)
+        .await
+        .map_err(persistence)?
+        .ok_or(ApplicationError::Integrity)?;
+    let existing = transaction
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"SELECT id, revision, generation, credential_generation,
+                      revocation_requested_at, revocation_disposition,
+                      revocation_dispatch_started_at, revocation_attempt_id,
+                      lease_kind, lease_owner, lease_expires_at
+                 FROM managed_provider_connections
+                WHERE project_id = $1 AND linked_identity_id = $2
+                FOR UPDATE",
+            [provider.project_id.into(), identity_id.into()],
+        ))
+        .await
+        .map_err(persistence)?;
+    let (connection_id, revision, generation, credential_generation) = if let Some(row) = existing {
+        let revocation_requested_at: Option<OffsetDateTime> = row
+            .try_get("", "revocation_requested_at")
+            .map_err(|_| ApplicationError::Integrity)?;
+        let revocation_disposition: Option<String> = row
+            .try_get("", "revocation_disposition")
+            .map_err(|_| ApplicationError::Integrity)?;
+        let dispatch_started_at: Option<OffsetDateTime> = row
+            .try_get("", "revocation_dispatch_started_at")
+            .map_err(|_| ApplicationError::Integrity)?;
+        let attempt_id: Option<uuid::Uuid> = row
+            .try_get("", "revocation_attempt_id")
+            .map_err(|_| ApplicationError::Integrity)?;
+        let lease_kind: Option<String> = row
+            .try_get("", "lease_kind")
+            .map_err(|_| ApplicationError::Integrity)?;
+        let lease_owner: Option<uuid::Uuid> = row
+            .try_get("", "lease_owner")
+            .map_err(|_| ApplicationError::Integrity)?;
+        let lease_expires_at: Option<OffsetDateTime> = row
+            .try_get("", "lease_expires_at")
+            .map_err(|_| ApplicationError::Integrity)?;
+        let intent_shape_valid = revocation_requested_at.is_some()
+            == revocation_disposition.is_some()
+            && dispatch_started_at.is_some() == attempt_id.is_some()
+            && dispatch_started_at.is_none_or(|started| {
+                revocation_requested_at.is_some_and(|requested| started >= requested)
+            })
+            && lease_kind.is_some() == lease_owner.is_some()
+            && lease_kind.is_some() == lease_expires_at.is_some();
+        if !intent_shape_valid {
+            return Err(ApplicationError::Integrity);
+        }
+        // Ordinary authentication remains authoritative for the browser handoff, but it must
+        // never replace credential generation while an operator's destructive intent is queued,
+        // leased, or already dispatched. The exact old generation remains owned by its worker;
+        // post-dispatch recovery must terminalize it before a later login can retain material.
+        if revocation_requested_at.is_some()
+            || dispatch_started_at.is_some()
+            || lease_kind.as_deref() == Some("revocation")
+        {
+            return Ok(());
+        }
+        (
+            row.try_get("", "id")
+                .map_err(|_| ApplicationError::Integrity)?,
+            row.try_get("", "revision")
+                .map_err(|_| ApplicationError::Integrity)?,
+            row.try_get("", "generation")
+                .map_err(|_| ApplicationError::Integrity)?,
+            row.try_get("", "credential_generation")
+                .map_err(|_| ApplicationError::Integrity)?,
+        )
+    } else {
+        (uuid::Uuid::new_v4(), 0_i64, 0_i64, 0_i64)
+    };
+    let next_generation = generation
+        .checked_add(1)
+        .ok_or(ApplicationError::Integrity)?;
+    let next_credential_generation = credential_generation
+        .checked_add(1)
+        .ok_or(ApplicationError::Integrity)?;
+    let context = ManagedCredentialContext {
+        project_id: provider.project_id,
+        provider_configuration_id: provider.id,
+        linked_identity_id: identity_id,
+        connection_id,
+        connection_generation: next_generation,
+        credential_generation: next_credential_generation,
+    };
+    let protected = protector.protect_credential(&context, renewable_credential)?;
+    if revision == 0 {
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"INSERT INTO managed_provider_connections
+                    (id, project_id, provider_configuration_id, linked_identity_id, user_id,
+                     state, revision, generation, credential_generation,
+                     project_security_revision, provider_revision, user_security_revision,
+                     identity_revision, managed_profile_revision, adapter_key,adapter_capability_revision,
+                     required_scopes, supports_revocation, last_safe_outcome,
+                     next_synchronize_at, next_renewal_at,
+                     consecutive_failures, created_at, updated_at)
+                   VALUES ($1,$2,$3,$4,$5,'active',1,1,1,$10,$6,$7,$8,$9,
+                           $12,$13,
+                           ARRAY(SELECT jsonb_array_elements_text($14::jsonb)),$15,
+                           'callback_credential_committed',$11,$11 + INTERVAL '30 days',0,$11,$11)",
+                [
+                    connection_id.into(),
+                    provider.project_id.into(),
+                    provider.id.into(),
+                    identity_id.into(),
+                    user.id.into(),
+                    provider.revision.into(),
+                    user.security_revision.into(),
+                    identity.identity_revision.into(),
+                    provider.managed_profile_revision.into(),
+                    project_security_revision.into(),
+                    now.into(),
+                    capability.adapter_key.clone().into(),
+                    capability.adapter_revision.into(),
+                    serde_json::json!(capability.exact_scopes).into(),
+                    capability.supports_revocation.into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?;
+    } else {
+        // The callback credential wins only after the exact connection generation is locked.
+        // Terminalize any in-flight old-generation renewal first so a dispatched response has a
+        // truthful durable outcome and can never be reclaimed or mutate this successor.
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"UPDATE managed_provider_renewal_operations
+                      SET state='superseded_by_login',safe_outcome='superseded_by_login',
+                          terminal_at=$1,lease_owner=NULL,lease_expires_at=NULL,updated_at=$1
+                    WHERE project_id=$2 AND connection_id=$3
+                      AND expected_connection_generation=$4
+                      AND expected_credential_generation=$5
+                      AND state IN ('prepared','submitted')",
+                [
+                    now.into(),
+                    provider.project_id.into(),
+                    connection_id.into(),
+                    generation.into(),
+                    credential_generation.into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"UPDATE managed_provider_credentials
+                      SET ciphertext = NULL, superseded_at = $1, destroyed_at = $1
+                    WHERE project_id = $2 AND connection_id = $3 AND ciphertext IS NOT NULL",
+                [now.into(), provider.project_id.into(), connection_id.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        let updated = transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"UPDATE managed_provider_connections
+                      SET provider_configuration_id = $1, user_id = $2, state = 'active',
+                          revision = revision + 1, generation = generation + 1,
+                          credential_generation = credential_generation + 1,
+                          provider_revision = $3, user_security_revision = $4,
+                          identity_revision = $5, managed_profile_revision = $6,
+                          project_security_revision = $13,
+                          adapter_key=$14,adapter_capability_revision=$15,
+                          required_scopes = ARRAY(SELECT jsonb_array_elements_text($16::jsonb)),
+                          supports_revocation = $17,
+                          last_safe_outcome = 'callback_credential_committed',
+                          next_synchronize_at = $7, next_renewal_at = $7 + INTERVAL '30 days',
+                          consecutive_failures = 0,
+                          lease_owner = NULL, lease_kind = NULL, lease_expires_at = NULL,
+                          disconnected_at = NULL, updated_at = $7
+                    WHERE project_id = $8 AND id = $9 AND revision = $10
+                      AND generation = $11 AND credential_generation = $12",
+                [
+                    provider.id.into(),
+                    user.id.into(),
+                    provider.revision.into(),
+                    user.security_revision.into(),
+                    identity.identity_revision.into(),
+                    provider.managed_profile_revision.into(),
+                    now.into(),
+                    provider.project_id.into(),
+                    connection_id.into(),
+                    revision.into(),
+                    generation.into(),
+                    credential_generation.into(),
+                    project_security_revision.into(),
+                    capability.adapter_key.clone().into(),
+                    capability.adapter_revision.into(),
+                    serde_json::json!(capability.exact_scopes).into(),
+                    capability.supports_revocation.into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?;
+        if updated.rows_affected() != 1 {
+            return Err(ApplicationError::RevisionConflict);
+        }
+    }
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"INSERT INTO managed_provider_credentials
+                (project_id, connection_id, connection_generation, credential_generation,
+                 key_version, ciphertext, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            [
+                provider.project_id.into(),
+                connection_id.into(),
+                next_generation.into(),
+                next_credential_generation.into(),
+                protected.key_version.into(),
+                protected.ciphertext.into(),
+                now.into(),
+            ],
+        ))
+        .await
+        .map_err(persistence)?;
+    Ok(())
 }

@@ -1,10 +1,13 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { RuntimeApp, safeNavigationUrl } from "./App";
+import { RuntimeApp, hostedNavigation, safeNavigationUrl } from "./App";
 
 const future = "2099-01-01T00:00:00Z";
 
-function installFlow(flow: "interaction" | "browser-logout", bootstrap: unknown) {
+function installFlow(
+  flow: "interaction" | "managed_reauthorization" | "browser-logout",
+  bootstrap: unknown,
+) {
   const flowMeta = document.createElement("meta");
   flowMeta.name = "owlauth-runtime-flow";
   flowMeta.content = flow;
@@ -24,6 +27,8 @@ function interactionBootstrap(overrides: Record<string, unknown> = {}) {
     status: "awaiting_method_selection",
     revision: 4,
     session_reuse_available: true,
+    email_available: false,
+    email_proof_modes: [],
     presentation_hint: "Use your company account",
     providers: [
       { key: "workforce", display_name: "Workforce SSO" },
@@ -100,6 +105,157 @@ describe("Runtime Hosted Authentication", () => {
     expect(screen.queryByText("Use your company account")).not.toBeInTheDocument();
   });
 
+  it("runs the accessible email entry and generic check-mail state without retaining the address", async () => {
+    window.history.replaceState({}, "", "/runtime/auth/interactions/email_interaction");
+    installFlow(
+      "interaction",
+      interactionBootstrap({
+        email_available: true,
+        email_proof_modes: ["otp"],
+        providers: [],
+      }),
+    );
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const request = input as Request;
+      if (request.url.endsWith("/email/select")) {
+        return Response.json({ completed: true });
+      }
+      expect(request.url).toContain("/email/challenges");
+      expect(await request.clone().json()).toEqual({
+        csrf: "csrf-sensitive-value",
+        expected_revision: 5,
+        email: "person@example.test",
+      });
+      return Response.json(
+        {
+          accepted: true,
+          revision: 6,
+          challenge_id: "01912345-6789-7abc-8def-0123456789ab",
+          generation: 1,
+          proof_modes: ["otp"],
+          expires_at: future,
+        },
+        { status: 202 },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<RuntimeApp />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue with email" }));
+    expect(await screen.findByRole("heading", { name: "Enter your email address" })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Email address"), {
+      target: { value: "person@example.test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send sign-in email" }));
+    expect(await screen.findByRole("heading", { name: "Check your email" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Verify code" })).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Use the newest code");
+    expect(screen.getByRole("status")).not.toHaveTextContent("sign-in link");
+    expect(document.body.textContent).not.toContain("person@example.test");
+    expect(window.localStorage).toHaveLength(0);
+    expect(window.sessionStorage).toHaveLength(0);
+  });
+
+  it("renders only magic-link instructions for a magic-only email policy", async () => {
+    window.history.replaceState({}, "", "/runtime/auth/interactions/magic_only");
+    installFlow(
+      "interaction",
+      interactionBootstrap({
+        email_available: true,
+        email_proof_modes: ["magic_link"],
+        providers: [],
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input) => {
+        await Promise.resolve();
+        const request = input as Request;
+        if (request.url.endsWith("/email/select")) return Response.json({ completed: true });
+        return Response.json(
+          {
+            accepted: true,
+            revision: 6,
+            challenge_id: "01912345-6789-7abc-8def-0123456789ab",
+            generation: 1,
+            proof_modes: ["magic_link"],
+            expires_at: future,
+          },
+          { status: 202 },
+        );
+      }),
+    );
+    render(<RuntimeApp />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue with email" }));
+    fireEvent.change(await screen.findByLabelText("Email address"), {
+      target: { value: "person@example.test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send sign-in email" }));
+    expect(await screen.findByRole("heading", { name: "Check your email" })).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent("Open the newest sign-in link");
+    expect(screen.queryByLabelText("One-time code")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Verify code" })).not.toBeInTheDocument();
+  });
+
+  it("scrubs a fragment-only magic proof before rendering explicit confirmation", () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/runtime/auth/email/confirm/01912345-6789-7abc-8def-0123456789ab#proof=abcdefghijklmnopqrstuv&project=prj_public&transaction=01912345-6789-7abc-8def-0123456789ab&generation=1&revision=3",
+    );
+    const flowMeta = document.createElement("meta");
+    flowMeta.name = "owlauth-runtime-flow";
+    flowMeta.content = "email-magic";
+    const csrfMeta = document.createElement("meta");
+    csrfMeta.name = "owlauth-magic-csrf";
+    csrfMeta.content = "transfer_csrf_value";
+    document.head.append(flowMeta, csrfMeta);
+    render(<RuntimeApp />);
+    expect(window.location.hash).toBe("");
+    expect(screen.getByRole("heading", { name: "Continue email sign-in" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeVisible();
+    expect(document.body.textContent).not.toContain("abcdefghijklmnopqrstuv");
+    expect(document.head.querySelector('meta[name="owlauth-magic-csrf"]')).toBeNull();
+  });
+
+  it("uses the trusted native type from a real magic response for custom-scheme navigation", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/runtime/auth/email/confirm/01912345-6789-7abc-8def-0123456789ab#proof=abcdefghijklmnopqrstuv&project=prj_public&transaction=01912345-6789-7abc-8def-0123456789ab&generation=1&revision=3",
+    );
+    const flowMeta = document.createElement("meta");
+    flowMeta.name = "owlauth-runtime-flow";
+    flowMeta.content = "email-magic";
+    const csrfMeta = document.createElement("meta");
+    csrfMeta.name = "owlauth-magic-csrf";
+    csrfMeta.content = "transfer_csrf_value";
+    document.head.append(flowMeta, csrfMeta);
+    const target = "com.example.app:/callback?handoff=one-use";
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const request = input as Request;
+      expect(request.method).toBe("POST");
+      expect(request.url).toContain("/auth/email/magic/confirm");
+      return Promise.resolve(
+        Response.json({
+          completed: true,
+          redirect_url: target,
+          application_type: "native",
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const replace = vi.spyOn(hostedNavigation, "replace").mockImplementation(() => undefined);
+
+    render(<RuntimeApp />);
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => {
+      expect(replace).toHaveBeenCalledWith(target);
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("submits provider selection with the bound revision and disposes the CSRF value", async () => {
     window.history.replaceState({}, "", "/runtime/auth/interactions/interaction_3");
     installFlow("interaction", interactionBootstrap());
@@ -146,6 +302,68 @@ describe("Runtime Hosted Authentication", () => {
     render(<RuntimeApp />);
     fireEvent.click(screen.getByRole("button", { name: "Continue with current session" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/start sign-in again/u);
+  });
+
+  it("starts only the fixed managed reauthorization provider with bound CSRF and revision", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/runtime/auth/managed-reauthorizations/managed_interaction_1",
+    );
+    installFlow("managed_reauthorization", {
+      project_public_id: "prj_public",
+      provider_key: "workforce",
+      status: "awaiting_provider_start",
+      revision: 2,
+      csrf: "managed-csrf-sensitive-value",
+      expires_at: future,
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const request = input as Request;
+      expect(request.url).toContain(
+        "/runtime/v1/projects/prj_public/auth/managed-reauthorizations/managed_interaction_1/start",
+      );
+      expect(await request.clone().json()).toEqual({
+        csrf: "managed-csrf-sensitive-value",
+        expected_revision: 2,
+      });
+      return Response.json({ url: "javascript:alert(1)" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<RuntimeApp />);
+
+    expect(screen.getByText(/fixed workforce provider/u)).toBeVisible();
+    expect(screen.getByText(/does not sign you in/u)).toBeVisible();
+    expect(screen.queryByText(/Partner login/u)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue with workforce" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/new managed reauthorization/u);
+    expect(document.body.textContent).not.toContain("managed-csrf-sensitive-value");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("directs a just-expired managed reauthorization back to the management flow", () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/runtime/auth/managed-reauthorizations/managed_interaction_expired",
+    );
+    installFlow("managed_reauthorization", {
+      project_public_id: "prj_public",
+      provider_key: "workforce",
+      status: "awaiting_provider_start",
+      revision: 2,
+      csrf: "expired-managed-csrf",
+      expires_at: new Date(Date.now() - 1).toISOString(),
+    });
+
+    render(<RuntimeApp />);
+
+    expect(screen.getByRole("heading", { name: "Reauthorization expired" })).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Return to the management flow and create a new reauthorization.",
+    );
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("expired-managed-csrf");
   });
 
   it("renders progress and terminal interaction states without mutation controls", () => {

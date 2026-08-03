@@ -37,6 +37,24 @@ pub(crate) trait SignerStore: Send + Sync {
     ) -> Result<(), ApplicationError>;
 }
 
+/// Write-only capability used by Control provisioning. Implementations must not read or decrypt
+/// an existing value while reconciling an idempotent alias; `PostgreSQL` request digests and safe
+/// keyed fingerprints are the authority for whether a retry is the same operation. Provisioning
+/// must also share a permanent per-alias ordering fence with Runtime erasure: an erase racing any
+/// stale writer must win durably and leave no material that can be recreated later.
+#[async_trait]
+pub(crate) trait ConfigurationSecretProvisioner: Send + Sync {
+    fn request_fingerprint(&self, value: &[u8]) -> [u8; 32];
+
+    async fn provision_if_absent(
+        &self,
+        alias: String,
+        value: Zeroizing<Vec<u8>>,
+    ) -> Result<(), ApplicationError>;
+}
+
+/// Read-capable configuration store retained for provider provisioning and Runtime resolution.
+/// Email Control is deliberately typed against `ConfigurationSecretProvisioner` instead.
 #[async_trait]
 pub(crate) trait ConfigurationSecretStore: Send + Sync {
     fn request_fingerprint(&self, value: &[u8]) -> [u8; 32];

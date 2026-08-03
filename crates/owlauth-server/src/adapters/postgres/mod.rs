@@ -5,13 +5,40 @@ mod audit;
 )]
 pub(crate) mod authentication;
 pub(crate) mod control_lifecycle;
+#[allow(
+    dead_code,
+    reason = "passwordless email repository is composed by Runtime"
+)]
+pub(crate) mod email;
+pub(crate) mod email_control;
+#[cfg(test)]
+mod email_tests;
 pub(crate) mod entity;
 #[cfg(test)]
+mod identity_lifecycle_migration_tests;
+#[allow(
+    dead_code,
+    reason = "identity-mutation HTTP composition is introduced by the following integration slice"
+)]
+pub(crate) mod identity_mutation;
+#[cfg(test)]
+mod identity_mutation_test_support;
+#[cfg(test)]
+mod identity_mutation_tests;
+#[cfg(test)]
 mod identity_projection_migration_tests;
-mod projection;
+#[allow(
+    dead_code,
+    reason = "managed connection service composition follows this persistence lane"
+)]
+pub(crate) mod managed_connection;
+pub(crate) mod managed_reauthorization;
+pub(crate) mod projection;
+pub(crate) mod provider_callback;
 pub(crate) mod provisioning;
 pub(crate) mod readiness;
 pub(crate) mod runtime_authority;
+mod runtime_incarnation;
 #[allow(
     dead_code,
     reason = "the Runtime composition follows the HTTP-free session authority slice"
@@ -141,8 +168,8 @@ mod tests {
     };
     use crc::{CRC_32_ISO_HDLC, Crc};
     use sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
-        QuerySelect, TransactionTrait,
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait,
+        IntoActiveModel, QueryFilter, QuerySelect, TransactionTrait,
     };
     use sqlx::{Connection, PgConnection};
     use testcontainers::{
@@ -182,10 +209,38 @@ mod tests {
         },
         config::{MigrationMode, PlaneMode, ServerConfig},
         domain::ApplicationType,
-        http::build_routers,
+        http::build_routers_with_runtime_incarnation,
     };
 
     const POSTGRES_PORT: u16 = 5432;
+
+    async fn wait_for_sqlx_backend_blocked_by(
+        observer: &mut PgConnection,
+        blocker_pid: i32,
+        label: &str,
+    ) -> i32 {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(blocked_pid) = sqlx::query_scalar::<_, i32>(
+                    "SELECT blocked.pid FROM pg_stat_activity blocked
+                     WHERE blocked.datname=current_database()
+                       AND blocked.wait_event_type='Lock'
+                       AND $1=ANY(pg_blocking_pids(blocked.pid))
+                     ORDER BY blocked.pid LIMIT 1",
+                )
+                .bind(blocker_pid)
+                .fetch_optional(&mut *observer)
+                .await
+                .expect("observe PostgreSQL lock wait")
+                {
+                    return blocked_pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label} did not establish the required PostgreSQL lock wait"))
+    }
 
     async fn bump_project_metadata_revision(
         database: &DatabaseConnection,
@@ -294,6 +349,10 @@ mod tests {
         false
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "integration fixture enumerates the complete split-plane key configuration"
+    )]
     fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> ServerConfig {
         let values = BTreeMap::from([
             ("OWLAUTH_MODE".to_owned(), "all".to_owned()),
@@ -342,6 +401,62 @@ mod tests {
             (
                 "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
                 "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
+            ),
+            (
+                "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY".to_owned(),
+                "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0".to_owned(),
+            ),
+            (
+                "OWLAUTH_EMAIL_IDENTITY_PROTECTION_KEY".to_owned(),
+                "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4".to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY".to_owned(),
+                "RkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkY".to_owned(),
+            ),
+            (
+                "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY".to_owned(),
+                "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_DIGEST_KEY".to_owned(),
+                "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_REAUTHORIZATION_PROTECTION_KEY".to_owned(),
+                "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws".to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_DIGEST_KEY".to_owned(),
+                "EBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBA".to_owned(),
+            ),
+            (
+                "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY".to_owned(),
+                "ERERERERERERERERERERERERERERERERERERERERERE".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_CREDENTIAL_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_MANAGED_CREDENTIAL_KEY".to_owned(),
+                "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY".to_owned(),
             ),
             (
                 "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
@@ -666,19 +781,48 @@ mod tests {
                 false,
             ),
         );
+        runtime
+            .execute_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "INSERT INTO runtime_process_incarnations (process_id,process_incarnation,started_at)
+                 VALUES ('runtime-test-process','00000000-0000-0000-0000-000000000001',transaction_timestamp()),
+                        ('runtime-secondary-process','00000000-0000-0000-0000-000000000002',transaction_timestamp()),
+                        ('runtime-unexpected-process','00000000-0000-0000-0000-000000000003',transaction_timestamp())"
+                    .to_owned(),
+            ))
+            .await
+            .expect("seed exact Runtime incarnations");
+        // Keep required Runtime leases alive across this test's lock-order scenarios. The
+        // unexpected Runtime's stale lease is exercised through explicit expiry below.
+        let required_runtime_lease_ttl = Duration::from_secs(10);
         let readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(
             runtime.clone(),
             "runtime-test-process".to_owned(),
-            Duration::from_secs(1),
+            Uuid::from_u128(1),
+            vec![
+                "runtime-test-process".to_owned(),
+                "runtime-secondary-process".to_owned(),
+            ],
+            required_runtime_lease_ttl,
         )));
         let secondary_readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(
             runtime.clone(),
             "runtime-secondary-process".to_owned(),
-            Duration::from_secs(1),
+            Uuid::from_u128(2),
+            vec![
+                "runtime-test-process".to_owned(),
+                "runtime-secondary-process".to_owned(),
+            ],
+            required_runtime_lease_ttl,
         )));
         let unexpected_readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(
             runtime.clone(),
             "runtime-unexpected-process".to_owned(),
+            Uuid::from_u128(3),
+            vec![
+                "runtime-test-process".to_owned(),
+                "runtime-secondary-process".to_owned(),
+            ],
             Duration::from_mins(1),
         )));
 
@@ -1117,6 +1261,7 @@ mod tests {
             issuer: "https://fenced-accounts.example/".to_owned(),
             client_id: "owlauth-fence-test".to_owned(),
             client_secret: zeroize::Zeroizing::new("provider-fence-secret".to_owned()),
+            managed_profile_enabled: false,
             idempotency_key: "provider-fence-operation-12345678".to_owned(),
             expected_project_revision: provider_fence_project.metadata_revision,
         };
@@ -1627,6 +1772,185 @@ mod tests {
             Err(crate::application::ApplicationError::PublicationPending)
         );
 
+        // Replacement first: public readiness must block on the exact incarnation before it can
+        // touch any Project/Application row. Rolling the replacement transaction back lets the
+        // same operation proceed with the still-current incarnation.
+        let mut observer = PgConnection::connect(&url)
+            .await
+            .expect("readiness lock observer should open");
+        let mut incarnation_blocker = PgConnection::connect(&control_url)
+            .await
+            .expect("incarnation blocker should open");
+        sqlx::query("BEGIN")
+            .execute(&mut incarnation_blocker)
+            .await
+            .expect("begin replacement-first transaction");
+        sqlx::query(
+            "UPDATE runtime_process_incarnations SET process_incarnation=$2
+             WHERE process_id=$1",
+        )
+        .bind("runtime-test-process")
+        .bind(Uuid::new_v4())
+        .execute(&mut incarnation_blocker)
+        .await
+        .expect("stage Runtime incarnation replacement");
+        let incarnation_blocker_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+            .fetch_one(&mut incarnation_blocker)
+            .await
+            .expect("read incarnation-blocker backend pid");
+        let readiness_for_public_order = readiness.clone();
+        let project_public_id = created_project.public_id.clone();
+        let application_public_id = created_application.public_id.clone();
+        let public_read = tokio::spawn(async move {
+            readiness_for_public_order
+                .public_application_config(&project_public_id, &application_public_id)
+                .await
+        });
+        let public_read_pid = wait_for_sqlx_backend_blocked_by(
+            &mut observer,
+            incarnation_blocker_pid,
+            "public config exact-incarnation first lock",
+        )
+        .await;
+        assert_ne!(public_read_pid, incarnation_blocker_pid);
+        sqlx::query("ROLLBACK")
+            .execute(&mut incarnation_blocker)
+            .await
+            .expect("roll back staged Runtime replacement");
+        public_read
+            .await
+            .expect("join replacement-first public read")
+            .expect("public read should resume on the exact current incarnation");
+
+        // Runtime first: hold only the final key-ring row. JWKS must retain the exact incarnation
+        // lock while waiting there, forcing a concurrent replacement to wait behind Runtime. Once
+        // JWKS commits its lease and replacement wins, Control must reject that predecessor lease.
+        secondary_readiness
+            .project_jwks(&created_project.public_id)
+            .await
+            .expect("seed every other required Runtime publication lease");
+        let mut ring_blocker = PgConnection::connect(&control_url)
+            .await
+            .expect("key-ring blocker should open");
+        sqlx::query("BEGIN")
+            .execute(&mut ring_blocker)
+            .await
+            .expect("begin Runtime-first ring transaction");
+        sqlx::query("SELECT id FROM project_key_rings WHERE project_id=$1 FOR UPDATE")
+            .bind(created_project.id)
+            .fetch_one(&mut ring_blocker)
+            .await
+            .expect("hold final key-ring lock");
+        let ring_blocker_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+            .fetch_one(&mut ring_blocker)
+            .await
+            .expect("read ring-blocker backend pid");
+        let readiness_for_jwks_order = readiness.clone();
+        let project_public_id = created_project.public_id.clone();
+        let jwks_read = tokio::spawn(async move {
+            readiness_for_jwks_order
+                .project_jwks(&project_public_id)
+                .await
+        });
+        let jwks_read_pid = wait_for_sqlx_backend_blocked_by(
+            &mut observer,
+            ring_blocker_pid,
+            "JWKS final ring lock",
+        )
+        .await;
+        let replacement_incarnation = Uuid::new_v4();
+        let replacement_url = control_url.clone();
+        let (replacement_pid_sender, replacement_pid_receiver) = tokio::sync::oneshot::channel();
+        let replacement = tokio::spawn(async move {
+            let mut connection = PgConnection::connect(&replacement_url)
+                .await
+                .expect("replacement connection should open");
+            sqlx::query("BEGIN")
+                .execute(&mut connection)
+                .await
+                .expect("begin Runtime replacement");
+            let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                .fetch_one(&mut connection)
+                .await
+                .expect("read replacement backend pid");
+            replacement_pid_sender
+                .send(pid)
+                .expect("publish replacement backend pid");
+            sqlx::query(
+                "UPDATE runtime_process_incarnations SET process_incarnation=$2
+                 WHERE process_id=$1",
+            )
+            .bind("runtime-test-process")
+            .bind(replacement_incarnation)
+            .execute(&mut connection)
+            .await
+            .expect("replace Runtime incarnation");
+            sqlx::query("COMMIT")
+                .execute(&mut connection)
+                .await
+                .expect("commit Runtime replacement");
+        });
+        let replacement_pid = replacement_pid_receiver
+            .await
+            .expect("receive replacement backend pid");
+        assert_eq!(
+            wait_for_sqlx_backend_blocked_by(
+                &mut observer,
+                jwks_read_pid,
+                "replacement behind in-flight JWKS",
+            )
+            .await,
+            replacement_pid
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut ring_blocker)
+            .await
+            .expect("release final key-ring lock");
+        let ordered_jwks = jwks_read
+            .await
+            .expect("join Runtime-first JWKS read")
+            .expect("JWKS read should commit before replacement");
+        assert_eq!(ordered_jwks.revision, signing_key.ring_revision);
+        replacement.await.expect("join Runtime replacement");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(
+            provisioning
+                .activate_signing_key(
+                    created_project.id,
+                    signing_key.id,
+                    signing_key.ring_revision,
+                    Uuid::new_v4(),
+                )
+                .await,
+            Err(ApplicationError::PublicationPending),
+            "Control must not trust a predecessor-incarnation publication lease"
+        );
+        let key_after_stale_activation = provisioning
+            .list_signing_keys(created_project.id)
+            .await
+            .expect("signing keys should remain queryable")
+            .into_iter()
+            .find(|key| key.id == signing_key.id)
+            .expect("published key should remain present");
+        assert_eq!(key_after_stale_activation.state, "published");
+        sqlx::query(
+            "UPDATE runtime_process_incarnations SET process_incarnation=$2
+             WHERE process_id=$1",
+        )
+        .bind("runtime-test-process")
+        .bind(Uuid::from_u128(1))
+        .execute(&mut incarnation_blocker)
+        .await
+        .expect("restore primary Runtime test incarnation");
+        sqlx::query(
+            "DELETE FROM runtime_publication_leases
+             WHERE project_id=$1 AND process_id='runtime-secondary-process'",
+        )
+        .bind(created_project.id)
+        .execute(&mut incarnation_blocker)
+        .await
+        .expect("restore the later missing-secondary publication fixture");
+
         let published_jwks = readiness
             .project_jwks(&created_project.public_id)
             .await
@@ -1722,7 +2046,12 @@ mod tests {
             .expect("unexpected Runtime lease should be queryable")
             .expect("unexpected Runtime lease should exist");
         let mut unexpected_lease_active = unexpected_lease.into_active_model();
-        let expired_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let database_now: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT transaction_timestamp()")
+                .fetch_one(&mut incarnation_blocker)
+                .await
+                .expect("database time should be queryable for explicit lease expiry");
+        let expired_at = database_now - time::Duration::seconds(1);
         unexpected_lease_active.first_observed_at = Set(expired_at - time::Duration::seconds(2));
         unexpected_lease_active.last_observed_at = Set(expired_at - time::Duration::seconds(1));
         unexpected_lease_active.expires_at = Set(expired_at);
@@ -1796,7 +2125,12 @@ mod tests {
             .expect("retiring key should be queryable")
             .expect("retiring key should exist");
         let mut retiring_active = retiring_model.into_active_model();
-        let elapsed_cutoff = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let database_now: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT transaction_timestamp()")
+                .fetch_one(&mut incarnation_blocker)
+                .await
+                .expect("database time should be queryable for the retention cutoff");
+        let elapsed_cutoff = database_now - time::Duration::seconds(1);
         retiring_active.sign_not_before =
             Set(Some(elapsed_cutoff - time::Duration::microseconds(1)));
         retiring_active.verify_not_after = Set(Some(elapsed_cutoff));
@@ -1847,6 +2181,7 @@ mod tests {
                     issuer: "https://accounts.example/".to_owned(),
                     client_id: "owlauth-test".to_owned(),
                     client_secret: zeroize::Zeroizing::new("provider-secret".to_owned()),
+                    managed_profile_enabled: false,
                     idempotency_key: "provider-operation-12345678".to_owned(),
                     expected_project_revision: created_project.metadata_revision,
                 },
@@ -1891,6 +2226,7 @@ mod tests {
                     issuer: "https://accounts.example/".to_owned(),
                     client_id: "owlauth-test".to_owned(),
                     client_secret: zeroize::Zeroizing::new("provider-secret".to_owned()),
+                    managed_profile_enabled: false,
                     idempotency_key: "provider-operation-12345678".to_owned(),
                     expected_project_revision: created_project.metadata_revision,
                 },
@@ -2031,6 +2367,7 @@ mod tests {
                     issuer: "https://accounts.example/".to_owned(),
                     client_id: "owlauth-test".to_owned(),
                     client_secret: zeroize::Zeroizing::new("provider-secret".to_owned()),
+                    managed_profile_enabled: false,
                     idempotency_key: "provider-operation-12345678".to_owned(),
                     expected_project_revision: created_project.metadata_revision,
                 },
@@ -2065,7 +2402,11 @@ mod tests {
         let mut blocked_egress_config = config.clone();
         blocked_egress_config.provider_allowed_origins =
             vec!["https://different-provider.example/".to_owned()];
-        let mut blocked_egress_routers = build_routers(&blocked_egress_config, Some(&pools));
+        let mut blocked_egress_routers = build_routers_with_runtime_incarnation(
+            &blocked_egress_config,
+            Some(&pools),
+            Uuid::from_u128(1),
+        );
         blocked_egress_routers.mark_ready();
         let blocked_egress_response = blocked_egress_routers
             .runtime
@@ -2257,7 +2598,8 @@ mod tests {
         assert!(revoked_jwks.keys.is_empty());
         assert!(revoked_jwks.signing_epoch > published_jwks.signing_epoch);
 
-        let mut routers = build_routers(&config, Some(&pools));
+        let mut routers =
+            build_routers_with_runtime_incarnation(&config, Some(&pools), Uuid::from_u128(1));
         routers.mark_ready();
         let control_router = routers.control.take().expect("Control router should exist");
         let denied = control_router
@@ -2432,17 +2774,27 @@ mod tests {
             .project_jwks(&created_project.public_id)
             .await
             .expect("secondary Runtime should observe the new revision");
-        // The lease timestamp is minted by PostgreSQL while this assertion reads the host clock.
-        // Leave a bounded skew margin for Docker Desktop's VM clock instead of racing at 50 ms.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let expired_primary_lease = runtime_publication_lease::Entity::find()
+        let primary_lease = runtime_publication_lease::Entity::find()
             .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
             .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-test-process"))
             .one(control)
             .await
-            .expect("expired primary lease should be queryable")
+            .expect("primary lease should be queryable")
             .expect("primary lease should exist");
-        assert!(expired_primary_lease.expires_at <= time::OffsetDateTime::now_utc());
+        let database_now: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT transaction_timestamp()")
+                .fetch_one(&mut incarnation_blocker)
+                .await
+                .expect("database time should be queryable for explicit lease expiry");
+        let mut primary_lease_active = primary_lease.into_active_model();
+        primary_lease_active.first_observed_at = Set(database_now - time::Duration::seconds(3));
+        primary_lease_active.last_observed_at = Set(database_now - time::Duration::seconds(2));
+        primary_lease_active.expires_at = Set(database_now - time::Duration::seconds(1));
+        let expired_primary_lease = primary_lease_active
+            .update(control)
+            .await
+            .expect("primary Runtime lease should expire explicitly");
+        assert!(expired_primary_lease.expires_at <= database_now);
         assert_eq!(
             provisioning
                 .activate_signing_key(
@@ -2725,6 +3077,7 @@ mod tests {
             display_name: "Capacity replay provider".to_owned(),
             issuer: "https://accounts.example/".to_owned(),
             client_id: "capacity-client".to_owned(),
+            managed_profile_enabled: false,
             operation_alias: "provider-capacity-replay-12345678".to_owned(),
             expected_project_revision: capacity_project.metadata_revision,
             request_digest: vec![31; 32],
@@ -2762,6 +3115,7 @@ mod tests {
                         display_name: "Over capacity".to_owned(),
                         issuer: "https://accounts.example/".to_owned(),
                         client_id: "capacity-client".to_owned(),
+                        managed_profile_enabled: false,
                         operation_alias: "provider-over-capacity-12345678".to_owned(),
                         expected_project_revision: capacity_project.metadata_revision,
                         request_digest: vec![32; 32],

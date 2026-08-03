@@ -6,6 +6,7 @@ use sea_orm::{
     TransactionTrait,
 };
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use async_trait::async_trait;
 
@@ -23,6 +24,8 @@ use crate::{
 pub(crate) struct PostgresReadinessAdapter {
     database: DatabaseConnection,
     process_id: Arc<str>,
+    process_incarnation: Uuid,
+    required_runtime_process_ids: Arc<[String]>,
     lease_ttl: Duration,
 }
 
@@ -30,11 +33,15 @@ impl PostgresReadinessAdapter {
     pub(crate) fn new(
         database: DatabaseConnection,
         process_id: String,
+        process_incarnation: Uuid,
+        required_runtime_process_ids: Vec<String>,
         lease_ttl: Duration,
     ) -> Self {
         Self {
             database,
             process_id: Arc::from(process_id),
+            process_incarnation,
+            required_runtime_process_ids: required_runtime_process_ids.into(),
             lease_ttl,
         }
     }
@@ -49,6 +56,7 @@ impl PostgresReadinessAdapter {
         application_public_id: &str,
     ) -> Result<PublicApplicationConfig, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         // Every Control mutation takes the same Project row exclusively before touching
         // child aggregates. This shared guard therefore linearizes the complete public
         // snapshot and prevents a child disable/unassignment from committing mid-read.
@@ -195,8 +203,123 @@ impl PostgresReadinessAdapter {
             return Err(ApplicationError::RevisionConflict);
         }
 
-        let login_available =
-            !publishable_keys.is_empty() && !providers.is_empty() && active_signing_keys.len() == 1;
+        // Email readiness follows the same canonical owner order as admission: policy and
+        // assignment first, then the selected SMTP generation/readiness, then scoped protection.
+        // Nullable outer-join sides are never row-locked.
+        let email_policy = transaction
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT policy.otp_enabled,policy.magic_link_enabled,policy.allow_deployment_default
+                 FROM project_email_policies policy
+                 JOIN application_email_assignments assignment
+                   ON assignment.project_id=policy.project_id AND assignment.application_id=$2
+                 WHERE policy.project_id=$1 AND policy.status='enabled'
+                   AND assignment.status='active'
+                 FOR SHARE OF policy,assignment",
+                vec![project.id.into(), application.id.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        let mut smtp_ready = false;
+        if let Some(policy) = &email_policy {
+            let project_smtp = transaction
+                .query_one_raw(Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT id,generation FROM project_smtp_configurations
+                     WHERE project_id=$1 AND status='active' FOR SHARE",
+                    vec![project.id.into()],
+                ))
+                .await
+                .map_err(persistence)?;
+            if let Some(smtp) = project_smtp {
+                let configuration_id: Uuid = smtp.try_get("", "id").map_err(persistence)?;
+                let generation: i32 = smtp.try_get("", "generation").map_err(persistence)?;
+                let roster_ready: bool = transaction
+                    .query_one_raw(Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT NOT EXISTS (
+                           SELECT required.process_id
+                           FROM jsonb_array_elements_text($4::jsonb) AS required(process_id)
+                           WHERE NOT EXISTS (
+                             SELECT 1 FROM project_smtp_runtime_readiness readiness
+                             WHERE readiness.project_id=$1
+                               AND readiness.configuration_id=$2
+                               AND readiness.generation=$3
+                               AND readiness.process_id=required.process_id
+                               AND readiness.state='ready'
+                               AND readiness.lease_expires_at>transaction_timestamp()
+                               AND EXISTS (
+                                 SELECT 1 FROM runtime_process_incarnations current
+                                 WHERE current.process_id=readiness.process_id
+                                   AND current.process_incarnation=readiness.process_incarnation)))
+                         AS roster_ready",
+                        vec![
+                            project.id.into(),
+                            configuration_id.into(),
+                            generation.into(),
+                            serde_json::json!(&*self.required_runtime_process_ids).into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(persistence)?
+                    .ok_or(ApplicationError::Persistence)?
+                    .try_get("", "roster_ready")
+                    .map_err(persistence)?;
+                smtp_ready = !self.required_runtime_process_ids.is_empty() && roster_ready;
+            } else if policy
+                .try_get::<bool>("", "allow_deployment_default")
+                .map_err(persistence)?
+            {
+                smtp_ready = transaction
+                    .query_one_raw(Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT generation FROM deployment_smtp_generations
+                         WHERE status='active' FOR SHARE"
+                            .to_owned(),
+                    ))
+                    .await
+                    .map_err(persistence)?
+                    .is_some();
+            }
+        }
+        let protection_ready = transaction
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT 1 FROM email_protection_runtime_readiness protection
+                 JOIN runtime_process_incarnations current
+                   ON current.process_id=protection.process_id
+                  AND current.process_incarnation=protection.process_incarnation
+                 WHERE protection.process_id=$1 AND protection.process_incarnation=$2
+                   AND protection.state='ready'
+                   AND protection.lease_expires_at>transaction_timestamp()
+                 FOR SHARE OF protection,current",
+                vec![
+                    self.process_id.to_string().into(),
+                    self.process_incarnation.into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?
+            .is_some();
+        let email_available = email_policy.is_some()
+            && smtp_ready
+            && protection_ready
+            && active_signing_keys.len() == 1;
+        let email_otp_enabled = email_available
+            && email_policy
+                .as_ref()
+                .map(|row| row.try_get("", "otp_enabled").map_err(persistence))
+                .transpose()?
+                .unwrap_or(false);
+        let email_magic_link_enabled = email_available
+            && email_policy
+                .as_ref()
+                .map(|row| row.try_get("", "magic_link_enabled").map_err(persistence))
+                .transpose()?
+                .unwrap_or(false);
+        let login_available = !publishable_keys.is_empty()
+            && active_signing_keys.len() == 1
+            && (!providers.is_empty() || email_available);
         let result = PublicApplicationConfig {
             project_public_id: project.public_id,
             project_display_name: project.display_name,
@@ -215,6 +338,9 @@ impl PostgresReadinessAdapter {
                     issuer: provider.issuer,
                 })
                 .collect(),
+            email_available,
+            email_otp_enabled,
+            email_magic_link_enabled,
             login_available,
         };
         transaction.commit().await.map_err(persistence)?;
@@ -226,6 +352,7 @@ impl PostgresReadinessAdapter {
         project_public_id: &str,
     ) -> Result<JwksDocument, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
+        self.lock_local_runtime_incarnation(&transaction).await?;
         // Control mutations serialize on the Project row exclusively. Keep the
         // corresponding shared guard through lease observation so disablement and
         // publication have one database ordering point, with no post-disable lease.
@@ -299,9 +426,12 @@ impl PostgresReadinessAdapter {
                 if existing.loaded_revision > loaded_revision {
                     return Err(ApplicationError::RevisionConflict);
                 }
-                let observation_restarted =
-                    existing.loaded_revision < loaded_revision || existing.expires_at <= now;
+                let observation_restarted = existing.process_incarnation
+                    != self.process_incarnation
+                    || existing.loaded_revision < loaded_revision
+                    || existing.expires_at <= now;
                 let mut active = existing.into_active_model();
+                active.process_incarnation = Set(self.process_incarnation);
                 active.loaded_revision = Set(loaded_revision);
                 if observation_restarted {
                     active.first_observed_at = Set(now);
@@ -315,6 +445,7 @@ impl PostgresReadinessAdapter {
                     project_id: Set(project_id),
                     ring_id: Set(ring_id),
                     process_id: Set(self.process_id.to_string()),
+                    process_incarnation: Set(self.process_incarnation),
                     loaded_revision: Set(loaded_revision),
                     first_observed_at: Set(now),
                     last_observed_at: Set(now),
@@ -326,6 +457,26 @@ impl PostgresReadinessAdapter {
             }
         }
         Ok(())
+    }
+
+    async fn lock_local_runtime_incarnation<C: ConnectionTrait>(
+        &self,
+        connection: &C,
+    ) -> Result<(), ApplicationError> {
+        let current = connection
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT 1 FROM runtime_process_incarnations
+                 WHERE process_id=$1 AND process_incarnation=$2 FOR SHARE",
+                vec![
+                    self.process_id.to_string().into(),
+                    self.process_incarnation.into(),
+                ],
+            ))
+            .await
+            .map_err(persistence)?
+            .is_some();
+        current.then_some(()).ok_or(ApplicationError::Disabled)
     }
 }
 

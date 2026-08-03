@@ -101,6 +101,14 @@ docs-build: ## Build documentation for deployment
 docs-deploy: ## Deploy documentation to Cloudflare Workers
 	@pnpm --filter @owlauth/docs run deploy
 
+.PHONY: dev
+dev: ## Build web assets, start local infrastructure, and run Runtime plus Control
+	@test -f .env || { echo "Missing .env; run: cp .env.example .env" >&2; exit 1; }
+	@$(MAKE) web-build
+	@$(MAKE) dev-up
+	@mkdir -p .local/owlauth/signers .local/owlauth/configuration-secrets
+	@set -a; . ./.env; set +a; exec cargo run --locked --package owlauth-server
+
 .PHONY: dev-up
 dev-up: ## Start healthy local PostgreSQL and Redis services
 	@$(DEV_COMPOSE) up --detach --wait

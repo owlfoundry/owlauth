@@ -13,13 +13,20 @@ use reqwest::{Client, StatusCode};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
+use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::application::{
+    BoundedManagedProfile, ConnectionGuard, ManagedProfileAdapter, ProviderAuthorization,
     ProviderAuthorizationRequest, ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity,
-    UpstreamProviderClient,
+    ProviderReadError, ProviderRenewalResult, ProviderRequestProfile, ProviderRevocationResult,
+    ProviderSecretResolver, RenewableProviderCredential, RenewedCredential, UpstreamProviderClient,
+};
+use crate::domain::{
+    BoundedProviderProfile, ManagedProfileCapability, ProfileDisplayName, ProfileLocale,
+    ProfilePictureUrl, RenewalReplay,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,7 +48,7 @@ const MAX_STATE_BYTES: usize = 512;
 const MAX_NONCE_BYTES: usize = 512;
 const MAX_PKCE_VERIFIER_BYTES: usize = 128;
 const MAX_SUBJECT_BYTES: usize = 512;
-const MAX_NAME_BYTES: usize = 256;
+const MAX_NAME_CHARACTERS: usize = 128;
 const MAX_PICTURE_BYTES: usize = 2048;
 const MAX_AUDIENCES: usize = 8;
 const MAX_ID_TOKEN_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
@@ -56,6 +63,7 @@ pub(crate) struct RestrictedOidcProviderClient {
     http: Client,
     endpoint_policy: Arc<EndpointPolicy>,
     exchange_budget: Arc<Semaphore>,
+    request_timeout: Duration,
 }
 
 impl RestrictedOidcProviderClient {
@@ -100,6 +108,7 @@ impl RestrictedOidcProviderClient {
             http,
             endpoint_policy: Arc::new(endpoint_policy),
             exchange_budget: Arc::new(Semaphore::new(exchange_concurrency_limit)),
+            request_timeout,
         })
     }
 
@@ -157,6 +166,54 @@ impl RestrictedOidcProviderClient {
         if response
             .content_length()
             .is_some_and(|length| length > limit as u64)
+        {
+            return Err(());
+        }
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| ())?;
+            if body
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|size| size > limit)
+            {
+                return Err(());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((status, content_type, body))
+    }
+
+    async fn fetch_bearer_bounded(
+        &self,
+        url: Url,
+        bearer: &[u8],
+        limit: usize,
+    ) -> Result<(StatusCode, Option<String>, Vec<u8>), ()> {
+        let bearer = std::str::from_utf8(bearer).map_err(|_| ())?;
+        if bearer.is_empty() || bearer.len() > 8192 {
+            return Err(());
+        }
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .map_err(|_| ())?;
+        if response
+            .headers()
+            .contains_key(reqwest::header::CONTENT_ENCODING)
+            || response
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
         {
             return Err(());
         }
@@ -248,8 +305,27 @@ impl RestrictedOidcProviderClient {
         if token.id_token.is_empty() || token.id_token.len() > ID_TOKEN_LIMIT {
             return Err(ProviderExchangeError::InvalidProof);
         }
+        // RFC 6749 permits `scope` to be omitted when it is unchanged. The omitted value is
+        // therefore derived only from OwlAuth's exact request profile; an explicit provider value
+        // remains an exact canonical set assertion and can never widen caller authority.
+        let expected_scopes = requested_scopes(request.profile);
+        let granted_scopes = token
+            .scope
+            .as_deref()
+            .map(parse_scopes)
+            .transpose()
+            .map_err(|()| ProviderExchangeError::InvalidProof)?
+            .unwrap_or_else(|| expected_scopes.clone());
+        if granted_scopes != expected_scopes {
+            return Err(ProviderExchangeError::InvalidProof);
+        }
+        let refresh_token = token.refresh_token.and_then(|value| {
+            (!value.is_empty() && value.len() <= 8192).then(|| Zeroizing::new(value.into_bytes()))
+        });
         Ok(TokenResponse {
             id_token: Zeroizing::new(token.id_token),
+            refresh_token,
+            granted_scopes,
         })
     }
 
@@ -291,7 +367,7 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
     async fn authorization_url(
         &self,
         request: ProviderAuthorizationRequest,
-    ) -> Result<String, ProviderExchangeError> {
+    ) -> Result<ProviderAuthorization, ProviderExchangeError> {
         validate_authorization_request(&request, &self.endpoint_policy)?;
         let discovery = self
             .discover(
@@ -299,7 +375,20 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
                 ProviderExchangeError::UnavailableBeforeDispatch,
             )
             .await?;
-        build_authorization_url(discovery.authorization_endpoint, &request)
+        if request.profile.is_managed_profile()
+            && (!contains_exact(&discovery.scopes_supported, "offline_access")
+                || discovery.userinfo_endpoint.is_none())
+        {
+            return Err(ProviderExchangeError::UnavailableBeforeDispatch);
+        }
+        let managed_supports_revocation = request
+            .profile
+            .is_managed_profile()
+            .then_some(discovery.revocation_endpoint.is_some());
+        Ok(ProviderAuthorization {
+            url: build_authorization_url(discovery.authorization_endpoint, &request)?,
+            managed_supports_revocation,
+        })
     }
 
     async fn exchange_code(
@@ -319,6 +408,13 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
                 ProviderExchangeError::UnavailableBeforeDispatch,
             )
             .await?;
+        if request.profile.is_managed_profile()
+            && (!contains_exact(&discovery.scopes_supported, "offline_access")
+                || discovery.userinfo_endpoint.is_none())
+        {
+            return Err(ProviderExchangeError::UnavailableBeforeDispatch);
+        }
+        let supports_revocation = discovery.revocation_endpoint.is_some();
         let token = self
             .exchange_once(discovery.token_endpoint, &request)
             .await?;
@@ -334,8 +430,329 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
                 .ok_or(ProviderExchangeError::InvalidProof)?
                 .clone()
         };
-        validate_id_token(&token.id_token, &jwk, &request)
+        let mut identity = validate_id_token(&token.id_token, &jwk, &request)?;
+        if request.profile.is_managed_profile() && token.granted_scopes == managed_profile_scopes()
+        {
+            identity.renewable_credential =
+                token
+                    .refresh_token
+                    .map(|value| RenewableProviderCredential {
+                        value,
+                        granted_scopes: token.granted_scopes,
+                        supports_revocation,
+                    });
+        }
+        Ok(identity)
     }
+}
+
+const CONTROLLED_OIDC_MANAGED_CAPABILITY: ManagedProfileCapability = ManagedProfileCapability {
+    adapter_key: "controlled_oidc_profile_v1",
+    adapter_revision: 1,
+    exact_scopes: &["offline_access", "openid", "profile"],
+    provider_pkce_required: true,
+    oidc_nonce_required: true,
+    credential_rotates: true,
+    read_retry_safe: true,
+    renewal_replay: RenewalReplay::Never,
+    supports_revocation: true,
+    profile_schema: "owlauth.provider-profile.v1",
+    maximum_body_bytes: 16 * 1024,
+    maximum_latency_seconds: 10,
+};
+
+pub(crate) fn controlled_oidc_managed_capability() -> &'static ManagedProfileCapability {
+    &CONTROLLED_OIDC_MANAGED_CAPABILITY
+}
+
+#[derive(Clone)]
+pub(crate) struct RestrictedOidcManagedProfileAdapter {
+    client: RestrictedOidcProviderClient,
+    secrets: Arc<dyn ProviderSecretResolver>,
+}
+
+impl RestrictedOidcManagedProfileAdapter {
+    pub(crate) fn new(
+        client: RestrictedOidcProviderClient,
+        secrets: Arc<dyn ProviderSecretResolver>,
+    ) -> Self {
+        Self { client, secrets }
+    }
+}
+
+#[derive(Deserialize)]
+struct RenewalDocument {
+    access_token: String,
+    refresh_token: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManagedProfileDocument {
+    sub: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    picture: Option<String>,
+    #[serde(default)]
+    locale: Option<String>,
+}
+
+#[async_trait]
+impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
+    fn capability(&self) -> Option<&'static ManagedProfileCapability> {
+        Some(&CONTROLLED_OIDC_MANAGED_CAPABILITY)
+    }
+
+    fn maximum_renewal_profile_duration(&self) -> Duration {
+        // Renewal discovery + token exchange + profile discovery + UserInfo. Each request is
+        // independently bounded by the configured client timeout.
+        self.client.request_timeout.saturating_mul(4)
+    }
+
+    async fn fetch_profile(
+        &self,
+        guard: &ConnectionGuard,
+        credential: Zeroizing<Vec<u8>>,
+    ) -> Result<BoundedManagedProfile, ProviderReadError> {
+        let discovery = self
+            .client
+            .discover(
+                &guard.issuer,
+                ProviderExchangeError::UnavailableBeforeDispatch,
+            )
+            .await
+            .map_err(|_| ProviderReadError::Transient)?;
+        let endpoint = discovery
+            .userinfo_endpoint
+            .ok_or(ProviderReadError::InvalidProfile)?;
+        let (status, content_type, body) = self
+            .client
+            .fetch_bearer_bounded(endpoint, credential.as_ref(), 16 * 1024)
+            .await
+            .map_err(|()| ProviderReadError::Ambiguous)?;
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ProviderReadError::InvalidCredential);
+        }
+        if !status.is_success() || !is_json_content_type(content_type.as_deref()) {
+            return Err(ProviderReadError::Transient);
+        }
+        let value = parse_unique_json(&body).map_err(|()| ProviderReadError::InvalidProfile)?;
+        if !object_has_at_most(&value, 16) {
+            return Err(ProviderReadError::InvalidProfile);
+        }
+        let profile: ManagedProfileDocument =
+            serde_json::from_value(value).map_err(|_| ProviderReadError::InvalidProfile)?;
+        if profile.sub != guard.subject {
+            return Err(ProviderReadError::InvalidProfile);
+        }
+        Ok(BoundedManagedProfile {
+            profile: BoundedProviderProfile {
+                display_name: profile
+                    .name
+                    .map(ProfileDisplayName::parse)
+                    .transpose()
+                    .map_err(|_| ProviderReadError::InvalidProfile)?,
+                picture_url: profile
+                    .picture
+                    .map(ProfilePictureUrl::parse)
+                    .transpose()
+                    .map_err(|_| ProviderReadError::InvalidProfile)?,
+                locale: profile
+                    .locale
+                    .map(ProfileLocale::parse)
+                    .transpose()
+                    .map_err(|_| ProviderReadError::InvalidProfile)?,
+            },
+            observed_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    async fn renew(
+        &self,
+        guard: &ConnectionGuard,
+        credential: Zeroizing<Vec<u8>>,
+        stable_attempt_id: uuid::Uuid,
+    ) -> ProviderRenewalResult {
+        let Ok(discovery) = self
+            .client
+            .discover(
+                &guard.issuer,
+                ProviderExchangeError::UnavailableBeforeDispatch,
+            )
+            .await
+        else {
+            return ProviderRenewalResult::TransientBeforeDispatch;
+        };
+        let Ok(secret) = self.secrets.resolve(&guard.secret_ref).await else {
+            return ProviderRenewalResult::TransientBeforeDispatch;
+        };
+        let Ok(refresh_token) = std::str::from_utf8(credential.as_ref()) else {
+            return ProviderRenewalResult::InvalidGrant;
+        };
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", guard.client_id.as_str()),
+            ("client_secret", secret.as_str()),
+        ];
+        let Ok(response) = self
+            .client
+            .http
+            .post(discovery.token_endpoint)
+            .header("OwlAuth-Renewal-Attempt", stable_attempt_id.to_string())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .form(&form)
+            .send()
+            .await
+        else {
+            return ProviderRenewalResult::AmbiguousAfterDispatch;
+        };
+        let Ok((status, _, body)) = read_response_bounded(response, TOKEN_BODY_LIMIT).await else {
+            return ProviderRenewalResult::AmbiguousAfterDispatch;
+        };
+        if status == StatusCode::BAD_REQUEST {
+            let error = parse_unique_json(&body).ok().and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+            return match error.as_deref() {
+                Some("invalid_grant") => ProviderRenewalResult::InvalidGrant,
+                Some("invalid_scope") => ProviderRenewalResult::ScopeLost,
+                _ => ProviderRenewalResult::AmbiguousAfterDispatch,
+            };
+        }
+        if !status.is_success() {
+            return ProviderRenewalResult::AmbiguousAfterDispatch;
+        }
+        let Some(document): Option<RenewalDocument> = parse_unique_json(&body)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+        else {
+            return ProviderRenewalResult::AmbiguousAfterDispatch;
+        };
+        // RFC 6749 section 6 defines an omitted scope as unchanged. Only the exact frozen
+        // connection grant is authoritative here; explicit response scope is still compared as a
+        // strict canonical set, including duplicate rejection.
+        let Some(expected_scopes) = canonical_scope_set(&guard.required_scopes) else {
+            return ProviderRenewalResult::ScopeLost;
+        };
+        let granted_scopes = match document.scope.as_deref() {
+            Some(scope) => {
+                let Ok(scopes) = parse_scopes(scope) else {
+                    return ProviderRenewalResult::ScopeLost;
+                };
+                if scopes != expected_scopes {
+                    return ProviderRenewalResult::ScopeLost;
+                }
+                scopes
+            }
+            None => expected_scopes,
+        };
+        if document.refresh_token.is_empty()
+            || document.refresh_token.len() > 8192
+            || document.access_token.is_empty()
+            || document.access_token.len() > 8192
+        {
+            return ProviderRenewalResult::AmbiguousAfterDispatch;
+        }
+        ProviderRenewalResult::Success(RenewedCredential {
+            renewable: Zeroizing::new(document.refresh_token.into_bytes()),
+            access: Zeroizing::new(document.access_token.into_bytes()),
+            granted_scopes,
+        })
+    }
+
+    async fn revoke(
+        &self,
+        guard: &ConnectionGuard,
+        credential: Zeroizing<Vec<u8>>,
+    ) -> ProviderRevocationResult {
+        let Ok(discovery) = self
+            .client
+            .discover(
+                &guard.issuer,
+                ProviderExchangeError::UnavailableBeforeDispatch,
+            )
+            .await
+        else {
+            return ProviderRevocationResult::Ambiguous;
+        };
+        let Some(endpoint) = discovery.revocation_endpoint else {
+            return ProviderRevocationResult::Unsupported;
+        };
+        let Ok(secret) = self.secrets.resolve(&guard.secret_ref).await else {
+            return ProviderRevocationResult::Ambiguous;
+        };
+        let Ok(refresh_token) = std::str::from_utf8(credential.as_ref()) else {
+            return ProviderRevocationResult::Ambiguous;
+        };
+        let form = [
+            ("token", refresh_token),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", guard.client_id.as_str()),
+            ("client_secret", secret.as_str()),
+        ];
+        let Ok(response) = self
+            .client
+            .http
+            .post(endpoint)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .form(&form)
+            .send()
+            .await
+        else {
+            return ProviderRevocationResult::Ambiguous;
+        };
+        let Ok((status, _, _)) = read_response_bounded(response, TOKEN_BODY_LIMIT).await else {
+            return ProviderRevocationResult::Ambiguous;
+        };
+        if status.is_success() {
+            ProviderRevocationResult::Confirmed
+        } else if matches!(status, StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED) {
+            ProviderRevocationResult::Unsupported
+        } else {
+            ProviderRevocationResult::Ambiguous
+        }
+    }
+}
+
+async fn read_response_bounded(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<(StatusCode, Option<String>, Vec<u8>), ()> {
+    if response
+        .headers()
+        .contains_key(reqwest::header::CONTENT_ENCODING)
+        || response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+    {
+        return Err(());
+    }
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|size| size > limit)
+        {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((status, content_type, body))
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -460,6 +877,10 @@ struct DiscoveryDocument {
     authorization_endpoint: Url,
     token_endpoint: Url,
     jwks_uri: Url,
+    #[serde(default)]
+    userinfo_endpoint: Option<Url>,
+    #[serde(default)]
+    revocation_endpoint: Option<Url>,
     response_types_supported: Vec<String>,
     #[serde(default)]
     response_modes_supported: Vec<String>,
@@ -495,6 +916,12 @@ impl DiscoveryDocument {
         policy.validate_endpoint(&self.authorization_endpoint)?;
         policy.validate_endpoint(&self.token_endpoint)?;
         policy.validate_endpoint(&self.jwks_uri)?;
+        if let Some(endpoint) = &self.userinfo_endpoint {
+            policy.validate_endpoint(endpoint)?;
+        }
+        if let Some(endpoint) = &self.revocation_endpoint {
+            policy.validate_endpoint(endpoint)?;
+        }
         Ok(())
     }
 }
@@ -572,7 +999,7 @@ fn build_authorization_url(
         .append_pair("response_mode", "query")
         .append_pair("client_id", &request.client_id)
         .append_pair("redirect_uri", &request.callback_url)
-        .append_pair("scope", "openid profile")
+        .append_pair("scope", requested_scope_parameter(request.profile))
         .append_pair("state", &request.state)
         .append_pair("nonce", &request.nonce)
         .append_pair("code_challenge", &request.pkce_challenge)
@@ -581,6 +1008,60 @@ fn build_authorization_url(
         return Err(ProviderExchangeError::UnavailableBeforeDispatch);
     }
     Ok(endpoint.into())
+}
+
+fn managed_profile_scopes() -> Vec<String> {
+    requested_scopes(ProviderRequestProfile::ManagedProfile)
+}
+
+fn requested_scope_parameter(profile: ProviderRequestProfile) -> &'static str {
+    match profile {
+        ProviderRequestProfile::ManagedProfile => "offline_access openid profile",
+        ProviderRequestProfile::Login | ProviderRequestProfile::IdentityProof => "openid profile",
+    }
+}
+
+fn requested_scopes(profile: ProviderRequestProfile) -> Vec<String> {
+    match profile {
+        ProviderRequestProfile::ManagedProfile => ["offline_access", "openid", "profile"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        ProviderRequestProfile::Login | ProviderRequestProfile::IdentityProof => {
+            ["openid", "profile"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+}
+
+fn canonical_scope_set(scopes: &[String]) -> Option<Vec<String>> {
+    if scopes.is_empty() || scopes.len() > 16 || scopes.iter().any(String::is_empty) {
+        return None;
+    }
+    let mut canonical = scopes.to_vec();
+    canonical.sort_unstable();
+    let before = canonical.len();
+    canonical.dedup();
+    (canonical.len() == before).then_some(canonical)
+}
+
+fn parse_scopes(value: &str) -> Result<Vec<String>, ()> {
+    if value.is_empty() || value.len() > 1024 {
+        return Err(());
+    }
+    let mut scopes: Vec<String> = value.split_ascii_whitespace().map(str::to_owned).collect();
+    if scopes.is_empty() || scopes.len() > 16 || scopes.iter().any(|scope| scope.len() > 128) {
+        return Err(());
+    }
+    scopes.sort_unstable();
+    let before = scopes.len();
+    scopes.dedup();
+    if scopes.len() != before {
+        return Err(());
+    }
+    Ok(scopes)
 }
 
 fn is_base64url(value: &str) -> bool {
@@ -606,11 +1087,17 @@ fn is_json_content_type(value: Option<&str>) -> bool {
 
 struct TokenResponse {
     id_token: Zeroizing<String>,
+    refresh_token: Option<Zeroizing<Vec<u8>>>,
+    granted_scopes: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct RawTokenResponse {
     id_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -861,11 +1348,12 @@ fn validate_claims(
         subject: claims.sub,
         display_name,
         picture_url,
+        renewable_credential: None,
     })
 }
 
 fn validate_display_name(value: String) -> Result<Option<String>, ProviderExchangeError> {
-    if value.len() > MAX_NAME_BYTES || value.chars().any(char::is_control) {
+    if value.chars().count() > MAX_NAME_CHARACTERS || value.chars().any(char::is_control) {
         return Err(ProviderExchangeError::InvalidProof);
     }
     if value.is_empty() {

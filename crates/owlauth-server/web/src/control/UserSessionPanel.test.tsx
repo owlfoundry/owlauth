@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import {
   type DisposableControlClient,
+  type ManagedProviderConnection,
   type Project,
   type ProjectUser,
   type ProjectUserSessions,
@@ -69,6 +70,27 @@ const sessions: ProjectUserSessions = {
   ],
 };
 
+const connection: ManagedProviderConnection = {
+  id: "66666666-6666-4666-8666-666666666666",
+  project_id: project.id,
+  user_id: user.id,
+  provider_id: "77777777-7777-4777-8777-777777777777",
+  identity_id: "88888888-8888-4888-8888-888888888888",
+  state: "active",
+  revision: 5,
+  generation: 3,
+  credential_generation: 2,
+  capability_key: "controlled_oidc_profile_v1",
+  required_scopes: ["offline_access", "openid", "profile"],
+  source_schema: "oidc_userinfo_v1",
+  last_safe_outcome: "callback_committed",
+  last_synchronized_at: null,
+  next_synchronize_at: "2026-08-01T01:00:00Z",
+  consecutive_failures: 0,
+  supports_revocation: true,
+  reauthorization_application_ids: ["99999999-9999-4999-8999-999999999999"],
+};
+
 function successful<T>(data: T) {
   return { data, error: undefined, response: Response.json(data) };
 }
@@ -76,8 +98,13 @@ function successful<T>(data: T) {
 function renderPanel(options?: {
   post?: (...args: unknown[]) => Promise<unknown>;
   onError?: (error: unknown) => Promise<void>;
+  connections?: ManagedProviderConnection[];
 }) {
   const get = vi.fn((path: string) => {
+    if (path.endsWith("/identities")) return Promise.resolve(successful({ items: [] }));
+    if (path.endsWith("/managed-provider-connections")) {
+      return Promise.resolve(successful({ items: options?.connections ?? [] }));
+    }
     if (path.endsWith("/sessions")) return Promise.resolve(successful(sessions));
     if (path.endsWith("/{user_id}")) {
       return Promise.resolve(
@@ -158,6 +185,156 @@ describe("Project user and session lifecycle", () => {
       expect.objectContaining({
         params: { path: { project_id: project.id, user_id: user.id } },
       }),
+    );
+  });
+
+  it("renders safe managed metadata and sends generation-fenced actions", async () => {
+    const post = vi.fn(() =>
+      Promise.resolve(
+        successful({ ...connection, revision: 6, last_safe_outcome: "sync_requested" }),
+      ),
+    );
+    renderPanel({ post, connections: [connection] });
+    await loadUserPanel();
+
+    expect(screen.getByRole("heading", { name: "Managed provider connections" })).toBeVisible();
+    expect(screen.getByText(/offline_access openid profile/u)).toBeVisible();
+    expect(screen.getByText(/generation 3; credential generation 2/u)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Reauthorize" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Revoke at provider" })).toBeVisible();
+    expect(document.body.textContent).not.toMatch(/refresh[_ -]?token|credential payload/iu);
+    fireEvent.click(screen.getByRole("button", { name: "Synchronize profile" }));
+    await waitFor(() => {
+      expect(post).toHaveBeenCalledWith(
+        "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/synchronize",
+        expect.objectContaining({
+          body: { expected_revision: 5, expected_generation: 3, confirm: false },
+        }),
+      );
+    });
+  });
+
+  it("keeps explicit reauthorization available for a disconnected connection", async () => {
+    renderPanel({
+      connections: [
+        {
+          ...connection,
+          state: "disconnected",
+          last_safe_outcome: "locally_disconnected",
+        },
+      ],
+    });
+    await loadUserPanel();
+
+    const reauthorize = screen.getByRole("button", { name: "Reauthorize" });
+    expect(reauthorize).toBeVisible();
+    expect(reauthorize).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Synchronize profile" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Revoke at provider" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Disconnect locally" })).toBeNull();
+  });
+
+  it("reserves a popup before a delayed reauthorization create and navigates the exact target", async () => {
+    let resolveCreate: ((value: unknown) => void) | undefined;
+    const post = vi.fn((...args: unknown[]) => {
+      void args;
+      return new Promise<unknown>((resolve) => {
+        resolveCreate = resolve;
+      });
+    });
+    const replace = vi.fn();
+    const close = vi.fn();
+    const popup = { opener: window, location: { replace }, close } as unknown as Window;
+    const open = vi.spyOn(window, "open").mockReturnValue(popup);
+    renderPanel({ post, connections: [connection] });
+    await loadUserPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reauthorize" }));
+    expect(open).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(replace).not.toHaveBeenCalled();
+    expect(post).toHaveBeenCalledTimes(1);
+    resolveCreate?.(
+      successful({
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        status: "awaiting_browser_binding",
+        revision: 1,
+        hosted_target: "https://runtime.example/auth/managed-reauthorizations/exact-target",
+      }),
+    );
+    await waitFor(() => {
+      expect(replace).toHaveBeenCalledWith(
+        "https://runtime.example/auth/managed-reauthorizations/exact-target",
+      );
+    });
+    expect(close).not.toHaveBeenCalled();
+    expect(
+      (post.mock.calls[0]?.[1] as { params?: { header?: Record<string, string> } }).params
+        ?.header?.["Idempotency-Key"],
+    ).toMatch(/^console_/u);
+  });
+
+  it("retries an ambiguous create with one key and renders the blocked-popup exact target", async () => {
+    const keys: string[] = [];
+    const post = vi.fn((...args: unknown[]) => {
+      const options = args[1];
+      const key = (options as { params: { header: { "Idempotency-Key": string } } }).params.header[
+        "Idempotency-Key"
+      ];
+      keys.push(key);
+      if (keys.length === 1) return Promise.reject(new ControlRequestError(undefined, 503));
+      return Promise.resolve(
+        successful({
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          status: "awaiting_browser_binding",
+          revision: 1,
+          hosted_target:
+            "https://runtime.example/auth/managed-reauthorizations/recovered-exact-target",
+        }),
+      );
+    });
+    const onError = vi.fn(() => Promise.resolve());
+    vi.spyOn(window, "open").mockReturnValue(null);
+    renderPanel({ post, onError, connections: [connection] });
+    await loadUserPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Reauthorize" }));
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reauthorize" }));
+    const fallback = await screen.findByRole("link", {
+      name: "Continue managed reauthorization",
+    });
+    expect(fallback).toHaveAttribute(
+      "href",
+      "https://runtime.example/auth/managed-reauthorizations/recovered-exact-target",
+    );
+    expect(fallback).toHaveAttribute("rel", "noopener noreferrer");
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("reports queued provider revocation without claiming terminal completion", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const post = vi.fn(() =>
+      Promise.resolve(
+        successful({
+          ...connection,
+          revision: 6,
+          state: "active" as const,
+          last_safe_outcome: "revocation_requested",
+        }),
+      ),
+    );
+    const { setMessage } = renderPanel({ post, connections: [connection] });
+    await loadUserPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Revoke at provider" }));
+    await waitFor(() => {
+      expect(setMessage).toHaveBeenCalledWith("Provider revocation queued (revocation_requested).");
+    });
+    expect(setMessage).not.toHaveBeenCalledWith(
+      expect.stringMatching(/completed|revoked by the provider/iu),
     );
   });
 

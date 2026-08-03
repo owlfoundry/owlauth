@@ -1,7 +1,8 @@
 use time::OffsetDateTime;
 
 use super::{
-    DomainError, ProfileDisplayName, ProfilePictureUrl, ProjectUserStatus, PublicId, UserRevision,
+    DomainError, ProfileDisplayName, ProfileLocale, ProfilePictureUrl, ProjectUserStatus, PublicId,
+    UserRevision,
 };
 
 pub(crate) const USER_PROJECTION_SCHEMA_V1: &str = "owlauth.user.v1";
@@ -40,6 +41,8 @@ pub(crate) struct UserProjectionSource {
     pub(crate) status: ProjectUserStatus,
     pub(crate) display_name: Option<ProfileDisplayName>,
     pub(crate) picture_url: Option<ProfilePictureUrl>,
+    pub(crate) locale: Option<ProfileLocale>,
+    pub(crate) verified_email: Option<String>,
     pub(crate) created_at: OffsetDateTime,
     pub(crate) updated_at: OffsetDateTime,
     pub(crate) user_revision: UserRevision,
@@ -52,6 +55,8 @@ pub(crate) struct UserProjection {
     pub(crate) status: ProjectUserStatus,
     pub(crate) display_name: Option<String>,
     pub(crate) picture_url: Option<String>,
+    pub(crate) locale: Option<String>,
+    pub(crate) verified_email: Option<String>,
     pub(crate) created_at: OffsetDateTime,
     pub(crate) updated_at: OffsetDateTime,
     pub(crate) user_revision: i64,
@@ -66,12 +71,19 @@ impl UserProjection {
         if source.updated_at < source.created_at {
             return Err(DomainError::InvalidTransition);
         }
+        if source.verified_email.as_ref().is_some_and(|value| {
+            !(3..=320).contains(&value.len()) || value.chars().any(char::is_control)
+        }) {
+            return Err(DomainError::InvalidCharacters);
+        }
         Ok(Self {
             schema: USER_PROJECTION_SCHEMA_V1,
             user_id: source.user_id.to_string(),
             status: source.status,
             display_name: source.display_name.map(ProfileDisplayName::into_inner),
             picture_url: source.picture_url.map(ProfilePictureUrl::into_inner),
+            locale: source.locale.map(ProfileLocale::into_inner),
+            verified_email: source.verified_email,
             created_at: source.created_at,
             updated_at: source.updated_at,
             user_revision: source.user_revision.value(),
@@ -93,6 +105,8 @@ mod tests {
             picture_url: Some(
                 ProfilePictureUrl::parse("https://cdn.example/ada.png".to_owned()).unwrap(),
             ),
+            locale: Some(ProfileLocale::parse("en-GB".to_owned()).unwrap()),
+            verified_email: Some("ada@example.test".to_owned()),
             created_at,
             updated_at: created_at,
             user_revision: UserRevision::initial(),
@@ -109,6 +123,8 @@ mod tests {
         assert_eq!(first.user_id, "usr_12345678");
         assert_eq!(first.status.as_str(), "active");
         assert_eq!(first.display_name.as_deref(), Some("Ada"));
+        assert_eq!(first.locale.as_deref(), Some("en-GB"));
+        assert_eq!(first.verified_email.as_deref(), Some("ada@example.test"));
         assert_eq!(first.user_revision, 1);
         assert_eq!(first.projection_revision, 1);
     }

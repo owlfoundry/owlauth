@@ -3,15 +3,17 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use sea_orm::sea_query::LockType;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    IntoActiveModel, QueryFilter, QueryOrder, QueryResult, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use uuid::Uuid;
 
 use crate::application::{
     ApplicationError, ApplicationSessionRecord, BrowserSessionRecord, ControlLifecyclePort,
-    DisableProjectUser, ManagedSessionStatus, ProjectUserRecord, ProjectUserSessions,
-    ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
+    DisableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind, ProjectUserIdentityRecord,
+    ProjectUserIdentityStatus, ProjectUserRecord, ProjectUserSessions, ProjectUserStatus,
+    RevokeApplicationSession, RevokeBrowserSession,
 };
 
 use super::{
@@ -65,6 +67,69 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)
             .and_then(project_user_record)
+    }
+
+    async fn list_project_user_identities(
+        &self,
+        project_id: Uuid,
+        user_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ProjectUserIdentityRecord>, ApplicationError> {
+        bounded_limit(limit)?;
+        require_project_user(&self.database, project_id, user_id).await?;
+        let probe_limit = i64::try_from(limit)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ApplicationError::InvalidInput)?;
+        // This SELECT is intentionally a closed safe-column allowlist. In particular, it does
+        // not read issuer, subject, address ciphertext, aliases/digests, client/secret material,
+        // credentials, receipts, or candidate evidence.
+        let rows = self
+            .database
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT identity_id, project_id, user_id, identity_kind, status,
+                        identity_revision, is_primary_source, provider_key,
+                        verified_or_observed_at, created_at, updated_at
+                   FROM (
+                     SELECT identity.id AS identity_id, identity.project_id, identity.user_id,
+                            'provider'::TEXT AS identity_kind, identity.status,
+                            identity.identity_revision,
+                            (user_record.primary_source_kind='provider'
+                             AND user_record.primary_profile_identity_id=identity.id)
+                                AS is_primary_source,
+                            provider.provider_key AS provider_key,
+                            identity.observed_at AS verified_or_observed_at,
+                            identity.created_at, identity.updated_at
+                       FROM linked_identities AS identity
+                       JOIN project_users AS user_record
+                         ON user_record.project_id=identity.project_id
+                        AND user_record.id=identity.user_id
+                       JOIN provider_configurations AS provider
+                         ON provider.project_id=identity.project_id
+                        AND provider.id=identity.created_via_provider_configuration_id
+                      WHERE identity.project_id=$1 AND identity.user_id=$2
+                     UNION ALL
+                     SELECT identity.id, identity.project_id, identity.user_id,
+                            'email'::TEXT, identity.status, identity.identity_revision,
+                            (user_record.primary_source_kind='email'
+                             AND user_record.primary_email_identity_id=identity.id),
+                            NULL::TEXT, identity.verified_at,
+                            identity.created_at, identity.updated_at
+                       FROM email_identities AS identity
+                       JOIN project_users AS user_record
+                         ON user_record.project_id=identity.project_id
+                        AND user_record.id=identity.user_id
+                      WHERE identity.project_id=$1 AND identity.user_id=$2
+                   ) AS safe_identities
+                  ORDER BY created_at, identity_id, identity_kind
+                  LIMIT $3",
+                [project_id.into(), user_id.into(), probe_limit.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        enforce_bound(&rows, limit)?;
+        rows.iter().map(project_user_identity_record).collect()
     }
 
     async fn disable_project_user(
@@ -294,9 +359,26 @@ fn next_revision(revision: Option<i64>) -> Result<i64, ApplicationError> {
         .ok_or(ApplicationError::Integrity)
 }
 
+async fn require_project_user<C>(
+    database: &C,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), ApplicationError>
+where
+    C: ConnectionTrait,
+{
+    project_user::Entity::find_by_id(user_id)
+        .filter(project_user::Column::ProjectId.eq(project_id))
+        .one(database)
+        .await
+        .map_err(persistence)?
+        .map(|_| ())
+        .ok_or(ApplicationError::NotFound)
+}
+
 async fn require_project<C>(database: &C, project_id: Uuid) -> Result<(), ApplicationError>
 where
-    C: sea_orm::ConnectionTrait,
+    C: ConnectionTrait,
 {
     project::Entity::find_by_id(project_id)
         .one(database)
@@ -323,10 +405,60 @@ where
         .ok_or(ApplicationError::NotFound)
 }
 
+fn project_user_identity_record(
+    row: &QueryResult,
+) -> Result<ProjectUserIdentityRecord, ApplicationError> {
+    let kind = match row
+        .try_get::<String>("", "identity_kind")
+        .map_err(persistence)?
+        .as_str()
+    {
+        "provider" => ProjectUserIdentityKind::Provider,
+        "email" => ProjectUserIdentityKind::Email,
+        _ => return Err(ApplicationError::Integrity),
+    };
+    let status = match row
+        .try_get::<String>("", "status")
+        .map_err(persistence)?
+        .as_str()
+    {
+        "active" => ProjectUserIdentityStatus::Active,
+        "disabled" => ProjectUserIdentityStatus::Disabled,
+        _ => return Err(ApplicationError::Integrity),
+    };
+    let identity_revision = row
+        .try_get::<i64>("", "identity_revision")
+        .map_err(persistence)?;
+    let provider_key = row
+        .try_get::<Option<String>>("", "provider_key")
+        .map_err(persistence)?;
+    if identity_revision <= 0
+        || matches!(kind, ProjectUserIdentityKind::Provider) != provider_key.is_some()
+    {
+        return Err(ApplicationError::Integrity);
+    }
+    Ok(ProjectUserIdentityRecord {
+        id: row.try_get("", "identity_id").map_err(persistence)?,
+        project_id: row.try_get("", "project_id").map_err(persistence)?,
+        user_id: row.try_get("", "user_id").map_err(persistence)?,
+        kind,
+        status,
+        identity_revision,
+        is_primary_source: row.try_get("", "is_primary_source").map_err(persistence)?,
+        provider_key,
+        verified_or_observed_at: row
+            .try_get("", "verified_or_observed_at")
+            .map_err(persistence)?,
+        created_at: row.try_get("", "created_at").map_err(persistence)?,
+        updated_at: row.try_get("", "updated_at").map_err(persistence)?,
+    })
+}
+
 fn project_user_record(model: project_user::Model) -> Result<ProjectUserRecord, ApplicationError> {
     let status = match model.status.as_str() {
         "active" => ProjectUserStatus::Active,
         "disabled" => ProjectUserStatus::Disabled,
+        "merged" => ProjectUserStatus::Merged,
         _ => return Err(ApplicationError::Integrity),
     };
     if model.user_revision <= 0 || model.security_revision <= 0 {

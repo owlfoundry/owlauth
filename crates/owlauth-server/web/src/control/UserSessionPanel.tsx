@@ -1,20 +1,28 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import styles from "./app.module.css";
 import {
+  type Application,
   type ApplicationSession,
   type BrowserSession,
   ControlRequestError,
   type DisposableControlClient,
+  IdempotencyAttempt,
+  type ManagedProviderConnection,
   type Project,
   type ProjectUser,
+  type ProjectUserIdentity,
   type ProjectUserSessions,
+  type Provider,
   requireData,
 } from "./client";
+import { IdentityMutationPanel, validateSafeIdentityInventory } from "./IdentityMutationPanel";
 
 interface UserSessionPanelProps {
   readonly session: DisposableControlClient;
   readonly project: Project;
+  readonly applications?: Application[];
+  readonly providers?: Provider[];
   readonly onError: (error: unknown) => Promise<void>;
   readonly setMessage: (message: string | null) => void;
 }
@@ -26,12 +34,24 @@ const EMPTY_SESSIONS: ProjectUserSessions = {
   browser_sessions: [],
 };
 
-export function UserSessionPanel({ session, project, onError, setMessage }: UserSessionPanelProps) {
+export function UserSessionPanel({
+  session,
+  project,
+  applications = [],
+  providers = [],
+  onError,
+  setMessage,
+}: UserSessionPanelProps) {
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [users, setUsers] = useState<ProjectUser[]>([]);
   const [selectedUser, setSelectedUser] = useState<ProjectUser | null>(null);
   const [sessions, setSessions] = useState<ProjectUserSessions | null>(null);
+  const [connections, setConnections] = useState<ManagedProviderConnection[] | null>(null);
+  const [identities, setIdentities] = useState<ProjectUserIdentity[] | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [reauthorizationFallback, setReauthorizationFallback] = useState<string | null>(null);
+  const reauthorizationAttempt = useRef(new IdempotencyAttempt());
+  const reauthorizationAttemptOwner = useRef<string | null>(null);
 
   const loadUsers = useCallback(
     async (preferredUserId?: string): Promise<ProjectUser | null> => {
@@ -53,12 +73,20 @@ export function UserSessionPanel({ session, project, onError, setMessage }: User
   const loadUser = useCallback(
     async (userId: string) => {
       setPendingAction(`load:${userId}`);
+      setIdentities(null);
       try {
-        const [userResult, sessionResult] = await Promise.all([
+        const [userResult, sessionResult, connectionResult, identityResult] = await Promise.all([
           session.client.GET("/v1/projects/{project_id}/users/{user_id}", {
             params: { path: { project_id: project.id, user_id: userId } },
           }),
           session.client.GET("/v1/projects/{project_id}/users/{user_id}/sessions", {
+            params: { path: { project_id: project.id, user_id: userId } },
+          }),
+          session.client.GET(
+            "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections",
+            { params: { path: { project_id: project.id, user_id: userId } } },
+          ),
+          session.client.GET("/v1/projects/{project_id}/users/{user_id}/identities", {
             params: { path: { project_id: project.id, user_id: userId } },
           }),
         ]);
@@ -71,6 +99,19 @@ export function UserSessionPanel({ session, project, onError, setMessage }: User
         setUsers((current) => current.map((item) => (item.id === user.id ? user : item)));
         setSelectedUser(user);
         setSessions(nextSessions);
+        setConnections(
+          requireData(connectionResult.data, connectionResult.error, connectionResult.response)
+            .items,
+        );
+        const nextIdentities = requireData(
+          identityResult.data,
+          identityResult.error,
+          identityResult.response,
+        ).items;
+        if (!validateSafeIdentityInventory(nextIdentities)) {
+          throw new Error("Unsafe identity inventory response");
+        }
+        setIdentities(nextIdentities);
       } catch (error) {
         await onError(error);
       } finally {
@@ -153,6 +194,142 @@ export function UserSessionPanel({ session, project, onError, setMessage }: User
       }));
       setMessage("Application session revoked.");
     } catch (error) {
+      await refreshAfterConflict(error);
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  async function runConnectionAction(
+    item: ManagedProviderConnection,
+    action: "synchronize" | "reauthorize" | "revoke" | "disconnect",
+  ) {
+    const destructive = action === "revoke" || action === "disconnect";
+    if (
+      destructive &&
+      !window.confirm(
+        action === "revoke"
+          ? "Request authoritative provider revocation for this managed connection?"
+          : "Disconnect this managed connection and make its credential inaccessible?",
+      )
+    ) {
+      return;
+    }
+    setPendingAction(`connection:${item.id}:${action}`);
+    let reauthorizationPopup: Window | null = null;
+    try {
+      if (action === "reauthorize") {
+        // Reserve a browsing context while this trusted click still has user activation. The
+        // create endpoint is intentionally asynchronous and its one-time target is recoverable
+        // through the explicit operator link if the popup is denied or cannot be navigated.
+        reauthorizationPopup = window.open("about:blank", "_blank");
+        if (reauthorizationPopup !== null) reauthorizationPopup.opener = null;
+        const attemptOwner = [
+          project.id,
+          item.user_id,
+          item.id,
+          String(item.revision),
+          String(item.generation),
+          String(item.credential_generation),
+        ].join(":");
+        if (
+          reauthorizationAttemptOwner.current !== null &&
+          reauthorizationAttemptOwner.current !== attemptOwner
+        ) {
+          reauthorizationAttempt.current.abandon();
+        }
+        reauthorizationAttemptOwner.current = attemptOwner;
+        const idempotencyKey = reauthorizationAttempt.current.begin();
+        if (idempotencyKey === null) {
+          reauthorizationPopup?.close();
+          return;
+        }
+        setReauthorizationFallback(null);
+        const applicationId = item.reauthorization_application_ids.at(0);
+        if (applicationId === undefined) {
+          throw new Error(
+            "No active Application/provider assignment can authorize this interaction.",
+          );
+        }
+        const result = await session.client.POST(
+          "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations",
+          {
+            params: {
+              path: {
+                project_id: project.id,
+                user_id: item.user_id,
+                connection_id: item.id,
+              },
+              header: { "Idempotency-Key": idempotencyKey },
+            },
+            body: {
+              application_id: applicationId,
+              expected_connection_revision: item.revision,
+              expected_connection_generation: item.generation,
+              expected_credential_generation: item.credential_generation,
+            },
+          },
+        );
+        const created = requireData(result.data, result.error, result.response);
+        reauthorizationAttempt.current.settle();
+        reauthorizationAttemptOwner.current = null;
+        if (created.hosted_target !== null && created.hosted_target !== undefined) {
+          if (reauthorizationPopup === null) {
+            setReauthorizationFallback(created.hosted_target);
+          } else {
+            try {
+              reauthorizationPopup.location.replace(created.hosted_target);
+            } catch {
+              reauthorizationPopup.close();
+              setReauthorizationFallback(created.hosted_target);
+            }
+          }
+        } else {
+          reauthorizationPopup?.close();
+        }
+        setMessage(
+          `Managed reauthorization ${created.status}; revision ${String(created.revision)}.`,
+        );
+        return;
+      }
+      const result = await session.client.POST(
+        `/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/${action}`,
+        {
+          params: {
+            path: {
+              project_id: project.id,
+              user_id: item.user_id,
+              connection_id: item.id,
+            },
+          },
+          body: {
+            expected_revision: item.revision,
+            expected_generation: item.generation,
+            confirm: destructive,
+          },
+        },
+      );
+      const updated = requireData(result.data, result.error, result.response);
+      setConnections((current) =>
+        (current ?? []).map((connection) => (connection.id === updated.id ? updated : connection)),
+      );
+      setMessage(
+        action === "synchronize"
+          ? "Managed profile synchronization queued."
+          : updated.state === "revoked"
+            ? "Managed connection revocation completed by the provider."
+            : updated.state === "disconnected"
+              ? "Managed connection disconnect completed."
+              : action === "revoke"
+                ? `Provider revocation queued (${updated.last_safe_outcome}).`
+                : `Disconnect queued (${updated.last_safe_outcome}).`,
+      );
+    } catch (error) {
+      reauthorizationPopup?.close();
+      if (action === "reauthorize") {
+        reauthorizationAttempt.current.settle(error);
+        if (!reauthorizationAttempt.current.retainsKey) reauthorizationAttemptOwner.current = null;
+      }
       await refreshAfterConflict(error);
     } finally {
       setPendingAction(null);
@@ -258,6 +435,36 @@ export function UserSessionPanel({ session, project, onError, setMessage }: User
                   revokeBrowserSession={revokeBrowserSession}
                 />
               )}
+              {reauthorizationFallback === null ? null : (
+                <p role="status">
+                  The reauthorization window was blocked.{" "}
+                  <a href={reauthorizationFallback} target="_blank" rel="noopener noreferrer">
+                    Continue managed reauthorization
+                  </a>
+                </p>
+              )}
+              {connections === null ? null : (
+                <ManagedConnectionList
+                  connections={connections}
+                  pendingAction={pendingAction}
+                  runAction={runConnectionAction}
+                />
+              )}
+              {identities === null ? null : (
+                <IdentityMutationPanel
+                  key={selectedUser.id}
+                  session={session}
+                  project={project}
+                  selectedUser={selectedUser}
+                  users={users}
+                  identities={identities}
+                  applications={applications}
+                  providers={providers}
+                  reloadSelectedUser={() => loadUser(selectedUser.id)}
+                  onError={onError}
+                  setMessage={setMessage}
+                />
+              )}
             </article>
           )}
         </div>
@@ -338,5 +545,94 @@ function SessionLists({
         )}
       </section>
     </div>
+  );
+}
+
+interface ManagedConnectionListProps {
+  readonly connections: ManagedProviderConnection[];
+  readonly pendingAction: string | null;
+  readonly runAction: (
+    connection: ManagedProviderConnection,
+    action: "synchronize" | "reauthorize" | "revoke" | "disconnect",
+  ) => Promise<void>;
+}
+
+function ManagedConnectionList({
+  connections,
+  pendingAction,
+  runAction,
+}: ManagedConnectionListProps) {
+  return (
+    <section aria-labelledby="managed-connections-heading">
+      <h5 id="managed-connections-heading">Managed provider connections</h5>
+      <p>
+        Credentials are never displayed. Actions are bound to the shown revision and generation.
+      </p>
+      {connections.length === 0 ? (
+        <p>No managed provider connections.</p>
+      ) : (
+        <ul className={styles["cards"]}>
+          {connections.map((connection) => (
+            <li key={connection.id}>
+              <strong>{connection.capability_key}</strong>
+              <span>
+                {connection.state}; revision {String(connection.revision)}; generation{" "}
+                {String(connection.generation)}; credential generation{" "}
+                {String(connection.credential_generation)}
+              </span>
+              <span>Source schema: {connection.source_schema}</span>
+              <span>Required scopes: {connection.required_scopes.join(" ")}</span>
+              <span>Last safe outcome: {connection.last_safe_outcome}</span>
+              <span>
+                Last synchronized: {connection.last_synchronized_at ?? "never"}; next sync:{" "}
+                {connection.next_synchronize_at ?? "not scheduled"}; next renewal:{" "}
+                {connection.next_renewal_at ?? "not scheduled"}; failures:{" "}
+                {String(connection.consecutive_failures)}
+              </span>
+              {connection.state === "active" ? (
+                <button
+                  type="button"
+                  onClick={() => void runAction(connection, "synchronize")}
+                  disabled={pendingAction !== null}
+                >
+                  Synchronize profile
+                </button>
+              ) : null}
+              {connection.reauthorization_application_ids.length > 0 ? (
+                <button
+                  type="button"
+                  onClick={() => void runAction(connection, "reauthorize")}
+                  disabled={pendingAction !== null}
+                >
+                  Reauthorize
+                </button>
+              ) : null}
+              {connection.supports_revocation &&
+              connection.state !== "revoked" &&
+              connection.state !== "disconnected" ? (
+                <button
+                  className={styles["danger"]}
+                  type="button"
+                  onClick={() => void runAction(connection, "revoke")}
+                  disabled={pendingAction !== null}
+                >
+                  Revoke at provider
+                </button>
+              ) : null}
+              {connection.state !== "disconnected" ? (
+                <button
+                  className={styles["danger"]}
+                  type="button"
+                  onClick={() => void runAction(connection, "disconnect")}
+                  disabled={pendingAction !== null}
+                >
+                  Disconnect locally
+                </button>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }

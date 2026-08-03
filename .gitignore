@@ -30,5 +30,6 @@
 .env.*
 !.env.example
 
-# Local reference material
+# Local development state and reference material
+/.local/
 /local-reference/

@@ -12,6 +12,7 @@ const MAX_CONTROL_RESULTS: usize = 100;
 pub(crate) enum ProjectUserStatus {
     Active,
     Disabled,
+    Merged,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +25,35 @@ pub(crate) struct ProjectUserRecord {
     pub security_revision: i64,
     pub display_name: Option<String>,
     pub picture_url: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectUserIdentityKind {
+    Provider,
+    Email,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectUserIdentityStatus {
+    Active,
+    Disabled,
+}
+
+/// Bounded Control read model. `provider_key` is creation provenance only; no provider subject,
+/// issuer, email material, alias, digest, credential, receipt, or evidence enters this record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectUserIdentityRecord {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub user_id: Uuid,
+    pub kind: ProjectUserIdentityKind,
+    pub status: ProjectUserIdentityStatus,
+    pub identity_revision: i64,
+    pub is_primary_source: bool,
+    pub provider_key: Option<String>,
+    pub verified_or_observed_at: OffsetDateTime,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -118,6 +148,13 @@ pub(crate) trait ControlLifecyclePort: Send + Sync {
         user_id: Uuid,
     ) -> Result<ProjectUserRecord, ApplicationError>;
 
+    async fn list_project_user_identities(
+        &self,
+        project_id: Uuid,
+        user_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<ProjectUserIdentityRecord>, ApplicationError>;
+
     async fn disable_project_user(
         &self,
         command: DisableProjectUser,
@@ -168,6 +205,16 @@ impl ControlLifecycleService {
         user_id: Uuid,
     ) -> Result<ProjectUserRecord, ApplicationError> {
         self.port.get_project_user(project_id, user_id).await
+    }
+
+    pub(crate) async fn list_project_user_identities(
+        &self,
+        project_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Vec<ProjectUserIdentityRecord>, ApplicationError> {
+        self.port
+            .list_project_user_identities(project_id, user_id, MAX_CONTROL_RESULTS)
+            .await
     }
 
     pub(crate) async fn disable_project_user(

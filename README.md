@@ -96,15 +96,22 @@ make build
 make package-check
 ```
 
-Start local PostgreSQL and Redis and export both OpenAPI documents:
+Start a complete local Runtime and Control process with disposable development configuration:
 
 ```bash
-make dev-up
-make openapi
-make web-e2e
+cp .env.example .env
+make dev
 ```
 
-The browser end-to-end gate starts isolated PostgreSQL, OwlAuth Runtime and Control listeners, a controlled standards-compatible OIDC provider, and real Application actors. Container-backed Rust integration tests skip locally when Docker is unavailable; CI requires Docker execution:
+Runtime is served at `http://127.0.0.1:8080/`, and the Control Console is served at
+`http://127.0.0.1:8081/console/`. The development Control key is the
+`OWLAUTH_CONTROL_API_KEY` value in `.env`. Stop the foreground server with `Ctrl-C`, then run
+`make dev-down` when the PostgreSQL and Redis containers are no longer needed.
+
+Use `make openapi` to export both contracts and `make web-e2e` to run the isolated real-browser
+gate. The browser gate starts its own PostgreSQL, OwlAuth Runtime and Control listeners, a
+controlled standards-compatible OIDC provider, and real Application actors. Container-backed Rust
+integration tests skip locally when Docker is unavailable; CI requires Docker execution:
 
 ```bash
 make test-containers

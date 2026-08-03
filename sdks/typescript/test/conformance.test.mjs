@@ -79,10 +79,12 @@ function syntheticCredentials(configured) {
     projection: {
       userId: "usr_conformance",
       userRevision: 1,
-      projectionSchema: "owlauth.project_user.v1",
+      projectionSchema: "owlauth.user.v1",
       projectionRevision: 1,
       displayName: null,
       pictureUrl: null,
+      locale: null,
+      verifiedEmail: null,
       status: "active",
       createdAt: "2099-01-01T00:00:00Z",
       updatedAt: "2099-01-01T00:00:00Z",

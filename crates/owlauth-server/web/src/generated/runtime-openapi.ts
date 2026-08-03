@@ -20,6 +20,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/email/confirm/{challenge_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_email_magic_confirmation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/interactions/{interaction}": {
         parameters: {
             query?: never;
@@ -148,6 +164,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_public_id}/auth/email/magic/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["confirm_email_magic"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_public_id}/auth/handoff/exchange": {
         parameters: {
             query?: never;
@@ -158,6 +190,150 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["exchange_handoff"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["confirm_identity_mutation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/email/challenges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["begin_identity_mutation_email_challenge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/email/link/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["verify_identity_mutation_email_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/email/otp/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["verify_identity_mutation_email_otp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/method": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["select_identity_mutation_method"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/challenges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["begin_email_challenge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/otp/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["verify_email_otp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/resend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["resend_email_challenge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/select": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["select_email"];
         delete?: never;
         options?: never;
         head?: never;
@@ -206,6 +382,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["start_login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_public_id}/auth/managed-reauthorizations/{interaction}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["start_managed_reauthorization"];
         delete?: never;
         options?: never;
         head?: never;
@@ -264,6 +456,18 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        BeginEmailChallengeRequest: {
+            csrf: string;
+            email: string;
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        BeginIdentityMutationEmailChallengeRequest: {
+            csrf: string;
+            email: string;
+            /** Format: int64 */
+            expected_revision: number;
+        };
         BrowserLogoutPreparationResponse: {
             expires_at: string;
             hosted_url: string;
@@ -279,6 +483,21 @@ export interface components {
             completed: boolean;
         };
         ConfirmBrowserLogoutRequest: {
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        ConfirmEmailMagicRequest: {
+            challenge_id: string;
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+            /** Format: int32 */
+            generation: number;
+            proof: string;
+            transaction_id: string;
+        };
+        ConfirmHostedIdentityMutationRequest: {
             csrf: string;
             /** Format: int64 */
             expected_revision: number;
@@ -315,6 +534,23 @@ export interface components {
             session_expires_at: string;
             user_id: string;
         };
+        EmailChallengeAcceptedResponse: {
+            accepted: boolean;
+            challenge_id: string;
+            expires_at: string;
+            /** Format: int32 */
+            generation: number;
+            proof_modes: components["schemas"]["EmailProofMode"][];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @enum {string} */
+        EmailProofMode: "otp" | "magic_link";
+        EmailProofResponse: {
+            application_type?: null | components["schemas"]["HostedApplicationType"];
+            completed: boolean;
+            redirect_url?: string | null;
+        };
         HandoffExchangeRequest: {
             application_id: string;
             handoff: string;
@@ -328,11 +564,20 @@ export interface components {
         };
         /** @enum {string} */
         HostedApplicationType: "web" | "native";
+        HostedIdentityMutationResponse: {
+            /** Format: int64 */
+            revision: number;
+            status: components["schemas"]["HostedIdentityMutationStatus"];
+        };
+        /** @enum {string} */
+        HostedIdentityMutationStatus: "pending_proof" | "ready" | "expired" | "cancelled";
         HostedInteractionResponse: {
             application_display_name: string;
             application_id: string;
             application_type: components["schemas"]["HostedApplicationType"];
             csrf: string;
+            email_available: boolean;
+            email_proof_modes: components["schemas"]["EmailProofMode"][];
             expires_at: string;
             presentation_hint?: string | null;
             project_display_name: string;
@@ -344,10 +589,40 @@ export interface components {
             status: components["schemas"]["HostedInteractionStatus"];
         };
         /** @enum {string} */
-        HostedInteractionStatus: "awaiting_method_selection" | "provider_authorization_started" | "provider_exchange_in_progress" | "authenticated" | "handoff_issued" | "completed" | "failed" | "expired";
+        HostedInteractionStatus: "awaiting_method_selection" | "email_address_entry" | "email_challenge_pending" | "provider_authorization_started" | "provider_exchange_in_progress" | "authenticated" | "handoff_issued" | "completed" | "failed" | "expired";
         HostedProvider: {
             display_name: string;
             key: string;
+        };
+        /** @enum {string} */
+        IdentityKind: "provider" | "email";
+        IdentityMutationEmailChallengeResponse: {
+            accepted: boolean;
+            challenge_id: string;
+            expires_at: string;
+            /** Format: int32 */
+            generation: number;
+            proof_modes: components["schemas"]["EmailProofMode"][];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @enum {string} */
+        IdentityMutationMethodKind: "provider" | "email";
+        IdentityMutationMethodResponse: {
+            /** @enum {string} */
+            method_kind: "provider";
+            result: components["schemas"]["NavigationResponse"];
+        } | {
+            /** @enum {string} */
+            method_kind: "email";
+            result: components["schemas"]["IdentityMutationProofStateResponse"];
+        };
+        /** @enum {string} */
+        IdentityMutationProofState: "email_address_entry" | "email_challenge_pending" | "provider_authorization_started" | "provider_exchange_in_progress" | "proved" | "expired";
+        IdentityMutationProofStateResponse: {
+            /** Format: int64 */
+            revision: number;
+            state: components["schemas"]["IdentityMutationProofState"];
         };
         /** @enum {string} */
         JwkCurve: "Ed25519";
@@ -382,6 +657,10 @@ export interface components {
         PublicApplicationConfig: {
             application_display_name: string;
             application_public_id: string;
+            /** @description True only while this Runtime can complete the durable email flow. */
+            email_available: boolean;
+            email_magic_link_enabled: boolean;
+            email_otp_enabled: boolean;
             login_available: boolean;
             project_display_name: string;
             project_public_id: string;
@@ -411,6 +690,18 @@ export interface components {
             message: string;
             request_id: string;
         };
+        SelectEmailRequest: {
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+        };
+        SelectIdentityMutationMethodRequest: {
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+            /** @description Assertion of the immutable method selected by Control for this exact proof slot. */
+            method_kind: components["schemas"]["IdentityMutationMethodKind"];
+        };
         SelectProviderRequest: {
             csrf: string;
             /** Format: int64 */
@@ -419,10 +710,16 @@ export interface components {
         };
         /** @enum {string} */
         SigningAlgorithm: "EdDSA";
+        StartManagedReauthorizationRequest: {
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+        };
         UserProjection: {
             created_at: string;
-            display_name?: string | null;
-            picture_url?: string | null;
+            display_name: string | null;
+            locale: string | null;
+            picture_url: string | null;
             /** Format: int64 */
             projection_revision: number;
             projection_schema: string;
@@ -431,6 +728,34 @@ export interface components {
             user_id: string;
             /** Format: int64 */
             user_revision: number;
+            verified_email: string | null;
+        };
+        VerifyEmailOtpRequest: {
+            challenge_id: string;
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+            /** Format: int32 */
+            generation: number;
+            otp: string;
+        };
+        VerifyIdentityMutationEmailLinkRequest: {
+            challenge_id: string;
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+            /** Format: int32 */
+            generation: number;
+            token: string;
+        };
+        VerifyIdentityMutationEmailOtpRequest: {
+            challenge_id: string;
+            csrf: string;
+            /** Format: int64 */
+            expected_revision: number;
+            /** Format: int32 */
+            generation: number;
+            otp: string;
         };
     };
     responses: never;
@@ -479,6 +804,42 @@ export interface operations {
                 headers: {
                     /** @description Required delay in whole seconds before retrying */
                     "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    get_email_magic_confirmation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                challenge_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Generic fragment-only magic-link confirmation shell */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
                     [name: string]: unknown;
                 };
                 content: {
@@ -851,6 +1212,63 @@ export interface operations {
             };
         };
     };
+    confirm_email_magic: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfirmEmailMagicRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailProofResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
     exchange_handoff: {
         parameters: {
             query?: never;
@@ -901,6 +1319,574 @@ export interface operations {
                 };
             };
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    confirm_identity_mutation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent: string;
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfirmHostedIdentityMutationRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostedIdentityMutationResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    begin_identity_mutation_email_challenge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent: string;
+                project_public_id: string;
+                proof_slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BeginIdentityMutationEmailChallengeRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMutationEmailChallengeResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    verify_identity_mutation_email_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent: string;
+                project_public_id: string;
+                proof_slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyIdentityMutationEmailLinkRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMutationProofStateResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    verify_identity_mutation_email_otp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent: string;
+                project_public_id: string;
+                proof_slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyIdentityMutationEmailOtpRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMutationProofStateResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    select_identity_mutation_method: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent: string;
+                project_public_id: string;
+                proof_slot: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SelectIdentityMutationMethodRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMutationMethodResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    begin_email_challenge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                interaction: string;
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BeginEmailChallengeRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailChallengeAcceptedResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    verify_email_otp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                interaction: string;
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyEmailOtpRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailProofResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    resend_email_challenge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                interaction: string;
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BeginEmailChallengeRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailChallengeAcceptedResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    select_email: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                interaction: string;
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SelectEmailRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CompletionResponse"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1073,6 +2059,66 @@ export interface operations {
             };
             503: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    start_managed_reauthorization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                interaction: string;
+                project_public_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StartManagedReauthorizationRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NavigationResponse"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {

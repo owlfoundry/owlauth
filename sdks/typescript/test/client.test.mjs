@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   AccessToken,
@@ -57,6 +60,8 @@ function projection(revision = 1) {
     projection_revision: revision,
     display_name: "Ada",
     picture_url: null,
+    locale: "en-GB",
+    verified_email: null,
     status: "active",
     created_at: "2026-07-30T00:00:00Z",
     updated_at: "2026-07-30T00:00:00Z",
@@ -147,6 +152,9 @@ test("Client enforces secure immutable Runtime context and preserves a path pref
         application_display_name: "App",
         publishable_keys: [KEY],
         providers: [],
+        email_available: true,
+        email_otp_enabled: true,
+        email_magic_link_enabled: true,
         login_available: true,
       }),
     ], calls),
@@ -284,6 +292,9 @@ test("public configuration and JWKS are bounded and context checked", async () =
       application_display_name: "App",
       publishable_keys: [KEY],
       providers: [{ key: "oidc", display_name: "OIDC", kind: "oidc", future: true }],
+      email_available: false,
+      email_otp_enabled: false,
+      email_magic_link_enabled: false,
       login_available: true,
       future: "ignored",
     }),
@@ -296,6 +307,7 @@ test("public configuration and JWKS are bounded and context checked", async () =
   const instance = client(queuedFetch(responses));
   const config = await instance.getPublicConfiguration();
   assert.equal(config.providers[0].displayName, "OIDC");
+  assert.equal(config.emailAvailable, false);
   const jwks = await instance.getProjectJwks();
   assert.equal(jwks.signingEpoch, 2);
 });
@@ -433,6 +445,8 @@ test("refresh success-response failures quarantine credentials without retry", a
           projectionRevision: 1,
           displayName: null,
           pictureUrl: null,
+          locale: null,
+          verifiedEmail: null,
           status: "active",
           createdAt: "2026-07-30T00:00:00Z",
           updatedAt: "2026-07-30T00:00:00Z",
@@ -500,6 +514,8 @@ test("credential context mismatch is a protocol error before refresh dispatch", 
       projectionRevision: 1,
       displayName: null,
       pictureUrl: null,
+      locale: null,
+      verifiedEmail: null,
       status: "active",
       createdAt: "2026-07-30T00:00:00Z",
       updatedAt: "2026-07-30T00:00:00Z",
@@ -530,6 +546,8 @@ test("refresh transport ambiguity is quarantined and never replayed", async () =
       projectionRevision: 1,
       displayName: null,
       pictureUrl: null,
+      locale: null,
+      verifiedEmail: null,
       status: "active",
       createdAt: "2026-07-30T00:00:00Z",
       updatedAt: "2026-07-30T00:00:00Z",
@@ -555,4 +573,52 @@ test("pre-dispatch cancellation performs no request", async () => {
     (error) => error.category === "Cancelled" && error.code === "cancelled_before_dispatch",
   );
   assert.equal(calls.length, 0);
+});
+
+
+test("user projection requires the exact schema and explicit nullable fields", async () => {
+  const fixture = JSON.parse(
+    await readFile(
+      path.resolve(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "../../spec/fixtures/user-projection-invalid-values.json",
+      ),
+      "utf8",
+    ),
+  );
+  const currentResponse = (wireProjection) =>
+    jsonResponse({
+      project_id: PROJECT,
+      application_id: APPLICATION,
+      user_id: "usr_public",
+      projection: wireProjection,
+      projection_revision: 1,
+      authenticated_at: "2026-07-31T00:00:00Z",
+      session_expires_at: "2026-08-30T00:00:00Z",
+    });
+
+  const nullable = projection(1);
+  nullable.locale = null;
+  nullable.verified_email = null;
+  const accepted = await client(queuedFetch([currentResponse(nullable)])).currentUser(
+    new AccessToken("access"),
+  );
+  assert.equal(accepted.projection.locale, null);
+  assert.equal(accepted.projection.verifiedEmail, null);
+
+  const fixtureInvalid = fixture.invalidPatches.map(({ field, value }) => ({
+    ...fixture.projection,
+    [field]: value,
+  }));
+  for (const invalid of [
+    { ...projection(1), projection_schema: "owlauth.project_user.v1" },
+    Object.fromEntries(Object.entries(projection(1)).filter(([key]) => key !== "locale")),
+    { ...projection(1), unexpected: true },
+    ...fixtureInvalid,
+  ]) {
+    await assert.rejects(
+      client(queuedFetch([currentResponse(invalid)])).currentUser(new AccessToken("access")),
+      OwlAuthError,
+    );
+  }
 });

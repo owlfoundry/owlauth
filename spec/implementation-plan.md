@@ -16,18 +16,15 @@
 This document turns the target architecture into an incremental, bottom-up delivery
 sequence for the single `owlauth-server` package, the Runtime Hosted Authentication UI,
 and the Control Management Console. It includes the server-side well-known descriptor and
-remote HTTP MCP adapter and coordinates official SDK delivery gates when real Runtime
-capabilities appear, but not delivery planning for the SaaS service, the CLI's SaaS client,
-or platform/framework SDK wrappers. It does not define another product contract or move
-behavioral authority out of the concern-specific specifications.
+remote HTTP MCP adapter. Official SDK contract convergence and documentation are a later,
+server-independent Block E; the server blocks do not wait on SDK design. This plan does not cover
+the SaaS service, the CLI's SaaS client, or platform/framework SDK wrappers, define another product
+contract, or move behavioral authority out of the concern-specific specifications.
 
-The repository now retains the production-shaped technical foundation selected by TS-001
-and TS-002: strict typed configuration, embedded migration and DDL-free verification,
-independent Runtime/Control composition and serving pools, an initial private Project Unit
-of Work, endpoint discovery, and separate deterministic embedded web shells. No Project
-Auth product journey exists yet. The remaining plan extends those foundations in substantial
-end-to-end capability blocks rather than treating tables, routes, or static pages as product
-milestones.
+The repository retains the production-shaped technical foundation selected by TS-001 and TS-002,
+and Blocks A through C now provide real provisioning, Project Auth, identity, email, and managed
+connection journeys. The remaining plan extends the server in substantial end-to-end capability
+blocks rather than treating tables, routes, static pages, or SDK packaging as server milestones.
 
 The following rules apply to every delivery block:
 
@@ -160,7 +157,7 @@ AEAD ciphertext in PostgreSQL so replacement is one authoritative transaction; p
 client secrets, SMTP passwords, webhook signing secrets, and private signing keys remain
 external references. None are ordinary plaintext columns.
 
-### 2.3 Contract, generated-client, and SDK increments
+### 2.3 Server contracts and hosted-web generated clients
 
 `owlauth-types` exports two complete OpenAPI 3.1 documents without compiling
 `owlauth-server`. Runtime and Control DTO modules remain disjoint. A contract increment
@@ -184,15 +181,11 @@ Representative contract families are those owned by specs 05 and 11:
 - the revisioned bounded user projection on successful handoff/current-user/refresh
   results, plus immutable signed webhook event envelopes for Application backends.
 
-Official SDK operations land only after the corresponding Runtime contract and application
-service are real. The core packages own protocol-safe transport, PKCE/state generation,
-callback validation, one-use/ambiguous request semantics, Project/Application isolation,
-redaction, and stable errors. They return pending-login and credential state explicitly;
-Applications or separately versioned integration libraries own navigation, history
-mutation, persistence, refresh serialization, automatic session management, and framework
-bindings. TypeScript continues to publish one `@owlauth/client` artifact with one
-Web-standard core for its declared browser and Node.js matrices; this phase adds neither a
-separate browser package nor an `@owlauth/client/browser` entry point.
+Existing SDK code may follow an implemented Runtime contract, but it is not an exit dependency for
+Blocks A through D. Block E will select and enforce one language-neutral contract/conformance
+scheme after the server surface is stable, then converge the TypeScript, Python, and Rust SDKs and
+documentation together. Until then, server and hosted-web changes remain authoritative through
+`owlauth-types`, exported OpenAPI, serialization tests, and real server/browser journeys.
 
 This plan does not freeze route spellings that spec 11 has not assigned. Contract review
 must prove exact Project/Application/redirect/PKCE binding, enumeration-safe email
@@ -237,7 +230,8 @@ flowchart LR
     F[Retained technical foundation] --> A[Block A: provisioning and login readiness]
     A --> B[Block B: complete federated Project Auth]
     B --> C[Block C: identity methods and managed connections]
-    C --> D[Block D: Application synchronization and production closure]
+    C --> D[Block D: Application synchronization and server hardening]
+    D --> E[Block E: SDK contract convergence and documentation]
 ```
 
 A block is the externally meaningful completion boundary. Its internal migration groups,
@@ -510,15 +504,10 @@ product, not a one-shot callback demo.
    selected-provider/progress/completion states, safe local restart/error paths,
    accessibility, and exact Application return. It receives only opaque interaction state
    and bounded public presentation data.
-7. Implement the official SDK protocol APIs only for these real Runtime paths. They expose
-   explicit pending-login and credential values and preserve PKCE, context binding,
-   one-use/ambiguous request, retry, redaction, and stable-error invariants without owning
-   navigation, history, persistence, refresh coordination, automatic sessions, or framework
-   state. TypeScript ships the same Web-standard `@owlauth/client` core to its declared
-   browser and Node.js matrices, with no separate browser artifact or `/browser` entry.
-8. Add server-backed SDK conformance only for real implemented Runtime paths. All three
-   SDK suites exercise the same started server and shared behavioral fixtures; no fake E2E
-   job is introduced or retained.
+7. Keep any existing SDK protocol code limited to real Runtime paths, without making SDK design,
+   packaging, or cross-language parity an exit dependency for this server block.
+8. Defer language-neutral SDK contract selection, three-language convergence, server-backed SDK
+   conformance, and SDK release claims to Block E.
 
 #### B.4 Risk gates and acceptance
 
@@ -546,15 +535,10 @@ The block exits only when:
   negative vectors reject cross-Project issuer/audience, wrong Application policy where
   additionally restricted, unknown/revoked `kid`, algorithm confusion, wrong type, and
   premature/expired tokens;
-- concurrent refresh and later reuse revoke the complete family; an ambiguous lost
-  response requires reauthentication rather than repeated use of the old token; SDK tests
-  prove no blind replay, while the test Application explicitly serializes each family and
-  atomically replaces or quarantines caller-owned credentials;
-- the same published `@owlauth/client` artifact exercises every browser-callable core
-  operation in every declared Node.js version and supported browser engine through
-  Web-standard APIs; the browser-direct test Application owns navigation, history cleanup,
-  pending/credential state, refresh serialization, and atomic replacement, while the SDK
-  closure has no Node-only dependency or implicit platform/session side effect;
+- concurrent refresh and later reuse revoke the complete family; an ambiguous lost response
+  requires reauthentication rather than repeated use of the old token, while the real test
+  Application explicitly serializes each family and atomically replaces or quarantines caller-owned
+  credentials;
 - Application logout leaves other Applications and the Project browser session valid,
   while Project browser logout blocks refresh for every derived Application session;
 - Project/Application/user/provider/assignment disablement is observed after PostgreSQL
@@ -571,9 +555,7 @@ The block exits only when:
   real application services, and a controlled standards-compatible provider through the
   production adapter; a real Application backend exchanges the handoff, verifies the JWT
   signature and complete trust namespace against Project JWKS, and performs
-  refresh/current-user/logout, including cross-Project and malformed-token rejection; the
-  browser-direct SDK matrix and backend-custody product topology are distinct required
-  evidence and neither substitutes for the other;
+  refresh/current-user/logout, including cross-Project and malformed-token rejection;
 - redirect abuse, DOM injection, CSP, no-store, referrer suppression, cookie path,
   same-origin CSRF, origin/fetch metadata, and cross-plane asset/route tests pass;
 - Redis loss or staleness never converts denial, revocation, duplicate use, or
@@ -588,7 +570,7 @@ reviewed provider now has a complete maintainable Project Auth and session journ
 additional providers must reuse the same port and conformance suite rather than fork
 policy.
 
-### Block C — Identity methods and managed connections
+### Block C — Identity methods and managed connections — completed
 
 **Capability outcome:** the stable Project Auth kernel gains first-party verified email
 OTP and magic-link login, managed provider-connection lifecycle, bounded login-time and
@@ -708,8 +690,9 @@ The block exits only when:
   different-user-agent completion preserves the exact transaction and Application PKCE;
   policy-denied transfer, wrong PKCE, stale revision, or replay still fails generically;
 - Project SMTP and explicit deployment fallback, generation replacement,
-  disable/compromise races, delivery retry/exhaustion, restart, backup/restore, TLS
-  downgrade/certificate failure, and redaction pass through real outbox and SMTP adapters;
+  disable/compromise races, delivery retry/exhaustion, restart, restored-state validation, TLS
+  downgrade/certificate failure, and redaction pass through real outbox and SMTP adapters; the
+  repository documents the consistent backup set but does not operate deployment backups;
   destination tests cover full CNAME/A/AAAA chains, an explicitly allowlisted private SMTP
   relay, unlisted private targets, mixed allowed/denied answers, IPv4-mapped IPv6,
   link-local/metadata/cross-plane targets, IP pinning, rebinding, redirect denial, and proxy
@@ -720,7 +703,7 @@ The block exits only when:
 - a delivered proof is denied after its pinned SMTP generation becomes compromised;
   email canonicalization/digest changes preserve uniqueness through dual lookup and alias
   backfill without duplicate identities; long-term PII key rotation proves re-encryption
-  before retirement, backup/restore preserves alias and key-version inventory plus
+  before retirement, documented restore invariants preserve alias and key-version inventory plus
   ciphertext, and missing required long-term key material makes the affected email
   capability explicitly unready/fail-closed rather than guessing or losing identities;
 - managed-connection transition, stale-revision, login-time/background sync,
@@ -742,18 +725,49 @@ The block exits only when:
   provider adapter, handoff/session kernel, and reauthorization paths without UI-level
   mocked completion.
 
+#### C.5 Closure record
+
+Block C closes on the server capability itself, not on repeated full-repository, packaging, SDK, or
+production-operations reviews. The frozen capability includes identity/email/managed-connection
+state, PostgreSQL authority and migrations, Runtime and Control HTTP contracts, Hosted and Console
+flows, cross-language wire facts already consumed by existing clients, and real public-boundary
+browser journeys. Its proportional closure evidence is:
+
+- immutable checksums for the three Block C migrations plus clean/populated/concurrent/verify and
+  repository rollback coverage;
+- focused PostgreSQL identity, email, managed-connection, projection, session, recovery, and
+  key-inventory suites;
+- server formatting, Clippy, library tests, hosted-web check/build/contract/plane-boundary gates,
+  and the focused real PostgreSQL identity browser specification;
+- `make dev` startup with Runtime health/readiness and the Control Console reachable from the public
+  disposable `.env.example` configuration.
+
+A deliberately slow five-minute browser wait is not required because expiry authority is already
+proved against PostgreSQL; browser tests prove transport and presentation rather than duplicate the
+clock. Partial state/cookie swaps are tested, while theft of the complete bearer-cookie capability
+set is not claimed detectable.
+
+Deployment backup scheduling, restore orchestration, and production operations are outside this
+repository. Block D documents the authoritative PostgreSQL/external-store backup set, PostgreSQL
+backup/PITR and restore best practices, verify-mode restart, and fail-closed server semantics; it
+does not build an operations platform. Server hardening, image/package qualification, and
+Application synchronization remain Block D. Three-language SDK convergence, SDK packaging matrices,
+and end-user documentation belong to Block E. None of these reopen Block C.
+
 **Explicit exclusions and honest claim:** Applications still receive user state only in
 synchronous Runtime projection responses. Signed asynchronous projection webhooks,
 application-wide directory export, SCIM, LDAP, password authentication, SMS, and downstream
 provider-token brokering remain absent.
 
-### Block D — Application synchronization and production closure
+### Block D — Application synchronization and server hardening
 
-**Capability outcome:** Applications can maintain a bounded local user view through the
-existing revisioned Runtime projection and signed durable asynchronous projection events;
-operators can configure, inspect, rotate, and replay that delivery safely; and the complete
-implemented product is qualified for combined/split operation, worker recovery,
-backup/restore, CLI/MCP administration, SDK conformance, and release packaging.
+**Capability outcome:** Applications can maintain a bounded local user view through the existing
+revisioned Runtime projection and signed durable asynchronous projection events; operators can
+configure, inspect, rotate, and replay that delivery safely; and the standalone server is hardened
+for combined/split operation, worker recovery semantics, CLI/MCP administration, and server release
+packaging. Deployment backup/restore and production operations remain operator responsibilities;
+the repository provides PostgreSQL-oriented guidance and validation boundaries. SDK convergence and
+documentation are independent Block E work.
 
 #### D.1 Projection evolution and immutable event state
 
@@ -799,7 +813,7 @@ backup/restore, CLI/MCP administration, SDK conformance, and release packaging.
    recovery workflows through the generated Control client. Application receiver E2E uses
    the real server, worker, signer, PostgreSQL outbox, and HTTP receiver across restart.
 
-#### D.3 Operational breadth and release qualification
+#### D.3 Server hardening and release qualification
 
 1. Add remaining approved provider adapters only through the established provider
    conformance suite, then complete reviewed Control user/identity/session/policy/audit
@@ -813,12 +827,13 @@ backup/restore, CLI/MCP administration, SDK conformance, and release packaging.
    deadline policy, retention, audit query bounds, Project-specific capability health, and
    load/backlog controls so background work cannot starve callback/handoff/refresh.
 4. Exercise signer, data-protection, email digest/PII, managed-credential, SMTP, webhook,
-   and operator-key rotation; migration lock contention; external outages; shutdown;
-   short- and long-term key loss; and complete backup/restore inventory and recovery.
+   and operator-key rotation; migration lock contention; external outages; shutdown; and short- and
+   long-term key loss. Document the exact PostgreSQL/external-store/key backup set, consistent
+   snapshot or PITR requirement, restore ordering, verify-mode restart, and fail-closed missing
+   reference behavior without implementing backup scheduling or restore orchestration.
 5. Prove expand/migrate/switch/contract compatibility, identical embedded asset digests,
-   source-free/no-network runtime images, package contents/licenses, server-backed
-   three-SDK conformance, the same `@owlauth/client` artifact across its declared Node.js
-   and browser matrices, and release/container smoke behavior.
+   source-free/no-network runtime images, server package contents/licenses, and server
+   release/container smoke behavior.
 6. Retain the server-owned origin-root well-known descriptor and add the self-hosted
    Streamable HTTP MCP Control adapter over stable reviewed application services:
    standards-conformant initialization/tool discovery, per-request `owl_ctrl` admission,
@@ -863,9 +878,11 @@ The block exits only when:
   plane introduces cross-plane RPC authority;
 - load tests prove bounded callback/handoff/refresh, mail, provider-sync, webhook, cleanup,
   audit, and Control-list behavior with Project fairness and no unbounded queue or query;
-- restore resumes only committed generations, cursors, leases, and outboxes; loss of an
-  external reference fails its purpose closed, Redis remains disposable, and retained key
-  material is not retired before proven re-encryption or expiry;
+- after an operator restores a consistent PostgreSQL/external-store/key snapshot, verify-mode
+  startup accepts only exact migration history and server recovery uses only committed generations,
+  cursors, leases, and outboxes; loss of an external reference fails its purpose closed, Redis
+  remains disposable, and retained key material is not retired before proven re-encryption or
+  expiry;
 - CLI discovery tests cover first use, confirmation, malformed/unsupported descriptors,
   redirect/TLS/cross-origin rejection, every identity pin, invalid product/credential
   pairing, and authenticated transport/version failures with proof of no pre-release
@@ -878,17 +895,56 @@ The block exits only when:
   wrong audience/deployment/endpoint, Runtime-route use, concurrent commit, and process
   restart, with exactly one
   atomic capability-consumption/mutation/audit winner;
-- package, offline crate, binary, container, licenses, migration/readiness, web digests,
-  and server-backed SDK artifacts pass the release qualification matrix; TypeScript
-  publishes one `@owlauth/client` artifact, and browser compatibility is proven on that
-  artifact rather than a divergent browser package or entry point;
+- server package, offline crate, binary, container, licenses, migration/readiness, and web
+  digests pass the server release qualification matrix;
 - no password authentication, silent email linking, downstream provider-token broker,
   SCIM, bulk directory, server-side Control principal/session, local MCP process, or SaaS
   tenant/RBAC behavior has entered the standalone server accidentally.
 
-**Exit condition:** release evidence covers every implemented product journey, security
-boundary, external-effect ambiguity, split-plane failure, and recovery path. A green build
-of isolated mocks or static shells is insufficient.
+**Exit condition:** server release evidence covers every implemented product journey, security
+boundary, external-effect ambiguity, split-plane failure, and recovery path. A green build of
+isolated mocks, static shells, or SDK-only tests is insufficient.
+
+### Block E — SDK contract convergence and documentation
+
+**Capability outcome:** after the server contract is stable, the TypeScript, Python, and Rust SDKs
+consume one language-neutral protocol authority, prove equivalent safety semantics against the same
+started server, and publish documentation that describes only implemented behavior. Existing SDK
+code is input to this block and may be retained where it already conforms; it does not constrain
+server design.
+
+#### E.1 Contract authority and conformance model
+
+1. Treat Rust DTOs and the two exported OpenAPI documents as the wire-shape authority. Select one
+   reproducible normalization/generation workflow for SDK inputs without requiring every SDK
+   implementation to be mechanically generated.
+2. Maintain one language-neutral conformance corpus under `sdks/spec/` for requests, responses,
+   errors, unknown values, PKCE/token lifecycle, one-use and ambiguous outcomes, redaction, and
+   projection semantics. Fixtures describe public protocol facts, never server internals.
+3. Add a drift gate that exports the server contracts, derives or validates the SDK contract input,
+   and runs all three SDK suites against the same started server. Contract drift must fail before
+   publication; no fake server E2E substitutes for this gate.
+
+#### E.2 SDK convergence and documentation
+
+1. Audit the existing TypeScript, Python, and Rust clients against the common contract and fixtures;
+   keep correct code, remove divergent handwritten wire assumptions, and preserve each language's
+   idioms without changing protocol meaning.
+2. Keep core SDK ownership limited to transport safety, explicit pending/credential state, PKCE,
+   token lifecycle, stable errors, and redaction. Navigation, persistence, framework sessions, and
+   automatic refresh coordination remain Application or integration-library concerns.
+3. Publish one `@owlauth/client` Web-standard core across its declared browser and Node.js matrices,
+   plus independently versioned Python and Rust packages with aligned capability declarations.
+4. Build reference and journey documentation from the stable server contract and real examples.
+   Document exclusions and custody boundaries explicitly; do not document planned or simulated
+   capabilities as available.
+
+#### E.3 Risk gates and acceptance
+
+Block E exits only when contract export is reproducible, all three clients pass the shared fixture
+and same-server conformance suites, supported runtime matrices exercise the published artifacts,
+package contents and licenses pass, and documentation links every claimed SDK operation to a real
+server route and tested journey.
 
 ## 5. Journey-to-block traceability
 
@@ -904,7 +960,8 @@ of isolated mocks or static shells is insufficient.
 | End user/operator links, reauthorizes, revokes, disconnects, or merges identities        | C                    | delivery and operational inspection in D                      |
 | Application receives signed changes and operator replays immutable events                | D                    | ongoing compatibility and release qualification               |
 | Operator CLI discovers/pins self-hosted endpoint and remote MCP exposes bounded tools    | D                    | SaaS CLI/MCP remains in the separate SaaS plan                |
-| Split deployment upgrades, degrades, backs up, restores, and releases safely             | D                    | ongoing release qualification                                 |
+| Operator follows documented PostgreSQL backup/restore guidance; server validates restart | D                    | deployment operations remain outside the repository           |
+| Developer integrates through aligned TypeScript, Python, or Rust SDK and documentation   | E                    | independently versioned SDK and docs releases                 |
 
 ## 6. Global definition of done for an implemented capability
 
@@ -926,13 +983,15 @@ A capability is complete only when all applicable items below are true:
   idempotency/reconciliation story, and redaction tests;
 - Runtime and Control DTOs/OpenAPI/clients remain plane-pure and clean regeneration is
   deterministic;
-- official SDK protocol APIs preserve explicit state custody, one-use/ambiguous request
-  safety, and redaction without claiming platform navigation, persistence, refresh
-  coordination, automatic session management, or framework behavior they do not own;
+- when Block E claims SDK support, every official client preserves explicit state custody,
+  one-use/ambiguous request safety, and redaction without claiming platform navigation,
+  persistence, refresh coordination, automatic session management, or framework behavior it does
+  not own;
 - any web workflow uses the real contract, configured plane base, embedded assets, strict
   security headers, accessible interaction, and no secret-bearing browser persistence;
-- combined and relevant split-mode composition, readiness, drain, backup/restore, and
-  dependency-loss behavior are tested;
+- combined and relevant split-mode composition, readiness, drain, restored-state validation,
+  and dependency-loss behavior are tested, while deployment backup/restore operation remains a
+  documented operator responsibility;
 - unit, real-PostgreSQL integration, adapter, HTTP, browser, and server-backed E2E labels
   accurately describe what they exercise;
 - unsupported behavior is absent rather than simulated, including silent email linking,

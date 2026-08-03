@@ -54,6 +54,8 @@ verifiers are redacted by default and are never automatically replayed.
 
 ```python
 current = client.current_user(credentials)
+# Exact `owlauth.user.v1`; None means the Application projection has no admitted value.
+locale, verified_email = current.projection.locale, current.projection.verified_email
 successor = client.refresh(credentials)
 completion = client.logout_application(successor)
 logout_target = client.prepare_browser_logout(successor)

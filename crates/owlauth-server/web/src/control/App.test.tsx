@@ -183,6 +183,15 @@ describe("Control shell", () => {
           status: "active",
           revision: 2,
           assigned_application_ids: [],
+          managed_profile: {
+            supported: true,
+            enabled: true,
+            exact_scopes: ["openid", "profile", "offline_access"],
+            profile_schema: "oidc_userinfo_v1",
+            read_retry_safe: true,
+            renewal_idempotent_replay: false,
+            supports_revocation: true,
+          },
         });
       }
       return new Response(null, { status: 404 });
@@ -239,6 +248,15 @@ describe("Control shell", () => {
       status: "provisioning",
       revision: 1,
       assigned_application_ids: [],
+      managed_profile: {
+        supported: true,
+        enabled: true,
+        exact_scopes: ["openid", "profile", "offline_access"],
+        profile_schema: "oidc_userinfo_v1",
+        read_retry_safe: true,
+        renewal_idempotent_replay: false,
+        supports_revocation: true,
+      },
     };
     let keyReconcileBody: unknown;
     let providerReconcileBody: unknown;
@@ -354,6 +372,15 @@ describe("Control shell", () => {
           status: "active",
           revision: 2,
           assigned_application_ids: [],
+          managed_profile: {
+            supported: true,
+            enabled: true,
+            exact_scopes: ["openid", "profile", "offline_access"],
+            profile_schema: "oidc_userinfo_v1",
+            read_retry_safe: true,
+            renewal_idempotent_replay: false,
+            supports_revocation: true,
+          },
         });
       }
       return new Response(null, { status: 404 });

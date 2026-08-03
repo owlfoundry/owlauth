@@ -13,6 +13,7 @@ import {
   type SigningKey,
   requireData,
 } from "./client";
+import { EmailPanel } from "./EmailPanel";
 import { ProviderPanel } from "./ProviderPanel";
 import { SigningKeyPanel } from "./SigningKeyPanel";
 import { UserSessionPanel } from "./UserSessionPanel";
@@ -71,6 +72,13 @@ export function ProjectWorkspace({
         : (nextApplications[0]?.id ?? null),
     );
   }, [project.id, session]);
+
+  const refreshProjectOwner = useCallback(async () => {
+    const result = await session.client.GET("/v1/projects/{project_id}", {
+      params: { path: { project_id: project.id } },
+    });
+    await onProjectChanged(requireData(result.data, result.error, result.response));
+  }, [onProjectChanged, project.id, session]);
 
   const handleMutationError = useCallback(
     async (error: unknown) => {
@@ -314,9 +322,20 @@ export function ProjectWorkspace({
         )}
       </section>
 
+      <EmailPanel
+        session={session}
+        project={project}
+        applications={applications}
+        onApplicationsChanged={refresh}
+        onProjectChanged={refreshProjectOwner}
+        onError={handleMutationError}
+        setMessage={setMessage}
+      />
       <UserSessionPanel
         session={session}
         project={project}
+        applications={applications}
+        providers={providers}
         onError={handleMutationError}
         setMessage={setMessage}
       />

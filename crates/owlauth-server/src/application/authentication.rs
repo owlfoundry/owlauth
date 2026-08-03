@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -55,6 +57,7 @@ pub(crate) struct CreateLoginTransaction {
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
     pub admitted_providers: Vec<AdmittedProviderMethod>,
+    pub admitted_email: Option<super::AdmittedEmailMethod>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,10 +97,25 @@ pub(crate) struct SelectProviderMethod {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClaimProviderCallback {
+    pub transaction_id: Uuid,
     pub project_public_id: String,
     pub provider_key: String,
     pub upstream_state: VersionedDigest,
     pub browser_binding: VersionedDigest,
+    /// Immutable Runtime key inventory. The repository compares both frozen nonce and PKCE
+    /// versions under the transaction lock before persisting the callback claim.
+    pub readable_key_versions: BTreeSet<i32>,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DenyProviderCallback {
+    pub transaction_id: Uuid,
+    pub project_public_id: String,
+    pub provider_key: String,
+    pub upstream_state: VersionedDigest,
+    pub browser_binding: VersionedDigest,
+    pub safe_outcome: &'static str,
     pub now: OffsetDateTime,
 }
 
@@ -139,6 +157,11 @@ pub(crate) trait AuthenticationRepository: Send + Sync {
         &self,
         command: ClaimProviderCallback,
     ) -> Result<ClaimedProviderExchange, ApplicationError>;
+
+    async fn deny_provider_callback(
+        &self,
+        command: DenyProviderCallback,
+    ) -> Result<LoginTransactionRecord, ApplicationError>;
 
     async fn fail_provider_exchange(
         &self,

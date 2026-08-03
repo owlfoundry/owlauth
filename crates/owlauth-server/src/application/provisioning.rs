@@ -93,6 +93,8 @@ pub(crate) struct ProviderRecord {
     pub callback_url: String,
     pub status: String,
     pub revision: i64,
+    pub managed_profile_enabled: bool,
+    pub managed_profile_revision: i64,
     pub assigned_application_ids: Vec<Uuid>,
 }
 
@@ -137,6 +139,7 @@ pub(crate) struct CreateProvider {
     pub issuer: String,
     pub client_id: String,
     pub client_secret: Zeroizing<String>,
+    pub managed_profile_enabled: bool,
     pub idempotency_key: String,
     pub expected_project_revision: i64,
 }
@@ -177,6 +180,7 @@ pub(crate) struct PrepareProvider {
     pub display_name: String,
     pub issuer: String,
     pub client_id: String,
+    pub managed_profile_enabled: bool,
     pub operation_alias: String,
     pub expected_project_revision: i64,
     pub request_digest: Vec<u8>,
@@ -197,6 +201,7 @@ pub(crate) struct ProviderRecovery {
     pub display_name: String,
     pub issuer: String,
     pub client_id: String,
+    pub managed_profile_enabled: bool,
 }
 
 impl CreateProject {
@@ -835,6 +840,7 @@ impl ProvisioningService {
                 issuer: recovery.issuer,
                 client_id: recovery.client_id,
                 client_secret,
+                managed_profile_enabled: recovery.managed_profile_enabled,
                 idempotency_key: recovery.operation_alias,
                 expected_project_revision,
             },
@@ -983,6 +989,7 @@ async fn create_provider_workflow(
         "display_name": &command.display_name,
         "issuer": &command.issuer,
         "client_id": &command.client_id,
+        "managed_profile_enabled": command.managed_profile_enabled,
         "secret_digest": URL_SAFE_NO_PAD.encode(secret_digest),
     }))?;
     let prepared = providers
@@ -993,6 +1000,7 @@ async fn create_provider_workflow(
                 display_name: command.display_name,
                 issuer: command.issuer,
                 client_id: command.client_id,
+                managed_profile_enabled: command.managed_profile_enabled,
                 operation_alias: command.idempotency_key.clone(),
                 expected_project_revision: command.expected_project_revision,
                 request_digest: digest.clone(),
@@ -1370,6 +1378,8 @@ mod tests {
                 callback_url: "https://identity.example/callback".to_owned(),
                 status: "active".to_owned(),
                 revision: 2,
+                managed_profile_enabled: false,
+                managed_profile_revision: 1,
                 assigned_application_ids: Vec::new(),
             }
         }
@@ -1534,6 +1544,7 @@ mod tests {
             issuer: "https://accounts.example/".to_owned(),
             client_id: "client".to_owned(),
             client_secret: Zeroizing::new("secret".to_owned()),
+            managed_profile_enabled: false,
             idempotency_key: "provider-operation-12345678".to_owned(),
             expected_project_revision: 1,
         }

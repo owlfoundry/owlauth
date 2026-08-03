@@ -15,6 +15,9 @@
         "kind": "oidc"
       }
     ],
+    "email_available": false,
+    "email_otp_enabled": false,
+    "email_magic_link_enabled": false,
     "login_available": true
   }
 }

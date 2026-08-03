@@ -8,6 +8,7 @@ import hmac
 import json
 import re
 import secrets
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -139,6 +140,9 @@ class Client:
             application_display_name=_string(payload, "application_display_name", 128),
             publishable_keys=keys,
             providers=tuple(providers),
+            email_available=_boolean(payload, "email_available"),
+            email_otp_enabled=_boolean(payload, "email_otp_enabled"),
+            email_magic_link_enabled=_boolean(payload, "email_magic_link_enabled"),
             login_available=_boolean(payload, "login_available"),
         )
 
@@ -696,8 +700,47 @@ def _optional_string(value: JsonObject, name: str, maximum: int) -> str | None:
     return _string_value(item, maximum)
 
 
+def _valid_projection_locale(value: str | None) -> bool:
+    if value is None:
+        return True
+    encoded_length = len(value.encode("utf-8"))
+    return (
+        2 <= encoded_length <= 35
+        and not value.startswith("-")
+        and not value.endswith("-")
+        and "--" not in value
+        and all(
+            character.isascii() and (character.isalnum() or character == "-") for character in value
+        )
+    )
+
+
+def _valid_projection_email(value: str | None) -> bool:
+    if value is None:
+        return True
+    encoded_length = len(value.encode("utf-8"))
+    return 3 <= encoded_length <= 320 and not any(
+        unicodedata.category(character) == "Cc" for character in value
+    )
+
+
 def _projection(value: object) -> UserProjection:
     payload = _object(value)
+    fields = {
+        "user_id",
+        "user_revision",
+        "projection_schema",
+        "projection_revision",
+        "display_name",
+        "picture_url",
+        "locale",
+        "verified_email",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+    if set(payload) != fields:
+        raise _protocol("invalid_projection", "Runtime returned an invalid user projection.")
     projection = UserProjection(
         user_id=_string(payload, "user_id", 96),
         user_revision=_positive_int(payload, "user_revision"),
@@ -705,11 +748,19 @@ def _projection(value: object) -> UserProjection:
         projection_revision=_positive_int(payload, "projection_revision"),
         display_name=_optional_string(payload, "display_name", 128),
         picture_url=_optional_string(payload, "picture_url", 2048),
+        locale=_optional_string(payload, "locale", 35),
+        verified_email=_optional_string(payload, "verified_email", 320),
         status=_string(payload, "status", 32),
         created_at=_timestamp(payload, "created_at"),
         updated_at=_timestamp(payload, "updated_at"),
     )
-    if projection.status != "active" or projection.updated_at < projection.created_at:
+    if (
+        projection.projection_schema != "owlauth.user.v1"
+        or projection.status != "active"
+        or not _valid_projection_locale(projection.locale)
+        or not _valid_projection_email(projection.verified_email)
+        or projection.updated_at < projection.created_at
+    ):
         raise _protocol("invalid_projection", "Runtime returned an invalid user projection.")
     return projection
 

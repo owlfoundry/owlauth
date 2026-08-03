@@ -62,6 +62,9 @@ class PublicApplicationConfig:
     application_display_name: str
     publishable_keys: tuple[str, ...]
     providers: tuple[PublicProvider, ...]
+    email_available: bool
+    email_otp_enabled: bool
+    email_magic_link_enabled: bool
     login_available: bool
 
 
@@ -90,6 +93,8 @@ class UserProjection:
     projection_revision: int
     display_name: str | None
     picture_url: str | None
+    locale: str | None
+    verified_email: str | None
     status: str
     created_at: datetime
     updated_at: datetime
@@ -100,7 +105,8 @@ class UserProjection:
             f"user_id={self.user_id!r}, user_revision={self.user_revision!r}, "
             f"projection_schema={self.projection_schema!r}, "
             f"projection_revision={self.projection_revision!r}, "
-            "display_name=<redacted>, picture_url=<redacted>, "
+            "display_name=<redacted>, picture_url=<redacted>, locale=<redacted>, "
+            "verified_email=<redacted>, "
             f"status={self.status!r}, created_at={self.created_at!r}, "
             f"updated_at={self.updated_at!r})"
         )

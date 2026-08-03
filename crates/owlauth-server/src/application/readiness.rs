@@ -15,6 +15,10 @@ pub(crate) struct PublicProvider {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the internal snapshot mirrors orthogonal public capability facts"
+)]
 pub(crate) struct PublicApplicationConfig {
     pub project_public_id: String,
     pub project_display_name: String,
@@ -22,6 +26,9 @@ pub(crate) struct PublicApplicationConfig {
     pub application_display_name: String,
     pub publishable_keys: Vec<String>,
     pub providers: Vec<PublicProvider>,
+    pub email_available: bool,
+    pub email_otp_enabled: bool,
+    pub email_magic_link_enabled: bool,
     pub login_available: bool,
 }
 

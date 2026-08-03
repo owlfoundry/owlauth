@@ -67,8 +67,11 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await expect(page.getByText(/write-only/u)).toBeVisible();
   await expect(page.locator("body")).not.toContainText(providerSecret);
 
-  await page.getByLabel("Assign to Application").selectOption({ label: applicationName });
-  await page.getByRole("button", { name: "Assign", exact: true }).click();
+  const identityProviders = page.getByLabel("Identity providers");
+  await identityProviders
+    .getByLabel("Assign to Application")
+    .selectOption({ label: applicationName });
+  await identityProviders.getByRole("button", { name: "Assign", exact: true }).click();
   await expect(page.getByRole("status")).toContainText("assigned");
 
   const accessibility = await new AxeBuilder({ page }).analyze();

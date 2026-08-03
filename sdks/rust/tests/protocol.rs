@@ -127,6 +127,8 @@ fn projection() -> Value {
         "projection_revision": 1,
         "display_name": "Example User",
         "picture_url": null,
+        "locale": "en-GB",
+        "verified_email": null,
         "status": "active",
         "created_at": "1970-01-01T00:00:00Z",
         "updated_at": "1970-01-01T00:00:00Z"
@@ -792,4 +794,80 @@ fn load_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
     let bytes = fs::read(path).expect("fixture");
     assert!(bytes.len() <= 1_048_576);
     serde_json::from_slice(&bytes).expect("valid strict fixture JSON")
+}
+
+#[tokio::test]
+async fn user_projection_requires_exact_schema_and_explicit_nullable_fields() {
+    fn current_response(projection: &Value) -> Result<HttpResponse, TransportFailure> {
+        response(
+            200,
+            json!({
+                "project_id": "project_public",
+                "application_id": "application_public",
+                "user_id": "user_public",
+                "projection": projection,
+                "projection_revision": 1,
+                "authenticated_at": "1970-01-01T00:00:00Z",
+                "session_expires_at": "1970-01-30T00:00:00Z"
+            }),
+        )
+    }
+
+    let mut nullable = projection();
+    nullable["locale"] = Value::Null;
+    nullable["verified_email"] = Value::Null;
+    let mut wrong_schema = projection();
+    wrong_schema["projection_schema"] = json!("owlauth.project_user.v1");
+    let mut missing_locale = projection();
+    missing_locale.as_object_mut().unwrap().remove("locale");
+    let mut unknown_field = projection();
+    unknown_field["unexpected"] = json!(true);
+
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../spec/fixtures/user-projection-invalid-values.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cases = vec![
+        (nullable, true),
+        (wrong_schema, false),
+        (missing_locale, false),
+        (unknown_field, false),
+    ];
+    for patch in fixture["invalidPatches"].as_array().unwrap() {
+        let mut invalid = fixture["projection"].clone();
+        let field = patch["field"].as_str().unwrap();
+        invalid[field] = patch["value"].clone();
+        cases.push((invalid, false));
+    }
+
+    for (wire_projection, should_accept) in cases {
+        let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+        let transport = Arc::new(MockTransport::with(vec![
+            begin_response(),
+            response(200, credentials(1)),
+            current_response(&wire_projection),
+        ]));
+        let client = client(transport);
+        let login = client
+            .begin_login("https://app.example/callback", None, None)
+            .await
+            .unwrap();
+        let pair = client
+            .complete_login(
+                &format!("https://app.example/callback?handoff=ticket&state={state}"),
+                login.pending,
+            )
+            .await
+            .unwrap();
+        let result = client.current_user(pair.access_token()).await;
+        assert_eq!(result.is_ok(), should_accept);
+        if let Ok(accepted) = result {
+            assert!(accepted.projection.locale.is_none());
+            assert!(accepted.projection.verified_email.is_none());
+        }
+    }
 }
