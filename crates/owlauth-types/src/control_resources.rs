@@ -177,6 +177,197 @@ pub struct ReplaceApplicationConfigurationRequest {
     pub expected_security_revision: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ProjectionPolicy {
+    pub project_id: String,
+    pub application_id: Option<String>,
+    pub verified_email_enabled: bool,
+    #[schema(minimum = 1)]
+    pub revision: i64,
+    pub expansion_operation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct UpdateProjectionPolicyRequest {
+    pub verified_email_enabled: bool,
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookEndpointStatus {
+    Pending,
+    Active,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub enum ApplicationUserEventType {
+    #[serde(rename = "user.projection.created")]
+    Created,
+    #[serde(rename = "user.projection.updated")]
+    Updated,
+    #[serde(rename = "user.projection.disabled")]
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookDeliveryState {
+    Pending,
+    Leased,
+    Delivered,
+    Terminal,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookDeliveryOutcomeClass {
+    Accepted,
+    Transient,
+    Ambiguous,
+    Permanent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct WebhookEndpoint {
+    pub id: String,
+    pub public_id: String,
+    pub project_id: String,
+    pub application_id: String,
+    pub url: String,
+    #[schema(max_items = 3)]
+    pub subscribed_event_types: Vec<ApplicationUserEventType>,
+    pub status: WebhookEndpointStatus,
+    #[schema(minimum = 1)]
+    pub revision: i64,
+    pub current_secret_generation: Option<i32>,
+    pub overlap_secret_generation: Option<i32>,
+    pub overlap_expires_at: Option<String>,
+    pub consecutive_failure_count: i32,
+    pub last_delivery_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_failure_class: Option<String>,
+    pub last_tested_at: Option<String>,
+    pub last_test_succeeded_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct WebhookEndpointList {
+    #[schema(max_items = 100)]
+    pub items: Vec<WebhookEndpoint>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct CreateWebhookEndpointRequest {
+    pub url: String,
+    #[schema(min_items = 1, max_items = 3)]
+    pub subscribed_event_types: Vec<ApplicationUserEventType>,
+    #[schema(min_length = 32, max_length = 128, write_only)]
+    pub secret: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct UpdateWebhookEndpointRequest {
+    #[schema(min_items = 1, max_items = 3)]
+    pub subscribed_event_types: Vec<ApplicationUserEventType>,
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ExpectedWebhookEndpointRevision {
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct PrepareWebhookSecretRotationRequest {
+    #[schema(min_length = 32, max_length = 128, write_only)]
+    pub secret: String,
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookSecretPreparationStatus {
+    Pending,
+    Provisioned,
+    Terminal,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct PreparedWebhookSecretRotation {
+    pub endpoint: WebhookEndpoint,
+    #[schema(minimum = 1)]
+    pub generation: i32,
+    pub preparation_status: WebhookSecretPreparationStatus,
+    pub already_active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ActivateWebhookSecretRotationRequest {
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+    #[schema(minimum = 300, maximum = 86400)]
+    pub overlap_seconds: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
+pub struct ApplicationUserEvent {
+    pub event_id: String,
+    pub project_id: String,
+    pub application_id: String,
+    pub user_id: String,
+    pub event_type: ApplicationUserEventType,
+    pub user_revision: i64,
+    pub projection_revision: i64,
+    pub projection_schema: String,
+    pub safe_body: serde_json::Value,
+    pub occurred_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
+pub struct ApplicationUserEventList {
+    #[schema(max_items = 100)]
+    pub items: Vec<ApplicationUserEvent>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct WebhookDelivery {
+    pub id: String,
+    pub endpoint_id: String,
+    pub event_id: String,
+    pub replay_sequence: i32,
+    pub replay_of_delivery_id: Option<String>,
+    pub state: WebhookDeliveryState,
+    pub attempt_count: i32,
+    pub next_attempt_at: String,
+    pub last_outcome_class: Option<WebhookDeliveryOutcomeClass>,
+    pub last_http_status: Option<i32>,
+    pub delivered_at: Option<String>,
+    pub terminal_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct WebhookDeliveryList {
+    #[schema(max_items = 100)]
+    pub items: Vec<WebhookDelivery>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ReplayWebhookDeliveryRequest {
+    pub confirm: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
 pub struct SigningKey {
     pub id: String,
@@ -240,6 +431,10 @@ pub struct Provider {
     pub callback_url: String,
     pub status: ProviderStatus,
     pub revision: i64,
+    /// Whether this adapter can be selected for ordinary Runtime login.
+    pub login_supported: bool,
+    /// Whether this adapter can serve as an identity-mutation proof authority.
+    pub identity_proof_supported: bool,
     pub managed_profile: ProviderManagedProfileCapability,
     #[schema(max_items = 100)]
     pub assigned_application_ids: Vec<String>,
@@ -253,6 +448,10 @@ pub struct ProviderList {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct CreateProviderRequest {
+    /// Closed adapter kind. Omission is accepted only for compatibility and inferred from the
+    /// exact issuer root by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProviderKind>,
     #[schema(min_length = 1, max_length = 64)]
     pub provider_key: String,
     #[schema(min_length = 1, max_length = 128)]
@@ -1102,6 +1301,202 @@ control_path!(
     params(
         ("project_id" = String, Path),
         ("application_id" = String, Path)
+    )
+);
+control_path!(
+    get_project_projection_policy,
+    get,
+    "/v1/projects/{project_id}/projection-policy",
+    ProjectionPolicy,
+    "Project projection policy",
+    params(("project_id" = String, Path))
+);
+control_path!(
+    update_project_projection_policy,
+    put,
+    "/v1/projects/{project_id}/projection-policy",
+    ProjectionPolicy,
+    "Updated Project projection policy and scheduled bounded convergence",
+    body = UpdateProjectionPolicyRequest,
+    params(("project_id" = String, Path))
+);
+control_path!(
+    get_application_projection_policy,
+    get,
+    "/v1/projects/{project_id}/applications/{application_id}/projection-policy",
+    ProjectionPolicy,
+    "Application projection policy",
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path)
+    )
+);
+control_path!(
+    update_application_projection_policy,
+    put,
+    "/v1/projects/{project_id}/applications/{application_id}/projection-policy",
+    ProjectionPolicy,
+    "Updated Application projection policy and scheduled bounded convergence",
+    body = UpdateProjectionPolicyRequest,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path)
+    )
+);
+control_path!(
+    list_webhook_endpoints,
+    get,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
+    WebhookEndpointList,
+    "Webhook endpoints",
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path)
+    )
+);
+control_path!(
+    create_webhook_endpoint,
+    post,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
+    WebhookEndpoint,
+    "Created pending webhook endpoint",
+    body = CreateWebhookEndpointRequest,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("Idempotency-Key" = String, Header)
+    )
+);
+control_path!(
+    get_webhook_endpoint,
+    get,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}",
+    WebhookEndpoint,
+    "Webhook endpoint",
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = String, Path)
+    )
+);
+control_path!(
+    update_webhook_endpoint,
+    put,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}",
+    WebhookEndpoint,
+    "Updated webhook endpoint subscriptions",
+    body = UpdateWebhookEndpointRequest,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = String, Path)
+    )
+);
+control_path!(
+    test_webhook_endpoint,
+    post,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/test",
+    WebhookEndpoint,
+    "Validated webhook endpoint DNS and destination policy",
+    body = ExpectedWebhookEndpointRevision,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = String, Path)
+    )
+);
+control_path!(
+    activate_webhook_endpoint,
+    post,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/activate",
+    WebhookEndpoint,
+    "Activated a tested webhook endpoint",
+    body = ExpectedWebhookEndpointRevision,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = String, Path)
+    )
+);
+control_path!(
+    disable_webhook_endpoint,
+    post,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/disable",
+    WebhookEndpoint,
+    "Disabled webhook endpoint",
+    body = ExpectedWebhookEndpointRevision,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = String, Path)
+    )
+);
+control_path!(
+    prepare_webhook_secret_rotation,
+    post,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/secret-rotations",
+    PreparedWebhookSecretRotation,
+    "Prepared a write-only webhook secret generation",
+    body = PrepareWebhookSecretRotationRequest,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = String, Path),
+        ("Idempotency-Key" = String, Header)
+    )
+);
+control_path!(
+    activate_webhook_secret_rotation,
+    post,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/secret-rotations/{generation}/activate",
+    WebhookEndpoint,
+    "Activated a prepared webhook secret generation",
+    body = ActivateWebhookSecretRotationRequest,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = String, Path),
+        ("generation" = i32, Path)
+    )
+);
+control_path!(
+    list_application_user_events,
+    get,
+    "/v1/projects/{project_id}/applications/{application_id}/user-events",
+    ApplicationUserEventList,
+    "Immutable Application user events",
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("cursor" = Option<String>, Query),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 100)
+    )
+);
+control_path!(
+    list_webhook_deliveries,
+    get,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries",
+    WebhookDeliveryList,
+    "Webhook delivery history",
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("endpoint_id" = Option<String>, Query),
+        ("cursor" = Option<String>, Query),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 100)
+    )
+);
+control_path!(
+    replay_webhook_delivery,
+    post,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}/replay",
+    WebhookDelivery,
+    "Created a new delivery for the same immutable event and endpoint",
+    body = ReplayWebhookDeliveryRequest,
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("delivery_id" = String, Path)
     )
 );
 control_path!(

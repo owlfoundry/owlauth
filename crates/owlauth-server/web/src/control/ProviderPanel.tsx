@@ -41,6 +41,7 @@ export function ProviderPanel({
     const idempotencyKey = createAttempt.current.begin();
     if (idempotencyKey === null) return;
     const body = {
+      kind: fieldProviderKind(fields),
       provider_key: fieldText(fields, "provider_key"),
       display_name: fieldText(fields, "display_name"),
       issuer: fieldText(fields, "issuer"),
@@ -187,6 +188,16 @@ export function ProviderPanel({
     <section aria-labelledby="providers-heading">
       <h3 id="providers-heading">Identity providers</h3>
       <form className={styles["form"]} onSubmit={(event) => void create(event)}>
+        <label htmlFor="provider-kind">Provider kind</label>
+        <select id="provider-kind" name="kind" defaultValue="oidc" required>
+          <option value="oidc">Generic OIDC</option>
+          <option value="google">Google</option>
+          <option value="github">GitHub</option>
+        </select>
+        <p>
+          Google requires issuer <code>https://accounts.google.com</code>. GitHub requires issuer{" "}
+          <code>https://github.com</code> and is login-only; managed profile sync is unsupported.
+        </p>
         <label htmlFor="provider-key">Provider key</label>
         <input
           id="provider-key"
@@ -233,7 +244,8 @@ export function ProviderPanel({
                 <div>
                   <strong>{provider.display_name}</strong> — {provider.status}
                   <p>
-                    Key: {provider.provider_key}; callback: <code>{provider.callback_url}</code>
+                    Kind: {provider.kind}; key: {provider.provider_key}; callback:{" "}
+                    <code>{provider.callback_url}</code>
                   </p>
                   <p>
                     Managed profile: {provider.managed_profile.enabled ? "enabled" : "disabled"};
@@ -322,4 +334,10 @@ export function ProviderPanel({
 function fieldText(fields: FormData, name: string): string {
   const value = fields.get(name);
   return typeof value === "string" ? value : "";
+}
+
+function fieldProviderKind(fields: FormData): Provider["kind"] {
+  const value = fieldText(fields, "kind");
+  if (value === "oidc" || value === "google" || value === "github") return value;
+  throw new Error("Invalid provider kind");
 }

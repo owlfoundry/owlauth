@@ -7,6 +7,7 @@ use tokio::time::timeout;
 use crate::config::{MigrationMode, PostgresConfig};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+const BINARY_SCHEMA_LEVEL: i64 = 20_260_803_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SchemaError {
@@ -58,15 +59,17 @@ async fn migrate(config: &PostgresConfig) -> Result<(), SchemaError> {
             .map_err(|_| SchemaError::Migration)?;
     }
 
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
     let migration_result =
-        timeout(config.migration_lock_timeout, MIGRATOR.run(&mut connection)).await;
+        timeout(config.migration_lock_timeout, migrator.run(&mut connection)).await;
     match migration_result {
         Ok(Ok(())) => {
             connection
                 .close()
                 .await
                 .map_err(|_| SchemaError::Migration)?;
-            Ok(())
+            verify_url(config.migration_url.expose(), config.connect_timeout).await
         }
         Ok(Err(error)) if is_database_lock_timeout(&error) => Err(SchemaError::LockTimeout),
         Ok(Err(_)) => Err(SchemaError::Migration),
@@ -105,12 +108,28 @@ pub(crate) async fn verify_url(url: &str, deadline: Duration) -> Result<(), Sche
     if rows.iter().any(|(_, success, _)| !success) {
         return Err(SchemaError::DirtyHistory);
     }
-    if rows.len() != expected.len()
-        || rows.iter().zip(expected).any(|(actual, expected)| {
+    if rows.len() < expected.len()
+        || rows.iter().zip(&expected).any(|(actual, expected)| {
             actual.0 != expected.version || actual.2.as_slice() != expected.checksum.as_ref()
         })
     {
         return Err(SchemaError::IncompatibleHistory);
+    }
+    if rows.len() > expected.len() {
+        let minimum_binary_schema_level = timeout(
+            deadline,
+            sqlx::query_scalar::<_, i64>(
+                "SELECT minimum_binary_schema_level FROM schema_compatibility WHERE singleton",
+            )
+            .fetch_optional(&mut connection),
+        )
+        .await
+        .map_err(|_| SchemaError::HistoryUnavailable)?
+        .map_err(|_| SchemaError::IncompatibleHistory)?
+        .ok_or(SchemaError::IncompatibleHistory)?;
+        if minimum_binary_schema_level > BINARY_SCHEMA_LEVEL {
+            return Err(SchemaError::IncompatibleHistory);
+        }
     }
 
     connection

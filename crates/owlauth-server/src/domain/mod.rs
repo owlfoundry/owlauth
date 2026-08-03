@@ -37,6 +37,7 @@ mod provider;
     reason = "authentication application and persistence integration follows this domain-only slice"
 )]
 mod session;
+mod webhook;
 
 pub(crate) use application::{ApplicationStatus, ApplicationType, BrowserOrigin, RedirectUri};
 #[allow(unused_imports, reason = "email lane is integrated incrementally")]
@@ -92,7 +93,10 @@ pub(crate) use project::{
 pub(crate) use projection::{
     ProjectionRevision, USER_PROJECTION_SCHEMA_V1, UserProjection, UserProjectionSource,
 };
-pub(crate) use provider::{ProviderKey, ProviderStatus};
+pub(crate) use provider::{
+    GITHUB_ISSUER, GOOGLE_ISSUER, ManagedProfileCapabilities, ProviderKey, ProviderKind,
+    ProviderStatus,
+};
 #[allow(
     unused_imports,
     reason = "authentication application and persistence integration follows this domain-only slice"
@@ -100,6 +104,10 @@ pub(crate) use provider::{ProviderKey, ProviderStatus};
 pub(crate) use session::{
     ApplicationSessionStatus, BrowserLogoutStatus, BrowserSessionStatus, HandoffStatus,
     RefreshFamilyStatus, RefreshGenerationStatus, RefreshPresentationDecision,
+};
+pub(crate) use webhook::{
+    ApplicationUserEventType, MAX_WEBHOOK_DELIVERY_ATTEMPTS, MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION,
+    WebhookDeliveryOutcome, WebhookEndpointStatus, WebhookEndpointUrl, WebhookSubscriptions,
 };
 
 use thiserror::Error;

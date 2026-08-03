@@ -11,6 +11,14 @@ const policy = {
   session_revision: 1,
 };
 
+const projectionPolicy = {
+  project_id: "11111111-1111-4111-8111-111111111111",
+  application_id: null,
+  verified_email_enabled: false,
+  revision: 1,
+  expansion_operation_id: null,
+};
+
 const project = {
   id: "11111111-1111-4111-8111-111111111111",
   public_id: "prj_public123",
@@ -161,6 +169,8 @@ describe("Control shell", () => {
       if (url.endsWith("/v1/projects") && request.method === "GET") {
         return Response.json({ items: [project] });
       }
+      if (url.endsWith("/projection-policy"))
+        return Promise.resolve(Response.json(projectionPolicy));
       if (url.includes("/applications")) return Response.json({ items: [] });
       if (url.includes("/signing-keys")) return Response.json({ items: [] });
       if (url.endsWith("/policy") && request.method === "GET") {
@@ -220,7 +230,7 @@ describe("Control shell", () => {
     });
     expect((secret as HTMLInputElement).value).toBe("");
     expect(document.body.textContent).not.toContain("never-render-me");
-    expect(providerBody).toMatchObject({ client_secret: "never-render-me" });
+    expect(providerBody).toMatchObject({ kind: "oidc", client_secret: "never-render-me" });
   });
 
   it("resumes durable key and provider operations after page state is lost", async () => {
@@ -274,6 +284,8 @@ describe("Control shell", () => {
       if (url.endsWith("/v1/projects") && request.method === "GET") {
         return Response.json({ items: [project] });
       }
+      if (url.endsWith("/projection-policy"))
+        return Promise.resolve(Response.json(projectionPolicy));
       if (url.includes("/applications")) return Response.json({ items: [] });
       if (url.endsWith("/signing-keys") && request.method === "GET") {
         return Response.json({ items: [signingKey] });
@@ -342,6 +354,8 @@ describe("Control shell", () => {
       if (url.endsWith("/v1/projects") && request.method === "GET") {
         return Response.json({ items: [project] });
       }
+      if (url.endsWith("/projection-policy"))
+        return Promise.resolve(Response.json(projectionPolicy));
       if (url.includes("/applications")) return Response.json({ items: [] });
       if (url.includes("/signing-keys")) return Response.json({ items: [] });
       if (url.endsWith("/policy") && request.method === "GET") return Response.json(policy);
@@ -454,6 +468,8 @@ describe("Control shell", () => {
           ),
         );
       }
+      if (url.endsWith("/projection-policy"))
+        return Promise.resolve(Response.json(projectionPolicy));
       if (url.includes("/applications")) {
         return Promise.resolve(Response.json({ items: [] }));
       }

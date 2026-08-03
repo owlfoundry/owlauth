@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod control;
 mod remote;
 mod update;
 
@@ -28,6 +29,18 @@ enum Command {
     Profile(ProfileArgs),
     /// Read authenticated self-hosted system capabilities.
     System,
+    /// Manage self-hosted Projects and Project policy.
+    Project(control::ProjectArgs),
+    /// Manage self-hosted Applications.
+    Application(control::ApplicationArgs),
+    /// Manage self-hosted upstream providers.
+    Provider(control::ProviderArgs),
+    /// Manage self-hosted Project signing keys.
+    SigningKey(control::SigningKeyArgs),
+    /// Manage Project or Application projection policy.
+    ProjectionPolicy(control::ProjectionPolicyArgs),
+    /// Manage webhook endpoints and inspect deliveries.
+    Webhook(control::WebhookArgs),
     /// Update this CLI from an `OwlAuth` GitHub Release.
     Update(update::UpdateArgs),
 }
@@ -69,9 +82,9 @@ enum ProfileCommand {
         name: String,
         #[arg(long)]
         endpoint: String,
-        /// Environment variable that will provide the new credential.
+        /// New environment-variable reference; it must differ from the old reference.
         #[arg(long)]
-        credential_env: Option<String>,
+        credential_env: String,
         /// Confirm the displayed old and new identities.
         #[arg(long)]
         yes: bool,
@@ -99,9 +112,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 endpoint,
                 credential_env,
                 yes,
-            } => remote::rebind_profile(&name, &endpoint, credential_env.as_deref(), yes)?,
+            } => remote::rebind_profile(&name, &endpoint, &credential_env, yes)?,
         },
         Some(Command::System) => remote::system(cli.profile.as_deref())?,
+        Some(Command::Project(args)) => control::run_project(cli.profile.as_deref(), args)?,
+        Some(Command::Application(args)) => {
+            control::run_application(cli.profile.as_deref(), args)?;
+        }
+        Some(Command::Provider(args)) => control::run_provider(cli.profile.as_deref(), args)?,
+        Some(Command::SigningKey(args)) => {
+            control::run_signing_key(cli.profile.as_deref(), args)?;
+        }
+        Some(Command::ProjectionPolicy(args)) => {
+            control::run_projection_policy(cli.profile.as_deref(), args)?;
+        }
+        Some(Command::Webhook(args)) => control::run_webhook(cli.profile.as_deref(), args)?,
         Some(Command::Update(args)) => update::run(&args)?,
         None => {
             Cli::command().print_help()?;
@@ -118,5 +143,208 @@ fn main() -> ExitCode {
             eprintln!("owlauth: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebind_requires_an_explicit_new_credential_reference() {
+        assert!(
+            Cli::try_parse_from([
+                "owlauth",
+                "profile",
+                "rebind",
+                "local",
+                "--endpoint",
+                "https://admin.example.com",
+                "--yes",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn high_impact_commands_refuse_before_profile_or_credential_access() {
+        let cli = Cli::try_parse_from([
+            "owlauth",
+            "project",
+            "policy",
+            "set",
+            "11111111-1111-4111-8111-111111111111",
+            "--access-token-lifetime-seconds",
+            "900",
+            "--browser-session-reuse",
+            "false",
+            "--expected-claims-revision",
+            "1",
+            "--expected-session-revision",
+            "1",
+        ])
+        .unwrap();
+        let error = run(cli).unwrap_err();
+        assert!(error.to_string().contains("explicit --yes confirmation"));
+    }
+
+    #[test]
+    fn replacement_policy_booleans_require_explicit_true_or_false_values() {
+        let project_policy = |value: Option<&str>| {
+            let mut arguments = vec![
+                "owlauth",
+                "project",
+                "policy",
+                "set",
+                "11111111-1111-4111-8111-111111111111",
+                "--access-token-lifetime-seconds",
+                "900",
+            ];
+            if let Some(value) = value {
+                arguments.extend(["--browser-session-reuse", value]);
+            }
+            arguments.extend([
+                "--expected-claims-revision",
+                "1",
+                "--expected-session-revision",
+                "1",
+                "--yes",
+            ]);
+            Cli::try_parse_from(arguments)
+        };
+        assert!(project_policy(None).is_err());
+        assert!(project_policy(Some("true")).is_ok());
+        assert!(project_policy(Some("false")).is_ok());
+
+        let projection_policy = |value: Option<&str>| {
+            let mut arguments = vec![
+                "owlauth",
+                "projection-policy",
+                "set",
+                "11111111-1111-4111-8111-111111111111",
+            ];
+            if let Some(value) = value {
+                arguments.extend(["--verified-email-enabled", value]);
+            }
+            arguments.extend(["--expected-revision", "1", "--yes"]);
+            Cli::try_parse_from(arguments)
+        };
+        assert!(projection_policy(None).is_err());
+        assert!(projection_policy(Some("true")).is_ok());
+        assert!(projection_policy(Some("false")).is_ok());
+    }
+
+    #[test]
+    fn new_high_impact_commands_refuse_before_profile_or_credential_access() {
+        const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
+        const APPLICATION: &str = "22222222-2222-4222-8222-222222222222";
+        const TARGET: &str = "33333333-3333-4333-8333-333333333333";
+        let commands = [
+            vec![
+                "owlauth",
+                "project",
+                "user",
+                "disable",
+                PROJECT,
+                TARGET,
+                "--expected-security-revision",
+                "1",
+            ],
+            vec![
+                "owlauth",
+                "project",
+                "user",
+                "revoke-application-session",
+                PROJECT,
+                TARGET,
+                APPLICATION,
+                "--expected-session-revision",
+                "1",
+            ],
+            vec![
+                "owlauth",
+                "webhook",
+                "endpoint",
+                "update",
+                PROJECT,
+                APPLICATION,
+                TARGET,
+                "--event",
+                "created",
+                "--expected-revision",
+                "1",
+            ],
+            vec![
+                "owlauth",
+                "webhook",
+                "endpoint",
+                "activate-secret-rotation",
+                PROJECT,
+                APPLICATION,
+                TARGET,
+                "2",
+                "--expected-revision",
+                "1",
+                "--overlap-seconds",
+                "600",
+            ],
+            vec![
+                "owlauth",
+                "webhook",
+                "delivery",
+                "replay",
+                PROJECT,
+                APPLICATION,
+                TARGET,
+            ],
+        ];
+        for arguments in commands {
+            let error = run(Cli::try_parse_from(arguments).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("explicit --yes confirmation"));
+        }
+    }
+
+    #[test]
+    fn write_only_secrets_accept_only_environment_references() {
+        let provider = [
+            "owlauth",
+            "provider",
+            "create",
+            "11111111-1111-4111-8111-111111111111",
+            "--kind",
+            "github",
+            "--provider-key",
+            "github",
+            "--display-name",
+            "GitHub",
+            "--issuer",
+            "https://github.com",
+            "--client-id",
+            "client",
+            "--client-secret",
+            "must-not-be-argv",
+            "--expected-project-revision",
+            "1",
+            "--idempotency-key",
+            "provider_create_1",
+        ];
+        assert!(Cli::try_parse_from(provider).is_err());
+
+        let webhook_rotation = [
+            "owlauth",
+            "webhook",
+            "endpoint",
+            "prepare-secret-rotation",
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "--secret",
+            "must-not-be-argv",
+            "--expected-revision",
+            "1",
+            "--idempotency-key",
+            "webhook_rotate_1",
+        ];
+        assert!(Cli::try_parse_from(webhook_rotation).is_err());
     }
 }

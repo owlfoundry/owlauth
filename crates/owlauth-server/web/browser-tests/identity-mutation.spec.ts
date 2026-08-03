@@ -1122,7 +1122,16 @@ async function control<T = unknown>(
   idempotencyKey?: string,
 ): Promise<T> {
   const response = await controlRaw(request, method, path, data, idempotencyKey);
-  expect(response.ok(), `${method} ${path}: ${await response.text()}`).toBe(true);
+  if (!response.ok()) {
+    const [problem, runtime, control] = await Promise.all([
+      response.text(),
+      readFile(runtimeLog, "utf8"),
+      readFile(controlLog, "utf8"),
+    ]);
+    throw new Error(
+      `${method} ${path}: ${problem}\nRuntime log tail:\n${tail(runtime)}\nControl log tail:\n${tail(control)}`,
+    );
+  }
   return (await response.json()) as T;
 }
 function controlRaw(
@@ -1146,6 +1155,9 @@ function only<T>(values: T[]): T {
   const value = values[0];
   if (value === undefined) throw new Error("expected one item");
   return value;
+}
+function tail(value: string): string {
+  return value.split("\n").slice(-80).join("\n");
 }
 function required(name: string): string {
   const value = process.env[name];

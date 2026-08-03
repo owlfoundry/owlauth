@@ -84,6 +84,12 @@ Redis may coordinate limits and cache public derived data. A cache hit cannot tu
 
 SQLx 0.9 embeds ordered migrations, uses its PostgreSQL history/checksum validation and startup locking, and applies them before readiness in default `auto` mode through a capability absent from normal serving pools. DDL-free `verify` mode checks exact compatibility. OwlAuth adds no second checksum subsystem, and SeaORM schema sync is disabled. Migration or schema incompatibility leaves business listeners unready.
 
+## Backup and recovery
+
+Treat PostgreSQL, the signer store, the configuration-secret store, deployment identity and URLs, the operator credential, wrapping keys, and every current or retained protection ring as one recovery set. Use PostgreSQL physical backup plus WAL archiving, or the equivalent managed-service point-in-time recovery facility, and continuously test restoration against a matched copy of external key and secret material. A database-only backup is insufficient; Redis is non-authoritative and is not restored as identity state.
+
+Keep all traffic blocked while restoring. Restore external stores first, then PostgreSQL to the selected point, then the exact process configuration. Start isolated processes with `OWLAUTH_MIGRATION_MODE=verify`, require `/ready`, and treat a missing referenced signer, external secret, or long-term key as a recovery failure rather than generating a replacement. Start the remaining split-plane processes in `verify` mode, confirm durable outbox and lease recovery, and only then reopen traffic. Run any schema upgrade later as a separate reviewed operation. Backup scheduling and restore orchestration remain deployment responsibilities; the detailed checklist is in the [`owlauth-server` operator README](https://github.com/owlfoundry/owlauth/blob/main/crates/owlauth-server/README.md#backup-point-in-time-recovery-and-verify-restart).
+
 ## Keys and secrets
 
 Private signing and data-protection material remains behind Project-aware provider interfaces. PostgreSQL stores public JWKs and opaque key/secret references, not ordinary private keys or provider secret bytes. Redis stores no secret/key authority.
@@ -118,4 +124,3 @@ Runtime and Control use TLS directly or through declared trusted proxies, separa
 No business listener becomes ready before typed configuration, PostgreSQL/schema compatibility, and plane-critical key/data-protection capabilities are valid. Redis failure follows endpoint-specific bounded fallback or fail-closed behavior and never weakens an invariant.
 
 For the complete target rules, see the [Project Auth flow specification](https://github.com/owlfoundry/owlauth/blob/main/spec/03-project-auth-flows-and-security-invariants.md), [operational security specification](https://github.com/owlfoundry/owlauth/blob/main/spec/06-operations-configuration-and-security.md), [identity connection/email/Application sync specification](https://github.com/owlfoundry/owlauth/blob/main/spec/11-identity-connections-passwordless-email-and-user-sync.md), and repository [`SECURITY.md`](https://github.com/owlfoundry/owlauth/blob/main/SECURITY.md).
-com/owlfoundry/owlauth/blob/main/SECURITY.md).

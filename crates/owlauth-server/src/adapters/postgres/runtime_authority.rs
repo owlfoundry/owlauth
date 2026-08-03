@@ -16,8 +16,25 @@ use crate::{
         ProviderRuntimeContext, RuntimeAuthorityRepository, RuntimeProtector, VerificationKey,
         VersionedDigest,
     },
-    domain::LoginTransactionStatus,
+    domain::{LoginTransactionStatus, ProviderKind},
 };
+
+fn validated_login_provider_kind(
+    legacy_kind: &str,
+    adapter_kind: Option<&str>,
+    issuer: &str,
+    managed_profile_enabled: bool,
+) -> Result<ProviderKind, ApplicationError> {
+    let kind = super::effective_provider_kind(legacy_kind, adapter_kind, issuer)?;
+    let capabilities = kind.capabilities();
+    if !capabilities.login
+        || !kind.issuer_matches(issuer)
+        || (managed_profile_enabled && !capabilities.managed_profile)
+    {
+        return Err(ApplicationError::Integrity);
+    }
+    Ok(kind)
+}
 
 use super::{
     authentication::{optional_digest_matches, parse_login_status, persistence},
@@ -191,10 +208,17 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                 .await
                 .map_err(persistence)?
                 .ok_or(ApplicationError::Integrity)?;
-            if provider.kind != "oidc" || provider.secret_ref.is_none() {
+            let kind = validated_login_provider_kind(
+                &provider.kind,
+                provider.adapter_kind.as_deref(),
+                &provider.issuer,
+                provider.managed_profile_enabled,
+            )?;
+            if provider.secret_ref.is_none() {
                 return Err(ApplicationError::Integrity);
             }
             admitted_providers.push(AdmittedProviderMethod {
+                kind,
                 method_key: provider.provider_key,
                 provider_id: provider.id,
                 display_name: provider.display_name,
@@ -491,12 +515,18 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         if assignment.status != "active"
             || Some(provider.revision) != method.provider_revision
             || Some(assignment.security_revision) != method.assignment_security_revision
-            || provider.kind != "oidc"
         {
             return Err(ApplicationError::RevisionConflict);
         }
+        let provider_kind = validated_login_provider_kind(
+            &provider.kind,
+            provider.adapter_kind.as_deref(),
+            &provider.issuer,
+            provider.managed_profile_enabled,
+        )?;
         let result = ProviderRuntimeContext {
             project_id,
+            provider_kind,
             transaction_id,
             provider_id: provider.id,
             provider_key: provider.provider_key,

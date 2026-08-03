@@ -30,9 +30,11 @@ cargo package \
 server_files="$(tar -tzf "$server_archive" | sed 's#^[^/]*/##')"
 grep -qx LICENSE <<< "$server_files"
 grep -qx build.rs <<< "$server_files"
-grep -qx migrations/20260729000000_project_application_core.sql <<< "$server_files"
-grep -qx migrations/20260730000000_control_provisioning_readiness.sql <<< "$server_files"
-grep -qx migrations/20260730010000_policy_signing_safety.sql <<< "$server_files"
+migration_files="$(grep '^migrations/.*\.sql$' <<< "$server_files")"
+[[ "$migration_files" == "migrations/20260803000000_initial.sql" ]]
+grep -qx third-party/README.md <<< "$server_files"
+grep -qx third-party/rmcp/LICENSE <<< "$server_files"
+grep -q 'Apache License' <(tar -xOzf "$server_archive" "owlauth-server-${server_version}/third-party/rmcp/LICENSE")
 grep -qx web/dist/runtime/server-manifest.json <<< "$server_files"
 grep -qx web/dist/control/server-manifest.json <<< "$server_files"
 

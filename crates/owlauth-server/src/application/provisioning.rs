@@ -13,7 +13,7 @@ use super::{
 };
 use crate::domain::{
     ApplicationType, DisplayName, MAX_ACCESS_TOKEN_LIFETIME_SECONDS,
-    MIN_ACCESS_TOKEN_LIFETIME_SECONDS, OpaqueOwner, ProviderKey, PublicId,
+    MIN_ACCESS_TOKEN_LIFETIME_SECONDS, OpaqueOwner, ProviderKey, ProviderKind, PublicId,
 };
 
 const SIGNING_ALGORITHM: &str = "EdDSA";
@@ -134,6 +134,7 @@ pub(crate) struct ReplaceApplicationConfiguration {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CreateProvider {
+    pub kind: ProviderKind,
     pub provider_key: String,
     pub display_name: String,
     pub issuer: String,
@@ -176,6 +177,7 @@ pub(crate) struct SigningKeyActivationCandidate {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PrepareProvider {
+    pub kind: ProviderKind,
     pub provider_key: String,
     pub display_name: String,
     pub issuer: String,
@@ -197,6 +199,7 @@ pub(crate) struct PreparedProvider {
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderRecovery {
     pub operation_alias: String,
+    pub kind: ProviderKind,
     pub provider_key: String,
     pub display_name: String,
     pub issuer: String,
@@ -242,6 +245,11 @@ impl CreateProvider {
         self.provider_key = ProviderKey::parse(self.provider_key)?.into_inner();
         self.display_name = DisplayName::parse(self.display_name)?.into_inner();
         validate_provider_issuer(&self.issuer, allow_http_loopback)?;
+        if !self.kind.issuer_matches(&self.issuer)
+            || (self.managed_profile_enabled && !self.kind.capabilities().managed_profile)
+        {
+            return Err(ApplicationError::InvalidInput);
+        }
         if self.client_id.is_empty()
             || self.client_id.len() > 512
             || self.client_secret.is_empty()
@@ -292,13 +300,15 @@ fn validate_provider_issuer(
         || (allow_http_loopback
             && url.scheme() == "http"
             && matches!(url.host_str(), Some("127.0.0.1" | "::1" | "[::1]")));
+    let canonical_serialization = url.as_str() == value
+        || (url.path() == "/" && url.as_str().strip_suffix('/') == Some(value));
     if !accepted_scheme
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || url.as_str() != value
+        || !canonical_serialization
     {
         return Err(ApplicationError::InvalidInput);
     }
@@ -835,6 +845,7 @@ impl ProvisioningService {
             &self.infrastructure,
             project_id,
             CreateProvider {
+                kind: recovery.kind,
                 provider_key: recovery.provider_key,
                 display_name: recovery.display_name,
                 issuer: recovery.issuer,
@@ -985,6 +996,7 @@ async fn create_provider_workflow(
         .request_fingerprint(command.client_secret.as_bytes());
     let digest = infrastructure.digester.digest_json(&json!({
         "project_id": project_id,
+        "kind": command.kind.as_str(),
         "provider_key": &command.provider_key,
         "display_name": &command.display_name,
         "issuer": &command.issuer,
@@ -996,6 +1008,7 @@ async fn create_provider_workflow(
         .prepare_provider(
             project_id,
             PrepareProvider {
+                kind: command.kind,
                 provider_key: command.provider_key,
                 display_name: command.display_name,
                 issuer: command.issuer,
@@ -1539,6 +1552,7 @@ mod tests {
 
     fn provider_command() -> CreateProvider {
         CreateProvider {
+            kind: ProviderKind::Oidc,
             provider_key: "workforce".to_owned(),
             display_name: "Workforce".to_owned(),
             issuer: "https://accounts.example/".to_owned(),
@@ -1551,8 +1565,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_kind_registry_enforces_named_issuer_and_capability() {
+        let mut google = provider_command();
+        google.kind = ProviderKind::Google;
+        google.issuer = crate::domain::GOOGLE_ISSUER.to_owned();
+        google.managed_profile_enabled = true;
+        assert!(google.normalize(false).is_ok());
+
+        let mut github = provider_command();
+        github.kind = ProviderKind::Github;
+        github.issuer = crate::domain::GITHUB_ISSUER.to_owned();
+        assert!(github.normalize(false).is_ok());
+
+        let mut managed_github = provider_command();
+        managed_github.kind = ProviderKind::Github;
+        managed_github.issuer = crate::domain::GITHUB_ISSUER.to_owned();
+        managed_github.managed_profile_enabled = true;
+        assert!(matches!(
+            managed_github.normalize(false),
+            Err(ApplicationError::InvalidInput)
+        ));
+
+        let mut generic_named = provider_command();
+        generic_named.issuer = crate::domain::GOOGLE_ISSUER.to_owned();
+        assert!(matches!(
+            generic_named.normalize(false),
+            Err(ApplicationError::InvalidInput)
+        ));
+    }
+
+    #[test]
     fn provider_issuer_requires_https_unless_exact_loopback_is_enabled() {
         assert!(validate_provider_issuer("https://accounts.example/", false).is_ok());
+        assert!(validate_provider_issuer("https://accounts.example", false).is_ok());
         assert_eq!(
             validate_provider_issuer("http://127.0.0.1:8080/", false),
             Err(ApplicationError::InvalidInput)

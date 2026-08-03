@@ -47,7 +47,7 @@ pub fn get_service_descriptor() -> ServiceDescriptor {
 }
 
 /// Bounded capabilities returned after Control operator authentication.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct SystemCapabilities {
     /// Product identifier for this Control endpoint.
     pub product: String,
@@ -103,6 +103,22 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::update_application,
         crate::control_resources::replace_application_configuration,
         crate::control_resources::disable_application,
+        crate::control_resources::get_project_projection_policy,
+        crate::control_resources::update_project_projection_policy,
+        crate::control_resources::get_application_projection_policy,
+        crate::control_resources::update_application_projection_policy,
+        crate::control_resources::list_webhook_endpoints,
+        crate::control_resources::create_webhook_endpoint,
+        crate::control_resources::get_webhook_endpoint,
+        crate::control_resources::update_webhook_endpoint,
+        crate::control_resources::test_webhook_endpoint,
+        crate::control_resources::activate_webhook_endpoint,
+        crate::control_resources::disable_webhook_endpoint,
+        crate::control_resources::prepare_webhook_secret_rotation,
+        crate::control_resources::activate_webhook_secret_rotation,
+        crate::control_resources::list_application_user_events,
+        crate::control_resources::list_webhook_deliveries,
+        crate::control_resources::replay_webhook_delivery,
         crate::control_resources::list_signing_keys,
         crate::control_resources::create_signing_key,
         crate::control_resources::reconcile_signing_key,
@@ -176,6 +192,26 @@ pub fn get_system() -> SystemCapabilities {
         CreateApplicationRequest,
         UpdateApplicationRequest,
         ReplaceApplicationConfigurationRequest,
+        ProjectionPolicy,
+        UpdateProjectionPolicyRequest,
+        WebhookEndpointStatus,
+        ApplicationUserEventType,
+        WebhookDeliveryState,
+        WebhookDeliveryOutcomeClass,
+        WebhookEndpoint,
+        WebhookEndpointList,
+        CreateWebhookEndpointRequest,
+        UpdateWebhookEndpointRequest,
+        ExpectedWebhookEndpointRevision,
+        PrepareWebhookSecretRotationRequest,
+        WebhookSecretPreparationStatus,
+        PreparedWebhookSecretRotation,
+        ActivateWebhookSecretRotationRequest,
+        ApplicationUserEvent,
+        ApplicationUserEventList,
+        WebhookDelivery,
+        WebhookDeliveryList,
+        ReplayWebhookDeliveryRequest,
         SigningKey,
         SigningKeyList,
         CreateSigningKeyRequest,
@@ -271,6 +307,44 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 #[cfg(test)]
 mod identity_inventory_tests {
     use super::*;
+
+    #[test]
+    fn application_sync_contract_is_typed_bounded_and_control_only() {
+        let document = serde_json::to_value(openapi()).expect("serialize Control OpenAPI");
+        for path in [
+            "/v1/projects/{project_id}/projection-policy",
+            "/v1/projects/{project_id}/applications/{application_id}/projection-policy",
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}",
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/test",
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/activate",
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/secret-rotations",
+            "/v1/projects/{project_id}/applications/{application_id}/user-events",
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries",
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}/replay",
+        ] {
+            assert!(document["paths"][path].is_object(), "missing path: {path}");
+        }
+        assert_eq!(
+            document["components"]["schemas"]["CreateWebhookEndpointRequest"]["properties"]["secret"]
+                ["writeOnly"],
+            true
+        );
+        assert_eq!(
+            document["components"]["schemas"]["WebhookEndpointList"]["properties"]["items"]["maxItems"],
+            100
+        );
+        let endpoint = document["components"]["schemas"]["WebhookEndpoint"].to_string();
+        assert!(!endpoint.contains("secret_ref"));
+        assert!(!endpoint.contains("request_fingerprint"));
+        let runtime =
+            serde_json::to_value(crate::runtime::openapi()).expect("serialize Runtime OpenAPI");
+        assert!(
+            runtime["paths"]
+                ["/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints"]
+                .is_null()
+        );
+    }
 
     #[test]
     fn identity_inventory_contract_is_bounded_redacted_and_control_only() {

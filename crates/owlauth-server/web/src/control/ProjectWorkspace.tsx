@@ -13,6 +13,7 @@ import {
   type SigningKey,
   requireData,
 } from "./client";
+import { ApplicationSyncPanel, ProjectProjectionPanel } from "./ApplicationSyncPanel";
 import { EmailPanel } from "./EmailPanel";
 import { ProviderPanel } from "./ProviderPanel";
 import { SigningKeyPanel } from "./SigningKeyPanel";
@@ -270,6 +271,14 @@ export function ProjectWorkspace({
         </form>
       )}
 
+      <ProjectProjectionPanel
+        session={session}
+        projectId={project.id}
+        disabled={project.status !== "active"}
+        onError={handleMutationError}
+        setMessage={setMessage}
+      />
+
       <section aria-labelledby="applications-heading">
         <h3 id="applications-heading">Applications</h3>
         <form className={styles["form"]} onSubmit={(event) => void createApplication(event)}>
@@ -488,6 +497,12 @@ function ApplicationEditor({
         </button>
       </form>
       <p>Publishable identifiers: {application.configuration.publishable_keys.join(", ")}</p>
+      <ApplicationSyncPanel
+        session={session}
+        application={application}
+        onError={onError}
+        setMessage={setMessage}
+      />
     </article>
   );
 }

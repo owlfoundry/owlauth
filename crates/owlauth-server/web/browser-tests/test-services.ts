@@ -9,6 +9,7 @@ import {
 } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import type { Server } from "node:net";
 import { resolve, sep } from "node:path";
 import { createServer as createTlsServer } from "node:tls";
@@ -94,6 +95,18 @@ export async function typescriptSdkArtifactDigest(repository: string): Promise<s
   return hash.digest("hex");
 }
 
+interface CapturedWebhook {
+  readonly body: string;
+  readonly eventId: string;
+  readonly signature: string;
+  readonly timestamp: string;
+}
+
+interface WebhookCaptureState {
+  entries: CapturedWebhook[];
+  failNext: boolean;
+}
+
 export interface ControlledServices {
   readonly applicationOrigin: string;
   readonly browserDriverToken: string;
@@ -102,6 +115,8 @@ export interface ControlledServices {
   readonly providerClientSecret: string;
   readonly providerOrigin: string;
   readonly mailCaptureUrl: string;
+  readonly webhookCaptureUrl: string;
+  readonly webhookEndpointUrl: string;
   close(): Promise<void>;
 }
 
@@ -111,6 +126,7 @@ export async function startControlledServices(
   applicationPort: number,
   runtimePort: number,
   smtpPort: number,
+  webhookPort: number,
   smtpCertificateFile: string,
   smtpKeyFile: string,
 ): Promise<ControlledServices> {
@@ -123,25 +139,27 @@ export async function startControlledServices(
   const runtimeOrigin = `http://127.0.0.1:${String(runtimePort)}`;
   const browserDriverToken = opaque(32);
   const provider = createControlledProvider(providerBase, providerIssuer);
+  const certificate = await readFile(smtpCertificateFile);
+  const key = await readFile(smtpKeyFile);
   const capturedMail: string[] = [];
-  const smtp = createSmtpCapture(
-    await readFile(smtpCertificateFile),
-    await readFile(smtpKeyFile),
-    capturedMail,
-  );
+  const webhookState: WebhookCaptureState = { entries: [], failNext: false };
+  const smtp = createSmtpCapture(certificate, key, capturedMail);
+  const webhook = createWebhookCapture(certificate, key, webhookState);
   const application = createApplicationServer(
     repository,
     applicationOrigin,
     browserDriverToken,
     runtimeOrigin,
     capturedMail,
+    webhookState,
   );
   await Promise.all([
     listen(provider, providerPort, "::1"),
     listen(application, applicationPort, "localhost"),
-    // `IpAddr`'s stable ordering pins localhost's IPv4 address first. Bind the capture to that
-    // exact address so the journey exercises the same resolve-all/validate-all/pin-one path.
+    // `IpAddr`'s stable ordering pins localhost's IPv4 address first. Bind the captures to that
+    // exact address so the journeys exercise the same resolve-all/validate-all/pin-one path.
     listen(smtp, smtpPort, "127.0.0.1"),
+    listen(webhook, webhookPort, "127.0.0.1"),
   ]);
   return {
     applicationOrigin,
@@ -151,8 +169,10 @@ export async function startControlledServices(
     providerClientSecret: PROVIDER_CLIENT_SECRET,
     providerOrigin: providerIssuer,
     mailCaptureUrl: `${applicationOrigin}/__e2e/mail`,
+    webhookCaptureUrl: `${applicationOrigin}/__e2e/webhooks`,
+    webhookEndpointUrl: `https://localhost:${String(webhookPort)}/events`,
     async close() {
-      await Promise.all([close(provider), close(application), close(smtp)]);
+      await Promise.all([close(provider), close(application), close(smtp), close(webhook)]);
     },
   };
 }
@@ -387,6 +407,33 @@ function createControlledProvider(origin: string, issuer: string) {
   });
 }
 
+function createWebhookCapture(certificate: Buffer, key: Buffer, state: WebhookCaptureState) {
+  return createHttpsServer({ cert: certificate, key }, (request, response) => {
+    void (async () => {
+      try {
+        if (request.method !== "POST" || request.url !== "/events") {
+          text(response, 404, "Not found");
+          return;
+        }
+        const captured: CapturedWebhook = {
+          body: await body(request),
+          eventId: requiredHeader(request, "owlauth-webhook-id"),
+          signature: requiredHeader(request, "owlauth-webhook-signature"),
+          timestamp: requiredHeader(request, "owlauth-webhook-timestamp"),
+        };
+        state.entries.push(captured);
+        if (state.entries.length > 32) state.entries.shift();
+        const status = state.failNext ? 503 : 204;
+        state.failNext = false;
+        response.writeHead(status, { "cache-control": "no-store" });
+        response.end();
+      } catch {
+        text(response, 400, "Invalid webhook");
+      }
+    })();
+  });
+}
+
 function createSmtpCapture(certificate: Buffer, key: Buffer, capturedMail: string[]) {
   return createTlsServer({ cert: certificate, key }, (socket) => {
     let buffer = "";
@@ -431,6 +478,7 @@ function createApplicationServer(
   browserDriverToken: string,
   runtimeOrigin: string,
   capturedMail: string[],
+  webhookState: WebhookCaptureState,
 ) {
   const pending = new Map<string, PendingBackendLogin>();
   const sessions = new Map<string, BackendSession>();
@@ -468,6 +516,22 @@ function createApplicationServer(
             "x-content-type-options": "nosniff",
           });
           response.end(source);
+          return;
+        }
+        if (request.method === "GET" && url.pathname === "/__e2e/webhooks") {
+          json(response, 200, { items: webhookState.entries });
+          return;
+        }
+        if (request.method === "DELETE" && url.pathname === "/__e2e/webhooks") {
+          webhookState.entries = [];
+          webhookState.failNext = false;
+          response.writeHead(204, { "cache-control": "no-store" });
+          response.end();
+          return;
+        }
+        if (request.method === "POST" && url.pathname === "/__e2e/webhooks/fail-next") {
+          webhookState.failNext = true;
+          json(response, 200, { armed: true });
           return;
         }
         if (request.method === "GET" && url.pathname === "/browser/") {
@@ -1086,6 +1150,14 @@ function positiveInteger(value: string | null): number {
 
 function required(value: string | null): string {
   if (value === null || value.length === 0 || value.length > 2048) throw new Error("missing value");
+  return value;
+}
+
+function requiredHeader(request: IncomingMessage, name: string): string {
+  const value = request.headers[name];
+  if (typeof value !== "string" || value.length === 0 || value.length > 4096) {
+    throw new Error(`missing ${name} header`);
+  }
   return value;
 }
 

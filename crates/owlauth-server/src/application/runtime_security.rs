@@ -251,6 +251,7 @@ impl ProviderRequestProfile {
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ProviderAuthorizationRequest {
+    pub kind: crate::domain::ProviderKind,
     pub issuer: String,
     pub client_id: String,
     pub callback_url: String,
@@ -267,6 +268,7 @@ pub(crate) struct ProviderAuthorization {
 }
 
 pub(crate) struct ProviderCallbackRequest {
+    pub kind: crate::domain::ProviderKind,
     pub issuer: String,
     pub client_id: String,
     pub client_secret: Zeroizing<String>,
@@ -316,7 +318,7 @@ pub(crate) enum ProviderExchangeError {
 
 #[async_trait]
 pub(crate) trait UpstreamProviderClient: Send + Sync {
-    fn issuer_allowed(&self, issuer: &str) -> bool;
+    fn issuer_allowed(&self, kind: crate::domain::ProviderKind, issuer: &str) -> bool;
 
     async fn authorization_url(
         &self,
@@ -376,6 +378,7 @@ pub(crate) struct HostedInteraction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderRuntimeContext {
     pub project_id: Uuid,
+    pub provider_kind: crate::domain::ProviderKind,
     pub transaction_id: Uuid,
     pub provider_id: Uuid,
     pub provider_key: String,

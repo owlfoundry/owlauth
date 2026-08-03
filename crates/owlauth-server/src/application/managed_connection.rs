@@ -11,7 +11,9 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::domain::{BoundedProviderProfile, ManagedProfileCapability, RenewalReplay};
+use crate::domain::{
+    BoundedProviderProfile, ManagedProfileCapability, ProviderKind, RenewalReplay,
+};
 
 use super::{ApplicationError, Clock, ProtectedValue};
 
@@ -128,6 +130,7 @@ pub(crate) struct ConnectionGuard {
     pub project_security_revision: i64,
     pub provider_revision: i64,
     pub managed_profile_revision: i64,
+    pub provider_kind: ProviderKind,
     pub adapter_key: String,
     pub adapter_capability_revision: i64,
     /// Exact frozen grant used when RFC 6749 permits a refresh response to omit `scope`.
@@ -256,6 +259,13 @@ pub(crate) enum ProviderRevocationResult {
 )]
 pub(crate) trait ManagedProfileAdapter: Send + Sync {
     fn capability(&self) -> Option<&'static ManagedProfileCapability>;
+
+    fn capability_for(&self, kind: ProviderKind) -> Option<&'static ManagedProfileCapability> {
+        kind.capabilities()
+            .managed_profile
+            .then(|| self.capability())
+            .flatten()
+    }
 
     /// Declared upper bound for the complete provider-I/O sequence of one renewal followed by
     /// its profile read. This includes every discovery, token and `UserInfo` request made by the
@@ -653,11 +663,11 @@ impl ManagedConnectionService {
         worker_id: Uuid,
         lease: Duration,
     ) -> Result<bool, ApplicationError> {
-        let capability = self
+        let scheduling_capability = self
             .adapter
             .capability()
             .ok_or(ApplicationError::Disabled)?;
-        let replayable = capability.renewal_replay == RenewalReplay::StableAttemptId;
+        let replayable = scheduling_capability.renewal_replay == RenewalReplay::StableAttemptId;
         let now = self.clock.now();
         let Some(renewal) = self
             .repository
@@ -667,8 +677,12 @@ impl ManagedConnectionService {
             return Ok(false);
         };
         // Recovery requires both the operation's frozen protocol decision and the currently
-        // compatible adapter capability. A later capability change can only make replay safer
-        // by refusing it, never by upgrading an already-submitted operation.
+        // compatible named-adapter capability. A later capability change can only make replay
+        // safer by refusing it, never by upgrading an already-submitted operation.
+        let capability = self
+            .adapter
+            .capability_for(renewal.claim.guard.provider_kind)
+            .ok_or(ApplicationError::Disabled)?;
         let can_replay_submitted = replayable && renewal.adapter_idempotent_replay;
         let adapter_matches = renewal.claim.guard.adapter_key == capability.adapter_key
             && renewal.claim.guard.adapter_capability_revision == capability.adapter_revision;
@@ -951,11 +965,7 @@ impl ManagedConnectionService {
         expected_generation: i64,
         lease: Duration,
     ) -> Result<ManagedConnectionMetadata, ApplicationError> {
-        let capability = self
-            .adapter
-            .capability()
-            .ok_or(ApplicationError::Disabled)?;
-        if !capability.supports_revocation || lease <= Duration::ZERO {
+        if lease <= Duration::ZERO {
             return Err(ApplicationError::Disabled);
         }
         let now = self.clock.now();
@@ -972,6 +982,16 @@ impl ManagedConnectionService {
                 now + lease,
             )
             .await?;
+        let capability = self
+            .adapter
+            .capability_for(claim.guard.provider_kind)
+            .ok_or(ApplicationError::Disabled)?;
+        if !capability.supports_revocation {
+            self.repository
+                .release_revocation_claim(&claim, self.clock.now())
+                .await?;
+            return Err(ApplicationError::Disabled);
+        }
         let credential = match self
             .protector
             .unprotect_credential(&context_for(&claim.guard), &claim.protected)
@@ -1003,11 +1023,7 @@ impl ManagedConnectionService {
         worker_id: Uuid,
         lease: Duration,
     ) -> Result<bool, ApplicationError> {
-        let capability = self
-            .adapter
-            .capability()
-            .ok_or(ApplicationError::Disabled)?;
-        if !capability.supports_revocation || lease <= Duration::ZERO {
+        if lease <= Duration::ZERO {
             return Err(ApplicationError::Disabled);
         }
         let now = self.clock.now();
@@ -1018,7 +1034,12 @@ impl ManagedConnectionService {
         else {
             return Ok(false);
         };
-        if claim.guard.adapter_key != capability.adapter_key
+        let capability = self
+            .adapter
+            .capability_for(claim.guard.provider_kind)
+            .ok_or(ApplicationError::Disabled)?;
+        if !capability.supports_revocation
+            || claim.guard.adapter_key != capability.adapter_key
             || claim.guard.adapter_capability_revision != capability.adapter_revision
         {
             if !self

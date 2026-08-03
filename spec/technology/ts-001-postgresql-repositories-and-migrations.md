@@ -66,7 +66,7 @@ Before broad repository implementation, one disposable-PostgreSQL spike MUST pro
 4. Runtime and Control SeaORM pools remain separately bounded under exhaustion;
 5. one application-owned Unit of Work atomically spans representative cross-repository mutation and durable audit append, including rollback and error mapping;
 6. one-use conditional mutation/row-lock behavior is expressible without leaking ORM types;
-7. release N-1 code operates safely against the expanded N schema during the rolling-deployment overlap.
+7. after the compatibility-aware bridge release, the specifically declared N-1 artifact starts in both `verify` and `auto` modes and operates safely against the expanded N schema during rolling overlap; the bridge's exact-history predecessor is drained before bridge migration instead of being misrepresented as compatible.
 
 Failure of a gate pauses implementation. If failure is intrinsic to SeaORM rather than the adapter design, the fallback decision is SQLx-only repositories plus SQLx migrations; it is not an unbounded mixed stack.
 

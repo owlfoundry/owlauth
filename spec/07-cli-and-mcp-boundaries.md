@@ -171,6 +171,8 @@ Tools MUST NOT provide raw SQL, repository access, generic HTTP/OpenAPI forwardi
 
 Prompt text, model output, UI approval, tool discovery, and tool arguments are untrusted input. They cannot establish authority; only successful operator-key authentication admits a self-hosted request.
 
+The initial self-hosted catalog classifies `owlauth_system_get`, Project/Application inventory reads, `owlauth_projection_policy_get`, and webhook endpoint/delivery inspection as read-only. Its only mutation is the high-impact projection-policy expansion pair: `owlauth_projection_policy_update_preview` issues the one-use confirmation capability, and `owlauth_projection_policy_update_commit` is the sole commit path. Preview rejects narrowing and no-change requests, so every successful commit advances the target policy revision and creates the bounded expansion operation. There is no direct mutation alias. Adding another mutating tool requires recording its impact class and confirmation path here before exposure.
+
 ## High-impact MCP confirmation
 
 High-impact tools use a preview/commit flow to bind operator intent to current state:
@@ -204,7 +206,7 @@ The high-entropy integrity-protected capability binds:
 - Project metadata and command-specific target revisions;
 - a short expiry and one-use state.
 
-It is not bound to a server-side user, role, permission grant, transport session, or secondary-authentication session. PostgreSQL stores only its digest and atomically consumes it with the command and deployment-operator audit event. A capability cannot move to another tool, command, Project, revision, deployment, endpoint, or Runtime route.
+It is not bound to a server-side user, role, permission grant, transport session, or secondary-authentication session. PostgreSQL stores only its digest and atomically consumes it with the command and deployment-operator audit event. A capability cannot move to another tool, command, Project, revision, deployment, endpoint, or Runtime route. Capability admission is serialized in PostgreSQL, removes expired rows in bounded `SKIP LOCKED` batches, and enforces a hard retained-row ceiling of 4096; once full, preview fails closed until expiry cleanup creates capacity. Thus preview-only traffic cannot create unbounded durable state even if no later maintenance traffic arrives.
 
 ## Surface and recovery boundaries
 

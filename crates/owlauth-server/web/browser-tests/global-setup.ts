@@ -23,6 +23,7 @@ export default async function globalSetup() {
   const providerPort = await freePort();
   const applicationPort = await freePort();
   const smtpPort = await freePort();
+  const webhookPort = await freePort();
   const smtpKeyFile = resolve(temporaryRoot, "smtp-key.pem");
   const smtpRequestFile = resolve(temporaryRoot, "smtp.csr");
   const smtpCertificateFile = resolve(temporaryRoot, "smtp-cert.pem");
@@ -123,6 +124,7 @@ export default async function globalSetup() {
       applicationPort,
       runtimePort,
       smtpPort,
+      webhookPort,
       smtpCertificateFile,
       smtpKeyFile,
     );
@@ -159,6 +161,8 @@ export default async function globalSetup() {
       OWLAUTH_ADMISSION_DIGEST_KEY: "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
       OWLAUTH_PROVIDER_ALLOWED_ORIGINS: services.providerOrigin,
       OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK: "true",
+      OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS: "127.0.0.1",
+      OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE: smtpRootCertificateDerFile,
       OWLAUTH_RUNTIME_BASE_URL: runtimeBase,
       OWLAUTH_KEY_PROPAGATION_DELAY_MS: "100",
       OWLAUTH_PUBLICATION_LEASE_TTL_MS: "5000",
@@ -217,6 +221,7 @@ export default async function globalSetup() {
         OWLAUTH_CONTROL_ADDR: `127.0.0.1:${String(controlPort)}`,
         OWLAUTH_CONTROL_BASE_URL: controlBase,
         OWLAUTH_CONTROL_API_KEY: operatorKey,
+        OWLAUTH_CONTROL_MCP_ENABLED: "true",
       },
       stdio: ["ignore", controlLog, controlLog],
     });
@@ -233,6 +238,8 @@ export default async function globalSetup() {
     process.env["OWLAUTH_E2E_BROWSER_DRIVER_TOKEN"] = services.browserDriverToken;
     process.env["OWLAUTH_E2E_TYPESCRIPT_SDK_DIGEST"] = typescriptSdkDigest;
     process.env["OWLAUTH_E2E_MAIL_CAPTURE_URL"] = services.mailCaptureUrl;
+    process.env["OWLAUTH_E2E_WEBHOOK_CAPTURE_URL"] = services.webhookCaptureUrl;
+    process.env["OWLAUTH_E2E_WEBHOOK_ENDPOINT_URL"] = services.webhookEndpointUrl;
     process.env["OWLAUTH_E2E_SMTP_PORT"] = String(smtpPort);
     process.env["OWLAUTH_E2E_POSTGRES_CONTAINER"] = container;
     process.env["OWLAUTH_E2E_RUNTIME_LOG"] = runtimeLogFile;

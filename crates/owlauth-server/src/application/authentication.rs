@@ -35,6 +35,7 @@ pub(crate) struct LoginRevisionSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AdmittedProviderMethod {
+    pub kind: crate::domain::ProviderKind,
     pub method_key: String,
     pub provider_id: Uuid,
     pub display_name: String,

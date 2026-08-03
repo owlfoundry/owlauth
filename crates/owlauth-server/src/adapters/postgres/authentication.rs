@@ -153,11 +153,17 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
                 .await
                 .map_err(persistence)?
                 .ok_or(ApplicationError::RevisionConflict)?;
+            let provider_kind = super::effective_provider_kind(
+                &provider.kind,
+                provider.adapter_kind.as_deref(),
+                &provider.issuer,
+            )?;
             if provider.status != "active"
                 || provider.revision != method.provider_revision
                 || provider.provider_key != method.method_key
                 || provider.display_name != method.display_name
                 || provider.issuer != method.issuer
+                || provider_kind != method.kind
             {
                 return Err(ApplicationError::RevisionConflict);
             }
@@ -845,6 +851,8 @@ fn validate_admitted_provider(method: &AdmittedProviderMethod) -> Result<(), App
         || method.display_name.is_empty()
         || method.issuer.is_empty()
         || method.issuer.len() > 2048
+        || !method.kind.capabilities().login
+        || !method.kind.issuer_matches(&method.issuer)
         || method.provider_revision <= 0
         || method.assignment_security_revision <= 0
     {
@@ -1251,6 +1259,7 @@ mod tests {
                 created_at,
                 expires_at: created_at + Duration::minutes(10),
                 admitted_providers: vec![AdmittedProviderMethod {
+                    kind: crate::domain::ProviderKind::Oidc,
                     method_key: "oidc-main".to_owned(),
                     provider_id,
                     display_name: "OIDC".to_owned(),
@@ -1413,6 +1422,7 @@ mod tests {
                     created_at: created_at + Duration::seconds(6),
                     expires_at: created_at + Duration::minutes(10) + Duration::seconds(6),
                     admitted_providers: vec![AdmittedProviderMethod {
+                        kind: crate::domain::ProviderKind::Oidc,
                         method_key: "oidc-main".to_owned(),
                         provider_id,
                         display_name: "OIDC".to_owned(),
@@ -1504,6 +1514,7 @@ mod tests {
                     created_at: created_at + Duration::seconds(7),
                     expires_at: created_at + Duration::minutes(10) + Duration::seconds(7),
                     admitted_providers: vec![AdmittedProviderMethod {
+                        kind: crate::domain::ProviderKind::Oidc,
                         method_key: "oidc-main".to_owned(),
                         provider_id,
                         display_name: "OIDC".to_owned(),

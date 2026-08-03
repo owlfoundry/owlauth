@@ -96,6 +96,11 @@ mod tests {
                 ["writeOnly"],
             true
         );
+        assert!(
+            control["components"]["schemas"]["CreateProviderRequest"]["required"]
+                .as_array()
+                .is_some_and(|required| !required.iter().any(|field| field == "kind"))
+        );
         assert_eq!(
             control["components"]["schemas"]["ReconcileProviderRequest"]["properties"]["client_secret"]
                 ["writeOnly"],

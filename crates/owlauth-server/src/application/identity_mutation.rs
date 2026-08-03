@@ -240,6 +240,7 @@ pub(crate) struct IdentityMutationView {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct IdentityMutationProviderSlotAuthority {
     pub provider_configuration_id: Uuid,
+    pub provider_kind: crate::domain::ProviderKind,
     pub provider_configuration_revision: i64,
     pub provider_key: String,
     pub issuer: String,
@@ -2161,6 +2162,7 @@ impl IdentityMutationRuntimeService {
         let authorization = self
             .provider
             .authorization_url(ProviderAuthorizationRequest {
+                kind: authority.provider_kind,
                 issuer: authority.issuer.clone(),
                 client_id: authority.client_id.clone(),
                 callback_url: authority.callback_url.clone(),
@@ -2231,6 +2233,7 @@ impl IdentityMutationRuntimeService {
         let identity = self
             .provider
             .exchange_code(ProviderCallbackRequest {
+                kind: authority.provider_kind,
                 issuer: authority.issuer.clone(),
                 client_id: authority.client_id.clone(),
                 client_secret: secret,
@@ -3897,7 +3900,7 @@ mod tests {
 
     #[async_trait]
     impl UpstreamProviderClient for TestProvider {
-        fn issuer_allowed(&self, _issuer: &str) -> bool {
+        fn issuer_allowed(&self, _kind: crate::domain::ProviderKind, _issuer: &str) -> bool {
             true
         }
 

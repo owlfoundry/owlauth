@@ -11,8 +11,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::domain::{
-    LoginTransactionStatus, ManagedProfileCapability, ProfileDisplayName, ProfilePictureUrl,
-    ProviderIssuer, ProviderSubject,
+    LoginTransactionStatus, ManagedProfileCapabilities, ManagedProfileCapability,
+    ProfileDisplayName, ProfilePictureUrl, ProviderIssuer, ProviderSubject,
 };
 
 use super::{
@@ -48,7 +48,7 @@ pub(crate) struct RuntimeAuthService {
     signer: Arc<dyn RuntimeSigner>,
     provider_secrets: Arc<dyn ProviderSecretResolver>,
     provider: Arc<dyn UpstreamProviderClient>,
-    managed_capability: &'static ManagedProfileCapability,
+    managed_capabilities: ManagedProfileCapabilities,
     clock: Arc<dyn Clock>,
     runtime_base: Url,
 }
@@ -65,7 +65,7 @@ impl RuntimeAuthService {
         signer: Arc<dyn RuntimeSigner>,
         provider_secrets: Arc<dyn ProviderSecretResolver>,
         provider: Arc<dyn UpstreamProviderClient>,
-        managed_capability: &'static ManagedProfileCapability,
+        managed_capabilities: impl Into<ManagedProfileCapabilities>,
         clock: Arc<dyn Clock>,
         runtime_base: Url,
     ) -> Self {
@@ -79,7 +79,7 @@ impl RuntimeAuthService {
             signer,
             provider_secrets,
             provider,
-            managed_capability,
+            managed_capabilities: managed_capabilities.into(),
             clock,
             runtime_base,
         }
@@ -116,8 +116,9 @@ impl RuntimeAuthService {
             .await
     }
 
-    pub(crate) fn provider_issuer_allowed(&self, issuer: &str) -> bool {
-        self.provider.issuer_allowed(issuer)
+    pub(crate) fn provider_issuer_allowed(&self, kind: &str, issuer: &str) -> bool {
+        crate::domain::ProviderKind::parse(kind)
+            .is_ok_and(|kind| self.provider.issuer_allowed(kind, issuer))
     }
 
     pub(crate) async fn project_origin_allowed(
@@ -179,9 +180,10 @@ impl RuntimeAuthService {
                 &request.redirect_uri,
             )
             .await?;
-        context
-            .admitted_providers
-            .retain(|provider| self.provider.issuer_allowed(&provider.issuer));
+        context.admitted_providers.retain(|provider| {
+            self.provider
+                .issuer_allowed(provider.kind, &provider.issuer)
+        });
         if context.admitted_providers.is_empty() && context.admitted_email.is_none() {
             return Err(ApplicationError::Disabled);
         }
@@ -895,6 +897,7 @@ impl RuntimeAuthService {
         let authorization = self
             .provider
             .authorization_url(ProviderAuthorizationRequest {
+                kind: provider.provider_kind,
                 issuer: provider.issuer,
                 client_id: provider.client_id,
                 callback_url: provider.callback_url.clone(),
@@ -1028,6 +1031,7 @@ impl RuntimeAuthService {
         let identity = self
             .provider
             .exchange_code(ProviderCallbackRequest {
+                kind: provider.provider_kind,
                 issuer: provider.issuer,
                 client_id: provider.client_id,
                 client_secret: secret,
@@ -1080,7 +1084,7 @@ impl RuntimeAuthService {
                 expected_transaction_revision: claimed.transaction.transaction_revision,
                 evidence: AuthenticatedIdentityEvidence::Provider(verified_provider_identity(
                     identity,
-                    self.managed_capability,
+                    self.managed_capabilities.for_kind(provider.provider_kind),
                 )?),
                 new_user_id: Uuid::new_v4(),
                 new_user_public_id: generated_public_id("usr"),
@@ -1959,14 +1963,16 @@ struct AccessTokenClaims {
     claims_rev: i64,
 }
 
-fn verified_provider_identity(
+fn verified_provider_identity<'a>(
     identity: ProviderIdentity,
-    capability: &ManagedProfileCapability,
+    capability: impl Into<Option<&'a ManagedProfileCapability>>,
 ) -> Result<VerifiedProviderIdentity, ApplicationError> {
+    let capability = capability.into();
     let managed_capability = identity
         .renewable_credential
         .as_ref()
         .map(|credential| {
+            let capability = capability.ok_or(ApplicationError::InvalidTransition)?;
             if !capability.scopes_match(&credential.granted_scopes) {
                 return Err(ApplicationError::InvalidTransition);
             }

@@ -1293,6 +1293,25 @@ impl ProviderSecretResolver for EncryptedFileProviderSecretResolver {
 }
 
 #[async_trait]
+impl crate::application::WebhookSecretResolver for EncryptedFileProviderSecretResolver {
+    async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        let value = self
+            .store
+            .read_utf8_secret(reference)
+            .await
+            .map_err(authoritative_reference_error)?;
+        Ok(Zeroizing::new(value.as_bytes().to_vec()))
+    }
+
+    async fn erase(&self, reference: &str) -> Result<(), ApplicationError> {
+        self.store
+            .erase(reference.to_owned())
+            .await
+            .map_err(|_| ApplicationError::ExternalStore)
+    }
+}
+
+#[async_trait]
 impl crate::application::SmtpCredentialResolver for EncryptedFileProviderSecretResolver {
     fn fingerprint(&self, value: &[u8]) -> [u8; 32] {
         self.store.request_fingerprint(value)

@@ -1,8 +1,10 @@
+pub(crate) mod github;
 pub(crate) mod migrations;
 #[cfg(test)]
 mod migrations_checksum_tests;
 pub(crate) mod oidc;
 pub(crate) mod postgres;
+pub(crate) mod provider_registry;
 pub(crate) mod redis_admission;
 pub(crate) mod runtime_security;
 #[allow(
@@ -12,3 +14,4 @@ pub(crate) mod runtime_security;
 pub(crate) mod smtp;
 pub(crate) mod software_store;
 pub(crate) mod system;
+pub(crate) mod webhook_http;

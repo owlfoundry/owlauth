@@ -78,7 +78,7 @@ Build and smoke-test the current server image:
 make docker-build
 ```
 
-The image runs as a non-root user with `tini` as PID 1 and is smoke-tested through `/health`. Runtime, Control, PostgreSQL, key stores, provider egress, TLS/reverse proxy, backup, and secret configuration remain deployment responsibilities.
+The image runs as a non-root user with `tini` as PID 1 and is smoke-tested through `/health`, `/ready`, and a bounded graceful `SIGTERM` shutdown. Runtime, Control, PostgreSQL, key stores, provider egress, TLS/reverse proxy, backup, and secret configuration remain deployment responsibilities.
 
 Published images use `ghcr.io/owlfoundry/owlauth`:
 

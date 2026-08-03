@@ -163,7 +163,7 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             .ok_or(ApplicationError::NotFound)?;
         let authority = transaction
             .query_one_raw(statement(
-                r"SELECT provider.id AS provider_id, provider.provider_key, provider.issuer,
+                r"SELECT provider.id AS provider_id, provider.kind AS provider_legacy_kind, provider.adapter_kind AS provider_adapter_kind, provider.provider_key, provider.issuer,
                           provider.client_id, provider.secret_ref, provider.callback_url,
                           provider.revision AS provider_revision,
                           provider.managed_profile_revision, application.revision AS application_revision,
@@ -247,6 +247,16 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::RevisionConflict)?;
+        let provider_kind = super::effective_provider_kind(
+            &get::<String>(&authority, "provider_legacy_kind")?,
+            get::<Option<String>>(&authority, "provider_adapter_kind")?.as_deref(),
+            &get::<String>(&authority, "issuer")?,
+        )?;
+        if !provider_kind.capabilities().managed_profile
+            || !provider_kind.issuer_matches(&get::<String>(&authority, "issuer")?)
+        {
+            return Err(ApplicationError::Integrity);
+        }
         if get::<Uuid>(&authority, "provider_id")?
             != get::<Uuid>(&connection, "provider_configuration_id")?
             || get::<Uuid>(&identity, "id")? != get::<Uuid>(&connection, "linked_identity_id")?
@@ -264,11 +274,12 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
                    identity_revision,provider_revision,managed_profile_revision,application_revision,
                    assignment_security_revision,callback_url,adapter_key,adapter_capability_revision,
                    supports_revocation,required_scopes,provider_pkce_required,oidc_nonce_required,
-                   interaction_digest,interaction_digest_key_version,revision,status,expires_at,created_at)
+                   interaction_digest,interaction_digest_key_version,revision,status,expires_at,created_at,
+                   provider_kind)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
                          $19,$20,$21,$22,$23,$24,$25,$26,$27,
                          ARRAY(SELECT jsonb_array_elements_text($28::jsonb)),$29,$30,$31,$32,1,
-                         'awaiting_browser_binding',$33,$34)",
+                         'awaiting_browser_binding',$33,$34,$35)",
                 vec![
                     prepared.interaction_id.into(),
                     prepared.command.project_id.into(),
@@ -306,6 +317,7 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
                     prepared.interaction_digest.key_version.into(),
                     prepared.expires_at.into(),
                     prepared.now.into(),
+                    provider_kind.as_str().into(),
                 ],
             ))
             .await
@@ -1015,6 +1027,7 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             project_security_revision: claimed.project_security_revision,
             provider_revision: claimed.provider_revision,
             managed_profile_revision: claimed.managed_profile_revision,
+            provider_kind: claimed.provider_kind,
             adapter_key: claimed.adapter_key.clone(),
             adapter_capability_revision: claimed.adapter_capability_revision,
             required_scopes: claimed.required_scopes.clone(),
@@ -1296,7 +1309,9 @@ async fn read_record_by_id<C: ConnectionTrait>(
     let row = connection
         .query_one_raw(statement(
             r"SELECT id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-                      provider_configuration_id,provider_key,issuer,subject,client_id,secret_ref,
+                      provider_configuration_id,provider_key,
+                      COALESCE(provider_kind, CASE issuer WHEN 'https://accounts.google.com' THEN 'google' ELSE 'oidc' END) AS provider_kind,
+                      issuer,subject,client_id,secret_ref,
                       application_id,expected_connection_generation,expected_credential_generation,
                       expected_connection_revision,project_security_revision,user_security_revision,
                       identity_revision,provider_revision,managed_profile_revision,application_revision,
@@ -1352,6 +1367,12 @@ fn record_from_row(
         (None, None) => None,
         _ => return Err(ApplicationError::Integrity),
     };
+    let provider_kind = crate::domain::ProviderKind::parse(&get::<String>(row, "provider_kind")?)
+        .map_err(|_| ApplicationError::Integrity)?;
+    let issuer = get::<String>(row, "issuer")?;
+    if !provider_kind.capabilities().managed_profile || !provider_kind.issuer_matches(&issuer) {
+        return Err(ApplicationError::Integrity);
+    }
     Ok(ManagedReauthorizationRecord {
         id: get(row, "id")?,
         project_id: get(row, "project_id")?,
@@ -1365,6 +1386,7 @@ fn record_from_row(
         expected_connection_generation: get(row, "expected_connection_generation")?,
         expected_credential_generation: get(row, "expected_credential_generation")?,
         expected_connection_revision: get(row, "expected_connection_revision")?,
+        provider_kind,
         project_security_revision: get(row, "project_security_revision")?,
         user_security_revision: get(row, "user_security_revision")?,
         identity_revision: get(row, "identity_revision")?,
@@ -1372,7 +1394,7 @@ fn record_from_row(
         managed_profile_revision: get(row, "managed_profile_revision")?,
         application_revision: get(row, "application_revision")?,
         assignment_security_revision: get(row, "assignment_security_revision")?,
-        issuer: get(row, "issuer")?,
+        issuer,
         subject: get(row, "subject")?,
         client_id: get(row, "client_id")?,
         secret_ref: get(row, "secret_ref")?,

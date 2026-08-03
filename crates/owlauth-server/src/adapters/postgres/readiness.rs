@@ -331,13 +331,20 @@ impl PostgresReadinessAdapter {
                 .collect(),
             providers: providers
                 .into_iter()
-                .map(|provider| PublicProvider {
-                    key: provider.provider_key,
-                    display_name: provider.display_name,
-                    kind: provider.kind,
-                    issuer: provider.issuer,
+                .map(|provider| {
+                    let kind = super::effective_provider_kind(
+                        &provider.kind,
+                        provider.adapter_kind.as_deref(),
+                        &provider.issuer,
+                    )?;
+                    Ok(PublicProvider {
+                        key: provider.provider_key,
+                        display_name: provider.display_name,
+                        kind: kind.as_str().to_owned(),
+                        issuer: provider.issuer,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, ApplicationError>>()?,
             email_available,
             email_otp_enabled,
             email_magic_link_enabled,

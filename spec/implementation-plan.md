@@ -247,7 +247,7 @@ and credential-free web-shell foundations.
 The retained repository foundation includes:
 
 - strict typed configuration with unknown-field rejection and redacted secret wrappers;
-- embedded SQLx `auto` migrations, DDL-free exact-history `verify`, bounded migration
+- embedded SQLx `auto` migrations, DDL-free checksum-prefix/compatibility-floor `verify`, bounded migration
   locking, and independent Runtime/Control SeaORM serving pools;
 - a private transaction-bound Project Unit of Work proving the selected repository shape;
 - distinct `all`, `runtime`, and `control` composition roots, listeners, routers, lifecycle,
@@ -733,8 +733,9 @@ state, PostgreSQL authority and migrations, Runtime and Control HTTP contracts, 
 flows, cross-language wire facts already consumed by existing clients, and real public-boundary
 browser journeys. Its proportional closure evidence is:
 
-- immutable checksums for the three Block C migrations plus clean/populated/concurrent/verify and
-  repository rollback coverage;
+- one immutable checksum for the consolidated pre-release initial schema, plus
+  clean/populated/concurrent/verify and repository rollback coverage; the first published server
+  release freezes that baseline and all later schema changes become additive;
 - focused PostgreSQL identity, email, managed-connection, projection, session, recovery, and
   key-inventory suites;
 - server formatting, Clippy, library tests, hosted-web check/build/contract/plane-boundary gates,
@@ -879,7 +880,7 @@ The block exits only when:
 - load tests prove bounded callback/handoff/refresh, mail, provider-sync, webhook, cleanup,
   audit, and Control-list behavior with Project fairness and no unbounded queue or query;
 - after an operator restores a consistent PostgreSQL/external-store/key snapshot, verify-mode
-  startup accepts only exact migration history and server recovery uses only committed generations,
+  startup accepts only checksum-matching embedded history plus compatibility-floor-approved forward expansion history and server recovery uses only committed generations,
   cursors, leases, and outboxes; loss of an external reference fails its purpose closed, Redis
   remains disposable, and retained key material is not retired before proven re-encryption or
   expiry;
@@ -904,6 +905,43 @@ The block exits only when:
 **Exit condition:** server release evidence covers every implemented product journey, security
 boundary, external-effect ambiguity, split-plane failure, and recovery path. A green build of
 isolated mocks, static shells, or SDK-only tests is insufficient.
+
+#### D.5 Closure record
+
+Block D closes the planned standalone-server delivery through Application synchronization and
+server hardening. The frozen capability includes bounded revisioned Application projections;
+exact-scope immutable events; signed durable webhook delivery, retry, replay, and retention;
+Control and Console administration; the self-hosted remote HTTP MCP adapter; descriptor-pinned
+self-hosted CLI dispatch; independent Runtime worker/recovery budgets; combined and split topology;
+and server package and container qualification. This is a capability-plan closure, not a claim that
+future maintenance, defect fixes, or release work can never change the server.
+
+The proportional closure evidence is:
+
+- the consolidated pre-release initial migration, frozen by checksum
+  `80256fafc981565ae414e3ea3ab4cc0779d175dff96b5f546d6b5ba6b756fe5e`, with real-PostgreSQL
+  migration, exact Project/Application webhook-graph, transaction, concurrency, lease, retention,
+  key-reference, and recovery coverage;
+- a Docker-required server-library run with 321 tests, 23 CLI tests, 12 public-types tests, and
+  workspace all-target Clippy with warnings denied;
+- hosted-web boundaries, lint, format, type checking, 68 Vitest tests, and 11 script tests, plus
+  Chromium public-boundary Application-sync and identity journeys and focused Chromium/Firefox
+  accessibility coverage;
+- combined and split listener isolation, durable `verify` restarts, bounded SIGTERM shutdown,
+  offline server-package/license qualification, and a container smoke test covering `tini`, health,
+  readiness, and graceful stop; and
+- cumulative independent review. The initial review's one P1 and three P2 findings were resolved;
+  its first fix re-review's additional email-primary merge P1 and disabled loser-only coverage P2
+  were also resolved. The final fix re-review reported no remaining P0–P3 finding or discussion
+  item.
+
+Block E remains independently responsible for language-neutral SDK contract selection,
+three-language conformance, SDK packaging matrices, and SDK documentation. The SaaS service,
+tenant authorization, billing, orchestration, and SaaS MCP remain governed by `spec/saas/`.
+Deployment backup scheduling, restore orchestration, and production operations remain operator
+responsibilities; Block D supplies only the documented backup set, PostgreSQL/PITR guidance,
+verify-mode restart, and fail-closed recovery semantics. Future server maintenance and release
+execution do not reopen this capability block unless they invalidate one of its stated boundaries.
 
 ### Block E — SDK contract convergence and documentation
 

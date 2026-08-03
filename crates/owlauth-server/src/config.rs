@@ -33,6 +33,12 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_CONTROL_ADDR",
     "OWLAUTH_CONTROL_BASE_URL",
     "OWLAUTH_CONTROL_API_KEY",
+    "OWLAUTH_CONTROL_MCP_ENABLED",
+    "OWLAUTH_CONTROL_MCP_MAX_REQUEST_BYTES",
+    "OWLAUTH_CONTROL_MCP_REQUEST_TIMEOUT_MS",
+    "OWLAUTH_CONTROL_MCP_MAX_CONCURRENT_REQUESTS",
+    "OWLAUTH_CONTROL_MCP_MAX_REQUESTS_PER_SECOND",
+    "OWLAUTH_CONTROL_MCP_MAX_RESULT_BYTES",
     "OWLAUTH_SIGNER_STORE_ROOT",
     "OWLAUTH_SIGNER_STORE_KEY",
     "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
@@ -54,6 +60,7 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_PROJECTION_EMAIL_CUTOVER_VERSION",
     "OWLAUTH_PROJECTION_EMAIL_RETIRE_VERSION",
     "OWLAUTH_SMTP_EXTRA_ROOT_CERT_DER_FILE",
+    "OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE",
     "OWLAUTH_MANAGED_REAUTHORIZATION_KEY_VERSION",
     "OWLAUTH_MANAGED_REAUTHORIZATION_DIGEST_KEY",
     "OWLAUTH_MANAGED_REAUTHORIZATION_PROTECTION_KEY",
@@ -83,6 +90,7 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_DEPLOYMENT_SMTP_CREDENTIAL_REF",
     "OWLAUTH_DEPLOYMENT_SMTP_SAFE_FINGERPRINT",
     "OWLAUTH_DEPLOYMENT_SMTP_ALLOWED_PRIVATE_IPS",
+    "OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS",
     "OWLAUTH_PUBLICATION_LEASE_TTL_MS",
     "OWLAUTH_KEY_PROPAGATION_DELAY_MS",
     "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
@@ -227,6 +235,17 @@ pub struct ListenerConfig {
     pub database_max_connections: NonZeroU32,
 }
 
+/// Bounded, explicitly enabled remote Streamable HTTP MCP configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpHttpConfig {
+    pub enabled: bool,
+    pub max_request_bytes: usize,
+    pub request_timeout: Duration,
+    pub max_concurrent_requests: usize,
+    pub max_requests_per_second: usize,
+    pub max_result_bytes: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgresConfig {
     pub serving_url: SecretString,
@@ -351,11 +370,13 @@ pub struct ServerConfig {
     pub runtime: ListenerConfig,
     pub control: ListenerConfig,
     pub control_api_key: Option<OperatorApiKey>,
+    pub control_mcp: McpHttpConfig,
     pub provisioning: Option<ProvisioningConfig>,
     pub runtime_protection: Option<RuntimeProtectionConfig>,
     pub email_identity_protection: Option<EmailIdentityProtectionConfig>,
     pub projection_email_protection: ProjectionEmailProtectionConfig,
     pub smtp_extra_root_cert_der: Option<Vec<u8>>,
+    pub webhook_extra_root_cert_der: Option<Vec<u8>>,
     pub managed_reauthorization_target_protection: RuntimeProtectionConfig,
     /// Dedicated cross-plane candidate-evidence ring. Both planes receive only narrow facades;
     /// Control never loads the generic Runtime protection ring.
@@ -367,6 +388,7 @@ pub struct ServerConfig {
     pub required_runtime_process_ids: Vec<String>,
     pub admission: Option<AdmissionConfig>,
     pub deployment_smtp: Option<DeploymentSmtpConfig>,
+    pub webhook_allowed_private_ips: Vec<IpAddr>,
     pub publication_lease_ttl: Duration,
     pub key_propagation_delay: Duration,
     pub signing_verification_retention: Duration,
@@ -458,6 +480,8 @@ impl ServerConfig {
         validate_external_bases(&runtime.external_base, &control.external_base)?;
 
         let (instance_id, control_api_key) = parse_control_identity(mode, values)?;
+        let control_mcp = parse_control_mcp(mode, values)?;
+        validate_control_mcp_listener(&control_mcp, &control)?;
         let provisioning = parse_provisioning(mode, values)?;
         let runtime_protection = parse_runtime_protection(mode, values)?;
         let email_identity_protection = parse_email_identity_protection(mode, values)?;
@@ -487,6 +511,39 @@ impl ServerConfig {
                         .add(rustls::pki_types::CertificateDer::from(bytes.clone()))
                         .map_err(|_| ConfigError::InvalidValue {
                             key: "OWLAUTH_SMTP_EXTRA_ROOT_CERT_DER_FILE",
+                            reason: "must contain one valid DER trust anchor".to_owned(),
+                        })?;
+                    Ok(bytes)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let webhook_extra_root_cert_der = if mode.has_runtime() {
+            optional(values, "OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE")
+                .map(PathBuf::from)
+                .map(|path| {
+                    if !path.is_absolute() {
+                        return Err(ConfigError::InvalidValue {
+                            key: "OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE",
+                            reason: "must be an absolute path to one DER certificate".to_owned(),
+                        });
+                    }
+                    let bytes = std::fs::read(path).map_err(|_| ConfigError::InvalidValue {
+                        key: "OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE",
+                        reason: "must be a readable DER certificate".to_owned(),
+                    })?;
+                    if bytes.is_empty() || bytes.len() > 65_536 {
+                        return Err(ConfigError::InvalidValue {
+                            key: "OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE",
+                            reason: "must contain one bounded DER certificate".to_owned(),
+                        });
+                    }
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots
+                        .add(rustls::pki_types::CertificateDer::from(bytes.clone()))
+                        .map_err(|_| ConfigError::InvalidValue {
+                            key: "OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE",
                             reason: "must contain one valid DER trust anchor".to_owned(),
                         })?;
                     Ok(bytes)
@@ -544,6 +601,10 @@ impl ServerConfig {
             });
         }
         let deployment_smtp = parse_deployment_smtp(values)?;
+        let webhook_allowed_private_ips = parse_allowed_private_ips(
+            "OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS",
+            optional(values, "OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS"),
+        )?;
         let admission = parse_admission(
             mode,
             values,
@@ -636,11 +697,13 @@ impl ServerConfig {
             runtime,
             control,
             control_api_key,
+            control_mcp,
             provisioning,
             runtime_protection,
             email_identity_protection,
             projection_email_protection,
             smtp_extra_root_cert_der,
+            webhook_extra_root_cert_der,
             managed_reauthorization_target_protection,
             identity_mutation_evidence_protection,
             managed_credential_protection,
@@ -650,6 +713,7 @@ impl ServerConfig {
             required_runtime_process_ids,
             admission,
             deployment_smtp,
+            webhook_allowed_private_ips,
             publication_lease_ttl,
             key_propagation_delay,
             signing_verification_retention,
@@ -814,6 +878,13 @@ fn parse_deployment_smtp(
 }
 
 fn parse_deployment_smtp_private_ips(value: Option<&str>) -> Result<Vec<IpAddr>, ConfigError> {
+    parse_allowed_private_ips("OWLAUTH_DEPLOYMENT_SMTP_ALLOWED_PRIVATE_IPS", value)
+}
+
+fn parse_allowed_private_ips(
+    key: &'static str,
+    value: Option<&str>,
+) -> Result<Vec<IpAddr>, ConfigError> {
     let mut addresses = value
         .unwrap_or_default()
         .split(',')
@@ -821,16 +892,15 @@ fn parse_deployment_smtp_private_ips(value: Option<&str>) -> Result<Vec<IpAddr>,
         .map(str::parse::<IpAddr>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ConfigError::InvalidValue {
-            key: "OWLAUTH_DEPLOYMENT_SMTP_ALLOWED_PRIVATE_IPS",
+            key,
             reason: "must be a comma-separated list of IP literals".to_owned(),
         })?;
     addresses.sort_unstable();
     addresses.dedup();
     crate::application::validate_private_relay_allowlist(&addresses).map_err(|_| {
         ConfigError::InvalidValue {
-            key: "OWLAUTH_DEPLOYMENT_SMTP_ALLOWED_PRIVATE_IPS",
-            reason: "must contain at most 16 explicitly overridable private relay addresses"
-                .to_owned(),
+            key,
+            reason: "must contain at most 16 explicitly overridable private addresses".to_owned(),
         }
     })?;
     Ok(addresses)
@@ -993,6 +1063,83 @@ fn parse_control_identity(
         None
     };
     Ok((Some(instance_id), control_api_key))
+}
+
+fn parse_control_mcp(
+    mode: PlaneMode,
+    values: &BTreeMap<String, String>,
+) -> Result<McpHttpConfig, ConfigError> {
+    let enabled = parse_boolean(values, "OWLAUTH_CONTROL_MCP_ENABLED", false)?;
+    if enabled && !mode.has_control() {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_CONTROL_MCP_ENABLED",
+            reason: "requires `OWLAUTH_MODE=control` or `OWLAUTH_MODE=all`".to_owned(),
+        });
+    }
+    let request_timeout = parse_millis(values, "OWLAUTH_CONTROL_MCP_REQUEST_TIMEOUT_MS", 10_000)?;
+    if request_timeout > Duration::from_mins(1) {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_CONTROL_MCP_REQUEST_TIMEOUT_MS",
+            reason: "must not exceed 60000 milliseconds".to_owned(),
+        });
+    }
+    Ok(McpHttpConfig {
+        enabled,
+        max_request_bytes: parse_bounded_usize(
+            values,
+            "OWLAUTH_CONTROL_MCP_MAX_REQUEST_BYTES",
+            65_536,
+            1_048_576,
+        )?,
+        request_timeout,
+        max_concurrent_requests: parse_bounded_usize(
+            values,
+            "OWLAUTH_CONTROL_MCP_MAX_CONCURRENT_REQUESTS",
+            16,
+            64,
+        )?,
+        max_requests_per_second: parse_bounded_usize(
+            values,
+            "OWLAUTH_CONTROL_MCP_MAX_REQUESTS_PER_SECOND",
+            64,
+            1_024,
+        )?,
+        max_result_bytes: parse_bounded_usize(
+            values,
+            "OWLAUTH_CONTROL_MCP_MAX_RESULT_BYTES",
+            65_536,
+            1_048_576,
+        )?,
+    })
+}
+
+fn validate_control_mcp_listener(
+    config: &McpHttpConfig,
+    listener: &ListenerConfig,
+) -> Result<(), ConfigError> {
+    if !config.enabled || listener.external_base.scheme() == "https" {
+        return Ok(());
+    }
+    let external_loopback = match listener.external_base.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(_)) | None => false,
+    };
+    if !external_loopback {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_CONTROL_BASE_URL",
+            reason: "must use HTTPS when remote MCP is enabled, except for an exact loopback IP"
+                .to_owned(),
+        });
+    }
+    if !listener.bind.ip().is_loopback() {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_CONTROL_ADDR",
+            reason: "must bind to an exact loopback IP when remote MCP uses development HTTP"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_provisioning(
@@ -1633,6 +1780,27 @@ fn parse_nonzero_u32(
     })
 }
 
+fn parse_bounded_usize(
+    values: &BTreeMap<String, String>,
+    key: &'static str,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, ConfigError> {
+    let value: usize = parse_value(
+        values,
+        key,
+        &default.to_string(),
+        "must be a positive integer",
+    )?;
+    if value == 0 || value > maximum {
+        return Err(ConfigError::InvalidValue {
+            key,
+            reason: format!("must be between 1 and {maximum}"),
+        });
+    }
+    Ok(value)
+}
+
 fn parse_millis(
     values: &BTreeMap<String, String>,
     key: &'static str,
@@ -1909,6 +2077,33 @@ mod tests {
         input.remove("OWLAUTH_DEPLOYMENT_SMTP_ALLOWED_PRIVATE_IPS");
         input.remove("OWLAUTH_DEPLOYMENT_SMTP_HOST");
         assert!(parse_deployment_smtp(&input).is_err());
+    }
+
+    #[test]
+    fn webhook_private_allowlist_is_exact_bounded_and_fail_closed() {
+        let mut input = runtime_values();
+        input.extend(control_store_values());
+        input.insert(
+            "OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS".to_owned(),
+            "10.0.0.8,fc00::8,10.0.0.8".to_owned(),
+        );
+        let config = ServerConfig::from_values(&input).expect("valid exact webhook allowlist");
+        assert_eq!(
+            config.webhook_allowed_private_ips,
+            ["10.0.0.8", "fc00::8"].map(|value| value.parse::<IpAddr>().unwrap())
+        );
+
+        input.insert(
+            "OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS".to_owned(),
+            "169.254.169.254".to_owned(),
+        );
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2640,6 +2835,103 @@ mod tests {
         assert!(key.matches(format!("{CONTROL_KEY_PREFIX}{}", "A".repeat(43)).as_bytes()));
         assert!(!key.matches(format!("{CONTROL_KEY_PREFIX}{}", "B".repeat(43)).as_bytes()));
         assert!(!format!("{key:?}").contains("owl_ctrl"));
+    }
+
+    #[test]
+    fn control_mcp_is_explicit_control_only_and_bounded() {
+        let disabled = parse_control_mcp(PlaneMode::Control, &BTreeMap::new())
+            .expect("disabled MCP defaults are valid");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.max_request_bytes, 65_536);
+        assert_eq!(disabled.max_concurrent_requests, 16);
+        assert_eq!(disabled.max_requests_per_second, 64);
+        assert_eq!(disabled.max_result_bytes, 65_536);
+
+        let mut values = BTreeMap::from([
+            ("OWLAUTH_CONTROL_MCP_ENABLED".to_owned(), "true".to_owned()),
+            (
+                "OWLAUTH_CONTROL_MCP_MAX_REQUEST_BYTES".to_owned(),
+                "32768".to_owned(),
+            ),
+            (
+                "OWLAUTH_CONTROL_MCP_REQUEST_TIMEOUT_MS".to_owned(),
+                "5000".to_owned(),
+            ),
+            (
+                "OWLAUTH_CONTROL_MCP_MAX_CONCURRENT_REQUESTS".to_owned(),
+                "8".to_owned(),
+            ),
+            (
+                "OWLAUTH_CONTROL_MCP_MAX_REQUESTS_PER_SECOND".to_owned(),
+                "32".to_owned(),
+            ),
+            (
+                "OWLAUTH_CONTROL_MCP_MAX_RESULT_BYTES".to_owned(),
+                "49152".to_owned(),
+            ),
+        ]);
+        let enabled = parse_control_mcp(PlaneMode::Control, &values)
+            .expect("bounded Control MCP configuration is valid");
+        assert!(enabled.enabled);
+        assert_eq!(enabled.max_request_bytes, 32_768);
+        assert_eq!(enabled.request_timeout, Duration::from_secs(5));
+        assert_eq!(enabled.max_concurrent_requests, 8);
+        assert_eq!(enabled.max_requests_per_second, 32);
+        assert_eq!(enabled.max_result_bytes, 49_152);
+        let listener = |bind, external_base| ListenerConfig {
+            bind,
+            external_base: Url::parse(external_base).unwrap(),
+            database_max_connections: NonZeroU32::new(1).unwrap(),
+        };
+        validate_control_mcp_listener(
+            &enabled,
+            &listener("127.0.0.1:8081".parse().unwrap(), "http://127.0.0.1:8081/"),
+        )
+        .expect("exact loopback development may use HTTP");
+        validate_control_mcp_listener(
+            &enabled,
+            &listener("0.0.0.0:8081".parse().unwrap(), "https://control.example/"),
+        )
+        .expect("remote MCP accepts HTTPS");
+        assert!(matches!(
+            validate_control_mcp_listener(
+                &enabled,
+                &listener("127.0.0.1:8081".parse().unwrap(), "http://control.example/"),
+            ),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_CONTROL_BASE_URL",
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_control_mcp_listener(
+                &enabled,
+                &listener("0.0.0.0:8081".parse().unwrap(), "http://127.0.0.1:8081/"),
+            ),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_CONTROL_ADDR",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            parse_control_mcp(PlaneMode::Runtime, &values),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_CONTROL_MCP_ENABLED",
+                ..
+            })
+        ));
+        values.insert(
+            "OWLAUTH_CONTROL_MCP_MAX_CONCURRENT_REQUESTS".to_owned(),
+            "65".to_owned(),
+        );
+        assert!(matches!(
+            parse_control_mcp(PlaneMode::Control, &values),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_CONTROL_MCP_MAX_CONCURRENT_REQUESTS",
+                ..
+            })
+        ));
     }
 
     #[test]

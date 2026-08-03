@@ -1121,6 +1121,7 @@ function AuthorityFields({
   const eligibleProviders = providers.filter(
     (provider) =>
       provider.status === "active" &&
+      provider.identity_proof_supported &&
       draft.applicationId !== "" &&
       provider.assigned_application_ids.includes(draft.applicationId),
   );

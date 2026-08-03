@@ -20,11 +20,13 @@ mod infrastructure;
 mod mail;
 mod managed_connection;
 mod managed_reauthorization;
+mod mcp_confirmation;
 #[allow(
     dead_code,
     reason = "passwordless email ports are consumed by Runtime and PostgreSQL"
 )]
 mod passwordless_email;
+mod projection_expansion;
 mod provider_callback;
 mod provisioning;
 mod readiness;
@@ -36,6 +38,7 @@ mod runtime_security;
 )]
 mod session_authority;
 mod unit_of_work;
+mod webhook;
 
 #[cfg(test)]
 pub(crate) use admission::MonotonicClock;
@@ -141,12 +144,21 @@ pub(crate) use managed_reauthorization::{
     ManagedReauthorizationTargetIssuer, ManagedReauthorizationTargetVerifier,
     ManagedReauthorizationView, PreparedManagedReauthorizationCreate, StartManagedReauthorization,
 };
+pub(crate) use mcp_confirmation::{
+    ConfirmedProjectionPolicyUpdate, McpConfirmationContext, McpConfirmationPort,
+    McpConfirmationService, PROJECTION_POLICY_COMMIT_TOOL, PreparedProjectionPolicyConfirmation,
+};
 #[allow(unused_imports, reason = "passwordless email integration is additive")]
 pub(crate) use passwordless_email::{
     AdmittedEmailMethod, CommitEmailGeneration, CompleteEmailProof, EmailGenerationPreparation,
     EmailIdentityAliasAuthority, EmailProofDecision, EmailProofKind, EstablishMagicTransferContext,
     PasswordlessEmailRepository, ResolveMagicTransferContext, ResolvedMagicTransferContext,
     SelectEmailMethod, VerifiedEmailChallenge, VerifyEmailProof,
+};
+pub(crate) use projection_expansion::{
+    DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE, ProjectionExpansionRepository,
+    ProjectionExpansionWorker, ProjectionPolicyPort, ProjectionPolicyRecord,
+    ProjectionPolicyService, UpdateProjectionPolicy,
 };
 pub(crate) use provider_callback::{ProviderCallbackOwner, ProviderCallbackOwnerResolver};
 pub(crate) use provisioning::{
@@ -190,3 +202,12 @@ pub(crate) use session_authority::{
     VerifiedProviderIdentity,
 };
 pub(crate) use unit_of_work::{CompleteIdempotency, NewProject, ProjectUnitOfWork};
+pub(crate) use webhook::{
+    ApplicationUserEventRecord, ClaimedWebhookDelivery, ClaimedWebhookSecretCleanup,
+    ConfirmWebhookSecretProvisioned, CreateWebhookEndpoint, HistoryCursor, PrepareWebhookEndpoint,
+    PrepareWebhookRotation, PrepareWebhookSecretRotation, PreparedWebhookEndpoint,
+    PreparedWebhookSecret, UpdateWebhookEndpoint, WebhookControlPort, WebhookControlService,
+    WebhookDeliveryRecord, WebhookDeliveryRepository, WebhookEndpointRecord,
+    WebhookEndpointValidator, WebhookSecretPreparationState, WebhookSecretResolver,
+    WebhookTransport, WebhookTransportOutcome, WebhookWorker, endpoint_status, event_type,
+};

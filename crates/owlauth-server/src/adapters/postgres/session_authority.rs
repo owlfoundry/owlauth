@@ -42,6 +42,7 @@ use super::{
         project_browser_session, project_key_ring, project_policy, project_signing_key,
         project_user, provider_configuration, refresh_family, refresh_token_generation,
     },
+    projection::IdentityProjectionMaterializer,
     runtime_incarnation::RuntimeIncarnationFence,
 };
 
@@ -51,6 +52,7 @@ pub(crate) struct PostgresSessionAuthorityRepository {
     runtime_incarnation: RuntimeIncarnationFence,
     managed_protector: Option<Arc<dyn ManagedCredentialProtector>>,
     runtime_protector: Option<Arc<dyn RuntimeProtector>>,
+    projection_materializer: Option<Arc<dyn IdentityProjectionMaterializer>>,
 }
 
 impl std::fmt::Debug for PostgresSessionAuthorityRepository {
@@ -61,6 +63,10 @@ impl std::fmt::Debug for PostgresSessionAuthorityRepository {
             .field("runtime_incarnation", &self.runtime_incarnation)
             .field("managed_protector", &self.managed_protector.is_some())
             .field("runtime_protector", &self.runtime_protector.is_some())
+            .field(
+                "projection_materializer",
+                &self.projection_materializer.is_some(),
+            )
             .finish()
     }
 }
@@ -73,6 +79,7 @@ impl PostgresSessionAuthorityRepository {
             runtime_incarnation: RuntimeIncarnationFence::test_default(),
             managed_protector: None,
             runtime_protector: None,
+            projection_materializer: None,
         }
     }
 
@@ -80,6 +87,7 @@ impl PostgresSessionAuthorityRepository {
         database: DatabaseConnection,
         runtime_process_id: String,
         runtime_incarnation: uuid::Uuid,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
@@ -89,7 +97,17 @@ impl PostgresSessionAuthorityRepository {
             ),
             managed_protector: None,
             runtime_protector: None,
+            projection_materializer: Some(projection_materializer),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_projection_materializer(
+        mut self,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
+    ) -> Self {
+        self.projection_materializer = Some(projection_materializer);
+        self
     }
 
     #[cfg(test)]
@@ -102,6 +120,7 @@ impl PostgresSessionAuthorityRepository {
             runtime_incarnation: RuntimeIncarnationFence::test_default(),
             managed_protector: Some(managed_protector),
             runtime_protector: None,
+            projection_materializer: None,
         }
     }
 
@@ -116,6 +135,7 @@ impl PostgresSessionAuthorityRepository {
             runtime_incarnation: RuntimeIncarnationFence::test_default(),
             managed_protector: Some(managed_protector),
             runtime_protector: Some(runtime_protector),
+            projection_materializer: None,
         }
     }
 
@@ -125,6 +145,7 @@ impl PostgresSessionAuthorityRepository {
         runtime_incarnation: uuid::Uuid,
         managed_protector: Arc<dyn ManagedCredentialProtector>,
         runtime_protector: Arc<dyn RuntimeProtector>,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
@@ -134,6 +155,27 @@ impl PostgresSessionAuthorityRepository {
             ),
             managed_protector: Some(managed_protector),
             runtime_protector: Some(runtime_protector),
+            projection_materializer: Some(projection_materializer),
+        }
+    }
+
+    async fn fan_out_user(
+        &self,
+        transaction: &sea_orm::DatabaseTransaction,
+        user: &project_user::Model,
+        now: OffsetDateTime,
+    ) -> Result<(), ApplicationError> {
+        if let Some(materializer) = &self.projection_materializer {
+            materializer.fan_out_user(transaction, user, now).await
+        } else {
+            #[cfg(test)]
+            {
+                fan_out_user_projections(transaction, user, now).await
+            }
+            #[cfg(not(test))]
+            {
+                Err(ApplicationError::Integrity)
+            }
         }
     }
 }
@@ -500,7 +542,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             }
         };
         if user_projection_changed {
-            fan_out_user_projections(&transaction, &user, command.now).await?;
+            self.fan_out_user(&transaction, &user, command.now).await?;
         }
         if let (Some(credential), Some(capability)) = (renewable_credential, managed_capability) {
             if !provider.managed_profile_enabled
@@ -1261,6 +1303,18 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         {
             return Err(ApplicationError::RevisionConflict);
         }
+        let projection_event_type = if existing_projection.is_none() {
+            Some(crate::domain::ApplicationUserEventType::Created)
+        } else if material.semantic_change {
+            Some(if user.status == "disabled" {
+                crate::domain::ApplicationUserEventType::Disabled
+            } else {
+                crate::domain::ApplicationUserEventType::Updated
+            })
+        } else {
+            None
+        };
+        let event_document = material.document.clone();
         let projection = match existing_projection {
             Some(projection) if self.runtime_protector.is_some() => {
                 super::projection::repair_runtime_projection(
@@ -1316,6 +1370,18 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?,
         };
+        if let Some(event_type) = projection_event_type {
+            super::webhook::append_projection_event(
+                &transaction,
+                &project.public_id,
+                &application.public_id,
+                binding.id,
+                &projection,
+                &event_document,
+                event_type,
+            )
+            .await?;
+        }
 
         let absolute_expires_at = command.now + Duration::days(30);
         let refresh_retain_until =
@@ -2658,6 +2724,7 @@ async fn record_refresh_replay(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn fan_out_user_projections(
     transaction: &sea_orm::DatabaseTransaction,
     user: &project_user::Model,

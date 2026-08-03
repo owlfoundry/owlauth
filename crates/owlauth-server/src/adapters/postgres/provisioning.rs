@@ -19,7 +19,7 @@ use crate::{
             application_publishable_key, application_redirect, audit_event,
             control_idempotency_record, key_provisioning_operation, key_state_event, project,
             project_key_ring, project_policy, project_signing_key, provider_configuration,
-            provider_secret_operation, runtime_publication_lease,
+            provider_secret_operation, runtime_publication_lease, webhook_endpoint,
         },
         system::{Sha256RequestDigester, SystemClock},
     },
@@ -34,7 +34,8 @@ use crate::{
     },
     domain::{
         ApplicationStatus, ApplicationType, BrowserOrigin, MAX_ACCESS_TOKEN_LIFETIME_SECONDS,
-        ProjectStatus, ProviderStatus, RedirectUri, SigningKeyState,
+        MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION, ProjectStatus, ProviderStatus, RedirectUri,
+        SigningKeyState,
     },
 };
 
@@ -600,6 +601,32 @@ impl PostgresProvisioningAdapter {
             .map_err(|_| ApplicationError::InvalidTransition)?;
         let aggregate_revision = model.revision + 1;
         let next_security_revision = expected_security_revision + 1;
+        let now = self.clock.now();
+        let endpoints = webhook_endpoint::Entity::find()
+            .filter(webhook_endpoint::Column::ProjectId.eq(project_id))
+            .filter(webhook_endpoint::Column::ApplicationId.eq(application_id))
+            .filter(webhook_endpoint::Column::Status.is_in(["pending", "active"]))
+            .order_by_asc(webhook_endpoint::Column::Id)
+            .limit((MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION + 1) as u64)
+            .lock_exclusive()
+            .all(&transaction)
+            .await
+            .map_err(persistence)?;
+        if endpoints.len() > MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION {
+            return Err(ApplicationError::Integrity);
+        }
+        for endpoint in endpoints {
+            let next_endpoint_revision = endpoint
+                .revision
+                .checked_add(1)
+                .ok_or(ApplicationError::Integrity)?;
+            let mut active = endpoint.into_active_model();
+            active.status = Set("disabled".to_owned());
+            active.revision = Set(next_endpoint_revision);
+            active.disabled_at = Set(Some(now));
+            active.updated_at = Set(now);
+            active.update(&transaction).await.map_err(persistence)?;
+        }
         let assignments = application_provider_assignment::Entity::find()
             .filter(application_provider_assignment::Column::ProjectId.eq(project_id))
             .filter(application_provider_assignment::Column::ApplicationId.eq(application_id))
@@ -638,7 +665,7 @@ impl PostgresProvisioningAdapter {
         active.status = Set(status.as_str().to_owned());
         active.security_revision = Set(next_security_revision);
         active.revision = Set(aggregate_revision);
-        active.updated_at = Set(self.clock.now());
+        active.updated_at = Set(now);
         active.update(&transaction).await.map_err(persistence)?;
         insert_audit(
             &transaction,
@@ -1502,6 +1529,7 @@ impl PostgresProvisioningAdapter {
             project_id: Set(project_id),
             provider_key: Set(command.provider_key),
             kind: Set("oidc".to_owned()),
+            adapter_kind: Set(Some(command.kind.as_str().to_owned())),
             display_name: Set(command.display_name),
             issuer: Set(command.issuer),
             client_id: Set(command.client_id),
@@ -1709,8 +1737,14 @@ impl PostgresProvisioningAdapter {
             _ => return Err(ApplicationError::InvalidTransition),
         }
         transaction.commit().await.map_err(persistence)?;
+        let provider_kind = super::effective_provider_kind(
+            &provider.kind,
+            provider.adapter_kind.as_deref(),
+            &provider.issuer,
+        )?;
         Ok(ProviderRecovery {
             operation_alias: operation.operation_alias,
+            kind: provider_kind,
             provider_key: provider.provider_key,
             display_name: provider.display_name,
             issuer: provider.issuer,
@@ -1932,11 +1966,16 @@ impl PostgresProvisioningAdapter {
             .into_iter()
             .map(|assignment| assignment.application_id)
             .collect();
+        let provider_kind = super::effective_provider_kind(
+            &provider.kind,
+            provider.adapter_kind.as_deref(),
+            &provider.issuer,
+        )?;
         Ok(ProviderRecord {
             id: provider.id,
             project_id: provider.project_id,
             provider_key: provider.provider_key,
-            kind: provider.kind,
+            kind: provider_kind.as_str().to_owned(),
             display_name: provider.display_name,
             issuer: provider.issuer,
             client_id: provider.client_id,
@@ -2117,7 +2156,13 @@ async fn active_application<C>(
 where
     C: ConnectionTrait,
 {
-    let application = find_application(connection, project_id, application_id).await?;
+    let application = application::Entity::find_by_id(application_id)
+        .filter(application::Column::ProjectId.eq(project_id))
+        .lock_exclusive()
+        .one(connection)
+        .await
+        .map_err(persistence)?
+        .ok_or(ApplicationError::NotFound)?;
     if application.status != "active" {
         return Err(ApplicationError::Disabled);
     }

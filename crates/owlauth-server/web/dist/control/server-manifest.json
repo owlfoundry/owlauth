@@ -1,15 +1,38 @@
 {
   "schemaVersion": 1,
   "plane": "control",
-  "entry": "assets/control-DNDjiICX.js",
+  "entry": "assets/control-1KYTIPem.js",
   "scripts": [
-    "assets/control-DNDjiICX.js"
+    "assets/control-1KYTIPem.js"
   ],
   "stylesheets": [
     "assets/control-BFfvGatZ.css"
   ],
-  "assetSetSha256": "977f0d13e061bba096f2628f5cc813cd1fdbd5aac06658b57ab1eff349f9f5b2",
+  "assetSetSha256": "46acb166138672a2fbb82ce6977bfcc5566f512d73c3004af1968a58b0b1e9dd",
   "files": [
+    {
+      "path": "assets/control-1KYTIPem.js",
+      "mime": "text/javascript; charset=utf-8",
+      "bytes": 319675,
+      "sha256": "9fb0e41b5f1b99fa6fdb335a308f8417fd1b4fa4ab96295590445e49ef7b79b5",
+      "representations": {
+        "identity": {
+          "path": "assets/control-1KYTIPem.js",
+          "bytes": 319675,
+          "sha256": "9fb0e41b5f1b99fa6fdb335a308f8417fd1b4fa4ab96295590445e49ef7b79b5"
+        },
+        "gzip": {
+          "path": "assets/control-1KYTIPem.js.gz",
+          "bytes": 96654,
+          "sha256": "d0a57ed390782a5f6a066e6dac7f3e36c03f488d2d758fd719ac10929723a2d3"
+        },
+        "brotli": {
+          "path": "assets/control-1KYTIPem.js.br",
+          "bytes": 80226,
+          "sha256": "f2eba843f97a6e15ad90d5f924591d7b197245094ee9fae2dba61a7b509899be"
+        }
+      }
+    },
     {
       "path": "assets/control-BFfvGatZ.css",
       "mime": "text/css; charset=utf-8",
@@ -30,29 +53,6 @@
           "path": "assets/control-BFfvGatZ.css.br",
           "bytes": 1084,
           "sha256": "0eff78ba53b398319f7cc9028e1ab498c5ad200f9f4c997d8ad2b4fdccb03457"
-        }
-      }
-    },
-    {
-      "path": "assets/control-DNDjiICX.js",
-      "mime": "text/javascript; charset=utf-8",
-      "bytes": 307055,
-      "sha256": "ee2c9c161abd5cbcaac1a5f6a56bc28c09a64ffc66a8e81093bdbe80bd92d8c6",
-      "representations": {
-        "identity": {
-          "path": "assets/control-DNDjiICX.js",
-          "bytes": 307055,
-          "sha256": "ee2c9c161abd5cbcaac1a5f6a56bc28c09a64ffc66a8e81093bdbe80bd92d8c6"
-        },
-        "gzip": {
-          "path": "assets/control-DNDjiICX.js.gz",
-          "bytes": 94012,
-          "sha256": "c2aaa76da7151880308e68d75d65c9122ac2cdf02b139964719fa6e8a3ec5452"
-        },
-        "brotli": {
-          "path": "assets/control-DNDjiICX.js.br",
-          "bytes": 78215,
-          "sha256": "037923b457de2fd1c9ed8001092dd3c90f8c58af8a15ccf952b005953fb49202"
         }
       }
     }

@@ -16,7 +16,8 @@ use super::{
     VersionedDigest,
 };
 use crate::domain::{
-    BoundedProviderProfile, ManagedProfileCapability, ProfileDisplayName, ProfilePictureUrl,
+    BoundedProviderProfile, ManagedProfileCapabilities, ManagedProfileCapability,
+    ProfileDisplayName, ProfilePictureUrl,
 };
 
 const REAUTHORIZATION_LIFETIME: Duration = Duration::minutes(10);
@@ -84,6 +85,7 @@ pub(crate) struct ManagedReauthorizationRecord {
     pub expected_connection_generation: i64,
     pub expected_credential_generation: i64,
     pub expected_connection_revision: i64,
+    pub provider_kind: crate::domain::ProviderKind,
     pub project_security_revision: i64,
     pub user_security_revision: i64,
     pub identity_revision: i64,
@@ -417,7 +419,7 @@ pub(crate) struct ManagedReauthorizationControlService {
     target_issuer: Arc<dyn ManagedReauthorizationTargetIssuer>,
     clock: Arc<dyn Clock>,
     runtime_base: Url,
-    capability: ManagedAdapterCapabilitySnapshot,
+    capabilities: ManagedProfileCapabilities,
 }
 
 impl ManagedReauthorizationControlService {
@@ -426,22 +428,30 @@ impl ManagedReauthorizationControlService {
         target_issuer: Arc<dyn ManagedReauthorizationTargetIssuer>,
         clock: Arc<dyn Clock>,
         runtime_base: Url,
-        capability: &'static ManagedProfileCapability,
+        capabilities: impl Into<ManagedProfileCapabilities>,
     ) -> Result<Self, ApplicationError> {
+        let capabilities = capabilities.into();
+        capabilities.validate().map_err(ApplicationError::from)?;
         Ok(Self {
             repository,
             target_issuer,
             clock,
             runtime_base,
-            capability: ManagedAdapterCapabilitySnapshot::from_capability(capability)?,
+            capabilities,
         })
     }
 
-    pub(crate) async fn create(
+    pub(crate) async fn create_for_adapter_key(
         &self,
         command: CreateManagedReauthorization,
+        adapter_key: &str,
     ) -> Result<CreatedManagedReauthorization, ApplicationError> {
         validate_create(&command)?;
+        let capability = self
+            .capabilities
+            .for_adapter_key(adapter_key)
+            .ok_or(ApplicationError::InvalidTransition)?;
+        let capability = ManagedAdapterCapabilitySnapshot::from_capability(capability)?;
         let now = self.clock.now();
         let interaction_id = Uuid::new_v4();
         let handle = self.credential_with_id(interaction_id)?;
@@ -457,7 +467,7 @@ impl ManagedReauthorizationControlService {
             .repository
             .create(PreparedManagedReauthorizationCreate {
                 command,
-                capability: self.capability.clone(),
+                capability,
                 interaction_id,
                 interaction_digest,
                 request_digest,
@@ -560,7 +570,7 @@ pub(crate) struct ManagedReauthorizationRuntimeService {
     provider: Arc<dyn UpstreamProviderClient>,
     provider_secrets: Arc<dyn ProviderSecretResolver>,
     clock: Arc<dyn Clock>,
-    capability: ManagedAdapterCapabilitySnapshot,
+    capabilities: ManagedProfileCapabilities,
 }
 
 impl ManagedReauthorizationRuntimeService {
@@ -574,8 +584,10 @@ impl ManagedReauthorizationRuntimeService {
         provider: Arc<dyn UpstreamProviderClient>,
         provider_secrets: Arc<dyn ProviderSecretResolver>,
         clock: Arc<dyn Clock>,
-        capability: &'static ManagedProfileCapability,
+        capabilities: impl Into<ManagedProfileCapabilities>,
     ) -> Result<Self, ApplicationError> {
+        let capabilities = capabilities.into();
+        capabilities.validate().map_err(ApplicationError::from)?;
         Ok(Self {
             repository,
             connections,
@@ -585,7 +597,7 @@ impl ManagedReauthorizationRuntimeService {
             provider,
             provider_secrets,
             clock,
-            capability: ManagedAdapterCapabilitySnapshot::from_capability(capability)?,
+            capabilities,
         })
     }
 
@@ -737,6 +749,7 @@ impl ManagedReauthorizationRuntimeService {
             .provider
             .as_ref()
             .authorization_url(ProviderAuthorizationRequest {
+                kind: current.provider_kind,
                 issuer: current.issuer.clone(),
                 client_id: current.client_id.clone(),
                 callback_url: current.callback_url.clone(),
@@ -894,7 +907,12 @@ impl ManagedReauthorizationRuntimeService {
         callback: &ManagedReauthorizationCallback,
         claimed: &ManagedReauthorizationRecord,
     ) -> Result<ManagedReauthorizationCallbackOutcome, ApplicationError> {
-        if !self.capability.matches_record(claimed) {
+        let capability = self
+            .capabilities
+            .for_kind(claimed.provider_kind)
+            .ok_or(ApplicationError::RevisionConflict)?;
+        let capability = ManagedAdapterCapabilitySnapshot::from_capability(capability)?;
+        if !capability.matches_record(claimed) {
             return Err(ApplicationError::RevisionConflict);
         }
         let secret = self
@@ -926,6 +944,7 @@ impl ManagedReauthorizationRuntimeService {
             .provider
             .as_ref()
             .exchange_code(ProviderCallbackRequest {
+                kind: claimed.provider_kind,
                 issuer: claimed.issuer.clone(),
                 client_id: claimed.client_id.clone(),
                 client_secret: secret,
@@ -961,7 +980,12 @@ impl ManagedReauthorizationRuntimeService {
             .protect_credential(&context, renewable.value.as_ref())?;
         // Re-check immediately before the successor commit. The callback freezes every adapter
         // property; a deployment capability change invalidates the exchanged observation.
-        if !self.capability.matches_record(claimed) {
+        let capability = self
+            .capabilities
+            .for_kind(claimed.provider_kind)
+            .ok_or(ApplicationError::RevisionConflict)?;
+        let capability = ManagedAdapterCapabilitySnapshot::from_capability(capability)?;
+        if !capability.matches_record(claimed) {
             return Err(ApplicationError::RevisionConflict);
         }
         let completed = self
@@ -1186,6 +1210,7 @@ mod tests {
             expected_connection_generation: 1,
             expected_credential_generation: 1,
             expected_connection_revision: 1,
+            provider_kind: crate::domain::ProviderKind::Oidc,
             project_security_revision: 1,
             user_security_revision: 1,
             identity_revision: 1,

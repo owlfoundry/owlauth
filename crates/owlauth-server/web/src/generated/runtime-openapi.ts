@@ -653,7 +653,7 @@ export interface components {
             url: string;
         };
         /** @enum {string} */
-        ProviderKind: "oidc";
+        ProviderKind: "oidc" | "google" | "github";
         PublicApplicationConfig: {
             application_display_name: string;
             application_public_id: string;

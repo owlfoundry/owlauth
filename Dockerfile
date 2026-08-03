@@ -56,6 +56,7 @@ RUN apt-get update \
 
 COPY --from=rust-builder --chown=owlauth:owlauth /workspace/target/release/owlauth-server /usr/local/bin/owlauth-server
 COPY --chown=owlauth:owlauth LICENSE /usr/share/licenses/owlauth/LICENSE
+COPY --chown=owlauth:owlauth crates/owlauth-server/third-party /usr/share/licenses/owlauth/third-party
 
 USER owlauth
 ENV OWLAUTH_MODE=runtime \

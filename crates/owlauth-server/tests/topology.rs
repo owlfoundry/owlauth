@@ -175,6 +175,39 @@ impl ServerProcess {
         let _ = self.child.wait();
     }
 
+    async fn terminate_gracefully(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        #[cfg(unix)]
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &self.child.id().to_string()])
+                .status()
+                .is_ok_and(|status| status.success()),
+            "OwlAuth topology process should accept SIGTERM"
+        );
+        #[cfg(not(unix))]
+        self.child
+            .kill()
+            .expect("OwlAuth topology process should accept termination");
+        for _ in 0..200 {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .expect("topology process status should be readable")
+            {
+                assert!(
+                    status.success(),
+                    "graceful shutdown should exit successfully"
+                );
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        panic!("OwlAuth topology process exceeded its graceful shutdown bound");
+    }
+
     async fn wait_for_exit(&mut self) -> std::process::ExitStatus {
         for _ in 0..200 {
             if let Some(status) = self
@@ -515,7 +548,7 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
     .await;
     assert_runtime_reads_project(&client, &combined_runtime_base, &combined_project.public_id)
         .await;
-    combined.terminate();
+    combined.terminate_gracefully().await;
 
     let runtime_port = free_port();
     let control_port = free_port();
@@ -534,11 +567,20 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
     control.terminate();
     assert_runtime_reads_project(&client, &runtime_base, &split_project.public_id).await;
 
-    let mut restarted_control = ServerProcess::spawn(&control_configuration);
+    let mut verify_control_configuration = control_configuration.clone();
+    verify_control_configuration.push(("OWLAUTH_MIGRATION_MODE".to_owned(), "verify".to_owned()));
+    let mut restarted_control = ServerProcess::spawn(&verify_control_configuration);
     wait_for_ready(&client, &control_base, &mut restarted_control).await;
     assert_control_reads_project(&client, &control_base, &split_project.public_id).await;
     runtime.terminate();
     assert_control_reads_project(&client, &control_base, &split_project.public_id).await;
+
+    let mut verify_runtime_configuration = runtime_environment(&common, runtime_port);
+    verify_runtime_configuration.push(("OWLAUTH_MIGRATION_MODE".to_owned(), "verify".to_owned()));
+    let mut restarted_runtime = ServerProcess::spawn(&verify_runtime_configuration);
+    wait_for_ready(&client, &runtime_base, &mut restarted_runtime).await;
+    assert_runtime_reads_project(&client, &runtime_base, &split_project.public_id).await;
+    restarted_runtime.terminate_gracefully().await;
 
     create_secondary_database(&primary_url).await;
     let secondary_url = database_url(&host, port, "owlauth_other");

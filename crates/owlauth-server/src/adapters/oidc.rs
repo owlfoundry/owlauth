@@ -53,6 +53,7 @@ const MAX_PICTURE_BYTES: usize = 2048;
 const MAX_AUDIENCES: usize = 8;
 const MAX_ID_TOKEN_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 const REQUIRED_CLOCK_SKEW_SECONDS: i64 = 60;
+#[cfg(test)]
 const PROVIDER_EXCHANGE_CONCURRENCY_LIMIT: usize = 16;
 
 /// A deliberately narrow OIDC client. Every issuer and endpoint origin must be explicitly
@@ -62,11 +63,13 @@ const PROVIDER_EXCHANGE_CONCURRENCY_LIMIT: usize = 16;
 pub(crate) struct RestrictedOidcProviderClient {
     http: Client,
     endpoint_policy: Arc<EndpointPolicy>,
+    callback_allow_http_loopback: bool,
     exchange_budget: Arc<Semaphore>,
     request_timeout: Duration,
 }
 
 impl RestrictedOidcProviderClient {
+    #[cfg(test)]
     pub(crate) fn new<I, S>(
         allowed_endpoint_origins: I,
         allow_http_loopback: bool,
@@ -75,25 +78,62 @@ impl RestrictedOidcProviderClient {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Self::build(
+        Self::new_with_budget(
             allowed_endpoint_origins,
             allow_http_loopback,
-            REQUEST_TIMEOUT,
-            PROVIDER_EXCHANGE_CONCURRENCY_LIMIT,
+            Arc::new(Semaphore::new(PROVIDER_EXCHANGE_CONCURRENCY_LIMIT)),
         )
     }
 
-    fn build<I, S>(
+    pub(crate) fn new_with_budget<I, S>(
         allowed_endpoint_origins: I,
         allow_http_loopback: bool,
-        request_timeout: Duration,
-        exchange_concurrency_limit: usize,
+        exchange_budget: Arc<Semaphore>,
     ) -> Result<Self, ProviderExchangeError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let endpoint_policy = EndpointPolicy::new(allowed_endpoint_origins, allow_http_loopback)?;
+        Self::new_with_budget_and_callback_policy(
+            allowed_endpoint_origins,
+            allow_http_loopback,
+            allow_http_loopback,
+            exchange_budget,
+        )
+    }
+
+    pub(crate) fn new_with_budget_and_callback_policy<I, S>(
+        allowed_endpoint_origins: I,
+        allow_http_loopback_endpoints: bool,
+        callback_allow_http_loopback: bool,
+        exchange_budget: Arc<Semaphore>,
+    ) -> Result<Self, ProviderExchangeError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::build(
+            allowed_endpoint_origins,
+            allow_http_loopback_endpoints,
+            callback_allow_http_loopback,
+            REQUEST_TIMEOUT,
+            exchange_budget,
+        )
+    }
+
+    fn build<I, S>(
+        allowed_endpoint_origins: I,
+        allow_http_loopback_endpoints: bool,
+        callback_allow_http_loopback: bool,
+        request_timeout: Duration,
+        exchange_budget: Arc<Semaphore>,
+    ) -> Result<Self, ProviderExchangeError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let endpoint_policy =
+            EndpointPolicy::new(allowed_endpoint_origins, allow_http_loopback_endpoints)?;
         let http = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(request_timeout)
@@ -101,13 +141,14 @@ impl RestrictedOidcProviderClient {
             .no_proxy()
             .build()
             .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?;
-        if exchange_concurrency_limit == 0 {
+        if exchange_budget.available_permits() == 0 {
             return Err(ProviderExchangeError::UnavailableBeforeDispatch);
         }
         Ok(Self {
             http,
             endpoint_policy: Arc::new(endpoint_policy),
-            exchange_budget: Arc::new(Semaphore::new(exchange_concurrency_limit)),
+            callback_allow_http_loopback,
+            exchange_budget,
             request_timeout,
         })
     }
@@ -119,8 +160,14 @@ impl RestrictedOidcProviderClient {
 
     #[cfg(test)]
     fn for_loopback_tests_with_exchange_limit(origin: &str, limit: usize) -> Self {
-        Self::build([origin], true, Duration::from_millis(250), limit)
-            .expect("loopback test origin and concurrency limit must be valid")
+        Self::build(
+            [origin],
+            true,
+            true,
+            Duration::from_millis(250),
+            Arc::new(Semaphore::new(limit)),
+        )
+        .expect("loopback test origin and concurrency limit must be valid")
     }
 
     async fn discover(
@@ -308,7 +355,7 @@ impl RestrictedOidcProviderClient {
         // RFC 6749 permits `scope` to be omitted when it is unchanged. The omitted value is
         // therefore derived only from OwlAuth's exact request profile; an explicit provider value
         // remains an exact canonical set assertion and can never widen caller authority.
-        let expected_scopes = requested_scopes(request.profile);
+        let expected_scopes = requested_scopes(request.kind, request.profile);
         let granted_scopes = token
             .scope
             .as_deref()
@@ -360,15 +407,26 @@ impl RestrictedOidcProviderClient {
 
 #[async_trait]
 impl UpstreamProviderClient for RestrictedOidcProviderClient {
-    fn issuer_allowed(&self, issuer: &str) -> bool {
-        self.endpoint_policy.validate_issuer(issuer).is_ok()
+    fn issuer_allowed(&self, kind: crate::domain::ProviderKind, issuer: &str) -> bool {
+        matches!(
+            kind,
+            crate::domain::ProviderKind::Oidc | crate::domain::ProviderKind::Google
+        ) && kind.issuer_matches(issuer)
+            && self.endpoint_policy.validate_issuer(issuer).is_ok()
     }
 
     async fn authorization_url(
         &self,
         request: ProviderAuthorizationRequest,
     ) -> Result<ProviderAuthorization, ProviderExchangeError> {
-        validate_authorization_request(&request, &self.endpoint_policy)?;
+        if !self.issuer_allowed(request.kind, &request.issuer) {
+            return Err(ProviderExchangeError::UnavailableBeforeDispatch);
+        }
+        validate_authorization_request(
+            &request,
+            &self.endpoint_policy,
+            self.callback_allow_http_loopback,
+        )?;
         let discovery = self
             .discover(
                 &request.issuer,
@@ -376,8 +434,7 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
             )
             .await?;
         if request.profile.is_managed_profile()
-            && (!contains_exact(&discovery.scopes_supported, "offline_access")
-                || discovery.userinfo_endpoint.is_none())
+            && !managed_discovery_supported(request.kind, &discovery)
         {
             return Err(ProviderExchangeError::UnavailableBeforeDispatch);
         }
@@ -395,7 +452,14 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
         &self,
         request: ProviderCallbackRequest,
     ) -> Result<ProviderIdentity, ProviderExchangeError> {
-        validate_callback_request(&request, &self.endpoint_policy)?;
+        if !self.issuer_allowed(request.kind, &request.issuer) {
+            return Err(ProviderExchangeError::UnavailableBeforeDispatch);
+        }
+        validate_callback_request(
+            &request,
+            &self.endpoint_policy,
+            self.callback_allow_http_loopback,
+        )?;
         // Provider exchange capacity is deliberately process-local and fail-fast. Waiting for a
         // permit would create an unbounded queue behind a slow or unavailable provider.
         let _permit = self
@@ -409,8 +473,7 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
             )
             .await?;
         if request.profile.is_managed_profile()
-            && (!contains_exact(&discovery.scopes_supported, "offline_access")
-                || discovery.userinfo_endpoint.is_none())
+            && !managed_discovery_supported(request.kind, &discovery)
         {
             return Err(ProviderExchangeError::UnavailableBeforeDispatch);
         }
@@ -431,7 +494,8 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
                 .clone()
         };
         let mut identity = validate_id_token(&token.id_token, &jwk, &request)?;
-        if request.profile.is_managed_profile() && token.granted_scopes == managed_profile_scopes()
+        if request.profile.is_managed_profile()
+            && token.granted_scopes == managed_profile_scopes(request.kind)
         {
             identity.renewable_credential =
                 token
@@ -461,22 +525,62 @@ const CONTROLLED_OIDC_MANAGED_CAPABILITY: ManagedProfileCapability = ManagedProf
     maximum_latency_seconds: 10,
 };
 
+const GOOGLE_OIDC_MANAGED_CAPABILITY: ManagedProfileCapability = ManagedProfileCapability {
+    adapter_key: "google_oidc_profile_v1",
+    adapter_revision: 1,
+    exact_scopes: &["openid", "profile"],
+    provider_pkce_required: true,
+    oidc_nonce_required: true,
+    credential_rotates: true,
+    read_retry_safe: true,
+    renewal_replay: RenewalReplay::Never,
+    supports_revocation: true,
+    profile_schema: "owlauth.provider-profile.v1",
+    maximum_body_bytes: 16 * 1024,
+    maximum_latency_seconds: 10,
+};
+
 pub(crate) fn controlled_oidc_managed_capability() -> &'static ManagedProfileCapability {
     &CONTROLLED_OIDC_MANAGED_CAPABILITY
 }
 
+pub(crate) fn google_oidc_managed_capability() -> &'static ManagedProfileCapability {
+    &GOOGLE_OIDC_MANAGED_CAPABILITY
+}
+
+pub(crate) fn managed_profile_capabilities() -> crate::domain::ManagedProfileCapabilities {
+    crate::domain::ManagedProfileCapabilities::new(
+        controlled_oidc_managed_capability(),
+        google_oidc_managed_capability(),
+    )
+}
+
 #[derive(Clone)]
 pub(crate) struct RestrictedOidcManagedProfileAdapter {
-    client: RestrictedOidcProviderClient,
+    oidc: RestrictedOidcProviderClient,
+    google: RestrictedOidcProviderClient,
     secrets: Arc<dyn ProviderSecretResolver>,
 }
 
 impl RestrictedOidcManagedProfileAdapter {
     pub(crate) fn new(
-        client: RestrictedOidcProviderClient,
+        oidc: RestrictedOidcProviderClient,
+        google: RestrictedOidcProviderClient,
         secrets: Arc<dyn ProviderSecretResolver>,
     ) -> Self {
-        Self { client, secrets }
+        Self {
+            oidc,
+            google,
+            secrets,
+        }
+    }
+
+    fn client(&self, guard: &ConnectionGuard) -> Result<&RestrictedOidcProviderClient, ()> {
+        match guard.provider_kind {
+            crate::domain::ProviderKind::Oidc => Ok(&self.oidc),
+            crate::domain::ProviderKind::Google => Ok(&self.google),
+            crate::domain::ProviderKind::Github => Err(()),
+        }
     }
 }
 
@@ -505,10 +609,20 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         Some(&CONTROLLED_OIDC_MANAGED_CAPABILITY)
     }
 
+    fn capability_for(
+        &self,
+        kind: crate::domain::ProviderKind,
+    ) -> Option<&'static ManagedProfileCapability> {
+        managed_profile_capabilities().for_kind(kind)
+    }
+
     fn maximum_renewal_profile_duration(&self) -> Duration {
         // Renewal discovery + token exchange + profile discovery + UserInfo. Each request is
         // independently bounded by the configured client timeout.
-        self.client.request_timeout.saturating_mul(4)
+        self.oidc
+            .request_timeout
+            .max(self.google.request_timeout)
+            .saturating_mul(4)
     }
 
     async fn fetch_profile(
@@ -516,8 +630,10 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         guard: &ConnectionGuard,
         credential: Zeroizing<Vec<u8>>,
     ) -> Result<BoundedManagedProfile, ProviderReadError> {
-        let discovery = self
-            .client
+        let client = self
+            .client(guard)
+            .map_err(|()| ProviderReadError::Transient)?;
+        let discovery = client
             .discover(
                 &guard.issuer,
                 ProviderExchangeError::UnavailableBeforeDispatch,
@@ -527,8 +643,7 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         let endpoint = discovery
             .userinfo_endpoint
             .ok_or(ProviderReadError::InvalidProfile)?;
-        let (status, content_type, body) = self
-            .client
+        let (status, content_type, body) = client
             .fetch_bearer_bounded(endpoint, credential.as_ref(), 16 * 1024)
             .await
             .map_err(|()| ProviderReadError::Ambiguous)?;
@@ -575,8 +690,10 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         credential: Zeroizing<Vec<u8>>,
         stable_attempt_id: uuid::Uuid,
     ) -> ProviderRenewalResult {
-        let Ok(discovery) = self
-            .client
+        let Ok(client) = self.client(guard) else {
+            return ProviderRenewalResult::TransientBeforeDispatch;
+        };
+        let Ok(discovery) = client
             .discover(
                 &guard.issuer,
                 ProviderExchangeError::UnavailableBeforeDispatch,
@@ -597,8 +714,7 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
             ("client_id", guard.client_id.as_str()),
             ("client_secret", secret.as_str()),
         ];
-        let Ok(response) = self
-            .client
+        let Ok(response) = client
             .http
             .post(discovery.token_endpoint)
             .header("OwlAuth-Renewal-Attempt", stable_attempt_id.to_string())
@@ -671,8 +787,10 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         guard: &ConnectionGuard,
         credential: Zeroizing<Vec<u8>>,
     ) -> ProviderRevocationResult {
-        let Ok(discovery) = self
-            .client
+        let Ok(client) = self.client(guard) else {
+            return ProviderRevocationResult::Ambiguous;
+        };
+        let Ok(discovery) = client
             .discover(
                 &guard.issuer,
                 ProviderExchangeError::UnavailableBeforeDispatch,
@@ -696,8 +814,7 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
             ("client_id", guard.client_id.as_str()),
             ("client_secret", secret.as_str()),
         ];
-        let Ok(response) = self
-            .client
+        let Ok(response) = client
             .http
             .post(endpoint)
             .header(reqwest::header::ACCEPT, "application/json")
@@ -845,19 +962,6 @@ impl EndpointPolicy {
         self.validate_common(url)
     }
 
-    fn validate_callback(&self, url: &Url) -> Result<(), ProviderExchangeError> {
-        if url.as_str().len() > MAX_CALLBACK_BYTES
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || url.username() != ""
-            || url.password().is_some()
-            || !Self::secure_scheme(url, self.allow_http_loopback)
-        {
-            return Err(ProviderExchangeError::UnavailableBeforeDispatch);
-        }
-        Ok(())
-    }
-
     fn validate_common(&self, url: &Url) -> Result<(), ProviderExchangeError> {
         if url.cannot_be_a_base()
             || url.username() != ""
@@ -869,6 +973,22 @@ impl EndpointPolicy {
         }
         Ok(())
     }
+}
+
+pub(super) fn validate_runtime_callback(
+    url: &Url,
+    allow_http_loopback: bool,
+) -> Result<(), ProviderExchangeError> {
+    if url.as_str().len() > MAX_CALLBACK_BYTES
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.username() != ""
+        || url.password().is_some()
+        || !EndpointPolicy::secure_scheme(url, allow_http_loopback)
+    {
+        return Err(ProviderExchangeError::UnavailableBeforeDispatch);
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -942,11 +1062,12 @@ fn discovery_url(issuer: &Url) -> Url {
 fn validate_authorization_request(
     request: &ProviderAuthorizationRequest,
     policy: &EndpointPolicy,
+    callback_allow_http_loopback: bool,
 ) -> Result<(), ProviderExchangeError> {
     policy.validate_issuer(&request.issuer)?;
     let callback = Url::parse(&request.callback_url)
         .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?;
-    policy.validate_callback(&callback)?;
+    validate_runtime_callback(&callback, callback_allow_http_loopback)?;
     if request.client_id.is_empty()
         || request.client_id.len() > MAX_CLIENT_ID_BYTES
         || request.state.is_empty()
@@ -964,11 +1085,12 @@ fn validate_authorization_request(
 fn validate_callback_request(
     request: &ProviderCallbackRequest,
     policy: &EndpointPolicy,
+    callback_allow_http_loopback: bool,
 ) -> Result<(), ProviderExchangeError> {
     policy.validate_issuer(&request.issuer)?;
     let callback = Url::parse(&request.callback_url)
         .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?;
-    policy.validate_callback(&callback)?;
+    validate_runtime_callback(&callback, callback_allow_http_loopback)?;
     if request.client_id.is_empty()
         || request.client_id.len() > MAX_CLIENT_ID_BYTES
         || request.client_secret.is_empty()
@@ -999,41 +1121,66 @@ fn build_authorization_url(
         .append_pair("response_mode", "query")
         .append_pair("client_id", &request.client_id)
         .append_pair("redirect_uri", &request.callback_url)
-        .append_pair("scope", requested_scope_parameter(request.profile))
+        .append_pair(
+            "scope",
+            requested_scope_parameter(request.kind, request.profile),
+        )
         .append_pair("state", &request.state)
         .append_pair("nonce", &request.nonce)
         .append_pair("code_challenge", &request.pkce_challenge)
         .append_pair("code_challenge_method", "S256");
+    if request.kind == crate::domain::ProviderKind::Google
+        && request.profile == ProviderRequestProfile::ManagedProfile
+    {
+        endpoint
+            .query_pairs_mut()
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent");
+    }
     if endpoint.as_str().len() > 8192 {
         return Err(ProviderExchangeError::UnavailableBeforeDispatch);
     }
     Ok(endpoint.into())
 }
 
-fn managed_profile_scopes() -> Vec<String> {
-    requested_scopes(ProviderRequestProfile::ManagedProfile)
-}
-
-fn requested_scope_parameter(profile: ProviderRequestProfile) -> &'static str {
-    match profile {
-        ProviderRequestProfile::ManagedProfile => "offline_access openid profile",
-        ProviderRequestProfile::Login | ProviderRequestProfile::IdentityProof => "openid profile",
-    }
-}
-
-fn requested_scopes(profile: ProviderRequestProfile) -> Vec<String> {
-    match profile {
-        ProviderRequestProfile::ManagedProfile => ["offline_access", "openid", "profile"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        ProviderRequestProfile::Login | ProviderRequestProfile::IdentityProof => {
-            ["openid", "profile"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+fn managed_discovery_supported(
+    kind: crate::domain::ProviderKind,
+    discovery: &DiscoveryDocument,
+) -> bool {
+    discovery.userinfo_endpoint.is_some()
+        && match kind {
+            crate::domain::ProviderKind::Oidc => {
+                contains_exact(&discovery.scopes_supported, "offline_access")
+            }
+            crate::domain::ProviderKind::Google => true,
+            crate::domain::ProviderKind::Github => false,
         }
+}
+
+fn managed_profile_scopes(kind: crate::domain::ProviderKind) -> Vec<String> {
+    requested_scopes(kind, ProviderRequestProfile::ManagedProfile)
+}
+
+fn requested_scope_parameter(
+    kind: crate::domain::ProviderKind,
+    profile: ProviderRequestProfile,
+) -> &'static str {
+    match (kind, profile) {
+        (crate::domain::ProviderKind::Oidc, ProviderRequestProfile::ManagedProfile) => {
+            "offline_access openid profile"
+        }
+        (_, _) => "openid profile",
     }
+}
+
+fn requested_scopes(
+    kind: crate::domain::ProviderKind,
+    profile: ProviderRequestProfile,
+) -> Vec<String> {
+    requested_scope_parameter(kind, profile)
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect()
 }
 
 fn canonical_scope_set(scopes: &[String]) -> Option<Vec<String>> {

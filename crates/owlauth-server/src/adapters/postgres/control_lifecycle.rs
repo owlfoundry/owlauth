@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use sea_orm::sea_query::LockType;
@@ -20,16 +20,52 @@ use super::{
     audit::append_runtime_audit,
     authentication::persistence,
     entity::{application, application_session, project, project_browser_session, project_user},
+    projection::IdentityProjectionMaterializer,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PostgresControlLifecycleRepository {
     database: DatabaseConnection,
+    projection_materializer: Option<Arc<dyn IdentityProjectionMaterializer>>,
 }
 
 impl PostgresControlLifecycleRepository {
+    #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self { database }
+        Self {
+            database,
+            projection_materializer: None,
+        }
+    }
+
+    pub(crate) fn new_with_projection_materializer(
+        database: DatabaseConnection,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
+    ) -> Self {
+        Self {
+            database,
+            projection_materializer: Some(projection_materializer),
+        }
+    }
+
+    async fn fan_out_user(
+        &self,
+        transaction: &sea_orm::DatabaseTransaction,
+        user: &project_user::Model,
+        now: time::OffsetDateTime,
+    ) -> Result<(), ApplicationError> {
+        if let Some(materializer) = &self.projection_materializer {
+            materializer.fan_out_user(transaction, user, now).await
+        } else {
+            #[cfg(test)]
+            {
+                super::projection::fan_out_user_projections(transaction, user, now).await
+            }
+            #[cfg(not(test))]
+            {
+                Err(ApplicationError::Integrity)
+            }
+        }
     }
 }
 
@@ -137,7 +173,7 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
         command: DisableProjectUser,
     ) -> Result<ProjectUserRecord, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        require_project(&transaction, command.project_id).await?;
+        lock_active_project(&transaction, command.project_id).await?;
         let user = project_user::Entity::find_by_id(command.user_id)
             .filter(project_user::Column::ProjectId.eq(command.project_id))
             .lock(LockType::Update)
@@ -156,7 +192,7 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
                 active.security_revision = Set(next_revision(active.security_revision.take())?);
                 active.updated_at = Set(command.now);
                 let updated = active.update(&transaction).await.map_err(persistence)?;
-                super::projection::fan_out_user_projections(&transaction, &updated, command.now)
+                self.fan_out_user(&transaction, &updated, command.now)
                     .await?;
                 append_runtime_audit(
                     &transaction,
@@ -374,6 +410,25 @@ where
         .map_err(persistence)?
         .map(|_| ())
         .ok_or(ApplicationError::NotFound)
+}
+
+async fn lock_active_project<C>(
+    database: &C,
+    project_id: Uuid,
+) -> Result<project::Model, ApplicationError>
+where
+    C: ConnectionTrait,
+{
+    let project = project::Entity::find_by_id(project_id)
+        .lock_shared()
+        .one(database)
+        .await
+        .map_err(persistence)?
+        .ok_or(ApplicationError::NotFound)?;
+    if project.status != "active" {
+        return Err(ApplicationError::Disabled);
+    }
+    Ok(project)
 }
 
 async fn require_project<C>(database: &C, project_id: Uuid) -> Result<(), ApplicationError>

@@ -15,6 +15,8 @@ where
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Oidc,
+    Google,
+    Github,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]

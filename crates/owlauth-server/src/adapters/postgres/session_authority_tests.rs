@@ -20,12 +20,14 @@ use super::{
     identity_mutation_test_support::PostgresIdentityMutationRepository,
     managed_connection::PostgresManagedConnectionRepository,
     managed_reauthorization::PostgresManagedReauthorizationRepository,
+    projection::PostgresIdentityProjectionMaterializer,
     runtime_authority::PostgresRuntimeAuthorityRepository,
     session_authority::PostgresSessionAuthorityRepository,
 };
 use crate::adapters::runtime_security::{
     ManagedCredentialKeyMaterial, RuntimeKeyMaterial, SoftwareManagedCredentialProtector,
-    SoftwareRuntimeProtector,
+    SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
+    UnavailableDurableEmailAddressReader,
 };
 use crate::{
     application::{
@@ -701,6 +703,7 @@ async fn prepare_provider_login(
             created_at: now,
             expires_at: now + Duration::minutes(10),
             admitted_providers: vec![AdmittedProviderMethod {
+                kind: crate::domain::ProviderKind::Oidc,
                 method_key: seeded.provider_key.clone(),
                 provider_id: seeded.provider_id,
                 display_name: "OIDC".to_owned(),
@@ -941,6 +944,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
             created_at: now,
             expires_at: now + Duration::minutes(10),
             admitted_providers: vec![AdmittedProviderMethod {
+                kind: crate::domain::ProviderKind::Oidc,
                 method_key: seeded.provider_key.clone(),
                 provider_id: seeded.provider_id,
                 display_name: "OIDC".to_owned(),
@@ -2704,6 +2708,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
             created_at: now,
             expires_at: now + Duration::minutes(10),
             admitted_providers: vec![AdmittedProviderMethod {
+                kind: crate::domain::ProviderKind::Oidc,
                 method_key: seeded.provider_key.clone(),
                 provider_id: seeded.provider_id,
                 display_name: "OIDC".to_owned(),
@@ -3334,6 +3339,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
                 created_at: refresh_at + Duration::seconds(4),
                 expires_at: refresh_at + Duration::minutes(10) + Duration::seconds(4),
                 admitted_providers: vec![AdmittedProviderMethod {
+                    kind: crate::domain::ProviderKind::Oidc,
                     method_key: seeded.provider_key.clone(),
                     provider_id: seeded.provider_id,
                     display_name: "OIDC".to_owned(),
@@ -3685,6 +3691,7 @@ async fn ordinary_login_and_managed_profile_share_canonical_user_identity_lock_o
     assert_eq!(coherent.0, 1);
     assert!(coherent.1 >= 1);
     assert!(coherent.2.is_some());
+
     database
         .close()
         .await
@@ -4995,7 +5002,20 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
 
     let database = Database::connect(&url).await.expect("SeaORM test pool");
     let authentication = PostgresAuthenticationRepository::new(database.clone());
-    let sessions = PostgresSessionAuthorityRepository::new(database.clone());
+    let projection_materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
+        Arc::new(UnavailableDurableEmailAddressReader),
+        Arc::new(
+            SoftwareProjectionVerifiedEmailProtector::new(
+                "provider-profile-event-test".to_owned(),
+                1,
+                RuntimeKeyMaterial::new([101; 32], [102; 32]),
+                BTreeMap::new(),
+            )
+            .expect("provider profile projection protector"),
+        ),
+    ));
+    let sessions = PostgresSessionAuthorityRepository::new(database.clone())
+        .with_projection_materializer(projection_materializer);
     let first_claim = claim_provider_login(&authentication, &first_project, 21, now).await;
     let competing_claim = claim_provider_login(&authentication, &first_project, 41, now).await;
     let other_project_claim = claim_provider_login(&authentication, &second_project, 61, now).await;
@@ -5190,6 +5210,15 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
     assert_eq!(application_policy_revision, 1);
     assert_eq!(document["display_name"], "Grace");
     assert_ne!(canonical_digest, vec![1_u8; 32]);
+    let profile_event_types: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM application_user_events WHERE binding_id=$1
+         ORDER BY projection_revision",
+    )
+    .bind(binding_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read provider profile immutable event");
+    assert_eq!(profile_event_types, vec!["user.projection.updated"]);
     let creation_provenance: Uuid = sqlx::query_scalar(
         "SELECT created_via_provider_configuration_id
          FROM linked_identities
@@ -5299,6 +5328,13 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
     .await
     .expect("load revisions after digest-only repair");
     assert_eq!(after_digest_repair, before_digest_repair);
+    let event_count_after_digest_repair: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM application_user_events WHERE binding_id=$1")
+            .bind(binding_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count events after provider digest-only no-op");
+    assert_eq!(event_count_after_digest_repair, 1);
 
     let orphan_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
@@ -7448,7 +7484,7 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            )
            INSERT INTO managed_provider_reauthorization_interactions
              (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-              provider_configuration_id,provider_key,issuer,subject,client_id,secret_ref,
+              provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
               application_id,expected_connection_generation,expected_credential_generation,
               expected_connection_revision,project_security_revision,user_security_revision,
               identity_revision,provider_revision,managed_profile_revision,application_revision,
@@ -7458,8 +7494,9 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            SELECT md5('managed-expired-scale-' || series.value::text)::uuid,
                   source.project_id,source.project_public_id,source.connection_id,
                   source.linked_identity_id,source.user_id,source.provider_configuration_id,
-                  source.provider_key,source.issuer,source.subject,source.client_id,source.secret_ref,
-                  source.application_id,source.expected_connection_generation,
+                  source.provider_key,source.issuer,source.provider_kind,source.subject,
+                  source.client_id,source.secret_ref,source.application_id,
+                  source.expected_connection_generation,
                   source.expected_credential_generation,source.expected_connection_revision,
                   source.project_security_revision,source.user_security_revision,
                   source.identity_revision,source.provider_revision,source.managed_profile_revision,
@@ -7530,7 +7567,7 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            )
            INSERT INTO managed_provider_reauthorization_interactions
              (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-              provider_configuration_id,provider_key,issuer,subject,client_id,secret_ref,
+              provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
               application_id,expected_connection_generation,expected_credential_generation,
               expected_connection_revision,project_security_revision,user_security_revision,
               identity_revision,provider_revision,managed_profile_revision,application_revision,
@@ -7541,8 +7578,9 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            SELECT md5('managed-restore-scale-' || series.value::text)::uuid,
                   source.project_id,source.project_public_id,source.connection_id,
                   source.linked_identity_id,source.user_id,source.provider_configuration_id,
-                  source.provider_key,source.issuer,source.subject,source.client_id,source.secret_ref,
-                  source.application_id,source.expected_connection_generation,
+                  source.provider_key,source.issuer,source.provider_kind,source.subject,
+                  source.client_id,source.secret_ref,source.application_id,
+                  source.expected_connection_generation,
                   source.expected_credential_generation,source.expected_connection_revision,
                   source.project_security_revision,source.user_security_revision,
                   source.identity_revision,source.provider_revision,source.managed_profile_revision,

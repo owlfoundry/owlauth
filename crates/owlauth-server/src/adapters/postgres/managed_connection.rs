@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
@@ -15,20 +17,36 @@ use crate::application::{
 use crate::domain::{ProfileDisplayName, ProfileLocale, ProfilePictureUrl};
 
 use super::{
-    audit::append_runtime_audit,
-    authentication::persistence,
-    entity::project_user,
-    session_authority::{base_profile_digest, fan_out_user_projections},
+    audit::append_runtime_audit, authentication::persistence, entity::project_user,
+    projection::IdentityProjectionMaterializer, session_authority::base_profile_digest,
 };
 
-#[derive(Clone, Debug)]
+#[cfg(test)]
+use super::session_authority::fan_out_user_projections;
+
+#[derive(Clone)]
 pub(crate) struct PostgresManagedConnectionRepository {
     database: DatabaseConnection,
+    projection_materializer: Option<Arc<dyn IdentityProjectionMaterializer>>,
 }
 
 impl PostgresManagedConnectionRepository {
+    #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self { database }
+        Self {
+            database,
+            projection_materializer: None,
+        }
+    }
+
+    pub(crate) fn new_with_projection_materializer(
+        database: DatabaseConnection,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
+    ) -> Self {
+        Self {
+            database,
+            projection_materializer: Some(projection_materializer),
+        }
     }
 }
 
@@ -271,7 +289,13 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                     active.user_revision = Set(active.user_revision.take().unwrap_or(1) + 1);
                     active.updated_at = Set(now);
                     let updated = active.update(&transaction).await.map_err(persistence)?;
-                    fan_out_user_projections(&transaction, &updated, now).await?;
+                    materialize_user_projections(
+                        self.projection_materializer.as_deref(),
+                        &transaction,
+                        &updated,
+                        now,
+                    )
+                    .await?;
                 }
             }
         }
@@ -361,7 +385,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                       connection.adapter_key,connection.adapter_capability_revision,
                       to_json(connection.required_scopes) AS required_scopes,
                       connection.user_security_revision, connection.identity_revision,
-                      connection.consecutive_failures,provider.issuer, identity.subject, provider.client_id, provider.secret_ref,
+                      connection.consecutive_failures,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer, identity.subject, provider.client_id, provider.secret_ref,
                       credential.key_version, credential.ciphertext
                FROM managed_provider_renewal_operations AS operation
                JOIN managed_provider_connections AS connection
@@ -695,6 +719,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
     ) -> Result<bool, ApplicationError> {
         commit_profile_for_guard(
             &self.database,
+            self.projection_materializer.as_deref(),
             &claim.guard,
             Some(claim),
             profile,
@@ -711,7 +736,16 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
         next_sync: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<bool, ApplicationError> {
-        commit_profile_for_guard(&self.database, guard, None, profile, next_sync, now).await
+        commit_profile_for_guard(
+            &self.database,
+            self.projection_materializer.as_deref(),
+            guard,
+            None,
+            profile,
+            next_sync,
+            now,
+        )
+        .await
     }
 
     async fn finish_successor_profile_failure(
@@ -1289,7 +1323,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                       claimed.adapter_key,claimed.adapter_capability_revision,
                       to_json(claimed.required_scopes) AS required_scopes,
                       claimed.user_security_revision, claimed.identity_revision,
-                      claimed.consecutive_failures,provider.issuer, identity.subject, provider.client_id, provider.secret_ref,
+                      claimed.consecutive_failures,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer, identity.subject, provider.client_id, provider.secret_ref,
                       credential.key_version, credential.ciphertext
                  FROM claimed JOIN projects AS project ON project.id=claimed.project_id
                  JOIN provider_configurations AS provider ON provider.project_id=claimed.project_id AND provider.id=claimed.provider_configuration_id
@@ -2366,7 +2400,7 @@ async fn claim_connection_on<C: ConnectionTrait>(
                  claimed.adapter_key,claimed.adapter_capability_revision,
                  to_json(claimed.required_scopes) AS required_scopes,
                  claimed.user_security_revision, claimed.identity_revision,
-                 claimed.consecutive_failures,provider.issuer, identity.subject,
+                 claimed.consecutive_failures,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer, identity.subject,
                  provider.client_id, provider.secret_ref, credential.key_version, credential.ciphertext
             FROM claimed JOIN projects AS project ON project.id = claimed.project_id
             JOIN provider_configurations AS provider
@@ -2449,6 +2483,11 @@ fn claim_from_row(
             project_security_revision: get(row, "project_security_revision")?,
             provider_revision: get(row, "provider_revision")?,
             managed_profile_revision: get(row, "managed_profile_revision")?,
+            provider_kind: super::effective_provider_kind(
+                &get::<String>(row, "provider_legacy_kind")?,
+                get::<Option<String>>(row, "provider_adapter_kind")?.as_deref(),
+                &get::<String>(row, "issuer")?,
+            )?,
             adapter_key: get(row, "adapter_key")?,
             adapter_capability_revision: get(row, "adapter_capability_revision")?,
             required_scopes: json_strings(&get(row, "required_scopes")?)?,
@@ -2580,8 +2619,8 @@ async fn lock_guard_authority<C: ConnectionTrait>(
     .await?;
     let provider_ok = lock_boolean(
         connection,
-        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 FOR SHARE)",
-        vec![guard.project_id.into(), guard.provider_configuration_id.into(), guard.provider_revision.into(), guard.managed_profile_revision.into()],
+        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 AND kind='oidc' AND COALESCE(adapter_kind, CASE issuer WHEN 'https://accounts.google.com' THEN 'google' WHEN 'https://github.com' THEN 'github' ELSE 'oidc' END)=$5 FOR SHARE)",
+        vec![guard.project_id.into(), guard.provider_configuration_id.into(), guard.provider_revision.into(), guard.managed_profile_revision.into(), guard.provider_kind.as_str().into()],
     )
     .await?;
     let user_ok = lock_boolean(
@@ -2612,12 +2651,33 @@ async fn lock_boolean<C: ConnectionTrait>(
     get(&row, "exists")
 }
 
+async fn materialize_user_projections(
+    materializer: Option<&dyn IdentityProjectionMaterializer>,
+    transaction: &sea_orm::DatabaseTransaction,
+    user: &project_user::Model,
+    now: OffsetDateTime,
+) -> Result<(), ApplicationError> {
+    if let Some(materializer) = materializer {
+        materializer.fan_out_user(transaction, user, now).await
+    } else {
+        #[cfg(test)]
+        {
+            fan_out_user_projections(transaction, user, now).await
+        }
+        #[cfg(not(test))]
+        {
+            Err(ApplicationError::Integrity)
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the separate successor-generation profile transaction keeps all projection guards visible"
 )]
 async fn commit_profile_for_guard(
     database: &DatabaseConnection,
+    projection_materializer: Option<&dyn IdentityProjectionMaterializer>,
     guard: &ConnectionGuard,
     claim: Option<&SuccessorProfileClaim>,
     profile: BoundedManagedProfile,
@@ -2645,8 +2705,8 @@ async fn commit_profile_for_guard(
     .await?;
     let provider_ok = lock_boolean(
         &transaction,
-        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 FOR SHARE)",
-        vec![guard.project_id.into(), guard.provider_configuration_id.into(), guard.provider_revision.into(), guard.managed_profile_revision.into()],
+        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 AND kind='oidc' AND COALESCE(adapter_kind, CASE issuer WHEN 'https://accounts.google.com' THEN 'google' WHEN 'https://github.com' THEN 'github' ELSE 'oidc' END)=$5 FOR SHARE)",
+        vec![guard.project_id.into(), guard.provider_configuration_id.into(), guard.provider_revision.into(), guard.managed_profile_revision.into(), guard.provider_kind.as_str().into()],
     )
     .await?;
     let user_ok = lock_boolean(
@@ -2757,7 +2817,8 @@ async fn commit_profile_for_guard(
             active.user_revision = Set(active.user_revision.take().unwrap_or(1) + 1);
             active.updated_at = Set(now);
             let updated = active.update(&transaction).await.map_err(persistence)?;
-            fan_out_user_projections(&transaction, &updated, now).await?;
+            materialize_user_projections(projection_materializer, &transaction, &updated, now)
+                .await?;
         }
     }
     let updated = if let Some(claim) = claim {

@@ -250,7 +250,10 @@ pub(crate) mod provider_configuration {
         pub id: Uuid,
         pub project_id: Uuid,
         pub provider_key: String,
+        /// Legacy N-1 compatibility discriminator; remains exactly `oidc` during overlap.
         pub kind: String,
+        /// Current closed adapter discriminator; nullable until bounded backfill contracts it.
+        pub adapter_kind: Option<String>,
         pub display_name: String,
         pub issuer: String,
         pub client_id: String,
@@ -832,6 +835,197 @@ pub(crate) mod project_browser_logout_interaction {
         pub consumed_at: Option<TimeDateTimeWithTimeZone>,
         pub created_at: TimeDateTimeWithTimeZone,
         pub updated_at: TimeDateTimeWithTimeZone,
+    }
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub(crate) mod projection_expansion_operation {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "projection_expansion_operations")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub project_id: Uuid,
+        pub application_id: Option<Uuid>,
+        pub scope_kind: String,
+        pub target_policy_revision: i64,
+        pub status: String,
+        pub cursor_binding_id: Option<Uuid>,
+        pub processed_count: i64,
+        pub lease_owner: Option<String>,
+        pub lease_incarnation: Option<Uuid>,
+        pub lease_generation: i64,
+        pub lease_expires_at: Option<TimeDateTimeWithTimeZone>,
+        pub last_error_class: Option<String>,
+        pub created_at: TimeDateTimeWithTimeZone,
+        pub updated_at: TimeDateTimeWithTimeZone,
+        pub completed_at: Option<TimeDateTimeWithTimeZone>,
+    }
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub(crate) mod webhook_endpoint {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "webhook_endpoints")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub project_id: Uuid,
+        pub application_id: Uuid,
+        pub public_id: String,
+        pub idempotency_key: String,
+        pub secret_request_fingerprint: Vec<u8>,
+        pub url: String,
+        pub subscribed_event_types: Vec<String>,
+        pub status: String,
+        pub revision: i64,
+        pub current_secret_generation: Option<i32>,
+        pub overlap_secret_generation: Option<i32>,
+        pub overlap_expires_at: Option<TimeDateTimeWithTimeZone>,
+        pub consecutive_failure_count: i32,
+        pub last_delivery_at: Option<TimeDateTimeWithTimeZone>,
+        pub last_success_at: Option<TimeDateTimeWithTimeZone>,
+        pub last_failure_class: Option<String>,
+        pub last_tested_at: Option<TimeDateTimeWithTimeZone>,
+        pub last_test_succeeded_at: Option<TimeDateTimeWithTimeZone>,
+        pub created_at: TimeDateTimeWithTimeZone,
+        pub updated_at: TimeDateTimeWithTimeZone,
+        pub disabled_at: Option<TimeDateTimeWithTimeZone>,
+    }
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub(crate) mod webhook_secret_generation {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "webhook_secret_generations")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub endpoint_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub generation: i32,
+        pub idempotency_key: String,
+        pub request_fingerprint: Vec<u8>,
+        pub secret_ref: String,
+        pub safe_fingerprint: String,
+        pub state: String,
+        pub created_at: TimeDateTimeWithTimeZone,
+        pub provisioned_at: Option<TimeDateTimeWithTimeZone>,
+        pub activated_at: Option<TimeDateTimeWithTimeZone>,
+        pub retired_at: Option<TimeDateTimeWithTimeZone>,
+    }
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub(crate) mod application_user_event {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "application_user_events")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub event_id: String,
+        pub project_id: Uuid,
+        pub application_id: Uuid,
+        pub binding_id: Uuid,
+        pub user_id: Uuid,
+        pub event_type: String,
+        pub user_revision: i64,
+        pub projection_revision: i64,
+        pub projection_schema: String,
+        pub safe_body: Json,
+        pub canonical_body_digest: Vec<u8>,
+        pub verified_email_source_identity_id: Option<Uuid>,
+        pub verified_email_ciphertext: Option<Vec<u8>>,
+        pub verified_email_key_version: Option<i32>,
+        pub occurred_at: TimeDateTimeWithTimeZone,
+        pub replay_until: TimeDateTimeWithTimeZone,
+        pub retain_until: TimeDateTimeWithTimeZone,
+        pub created_at: TimeDateTimeWithTimeZone,
+    }
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub(crate) mod webhook_delivery {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "webhook_deliveries")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub project_id: Uuid,
+        pub application_id: Uuid,
+        pub endpoint_id: Uuid,
+        pub event_id: Uuid,
+        pub replay_sequence: i32,
+        pub replay_of_delivery_id: Option<Uuid>,
+        pub state: String,
+        pub attempt_count: i32,
+        pub next_attempt_at: TimeDateTimeWithTimeZone,
+        pub lease_owner: Option<String>,
+        pub lease_incarnation: Option<Uuid>,
+        pub lease_generation: i64,
+        pub lease_expires_at: Option<TimeDateTimeWithTimeZone>,
+        pub claimed_secret_generation: Option<i32>,
+        pub claimed_overlap_generation: Option<i32>,
+        pub last_outcome_class: Option<String>,
+        pub last_http_status: Option<i32>,
+        pub created_at: TimeDateTimeWithTimeZone,
+        pub updated_at: TimeDateTimeWithTimeZone,
+        pub delivered_at: Option<TimeDateTimeWithTimeZone>,
+        pub terminal_at: Option<TimeDateTimeWithTimeZone>,
+    }
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub(crate) mod webhook_delivery_attempt {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "webhook_delivery_attempts")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub delivery_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub attempt_number: i32,
+        pub lease_generation: i64,
+        pub attempted_at: TimeDateTimeWithTimeZone,
+        pub attempt_timestamp: i64,
+        pub outcome_class: String,
+        pub http_status: Option<i32>,
+        pub duration_millis: i32,
+        pub correlation_id: Uuid,
     }
 
     #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]

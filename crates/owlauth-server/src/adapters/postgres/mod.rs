@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod application_sync_tests;
 mod audit;
 #[allow(
     dead_code,
@@ -25,8 +27,6 @@ pub(crate) mod identity_mutation;
 mod identity_mutation_test_support;
 #[cfg(test)]
 mod identity_mutation_tests;
-#[cfg(test)]
-mod identity_projection_migration_tests;
 #[allow(
     dead_code,
     reason = "managed connection service composition follows this persistence lane"
@@ -34,6 +34,7 @@ mod identity_projection_migration_tests;
 pub(crate) mod managed_connection;
 pub(crate) mod managed_reauthorization;
 pub(crate) mod projection;
+pub(crate) mod projection_expansion;
 pub(crate) mod provider_callback;
 pub(crate) mod provisioning;
 pub(crate) mod readiness;
@@ -51,6 +52,7 @@ mod session_authority_tests;
     reason = "the transaction boundary is validated before HTTP mutation exposure"
 )]
 mod unit_of_work;
+pub(crate) mod webhook;
 
 use std::time::Duration;
 
@@ -59,7 +61,9 @@ use thiserror::Error;
 
 use crate::{
     adapters::migrations::{SchemaError, verify_url},
+    application::ApplicationError,
     config::ServerConfig,
+    domain::ProviderKind,
 };
 
 #[derive(Debug)]
@@ -147,6 +151,26 @@ async fn create_pool(
 
 const fn map_schema_error(_: SchemaError) -> PoolError {
     PoolError::Schema
+}
+
+pub(crate) fn effective_provider_kind(
+    legacy_kind: &str,
+    adapter_kind: Option<&str>,
+    issuer: &str,
+) -> Result<ProviderKind, ApplicationError> {
+    if legacy_kind != "oidc" {
+        return Err(ApplicationError::Integrity);
+    }
+    let kind = match adapter_kind {
+        Some(value) => ProviderKind::parse(value).map_err(|_| ApplicationError::Integrity)?,
+        None if issuer == crate::domain::GOOGLE_ISSUER => ProviderKind::Google,
+        None if issuer == crate::domain::GITHUB_ISSUER => ProviderKind::Github,
+        None => ProviderKind::Oidc,
+    };
+    if !kind.issuer_matches(issuer) {
+        return Err(ApplicationError::Integrity);
+    }
+    Ok(kind)
 }
 
 #[cfg(test)]
@@ -650,6 +674,36 @@ mod tests {
         .await
         .expect("serving history grants should be queryable");
         assert_eq!(history_privileges, (true, false));
+        let provider_constraints: Vec<(String, String)> = sqlx::query_as(
+            "SELECT conname, pg_get_constraintdef(oid) \
+             FROM pg_constraint \
+             WHERE conname IN (\
+                 'provider_configurations_named_adapter_check', \
+                 'managed_reauthorization_provider_kind_check', \
+                 'linked_identities_github_numeric_subject_check'\
+             ) ORDER BY conname",
+        )
+        .fetch_all(&mut ownership_connection)
+        .await
+        .expect("provider-kind constraints should be queryable");
+        assert_eq!(provider_constraints.len(), 3);
+        assert!(provider_constraints.iter().any(|(name, definition)| {
+            name == "provider_configurations_named_adapter_check"
+                && definition.contains("accounts.google.com")
+                && definition.contains("github.com")
+                && definition.contains("NOT managed_profile_enabled")
+        }));
+        assert!(provider_constraints.iter().any(|(name, definition)| {
+            name == "managed_reauthorization_provider_kind_check"
+                && definition.contains("'oidc'::text")
+                && definition.contains("'google'::text")
+                && !definition.contains("'github'::text")
+        }));
+        assert!(provider_constraints.iter().any(|(name, definition)| {
+            name == "linked_identities_github_numeric_subject_check"
+                && definition.contains("https://github.com")
+                && definition.contains("^[1-9][0-9]{0,19}$")
+        }));
         ownership_connection
             .close()
             .await
@@ -658,6 +712,52 @@ mod tests {
         verify_url(&url, Duration::from_secs(5))
             .await
             .expect("exact serving history should verify without DDL");
+
+        let mut compatibility_connection = PgConnection::connect(&url)
+            .await
+            .expect("compatibility test connection should open");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations
+                 (version,description,success,checksum,execution_time)
+             VALUES ($1,'synthetic additive forward migration',TRUE,$2,1)",
+        )
+        .bind(20_260_804_000_000_i64)
+        .bind(vec![73_u8; 48])
+        .execute(&mut compatibility_connection)
+        .await
+        .expect("synthetic forward history should insert");
+        verify_url(&url, Duration::from_secs(5))
+            .await
+            .expect("baseline binary should accept its own compatibility floor");
+        sqlx::query(
+            "UPDATE schema_compatibility SET minimum_binary_schema_level=$1 WHERE singleton",
+        )
+        .bind(20_260_803_000_001_i64)
+        .execute(&mut compatibility_connection)
+        .await
+        .expect("newer compatibility floor should install");
+        assert_eq!(
+            verify_url(&url, Duration::from_secs(5))
+                .await
+                .expect_err("newer compatibility floor must reject the baseline binary"),
+            SchemaError::IncompatibleHistory
+        );
+        sqlx::query(
+            "UPDATE schema_compatibility SET minimum_binary_schema_level=$1 WHERE singleton",
+        )
+        .bind(20_260_803_000_000_i64)
+        .execute(&mut compatibility_connection)
+        .await
+        .expect("baseline compatibility floor should restore");
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version=$1")
+            .bind(20_260_804_000_000_i64)
+            .execute(&mut compatibility_connection)
+            .await
+            .expect("synthetic forward history should clean up");
+        compatibility_connection
+            .close()
+            .await
+            .expect("compatibility test connection should close");
 
         let pools = create_pools(&config)
             .await
@@ -1256,6 +1356,7 @@ mod tests {
             ),
         );
         let provider_fence_command = || CreateProvider {
+            kind: crate::domain::ProviderKind::Oidc,
             provider_key: "fenced-workforce".to_owned(),
             display_name: "Fenced Workforce".to_owned(),
             issuer: "https://fenced-accounts.example/".to_owned(),
@@ -2176,6 +2277,7 @@ mod tests {
             .create_provider(
                 created_project.id,
                 CreateProvider {
+                    kind: crate::domain::ProviderKind::Oidc,
                     provider_key: "workforce".to_owned(),
                     display_name: "Workforce SSO".to_owned(),
                     issuer: "https://accounts.example/".to_owned(),
@@ -2221,6 +2323,7 @@ mod tests {
             .create_provider(
                 created_project.id,
                 CreateProvider {
+                    kind: crate::domain::ProviderKind::Oidc,
                     provider_key: "workforce".to_owned(),
                     display_name: "Workforce SSO".to_owned(),
                     issuer: "https://accounts.example/".to_owned(),
@@ -2362,6 +2465,7 @@ mod tests {
             .create_provider(
                 created_project.id,
                 CreateProvider {
+                    kind: crate::domain::ProviderKind::Oidc,
                     provider_key: "workforce".to_owned(),
                     display_name: "Workforce SSO".to_owned(),
                     issuer: "https://accounts.example/".to_owned(),
@@ -3073,6 +3177,7 @@ mod tests {
         );
 
         let first_provider_command = PrepareProvider {
+            kind: crate::domain::ProviderKind::Oidc,
             provider_key: "capacity_replay".to_owned(),
             display_name: "Capacity replay provider".to_owned(),
             issuer: "https://accounts.example/".to_owned(),
@@ -3111,6 +3216,7 @@ mod tests {
                 .prepare_provider(
                     capacity_project.id,
                     PrepareProvider {
+                        kind: crate::domain::ProviderKind::Oidc,
                         provider_key: "capacity_overflow".to_owned(),
                         display_name: "Over capacity".to_owned(),
                         issuer: "https://accounts.example/".to_owned(),

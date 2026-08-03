@@ -2387,6 +2387,10 @@ async fn derive_and_lock_slots(
     Ok(seeds)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one transaction snapshot keeps provider and email authority fencing visibly atomic"
+)]
 async fn snapshot_method(
     transaction: &DatabaseTransaction,
     project_id: Uuid,
@@ -2415,7 +2419,7 @@ async fn snapshot_method(
         } => {
             let row = transaction
                 .query_one_raw(statement(
-                    "SELECT provider.provider_key,provider.revision,provider.status,
+                    "SELECT provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer,provider.provider_key,provider.revision,provider.status,
                             provider.secret_ref,assignment.status AS assignment_status,
                             assignment.security_revision AS assignment_revision
                        FROM provider_configurations provider
@@ -2439,11 +2443,25 @@ async fn snapshot_method(
             {
                 return Err(ApplicationError::Disabled);
             }
+            let provider_kind = super::effective_provider_kind(
+                &get::<String>(&row, "provider_legacy_kind")?,
+                get::<Option<String>>(&row, "provider_adapter_kind")?.as_deref(),
+                &get::<String>(&row, "issuer")?,
+            )?;
+            let capabilities = provider_kind.capabilities();
+            if !capabilities.identity_proof
+                || !provider_kind.issuer_matches(&get::<String>(&row, "issuer")?)
+            {
+                return Err(ApplicationError::InvalidInput);
+            }
             let capability = prepared.provider_capability.snapshot(
                 &prepared.runtime_base,
                 project_public_id,
                 &get::<String>(&row, "provider_key")?,
             )?;
+            if capability.adapter_key() != capabilities.adapter_key {
+                return Err(ApplicationError::Integrity);
+            }
             Ok(MethodSnapshot {
                 application_revision,
                 provider: Some(ProviderSnapshot {
@@ -2624,7 +2642,7 @@ async fn record_from_row(
     );
     let slots = transaction
         .query_all_raw(statement(
-            "SELECT slot.*,provider.provider_key,provider.issuer,provider.client_id,
+            "SELECT slot.*,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.provider_key,provider.issuer,provider.client_id,
                     provider.secret_ref
                FROM identity_mutation_proof_slots slot
                LEFT JOIN provider_configurations provider
@@ -2654,15 +2672,30 @@ async fn record_from_row(
 fn slot_record(row: &QueryResult) -> Result<IdentityMutationSlotRecord, ApplicationError> {
     let method_kind = parse_method(&get::<String>(row, "method_kind")?)?;
     let provider = if method_kind == IdentityMutationProofMethodKind::Provider {
+        let issuer = required::<String>(row, "issuer")?;
+        let provider_kind = super::effective_provider_kind(
+            &required::<String>(row, "provider_legacy_kind")?,
+            get::<Option<String>>(row, "provider_adapter_kind")?.as_deref(),
+            &issuer,
+        )?;
+        let capabilities = provider_kind.capabilities();
+        let adapter_key = required::<String>(row, "provider_adapter_key")?;
+        if !capabilities.identity_proof
+            || !provider_kind.issuer_matches(&issuer)
+            || adapter_key != capabilities.adapter_key
+        {
+            return Err(ApplicationError::Integrity);
+        }
         Some(IdentityMutationProviderSlotAuthority {
             provider_configuration_id: required(row, "provider_configuration_id")?,
+            provider_kind,
             provider_configuration_revision: required(row, "provider_revision")?,
             provider_key: required(row, "provider_key")?,
-            issuer: required(row, "issuer")?,
+            issuer,
             client_id: required(row, "client_id")?,
             secret_ref: required(row, "secret_ref")?,
             callback_url: required(row, "callback_url")?,
-            adapter_key: required(row, "provider_adapter_key")?,
+            adapter_key,
             adapter_capability_revision: required(row, "provider_adapter_capability_revision")?,
             exact_scopes: required(row, "provider_scopes")?,
             provider_pkce_required: required(row, "provider_pkce_required")?,
@@ -4668,6 +4701,20 @@ async fn confirm_merge(
     if loser_result.rows_affected() != 1 {
         return Err(ApplicationError::RevisionConflict);
     }
+    let mut disabled_loser = project_user::Entity::find_by_id(loser_id)
+        .one(transaction)
+        .await
+        .map_err(persistence)?
+        .filter(|user| user.project_id == project_id)
+        .ok_or(ApplicationError::Integrity)?;
+    // A merged Project user is externally unusable, but the public projection vocabulary is
+    // deliberately active/disabled. Publish that terminal loser view before bindings move or a
+    // duplicate projection is erased, so every previously bound Application can retire its old
+    // local user while immutable history remains attributed to the retained binding.
+    "disabled".clone_into(&mut disabled_loser.status);
+    projection_materializer
+        .fan_out_user(transaction, &disabled_loser, timestamp)
+        .await?;
 
     // Identity revision advances because durable ownership changed. Managed connections follow
     // the same new owner/revision under the deferrable exact-owner FK.
@@ -4841,6 +4888,7 @@ async fn merge_bindings(
     for binding in loser_bindings {
         let binding_id: Uuid = get(&binding, "id")?;
         let application_id: Uuid = get(&binding, "application_id")?;
+        let binding_status: String = get(&binding, "status")?;
         let winner = transaction
             .query_one_raw(statement(
                 "SELECT id FROM application_user_bindings WHERE project_id=$1
@@ -4876,6 +4924,21 @@ async fn merge_bindings(
                 .await
                 .map_err(persistence)?;
         } else {
+            if binding_status == "disabled" {
+                // A disabled binding is not part of projection fan-out and cannot become visible
+                // again. Erase its obsolete current projection (including protected PII) before
+                // moving durable binding/history attribution to the winner.
+                transaction
+                    .execute_raw(statement(
+                        "DELETE FROM application_user_projections
+                          WHERE project_id=$1 AND binding_id=$2",
+                        vec![project_id.into(), binding_id.into()],
+                    ))
+                    .await
+                    .map_err(persistence)?;
+            } else if binding_status != "active" {
+                return Err(ApplicationError::Integrity);
+            }
             transaction
                 .execute_raw(statement(
                     "UPDATE application_user_bindings SET user_id=$3,
@@ -4890,19 +4953,9 @@ async fn merge_bindings(
                 ))
                 .await
                 .map_err(persistence)?;
-            transaction
-                .execute_raw(statement(
-                    "UPDATE application_user_projections SET user_id=$3,updated_at=$4
-                      WHERE project_id=$1 AND binding_id=$2",
-                    vec![
-                        project_id.into(),
-                        binding_id.into(),
-                        winner_id.into(),
-                        timestamp.into(),
-                    ],
-                ))
-                .await
-                .map_err(persistence)?;
+            // For an active binding, keep the projection's prior owner visible until winner
+            // fan-out. Its deferred owner foreign key permits this transaction-local state; the
+            // materializer treats the owner change as a public semantic revision and updates it.
         }
     }
     Ok(())

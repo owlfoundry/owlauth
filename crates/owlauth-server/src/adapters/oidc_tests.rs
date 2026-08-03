@@ -104,6 +104,7 @@ fn jwk(kid: &str) -> RsaJwk {
 
 fn callback_request(issuer: &str) -> ProviderCallbackRequest {
     ProviderCallbackRequest {
+        kind: crate::domain::ProviderKind::Oidc,
         issuer: issuer.to_owned(),
         client_id: "client-123".to_owned(),
         client_secret: Zeroizing::new("secret-123".to_owned()),
@@ -115,6 +116,77 @@ fn callback_request(issuer: &str) -> ProviderCallbackRequest {
         allowed_clock_skew_seconds: 60,
         profile: ProviderRequestProfile::Login,
     }
+}
+
+#[test]
+fn captured_google_discovery_uses_offline_parameters_without_offline_scope() {
+    let discovery: DiscoveryDocument = serde_json::from_value(json!({
+        "issuer": "https://accounts.google.com",
+        "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_endpoint": "https://oauth2.googleapis.com/token",
+        "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+        "revocation_endpoint": "https://oauth2.googleapis.com/revoke",
+        "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "scopes_supported": ["openid", "email", "profile"],
+        "code_challenge_methods_supported": ["S256"]
+    }))
+    .expect("captured Google discovery shape");
+    let policy = EndpointPolicy::new(
+        [
+            "https://accounts.google.com",
+            "https://oauth2.googleapis.com",
+            "https://www.googleapis.com",
+            "https://openidconnect.googleapis.com",
+        ],
+        false,
+    )
+    .expect("fixed Google origins");
+    discovery.validate(&policy).expect("valid Google discovery");
+    assert!(managed_discovery_supported(
+        crate::domain::ProviderKind::Google,
+        &discovery
+    ));
+    assert!(!contains_exact(
+        &discovery.scopes_supported,
+        "offline_access"
+    ));
+
+    let authorization = build_authorization_url(
+        discovery.authorization_endpoint,
+        &ProviderAuthorizationRequest {
+            kind: crate::domain::ProviderKind::Google,
+            issuer: "https://accounts.google.com".to_owned(),
+            client_id: "client-123".to_owned(),
+            callback_url: "https://runtime.example/auth/callback".to_owned(),
+            state: "state-123".to_owned(),
+            nonce: "nonce-123".to_owned(),
+            pkce_challenge: "c".repeat(43),
+            profile: ProviderRequestProfile::ManagedProfile,
+        },
+    )
+    .expect("Google managed authorization URL");
+    let authorization = Url::parse(&authorization).unwrap();
+    let query: HashMap<_, _> = authorization.query_pairs().into_owned().collect();
+    assert_eq!(
+        query.get("scope").map(String::as_str),
+        Some("openid profile")
+    );
+    assert_eq!(
+        query.get("access_type").map(String::as_str),
+        Some("offline")
+    );
+    assert_eq!(query.get("prompt").map(String::as_str), Some("consent"));
+    assert_eq!(
+        managed_profile_capabilities()
+            .for_kind(crate::domain::ProviderKind::Google)
+            .expect("Google managed capability")
+            .exact_scopes,
+        ["openid", "profile"]
+    );
 }
 
 #[test]
@@ -226,6 +298,32 @@ fn malformed_signature_duplicate_json_and_collection_bounds_are_rejected() {
         duplicate.validate(),
         Err(ProviderExchangeError::InvalidProof)
     );
+}
+
+#[test]
+fn named_google_is_fixed_and_never_falls_back_to_generic_oidc() {
+    let client = RestrictedOidcProviderClient::new(
+        [
+            "https://accounts.google.com",
+            "https://oauth2.googleapis.com",
+            "https://www.googleapis.com",
+            "https://openidconnect.googleapis.com",
+        ],
+        false,
+    )
+    .unwrap();
+    assert!(client.issuer_allowed(
+        crate::domain::ProviderKind::Google,
+        crate::domain::GOOGLE_ISSUER
+    ));
+    assert!(!client.issuer_allowed(
+        crate::domain::ProviderKind::Oidc,
+        crate::domain::GOOGLE_ISSUER
+    ));
+    assert!(!client.issuer_allowed(
+        crate::domain::ProviderKind::Google,
+        "https://accounts.example"
+    ));
 }
 
 #[test]
@@ -560,6 +658,48 @@ async fn identity_proof_uses_nonrenewable_scopes_and_discards_provider_material(
 }
 
 #[tokio::test]
+async fn google_managed_exchange_accepts_only_its_actual_scope_contract() {
+    let provider =
+        start_provider_with_scope(TokenBehavior::Success, false, Some("profile openid")).await;
+    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+    let mut request = callback_request(&provider.origin);
+    request.kind = crate::domain::ProviderKind::Google;
+    request.profile = ProviderRequestProfile::ManagedProfile;
+    let token = client
+        .exchange_once(
+            Url::parse(&format!("{}/token", provider.origin)).unwrap(),
+            &request,
+        )
+        .await
+        .expect("Google managed exchange with exact actual scopes");
+    assert_eq!(token.granted_scopes, ["openid", "profile"]);
+    assert_eq!(
+        token
+            .refresh_token
+            .expect("renewable Google credential")
+            .as_slice(),
+        b"renewable-secret"
+    );
+
+    let provider = start_provider_with_scope(
+        TokenBehavior::Success,
+        false,
+        Some("offline_access openid profile"),
+    )
+    .await;
+    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+    assert!(matches!(
+        client
+            .exchange_once(
+                Url::parse(&format!("{}/token", provider.origin)).unwrap(),
+                &request
+            )
+            .await,
+        Err(ProviderExchangeError::InvalidProof)
+    ));
+}
+
+#[tokio::test]
 async fn managed_callback_retains_only_exact_adapter_declared_scopes() {
     let provider = start_provider(TokenBehavior::Success, false).await;
     let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
@@ -650,6 +790,7 @@ fn managed_guard(origin: &str) -> ConnectionGuard {
         project_security_revision: 1,
         provider_revision: 1,
         managed_profile_revision: 1,
+        provider_kind: crate::domain::ProviderKind::Oidc,
         adapter_key: "controlled_oidc_profile_v1".to_owned(),
         adapter_capability_revision: 1,
         required_scopes: ["offline_access", "openid", "profile"]
@@ -665,11 +806,15 @@ fn managed_guard(origin: &str) -> ConnectionGuard {
     }
 }
 
+fn managed_adapter(origin: &str) -> RestrictedOidcManagedProfileAdapter {
+    let client = RestrictedOidcProviderClient::for_loopback_tests(origin);
+    RestrictedOidcManagedProfileAdapter::new(client.clone(), client, Arc::new(TestSecretResolver))
+}
+
 #[tokio::test]
 async fn managed_refresh_body_attempt_header_and_userinfo_token_are_confined() {
     let provider = start_provider(TokenBehavior::Success, false).await;
-    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
-    let adapter = RestrictedOidcManagedProfileAdapter::new(client, Arc::new(TestSecretResolver));
+    let adapter = managed_adapter(&provider.origin);
     let guard = managed_guard(&provider.origin);
     let attempt = uuid::Uuid::new_v4();
     let ProviderRenewalResult::Success(renewed) = adapter
@@ -727,10 +872,7 @@ async fn managed_renewal_scope_omission_uses_only_the_frozen_exact_grant() {
         (Some("offline_access openid profile profile"), false),
     ] {
         let provider = start_provider_with_scope(TokenBehavior::Success, false, scope).await;
-        let adapter = RestrictedOidcManagedProfileAdapter::new(
-            RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
-            Arc::new(TestSecretResolver),
-        );
+        let adapter = managed_adapter(&provider.origin);
         let result = adapter
             .renew(
                 &managed_guard(&provider.origin),
@@ -765,10 +907,7 @@ async fn managed_revocation_is_capability_aware_and_body_confined() {
         ),
     ] {
         let provider = start_provider(behavior, false).await;
-        let adapter = RestrictedOidcManagedProfileAdapter::new(
-            RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
-            Arc::new(TestSecretResolver),
-        );
+        let adapter = managed_adapter(&provider.origin);
         assert_eq!(
             adapter
                 .revoke(
@@ -795,10 +934,7 @@ async fn managed_revocation_is_capability_aware_and_body_confined() {
 #[tokio::test]
 async fn managed_revocation_endpoint_removal_is_unsupported_without_token_dispatch() {
     let provider = start_provider(TokenBehavior::NoRevocation, false).await;
-    let adapter = RestrictedOidcManagedProfileAdapter::new(
-        RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
-        Arc::new(TestSecretResolver),
-    );
+    let adapter = managed_adapter(&provider.origin);
     assert_eq!(
         adapter
             .revoke(
@@ -814,10 +950,7 @@ async fn managed_revocation_endpoint_removal_is_unsupported_without_token_dispat
 #[tokio::test]
 async fn managed_renewal_rejects_oversized_chunked_response_without_buffering_it() {
     let provider = start_provider(TokenBehavior::Oversized, false).await;
-    let adapter = RestrictedOidcManagedProfileAdapter::new(
-        RestrictedOidcProviderClient::for_loopback_tests(&provider.origin),
-        Arc::new(TestSecretResolver),
-    );
+    let adapter = managed_adapter(&provider.origin);
     assert!(matches!(
         adapter
             .renew(
@@ -939,6 +1072,7 @@ async fn authorization_request_has_only_the_fixed_oidc_profile() {
     let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
     let url = client
         .authorization_url(ProviderAuthorizationRequest {
+            kind: crate::domain::ProviderKind::Oidc,
             issuer: provider.origin.clone(),
             client_id: "client-123".to_owned(),
             callback_url: format!("{}/callback", provider.origin),
@@ -998,6 +1132,7 @@ async fn redirects_oversized_documents_and_endpoint_mismatch_fail_before_dispatc
         let client = RestrictedOidcProviderClient::for_loopback_tests(&origin);
         let error = client
             .authorization_url(ProviderAuthorizationRequest {
+                kind: crate::domain::ProviderKind::Oidc,
                 issuer: origin.clone(),
                 client_id: "client-123".to_owned(),
                 callback_url: format!("{origin}/callback"),

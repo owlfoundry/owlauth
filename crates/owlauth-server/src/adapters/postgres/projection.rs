@@ -24,8 +24,8 @@ use crate::{
 use super::{
     authentication::persistence,
     entity::{
-        application, application_user_binding, application_user_projection, project_policy,
-        project_user,
+        application, application_user_binding, application_user_projection, project,
+        project_policy, project_user,
     },
 };
 
@@ -218,6 +218,109 @@ impl PostgresIdentityProjectionMaterializer {
             },
         }
     }
+
+    /// Converge one existing binding to the current monotonic projection policies. The immutable
+    /// event is appended in the caller's transaction only when public projection semantics change.
+    pub(crate) async fn converge_binding(
+        &self,
+        transaction: &sea_orm::DatabaseTransaction,
+        binding_id: uuid::Uuid,
+        now: OffsetDateTime,
+    ) -> Result<(), ApplicationError> {
+        assert_projection_write_authority(
+            transaction,
+            self.cryptography.projection_protector.as_ref(),
+        )
+        .await?;
+        let hint = application_user_binding::Entity::find_by_id(binding_id)
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        let project = project::Entity::find_by_id(hint.project_id)
+            .lock_shared()
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        if project.status != "active" {
+            return Ok(());
+        }
+        let policy = project_policy::Entity::find_by_id(hint.project_id)
+            .lock_shared()
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        let application = application::Entity::find_by_id(hint.application_id)
+            .filter(application::Column::ProjectId.eq(hint.project_id))
+            .lock_shared()
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        if application.status != "active" {
+            return Ok(());
+        }
+        let user = project_user::Entity::find_by_id(hint.user_id)
+            .filter(project_user::Column::ProjectId.eq(hint.project_id))
+            .lock_shared()
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        let binding = application_user_binding::Entity::find_by_id(binding_id)
+            .filter(application_user_binding::Column::ProjectId.eq(hint.project_id))
+            .filter(application_user_binding::Column::ApplicationId.eq(hint.application_id))
+            .filter(application_user_binding::Column::UserId.eq(user.id))
+            .lock_exclusive()
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        if binding.status != "active" {
+            return Ok(());
+        }
+        let projection = application_user_projection::Entity::find()
+            .filter(application_user_projection::Column::ProjectId.eq(binding.project_id))
+            .filter(application_user_projection::Column::BindingId.eq(binding.id))
+            .lock_exclusive()
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        let (projection, material) = repair_runtime_projection(
+            transaction,
+            projection,
+            application.id,
+            &user,
+            policy.projection_revision,
+            application.projection_revision,
+            policy.projection_verified_email_enabled,
+            application.projection_verified_email_enabled,
+            &self.cryptography,
+            now,
+        )
+        .await?;
+        if material.semantic_change {
+            let event_type = if user.status == "disabled" {
+                crate::domain::ApplicationUserEventType::Disabled
+            } else {
+                crate::domain::ApplicationUserEventType::Updated
+            };
+            super::webhook::append_projection_event(
+                transaction,
+                &project.public_id,
+                &application.public_id,
+                binding.id,
+                &projection,
+                &material.document,
+                event_type,
+            )
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +374,9 @@ pub(super) struct ProjectionMaterial {
     pub(super) verified_email_source_identity_id: Option<uuid::Uuid>,
     pub(super) verified_email_ciphertext: Option<Vec<u8>>,
     pub(super) verified_email_key_version: Option<i32>,
+    /// A public projection field or its governing policy changed. Storage-only repair must not
+    /// advance the public revision or emit an Application event.
+    pub(super) semantic_change: bool,
     pub(super) storage_repair_required: bool,
 }
 
@@ -473,6 +579,14 @@ pub(super) async fn primary_verified_email<P: ProjectionCryptography + ?Sized>(
     user: &project_user::Model,
     protector: &P,
 ) -> Result<Option<(uuid::Uuid, String)>, ApplicationError> {
+    match user.status.as_str() {
+        // Disabled projections are terminal public views and must never retain or reload PII.
+        // Merge deliberately clears the loser's immediate primary-identity references before it
+        // publishes this view and moves identity ownership in the same transaction.
+        "disabled" => return Ok(None),
+        "active" => {}
+        _ => return Err(ApplicationError::Integrity),
+    }
     if user.primary_source_kind != "email" {
         return Ok(None);
     }
@@ -540,11 +654,13 @@ pub(super) fn authoritative_projection_material(
             verified_email_source_identity_id: None,
             verified_email_ciphertext: None,
             verified_email_key_version: None,
+            semantic_change: true,
             storage_repair_required: true,
         });
     };
 
-    let semantic_change = existing.source_user_revision != user.user_revision
+    let semantic_change = existing.user_id != user.id
+        || existing.source_user_revision != user.user_revision
         || existing.project_policy_revision != project_projection_revision
         || existing.application_policy_revision != application_projection_revision;
     let revision = if semantic_change {
@@ -576,6 +692,7 @@ pub(super) fn authoritative_projection_material(
         verified_email_source_identity_id: None,
         verified_email_ciphertext: None,
         verified_email_key_version: None,
+        semantic_change,
         storage_repair_required,
     })
 }
@@ -610,7 +727,8 @@ pub(super) async fn authoritative_runtime_projection_material<
     }
     let source_identity_id = source_email.as_ref().map(|(identity_id, _)| *identity_id);
     let semantic_change = projection.is_none_or(|existing| {
-        existing.source_user_revision != user.user_revision
+        existing.user_id != user.id
+            || existing.source_user_revision != user.user_revision
             || existing.project_policy_revision != project_projection_revision
             || existing.application_policy_revision != application_projection_revision
             || existing.verified_email_source_identity_id != source_identity_id
@@ -692,6 +810,7 @@ pub(super) async fn authoritative_runtime_projection_material<
         verified_email_source_identity_id: source_identity_id,
         verified_email_ciphertext: ciphertext,
         verified_email_key_version: key_version,
+        semantic_change,
         storage_repair_required,
     })
 }
@@ -726,6 +845,7 @@ pub(super) async fn repair_runtime_projection<P: ProjectionCryptography + ?Sized
     .await?;
     let projection = if material.storage_repair_required {
         let mut active = projection.into_active_model();
+        active.user_id = Set(user.id);
         active.projection_revision = Set(material.revision);
         active.source_user_revision = Set(user.user_revision);
         active.project_policy_revision = Set(project_projection_revision);
@@ -766,6 +886,7 @@ pub(super) async fn repair_projection(
     )?;
     let projection = if material.storage_repair_required {
         let mut active = projection.into_active_model();
+        active.user_id = Set(user.id);
         active.projection_revision = Set(material.revision);
         active.source_user_revision = Set(user.user_revision);
         active.project_policy_revision = Set(project_projection_revision);
@@ -793,6 +914,15 @@ async fn fan_out_projected_user<P: ProjectionCryptography + ?Sized>(
     protector: &P,
     now: OffsetDateTime,
 ) -> Result<(), ApplicationError> {
+    let project = project::Entity::find_by_id(user.project_id)
+        .lock_shared()
+        .one(transaction)
+        .await
+        .map_err(persistence)?
+        .ok_or(ApplicationError::Integrity)?;
+    if project.status != "active" {
+        return Ok(());
+    }
     let policy = project_policy::Entity::find_by_id(user.project_id)
         .lock_shared()
         .one(transaction)
@@ -815,10 +945,14 @@ async fn fan_out_projected_user<P: ProjectionCryptography + ?Sized>(
     for binding in bindings {
         let application = application::Entity::find_by_id(binding.application_id)
             .filter(application::Column::ProjectId.eq(user.project_id))
+            .lock_shared()
             .one(transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
+        if application.status != "active" {
+            continue;
+        }
         let projection = application_user_projection::Entity::find()
             .filter(application_user_projection::Column::ProjectId.eq(user.project_id))
             .filter(application_user_projection::Column::BindingId.eq(binding.id))
@@ -827,7 +961,8 @@ async fn fan_out_projected_user<P: ProjectionCryptography + ?Sized>(
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        repair_runtime_projection(
+        let binding_id = projection.binding_id;
+        let (projection, material) = repair_runtime_projection(
             transaction,
             projection,
             application.id,
@@ -840,6 +975,23 @@ async fn fan_out_projected_user<P: ProjectionCryptography + ?Sized>(
             now,
         )
         .await?;
+        if material.semantic_change {
+            let event_type = if user.status == "disabled" {
+                crate::domain::ApplicationUserEventType::Disabled
+            } else {
+                crate::domain::ApplicationUserEventType::Updated
+            };
+            super::webhook::append_projection_event(
+                transaction,
+                &project.public_id,
+                &application.public_id,
+                binding_id,
+                &projection,
+                &material.document,
+                event_type,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -1097,19 +1249,21 @@ impl PostgresProjectionEmailKeyAuthority {
                 write_version,
             )
             .await?;
-            let references: i64 = transaction
+            let referenced: bool = transaction
                 .query_one_raw(Statement::from_sql_and_values(
                     DbBackend::Postgres,
-                    "SELECT count(*)::BIGINT AS count FROM application_user_projections \
-                     WHERE verified_email_key_version=$1",
+                    "SELECT EXISTS(SELECT 1 FROM application_user_projections \
+                                      WHERE verified_email_key_version=$1) \
+                            OR EXISTS(SELECT 1 FROM application_user_events \
+                                      WHERE verified_email_key_version=$1) AS referenced",
                     [version.into()],
                 ))
                 .await
                 .map_err(persistence)?
                 .ok_or(ApplicationError::Integrity)?
-                .try_get("", "count")
+                .try_get("", "referenced")
                 .map_err(persistence)?;
-            if references != 0 {
+            if referenced {
                 return Err(ApplicationError::Disabled);
             }
             if retirement != Some(version) {
@@ -1182,6 +1336,7 @@ async fn assert_required_projection_observations(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn fan_out_user_projections(
     transaction: &sea_orm::DatabaseTransaction,
     user: &project_user::Model,

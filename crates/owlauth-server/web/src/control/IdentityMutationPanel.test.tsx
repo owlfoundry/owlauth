@@ -94,6 +94,8 @@ const provider: Provider = {
   callback_url: "https://runtime.example/callback",
   status: "active",
   revision: 5,
+  login_supported: true,
+  identity_proof_supported: true,
   assigned_application_ids: [application.id],
   managed_profile: {
     enabled: false,
@@ -104,6 +106,15 @@ const provider: Provider = {
     supported: false,
     supports_revocation: false,
   },
+};
+const githubProvider: Provider = {
+  ...provider,
+  id: "89898989-8989-4989-8989-898989898989",
+  provider_key: "github",
+  display_name: "GitHub login only",
+  kind: "github",
+  issuer: "https://github.com",
+  identity_proof_supported: false,
 };
 
 function successful<T>(data: T) {
@@ -140,6 +151,7 @@ function renderPanel(options?: {
   post?: (path: string, options: unknown) => Promise<unknown>;
   get?: (path: string, options: unknown) => Promise<unknown>;
   identities?: ProjectUserIdentity[];
+  providers?: Provider[];
   onError?: (error: unknown) => Promise<void>;
   reload?: () => Promise<void>;
 }) {
@@ -172,7 +184,7 @@ function renderPanel(options?: {
       users={[winner, loser]}
       identities={options?.identities ?? [providerIdentity, emailIdentity]}
       applications={[application]}
-      providers={[provider]}
+      providers={options?.providers ?? [provider]}
       reloadSelectedUser={reload}
       onError={onError}
       setMessage={setMessage}
@@ -209,6 +221,22 @@ function popup() {
 
 describe("Control identity mutation orchestration", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("omits login-only providers from identity-proof authority choices", () => {
+    renderPanel({ providers: [provider, githubProvider] });
+    chooseOperation("link");
+    fireEvent.change(screen.getByLabelText("Exact existing identity"), {
+      target: { value: providerIdentity.id },
+    });
+    fireEvent.change(selectElement("#destination-application"), {
+      target: { value: application.id },
+    });
+    const options = Array.from(selectElement("#destination-provider").options).map(
+      (option) => option.textContent,
+    );
+    expect(options).toContain("Current authority (current-authority)");
+    expect(options).not.toContain("GitHub login only (github)");
+  });
 
   it("accepts only bounded redacted inventory", () => {
     expect(validateSafeIdentityInventory([providerIdentity, emailIdentity])).toBe(true);

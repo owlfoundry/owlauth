@@ -22,8 +22,8 @@ use crate::{
     },
     application::{
         ConfigurationSecretStore, DeploymentSmtpDesiredStatus, DeploymentSmtpGeneration,
-        DeploymentSmtpRegistry, ManagedConnectionService, RuntimeAuthService,
-        SmtpCredentialResolver, SmtpTlsMode,
+        DeploymentSmtpRegistry, ManagedConnectionService, ProjectionExpansionWorker,
+        RuntimeAuthService, SmtpCredentialResolver, SmtpTlsMode, WebhookWorker,
     },
     config::{DeploymentSmtpStatus, PlaneMode, ServerConfig},
     http::{PlaneRouters, build_routers_with_runtime_incarnation},
@@ -720,6 +720,8 @@ async fn serve_until_shutdown(
     let selection = runtime_worker_selection(
         routers.runtime_auth.is_some(),
         routers.managed_sync.is_some(),
+        routers.projection_expansion.is_some(),
+        routers.webhook_delivery.is_some(),
     );
     let runtime_auth = routers.runtime_auth.clone();
     let runtime_workers = spawn_runtime_worker_tasks(
@@ -734,6 +736,14 @@ async fn serve_until_shutdown(
             .managed_sync
             .clone()
             .map(|managed| run_managed_workers(managed, shutdown_receiver.clone())),
+        routers
+            .projection_expansion
+            .clone()
+            .map(|worker| run_projection_expansion_worker(worker, shutdown_receiver.clone())),
+        routers
+            .webhook_delivery
+            .clone()
+            .map(|worker| run_webhook_worker(worker, shutdown_receiver.clone())),
     );
     let mut servers = JoinSet::new();
     spawn_selected(
@@ -792,41 +802,66 @@ async fn serve_until_shutdown(
 const RUNTIME_MAIL_BATCH_BUDGET: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "tests compare independent optional worker composition decisions"
+)]
 struct RuntimeWorkerSelection {
     mail: bool,
     provider_recovery: bool,
     managed_sync: bool,
+    projection_expansion: bool,
+    webhook_delivery: bool,
 }
 
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "the pure helper verifies independent optional worker inputs"
+)]
 const fn runtime_worker_selection(
     runtime_auth_composed: bool,
     managed_sync_composed: bool,
+    projection_expansion_composed: bool,
+    webhook_delivery_composed: bool,
 ) -> RuntimeWorkerSelection {
     RuntimeWorkerSelection {
         mail: runtime_auth_composed,
         provider_recovery: FEDERATED_PROJECT_AUTH_AVAILABLE && runtime_auth_composed,
         managed_sync: managed_sync_composed,
+        projection_expansion: projection_expansion_composed,
+        webhook_delivery: webhook_delivery_composed,
     }
 }
 
-fn spawn_runtime_worker_tasks<Mail, Recovery, Managed>(
+fn spawn_runtime_worker_tasks<Mail, Recovery, Managed, Projection, Webhook>(
     selection: RuntimeWorkerSelection,
     mail: Option<Mail>,
     provider_recovery: Option<Recovery>,
     managed_sync: Option<Managed>,
+    projection_expansion: Option<Projection>,
+    webhook_delivery: Option<Webhook>,
 ) -> Vec<tokio::task::JoinHandle<()>>
 where
     Mail: Future<Output = ()> + Send + 'static,
     Recovery: Future<Output = ()> + Send + 'static,
     Managed: Future<Output = ()> + Send + 'static,
+    Projection: Future<Output = ()> + Send + 'static,
+    Webhook: Future<Output = ()> + Send + 'static,
 {
     assert_eq!(selection.mail, mail.is_some());
     assert_eq!(selection.provider_recovery, provider_recovery.is_some());
     assert_eq!(selection.managed_sync, managed_sync.is_some());
+    assert_eq!(
+        selection.projection_expansion,
+        projection_expansion.is_some()
+    );
+    assert_eq!(selection.webhook_delivery, webhook_delivery.is_some());
     mail.into_iter()
         .map(tokio::spawn)
         .chain(provider_recovery.into_iter().map(tokio::spawn))
         .chain(managed_sync.into_iter().map(tokio::spawn))
+        .chain(projection_expansion.into_iter().map(tokio::spawn))
+        .chain(webhook_delivery.into_iter().map(tokio::spawn))
         .collect()
 }
 
@@ -963,6 +998,83 @@ async fn run_managed_workers(
     }
 }
 
+async fn run_projection_expansion_worker(
+    worker: Arc<ProjectionExpansionWorker>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let started = tokio::time::Instant::now();
+                for _ in 0..4 {
+                    match worker.run_once().await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                event = "projection_expansion_worker_failed",
+                                error = ?error,
+                                "a bounded projection expansion batch did not complete"
+                            );
+                            break;
+                        }
+                    }
+                    if started.elapsed() >= Duration::from_secs(1) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_webhook_worker(worker: Arc<WebhookWorker>, mut shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let started = tokio::time::Instant::now();
+                for _ in 0..16 {
+                    match worker.run_once().await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                event = "webhook_delivery_worker_failed",
+                                error = ?error,
+                                "a bounded webhook delivery attempt did not complete"
+                            );
+                            break;
+                        }
+                    }
+                    if started.elapsed() >= Duration::from_secs(1) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn spawn_selected(
     servers: &mut JoinSet<Result<(), std::io::Error>>,
     listener: Option<TcpListener>,
@@ -988,6 +1100,17 @@ fn spawn_selected(
     });
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<(), ServerError> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|_| ServerError::ShutdownSignal)?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.map_err(|_| ServerError::ShutdownSignal),
+        signal = terminate.recv() => signal.ok_or(ServerError::ShutdownSignal).map(drop),
+    }
+}
+
+#[cfg(not(unix))]
 async fn shutdown_signal() -> Result<(), ServerError> {
     tokio::signal::ctrl_c()
         .await
@@ -1025,27 +1148,33 @@ mod tests {
     fn runtime_worker_ownership_is_independent_across_optional_capabilities() {
         const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
         assert_eq!(
-            runtime_worker_selection(false, false),
+            runtime_worker_selection(false, false, false, false),
             RuntimeWorkerSelection {
                 mail: false,
                 provider_recovery: false,
                 managed_sync: false,
+                projection_expansion: false,
+                webhook_delivery: false,
             }
         );
         assert_eq!(
-            runtime_worker_selection(true, false),
+            runtime_worker_selection(true, false, false, false),
             RuntimeWorkerSelection {
                 mail: true,
                 provider_recovery: true,
                 managed_sync: false,
+                projection_expansion: false,
+                webhook_delivery: false,
             }
         );
         assert_eq!(
-            runtime_worker_selection(false, true),
+            runtime_worker_selection(false, true, true, true),
             RuntimeWorkerSelection {
                 mail: false,
                 provider_recovery: false,
                 managed_sync: true,
+                projection_expansion: true,
+                webhook_delivery: true,
             }
         );
     }
@@ -1080,7 +1209,7 @@ mod tests {
         let managed_dropped = Arc::clone(&dropped);
         let managed_all_started = Arc::clone(&all_started);
         let workers = spawn_runtime_worker_tasks(
-            runtime_worker_selection(true, true),
+            runtime_worker_selection(true, true, false, false),
             Some(worker(shutdown_receiver.clone(), Arc::clone(&mail_stopped))),
             Some(worker(
                 shutdown_receiver.clone(),
@@ -1093,6 +1222,8 @@ mod tests {
                 }
                 std::future::pending::<()>().await;
             }),
+            None::<std::future::Ready<()>>,
+            None::<std::future::Ready<()>>,
         );
         assert_eq!(workers.len(), 3);
         tokio::time::timeout(Duration::from_secs(1), all_started.notified())

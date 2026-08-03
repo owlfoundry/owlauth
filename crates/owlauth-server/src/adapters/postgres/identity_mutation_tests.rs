@@ -8,7 +8,7 @@
 use std::{collections::BTreeMap, env, sync::Arc};
 
 use async_trait::async_trait;
-use sea_orm::{Database, DatabaseConnection, DatabaseTransaction, EntityTrait};
+use sea_orm::{Database, DatabaseConnection, DatabaseTransaction, EntityTrait, TransactionTrait};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -58,7 +58,8 @@ use crate::{
     },
     config::PlaneMode,
     domain::{
-        IdentityKind, IdentityMutationKind, IdentityMutationSlotRole, IdentityMutationStatus,
+        ApplicationUserEventType, IdentityKind, IdentityMutationKind, IdentityMutationSlotRole,
+        IdentityMutationStatus,
     },
     http::{build_routers_with_runtime_incarnation, tests::identity_mutation_composition_config},
 };
@@ -346,6 +347,61 @@ fn digest(byte: u8) -> VersionedDigest {
         value: [byte; 32],
         key_version: 1,
     }
+}
+
+async fn seed_application_projection(
+    fixture: &Fixture,
+    application_id: Uuid,
+    user_id: Uuid,
+) -> (
+    super::entity::application_user_projection::Model,
+    serde_json::Value,
+) {
+    let user = super::entity::project_user::Entity::find_by_id(user_id)
+        .one(&fixture.database)
+        .await
+        .expect("read projection user")
+        .expect("projection user exists");
+    let (document, canonical_digest) =
+        super::projection::projection_material(&user, 1, 1, 1).expect("materialize projection");
+    let binding_id = Uuid::new_v4();
+    let projection_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO application_user_bindings
+         (id,project_id,application_id,user_id,status,binding_revision)
+         VALUES ($1,$2,$3,$4,'active',1)",
+    )
+    .bind(binding_id)
+    .bind(fixture.project_id)
+    .bind(application_id)
+    .bind(user_id)
+    .execute(&fixture.sqlx)
+    .await
+    .expect("seed Application binding");
+    sqlx::query(
+        "INSERT INTO application_user_projections
+         (id,project_id,binding_id,application_id,user_id,schema_name,projection_revision,
+          source_user_revision,project_policy_revision,application_policy_revision,
+          canonical_digest,source_base_profile_digest,document)
+         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,1,1,$6,$7,$8)",
+    )
+    .bind(projection_id)
+    .bind(fixture.project_id)
+    .bind(binding_id)
+    .bind(application_id)
+    .bind(user_id)
+    .bind(canonical_digest)
+    .bind(user.base_profile_digest)
+    .bind(&document)
+    .execute(&fixture.sqlx)
+    .await
+    .expect("seed Application projection");
+    let projection = super::entity::application_user_projection::Entity::find_by_id(projection_id)
+        .one(&fixture.database)
+        .await
+        .expect("read seeded projection")
+        .expect("seeded projection exists");
+    (projection, document)
 }
 
 fn protected(byte: u8, len: usize) -> ProtectedValue {
@@ -2781,6 +2837,18 @@ async fn final_merge_has_one_concurrent_winner_moves_graph_and_writes_exact_tomb
     };
     let loser_id = Uuid::new_v4();
     let loser_identity_id = Uuid::new_v4();
+    let loser_email_identity_id = Uuid::new_v4();
+    let mut loser_email_context = b"owlauth-email-identity-v1\0".to_vec();
+    loser_email_context.extend_from_slice(fixture.project_id.as_bytes());
+    loser_email_context.extend_from_slice(loser_email_identity_id.as_bytes());
+    let loser_email = fixture
+        .protector
+        .protect(
+            ProtectedPurpose::EmailIdentityAddress,
+            &loser_email_context,
+            b"merge-loser@example.com",
+        )
+        .expect("protect loser primary email");
     let mut seed = fixture.sqlx.begin().await.expect("begin loser seed");
     sqlx::query(
         "INSERT INTO project_users
@@ -2808,15 +2876,165 @@ async fn final_merge_has_one_concurrent_winner_moves_graph_and_writes_exact_tomb
     .await
     .expect("seed loser identity");
     sqlx::query(
-        "UPDATE project_users SET primary_source_kind='provider',primary_profile_identity_id=$2
+        "INSERT INTO email_identities
+         (id,project_id,user_id,status,identity_revision,canonicalization_version,
+          address_ciphertext,address_key_version,verified_at)
+         VALUES ($1,$2,$3,'active',1,1,$4,$5,clock_timestamp())",
+    )
+    .bind(loser_email_identity_id)
+    .bind(fixture.project_id)
+    .bind(loser_id)
+    .bind(loser_email.ciphertext)
+    .bind(loser_email.key_version)
+    .execute(&mut *seed)
+    .await
+    .expect("seed loser primary email");
+    sqlx::query(
+        "UPDATE project_users SET primary_source_kind='email',primary_email_identity_id=$2
           WHERE id=$1",
     )
     .bind(loser_id)
-    .bind(loser_identity_id)
+    .bind(loser_email_identity_id)
     .execute(&mut *seed)
     .await
-    .expect("seed loser primary");
+    .expect("select loser email primary");
     seed.commit().await.expect("commit loser seed");
+    let moved_application_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO applications
+         (id,project_id,public_id,status,revision,metadata_revision,security_revision)
+         VALUES ($1,$2,$3,'active',1,1,1)",
+    )
+    .bind(moved_application_id)
+    .bind(fixture.project_id)
+    .bind(format!("app_{moved_application_id}"))
+    .execute(&fixture.sqlx)
+    .await
+    .expect("seed loser-only Application");
+    let disabled_application_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO applications
+         (id,project_id,public_id,status,revision,metadata_revision,security_revision,
+          projection_verified_email_enabled)
+         VALUES ($1,$2,$3,'active',1,1,1,TRUE)",
+    )
+    .bind(disabled_application_id)
+    .bind(fixture.project_id)
+    .bind(format!("app_{disabled_application_id}"))
+    .execute(&fixture.sqlx)
+    .await
+    .expect("seed disabled loser-only Application");
+    sqlx::query(
+        "UPDATE project_policies SET projection_verified_email_enabled=TRUE WHERE project_id=$1",
+    )
+    .bind(fixture.project_id)
+    .execute(&fixture.sqlx)
+    .await
+    .expect("admit Project verified email projection");
+    sqlx::query("UPDATE applications SET projection_verified_email_enabled=TRUE WHERE id=$1")
+        .bind(fixture.application_id)
+        .execute(&fixture.sqlx)
+        .await
+        .expect("admit shared-Application verified email projection");
+
+    // Both users already reached the same Application and the loser has immutable delivery
+    // history. Merge must retain that history through its binding while deleting the loser's
+    // mutable projection, which may contain stale protected PII.
+    let (winner_projection, winner_document) =
+        seed_application_projection(&fixture, fixture.application_id, fixture.user_id).await;
+    let (loser_projection, loser_document) =
+        seed_application_projection(&fixture, fixture.application_id, loser_id).await;
+    let (moved_projection, moved_document) =
+        seed_application_projection(&fixture, moved_application_id, loser_id).await;
+    let (disabled_projection, _) =
+        seed_application_projection(&fixture, disabled_application_id, loser_id).await;
+    let loser_user = super::entity::project_user::Entity::find_by_id(loser_id)
+        .one(&fixture.database)
+        .await
+        .expect("read email-primary loser")
+        .expect("email-primary loser exists");
+    let (disabled_document, disabled_digest) =
+        super::projection::projection_material_with_verified_email(
+            &loser_user,
+            1,
+            1,
+            1,
+            Some("merge-loser@example.com".to_owned()),
+        )
+        .expect("materialize disabled-branch PII projection");
+    let disabled_storage_document = super::projection::safe_projection_document(&disabled_document)
+        .expect("redact disabled-branch stored projection");
+    let disabled_protected_email = super::projection::protect_projection_verified_email(
+        fixture.protector.as_ref(),
+        fixture.project_id,
+        disabled_application_id,
+        loser_id,
+        1,
+        "merge-loser@example.com",
+    )
+    .expect("protect disabled-branch projection email");
+    sqlx::query(
+        "UPDATE application_user_projections
+            SET canonical_digest=$2,document=$3,verified_email_source_identity_id=$4,
+                verified_email_ciphertext=$5,verified_email_key_version=$6
+          WHERE id=$1",
+    )
+    .bind(disabled_projection.id)
+    .bind(disabled_digest)
+    .bind(disabled_storage_document)
+    .bind(loser_email_identity_id)
+    .bind(disabled_protected_email.ciphertext)
+    .bind(disabled_protected_email.key_version)
+    .execute(&fixture.sqlx)
+    .await
+    .expect("seed retained PII on disabled-branch projection");
+    let retained_projection_has_pii: bool = sqlx::query_scalar(
+        "SELECT verified_email_ciphertext IS NOT NULL FROM application_user_projections WHERE id=$1",
+    )
+    .bind(disabled_projection.id)
+    .fetch_one(&fixture.sqlx)
+    .await
+    .expect("confirm retained disabled-branch projection PII");
+    assert!(retained_projection_has_pii);
+    let disabled_projection =
+        super::entity::application_user_projection::Entity::find_by_id(disabled_projection.id)
+            .one(&fixture.database)
+            .await
+            .expect("read retained disabled-branch projection")
+            .expect("retained disabled-branch projection exists");
+    let event_transaction = fixture.database.begin().await.expect("begin event seed");
+    for (projection, document, application_id) in [
+        (&winner_projection, &winner_document, fixture.application_id),
+        (&loser_projection, &loser_document, fixture.application_id),
+        (&moved_projection, &moved_document, moved_application_id),
+        (
+            &disabled_projection,
+            &disabled_document,
+            disabled_application_id,
+        ),
+    ] {
+        super::webhook::append_projection_event(
+            &event_transaction,
+            &format!("prj_{}", fixture.project_id),
+            &format!("app_{application_id}"),
+            projection.binding_id,
+            projection,
+            document,
+            ApplicationUserEventType::Created,
+        )
+        .await
+        .expect("append immutable initial projection event");
+    }
+    event_transaction.commit().await.expect("commit event seed");
+    sqlx::query(
+        "UPDATE application_user_bindings
+            SET status='disabled',binding_revision=binding_revision+1,updated_at=clock_timestamp()
+          WHERE id=$1",
+    )
+    .bind(disabled_projection.binding_id)
+    .execute(&fixture.sqlx)
+    .await
+    .expect("disable loser-only binding while retaining its PII projection");
 
     let intent_id = Uuid::new_v4();
     let created = fixture
@@ -2968,6 +3186,130 @@ async fn final_merge_has_one_concurrent_winner_moves_graph_and_writes_exact_tomb
     .await
     .expect("read merge tombstone");
     assert_eq!(tombstone, (loser_id, fixture.user_id, intent_id));
+    let retained_loser_events: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT event_type,projection_revision,
+                safe_body #>> '{data,projection,status}' AS projection_status
+           FROM application_user_events WHERE binding_id=$1
+          ORDER BY projection_revision",
+    )
+    .bind(loser_projection.binding_id)
+    .fetch_all(&fixture.sqlx)
+    .await
+    .expect("read retained loser events");
+    assert_eq!(
+        retained_loser_events,
+        vec![
+            ("user.projection.created".to_owned(), 1, "active".to_owned()),
+            (
+                "user.projection.disabled".to_owned(),
+                2,
+                "disabled".to_owned(),
+            ),
+        ]
+    );
+    let winner_events: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT event_type,projection_revision,
+                safe_body #>> '{data,projection,status}' AS projection_status
+           FROM application_user_events WHERE binding_id=$1
+          ORDER BY projection_revision",
+    )
+    .bind(winner_projection.binding_id)
+    .fetch_all(&fixture.sqlx)
+    .await
+    .expect("read winner events");
+    assert_eq!(
+        winner_events,
+        vec![
+            ("user.projection.created".to_owned(), 1, "active".to_owned()),
+            ("user.projection.updated".to_owned(), 2, "active".to_owned()),
+        ]
+    );
+    let deleted_loser_projection: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM application_user_projections WHERE binding_id=$1")
+            .bind(loser_projection.binding_id)
+            .fetch_one(&fixture.sqlx)
+            .await
+            .expect("read deleted loser projection");
+    assert_eq!(deleted_loser_projection, 0);
+    let moved_events: Vec<(String, i64, Uuid, String)> = sqlx::query_as(
+        "SELECT event_type,projection_revision,user_id,
+                safe_body #>> '{data,projection,status}' AS projection_status
+           FROM application_user_events WHERE binding_id=$1
+          ORDER BY projection_revision",
+    )
+    .bind(moved_projection.binding_id)
+    .fetch_all(&fixture.sqlx)
+    .await
+    .expect("read moved-binding events");
+    assert_eq!(
+        moved_events,
+        vec![
+            (
+                "user.projection.created".to_owned(),
+                1,
+                loser_id,
+                "active".to_owned(),
+            ),
+            (
+                "user.projection.disabled".to_owned(),
+                2,
+                loser_id,
+                "disabled".to_owned(),
+            ),
+            (
+                "user.projection.updated".to_owned(),
+                3,
+                fixture.user_id,
+                "active".to_owned(),
+            ),
+        ]
+    );
+    let moved_projection_owner: (Uuid, i64) = sqlx::query_as(
+        "SELECT user_id,projection_revision FROM application_user_projections WHERE binding_id=$1",
+    )
+    .bind(moved_projection.binding_id)
+    .fetch_one(&fixture.sqlx)
+    .await
+    .expect("read moved winner projection");
+    assert_eq!(moved_projection_owner, (fixture.user_id, 3));
+    let disabled_binding: (Uuid, String, i64) = sqlx::query_as(
+        "SELECT user_id,status,binding_revision FROM application_user_bindings WHERE id=$1",
+    )
+    .bind(disabled_projection.binding_id)
+    .fetch_one(&fixture.sqlx)
+    .await
+    .expect("read moved disabled loser-only binding");
+    assert_eq!(
+        disabled_binding,
+        (fixture.user_id, "disabled".to_owned(), 3)
+    );
+    let erased_disabled_projection: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM application_user_projections WHERE binding_id=$1")
+            .bind(disabled_projection.binding_id)
+            .fetch_one(&fixture.sqlx)
+            .await
+            .expect("read disabled loser-only projection erasure");
+    assert_eq!(erased_disabled_projection, 0);
+    let retained_disabled_history: Vec<(String, Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT event_type,user_id,
+                safe_body #>> '{data,projection,verified_email}' AS verified_email
+           FROM application_user_events WHERE binding_id=$1 ORDER BY projection_revision",
+    )
+    .bind(disabled_projection.binding_id)
+    .fetch_all(&fixture.sqlx)
+    .await
+    .expect("read retained disabled loser-only history");
+    assert_eq!(
+        retained_disabled_history,
+        vec![("user.projection.created".to_owned(), loser_id, None,)]
+    );
+    let moved_email_owner: Uuid =
+        sqlx::query_scalar("SELECT user_id FROM email_identities WHERE id=$1")
+            .bind(loser_email_identity_id)
+            .fetch_one(&fixture.sqlx)
+            .await
+            .expect("read moved loser email identity");
+    assert_eq!(moved_email_owner, fixture.user_id);
     let unconsumed: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM identity_proof_receipts
           WHERE intent_id=$1 AND consumed_at IS NULL",

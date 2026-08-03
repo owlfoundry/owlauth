@@ -1,3 +1,5 @@
+mod mcp;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
@@ -27,6 +29,7 @@ use owlauth_types::{
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::Semaphore;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer};
 use tracing::info;
@@ -34,6 +37,7 @@ use uuid::Uuid;
 
 use crate::{
     adapters::{
+        github::GithubOAuthProviderClient,
         oidc::{RestrictedOidcManagedProfileAdapter, RestrictedOidcProviderClient},
         postgres::{
             DatabasePools,
@@ -48,12 +52,15 @@ use crate::{
             managed_connection::PostgresManagedConnectionRepository,
             managed_reauthorization::PostgresManagedReauthorizationRepository,
             projection::PostgresIdentityProjectionMaterializer,
+            projection_expansion::PostgresProjectionExpansionRepository,
             provider_callback::PostgresProviderCallbackOwnerResolver,
             provisioning::PostgresProvisioningAdapter,
             readiness::PostgresReadinessAdapter,
             runtime_authority::PostgresRuntimeAuthorityRepository,
             session_authority::PostgresSessionAuthorityRepository,
+            webhook::PostgresWebhookRepository,
         },
+        provider_registry::ProviderClientRegistry,
         redis_admission::RedisAdmissionCounter,
         runtime_security::{
             EncryptedFileProviderSecretResolver, EncryptedFileRuntimeSigner,
@@ -69,24 +76,28 @@ use crate::{
         smtp::{ForbiddenSmtpDestinations, SafeSmtpTransport},
         software_store::{EncryptedFileStore, WriteOnlyEncryptedFileProvisioner},
         system::{Sha256RequestDigester, SystemClock, SystemEntropy},
+        webhook_http::SafeWebhookTransport,
     },
     application::{
         self, AdmissionDecision, AdmissionDimension, AdmissionDimensionKind, AdmissionEndpoint,
         AdmissionService, ApplicationError, BeginEmailChallenge, BeginLogin, Clock,
         ConfirmProjectBrowserLogout, ConfirmSessionReuse, ControlLifecycleService,
         CreateApplication, CreateManagedReauthorization, CreateProject, CreateProvider,
-        CreateSmtpConfiguration, DurableEmailAddressReader, EmailControlService, ExchangeHandoff,
+        CreateSmtpConfiguration, DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE,
+        DurableEmailAddressReader, EmailControlService, ExchangeHandoff,
         IdentityMutationControlService, IdentityMutationProviderCapability,
         IdentityMutationRuntimeService, MailWorker, ManagedConnectionMetadata,
         ManagedConnectionRepository, ManagedConnectionService, ManagedInteractionCleanupService,
         ManagedReauthorizationCallback, ManagedReauthorizationCallbackOutcome,
         ManagedReauthorizationControlService, ManagedReauthorizationDenial,
         ManagedReauthorizationRuntimeService, ManagedReauthorizationTargetVerifier,
-        ProjectionVerifiedEmailProtector, ProviderCallback, ProviderCallbackDenial,
-        ProviderCallbackOwner, ProviderCallbackOwnerResolver, ProvisioningInfrastructure,
-        ProvisioningService, ReadinessService, RefreshSession, ReplaceApplicationConfiguration,
-        RuntimeAuthService, RuntimeProtector, SelectEmail, SelectProvider, SubmitEmailProof,
-        UpdateApplication, UpdateProject, UpdateProjectPolicy,
+        McpConfirmationContext, McpConfirmationService, ProjectionExpansionWorker,
+        ProjectionPolicyService, ProjectionVerifiedEmailProtector, ProviderCallback,
+        ProviderCallbackDenial, ProviderCallbackOwner, ProviderCallbackOwnerResolver,
+        ProvisioningInfrastructure, ProvisioningService, ReadinessService, RefreshSession,
+        ReplaceApplicationConfiguration, RuntimeAuthService, RuntimeProtector, SelectEmail,
+        SelectProvider, SubmitEmailProof, UpdateApplication, UpdateProject, UpdateProjectPolicy,
+        WebhookControlService, WebhookWorker,
     },
     config::{ListenerConfig, OperatorApiKey, ServerConfig},
     domain::ApplicationType,
@@ -255,6 +266,9 @@ struct ControlState {
     managed_connections: Option<Arc<PostgresManagedConnectionRepository>>,
     managed_reauthorization: Option<Arc<ManagedReauthorizationControlService>>,
     identity_mutations: Option<Arc<IdentityMutationControlService>>,
+    projection_policy: Option<Arc<ProjectionPolicyService>>,
+    mcp_confirmation: Option<Arc<McpConfirmationService>>,
+    webhooks: Option<Arc<WebhookControlService>>,
 }
 
 pub(crate) struct PlaneRouters {
@@ -262,6 +276,8 @@ pub(crate) struct PlaneRouters {
     pub control: Option<Router>,
     pub runtime_auth: Option<Arc<RuntimeAuthService>>,
     pub managed_sync: Option<Arc<ManagedConnectionService>>,
+    pub projection_expansion: Option<Arc<ProjectionExpansionWorker>>,
+    pub webhook_delivery: Option<Arc<WebhookWorker>>,
     #[allow(
         dead_code,
         reason = "test and worker composition inspection uses this named service"
@@ -312,6 +328,10 @@ pub(crate) fn build_routers_with_runtime_incarnation(
 ) -> PlaneRouters {
     let runtime_ready = Arc::new(AtomicBool::new(false));
     let control_ready = Arc::new(AtomicBool::new(false));
+    let provider_clients = config
+        .mode
+        .has_runtime()
+        .then(|| build_provider_clients(config));
     let runtime_identity_mutations = config
         .mode
         .has_runtime()
@@ -319,7 +339,14 @@ pub(crate) fn build_routers_with_runtime_incarnation(
             pools
                 .and_then(|pools| pools.runtime.clone())
                 .map(|database| {
-                    build_identity_mutation_runtime_service(database, config, runtime_incarnation)
+                    build_identity_mutation_runtime_service(
+                        database,
+                        config,
+                        runtime_incarnation,
+                        provider_clients
+                            .as_ref()
+                            .expect("Runtime provider clients are composed once"),
+                    )
                 })
         })
         .flatten();
@@ -336,7 +363,16 @@ pub(crate) fn build_routers_with_runtime_incarnation(
         .then(|| {
             pools
                 .and_then(|pools| pools.runtime.clone())
-                .map(|database| build_runtime_auth_service(database, config, runtime_incarnation))
+                .map(|database| {
+                    build_runtime_auth_service(
+                        database,
+                        config,
+                        runtime_incarnation,
+                        provider_clients
+                            .as_ref()
+                            .expect("Runtime provider clients are composed once"),
+                    )
+                })
         })
         .flatten();
     let runtime_auth = runtime_components
@@ -348,6 +384,26 @@ pub(crate) fn build_routers_with_runtime_incarnation(
     let runtime_reauthorization = runtime_components
         .as_ref()
         .map(|(_, _, reauthorization)| Arc::clone(reauthorization));
+    let projection_expansion = config
+        .mode
+        .has_runtime()
+        .then(|| {
+            pools
+                .and_then(|pools| pools.runtime.clone())
+                .map(|database| {
+                    build_projection_expansion_worker(database, config, runtime_incarnation)
+                })
+        })
+        .flatten();
+    let webhook_delivery = config
+        .mode
+        .has_runtime()
+        .then(|| {
+            pools
+                .and_then(|pools| pools.runtime.clone())
+                .map(|database| build_webhook_worker(database, config, runtime_incarnation))
+        })
+        .flatten();
 
     let runtime = config.mode.has_runtime().then(|| {
         let readiness = pools
@@ -421,7 +477,14 @@ pub(crate) fn build_routers_with_runtime_incarnation(
                         .to_string(),
                     api_versions: vec!["v1".to_owned()],
                     credential_class: "operator-api-key".to_owned(),
-                    mcp_url: None,
+                    mcp_url: config.control_mcp.enabled.then(|| {
+                        config
+                            .control
+                            .external_base
+                            .join("mcp")
+                            .expect("validated Control base accepts the MCP path")
+                            .to_string()
+                    }),
                 }),
                 provisioning: pools
                     .and_then(|pools| pools.control.clone())
@@ -430,7 +493,12 @@ pub(crate) fn build_routers_with_runtime_incarnation(
                     .and_then(|pools| pools.control.clone())
                     .map(|database| {
                         Arc::new(ControlLifecycleService::new(
-                            Arc::new(PostgresControlLifecycleRepository::new(database)),
+                            Arc::new(
+                                PostgresControlLifecycleRepository::new_with_projection_materializer(
+                                    database,
+                                    build_identity_projection_materializer(config),
+                                ),
+                            ),
                             Arc::new(SystemClock),
                         ))
                     }),
@@ -439,12 +507,33 @@ pub(crate) fn build_routers_with_runtime_incarnation(
                     .map(|database| build_email_control_service(database, config)),
                 managed_connections: pools
                     .and_then(|pools| pools.control.clone())
-                    .map(PostgresManagedConnectionRepository::new)
-                    .map(Arc::new),
+                    .map(|database| {
+                        Arc::new(
+                            PostgresManagedConnectionRepository::new_with_projection_materializer(
+                                database,
+                                build_identity_projection_materializer(config),
+                            ),
+                        )
+                    }),
                 managed_reauthorization: pools
                     .and_then(|pools| pools.control.clone())
                     .map(|database| build_managed_reauthorization_service(database, config)),
                 identity_mutations: control_identity_mutations.clone(),
+                projection_policy: pools
+                    .and_then(|pools| pools.control.clone())
+                    .map(|database| build_projection_policy_service(database, config)),
+                mcp_confirmation: config
+                    .control_mcp
+                    .enabled
+                    .then(|| {
+                        pools
+                            .and_then(|pools| pools.control.clone())
+                            .map(|database| build_mcp_confirmation_service(database, config))
+                    })
+                    .flatten(),
+                webhooks: pools
+                    .and_then(|pools| pools.control.clone())
+                    .map(|database| build_webhook_control_service(database, config)),
             },
             config,
         )
@@ -455,6 +544,8 @@ pub(crate) fn build_routers_with_runtime_incarnation(
         control,
         runtime_auth,
         managed_sync,
+        projection_expansion,
+        webhook_delivery,
         runtime_identity_mutations,
         control_identity_mutations,
         runtime_ready,
@@ -523,6 +614,147 @@ fn build_email_control_service(
     ))
 }
 
+fn build_projection_policy_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<ProjectionPolicyService> {
+    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
+    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
+        source_reader,
+        projection_protector,
+    ));
+    Arc::new(ProjectionPolicyService::new(
+        Arc::new(PostgresProjectionExpansionRepository::new(
+            database,
+            materializer,
+        )),
+        Arc::new(SystemClock),
+    ))
+}
+
+fn build_mcp_confirmation_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<McpConfirmationService> {
+    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
+    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
+        source_reader,
+        projection_protector,
+    ));
+    Arc::new(
+        McpConfirmationService::new(
+            Arc::new(PostgresProjectionExpansionRepository::new(
+                database,
+                materializer,
+            )),
+            McpConfirmationContext {
+                instance_id: config
+                    .instance_id
+                    .clone()
+                    .expect("validated Control configuration has an instance ID"),
+                control_endpoint: config
+                    .control
+                    .external_base
+                    .join("mcp")
+                    .expect("validated Control base accepts the MCP path")
+                    .to_string(),
+            },
+        )
+        .expect("validated Control identity forms an MCP confirmation context"),
+    )
+}
+
+fn build_webhook_control_service(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+) -> Arc<WebhookControlService> {
+    let provisioning = config
+        .provisioning
+        .as_ref()
+        .expect("validated Control configuration has provisioning stores");
+    let secrets = WriteOnlyEncryptedFileProvisioner::new(
+        provisioning.configuration_secret_store_root.clone(),
+        provisioning.configuration_secret_store_key.expose_copy(),
+    )
+    .expect("validated write-only webhook secret provisioner configuration");
+    let (_, projection_protector) = build_projection_materializer_capabilities(config);
+    Arc::new(WebhookControlService::new(
+        Arc::new(PostgresWebhookRepository::new(
+            database,
+            projection_protector,
+        )),
+        Arc::new(secrets),
+        Arc::new(SafeWebhookTransport::new(
+            [config.runtime.bind, config.control.bind],
+            config.webhook_allowed_private_ips.clone(),
+            config.webhook_extra_root_cert_der.as_deref(),
+        )),
+        Arc::new(SystemClock),
+    ))
+}
+
+fn build_projection_expansion_worker(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+    runtime_incarnation: Uuid,
+) -> Arc<ProjectionExpansionWorker> {
+    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
+    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
+        source_reader,
+        projection_protector,
+    ));
+    Arc::new(
+        ProjectionExpansionWorker::new(
+            Arc::new(PostgresProjectionExpansionRepository::new(
+                database,
+                materializer,
+            )),
+            Arc::new(SystemClock),
+            config.runtime_process_id.clone(),
+            runtime_incarnation,
+            config.publication_lease_ttl,
+            DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE,
+        )
+        .expect("validated projection expansion worker configuration"),
+    )
+}
+
+fn build_webhook_worker(
+    database: DatabaseConnection,
+    config: &ServerConfig,
+    runtime_incarnation: Uuid,
+) -> Arc<WebhookWorker> {
+    let provisioning = config
+        .provisioning
+        .as_ref()
+        .expect("validated Runtime configuration has provisioning stores");
+    let secret_store = EncryptedFileStore::new(
+        provisioning.configuration_secret_store_root.clone(),
+        provisioning.configuration_secret_store_key.expose_copy(),
+    )
+    .expect("validated readable webhook secret store configuration");
+    let (_, projection_protector) = build_projection_materializer_capabilities(config);
+    Arc::new(
+        WebhookWorker::new(
+            Arc::new(PostgresWebhookRepository::new(
+                database,
+                projection_protector,
+            )),
+            Arc::new(EncryptedFileProviderSecretResolver::new(secret_store)),
+            Arc::new(SafeWebhookTransport::new(
+                [config.runtime.bind, config.control.bind],
+                config.webhook_allowed_private_ips.clone(),
+                config.webhook_extra_root_cert_der.as_deref(),
+            )),
+            Arc::new(SystemClock),
+            config.runtime_process_id.clone(),
+            runtime_incarnation,
+            config.publication_lease_ttl,
+        )
+        .expect("validated webhook delivery worker configuration"),
+    )
+}
+
 fn forbidden_smtp_listener_destinations(config: &ServerConfig) -> ForbiddenSmtpDestinations {
     let mut forbidden = ForbiddenSmtpDestinations::default();
     for bind in [config.runtime.bind, config.control.bind] {
@@ -547,6 +779,16 @@ fn build_runtime_admission(config: &ServerConfig) -> Arc<AdmissionService> {
         admission.digest_key.expose_copy(),
         admission.maximum_processes.get(),
         distributed,
+    ))
+}
+
+fn build_identity_projection_materializer(
+    config: &ServerConfig,
+) -> Arc<PostgresIdentityProjectionMaterializer> {
+    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
+    Arc::new(PostgresIdentityProjectionMaterializer::new(
+        source_reader,
+        projection_protector,
     ))
 }
 
@@ -735,10 +977,56 @@ fn build_identity_mutation_control_service(
     )
 }
 
+const PROVIDER_CALLBACK_CONCURRENCY_LIMIT: usize = 16;
+const GOOGLE_PROVIDER_ORIGINS: [&str; 4] = [
+    "https://accounts.google.com",
+    "https://oauth2.googleapis.com",
+    "https://www.googleapis.com",
+    "https://openidconnect.googleapis.com",
+];
+
+struct ComposedProviderClients {
+    oidc: RestrictedOidcProviderClient,
+    google: RestrictedOidcProviderClient,
+    registry: Arc<ProviderClientRegistry>,
+}
+
+fn build_provider_clients(config: &ServerConfig) -> ComposedProviderClients {
+    let callback_budget = Arc::new(Semaphore::new(PROVIDER_CALLBACK_CONCURRENCY_LIMIT));
+    let oidc = RestrictedOidcProviderClient::new_with_budget(
+        config.provider_allowed_origins.clone(),
+        config.provider_allow_http_loopback,
+        callback_budget.clone(),
+    )
+    .expect("validated generic OIDC endpoint policy");
+    let google = RestrictedOidcProviderClient::new_with_budget_and_callback_policy(
+        GOOGLE_PROVIDER_ORIGINS,
+        false,
+        config.provider_allow_http_loopback,
+        callback_budget.clone(),
+    )
+    .expect("fixed Google endpoint policy");
+    let registry = Arc::new(ProviderClientRegistry::new(
+        oidc.clone(),
+        google.clone(),
+        GithubOAuthProviderClient::new_with_budget_and_callback_policy(
+            callback_budget,
+            config.provider_allow_http_loopback,
+        )
+        .expect("fixed GitHub provider transport"),
+    ));
+    ComposedProviderClients {
+        oidc,
+        google,
+        registry,
+    }
+}
+
 fn build_identity_mutation_runtime_service(
     database: DatabaseConnection,
     config: &ServerConfig,
     runtime_incarnation: Uuid,
+    provider_clients: &ComposedProviderClients,
 ) -> Arc<IdentityMutationRuntimeService> {
     let deployment = config
         .instance_id
@@ -776,13 +1064,7 @@ fn build_identity_mutation_runtime_service(
         stores.configuration_secret_store_key.expose_copy(),
     )
     .expect("validated provider secret store");
-    let provider = Arc::new(
-        RestrictedOidcProviderClient::new(
-            &config.provider_allowed_origins,
-            config.provider_allow_http_loopback,
-        )
-        .expect("validated provider endpoint policy"),
-    );
+    let provider = provider_clients.registry.clone();
     Arc::new(IdentityMutationRuntimeService::new(
         Arc::new(PostgresRuntimeIdentityMutationRepository::new(
             database,
@@ -812,6 +1094,7 @@ fn build_runtime_auth_service(
     database: DatabaseConnection,
     config: &ServerConfig,
     runtime_incarnation: Uuid,
+    provider_clients: &ComposedProviderClients,
 ) -> (
     Arc<RuntimeAuthService>,
     Arc<ManagedConnectionService>,
@@ -917,11 +1200,7 @@ fn build_runtime_auth_service(
         .expect("validated managed credential protection configuration"),
     );
 
-    let provider = RestrictedOidcProviderClient::new(
-        &config.provider_allowed_origins,
-        config.provider_allow_http_loopback,
-    )
-    .expect("validated provider endpoint policy");
+    let provider = provider_clients.registry.as_ref().clone();
     let secret_resolver = Arc::new(EncryptedFileProviderSecretResolver::new(secret_store));
     let email = Arc::new(
         PostgresPasswordlessEmailRepository::new_with_runtime_identity(
@@ -964,10 +1243,17 @@ fn build_runtime_auth_service(
     let target_readable_key_versions =
         managed_reauthorization_target_verifier.readable_key_versions();
     let managed_adapter = Arc::new(RestrictedOidcManagedProfileAdapter::new(
-        provider.clone(),
+        provider_clients.oidc.clone(),
+        provider_clients.google.clone(),
         secret_resolver.clone(),
     ));
-    let managed_repository = Arc::new(PostgresManagedConnectionRepository::new(database.clone()));
+    let projection_materializer = build_identity_projection_materializer(config);
+    let managed_repository = Arc::new(
+        PostgresManagedConnectionRepository::new_with_projection_materializer(
+            database.clone(),
+            projection_materializer.clone(),
+        ),
+    );
     let interaction_cleanup = Arc::new(
         ManagedInteractionCleanupService::new(
             managed_repository.clone(),
@@ -999,7 +1285,7 @@ fn build_runtime_auth_service(
             Arc::new(provider.clone()),
             secret_resolver.clone(),
             Arc::new(SystemClock),
-            crate::adapters::oidc::controlled_oidc_managed_capability(),
+            crate::adapters::oidc::managed_profile_capabilities(),
         )
         .expect("validated managed reauthorization capability"),
     );
@@ -1016,6 +1302,7 @@ fn build_runtime_auth_service(
                 runtime_incarnation,
                 managed_protector,
                 protector.clone(),
+                projection_materializer,
             ),
         ),
         Arc::new(
@@ -1033,7 +1320,7 @@ fn build_runtime_auth_service(
         Arc::new(EncryptedFileRuntimeSigner::new(signer_store)),
         secret_resolver,
         Arc::new(provider),
-        crate::adapters::oidc::controlled_oidc_managed_capability(),
+        crate::adapters::oidc::managed_profile_capabilities(),
         Arc::new(SystemClock),
         config.runtime.external_base.clone(),
     ));
@@ -1111,7 +1398,7 @@ fn build_managed_reauthorization_service(
             target_issuer,
             Arc::new(SystemClock),
             config.runtime.external_base.clone(),
-            crate::adapters::oidc::controlled_oidc_managed_capability(),
+            crate::adapters::oidc::managed_profile_capabilities(),
         )
         .expect("validated managed reauthorization capability"),
     )
@@ -1303,6 +1590,54 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             post(disable_application),
         )
         .route(
+            "/projects/{project_id}/projection-policy",
+            get(get_project_projection_policy).put(update_project_projection_policy),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/projection-policy",
+            get(get_application_projection_policy).put(update_application_projection_policy),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-endpoints",
+            get(list_webhook_endpoints).post(create_webhook_endpoint),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}",
+            get(get_webhook_endpoint).put(update_webhook_endpoint),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/test",
+            post(test_webhook_endpoint),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/activate",
+            post(activate_webhook_endpoint),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/disable",
+            post(disable_webhook_endpoint),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/secret-rotations",
+            post(prepare_webhook_secret_rotation),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}/secret-rotations/{generation}/activate",
+            post(activate_webhook_secret_rotation),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/user-events",
+            get(list_application_user_events),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-deliveries",
+            get(list_webhook_deliveries),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}/replay",
+            post(replay_webhook_delivery),
+        )
+        .route(
             "/projects/{project_id}/signing-keys",
             get(list_signing_keys).post(create_signing_key),
         )
@@ -1403,7 +1738,7 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             state.clone(),
             require_operator,
         ));
-    let application = Router::new()
+    let mut application = Router::new()
         .route("/", get(control_root))
         .route("/console/", get(control_shell))
         .route("/console/assets/{*path}", get(control_asset))
@@ -1412,6 +1747,14 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         .route("/ready", get(control_readiness))
         .nest("/v1", protected)
         .with_state(state.clone());
+    if config.control_mcp.enabled {
+        application = application.merge(mcp::router(
+            &state,
+            listener,
+            &config.control_mcp,
+            config.max_request_bytes,
+        ));
+    }
     let descriptor = Router::new()
         .route("/.well-known/owlauth", get(service_descriptor))
         .with_state(state);
@@ -4438,6 +4781,20 @@ fn provisioning(state: &ControlState) -> Result<&ProvisioningService, Applicatio
         .ok_or(ApplicationError::Persistence)
 }
 
+fn projection_policy(state: &ControlState) -> Result<&ProjectionPolicyService, ApplicationError> {
+    state
+        .projection_policy
+        .as_deref()
+        .ok_or(ApplicationError::Persistence)
+}
+
+fn webhook_control(state: &ControlState) -> Result<&WebhookControlService, ApplicationError> {
+    state
+        .webhooks
+        .as_deref()
+        .ok_or(ApplicationError::Persistence)
+}
+
 async fn list_managed_provider_connections(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -4600,21 +4957,34 @@ async fn create_managed_reauthorization(
     let Ok(idempotency_key) = idempotency_key(&headers) else {
         return invalid_idempotency(&request_id);
     };
+    let Some(repository) = state.managed_connections.as_deref() else {
+        return application_problem(ApplicationError::Persistence, &request_id);
+    };
+    let metadata = match repository
+        .metadata_for_owner(project_id, user_id, connection_id)
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(error) => return application_problem(error, &request_id),
+    };
     let Some(service) = state.managed_reauthorization.as_deref() else {
         return application_problem(ApplicationError::Persistence, &request_id);
     };
     let result = service
-        .create(CreateManagedReauthorization {
-            project_id,
-            user_id,
-            connection_id,
-            application_id,
-            expected_connection_revision: body.expected_connection_revision,
-            expected_connection_generation: body.expected_connection_generation,
-            expected_credential_generation: body.expected_credential_generation,
-            idempotency_key,
-            correlation_id: request_uuid(&request_id),
-        })
+        .create_for_adapter_key(
+            CreateManagedReauthorization {
+                project_id,
+                user_id,
+                connection_id,
+                application_id,
+                expected_connection_revision: body.expected_connection_revision,
+                expected_connection_generation: body.expected_connection_generation,
+                expected_credential_generation: body.expected_credential_generation,
+                idempotency_key,
+                correlation_id: request_uuid(&request_id),
+            },
+            &metadata.capability_key,
+        )
         .await
         .map(
             |created| control_types::CreateManagedReauthorizationResponse {
@@ -6430,6 +6800,654 @@ async fn disable_application(
     }
 }
 
+fn control_projection_policy(
+    policy: &application::ProjectionPolicyRecord,
+) -> control_types::ProjectionPolicy {
+    control_types::ProjectionPolicy {
+        project_id: policy.project_id.to_string(),
+        application_id: policy.application_id.map(|value| value.to_string()),
+        verified_email_enabled: policy.verified_email_enabled,
+        revision: policy.revision,
+        expansion_operation_id: policy.expansion_operation_id.map(|value| value.to_string()),
+    }
+}
+
+fn webhook_event_type(value: control_types::ApplicationUserEventType) -> String {
+    match value {
+        control_types::ApplicationUserEventType::Created => "user.projection.created",
+        control_types::ApplicationUserEventType::Updated => "user.projection.updated",
+        control_types::ApplicationUserEventType::Disabled => "user.projection.disabled",
+    }
+    .to_owned()
+}
+
+fn control_webhook_event_type(
+    value: &str,
+) -> Result<control_types::ApplicationUserEventType, ApplicationError> {
+    match value {
+        "user.projection.created" => Ok(control_types::ApplicationUserEventType::Created),
+        "user.projection.updated" => Ok(control_types::ApplicationUserEventType::Updated),
+        "user.projection.disabled" => Ok(control_types::ApplicationUserEventType::Disabled),
+        _ => Err(ApplicationError::Integrity),
+    }
+}
+
+fn control_webhook_endpoint(
+    endpoint: application::WebhookEndpointRecord,
+) -> Result<control_types::WebhookEndpoint, ApplicationError> {
+    let status = match endpoint.status.as_str() {
+        "pending" => control_types::WebhookEndpointStatus::Pending,
+        "active" => control_types::WebhookEndpointStatus::Active,
+        "disabled" => control_types::WebhookEndpointStatus::Disabled,
+        _ => return Err(ApplicationError::Integrity),
+    };
+    Ok(control_types::WebhookEndpoint {
+        id: endpoint.id.to_string(),
+        public_id: endpoint.public_id,
+        project_id: endpoint.project_id.to_string(),
+        application_id: endpoint.application_id.to_string(),
+        url: endpoint.url,
+        subscribed_event_types: endpoint
+            .subscribed_event_types
+            .iter()
+            .map(|value| control_webhook_event_type(value))
+            .collect::<Result<Vec<_>, _>>()?,
+        status,
+        revision: endpoint.revision,
+        current_secret_generation: endpoint.current_secret_generation,
+        overlap_secret_generation: endpoint.overlap_secret_generation,
+        overlap_expires_at: endpoint.overlap_expires_at.map(timestamp),
+        consecutive_failure_count: endpoint.consecutive_failure_count,
+        last_delivery_at: endpoint.last_delivery_at.map(timestamp),
+        last_success_at: endpoint.last_success_at.map(timestamp),
+        last_failure_class: endpoint.last_failure_class,
+        last_tested_at: endpoint.last_tested_at.map(timestamp),
+        last_test_succeeded_at: endpoint.last_test_succeeded_at.map(timestamp),
+        created_at: timestamp(endpoint.created_at),
+        updated_at: timestamp(endpoint.updated_at),
+    })
+}
+
+fn control_application_user_event(
+    event: application::ApplicationUserEventRecord,
+) -> Result<control_types::ApplicationUserEvent, ApplicationError> {
+    Ok(control_types::ApplicationUserEvent {
+        event_id: event.event_id,
+        project_id: event.project_id.to_string(),
+        application_id: event.application_id.to_string(),
+        user_id: event.user_id.to_string(),
+        event_type: control_webhook_event_type(&event.event_type)?,
+        user_revision: event.user_revision,
+        projection_revision: event.projection_revision,
+        projection_schema: event.projection_schema,
+        safe_body: event.safe_body,
+        occurred_at: timestamp(event.occurred_at),
+    })
+}
+
+fn control_webhook_delivery(
+    delivery: application::WebhookDeliveryRecord,
+) -> Result<control_types::WebhookDelivery, ApplicationError> {
+    let state = match delivery.state.as_str() {
+        "pending" => control_types::WebhookDeliveryState::Pending,
+        "leased" => control_types::WebhookDeliveryState::Leased,
+        "delivered" => control_types::WebhookDeliveryState::Delivered,
+        "terminal" => control_types::WebhookDeliveryState::Terminal,
+        "cancelled" => control_types::WebhookDeliveryState::Cancelled,
+        _ => return Err(ApplicationError::Integrity),
+    };
+    let last_outcome_class = delivery
+        .last_outcome_class
+        .as_deref()
+        .map(|value| match value {
+            "accepted" => Ok(control_types::WebhookDeliveryOutcomeClass::Accepted),
+            "transient" => Ok(control_types::WebhookDeliveryOutcomeClass::Transient),
+            "ambiguous" => Ok(control_types::WebhookDeliveryOutcomeClass::Ambiguous),
+            "permanent" => Ok(control_types::WebhookDeliveryOutcomeClass::Permanent),
+            _ => Err(ApplicationError::Integrity),
+        })
+        .transpose()?;
+    Ok(control_types::WebhookDelivery {
+        id: delivery.id.to_string(),
+        endpoint_id: delivery.endpoint_id.to_string(),
+        event_id: delivery.event_id,
+        replay_sequence: delivery.replay_sequence,
+        replay_of_delivery_id: delivery
+            .replay_of_delivery_id
+            .map(|value| value.to_string()),
+        state,
+        attempt_count: delivery.attempt_count,
+        next_attempt_at: timestamp(delivery.next_attempt_at),
+        last_outcome_class,
+        last_http_status: delivery.last_http_status,
+        delivered_at: delivery.delivered_at.map(timestamp),
+        terminal_at: delivery.terminal_at.map(timestamp),
+        created_at: timestamp(delivery.created_at),
+    })
+}
+
+async fn get_project_projection_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let result = match projection_policy(&state) {
+        Ok(service) => service
+            .get_project(project_id)
+            .await
+            .map(|policy| control_projection_policy(&policy)),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn update_project_projection_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::UpdateProjectionPolicyRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let result = match projection_policy(&state) {
+        Ok(service) => service
+            .update_project(
+                project_id,
+                application::UpdateProjectionPolicy {
+                    verified_email_enabled: body.verified_email_enabled,
+                    expected_revision: body.expected_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+            .map(|policy| control_projection_policy(&policy)),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn get_application_projection_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id)): Path<(String, String)>,
+) -> Response {
+    let (project_id, application_id) =
+        match resource_pair(&project_id, &application_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match projection_policy(&state) {
+        Ok(service) => service
+            .get_application(project_id, application_id)
+            .await
+            .map(|policy| control_projection_policy(&policy)),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn update_application_projection_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::UpdateProjectionPolicyRequest>,
+) -> Response {
+    let (project_id, application_id) =
+        match resource_pair(&project_id, &application_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match projection_policy(&state) {
+        Ok(service) => service
+            .update_application(
+                project_id,
+                application_id,
+                application::UpdateProjectionPolicy {
+                    verified_email_enabled: body.verified_email_enabled,
+                    expected_revision: body.expected_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+            .map(|policy| control_projection_policy(&policy)),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Axum handler parsing returns the complete bounded HTTP problem response directly"
+)]
+fn three_resource_ids(
+    first: &str,
+    second: &str,
+    third: &str,
+    request_id: &str,
+) -> Result<(Uuid, Uuid, Uuid), Response> {
+    match (
+        resource_uuid(first, request_id),
+        resource_uuid(second, request_id),
+        resource_uuid(third, request_id),
+    ) {
+        (Ok(first), Ok(second), Ok(third)) => Ok((first, second, third)),
+        (Err(response), _, _) | (_, Err(response), _) | (_, _, Err(response)) => Err(response),
+    }
+}
+
+async fn list_webhook_endpoints(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id)): Path<(String, String)>,
+) -> Response {
+    let (project_id, application_id) =
+        match resource_pair(&project_id, &application_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .list_endpoints(project_id, application_id)
+            .await
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .map(control_webhook_endpoint)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map(|items| control_types::WebhookEndpointList { items }),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn create_webhook_endpoint(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::CreateWebhookEndpointRequest>,
+) -> Response {
+    let (project_id, application_id) =
+        match resource_pair(&project_id, &application_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .create_endpoint(
+                project_id,
+                application_id,
+                application::CreateWebhookEndpoint {
+                    url: body.url,
+                    subscribed_event_types: body
+                        .subscribed_event_types
+                        .into_iter()
+                        .map(webhook_event_type)
+                        .collect(),
+                    secret: zeroize::Zeroizing::new(body.secret.into_bytes()),
+                    idempotency_key,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(control_webhook_endpoint),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn get_webhook_endpoint(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, endpoint_id)): Path<(String, String, String)>,
+) -> Response {
+    let (project_id, application_id, endpoint_id) =
+        match three_resource_ids(&project_id, &application_id, &endpoint_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .get_endpoint(project_id, application_id, endpoint_id)
+            .await
+            .and_then(control_webhook_endpoint),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn update_webhook_endpoint(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, endpoint_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::UpdateWebhookEndpointRequest>,
+) -> Response {
+    let (project_id, application_id, endpoint_id) =
+        match three_resource_ids(&project_id, &application_id, &endpoint_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .update_endpoint(
+                project_id,
+                application_id,
+                endpoint_id,
+                application::UpdateWebhookEndpoint {
+                    subscribed_event_types: body
+                        .subscribed_event_types
+                        .into_iter()
+                        .map(webhook_event_type)
+                        .collect(),
+                    expected_revision: body.expected_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(control_webhook_endpoint),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn test_webhook_endpoint(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, endpoint_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ExpectedWebhookEndpointRevision>,
+) -> Response {
+    let (project_id, application_id, endpoint_id) =
+        match three_resource_ids(&project_id, &application_id, &endpoint_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .test_endpoint(
+                project_id,
+                application_id,
+                endpoint_id,
+                body.expected_revision,
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(control_webhook_endpoint),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn activate_webhook_endpoint(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, endpoint_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ExpectedWebhookEndpointRevision>,
+) -> Response {
+    let (project_id, application_id, endpoint_id) =
+        match three_resource_ids(&project_id, &application_id, &endpoint_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .activate_endpoint(
+                project_id,
+                application_id,
+                endpoint_id,
+                body.expected_revision,
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(control_webhook_endpoint),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn disable_webhook_endpoint(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, endpoint_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ExpectedWebhookEndpointRevision>,
+) -> Response {
+    let (project_id, application_id, endpoint_id) =
+        match three_resource_ids(&project_id, &application_id, &endpoint_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .disable_endpoint(
+                project_id,
+                application_id,
+                endpoint_id,
+                body.expected_revision,
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(control_webhook_endpoint),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn prepare_webhook_secret_rotation(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, endpoint_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::PrepareWebhookSecretRotationRequest>,
+) -> Response {
+    let (project_id, application_id, endpoint_id) =
+        match three_resource_ids(&project_id, &application_id, &endpoint_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .prepare_secret_rotation(
+                project_id,
+                application_id,
+                endpoint_id,
+                application::PrepareWebhookSecretRotation {
+                    secret: zeroize::Zeroizing::new(body.secret.into_bytes()),
+                    idempotency_key,
+                    expected_revision: body.expected_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(|prepared| {
+                let preparation_status = match prepared.preparation_state {
+                    application::WebhookSecretPreparationState::Pending => {
+                        control_types::WebhookSecretPreparationStatus::Pending
+                    }
+                    application::WebhookSecretPreparationState::Provisioned => {
+                        control_types::WebhookSecretPreparationStatus::Provisioned
+                    }
+                    application::WebhookSecretPreparationState::Terminal => {
+                        control_types::WebhookSecretPreparationStatus::Terminal
+                    }
+                };
+                Ok(control_types::PreparedWebhookSecretRotation {
+                    endpoint: control_webhook_endpoint(prepared.endpoint)?,
+                    generation: prepared.generation,
+                    preparation_status,
+                    already_active: prepared.already_active,
+                })
+            }),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn activate_webhook_secret_rotation(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, endpoint_id, generation)): Path<(
+        String,
+        String,
+        String,
+        i32,
+    )>,
+    ControlJson(body): ControlJson<control_types::ActivateWebhookSecretRotationRequest>,
+) -> Response {
+    let (project_id, application_id, endpoint_id) =
+        match three_resource_ids(&project_id, &application_id, &endpoint_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .activate_secret_rotation(
+                project_id,
+                application_id,
+                endpoint_id,
+                generation,
+                body.expected_revision,
+                body.overlap_seconds,
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(control_webhook_endpoint),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+#[derive(Deserialize)]
+struct ListHistoryQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_application_user_events(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id)): Path<(String, String)>,
+    Query(query): Query<ListHistoryQuery>,
+) -> Response {
+    let (project_id, application_id) =
+        match resource_pair(&project_id, &application_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .list_events(
+                project_id,
+                application_id,
+                query.cursor.as_deref(),
+                query.limit,
+            )
+            .await
+            .and_then(|page| {
+                page.items
+                    .into_iter()
+                    .map(control_application_user_event)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|items| control_types::ApplicationUserEventList {
+                        items,
+                        next_cursor: page.next_cursor,
+                    })
+            }),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+#[derive(Deserialize)]
+struct ListWebhookDeliveriesQuery {
+    endpoint_id: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_webhook_deliveries(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id)): Path<(String, String)>,
+    Query(query): Query<ListWebhookDeliveriesQuery>,
+) -> Response {
+    let (project_id, application_id) =
+        match resource_pair(&project_id, &application_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let endpoint_id = match query.endpoint_id.as_deref() {
+        Some(value) => match resource_uuid(value, &request_id) {
+            Ok(value) => Some(value),
+            Err(response) => return response,
+        },
+        None => None,
+    };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .list_deliveries(
+                project_id,
+                application_id,
+                endpoint_id,
+                query.cursor.as_deref(),
+                query.limit,
+            )
+            .await
+            .and_then(|page| {
+                page.items
+                    .into_iter()
+                    .map(control_webhook_delivery)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|items| control_types::WebhookDeliveryList {
+                        items,
+                        next_cursor: page.next_cursor,
+                    })
+            }),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
+async fn replay_webhook_delivery(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, delivery_id)): Path<(String, String, String)>,
+    ControlJson(body): ControlJson<control_types::ReplayWebhookDeliveryRequest>,
+) -> Response {
+    if !body.confirm {
+        return application_problem(ApplicationError::InvalidInput, &request_id);
+    }
+    let (project_id, application_id, delivery_id) =
+        match three_resource_ids(&project_id, &application_id, &delivery_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .replay_delivery(
+                project_id,
+                application_id,
+                delivery_id,
+                request_uuid(&request_id),
+            )
+            .await
+            .and_then(control_webhook_delivery),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
 async fn list_signing_keys(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -6634,11 +7652,13 @@ async fn create_provider(
     let Ok(idempotency_key) = idempotency_key(&headers) else {
         return invalid_idempotency(&request_id);
     };
+    let provider_kind = control_provider_kind(body.kind, &body.issuer);
     match provisioning(&state) {
         Ok(service) => match service
             .create_provider(
                 project_id,
                 CreateProvider {
+                    kind: provider_kind,
                     provider_key: body.provider_key,
                     display_name: body.display_name,
                     issuer: body.issuer,
@@ -6859,7 +7879,9 @@ async fn public_application_config(
                 let providers = config
                     .providers
                     .into_iter()
-                    .filter(|provider| auth.provider_issuer_allowed(&provider.issuer))
+                    .filter(|provider| {
+                        auth.provider_issuer_allowed(&provider.kind, &provider.issuer)
+                    })
                     .map(runtime_provider)
                     .collect::<Result<Vec<_>, _>>();
                 providers.map(|providers| runtime_types::PublicApplicationConfig {
@@ -6930,13 +7952,35 @@ async fn project_jwks(
     }
 }
 
+fn control_provider_kind(
+    kind: Option<runtime_types::ProviderKind>,
+    issuer: &str,
+) -> crate::domain::ProviderKind {
+    match kind {
+        Some(runtime_types::ProviderKind::Oidc) => crate::domain::ProviderKind::Oidc,
+        Some(runtime_types::ProviderKind::Google) => crate::domain::ProviderKind::Google,
+        Some(runtime_types::ProviderKind::Github) => crate::domain::ProviderKind::Github,
+        None => match issuer {
+            crate::domain::GOOGLE_ISSUER => crate::domain::ProviderKind::Google,
+            crate::domain::GITHUB_ISSUER => crate::domain::ProviderKind::Github,
+            _ => crate::domain::ProviderKind::Oidc,
+        },
+    }
+}
+
+fn runtime_provider_kind(value: &str) -> Result<runtime_types::ProviderKind, ApplicationError> {
+    match value {
+        "oidc" => Ok(runtime_types::ProviderKind::Oidc),
+        "google" => Ok(runtime_types::ProviderKind::Google),
+        "github" => Ok(runtime_types::ProviderKind::Github),
+        _ => Err(ApplicationError::Integrity),
+    }
+}
+
 fn runtime_provider(
     provider: application::PublicProvider,
 ) -> Result<runtime_types::PublicProvider, ApplicationError> {
-    let kind = match provider.kind.as_str() {
-        "oidc" => runtime_types::ProviderKind::Oidc,
-        _ => return Err(ApplicationError::Integrity),
-    };
+    let kind = runtime_provider_kind(&provider.kind)?;
     Ok(runtime_types::PublicProvider {
         key: provider.key,
         display_name: provider.display_name,
@@ -7575,17 +8619,19 @@ fn control_signing_key(
 fn control_provider(
     provider: application::ProviderRecord,
 ) -> Result<control_types::Provider, ApplicationError> {
-    let kind = match provider.kind.as_str() {
-        "oidc" => runtime_types::ProviderKind::Oidc,
-        _ => return Err(ApplicationError::Integrity),
-    };
+    let domain_kind = crate::domain::ProviderKind::parse(&provider.kind)
+        .map_err(|_| ApplicationError::Integrity)?;
+    let kind = runtime_provider_kind(&provider.kind)?;
     let status = match provider.status.as_str() {
         "provisioning" => control_types::ProviderStatus::Provisioning,
         "active" => control_types::ProviderStatus::Active,
         "disabled" => control_types::ProviderStatus::Disabled,
         _ => return Err(ApplicationError::Integrity),
     };
-    let managed = crate::adapters::oidc::controlled_oidc_managed_capability();
+    let managed = crate::adapters::oidc::managed_profile_capabilities()
+        .for_kind(domain_kind)
+        .unwrap_or_else(crate::adapters::oidc::controlled_oidc_managed_capability);
+    let managed_supported = domain_kind.capabilities().managed_profile;
     Ok(control_types::Provider {
         id: provider.id.to_string(),
         project_id: provider.project_id.to_string(),
@@ -7597,21 +8643,32 @@ fn control_provider(
         callback_url: provider.callback_url,
         status,
         revision: provider.revision,
+        login_supported: domain_kind.capabilities().login,
+        identity_proof_supported: domain_kind.capabilities().identity_proof,
         managed_profile: control_types::ProviderManagedProfileCapability {
-            supported: true,
+            supported: managed_supported,
             enabled: provider.managed_profile_enabled,
-            exact_scopes: managed
-                .exact_scopes
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            profile_schema: managed.profile_schema.to_owned(),
-            read_retry_safe: managed.read_retry_safe,
-            renewal_idempotent_replay: matches!(
-                managed.renewal_replay,
-                crate::domain::RenewalReplay::StableAttemptId
-            ),
-            supports_revocation: managed.supports_revocation,
+            exact_scopes: if managed_supported {
+                managed
+                    .exact_scopes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            profile_schema: if managed_supported {
+                managed.profile_schema.to_owned()
+            } else {
+                String::new()
+            },
+            read_retry_safe: managed_supported && managed.read_retry_safe,
+            renewal_idempotent_replay: managed_supported
+                && matches!(
+                    managed.renewal_replay,
+                    crate::domain::RenewalReplay::StableAttemptId
+                ),
+            supports_revocation: managed_supported && managed.supports_revocation,
         },
         assigned_application_ids: provider
             .assigned_application_ids
@@ -8648,6 +9705,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn omitted_control_provider_kind_infers_only_exact_named_issuers() {
+        assert_eq!(
+            control_provider_kind(None, crate::domain::GOOGLE_ISSUER),
+            crate::domain::ProviderKind::Google
+        );
+        assert_eq!(
+            control_provider_kind(None, crate::domain::GITHUB_ISSUER),
+            crate::domain::ProviderKind::Github
+        );
+        assert_eq!(
+            control_provider_kind(None, "https://issuer.example"),
+            crate::domain::ProviderKind::Oidc
+        );
+        assert_eq!(
+            control_provider_kind(
+                Some(runtime_types::ProviderKind::Oidc),
+                crate::domain::GOOGLE_ISSUER,
+            ),
+            crate::domain::ProviderKind::Oidc
+        );
+    }
+
+    #[test]
     fn control_provider_managed_capability_matches_the_reviewed_adapter() {
         let record = application::ProviderRecord {
             id: Uuid::new_v4(),
@@ -8664,7 +9744,9 @@ pub(crate) mod tests {
             managed_profile_revision: 1,
             assigned_application_ids: Vec::new(),
         };
-        let public = control_provider(record).expect("map reviewed OIDC capability");
+        let public = control_provider(record.clone()).expect("map reviewed OIDC capability");
+        assert!(public.login_supported);
+        assert!(public.identity_proof_supported);
         let reviewed = crate::adapters::oidc::controlled_oidc_managed_capability();
         assert_eq!(
             public.managed_profile.exact_scopes,
@@ -8694,6 +9776,34 @@ pub(crate) mod tests {
             reviewed.supports_revocation
         );
         assert!(public.managed_profile.supports_revocation);
+
+        let mut google_record = record.clone();
+        google_record.kind = "google".to_owned();
+        google_record.provider_key = "google".to_owned();
+        google_record.issuer = crate::domain::GOOGLE_ISSUER.to_owned();
+        let google = control_provider(google_record).expect("map reviewed Google capability");
+        assert_eq!(google.kind, owlauth_types::runtime::ProviderKind::Google);
+        assert_eq!(
+            google.managed_profile.exact_scopes,
+            ["openid", "profile"].map(str::to_owned)
+        );
+
+        let mut github_record = record;
+        github_record.kind = "github".to_owned();
+        github_record.provider_key = "github".to_owned();
+        github_record.issuer = crate::domain::GITHUB_ISSUER.to_owned();
+        github_record.managed_profile_enabled = false;
+        let github = control_provider(github_record).expect("map reviewed GitHub capability");
+        assert_eq!(github.kind, owlauth_types::runtime::ProviderKind::Github);
+        assert!(github.login_supported);
+        assert!(!github.identity_proof_supported);
+        assert!(!github.managed_profile.supported);
+        assert!(!github.managed_profile.enabled);
+        assert!(github.managed_profile.exact_scopes.is_empty());
+        assert!(github.managed_profile.profile_schema.is_empty());
+        assert!(!github.managed_profile.read_retry_safe);
+        assert!(!github.managed_profile.renewal_idempotent_replay);
+        assert!(!github.managed_profile.supports_revocation);
     }
 
     #[test]
@@ -9402,6 +10512,7 @@ pub(crate) mod tests {
             descriptor.api_base_url,
             "https://identity.example/control/v1/"
         );
+        assert_eq!(descriptor.mcp_url, None);
 
         let misplaced_discovery = control
             .clone()
@@ -9465,6 +10576,337 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(runtime_path.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one protocol journey proves MCP discovery, admission, negotiation, catalog, dispatch, and plane isolation"
+    )]
+    async fn mcp_is_explicit_control_only_authenticated_and_tools_only() {
+        let mut config = test_config(PlaneMode::All);
+        config.control_mcp.enabled = true;
+        config.max_request_bytes = 1024;
+        let mut routers = build_routers(&config, None);
+        routers.mark_ready();
+        let control = routers.control.take().expect("Control router should exist");
+        let authorization = format!("Bearer owl_ctrl_v1_{}", "A".repeat(43));
+        let initialize = r#"{
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-06-18",
+                "capabilities":{},
+                "clientInfo":{"name":"owlauth-test","version":"1.0.0"}
+            }
+        }"#;
+
+        let discovery = control
+            .clone()
+            .oneshot(
+                Request::get("/.well-known/owlauth")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let descriptor: ServiceDescriptor =
+            serde_json::from_slice(&to_bytes(discovery.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            descriptor.mcp_url.as_deref(),
+            Some("https://identity.example/control/mcp")
+        );
+
+        let denied = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        for unauthenticated in [
+            Request::get("/control/mcp")
+                .header(header::HOST, "identity.example")
+                .body(Body::empty())
+                .unwrap(),
+            Request::delete("/control/mcp")
+                .header(header::HOST, "identity.example")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = control.clone().oneshot(unauthenticated).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let mut duplicate_credential = Request::post("/control/mcp")
+            .header(header::HOST, "identity.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .body(Body::from(initialize))
+            .unwrap();
+        duplicate_credential.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&authorization).unwrap(),
+        );
+        duplicate_credential.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&authorization).unwrap(),
+        );
+        let duplicate_credential = control.clone().oneshot(duplicate_credential).await.unwrap();
+        assert_eq!(duplicate_credential.status(), StatusCode::UNAUTHORIZED);
+
+        let oversized = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from("x".repeat(1025)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let wrong_origin = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::ORIGIN, "https://attacker.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(initialize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_origin.status(), StatusCode::BAD_REQUEST);
+
+        let wrong_host = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "attacker.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(initialize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_host.status(), StatusCode::BAD_REQUEST);
+
+        for wrong_authority in [
+            Request::post("/control/mcp")
+                .header(header::HOST, "identity.example:8443")
+                .header(header::AUTHORIZATION, &authorization)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(initialize))
+                .unwrap(),
+            Request::post("/control/mcp")
+                .header(header::HOST, "identity.example")
+                .header(header::ORIGIN, "https://identity.example:8443")
+                .header(header::AUTHORIZATION, &authorization)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(initialize))
+                .unwrap(),
+        ] {
+            let response = control.clone().oneshot(wrong_authority).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let initialized = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::ORIGIN, "https://identity.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(initialize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initialized.status(), StatusCode::OK);
+        assert!(initialized.headers().get("mcp-session-id").is_none());
+        let initialized: serde_json::Value =
+            serde_json::from_slice(&to_bytes(initialized.into_body(), 65_536).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            initialized["result"]["serverInfo"]["name"],
+            "owlauth-server"
+        );
+        assert!(initialized["result"]["capabilities"]["tools"].is_object());
+        assert!(
+            initialized["result"]["capabilities"]
+                .get("prompts")
+                .is_none()
+        );
+        assert!(
+            initialized["result"]["capabilities"]
+                .get("resources")
+                .is_none()
+        );
+
+        let unsupported_protocol = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-protocol-version", "2099-01-01")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported_protocol.status(), StatusCode::BAD_REQUEST);
+
+        let tools = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-protocol-version", "2025-06-18")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tools.status(), StatusCode::OK);
+        let tools: serde_json::Value =
+            serde_json::from_slice(&to_bytes(tools.into_body(), 65_536).await.unwrap()).unwrap();
+        let tools = tools["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns a bounded catalog");
+        assert_eq!(tools.len(), 10);
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "owlauth_system_get")
+        );
+        assert!(tools.iter().all(|tool| {
+            tool["inputSchema"]["additionalProperties"] == false
+                && tool["outputSchema"]["type"] == "object"
+                && tool["outputSchema"]["additionalProperties"] == false
+        }));
+        let mut mutation_names = tools
+            .iter()
+            .filter(|tool| tool["annotations"]["readOnlyHint"] == false)
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        mutation_names.sort_unstable();
+        assert_eq!(
+            mutation_names,
+            vec![
+                "owlauth_projection_policy_update_commit",
+                "owlauth_projection_policy_update_preview",
+            ],
+            "the high-impact catalog has no direct or lower-impact mutation alias"
+        );
+        let commit = tools
+            .iter()
+            .find(|tool| tool["name"] == "owlauth_projection_policy_update_commit")
+            .unwrap();
+        assert_eq!(commit["annotations"]["destructiveHint"], true);
+        let preview = tools
+            .iter()
+            .find(|tool| tool["name"] == "owlauth_projection_policy_update_preview")
+            .unwrap();
+        assert_eq!(preview["annotations"]["destructiveHint"], false);
+
+        let called = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-protocol-version", "2025-06-18")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"call-1","method":"tools/call","params":{"name":"owlauth_system_get","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(called.status(), StatusCode::OK);
+        let called: serde_json::Value =
+            serde_json::from_slice(&to_bytes(called.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(
+            called["result"]["structuredContent"]["product"],
+            "owlauth-server"
+        );
+        assert_eq!(called["result"]["isError"], false);
+        assert!(!called.to_string().contains("owl_ctrl_v1_"));
+
+        let rejected_arguments = control
+            .clone()
+            .oneshot(
+                Request::post("/control/mcp")
+                    .header(header::HOST, "identity.example")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header("mcp-protocol-version", "2025-06-18")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"call-2","method":"tools/call","params":{"name":"owlauth_system_get","arguments":{"injected":"value"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_arguments.status(), StatusCode::OK);
+        let rejected_arguments: serde_json::Value = serde_json::from_slice(
+            &to_bytes(rejected_arguments.into_body(), 65_536)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            rejected_arguments["error"]["code"] == -32602
+                || rejected_arguments["result"]["isError"] == true,
+            "closed tool input must reject unknown fields: {rejected_arguments}"
+        );
+        assert!(!rejected_arguments.to_string().contains("owl_ctrl_v1_"));
+
+        let runtime = routers.runtime.take().expect("Runtime router should exist");
+        let runtime_mcp = runtime
+            .oneshot(
+                Request::post("/runtime/mcp")
+                    .header(header::AUTHORIZATION, authorization)
+                    .body(Body::from(initialize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_mcp.status(), StatusCode::NOT_FOUND);
     }
 
     fn attribute(document: &str, name: &str) -> String {
@@ -9683,5 +11125,56 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(cross_site_rejected.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn application_sync_routes_are_control_authenticated_and_runtime_absent() {
+        let config = test_config(PlaneMode::All);
+        let routers = build_routers(&config, None);
+        let control = routers.control.expect("Control router");
+        let runtime = routers.runtime.expect("Runtime router");
+        let project = Uuid::new_v4();
+        let application = Uuid::new_v4();
+        let endpoint = Uuid::new_v4();
+        let paths = [
+            format!("/control/v1/projects/{project}/projection-policy"),
+            format!("/control/v1/projects/{project}/applications/{application}/projection-policy"),
+            format!("/control/v1/projects/{project}/applications/{application}/webhook-endpoints"),
+            format!(
+                "/control/v1/projects/{project}/applications/{application}/webhook-endpoints/{endpoint}"
+            ),
+            format!("/control/v1/projects/{project}/applications/{application}/user-events"),
+            format!("/control/v1/projects/{project}/applications/{application}/webhook-deliveries"),
+        ];
+        for path in paths {
+            let unauthenticated = control
+                .clone()
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            let authenticated = control
+                .clone()
+                .oneshot(
+                    Request::get(&path)
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer owl_ctrl_v1_{}", "A".repeat(43)),
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(authenticated.status(), StatusCode::NOT_FOUND, "{path}");
+
+            let runtime_response = runtime
+                .clone()
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(runtime_response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 }

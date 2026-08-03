@@ -102,6 +102,11 @@ if ! docker exec "$server_container" grep -q "BSD 3-Clause License" "$license_pa
   printf 'server image must include the OwlAuth BSD license: %s\n' "$image" >&2
   exit 1
 fi
+rmcp_license_path=/usr/share/licenses/owlauth/third-party/rmcp/LICENSE
+if ! docker exec "$server_container" grep -q "Apache License" "$rmcp_license_path"; then
+  printf 'server image must include the rmcp redistribution terms: %s\n' "$image" >&2
+  exit 1
+fi
 
 for command in node npm pnpm; do
   if docker exec "$server_container" sh -c "command -v $command" >/dev/null 2>&1; then
@@ -114,6 +119,7 @@ if docker exec "$server_container" test -e /workspace; then
   exit 1
 fi
 
+ready=false
 for _ in {1..60}; do
   if [[ "$(docker inspect --format '{{.State.Running}}' "$server_container")" != "true" ]]; then
     break
@@ -122,12 +128,24 @@ for _ in {1..60}; do
     curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null 2>&1 \
     && docker exec "$server_container" \
       curl --fail --silent --show-error http://127.0.0.1:8080/ready >/dev/null 2>&1; then
-    printf 'server image health and readiness checks passed: %s\n' "$image"
-    exit 0
+    ready=true
+    break
   fi
   sleep 1
 done
 
-printf 'server image did not become ready: %s\n' "$image" >&2
-docker logs "$server_container" >&2
-exit 1
+if [[ "$ready" != true ]]; then
+  printf 'server image did not become ready: %s\n' "$image" >&2
+  docker logs "$server_container" >&2
+  exit 1
+fi
+
+docker stop --time 5 "$server_container" >/dev/null
+exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$server_container")"
+if [[ "$exit_code" != 0 ]]; then
+  printf 'server image did not drain successfully after tini forwarded SIGTERM: %s (exit %s)\n' \
+    "$image" "$exit_code" >&2
+  docker logs "$server_container" >&2
+  exit 1
+fi
+printf 'server image health, readiness, tini, and graceful shutdown checks passed: %s\n' "$image"

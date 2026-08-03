@@ -4,7 +4,7 @@ The `owlauth` command-line interface for administering [OwlAuth](https://github.
 
 One binary is the remote client for both self-hosted OwlAuth Control and OwlAuth SaaS. A profile stores a trusted administrative service origin but no user-configured product type. Origin-root discovery pins the product, stable instance, authority, API base, and credential class before the CLI selects an isolated self-hosted or SaaS client.
 
-> OwlAuth is pre-alpha. Endpoint profiles, strict discovery, self-hosted system inspection, and checksum-verified self-update are implemented. Project/Application/provider/user/session/policy/key/audit management and SaaS tenant commands are not yet implemented.
+> OwlAuth is pre-alpha. Endpoint profiles, strict discovery, typed self-hosted Project/Application/user/session/provider/key/projection/webhook operations, cursor-bounded event and delivery inspection, system inspection, and checksum-verified self-update are implemented. Audit export and SaaS tenant commands are not yet implemented.
 
 ## Endpoint profiles
 
@@ -32,20 +32,57 @@ owlauth profile rebind local \
   --yes
 ```
 
-Rebind replaces the complete identity pin and credential reference. No credential or product context is carried across automatically.
+Rebind requires `--credential-env`, rejects the existing reference, and shows the proposed new reference with both identities before confirmation. It never reads either credential. The confirmed operation replaces the complete identity pin and credential reference; no credential, typed client, or product context is carried across automatically.
 
 ## Typed dispatch
 
-Every authenticated command repeats discovery validation before reading the referenced credential. A missing/malformed descriptor or changed product, instance, authority, API base, or credential class fails without credential release. The CLI never probes both products, infers identity from an authenticated error, retries against the other adapter, or stores a key.
+Every authenticated command repeats discovery validation before reading the referenced credential, then completes a bounded self-hosted `GET system` authentication handshake before exposing the typed client. A missing/malformed descriptor, changed product/instance/authority/API base/credential class, or rejected operator key fails before any provider or webhook resource secret is read. The CLI never probes both products, infers identity from an authenticated error, retries against the other adapter, or stores a key.
 
-The currently implemented authenticated command is self-hosted system inspection:
+The self-hosted client supports typed commands for:
+
+- Project list/get/create/disable, token/session policy get/set, and Project-user list/get/identity/session inspection, disable, and exact session revoke;
+- Application list/get/create/disable and cursor-bounded immutable user-event history;
+- provider list/create/disable/assign/unassign for the closed `oidc`, `google`, and `github` kinds;
+- signing-key list/create/activate/retire/revoke;
+- Project- or Application-scoped projection-policy get/set;
+- webhook endpoint list/get/create/subscription update/test/activate/disable, write-only secret rotation prepare/activate, cursor-bounded delivery inspection, and explicit replay.
+
+Examples:
 
 ```bash
 export OWLAUTH_CONTROL_API_KEY='owl_ctrl_v1_<43-character-base64url-secret>'
 owlauth --profile local system
+owlauth --profile local project list
+owlauth --profile local project create \
+  --display-name 'Example' \
+  --idempotency-key project_create_20260803
+owlauth --profile local application list \
+  11111111-1111-4111-8111-111111111111
+owlauth --profile local signing-key list \
+  11111111-1111-4111-8111-111111111111
 ```
 
-Replace the placeholder with a real canonical key. If discovery selected SaaS, `system` is rejected as unsupported before reading `OWLAUTH_SAAS_API_KEY`; future SaaS commands will use the isolated SaaS typed client and SaaS-owned DTOs/authorization.
+All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` and `--verified-email-enabled` require an explicit `true` or `false` value.
+
+Provider client secrets and webhook signing secrets, including candidate rotation generations, are accepted only through named environment-variable references:
+
+```bash
+export PROVIDER_CLIENT_SECRET='write-only-provider-secret'
+owlauth --profile local provider create \
+  11111111-1111-4111-8111-111111111111 \
+  --kind github \
+  --provider-key github \
+  --display-name GitHub \
+  --issuer https://github.com \
+  --client-id example-client \
+  --client-secret-env PROVIDER_CLIENT_SECRET \
+  --expected-project-revision 1 \
+  --idempotency-key provider_create_20260803
+```
+
+Raw secrets are never accepted as ordinary command arguments. Owned operator and resource-secret buffers are explicitly zeroized after use; the synchronous HTTP serializer may still create bounded transient transport-body copies that are dropped normally. A write-only resource secret must use a different environment reference and value from the active operator credential, preventing accidental operator-key submission to provider or webhook storage. Replace placeholders with real canonical values. If discovery selects SaaS, every self-hosted command is rejected before credential access; a future SaaS surface will use an isolated SaaS typed client and SaaS-owned DTOs/authorization.
+
+The CLI intentionally omits generic HTTP/OpenAPI forwarding, Runtime and worker routes, raw database or key-store access, provider/key reconcile recovery, identity-mutation proof workflows, and operations absent from the reviewed public Control contract. Webhook replay is an explicit high-impact command: after an ambiguous transport outcome, inspect the paginated delivery history before deciding whether another replay is warranted.
 
 ## Self-update
 
