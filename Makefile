@@ -58,8 +58,8 @@ build: web-build ## Build the server, CLI, SDK distributions, and documentation
 package-check: web-build ## Verify exact registry distribution contents
 	@cd $(PYTHON_DIR) && uv run --locked twine check dist/*
 	@cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty
-	@cargo package --manifest-path crates/owlauth-cli/Cargo.toml --locked --allow-dirty
 	@cargo package --manifest-path $(RUST_SDK_DIR)/Cargo.toml --locked --allow-dirty
+	@scripts/test-cli-package.sh
 	@scripts/test-server-package.sh
 	@cd $(TYPESCRIPT_DIR) && npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
 

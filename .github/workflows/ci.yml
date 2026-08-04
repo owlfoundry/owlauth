@@ -103,14 +103,14 @@ jobs:
         run: |
           for manifest in \
             crates/owlauth-types/Cargo.toml \
-            crates/owlauth-cli/Cargo.toml \
             sdks/rust/Cargo.toml; do
             cargo package --manifest-path "$manifest" --locked --allow-dirty
             package_files="$(cargo package --manifest-path "$manifest" --locked --allow-dirty --list)"
             grep -qx LICENSE <<< "$package_files"
           done
-          # The server package uses the just-packaged unpublished owlauth-types through
-          # a temporary local patch and must compile without network access.
+          # The CLI and server packages use the just-packaged unpublished owlauth-types
+          # through temporary local patches and must compile without network access.
+          scripts/test-cli-package.sh
           scripts/test-server-package.sh
       - name: Verify Rust product boundaries
         run: |
