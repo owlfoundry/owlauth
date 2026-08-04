@@ -22,29 +22,29 @@ The initial profile explicitly excludes:
 
 The product boundary was checked against current official Auth0 and Firebase documentation rather than inferred from product names:
 
-| Observed pattern | OwlAuth decision |
-| --- | --- |
-| Auth0 supports email OTP and magic links, newest/one-use challenges, short expiry/attempt limits, Application assignment, and custom SMTP. Firebase supports email-link sign-in, verified email ownership, authorized continuation domains, and enumeration protection. | Support both OTP and magic link, with Project/Application/redirect/PKCE binding, generic start responses, Project rate policy, and durable SMTP delivery. |
-| Auth0 keeps identities separate by default and requires proof of both accounts for linking. Firebase links a fresh provider credential to an already authenticated user. | Preserve issuer/subject identity lookup and require explicit recent proof of both identities. Matching verified email may suggest a link in UI but never performs one. |
-| Auth0 can refresh normalized provider profile attributes on first or every login. Firebase exposes one stable local user plus provider-specific profiles. | Store a bounded source profile per identity, map it deterministically into a local projection, and support login-triggered plus provider-capability-gated background refresh. |
-| Auth0 Connected Accounts can store provider tokens for delegated external API use; Firebase browser flows can expose provider OAuth credentials to a client. | Deliberately do not provide that capability. A retained credential is server-only, least-scope, and usable only by the identity-profile synchronization adapter. |
-| Auth0 event streams document duplicate/out-of-order delivery and retries; Firebase exposes auth lifecycle functions and privileged user management/listing. | Provide a smaller per-Application projection webhook with immutable event IDs, monotonic user revisions, HMAC signatures, durable delivery/replay, and no bulk directory API. |
+| Observed pattern                                                                                                                                                                                                                                                        | OwlAuth decision                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Auth0 supports email OTP and magic links, newest/one-use challenges, short expiry/attempt limits, Application assignment, and custom SMTP. Firebase supports email-link sign-in, verified email ownership, authorized continuation domains, and enumeration protection. | Support both OTP and magic link, with Project/Application/redirect/PKCE binding, generic start responses, Project rate policy, and durable SMTP delivery.                     |
+| Auth0 keeps identities separate by default and requires proof of both accounts for linking. Firebase links a fresh provider credential to an already authenticated user.                                                                                                | Preserve issuer/subject identity lookup and require explicit recent proof of both identities. Matching verified email may suggest a link in UI but never performs one.        |
+| Auth0 can refresh normalized provider profile attributes on first or every login. Firebase exposes one stable local user plus provider-specific profiles.                                                                                                               | Store a bounded source profile per identity, map it deterministically into a local projection, and support login-triggered plus provider-capability-gated background refresh. |
+| Auth0 Connected Accounts can store provider tokens for delegated external API use; Firebase browser flows can expose provider OAuth credentials to a client.                                                                                                            | Deliberately do not provide that capability. A retained credential is server-only, least-scope, and usable only by the identity-profile synchronization adapter.              |
+| Auth0 event streams document duplicate/out-of-order delivery and retries; Firebase exposes auth lifecycle functions and privileged user management/listing.                                                                                                             | Provide a smaller per-Application projection webhook with immutable event IDs, monotonic user revisions, HMAC signatures, durable delivery/replay, and no bulk directory API. |
 
 Research sources, snapshots, and the detailed gap analysis are retained in the gitignored `local-reference/identity-expansion/` workspace. The normative behavior is this specification, not competitor behavior.
 
 ## Terminology and ownership
 
-| Concept | Meaning |
-| --- | --- |
-| Provider configuration | Project-owned OAuth/OIDC client registration and Application assignment from specs 01–05. It is not a user's consent or credential. |
-| Linked identity | Stable canonical `(project_id, provider_issuer, provider_subject)` proof attached to one Project user and unique across provider registrations in that Project. |
-| Managed provider connection | Optional lifecycle and encrypted renewable credential for one linked identity, used only to retrieve that identity's bounded source profile. |
-| Email identity | First-party Project identity proving control of one canonicalized email address; it is not an upstream provider identity. |
-| Email challenge | Short-lived, generation-controlled OTP or magic-link proof with an XOR owner: one ordinary login transaction or one exact identity-mutation intent/proof slot. |
-| Source profile | Bounded provider/email-origin attributes plus source and observation metadata; never an arbitrary provider payload. |
-| User projection | Versioned, policy-approved representation of one Project user exposed to a particular Application. |
-| Application-user binding | Durable record that the user has been delivered to that Application; it prevents synchronization to unrelated Applications in the Project. |
-| Projection event | Immutable Application-specific snapshot and revision delivered by webhook. |
+| Concept                     | Meaning                                                                                                                                                         |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Provider configuration      | Project-owned OAuth/OIDC client registration and Application assignment from specs 01–05. It is not a user's consent or credential.                             |
+| Linked identity             | Stable canonical `(project_id, provider_issuer, provider_subject)` proof attached to one Project user and unique across provider registrations in that Project. |
+| Managed provider connection | Optional lifecycle and encrypted renewable credential for one linked identity, used only to retrieve that identity's bounded source profile.                    |
+| Email identity              | First-party Project identity proving control of one canonicalized email address; it is not an upstream provider identity.                                       |
+| Email challenge             | Short-lived, generation-controlled OTP or magic-link proof with an XOR owner: one ordinary login transaction or one exact identity-mutation intent/proof slot.  |
+| Source profile              | Bounded provider/email-origin attributes plus source and observation metadata; never an arbitrary provider payload.                                             |
+| User projection             | Versioned, policy-approved representation of one Project user exposed to a particular Application.                                                              |
+| Application-user binding    | Durable record that the user has been delivered to that Application; it prevents synchronization to unrelated Applications in the Project.                      |
+| Projection event            | Immutable Application-specific snapshot and revision delivered by webhook.                                                                                      |
 
 Spec 04 owns the PostgreSQL representation and transaction constraints. A linked identity's immutable `created_via_provider_configuration_id` records only the same-Project registration that first created it; it is creation provenance, not authorization ownership. A later callback through another registration with the same canonical issuer may resolve that identity only after the current registration and Application assignment are active and the verified issuer exactly matches the current registration's canonical issuer. Spec 05 owns stable wire DTOs and routes. Specs 06 and 08 own worker composition, dependency failure, resource limits, and operations. Spec 09 owns browser routes and security. This document owns lifecycle meaning, information-flow limits, and cross-surface behavior.
 
@@ -257,16 +257,16 @@ Sensitive payload columns are encrypted and subject to short retention. Workers 
 
 Every handoff exchange, successful refresh, and current-user response returns the same versioned projection shape for that Application and includes at least:
 
-| Field | Meaning |
-| --- | --- |
-| `user_id` | stable Project-scoped local subject |
-| `user_revision` | monotonic Project-user base profile/security revision |
-| `projection_revision` | monotonic revision of this Application-user materialized projection, including relevant Project/Application projection-policy changes |
-| `projection_schema` | additive wire-schema identifier understood by the SDK |
-| `status` | bounded Application-visible active/disabled state |
-| `profile` | Project policy-approved fields such as display name, picture, locale, and verified email |
-| `identities` | optional bounded presentation metadata such as method/provider display key; never issuer subject unless explicitly safe policy allows it |
-| `created_at`, `updated_at` | bounded local lifecycle timestamps |
+| Field                      | Meaning                                                                                                                                  |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `user_id`                  | stable Project-scoped local subject                                                                                                      |
+| `user_revision`            | monotonic Project-user base profile/security revision                                                                                    |
+| `projection_revision`      | monotonic revision of this Application-user materialized projection, including relevant Project/Application projection-policy changes    |
+| `projection_schema`        | additive wire-schema identifier understood by the SDK                                                                                    |
+| `status`                   | bounded Application-visible active/disabled state                                                                                        |
+| `profile`                  | Project policy-approved fields such as display name, picture, locale, and verified email                                                 |
+| `identities`               | optional bounded presentation metadata such as method/provider display key; never issuer subject unless explicitly safe policy allows it |
+| `created_at`, `updated_at` | bounded local lifecycle timestamps                                                                                                       |
 
 Provider payloads, source-profile fields not admitted by policy, provider subjects by default, connection credential/status internals, SMTP data, secret references, Control metadata, `belongs_to`, and provider tokens are absent. Access-token claims and user projections remain separate contracts; `user_revision` does not imply that every projection field belongs in a JWT.
 
@@ -408,15 +408,15 @@ For ordinary login, method keys, branding, email address, challenge kind, and ne
 
 This concern is implemented only when all of the following hold:
 
-1. provider adapters explicitly declare managed-sync capability and least scopes; login-only adapters retain no renewable credential;
-2. active/reauth-required/revoked/disconnected transitions, credential rotation, stale-result rejection, disconnect erasure, and provider failure classification pass concurrency and recovery tests;
-3. provider tokens cannot appear in any Runtime/Control DTO, Application projection/webhook, redirect, Redis value, log, audit safe context, or browser asset/configuration;
-4. ordinary-login email OTP and magic-link starts are enumeration-safe and bind the exact Project/Application/redirect/PKCE transaction; identity-mutation email proof instead binds the exact intent/slot and captured Application email-policy authority without creating a handoff; a mutation magic GET creates only a separate challenge-scoped, purpose-separated transfer cookie and CSRF gate without reading or consuming fragment proof, while the explicit same-origin POST resolves the stored owner and consumes the newest proof/context once; newest-generation, expiry, attempt, one-use, copied-context, fresh-user-agent, concurrent verification, and restart behavior are tested for both typed interaction classes;
-5. no matching provider/email profile silently links users; prospective link evidence creates/attaches the identity only in final Control confirmation, an already owned candidate requires merge, explicit linking proves every required slot recently, and merge preserves Project/issuer/subject/email-alias uniqueness; every explicit replacement primary source freezes its typed identity ID and positive expected identity revision into idempotency and final confirmation authority;
-6. Project SMTP, explicit deployment fallback, write-only secrets, test/activate transitions, production TLS/no-downgrade policy, immutable challenge/outbox generation+revision pinning, disable/compromise versus proof-completion races, in-flight delivery followed by proof denial, durable outbox, duplicate delivery, retry cutoff, and redaction have integration tests;
-7. handoff, refresh, and current-user return one generated-contract projection with monotonic `user_revision` and Application-specific `projection_revision`; source observation-only changes churn neither, while relevant projection-policy changes advance only affected bound projections;
-8. an Application receives events only after its own Application-user binding and never receives another Application's projection or an unrelated Project user;
-9. webhook events and payloads commit with the materialized projection, retain both revisions immutably on retry/replay, sign `timestamp.event_id.raw_body`, reject header/body ID mismatch, tolerate duplicates/out-of-order delivery, and enforce DNS-chain/IP-pinning/proxy/redirect/response bounds;
+01. provider adapters explicitly declare managed-sync capability and least scopes; login-only adapters retain no renewable credential;
+02. active/reauth-required/revoked/disconnected transitions, credential rotation, stale-result rejection, disconnect erasure, and provider failure classification pass concurrency and recovery tests;
+03. provider tokens cannot appear in any Runtime/Control DTO, Application projection/webhook, redirect, Redis value, log, audit safe context, or browser asset/configuration;
+04. ordinary-login email OTP and magic-link starts are enumeration-safe and bind the exact Project/Application/redirect/PKCE transaction; identity-mutation email proof instead binds the exact intent/slot and captured Application email-policy authority without creating a handoff; a mutation magic GET creates only a separate challenge-scoped, purpose-separated transfer cookie and CSRF gate without reading or consuming fragment proof, while the explicit same-origin POST resolves the stored owner and consumes the newest proof/context once; newest-generation, expiry, attempt, one-use, copied-context, fresh-user-agent, concurrent verification, and restart behavior are tested for both typed interaction classes;
+05. no matching provider/email profile silently links users; prospective link evidence creates/attaches the identity only in final Control confirmation, an already owned candidate requires merge, explicit linking proves every required slot recently, and merge preserves Project/issuer/subject/email-alias uniqueness; every explicit replacement primary source freezes its typed identity ID and positive expected identity revision into idempotency and final confirmation authority;
+06. Project SMTP, explicit deployment fallback, write-only secrets, test/activate transitions, production TLS/no-downgrade policy, immutable challenge/outbox generation+revision pinning, disable/compromise versus proof-completion races, in-flight delivery followed by proof denial, durable outbox, duplicate delivery, retry cutoff, and redaction have integration tests;
+07. handoff, refresh, and current-user return one generated-contract projection with monotonic `user_revision` and Application-specific `projection_revision`; source observation-only changes churn neither, while relevant projection-policy changes advance only affected bound projections;
+08. an Application receives events only after its own Application-user binding and never receives another Application's projection or an unrelated Project user;
+09. webhook events and payloads commit with the materialized projection, retain both revisions immutably on retry/replay, sign `timestamp.event_id.raw_body`, reject header/body ID mismatch, tolerate duplicates/out-of-order delivery, and enforce DNS-chain/IP-pinning/proxy/redirect/response bounds;
 10. Control and Hosted UI workflows preserve plane separation, expected revisions, idempotency, exact redirects, generic errors, accessibility, and no browser secret persistence;
 11. worker shutdown/restart, expired leases, PostgreSQL/Redis/provider/SMTP/endpoint outages, backup/restore, and secret/protector rotation preserve the failure rules above;
 12. SCIM, bulk directory, arbitrary provider API access, provider-token brokering, password authentication, and silent email linking are absent from routes, DTOs, UI claims, and documentation.

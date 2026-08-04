@@ -2,8 +2,8 @@
 
 OwlAuth is designed as self-hostable, project-scoped authentication and identity infrastructure. It is a modular monolith: one Rust server artifact, one shared application/domain core, and two isolated transport planes.
 
-::: warning Current pre-alpha scope
-The repository implements PostgreSQL-backed Project, Application, provider, SMTP, signing-key, user, projection, and webhook state; isolated Runtime and Control planes; embedded Hosted Authentication and Management Console surfaces; OIDC and passwordless-email login; managed provider renewal and bounded profile synchronization; PKCE handoff; Project JWT/session/refresh/logout lifecycle; signed durable projection webhooks; an optional remote self-hosted Control MCP adapter; and TypeScript, Python, and Rust protocol SDKs. These are implemented pre-alpha capabilities, not production-support claims. SCIM, bulk directory/export, SaaS tenant control, and a general downstream OAuth authorization-server surface remain excluded or deferred. Interfaces and deployment requirements may still change.
+::: warning Current Beta scope
+The repository delivers PostgreSQL-backed Project, Application, provider, SMTP, signing-key, user, projection, and webhook state; isolated Runtime and Control planes; embedded Hosted Authentication and Management Console surfaces; OIDC and passwordless-email login; managed provider renewal and bounded profile synchronization; PKCE handoff; Project JWT/session/refresh/logout lifecycle; signed durable projection webhooks; an optional remote self-hosted Control MCP adapter; and TypeScript, Python, and Rust protocol SDKs. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment: operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and a general downstream OAuth authorization-server surface are outside the product.
 :::
 
 The normative details live in the repository [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec).
@@ -145,7 +145,7 @@ flowchart TB
 
 - `crates/owlauth-server` is the single server package. The shared core, adapters, composition, and embedded migrations remain here.
 - `crates/owlauth-types` owns public Runtime, Control, and health wire vocabulary plus OpenAPI derivation—not domain entities or database rows.
-- `crates/owlauth-cli` is one remote client with endpoint-discovered profiles pinned to product, instance, authority, API base, and credential class for self-hosted Control and SaaS. Discovery selects isolated clients before credential release; it cannot depend on either service implementation, access storage, load keys, or launch local MCP.
+- `crates/owlauth-cli` is the remote client for self-hosted Control, with endpoint-discovered profiles pinned to the OwlAuth server product, instance, authority, API base, and operator credential class before credential release. It cannot depend on the server implementation, access storage, load keys, or launch local MCP.
 - `sdks/*` consume the public Runtime Project Auth contract. The Rust SDK receives no privileged server dependency.
 
 Dependencies point inward. HTTP frameworks, SQL rows, Redis clients, provider payloads, CLI types, MCP schemas, and SDK code cannot become the domain model.

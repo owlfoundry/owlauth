@@ -1,6 +1,6 @@
 # Current SDK examples
 
-These examples show the implemented pre-alpha protocol boundary. Each client is immutable and bound to one Runtime, Project, Application, and publishable key. The Application owns navigation, pending-state and credential persistence, callback history cleanup, refresh single-flight/atomic replacement, and framework or backend sessions.
+These examples show the implemented Beta protocol boundary. Each client is immutable and bound to one Runtime, Project, Application, and publishable key. The Application owns navigation, pending-state and credential persistence, callback history cleanup, refresh single-flight/atomic replacement, and framework or backend sessions.
 
 ## TypeScript
 

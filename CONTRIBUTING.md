@@ -1,14 +1,14 @@
 # Contributing to OwlAuth
 
-OwlAuth is in its initial design and scaffold phase. Open an issue before making a substantial product, protocol, persistence, or package-boundary change.
+OwlAuth is in Beta for its delivered self-hosted product scope. Open an issue before making a substantial product, protocol, persistence, security-boundary, or package-boundary change. Pre-1.0 interfaces and operational requirements may change, but breaking changes still require explicit review, migration guidance, and release notes.
 
 ## Design authority
 
 The repository separates target design from implemented behavior:
 
-- [`spec/`](spec/README.md) defines the normative self-hosted server, Runtime, Control, endpoint-discovered CLI, and remote HTTP MCP architecture; [`spec/saas/`](spec/saas/README.md) owns SaaS tenant behavior and its CLI/MCP adapter.
+- [`spec/`](spec/README.md) defines the normative self-hosted server, Runtime, Control, endpoint-discovered CLI, and remote HTTP MCP architecture.
 - [`sdks/spec/`](sdks/spec/README.md) defines language-neutral SDK behavior and conformance requirements.
-- [`docs/`](docs/index.md) provides user-facing guidance and must state pre-alpha limitations truthfully.
+- [`docs/`](docs/index.md) provides user-facing guidance and must state Beta, pre-1.0, compatibility-evidence, and operator-owned deployment limitations truthfully.
 - Rust definitions in `crates/owlauth-types` are the source of generated public HTTP/OpenAPI contracts.
 
 Do not document target behavior as currently available. OwlAuth is Project-scoped authentication infrastructure, not a downstream general-purpose OAuth/OIDC authorization server. OAuth/OIDC integrations are upstream provider adapters.
@@ -17,7 +17,7 @@ Do not document target behavior as currently available. OwlAuth is Project-scope
 
 - Server-only domain, storage, HTTP, and composition code stays inside `crates/owlauth-server` until a real independent package boundary exists.
 - `crates/owlauth-types` contains public DTOs and OpenAPI definitions, not domain entities or persistence rows.
-- `crates/owlauth-cli` is one endpoint-discovered self-hosted/SaaS remote client. It must not depend on either service implementation, probe/fallback across credentials, access storage, or bypass server/SaaS authorization. CLI/plugins never bundle a local MCP process.
+- `crates/owlauth-cli` is the endpoint-discovered remote client for self-hosted Control. It must not depend on the server implementation, access storage, or bypass server authorization. CLI/plugins never bundle a local MCP process.
 - TypeScript, Python, and Rust SDKs consume public Runtime contracts plus shared fixtures; none may depend on server implementation crates.
 - Generated OpenAPI documents and release-only version bumps are not committed.
 
@@ -33,9 +33,11 @@ make package-check
 
 GitHub Actions additionally runs the declared compatibility matrix: Rust stable, Python 3.11-3.14, and Node.js 20, 22, and 24. Repository tooling requires Node.js 22.13 or later because dependencies are installed from the root pnpm 11.17.0 lockfile; the published TypeScript SDK remains runtime-tested on Node.js 20, 22, and 24. Python development dependencies use the root uv 0.11.32 workspace and lockfile.
 
-Run `make help` for focused package, OpenAPI, container, installer, and documentation targets. When changing Markdown links or VitePress content, also run:
+Run `make help` for focused package, OpenAPI, container, installer, and documentation targets. When changing Markdown, run the pinned formatter and retain the separate link and VitePress checks:
 
 ```bash
+make markdown-check
+python3 scripts/check-markdown-links.py
 pnpm --dir docs build
 ```
 

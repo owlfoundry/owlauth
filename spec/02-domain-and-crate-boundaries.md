@@ -2,7 +2,7 @@
 
 ## Dependency rule
 
-Dependencies point inward. Runtime HTTP, Control HTTP, PostgreSQL, Redis, KMS, upstream providers, the CLI's discovered self-hosted client, self-hosted HTTP MCP, and SDKs are adapters around Project-scoped application and domain policy. The discovered SaaS client and SaaS MCP terminate at SaaS application services instead.
+Dependencies point inward. Runtime HTTP, Control HTTP, PostgreSQL, Redis, KMS, upstream providers, the CLI's discovered Control client, remote HTTP MCP, and SDKs are adapters around Project-scoped application and domain policy.
 
 ```mermaid
 flowchart TB
@@ -43,9 +43,9 @@ This package owns stable public HTTP DTOs, wire enums, error serialization, endp
 
 ### `crates/owlauth-cli`
 
-This package owns the one `owlauth` remote administration experience: argument parsing, endpoint profiles, well-known product/instance/authority/API-base/credential-class discovery and pinning, safe credential input, product-specific typed clients, confirmation, machine output, and public server/SaaS API calls. It MUST NOT link either service implementation, open PostgreSQL/Redis, invoke domain repositories, load Project keys, act as a local Control Plane, or launch a local MCP process.
+This package owns the `owlauth` remote administration experience: argument parsing, endpoint profiles, well-known OwlAuth server product/instance/authority/API-base/credential-class discovery and pinning, safe operator-credential input, the typed Control client, confirmation, machine output, and public Control API calls. It MUST NOT link the server implementation, open PostgreSQL/Redis, invoke domain repositories, load Project keys, act as a local Control Plane, or launch a local MCP process.
 
-The CLI uses isolated self-hosted Control and SaaS client modules selected only after endpoint discovery validation. Default Runtime SDK surfaces do not gain administrative operations merely because the CLI and SDK share transport primitives. The two CLI clients do not call or fall back to one another.
+Default Runtime SDK surfaces do not gain administrative operations merely because the CLI and SDK share transport primitives.
 
 ### `sdks/*`
 
@@ -60,56 +60,54 @@ flowchart LR
     SERVER[owlauth-server] --> TYPES[owlauth-types]
     SDK[Runtime SDKs] -. Runtime DTO vocabulary .-> TYPES
     CLI[owlauth-cli] --> DISCOVERY[Well-known descriptor client]
-    DISCOVERY --> CCLIENT[Isolated Control client]
-    DISCOVERY --> SCLIENT[Isolated SaaS client]
+    DISCOVERY --> CCLIENT[Typed Control client]
     CCLIENT -. Control DTO vocabulary .-> TYPES
-    SCLIENT -. SaaS public contract .-> SAASAPI[OwlAuth SaaS API]
 
-    CLI ~~~ NO1["must not depend on either service implementation"]
+    CLI ~~~ NO1["must not depend on the server implementation"]
     SDK ~~~ NO2["must not depend on owlauth-server"]
 ```
 
 Forbidden dependencies apply transitively:
 
-- `owlauth-cli -> owlauth-server` or any SaaS service implementation package;
-- any client SDK, Control client, or SaaS client `->` its service implementation;
+- `owlauth-cli -> owlauth-server`;
+- any client SDK or Control client `->` the server implementation;
 - `owlauth-server -> owlauth-cli | client SDK`;
 - `owlauth-types -> owlauth-server | owlauth-cli | client SDK`.
 
 ## Project-bound application services
 
-| Service | Representative commands and queries | Plane access |
-| --- | --- | --- |
-| `ProjectApplicationService` | create/disable Project, read/update metadata, set `belongs_to` | Control |
-| `ApplicationConfigurationService` | register/disable Application, manage origins, redirects, publishable key revisions | Control; Runtime reads authoritative state |
-| `ProviderConfigurationService` | configure per-Project provider client registrations/secrets and assign them to Applications | Control; Runtime uses active assigned configuration |
-| `IdentityConnectionService` | retain/rotate a renewable profile credential, synchronize bounded source profile, reauthorize/revoke/disconnect | Runtime login and bounded workers; Control lifecycle commands |
-| `PasswordlessEmailService` | begin/verify OTP or magic-link proof, resolve email identity, enqueue challenge delivery | Runtime; Control configures policy/SMTP |
-| `LoginApplicationService` | begin login, validate provider or email completion, complete one-use handoff | Runtime |
-| `IdentityApplicationService` | resolve/create Project user, explicitly link/unlink proven identities, disable/merge user, materialize user revision | Runtime and Control with command-specific authorization |
-| `ApplicationUserSyncService` | maintain Application-user binding/projection, append immutable events, administer endpoint delivery/replay | Runtime/identity mutations append; Control configures and inspects |
-| `SessionApplicationService` | create/validate Project browser session, issue Application session, terminate session | Runtime; Control can revoke through administrative commands |
-| `TokenApplicationService` | issue Project access token, rotate refresh family, revoke family | Runtime |
-| `ProjectPolicyService` | manage token claims, lifetimes, provider/app admission, and session policy | Control writes; Runtime evaluates |
-| `KeyLifecycleService` | provision, publish, activate, retire, and revoke Project signing keys | Control commands; Runtime signs and publishes Project JWKS |
-| `DeploymentOperatorAccessService` | authenticate the process-configured operator API key for the Control listener | Control adapters |
-| `AuditApplicationService` | append Project/deployment security events and query Control views | both append; Control queries as the deployment operator |
+| Service                           | Representative commands and queries                                                                                  | Plane access                                                       |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `ProjectApplicationService`       | create/disable Project, read/update metadata, set `belongs_to`                                                       | Control                                                            |
+| `ApplicationConfigurationService` | register/disable Application, manage origins, redirects, publishable key revisions                                   | Control; Runtime reads authoritative state                         |
+| `ProviderConfigurationService`    | configure per-Project provider client registrations/secrets and assign them to Applications                          | Control; Runtime uses active assigned configuration                |
+| `IdentityConnectionService`       | retain/rotate a renewable profile credential, synchronize bounded source profile, reauthorize/revoke/disconnect      | Runtime login and bounded workers; Control lifecycle commands      |
+| `PasswordlessEmailService`        | begin/verify OTP or magic-link proof, resolve email identity, enqueue challenge delivery                             | Runtime; Control configures policy/SMTP                            |
+| `LoginApplicationService`         | begin login, validate provider or email completion, complete one-use handoff                                         | Runtime                                                            |
+| `IdentityApplicationService`      | resolve/create Project user, explicitly link/unlink proven identities, disable/merge user, materialize user revision | Runtime and Control with command-specific authorization            |
+| `ApplicationUserSyncService`      | maintain Application-user binding/projection, append immutable events, administer endpoint delivery/replay           | Runtime/identity mutations append; Control configures and inspects |
+| `SessionApplicationService`       | create/validate Project browser session, issue Application session, terminate session                                | Runtime; Control can revoke through administrative commands        |
+| `TokenApplicationService`         | issue Project access token, rotate refresh family, revoke family                                                     | Runtime                                                            |
+| `ProjectPolicyService`            | manage token claims, lifetimes, provider/app admission, and session policy                                           | Control writes; Runtime evaluates                                  |
+| `KeyLifecycleService`             | provision, publish, activate, retire, and revoke Project signing keys                                                | Control commands; Runtime signs and publishes Project JWKS         |
+| `DeploymentOperatorAccessService` | authenticate the process-configured operator API key for the Control listener                                        | Control adapters                                                   |
+| `AuditApplicationService`         | append Project/deployment security events and query Control views                                                    | both append; Control queries as the deployment operator            |
 
 Every Project-bound service method receives a validated `ProjectId` established by the adapter and revalidated against authoritative state. A payload field cannot override the route/actor Project context.
 
 ## Domain aggregates and invariants
 
-| Aggregate | Owned invariants |
-| --- | --- |
-| Project | status, public identifier, token namespace, optional `belongs_to`, revision, isolation boundary |
-| Application | Project ownership, type, status, public app identifier, allowed origins, exact post-login redirects |
-| Provider configuration | Project ownership, provider issuer/kind, client ID, opaque secret reference, callback identity, revision |
-| Project user and linked identities | Project ownership, stable user ID, unique Project/provider issuer/subject, explicit link/merge proof, disabled behavior |
-| Login transaction and handoff | Project/Application/browser/provider/redirect/PKCE binding, expiry, one-use completion and exchange |
-| Project browser session | Project/user/browser binding, rotation, expiry, and termination; reusable across Applications in one Project |
-| Application session and refresh family | Project/Application/user binding, one current generation, strict replay-family revocation |
-| Project signing-key ring | Project issuer/purpose, unique `kid`, publish-before-sign lifecycle, verification overlap |
-| Audit event | immutable actor/action/Project/target/outcome/correlation semantics without recoverable secrets; Control actor is always the deployment operator |
+| Aggregate                              | Owned invariants                                                                                                                                 |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Project                                | status, public identifier, token namespace, optional `belongs_to`, revision, isolation boundary                                                  |
+| Application                            | Project ownership, type, status, public app identifier, allowed origins, exact post-login redirects                                              |
+| Provider configuration                 | Project ownership, provider issuer/kind, client ID, opaque secret reference, callback identity, revision                                         |
+| Project user and linked identities     | Project ownership, stable user ID, unique Project/provider issuer/subject, explicit link/merge proof, disabled behavior                          |
+| Login transaction and handoff          | Project/Application/browser/provider/redirect/PKCE binding, expiry, one-use completion and exchange                                              |
+| Project browser session                | Project/user/browser binding, rotation, expiry, and termination; reusable across Applications in one Project                                     |
+| Application session and refresh family | Project/Application/user binding, one current generation, strict replay-family revocation                                                        |
+| Project signing-key ring               | Project issuer/purpose, unique `kid`, publish-before-sign lifecycle, verification overlap                                                        |
+| Audit event                            | immutable actor/action/Project/target/outcome/correlation semantics without recoverable secrets; Control actor is always the deployment operator |
 
 Aggregate boundaries define transaction scope where one aggregate can enforce the rule alone. Cross-aggregate commands use an application-owned unit of work and PostgreSQL constraints; adapters cannot approximate them with unrelated writes.
 

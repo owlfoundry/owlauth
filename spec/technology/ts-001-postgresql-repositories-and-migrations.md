@@ -26,10 +26,10 @@ The production schema is controlled only by reviewed SQL migration files. SeaORM
 
 The intended minimal feature profile is:
 
-| Dependency | Required feature categories | Explicitly excluded |
-| --- | --- | --- |
+| Dependency    | Required feature categories                                                          | Explicitly excluded                                                |
+| ------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
 | `sea-orm` 2.x | macros, Tokio rustls runtime, PostgreSQL, UUID/time/JSON mappings used by the schema | default features, `schema-sync`, entity-registry schema management |
-| `sqlx` 0.9.x | macros, migrate, PostgreSQL, Tokio runtime, rustls TLS | unrelated database drivers and use as an ordinary repository layer |
+| `sqlx` 0.9.x  | macros, migrate, PostgreSQL, Tokio runtime, rustls TLS                               | unrelated database drivers and use as an ordinary repository layer |
 
 Exact patch versions are controlled by `Cargo.lock` and normal dependency review. A major/minor upgrade that changes migration history, locking, feature activation, transaction behavior, or supported Rust toolchain requires revalidation of this selection.
 
@@ -47,14 +47,14 @@ SQLx's own `_sqlx_migrations` history and checksum behavior is library infrastru
 
 ### Alternatives considered
 
-| Alternative | Decision |
-| --- | --- |
-| SQLx for both repositories and migrations | Viable fallback if validation exposes an intrinsic SeaORM limitation, but does not satisfy the current full-ORM preference as well |
-| Diesel plus `diesel-async` | Strong compile-time query model, but higher integration and repository complexity for the current async service |
-| SeaORM plus `sea-orm-migration` | Rejected because the evaluated 2.0 dependency path activates unwanted SeaORM schema features and does not supply the selected documented cross-process lock behavior |
-| SeaORM schema sync | Rejected for production because runtime model convergence is not a reviewed, ordered, rolling-deployment migration contract |
-| Mixed SeaORM and direct SQLx repositories | Rejected because ownership and query conventions become ambiguous |
-| Custom OwlAuth migration/checksum/lock framework | Rejected as unnecessary infrastructure already covered by SQLx and PostgreSQL |
+| Alternative                                      | Decision                                                                                                                                                             |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SQLx for both repositories and migrations        | Viable fallback if validation exposes an intrinsic SeaORM limitation, but does not satisfy the current full-ORM preference as well                                   |
+| Diesel plus `diesel-async`                       | Strong compile-time query model, but higher integration and repository complexity for the current async service                                                      |
+| SeaORM plus `sea-orm-migration`                  | Rejected because the evaluated 2.0 dependency path activates unwanted SeaORM schema features and does not supply the selected documented cross-process lock behavior |
+| SeaORM schema sync                               | Rejected for production because runtime model convergence is not a reviewed, ordered, rolling-deployment migration contract                                          |
+| Mixed SeaORM and direct SQLx repositories        | Rejected because ownership and query conventions become ambiguous                                                                                                    |
+| Custom OwlAuth migration/checksum/lock framework | Rejected as unnecessary infrastructure already covered by SQLx and PostgreSQL                                                                                        |
 
 ### Required validation evidence
 

@@ -2,6 +2,8 @@
 
 The official Web-standard TypeScript SDK for [OwlAuth Project Auth](https://github.com/owlfoundry/owlauth). The same package runs in supported browsers and Node.js 20, 22, and 24; there is no separate browser entry point. The current browser support matrix is Playwright Chromium and Firefox. WebKit and Safari are not yet declared supported.
 
+> This SDK is Beta and pre-1.0. Its API may change through reviewed releases. Exact-artifact qualification proves one source commit, Runtime contract, corpus, archive, and runtime coordinate; it is not a broad compatibility range, deployment certification, or production support commitment.
+
 ```bash
 pnpm add @owlauth/client
 ```

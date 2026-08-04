@@ -48,6 +48,7 @@ export default defineConfig({
           { text: "Getting started", link: "/guide/getting-started" },
           { text: "Architecture", link: "/guide/architecture" },
           { text: "SDKs", link: "/guide/sdks" },
+          { text: "Building a SaaS", link: "/guide/building-saas" },
           {
             text: "CLI & agent integrations",
             link: "/guide/agent-integrations",

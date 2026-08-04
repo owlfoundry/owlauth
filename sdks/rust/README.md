@@ -2,6 +2,8 @@
 
 The official async Rust protocol SDK for [OwlAuth Project Auth](https://github.com/owlfoundry/owlauth).
 
+> This SDK is Beta and pre-1.0. Its API may change through reviewed releases. Exact-artifact qualification proves one source commit, Runtime contract, corpus, archive, and runtime coordinate; it is not a broad compatibility range, deployment certification, or production support commitment.
+
 ```bash
 cargo add owlauth-client
 ```

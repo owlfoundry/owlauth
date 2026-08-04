@@ -6,7 +6,7 @@ OwlAuth brokers authentication through Project-configured methods, including ups
 
 ## Current implementation status
 
-The SDK packages are pre-alpha protocol clients for the implemented Runtime Project Auth surface. They fetch public Project/Application configuration and JWKS, create caller-held PKCE pending state, validate and exchange one-use handoffs, return atomic credential generations, refresh, query current user, prepare browser logout, perform Application logout, and map bounded Runtime/transport failures to stable redacted errors.
+The SDK packages are Beta, pre-1.0 protocol clients for the implemented Runtime Project Auth surface. They fetch public Project/Application configuration and JWKS, create caller-held PKCE pending state, validate and exchange one-use handoffs, return atomic credential generations, refresh, query current user, prepare browser logout, perform Application logout, and map bounded Runtime/transport failures to stable redacted errors. Their final evidence proves one source commit, Runtime contract, corpus, archive, and runtime coordinate; it is not a broad compatibility range, deployment certification, or production support commitment.
 
 The core SDKs deliberately do not navigate, mutate browser history, persist pending or credential state, coordinate refresh, manage framework sessions, verify access tokens for an Application backend, or expose provider credentials. Applications retain those responsibilities. The specifications below define the release acceptance gates for these implemented operations and their future evolution.
 
@@ -36,15 +36,15 @@ Attachments use synthetic, non-secret values and explicit schema versions. Passi
 
 ## Cross-cutting invariants
 
-1. SDKs are untrusted Runtime clients. OwlAuth remains authoritative for Project, Application, user, provider, handoff, session, refresh, and policy decisions.
-2. `project_id`, `application_id`, and a publishable Application key are public identifiers, not secrets, user credentials, or Control authority.
-3. Every Project Auth operation remains bound to one Project and, where applicable, one Application. SDK state from one Project/Application cannot be reused for another.
-4. SDKs consume only public Runtime wire behavior. They do not import server domain modules, storage adapters, provider payloads, or Control authority. The Rust SDK receives no special access from sharing the implementation language.
-5. Generated models and low-level operations may follow OpenAPI. PKCE custody, callback validation, one-use handoff/refresh retry safety, Project/Application isolation, redaction, and semantic errors remain handwritten core behavior.
-6. Core SDKs expose explicit protocol values and operations; Applications or separate integration libraries own navigation, history mutation, persistence, refresh serialization, automatic session management, and framework bindings.
-7. The TypeScript SDK ships once as `@owlauth/client` and uses one Web-standard core across its declared browser and Node.js matrices. The initial protocol API defines no separate browser package or `/browser` entry point.
-8. Handoff tickets, access tokens, refresh tokens, PKCE verifiers, browser/session cookies, provider callback values, and management credentials never appear in default strings, debug output, logs, traces, fixtures, exceptions, or telemetry.
-9. Automatic retry is limited to demonstrably replay-safe operations. Ambiguous handoff exchange or refresh rotation is never blindly replayed.
+01. SDKs are untrusted Runtime clients. OwlAuth remains authoritative for Project, Application, user, provider, handoff, session, refresh, and policy decisions.
+02. `project_id`, `application_id`, and a publishable Application key are public identifiers, not secrets, user credentials, or Control authority.
+03. Every Project Auth operation remains bound to one Project and, where applicable, one Application. SDK state from one Project/Application cannot be reused for another.
+04. SDKs consume only public Runtime wire behavior. They do not import server domain modules, storage adapters, provider payloads, or Control authority. The Rust SDK receives no special access from sharing the implementation language.
+05. Generated models and low-level operations may follow OpenAPI. PKCE custody, callback validation, one-use handoff/refresh retry safety, Project/Application isolation, redaction, and semantic errors remain handwritten core behavior.
+06. Core SDKs expose explicit protocol values and operations; Applications or separate integration libraries own navigation, history mutation, persistence, refresh serialization, automatic session management, and framework bindings.
+07. The TypeScript SDK ships once as `@owlauth/client` and uses one Web-standard core across its declared browser and Node.js matrices. The initial protocol API defines no separate browser package or `/browser` entry point.
+08. Handoff tickets, access tokens, refresh tokens, PKCE verifiers, browser/session cookies, provider callback values, and management credentials never appear in default strings, debug output, logs, traces, fixtures, exceptions, or telemetry.
+09. Automatic retry is limited to demonstrably replay-safe operations. Ambiguous handoff exchange or refresh rotation is never blindly replayed.
 10. Equivalent Runtime responses map to equivalent semantic outcomes in every official SDK.
 11. Each SDK versions and ships independently from the server and other SDKs. Numeric version equality never implies compatibility.
 12. Package, unit, fixture, conformance, and real-server end-to-end checks remain distinct. A mock or static fixture is not Project Auth E2E.

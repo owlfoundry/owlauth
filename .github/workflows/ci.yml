@@ -246,6 +246,7 @@ jobs:
         run: uv sync --all-packages --locked
       - name: Run source checks
         run: |
+          uv run --locked pre-commit run mdformat --all-files
           uv run --locked ruff check sdks/python
           uv run --locked ruff format --check sdks/python
           uv run --locked pytest -q sdks/python/tests

@@ -39,13 +39,13 @@ Each external base URL is immutable process configuration. Redirect, callback, c
 
 The Management Console is present only on the Control listener in `all` and `control` composition modes.
 
-| Control-base-relative route | Authentication | Purpose |
-| --- | --- | --- |
-| `GET <control-base>/` | none | redirect to the canonical `<control-base>/console/` URL when the Control base is dedicated to OwlAuth |
-| `GET <control-base>/console/` and fingerprinted asset paths | none | load the credential-free Console shell |
-| `GET <control-base>/v1/system` | deployment API key | verify the key and return bounded Console bootstrap capabilities |
-| other `<control-base>/v1/*` Control routes | deployment API key | execute the existing Control contract |
-| Control health route | probe policy from spec 06 | deployment health, not Console login |
+| Control-base-relative route                                 | Authentication            | Purpose                                                                                               |
+| ----------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `GET <control-base>/`                                       | none                      | redirect to the canonical `<control-base>/console/` URL when the Control base is dedicated to OwlAuth |
+| `GET <control-base>/console/` and fingerprinted asset paths | none                      | load the credential-free Console shell                                                                |
+| `GET <control-base>/v1/system`                              | deployment API key        | verify the key and return bounded Console bootstrap capabilities                                      |
+| other `<control-base>/v1/*` Control routes                  | deployment API key        | execute the existing Control contract                                                                 |
+| Control health route                                        | probe policy from spec 06 | deployment health, not Console login                                                                  |
 
 The Runtime listener MUST NOT mount the Control-relative `console/` tree, Control assets, Control OpenAPI, or Control API routes. An unauthenticated Console shell contains no deployment data, Project identifiers, topology, version detail beyond ordinary static asset metadata, or credential-derived state.
 
@@ -55,16 +55,16 @@ The Hosted Authentication UI is present on the Runtime listener in `all` and `ru
 
 A representative Runtime-base-relative partition is:
 
-| Route class | Purpose |
-| --- | --- |
-| `<runtime-base>/auth/interactions/{opaque_handle}` | first top-level GET conditionally binds one Runtime browser/CSRF context, then renders or continues one bounded Project/Application interaction |
-| `<runtime-base>/auth/browser-logout/{opaque_preparation}` | render the no-store confirmation for one access-token-prepared Project browser logout; mutation requires matching cookie plus same-origin CSRF POST |
-| `<runtime-base>/auth/interactions/{opaque_handle}/email-link#<opaque_proof>` | load a no-store confirmation view, remove the fragment proof from history, and consume only through an explicit same-origin POST |
-| `<runtime-base>/auth/managed-reauthorizations/{opaque_interaction}` | bind and render one Control-created exact managed-connection reauthorization; explicit provider start and callback may replace only its fenced renewable credential generation and never issue Application credentials |
-| `<runtime-base>/auth/identity-mutations/{opaque_intent}` | bind and render only one Control-created identity-mutation proof ceremony; proof completion may attach one server-side slot receipt, and only a separate explicit final POST may mark all-current slots ready; neither can mutate identity or issue credentials |
-| `<runtime-base>/auth/assets/{fingerprinted_asset}` | serve credential-free, version-matched hosted UI assets |
-| `<runtime-base>/projects/{project_public_id}/auth/callback/{provider_key}` | stable exact upstream provider callback; no alias or generic fallback |
-| `<runtime-base>/v1/projects/{project_id}/auth/*` | Runtime Project Auth API, including generic login start, transaction method selection, method-specific proof, handoff, session, and logout operations |
+| Route class                                                                  | Purpose                                                                                                                                                                                                                                                         |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<runtime-base>/auth/interactions/{opaque_handle}`                           | first top-level GET conditionally binds one Runtime browser/CSRF context, then renders or continues one bounded Project/Application interaction                                                                                                                 |
+| `<runtime-base>/auth/browser-logout/{opaque_preparation}`                    | render the no-store confirmation for one access-token-prepared Project browser logout; mutation requires matching cookie plus same-origin CSRF POST                                                                                                             |
+| `<runtime-base>/auth/interactions/{opaque_handle}/email-link#<opaque_proof>` | load a no-store confirmation view, remove the fragment proof from history, and consume only through an explicit same-origin POST                                                                                                                                |
+| `<runtime-base>/auth/managed-reauthorizations/{opaque_interaction}`          | bind and render one Control-created exact managed-connection reauthorization; explicit provider start and callback may replace only its fenced renewable credential generation and never issue Application credentials                                          |
+| `<runtime-base>/auth/identity-mutations/{opaque_intent}`                     | bind and render only one Control-created identity-mutation proof ceremony; proof completion may attach one server-side slot receipt, and only a separate explicit final POST may mark all-current slots ready; neither can mutate identity or issue credentials |
+| `<runtime-base>/auth/assets/{fingerprinted_asset}`                           | serve credential-free, version-matched hosted UI assets                                                                                                                                                                                                         |
+| `<runtime-base>/projects/{project_public_id}/auth/callback/{provider_key}`   | stable exact upstream provider callback; no alias or generic fallback                                                                                                                                                                                           |
+| `<runtime-base>/v1/projects/{project_id}/auth/*`                             | Runtime Project Auth API, including generic login start, transaction method selection, method-specific proof, handoff, session, and logout operations                                                                                                           |
 
 Exact stable interaction paths are finalized with the Runtime HTTP contract, but they MUST stay outside the Control base and cannot use a generic fallback over `v1/*` or provider callback routes.
 
@@ -161,15 +161,15 @@ An external RBAC gateway may keep the deployment API key server-side and expose 
 
 Before the hosted web surfaces are considered implemented:
 
-1. `runtime` and `all` expose hosted authentication only on Runtime; `control` and `all` expose the Management Console only on Control;
-2. distinct-origin and explicitly configured shared-origin deployments both preserve internal listener/router separation, generated external URLs, route fallbacks, and opener policy; shared-origin tests prove disjoint non-root bases, Runtime cookie-path containment, no service workers, and documented acceptance that the two surfaces have no browser/XSS credential isolation;
-3. every Hosted route recovers exactly one persisted `login`, `identity_mutation`, or `managed_reauthorization` class with no fallback; generic login start snapshots allowed methods without binding a browser, exactly one eligible first top-level GET can bind the exact typed interaction, and browser/CSRF/expected-revision tests prove exactly one later provider/email selection, fixed managed-provider start, or eligible browser-session reuse wins as applicable, while rejecting copied-browser disclosure, method switching, caller-named session/user/connection, stale/logged-out/cross-Project reuse, or replacement of provider, scope, email policy, callback, redirect, browser binding, or PKCE values;
-4. successful provider, OTP, or magic-link authentication for `login` returns only to the exact stored Application redirect with the bounded one-use handoff; `identity_mutation` instead enforces server-derived proof roles, exact captured Application method authority, prospective evidence without identity creation, no Project session/redirect/handoff, one receipt per slot, and a separate explicit Hosted ready transition before Control confirmation; `managed_reauthorization` requires the exact existing identity/connection and managed scopes and can commit only its generation-fenced successor/profile/audit with no user/session/handoff/receipt effect; enumeration-safe/check-email/error/restart paths cannot reveal account existence or become open redirects;
-5. Runtime never accepts or receives the operator key, and plane-specific asset manifests cannot be served by the other plane;
-6. `all` and `control` fail closed without valid `OWLAUTH_CONTROL_API_KEY`; `runtime` starts without loading it;
-7. only the Bearer header authenticates Control, comparison is constant-time, and credential values are absent from all observable outputs;
-8. the Console can be loaded without a credential, validates an entered key through the Control-base-relative `v1/system`, and then uses only the existing Control API under that base;
-9. reload, close, lock, and authentication-failure tests prove no supported browser storage contains the key;
+01. `runtime` and `all` expose hosted authentication only on Runtime; `control` and `all` expose the Management Console only on Control;
+02. distinct-origin and explicitly configured shared-origin deployments both preserve internal listener/router separation, generated external URLs, route fallbacks, and opener policy; shared-origin tests prove disjoint non-root bases, Runtime cookie-path containment, no service workers, and documented acceptance that the two surfaces have no browser/XSS credential isolation;
+03. every Hosted route recovers exactly one persisted `login`, `identity_mutation`, or `managed_reauthorization` class with no fallback; generic login start snapshots allowed methods without binding a browser, exactly one eligible first top-level GET can bind the exact typed interaction, and browser/CSRF/expected-revision tests prove exactly one later provider/email selection, fixed managed-provider start, or eligible browser-session reuse wins as applicable, while rejecting copied-browser disclosure, method switching, caller-named session/user/connection, stale/logged-out/cross-Project reuse, or replacement of provider, scope, email policy, callback, redirect, browser binding, or PKCE values;
+04. successful provider, OTP, or magic-link authentication for `login` returns only to the exact stored Application redirect with the bounded one-use handoff; `identity_mutation` instead enforces server-derived proof roles, exact captured Application method authority, prospective evidence without identity creation, no Project session/redirect/handoff, one receipt per slot, and a separate explicit Hosted ready transition before Control confirmation; `managed_reauthorization` requires the exact existing identity/connection and managed scopes and can commit only its generation-fenced successor/profile/audit with no user/session/handoff/receipt effect; enumeration-safe/check-email/error/restart paths cannot reveal account existence or become open redirects;
+05. Runtime never accepts or receives the operator key, and plane-specific asset manifests cannot be served by the other plane;
+06. `all` and `control` fail closed without valid `OWLAUTH_CONTROL_API_KEY`; `runtime` starts without loading it;
+07. only the Bearer header authenticates Control, comparison is constant-time, and credential values are absent from all observable outputs;
+08. the Console can be loaded without a credential, validates an entered key through the Control-base-relative `v1/system`, and then uses only the existing Control API under that base;
+09. reload, close, lock, and authentication-failure tests prove no supported browser storage contains the key;
 10. CSP, framing, referrer, cache, MIME, permissions, CORS, origin, fetch-metadata, and malicious-rendered-value policies have integration tests for both surfaces;
 11. direct client navigation cannot shadow either plane's API, health, hosted interaction, asset, or provider callback routes;
 12. the production binary/container serves both embedded asset sets without Node.js, a sidecar, a CDN, or network fetches;

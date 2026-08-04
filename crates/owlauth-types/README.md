@@ -1,14 +1,12 @@
 # owlauth-types
 
-Stable public HTTP response and OpenAPI types for [OwlAuth](https://github.com/owlfoundry/owlauth).
+Public HTTP DTO and OpenAPI authority for [OwlAuth](https://github.com/owlfoundry/owlauth).
 
-The crate currently defines complete, separate OpenAPI 3.1 documents for the implemented Runtime and Control surfaces:
+> OwlAuth and these public contracts are Beta for the delivered self-hosted scope. Pre-1.0 DTOs and operations may change through reviewed releases; generated OpenAPI and exact-artifact SDK evidence do not establish a broad compatibility range or production support commitment.
 
-- listener liveness and readiness responses;
-- the Runtime Hosted Authentication UI shell routes;
-- the authenticated Control system-information endpoint and Management Console shell routes.
+The crate defines complete, separate OpenAPI 3.1 documents for the implemented Runtime and Control surfaces. Runtime includes health/readiness, public Project/Application configuration and JWKS, Hosted authentication transitions, handoff, session, user, refresh, logout, and identity flows. Control includes system inspection plus Project, Application, provider, key, SMTP, identity, user/session, projection, and webhook operations used by the server, Console, and CLI.
 
-Future Project Auth and management DTOs will be added here as their server behavior is implemented. MCP protocol messages and hand-designed tool schemas follow the negotiated MCP protocol and are not OpenAPI DTOs generated into this crate.
+MCP protocol messages and hand-designed tool schemas follow the negotiated MCP protocol and are not OpenAPI DTOs generated into this crate.
 
 This crate is the Rust authority for generated public documents and does not compile or depend on `owlauth-server`. It provides no HTTP server or client, domain entities, database rows, or authorization behavior.
 

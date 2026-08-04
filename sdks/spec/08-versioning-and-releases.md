@@ -12,7 +12,7 @@ The server, CLI, and every official SDK have separate SemVer, tags, artifacts, c
 
 An SDK release never requires synchronized server/CLI/other-SDK versions. Equal version numbers do not imply compatibility. Current SDK evidence identifies one exact tested Runtime/source coordinate: source commit, Runtime contract digests, corpus digest, and archive digest. A broader server or contract range may be claimed only after separate evidence validates every supported boundary or an explicit compatibility rule.
 
-Current SDK packages are pre-alpha protocol clients with Project/Application-bound configuration and JWKS retrieval, Hosted login start, PKCE callback/handoff, atomic credential refresh, current-user, and logout operations. Pre-1.0 SemVer permits deliberate iteration but does not permit silent breaking changes or claims of framework session management, persistent storage, navigation, backend JWT verification, or production support.
+Current SDK packages are Beta protocol clients with Project/Application-bound configuration and JWKS retrieval, Hosted login start, PKCE callback/handoff, atomic credential refresh, current-user, and logout operations. Pre-1.0 SemVer permits deliberate iteration but does not permit silent breaking changes or claims of framework session management, persistent storage, navigation, backend JWT verification, or production support.
 
 ## TypeScript artifact and integration boundary
 
@@ -88,7 +88,7 @@ Release qualification is build-once and publish-the-same-bytes:
 
 TypeScript publishes the qualified `.tgz` with `npm publish`; Python publishes the qualified wheel with the locked `uv`/Twine toolchain; Rust uploads the qualified `.crate` bytes through the reviewed direct-upload helper and its archive-bound metadata. Registry-specific trusted publishing authenticates the upload but does not replace the candidate/evidence binding.
 
-Final manifests list an operation as exact-artifact and same-server passed only when the raw same-server observed-operation set exactly equals the candidate's claimed operation set. TypeScript has Chromium and Firefox assignments; Python and Rust have Chromium assignments only. These manifests remain pre-alpha exact-coordinate evidence, not production certification.
+Final manifests list an operation as exact-artifact and same-server passed only when the raw same-server observed-operation set exactly equals the candidate's claimed operation set. TypeScript has Chromium and Firefox assignments; Python and Rust have Chromium assignments only. These manifests remain Beta exact-coordinate evidence, not production certification.
 
 ## Generated contract coordination
 

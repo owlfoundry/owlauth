@@ -28,14 +28,12 @@ const MAX_STORE_BYTES: u64 = 1024 * 1024;
 #[serde(rename_all = "kebab-case")]
 enum Product {
     OwlauthServer,
-    OwlauthSaas,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum CredentialClass {
     OperatorApiKey,
-    SaasApiKey,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,13 +74,33 @@ struct Profile {
     mcp_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Serialize)]
 struct ProfileStore {
     schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     current_profile: Option<String>,
     profiles: BTreeMap<String, Profile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProfileStore {
+    schema_version: u32,
+    current_profile: Option<String>,
+    profiles: BTreeMap<String, RawProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProfile {
+    endpoint: String,
+    product: String,
+    instance_id: String,
+    api_base_url: String,
+    api_versions: Vec<String>,
+    credential_class: String,
+    credential_environment: String,
+    mcp_url: Option<String>,
 }
 
 impl Default for ProfileStore {
@@ -495,7 +513,6 @@ fn profile_from_descriptor(
 ) -> Result<Profile, RemoteError> {
     let default_environment = match descriptor.credential_class {
         CredentialClass::OperatorApiKey => "OWLAUTH_CONTROL_API_KEY",
-        CredentialClass::SaasApiKey => "OWLAUTH_SAAS_API_KEY",
     };
     let credential_environment = credential_environment.unwrap_or(default_environment);
     validate_credential_environment(credential_environment)?;
@@ -669,7 +686,6 @@ fn validate_descriptor(endpoint: &Url, raw: RawDescriptor) -> Result<Descriptor,
         || !matches!(
             (raw.product, raw.credential_class),
             (Product::OwlauthServer, CredentialClass::OperatorApiKey)
-                | (Product::OwlauthSaas, CredentialClass::SaasApiKey)
         )
     {
         return Err(RemoteError::InvalidDescriptor);
@@ -905,22 +921,59 @@ fn load_store(path: &Path) -> Result<ProfileStore, RemoteError> {
         return Err(RemoteError::ProfileStorage);
     }
     let bytes = fs::read(path).map_err(|_| RemoteError::ProfileStorage)?;
-    let store: ProfileStore =
+    let raw: RawProfileStore =
         serde_json::from_slice(&bytes).map_err(|_| RemoteError::ProfileStorage)?;
-    if store.schema_version != STORE_SCHEMA_VERSION
-        || store
+    if raw.schema_version != STORE_SCHEMA_VERSION
+        || raw
             .current_profile
             .as_ref()
-            .is_some_and(|name| !store.profiles.contains_key(name))
-        || store.profiles.iter().any(|(name, profile)| {
-            validate_profile_name(name).is_err()
-                || validate_endpoint(&profile.endpoint).is_err()
-                || validate_credential_environment(&profile.credential_environment).is_err()
-        })
+            .is_some_and(|name| !raw.profiles.contains_key(name))
+        || raw
+            .profiles
+            .keys()
+            .any(|name| validate_profile_name(name).is_err())
     {
         return Err(RemoteError::ProfileStorage);
     }
-    Ok(store)
+
+    let mut profiles = BTreeMap::new();
+    for (name, raw_profile) in raw.profiles {
+        if raw_profile.product == "owlauth-saas" && raw_profile.credential_class == "saas-api-key" {
+            // Keep the legacy bytes on disk so a read cannot destroy profile state or race a
+            // concurrent writer. An explicit `profile add` with this name replaces the ignored
+            // entry when the operator binds it to a supported self-hosted endpoint.
+            continue;
+        }
+        if raw_profile.product != "owlauth-server"
+            || raw_profile.credential_class != "operator-api-key"
+        {
+            return Err(RemoteError::ProfileStorage);
+        }
+        let profile = Profile {
+            endpoint: raw_profile.endpoint,
+            product: Product::OwlauthServer,
+            instance_id: raw_profile.instance_id,
+            api_base_url: raw_profile.api_base_url,
+            api_versions: raw_profile.api_versions,
+            credential_class: CredentialClass::OperatorApiKey,
+            credential_environment: raw_profile.credential_environment,
+            mcp_url: raw_profile.mcp_url,
+        };
+        if validate_endpoint(&profile.endpoint).is_err()
+            || validate_credential_environment(&profile.credential_environment).is_err()
+        {
+            return Err(RemoteError::ProfileStorage);
+        }
+        profiles.insert(name, profile);
+    }
+    let current_profile = raw
+        .current_profile
+        .filter(|name| profiles.contains_key(name));
+    Ok(ProfileStore {
+        schema_version: raw.schema_version,
+        current_profile,
+        profiles,
+    })
 }
 
 fn save_store(path: &Path, store: &ProfileStore) -> Result<(), RemoteError> {
@@ -970,7 +1023,139 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_rejects_cross_product_credentials_and_cross_origin_urls() {
+    fn store_load_ignores_exact_legacy_profiles_without_rewriting_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        let server_profile = test_profile("http://127.0.0.1:8081/", "SERVER_OPERATOR_KEY");
+        let original = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": STORE_SCHEMA_VERSION,
+            "current_profile": "legacy",
+            "profiles": {
+                "server": server_profile,
+                "legacy": {
+                    "endpoint": "https://legacy.example/",
+                    "product": "owlauth-saas",
+                    "instance_id": "legacy-instance",
+                    "api_base_url": "https://legacy.example/v1/",
+                    "api_versions": ["v1"],
+                    "credential_class": "saas-api-key",
+                    "credential_environment": "LEGACY_API_KEY"
+                }
+            }
+        }))
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let loaded = load_store(&path).unwrap();
+        assert_eq!(loaded.current_profile, None);
+        assert_eq!(loaded.profiles.len(), 1);
+        assert!(loaded.profiles.contains_key("server"));
+        assert!(!loaded.profiles.contains_key("legacy"));
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn confirmed_store_write_replaces_one_legacy_name_and_collects_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": STORE_SCHEMA_VERSION,
+                "current_profile": "first",
+                "profiles": {
+                    "first": legacy_profile_document("first"),
+                    "second": legacy_profile_document("second")
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut store = load_store(&path).unwrap();
+        store.profiles.insert(
+            "first".to_owned(),
+            test_profile("http://127.0.0.1:8081/", "SERVER_OPERATOR_KEY"),
+        );
+        store.current_profile = Some("first".to_owned());
+        save_store(&path, &store).unwrap();
+
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("owlauth-saas"));
+        assert!(!persisted.contains("saas-api-key"));
+        let loaded = load_store(&path).unwrap();
+        assert_eq!(loaded.current_profile.as_deref(), Some("first"));
+        assert_eq!(loaded.profiles.len(), 1);
+        assert!(loaded.profiles.contains_key("first"));
+    }
+
+    #[test]
+    fn store_load_rejects_unknown_and_crossed_profile_kinds_without_rewriting() {
+        for (product, credential_class) in [
+            ("owlauth-sever", "operator-api-key"),
+            ("owlauth-server", "operator-key"),
+            ("owlauth-saas", "operator-api-key"),
+            ("owlauth-server", "saas-api-key"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("profiles.json");
+            let original = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": STORE_SCHEMA_VERSION,
+                "current_profile": "broken",
+                "profiles": {
+                    "broken": {
+                        "endpoint": "https://admin.example/",
+                        "product": product,
+                        "instance_id": "instance",
+                        "api_base_url": "https://admin.example/v1/",
+                        "api_versions": ["v1"],
+                        "credential_class": credential_class,
+                        "credential_environment": "OPERATOR_KEY"
+                    }
+                }
+            }))
+            .unwrap();
+            fs::write(&path, &original).unwrap();
+
+            assert!(matches!(
+                load_store(&path),
+                Err(RemoteError::ProfileStorage)
+            ));
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn store_load_rejects_duplicate_profile_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        let document = br#"{
+          "schema_version": 1,
+          "current_profile": "server",
+          "profiles": {
+            "server": {
+              "endpoint": "https://first.example/",
+              "endpoint": "https://second.example/",
+              "product": "owlauth-server",
+              "instance_id": "instance",
+              "api_base_url": "https://first.example/v1/",
+              "api_versions": ["v1"],
+              "credential_class": "operator-api-key",
+              "credential_environment": "OPERATOR_KEY"
+            }
+          }
+        }"#;
+        fs::write(&path, document).unwrap();
+
+        assert!(matches!(
+            load_store(&path),
+            Err(RemoteError::ProfileStorage)
+        ));
+        assert_eq!(fs::read(path).unwrap(), document);
+    }
+
+    #[test]
+    fn descriptor_rejects_cross_origin_and_noncanonical_urls() {
         let endpoint = validate_endpoint("https://admin.example.com").unwrap();
         let valid = RawDescriptor {
             schema_version: "1".to_owned(),
@@ -982,17 +1167,6 @@ mod tests {
             mcp_url: None,
         };
         assert!(validate_descriptor(&endpoint, valid).is_ok());
-
-        let wrong_pair = RawDescriptor {
-            schema_version: "1".to_owned(),
-            product: Product::OwlauthSaas,
-            instance_id: "deployment-1".to_owned(),
-            api_base_url: "https://admin.example.com/v1/".to_owned(),
-            api_versions: vec!["v1".to_owned()],
-            credential_class: CredentialClass::OperatorApiKey,
-            mcp_url: None,
-        };
-        assert!(validate_descriptor(&endpoint, wrong_pair).is_err());
 
         let cross_origin = RawDescriptor {
             schema_version: "1".to_owned(),
@@ -1020,7 +1194,6 @@ mod tests {
     #[test]
     fn operator_key_recognition_is_exact() {
         assert!(is_operator_key(&format!("owl_ctrl_v1_{}", "A".repeat(43))));
-        assert!(!is_operator_key(&format!("owl_saas_v1_{}", "A".repeat(43))));
         assert!(!is_operator_key(&format!("owl_ctrl_v1_{}", "A".repeat(42))));
     }
 
@@ -1300,6 +1473,18 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer owl_ctrl_v1_")
         );
+    }
+
+    fn legacy_profile_document(label: &str) -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": format!("https://{label}.example/"),
+            "product": "owlauth-saas",
+            "instance_id": format!("{label}-instance"),
+            "api_base_url": format!("https://{label}.example/v1/"),
+            "api_versions": ["v1"],
+            "credential_class": "saas-api-key",
+            "credential_environment": format!("{}_API_KEY", label.to_ascii_uppercase())
+        })
     }
 
     fn test_profile(endpoint: &str, credential_environment: &str) -> Profile {

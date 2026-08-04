@@ -18,7 +18,7 @@ format: ## Format Rust and Python sources
 	@uv run --locked ruff format $(PYTHON_DIR)
 
 .PHONY: check
-check: web-verify ## Run formatting, lint, package metadata, and workflow checks
+check: web-verify markdown-check ## Run formatting, lint, package metadata, and workflow checks
 	@cargo fmt --all --check
 	@cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	@uv lock --check
@@ -101,6 +101,10 @@ web-e2e: web-build ## Qualify exact SDK candidates in the real PostgreSQL/Rust/b
 .PHONY: web-verify
 web-verify: web-build ## Rebuild hosted-web assets and reject committed contract or asset drift
 	@git diff --exit-code -- $(SERVER_WEB_DIR)/src/generated $(SERVER_WEB_DIR)/dist
+
+.PHONY: markdown-check
+markdown-check: ## Check Markdown formatting with the pinned pre-commit hook
+	@uv run --locked pre-commit run mdformat --all-files
 
 .PHONY: docs
 docs: ## Serve documentation locally

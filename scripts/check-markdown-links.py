@@ -30,7 +30,8 @@ def tracked_markdown_files(repository: Path) -> list[Path]:
         check=True,
         capture_output=True,
     )
-    return [repository / os.fsdecode(name) for name in result.stdout.split(b"\0") if name]
+    tracked = [repository / os.fsdecode(name) for name in result.stdout.split(b"\0") if name]
+    return [path for path in tracked if path.is_file()]
 
 
 def relative_path(target: str) -> str | None:

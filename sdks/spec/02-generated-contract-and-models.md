@@ -15,7 +15,7 @@ The complete documents are derived from reviewed public DTOs in `crates/owlauth-
 
 The normalized snapshot is a reviewed derivative and drift baseline, not a second server contract. The full Runtime digest is provenance only: an unrelated additive Runtime operation changes provenance but does not silently expand or block the SDK surface. Any selected-surface drift fails CI with an explicit client-review diagnostic until compatibility, all three adapters, shared cases, and documentation are reviewed together. Any claimed Control operation or operator security scheme fails unconditionally.
 
-The pre-alpha SDKs retain handwritten narrow wire adapters and protocol-safety layers rather than generated public clients. This is intentional for the bounded eight-operation surface. Contract extraction proves structural authority; shared fixtures, semantic cases, exact-artifact tests, and real-server journeys prove the behavior that OpenAPI cannot express, including PKCE custody, one-use handoff/refresh behavior, context isolation, ambiguity, and redaction.
+The Beta SDKs retain handwritten narrow wire adapters and protocol-safety layers rather than generated public clients. This is intentional for the bounded eight-operation surface. Contract extraction proves structural authority; shared fixtures, semantic cases, exact-artifact tests, and real-server journeys prove the behavior that OpenAPI cannot express, including PKCE custody, one-use handoff/refresh behavior, context isolation, ambiguity, and redaction.
 
 ## Surface separation
 

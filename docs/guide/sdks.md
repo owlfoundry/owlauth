@@ -1,9 +1,9 @@
 # SDKs
 
-OwlAuth maintains pre-alpha first-party TypeScript, Python, and Rust Runtime protocol clients.
+OwlAuth maintains Beta first-party TypeScript, Python, and Rust Runtime protocol clients.
 
-::: warning Pre-alpha API
-The SDKs implement public configuration and JWKS retrieval, generic Hosted login start, caller-held PKCE state, callback validation and handoff exchange, refresh, current user, Application logout, browser-logout preparation, and stable redacted errors. Interfaces may still change independently before production support is declared.
+::: warning Beta API
+The SDKs implement public configuration and JWKS retrieval, generic Hosted login start, caller-held PKCE state, callback validation and handoff exchange, refresh, current user, Application logout, browser-logout preparation, and stable redacted errors. They remain pre-1.0 and may change independently. Exact-artifact qualification proves one source commit, Runtime contract, corpus, archive, and runtime coordinate; it is not a broad compatibility range, deployment certification, or production support commitment.
 :::
 
 ## Packages and compatibility

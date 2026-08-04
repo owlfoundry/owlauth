@@ -4,7 +4,7 @@
 
 SDKs run inside Applications that may log, crash, persist state, load plugins, follow redirects, or execute concurrently. They reduce common misuse but cannot secure a compromised Application, establish server-side Project membership, verify backend business authorization, or replace OwlAuth Runtime enforcement.
 
-The current packages implement pre-alpha Runtime Project Auth clients, but they are not production-supported authentication products. They do not own Application navigation, history cleanup, persistence, refresh coordination, framework sessions, or backend authorization, and their guarantees remain limited to the reviewed protocol behaviors and tested Runtime compatibility stated here.
+The current packages implement Beta Runtime Project Auth clients, but they are not production-supported authentication products. They do not own Application navigation, history cleanup, persistence, refresh coordination, framework sessions, or backend authorization, and their guarantees remain limited to the reviewed protocol behaviors and tested Runtime compatibility stated here.
 
 ## Public identifiers versus credentials
 

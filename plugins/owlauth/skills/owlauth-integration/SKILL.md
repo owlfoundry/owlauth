@@ -1,11 +1,11 @@
 ---
 name: owlauth-integration
-description: Integrate applications and developer tooling with OwlAuth Project Auth, select the TypeScript, Python, or Rust client, inspect generated Runtime contracts, and reason about the updater-only CLI or planned endpoint-discovered self-hosted/SaaS CLI and remote HTTP MCP capabilities. Use for OwlAuth setup, Project/Application integration, upstream provider login, SDK usage, migration, troubleshooting, or agent integration requests.
+description: Integrate applications and developer tooling with OwlAuth Project Auth, select the TypeScript, Python, or Rust client, inspect generated Runtime contracts, and reason about the endpoint-discovered self-hosted CLI and remote HTTP MCP capabilities. Use for OwlAuth setup, Project/Application integration, upstream provider login, SDK usage, migration, troubleshooting, or agent integration requests.
 ---
 
 # OwlAuth integration
 
-Treat OwlAuth as pre-alpha until published documentation says otherwise. The server implements one strict-OIDC Project Auth/session journey, provisioning and user/session lifecycle Control APIs, embedded Runtime/Control browser surfaces, PostgreSQL authority, and software signer/secret stores. The TypeScript, Python, and Rust SDKs implement the public Runtime protocol while leaving navigation, persistence, refresh coordination, framework sessions, and backend JWT verification to the Application. The `owlauth` CLI provides endpoint discovery, system inspection, and checksum-verified self-update but no resource-management commands. Do not invent deferred identity methods, CLI commands, MCP tools, or stability guarantees.
+Treat OwlAuth as Beta until published documentation says otherwise. The delivered self-hosted server includes PostgreSQL authority, isolated Runtime/Control planes, Hosted Authentication and Management Console surfaces, GitHub/Google/strict custom OIDC and passwordless-email login, managed provider profile synchronization, Project session/token lifecycles, revisioned projections and signed webhooks, and optional remote Control MCP. The TypeScript, Python, and Rust SDKs implement the public Runtime protocol while leaving navigation, persistence, refresh coordination, framework sessions, and backend JWT verification to the Application. The `owlauth` CLI provides endpoint discovery, typed self-hosted administration, system inspection, and checksum-verified self-update. Preserve pre-1.0 and exact-coordinate evidence limits; do not invent deferred interfaces, CLI commands, MCP tools, compatibility ranges, deployment certification, or production support.
 
 ## Product model
 
@@ -16,7 +16,9 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
 ## Workflow
 
 1. Determine whether the request concerns Runtime Application integration, Control administration, an SDK, an agent plugin, or a proposed interface.
+
 2. Establish whether the user is asking about implemented behavior or explicitly deferred architecture. State unavailable capabilities precisely.
+
 3. When working from a source checkout, inspect the Rust public types and generate separate current contracts with:
 
    ```bash
@@ -24,6 +26,7 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
    ```
 
 4. Select the public Runtime client without coupling it to server internals:
+
    - TypeScript: `@owlauth/client`
    - Python distribution: `owlauth-client`; import: `owlauth`
    - Rust crate: `owlauth-client`; import: `owlauth_client`
@@ -31,6 +34,7 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
    Read [SDK examples](references/sdk-examples.md) when the user needs current protocol setup examples.
 
 5. Validate integrations against `sdks/spec/`, its fixtures, conformance cases, and current package README. Preserve Project/Application binding, exact redirects/origins, PKCE handoff, serialized refresh rotation, backend token verification, redaction, and stable errors.
+
 6. Keep Runtime SDK operations separate from privileged Control operations. Do not imply that the core SDK owns browser navigation, history cleanup, persistence, refresh single-flight, backend sessions, or business authorization.
 
 ## Boundaries
@@ -38,7 +42,7 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
 - Public `project_id`, `application_id`, and publishable configuration are identifiers, not secrets or Control credentials.
 - Do not add a path or package dependency from any SDK or CLI to `owlauth-server`.
 - Do not commit generated OpenAPI output. Generate the plane-specific documents from `crates/owlauth-types` with `make openapi` when needed.
-- Treat self-hosted and SaaS MCP as future separate remote Streamable HTTP server adapters authenticated by operator and SaaS API keys respectively. The plugin never bundles, launches, downloads, supervises, or impersonates a local MCP process.
-- Treat all CLI commands other than help/version output and `update` as unimplemented. The target single CLI discovers/pins the endpoint product before selecting isolated self-hosted or SaaS clients; it never guesses from an authenticated failure or falls back across credentials.
+- Treat MCP as an optional remote Streamable HTTP Control adapter authenticated by the deployment operator key. The plugin never bundles, launches, downloads, supervises, or impersonates a local MCP process.
+- Treat only documented CLI commands as implemented. The CLI discovers and pins the self-hosted server endpoint identity before reading the operator credential; it never guesses identity from an authenticated failure.
 - Never request provider client secrets, registry tokens, Project access/refresh tokens, management credentials, signing keys, or Cloudflare credentials in chat. Use secure local prompts, secret stores, or trusted publishing.
-- Do not present the current pre-alpha implementation as production-supported authentication or authorization infrastructure.
+- Present the delivered scope as Beta and pre-1.0, never as deployment-certified or production-supported authentication or authorization infrastructure. Operators retain hardening, monitoring, upgrade, backup, PITR, and restore responsibility.

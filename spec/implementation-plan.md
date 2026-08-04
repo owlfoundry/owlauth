@@ -18,8 +18,8 @@ sequence for the single `owlauth-server` package, the Runtime Hosted Authenticat
 and the Control Management Console. It includes the server-side well-known descriptor and
 remote HTTP MCP adapter. Official SDK contract convergence and documentation are a later,
 server-independent Block E; the server blocks do not wait on SDK design. This plan does not cover
-the SaaS service, the CLI's SaaS client, or platform/framework SDK wrappers, define another product
-contract, or move behavioral authority out of the concern-specific specifications.
+platform/framework SDK wrappers, define another product contract, or move behavioral authority out
+of the concern-specific specifications.
 
 The repository retains the production-shaped technical foundation selected by TS-001 and TS-002,
 and Blocks A through C now provide real provisioning, Project Auth, identity, email, and managed
@@ -28,32 +28,32 @@ blocks rather than treating tables, routes, static pages, or SDK packaging as se
 
 The following rules apply to every delivery block:
 
-1. **Dependencies point inward.** Domain and application code know semantic ports, not
-   Axum, SeaORM, SQLx, Redis, provider/SMTP payloads, React, or public DTOs.
-2. **PostgreSQL proves security facts.** One-use state, Project ownership, revisions,
-   sessions, credential generations, outboxes, and audit outcomes are committed there.
-   Redis can improve admission and derived-data latency only.
-3. **Each increment is usable through its real boundary.** A UI workflow is enabled only
-   after its ordinary HTTP contract and application service exist. Browser tests start
-   the real Rust server; they do not replace missing backend behavior with a mock server.
-4. **A narrow technology spike proves only technology.** The required TS-001 and TS-002
-   spikes are retained as production foundations, but do not count as Project Auth,
-   Console, or product end-to-end completion.
-5. **Schema evolves by expand/migrate/switch/contract.** Released migrations are never
-   edited. Each delivery block remains safe for the declared mixed-version overlap before a
-   later contraction.
-6. **One vertical journey before breadth.** For example, one real upstream provider is
-   completed through handoff before adding other provider adapters; one complete Console
-   resource workflow precedes broad CRUD coverage.
-7. **No hidden alternate implementations.** CLI, MCP, HTTP, workers, and both web surfaces
-   invoke the same application services. Test-only helpers may substitute external ports,
-   but never domain authorization, repository transactions, or one-use semantics.
-8. **Security and operations ship with the behavior.** Redaction, audit, limits,
-   idempotency, deadlines, readiness, recovery, and negative tests are block exit
-   conditions rather than a final cleanup pass.
-9. **Capability blocks are completion boundaries, not one-commit mandates.** A block may
-   use several reviewable commits and parallel work lanes, but intermediate infrastructure
-   is not advertised as a completed product capability.
+01. **Dependencies point inward.** Domain and application code know semantic ports, not
+    Axum, SeaORM, SQLx, Redis, provider/SMTP payloads, React, or public DTOs.
+02. **PostgreSQL proves security facts.** One-use state, Project ownership, revisions,
+    sessions, credential generations, outboxes, and audit outcomes are committed there.
+    Redis can improve admission and derived-data latency only.
+03. **Each increment is usable through its real boundary.** A UI workflow is enabled only
+    after its ordinary HTTP contract and application service exist. Browser tests start
+    the real Rust server; they do not replace missing backend behavior with a mock server.
+04. **A narrow technology spike proves only technology.** The required TS-001 and TS-002
+    spikes are retained as production foundations, but do not count as Project Auth,
+    Console, or product end-to-end completion.
+05. **Schema evolves by expand/migrate/switch/contract.** Released migrations are never
+    edited. Each delivery block remains safe for the declared mixed-version overlap before a
+    later contraction.
+06. **One vertical journey before breadth.** For example, one real upstream provider is
+    completed through handoff before adding other provider adapters; one complete Console
+    resource workflow precedes broad CRUD coverage.
+07. **No hidden alternate implementations.** CLI, MCP, HTTP, workers, and both web surfaces
+    invoke the same application services. Test-only helpers may substitute external ports,
+    but never domain authorization, repository transactions, or one-use semantics.
+08. **Security and operations ship with the behavior.** Redaction, audit, limits,
+    idempotency, deadlines, readiness, recovery, and negative tests are block exit
+    conditions rather than a final cleanup pass.
+09. **Capability blocks are completion boundaries, not one-commit mandates.** A block may
+    use several reviewable commits and parallel work lanes, but intermediate infrastructure
+    is not advertised as a completed product capability.
 10. **Prepare the execution detail just in time.** Before implementation begins for each
     block, create or refresh an English detailed plan under the gitignored
     `local-reference/` tree. That local plan inventories the current code, migration and
@@ -252,7 +252,7 @@ The retained repository foundation includes:
 - a private transaction-bound Project Unit of Work proving the selected repository shape;
 - distinct `all`, `runtime`, and `control` composition roots, listeners, routers, lifecycle,
   liveness/readiness foundations, and Control Bearer admission;
-- origin-root self-hosted/SaaS endpoint discovery and credential-before-release CLI
+- origin-root self-hosted endpoint discovery and credential-before-release CLI
   dispatch foundations;
 - separate Runtime and Control OpenAPI roots and deterministic embedded hosted-web build
   pipelines, manifests, asset trees, and credential-free shells;
@@ -849,11 +849,9 @@ documentation are independent Block E work.
    prompts, tool schemas/arguments/results, protocol errors,
    URLs, session identifiers, logs, and plugin configuration; MCP session state never
    becomes authorization.
-7. Complete the CLI's self-hosted descriptor-pin lifecycle and isolated typed Control
-   client for implemented commands. Discovery, identity-pin changes, credential release,
-   product/client selection, and failure behavior never probe with credentials or fall
-   back across self-hosted/SaaS products. SaaS service/client/MCP delivery remains governed
-   by the separate SaaS plan.
+7. Complete the CLI's self-hosted descriptor-pin lifecycle and typed Control client for
+   implemented commands. Discovery, identity-pin changes, credential release, and failure
+   behavior never infer endpoint identity from authenticated requests.
 
 #### D.4 Risk gates and acceptance
 
@@ -899,8 +897,8 @@ The block exits only when:
 - server package, offline crate, binary, container, licenses, migration/readiness, and web
   digests pass the server release qualification matrix;
 - no password authentication, silent email linking, downstream provider-token broker,
-  SCIM, bulk directory, server-side Control principal/session, local MCP process, or SaaS
-  tenant/RBAC behavior has entered the standalone server accidentally.
+  SCIM, bulk directory, server-side Control principal/session, local MCP process, or hosted
+  multi-tenant/RBAC behavior has entered the product accidentally.
 
 **Exit condition:** server release evidence covers every implemented product journey, security
 boundary, external-effect ambiguity, split-plane failure, and recovery path. A green build of
@@ -936,9 +934,8 @@ The proportional closure evidence is:
   item.
 
 Block E remains independently responsible for language-neutral SDK contract selection,
-three-language conformance, SDK packaging matrices, and SDK documentation. The SaaS service,
-tenant authorization, billing, orchestration, and SaaS MCP remain governed by `spec/saas/`.
-Deployment backup scheduling, restore orchestration, and production operations remain operator
+three-language conformance, SDK packaging matrices, and SDK documentation. Deployment backup
+scheduling, restore orchestration, and production operations remain operator
 responsibilities; Block D supplies only the documented backup set, PostgreSQL/PITR guidance,
 verify-mode restart, and fail-closed recovery semantics. Future server maintenance and release
 execution do not reopen this capability block unless they invalidate one of its stated boundaries.
@@ -986,7 +983,7 @@ server route and tested journey.
 
 #### E.4 Closure record
 
-Block E is complete for the initial pre-alpha Project Auth SDK surface:
+Block E is complete for the initial Beta Project Auth SDK surface:
 
 - Rust DTOs and reproducibly exported Runtime/Control OpenAPI remain wire authority. Canonical
   provenance binds the full Runtime and claimed-surface contract digests, while the reviewed schema
@@ -1022,11 +1019,11 @@ Block E is complete for the initial pre-alpha Project Auth SDK surface:
 
 These results establish compatibility only for each manifest's exact source, server contract,
 corpus, artifact, and runtime coordinate. They do not establish a broad server-version range,
-production certification, or stability beyond the current pre-alpha packages. Core SDKs still do
+production certification, or stability beyond the current Beta packages. Core SDKs still do
 not own navigation, browser history, persistence, refresh coordination, framework session state,
-Application access-token verification, provider credentials, or downstream token brokering. The
-SaaS control layer, platform/framework integrations, and future compatibility-range promotion remain
-separate work and do not reopen Block E unless they invalidate one of these boundaries.
+Application access-token verification, provider credentials, or downstream token brokering.
+Platform/framework integrations and future compatibility-range promotion remain separate work and
+do not reopen Block E unless they invalidate one of these boundaries.
 
 ## 5. Journey-to-block traceability
 
@@ -1041,7 +1038,7 @@ separate work and do not reopen Block E unless they invalidate one of these boun
 | End user signs in by OTP or magic link                                                   | C                    | signed projection events in D                                 |
 | End user/operator links, reauthorizes, revokes, disconnects, or merges identities        | C                    | delivery and operational inspection in D                      |
 | Application receives signed changes and operator replays immutable events                | D                    | ongoing compatibility and release qualification               |
-| Operator CLI discovers/pins self-hosted endpoint and remote MCP exposes bounded tools    | D                    | SaaS CLI/MCP remains in the separate SaaS plan                |
+| Operator CLI discovers/pins self-hosted endpoint and remote MCP exposes bounded tools    | D                    | ongoing compatibility and release qualification               |
 | Operator follows documented PostgreSQL backup/restore guidance; server validates restart | D                    | deployment operations remain outside the repository           |
 | Developer integrates through aligned TypeScript, Python, or Rust SDK and documentation   | E                    | independently versioned SDK and docs releases                 |
 
@@ -1099,6 +1096,6 @@ A capability is complete only when all applicable items below are true:
 | Four large blocks are mistaken for four mandatory releases or giant commits       | Blocks express dependency and honest capability claims only; release timing and reviewable commit boundaries remain independent                                         |
 
 Blocks A through E are complete for the capability and evidence boundaries recorded above.
-Subsequent work is independently scoped maintenance, release execution, compatibility promotion, or
-work governed by the separate SaaS plan; it does not reopen a completed block unless a change
-invalidates that block's stated contract, security, custody, or acceptance boundary.
+Subsequent work is independently scoped maintenance, release execution, or compatibility promotion;
+it does not reopen a completed block unless a change invalidates that block's stated contract,
+security, custody, or acceptance boundary.

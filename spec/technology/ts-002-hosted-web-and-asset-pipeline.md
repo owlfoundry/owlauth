@@ -10,17 +10,17 @@
 
 `crates/owlauth-server/web` is one private package in the repository pnpm workspace and owns both browser surfaces with these version baselines:
 
-| Concern | Selection |
-| --- | --- |
-| UI language and library | strict TypeScript and React 19 |
-| Routing | no general Runtime router initially; React Router 8 Declarative mode for the Console with explicit `basename` |
-| Forms and state | semantic native forms, application-owned hooks and bounded state machines; no default form, server-cache, or global-state library |
-| Styling | external CSS Modules plus CSS custom properties |
-| Build | Vite 8 with two explicit configs, entry graphs, output roots, and manifests |
-| Browser client | separate OpenAPI 3.1 documents; `openapi-typescript` 7 type generation plus `openapi-fetch` 0.17 |
-| Binary embedding | two `rust-embed` 8 derive types with embedding enabled in debug/test/release and an OwlAuth-owned Axum adapter |
-| Tests | Vitest 4, React Testing Library 16, Playwright 1, and `@axe-core/playwright` 4 |
-| Static quality | TypeScript strict options, ESLint flat config with typed typescript-eslint/React Hooks/jsx-a11y, and Prettier 3 |
+| Concern                 | Selection                                                                                                                         |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| UI language and library | strict TypeScript and React 19                                                                                                    |
+| Routing                 | no general Runtime router initially; React Router 8 Declarative mode for the Console with explicit `basename`                     |
+| Forms and state         | semantic native forms, application-owned hooks and bounded state machines; no default form, server-cache, or global-state library |
+| Styling                 | external CSS Modules plus CSS custom properties                                                                                   |
+| Build                   | Vite 8 with two explicit configs, entry graphs, output roots, and manifests                                                       |
+| Browser client          | separate OpenAPI 3.1 documents; `openapi-typescript` 7 type generation plus `openapi-fetch` 0.17                                  |
+| Binary embedding        | two `rust-embed` 8 derive types with embedding enabled in debug/test/release and an OwlAuth-owned Axum adapter                    |
+| Tests                   | Vitest 4, React Testing Library 16, Playwright 1, and `@axe-core/playwright` 4                                                    |
+| Static quality          | TypeScript strict options, ESLint flat config with typed typescript-eslint/React Hooks/jsx-a11y, and Prettier 3                   |
 
 Exact compatible patch versions are controlled by `pnpm-lock.yaml` and `Cargo.lock`. A selected major upgrade remains subject to the output, CSP, contract, package, and browser gates below. The current root-wide Vite 6 override must be removed, narrowed to the documentation dependency that needs it, or otherwise reconciled during implementation; it cannot silently downgrade this workspace.
 
@@ -118,15 +118,15 @@ React has the strongest proportional forms, accessibility, router, testing, and 
 
 Before broad UI implementation, one narrow end-to-end spike MUST prove the acyclic OpenAPI-to-two-build-to-two-embed chain, offline Cargo packaging, and correct asset loading under both configured external URL topologies. The remaining items are ordinary build, browser, integration, and release tests rather than separate PoCs. Together, validation MUST prove:
 
-1. deterministic plane-pure OpenAPI 3.1 export from `owlauth-types` without compiling the server, byte-stable TS regeneration, drift failure, and rejected cross-plane imports;
-2. two Vite manifest closures with no shared emitted file and no inline/eval/remote/worker/service-worker/source-map output;
-3. correct shell, asset, API, callback, and client-navigation behavior on distinct origins and on one origin with disjoint non-root bases, using only configured base values;
-4. absent or correct manifest-reachable dynamic imports and module preloads in both topologies;
-5. normalized-manifest rejection of traversal, encoding, URL, duplicate/missing file, MIME, unlisted-output, corruption, and cross-plane cases;
-6. byte-reproducible Brotli/gzip output and correct bounded negotiation, ETags, `Vary`, HEAD, cache, and MIME behavior;
-7. debug/test/release embedding, asset-change rebuild tracking, plane-local 404/fallback behavior, and inability of either router to retrieve the other plane's bytes;
-8. strict CSP and output checks plus malicious rendering, exact redirect, route partition, cookie containment, no-service-worker, keyboard, focus, and accessibility browser tests;
-9. Console key verification and one authenticated call followed by lock/reload/authentication failure, proving the key is page-memory only, disposable, Control-base confined, and absent from Runtime and observable browser/server surfaces;
+01. deterministic plane-pure OpenAPI 3.1 export from `owlauth-types` without compiling the server, byte-stable TS regeneration, drift failure, and rejected cross-plane imports;
+02. two Vite manifest closures with no shared emitted file and no inline/eval/remote/worker/service-worker/source-map output;
+03. correct shell, asset, API, callback, and client-navigation behavior on distinct origins and on one origin with disjoint non-root bases, using only configured base values;
+04. absent or correct manifest-reachable dynamic imports and module preloads in both topologies;
+05. normalized-manifest rejection of traversal, encoding, URL, duplicate/missing file, MIME, unlisted-output, corruption, and cross-plane cases;
+06. byte-reproducible Brotli/gzip output and correct bounded negotiation, ETags, `Vary`, HEAD, cache, and MIME behavior;
+07. debug/test/release embedding, asset-change rebuild tracking, plane-local 404/fallback behavior, and inability of either router to retrieve the other plane's bytes;
+08. strict CSP and output checks plus malicious rendering, exact redirect, route partition, cookie containment, no-service-worker, keyboard, focus, and accessibility browser tests;
+09. Console key verification and one authenticated call followed by lock/reload/authentication failure, proving the key is page-memory only, disposable, Control-base confined, and absent from Runtime and observable browser/server surfaces;
 10. Cargo packaging of both generated trees, offline build of the unpacked crate without Node, final binary/container serving with source asset directories removed, and the same asset digest across Linux/macOS/Windows/container consumers.
 
 Failure pauses broad implementation. First adjust the adapter or build design. Revisit React, the OpenAPI client pair, or `rust-embed` only when evidence shows an intrinsic limitation rather than an OwlAuth integration defect.

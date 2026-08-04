@@ -4,11 +4,11 @@
 
 One `owlauth-server` artifact supports:
 
-| Mode | Runtime listener | Control listener | Shared core | PostgreSQL schema |
-| --- | --- | --- | --- | --- |
-| `all` | enabled | enabled | one in-process instance | shared |
-| `runtime` | enabled | absent | Runtime capabilities only | shared |
-| `control` | absent | enabled | Control capabilities only | shared |
+| Mode      | Runtime listener | Control listener | Shared core               | PostgreSQL schema |
+| --------- | ---------------- | ---------------- | ------------------------- | ----------------- |
+| `all`     | enabled          | enabled          | one in-process instance   | shared            |
+| `runtime` | enabled          | absent           | Runtime capabilities only | shared            |
+| `control` | absent           | enabled          | Control capabilities only | shared            |
 
 Mode changes adapter composition, exposure, dependency readiness, and database role; it does not change Project/domain semantics.
 
@@ -59,17 +59,17 @@ Project/provider/Application/email/webhook policy is authoritative PostgreSQL st
 
 The v1 Project Auth protocol bounds are exact implementation and readiness inputs:
 
-| Value | v1 bound | Authority and effect |
-| --- | --- | --- |
-| login transaction | fixed 10 minutes | captured at start; no later configuration change extends it |
-| one-use handoff | fixed maximum 60 seconds | `min(issued_at + 60 seconds, login transaction expiry)`; captured when issued |
-| Project browser session idle / absolute lifetime | fixed 8 hours / 24 hours | authoritative activity and `session_revision`; activity never extends the absolute deadline |
-| browser-session reuse maximum authentication age | Project-configurable 0–24 hours, default 8 hours | `session_revision`; revalidated at confirmation |
-| Application session and refresh-family absolute lifetime | fixed 30 days | Project, Application, user, and session revisions revalidated on refresh |
-| Project access token | Project-configurable 60–3,600 seconds | `claims_revision`; exact lifetime captured for each issuance |
-| allowed clock skew | fixed deployment safety bound, default 60 seconds | applied consistently to OwlAuth and upstream-provider token/time checks |
-| Project browser-logout preparation | fixed 60 seconds | one-use and bound to the initiating Application and Project browser sessions |
-| consumed-credential replay evidence | at least the owning family/session lifetime plus clock skew | configuration and cleanup cannot shorten this floor |
+| Value                                                    | v1 bound                                                    | Authority and effect                                                                        |
+| -------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| login transaction                                        | fixed 10 minutes                                            | captured at start; no later configuration change extends it                                 |
+| one-use handoff                                          | fixed maximum 60 seconds                                    | `min(issued_at + 60 seconds, login transaction expiry)`; captured when issued               |
+| Project browser session idle / absolute lifetime         | fixed 8 hours / 24 hours                                    | authoritative activity and `session_revision`; activity never extends the absolute deadline |
+| browser-session reuse maximum authentication age         | Project-configurable 0–24 hours, default 8 hours            | `session_revision`; revalidated at confirmation                                             |
+| Application session and refresh-family absolute lifetime | fixed 30 days                                               | Project, Application, user, and session revisions revalidated on refresh                    |
+| Project access token                                     | Project-configurable 60–3,600 seconds                       | `claims_revision`; exact lifetime captured for each issuance                                |
+| allowed clock skew                                       | fixed deployment safety bound, default 60 seconds           | applied consistently to OwlAuth and upstream-provider token/time checks                     |
+| Project browser-logout preparation                       | fixed 60 seconds                                            | one-use and bound to the initiating Application and Project browser sessions                |
+| consumed-credential replay evidence                      | at least the owning family/session lifetime plus clock skew | configuration and cleanup cannot shorten this floor                                         |
 
 Fixed bounds are not Project policy and cannot be lengthened or shortened per Project. Policy changes use the owning revision checks rather than synchronously rewriting unbounded pending/session rows. Runtime startup and readiness reject unsupported bounds, replay retention below the safety floor, or an active/retained digest or data-protection key set that cannot cover every unexpired value plus allowed skew.
 
@@ -149,18 +149,18 @@ Outbound webhook admission and every attempt resolve the complete CNAME chain an
 
 ## Key and secret ownership
 
-| Component | May access | Must not access |
-| --- | --- | --- |
-| Control | Project key metadata/public JWK, lifecycle command, provider secret reference, purpose-limited managed-reauthorization target issuer, identity-mutation evidence verifier/decrypt facade | generic Runtime digest/protection roots, evidence producer/receipt authority, managed credentials, exportable private key, or provider secret bytes in DTOs |
-| Runtime | active Project signer reference, Project verification set, provider secret handle, signing/provider operation, managed-reauthorization target verifier, identity-mutation evidence producer/receipt facade | evidence verifier/decrypt facade, arbitrary Project lifecycle mutation, Control operator key, or raw private key bytes |
-| PostgreSQL | public JWK, opaque signer/provider/SMTP/webhook references, Project/default SMTP generation eligibility and safe default fingerprint, versioned purpose-bound managed-credential and long-term email-PII ciphertext, revisions, lifecycle/provisioning state | plaintext private key, provider/SMTP/webhook secret, managed credential, email PII, or wrapping-key bytes |
-| Redis | public Project config/JWKS cache with revision | key/provider authority, secret material, activation locks |
-| Signer/KMS | Project-namespaced private material and operation authorization | user/Application policy or routing |
-| Secret store | Project provider/SMTP/webhook secret material by opaque purpose-bound reference | Project user/session/profile data or secret read-back DTOs |
-| Provider-sync worker | exact linked-identity renewable credential and bounded provider profile operation | Application-selected provider scope/API, downstream token export, or unrelated identity |
-| Mail worker | one leased encrypted Project mail job and selected Project/explicit-default SMTP handle | identity/challenge authority, another Project sender, or secret read-back |
-| Webhook worker | one leased immutable Application event, exact endpoint, and active signing handle | projection mutation, arbitrary payload/URL, provider token, or Control endpoint |
-| Data protector | purpose-separated login/challenge/outbox, long-term email PII, and managed-credential AEAD key versions | token signing authority, external configuration-secret storage, or Project policy |
+| Component            | May access                                                                                                                                                                                                                                                   | Must not access                                                                                                                                             |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Control              | Project key metadata/public JWK, lifecycle command, provider secret reference, purpose-limited managed-reauthorization target issuer, identity-mutation evidence verifier/decrypt facade                                                                     | generic Runtime digest/protection roots, evidence producer/receipt authority, managed credentials, exportable private key, or provider secret bytes in DTOs |
+| Runtime              | active Project signer reference, Project verification set, provider secret handle, signing/provider operation, managed-reauthorization target verifier, identity-mutation evidence producer/receipt facade                                                   | evidence verifier/decrypt facade, arbitrary Project lifecycle mutation, Control operator key, or raw private key bytes                                      |
+| PostgreSQL           | public JWK, opaque signer/provider/SMTP/webhook references, Project/default SMTP generation eligibility and safe default fingerprint, versioned purpose-bound managed-credential and long-term email-PII ciphertext, revisions, lifecycle/provisioning state | plaintext private key, provider/SMTP/webhook secret, managed credential, email PII, or wrapping-key bytes                                                   |
+| Redis                | public Project config/JWKS cache with revision                                                                                                                                                                                                               | key/provider authority, secret material, activation locks                                                                                                   |
+| Signer/KMS           | Project-namespaced private material and operation authorization                                                                                                                                                                                              | user/Application policy or routing                                                                                                                          |
+| Secret store         | Project provider/SMTP/webhook secret material by opaque purpose-bound reference                                                                                                                                                                              | Project user/session/profile data or secret read-back DTOs                                                                                                  |
+| Provider-sync worker | exact linked-identity renewable credential and bounded provider profile operation                                                                                                                                                                            | Application-selected provider scope/API, downstream token export, or unrelated identity                                                                     |
+| Mail worker          | one leased encrypted Project mail job and selected Project/explicit-default SMTP handle                                                                                                                                                                      | identity/challenge authority, another Project sender, or secret read-back                                                                                   |
+| Webhook worker       | one leased immutable Application event, exact endpoint, and active signing handle                                                                                                                                                                            | projection mutation, arbitrary payload/URL, provider token, or Control endpoint                                                                             |
+| Data protector       | purpose-separated login/challenge/outbox, long-term email PII, and managed-credential AEAD key versions                                                                                                                                                      | token signing authority, external configuration-secret storage, or Project policy                                                                           |
 
 KMS identities are least-privilege separated: Control provisioning identity creates/manages Project keys; Runtime identity can sign only with authorized active Project key references. Software keys use a dedicated envelope-encrypted store with external wrapping keys.
 

@@ -3,6 +3,8 @@
 The official synchronous Python SDK for [OwlAuth Project Auth](https://github.com/owlfoundry/owlauth).
 The distribution is `owlauth-client`; import it as `owlauth`.
 
+> This SDK is Beta and pre-1.0. Its API may change through reviewed releases. Exact-artifact qualification proves one source commit, Runtime contract, corpus, archive, and runtime coordinate; it is not a broad compatibility range, deployment certification, or production support commitment.
+
 ```bash
 pip install owlauth-client
 ```

@@ -5,7 +5,7 @@ OwlAuth is self-hostable authentication and identity infrastructure for applicat
 OwlAuth federates with upstream OAuth/OIDC providers such as GitHub and Google and targets first-party passwordless email OTP/magic-link authentication through user-configured SMTP. Applications integrate through a Project Auth API, revisioned user projections, optional signed webhooks, and language SDKs; OwlAuth is not a general-purpose downstream OAuth/OIDC authorization server or provider-token broker.
 
 > [!IMPORTANT]
-> OwlAuth is pre-alpha. The repository implements PostgreSQL-backed Project/Application/provider/signing-key provisioning, isolated Runtime and Control planes, embedded Hosted Authentication and Management Console surfaces, strict OIDC federation, PKCE handoff, Project JWT/session/refresh/logout lifecycle, operational user/session controls, and three protocol SDKs. Passwordless email, managed provider credential renewal/profile synchronization, projection webhooks, SCIM/bulk directory, and remote MCP remain future work. Interfaces and operational requirements may change; do not treat the current release as production-supported.
+> OwlAuth is Beta for its delivered self-hosted server, CLI, hosted web, and Project Auth SDK scope. The repository implements PostgreSQL-backed Project/Application authority; GitHub, Google, and strict custom OIDC federation; passwordless email; managed provider profile synchronization; PKCE handoff and Project session/token lifecycles; revisioned Application projections and signed webhooks; operational Control, Console, CLI, and optional remote MCP surfaces; and three protocol SDKs. Pre-1.0 APIs, configuration, and operational requirements may change. Beta is not deployment certification or a production support commitment: operators remain responsible for hardening, monitoring, upgrades, and a tested PostgreSQL/external-store/key backup, PITR, and restore program. SCIM, bulk directory/export, hosted multi-tenant control, and downstream OAuth authorization-server behavior are outside the current product.
 
 ## Product model
 
@@ -56,7 +56,7 @@ The two planes use distinct listeners and authentication policies even when one 
 │   ├── owlauth-server  # server library, executable, migrations, and hosted-web ownership
 │   │   ├── migrations  # reviewed PostgreSQL migration assets
 │   │   └── web         # Runtime/Control hosted-web ownership boundary
-│   ├── owlauth-cli     # endpoint-discovered self-hosted/SaaS remote CLI
+│   ├── owlauth-cli     # endpoint-discovered self-hosted administration CLI
 │   └── owlauth-types   # public HTTP DTO and OpenAPI authority
 ├── spec                # normative server/CLI architecture and technology register
 │   └── technology      # detailed canonical technology decisions
@@ -73,16 +73,16 @@ Start with:
 
 - [User documentation](https://owlauth-docs.owlfoundry.org)
 - [Server architecture specifications](spec/README.md)
-- [SaaS architecture specifications](spec/saas/README.md)
 - [Technology selection register](spec/10-implementation-technology-selections.md)
 - [Identity connection, passwordless email, and user-sync specification](spec/11-identity-connections-passwordless-email-and-user-sync.md)
 - [Bottom-up server and hosted-web implementation plan](spec/implementation-plan.md)
 - [Detailed technology decisions](spec/technology/README.md)
 - [SDK specifications](sdks/spec/README.md)
+- [Building a SaaS around OwlAuth](docs/guide/building-saas.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 
-The architecture and SDK specifications distinguish implemented pre-alpha behavior from explicitly deferred capabilities.
+The architecture and SDK specifications distinguish delivered Beta behavior from explicitly deferred or out-of-scope capabilities.
 
 ## Development
 
@@ -121,7 +121,7 @@ Database migrations are embedded from [`crates/owlauth-server/migrations/`](crat
 
 ## CLI installation
 
-The CLI provides strict endpoint-discovered profiles, self-hosted system inspection, and checksum-verified self-update. It discovers and pins product, instance, authority, API base, and credential class before choosing an isolated typed client or reading a referenced credential; profiles have no user-configured server/SaaS type. Resource-management and SaaS tenant commands are not implemented yet.
+The CLI provides strict endpoint-discovered profiles, self-hosted administration, and checksum-verified self-update. It discovers and pins the OwlAuth server product, instance, authority, API base, and operator credential class before choosing its typed client or reading a referenced credential.
 
 Unix-like systems:
 

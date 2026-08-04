@@ -1,9 +1,9 @@
 # Getting started
 
-This guide helps contributors run and inspect the current pre-alpha implementation. It is not a production deployment guide.
+This guide helps contributors run and inspect the current Beta implementation. It is not a production deployment guide.
 
-::: warning Current capability
-`owlauth-server` provides isolated Runtime and Control listeners over PostgreSQL, automatic or verification-only embedded migrations, OIDC and passwordless-email Project login, Hosted Authentication, PKCE handoff, Project JWT/session/refresh/logout behavior, managed provider connections and bounded profile synchronization, revisioned Application projections with signed durable webhooks, provisioning/lifecycle Control APIs, an embedded Management Console, and an optional remote Control MCP endpoint. Three pre-alpha SDKs consume the Runtime protocol. These surfaces are implemented but not production-supported. SCIM, bulk directory/export, SaaS tenant control, and general downstream OAuth-provider behavior are not implemented.
+::: warning Current Beta capability
+`owlauth-server` provides isolated Runtime and Control listeners over PostgreSQL, automatic or verification-only embedded migrations, OIDC and passwordless-email Project login, Hosted Authentication, PKCE handoff, Project JWT/session/refresh/logout behavior, managed provider connections and bounded profile synchronization, revisioned Application projections with signed durable webhooks, provisioning/lifecycle Control APIs, an embedded Management Console, and an optional remote Control MCP endpoint. Three Beta SDKs consume the Runtime protocol. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment; operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and general downstream OAuth-provider behavior are outside the product.
 :::
 
 ## Prerequisites
@@ -118,7 +118,7 @@ owlauth update --dry-run
 owlauth update
 ```
 
-Self-hosted commands use the deployment operator credential and therefore carry full Control authority. Supply it only through an approved prompt, protected descriptor, OS credential store, or secret provider—not ordinary arguments, shell history, or agent context. Audit export and SaaS tenant commands remain deferred.
+CLI commands use the deployment operator credential and therefore carry full Control authority. Supply it only through an approved prompt, protected descriptor, OS credential store, or secret provider—not ordinary arguments, shell history, or agent context. Audit export remains deferred.
 
 ## Release identities
 
@@ -136,4 +136,4 @@ Tags point at the selected `main` commit; release workflows materialize componen
 
 ## Follow the architecture
 
-The architecture under [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec) is normative behavior, not a command reference. Start with [Architecture](/guide/architecture), [Security](/guide/security), and [SDKs](/guide/sdks). Implemented pre-alpha behavior and explicitly deferred capabilities are stated separately; implementation does not imply production support.
+The architecture under [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec) is normative behavior, not a command reference. Start with [Architecture](/guide/architecture), [Security](/guide/security), and [SDKs](/guide/sdks). Delivered Beta behavior and explicitly deferred capabilities are stated separately; implementation and exact-artifact evidence do not imply deployment certification or production support.

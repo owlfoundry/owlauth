@@ -2,7 +2,7 @@
 
 ## Current status
 
-All three pre-alpha official SDKs implement the Runtime Project Auth network operations described here through their platform-appropriate injectable transports. The TypeScript package uses one Web-standard core in Node.js and supported browsers. The normative matrices below are the Block E convergence target; an existing pre-alpha implementation is not conformant evidence until its source, shared corpus, exact artifact, and real-server lanes all pass them.
+All three Beta official SDKs implement the Runtime Project Auth network operations described here through their platform-appropriate injectable transports. The TypeScript package uses one Web-standard core in Node.js and supported browsers. The normative matrices below are the Block E convergence target; an existing Beta implementation is not conformant evidence until its source, shared corpus, exact artifact, and real-server lanes all pass them.
 
 ## TypeScript runtime portability
 
@@ -38,16 +38,16 @@ Transport does not send provider credentials or provider tokens: OwlAuth Runtime
 
 The following table is normative for the initial SDK surface. An accepted success status is exact, not an arbitrary `2xx` range. Every success and Runtime error response is JSON and is subject to the common decoded-body bound below.
 
-| Operation ID | Method and path | Request parameters/body | Credential placement | Exact success |
-| --- | --- | --- | --- | --- |
-| `get_public_application_config` | `GET /v1/projects/{project_public_id}/auth/config` | required `application_id` query; no body | none | `200` |
-| `get_project_jwks` | `GET /projects/{project_public_id}/.well-known/jwks.json` | no body | none | `200` |
-| `start_login` | `POST /v1/projects/{project_public_id}/auth/login/start` | required JSON `LoginStartRequest` | publishable key in JSON | `201` |
-| `exchange_handoff` | `POST /v1/projects/{project_public_id}/auth/handoff/exchange` | required JSON `HandoffExchangeRequest` | publishable key, handoff, and verifier in JSON | `200` |
-| `refresh_session` | `POST /v1/projects/{project_public_id}/auth/sessions/refresh` | required JSON `RefreshRequest` | publishable key and refresh token in JSON | `200` |
-| `get_current_user` | `GET /v1/projects/{project_public_id}/auth/users/me` | no body | Project access token as Bearer | `200` |
-| `logout_application_session` | `POST /v1/projects/{project_public_id}/auth/sessions/logout` | no body and no invented `{}` | Project access token as Bearer | `200` |
-| `prepare_browser_logout` | `POST /v1/projects/{project_public_id}/auth/browser-logout/prepare` | no body and no invented `{}` | Project access token as Bearer | `201` |
+| Operation ID                    | Method and path                                                     | Request parameters/body                  | Credential placement                           | Exact success |
+| ------------------------------- | ------------------------------------------------------------------- | ---------------------------------------- | ---------------------------------------------- | ------------- |
+| `get_public_application_config` | `GET /v1/projects/{project_public_id}/auth/config`                  | required `application_id` query; no body | none                                           | `200`         |
+| `get_project_jwks`              | `GET /projects/{project_public_id}/.well-known/jwks.json`           | no body                                  | none                                           | `200`         |
+| `start_login`                   | `POST /v1/projects/{project_public_id}/auth/login/start`            | required JSON `LoginStartRequest`        | publishable key in JSON                        | `201`         |
+| `exchange_handoff`              | `POST /v1/projects/{project_public_id}/auth/handoff/exchange`       | required JSON `HandoffExchangeRequest`   | publishable key, handoff, and verifier in JSON | `200`         |
+| `refresh_session`               | `POST /v1/projects/{project_public_id}/auth/sessions/refresh`       | required JSON `RefreshRequest`           | publishable key and refresh token in JSON      | `200`         |
+| `get_current_user`              | `GET /v1/projects/{project_public_id}/auth/users/me`                | no body                                  | Project access token as Bearer                 | `200`         |
+| `logout_application_session`    | `POST /v1/projects/{project_public_id}/auth/sessions/logout`        | no body and no invented `{}`             | Project access token as Bearer                 | `200`         |
+| `prepare_browser_logout`        | `POST /v1/projects/{project_public_id}/auth/browser-logout/prepare` | no body and no invented `{}`             | Project access token as Bearer                 | `201`         |
 
 For requests with a JSON body, `Content-Type` is `application/json`; body fields and bounds come from the normalized OpenAPI 3.1 schema and unknown request fields are never added. Bodyless operations do not send a JSON placeholder or claim a content type for a body that is absent.
 
@@ -91,14 +91,14 @@ Client instances document thread/task safety. Raw transport is stateless except 
 
 The initial platform capability matrix is:
 
-| Capability | TypeScript browser | TypeScript Node.js | Python | Rust |
-| --- | --- | --- | --- | --- |
-| Overall deadline | SDK timer plus `AbortSignal` | SDK timer plus `AbortSignal` | explicit timeout passed to transport | explicit deadline passed to async transport |
-| Caller cancellation | `AbortSignal` | `AbortSignal` | transport-specific; no false core claim | task/transport cancellation with dispatched phase retained |
-| Redirect refusal | Fetch `redirect: error`; user-agent policy applies | Fetch `redirect: error` | selected transport must not follow API redirects | selected transport must not follow API redirects |
-| Trust roots/proxy | user agent owned | runtime/transport owned; no core override | transport/platform owned | transport/platform owned |
-| Decompression and pooling | user agent owned | runtime owned | transport owned | transport owned |
-| Request phase | before dispatch versus possibly dispatched | before dispatch versus possibly dispatched | transport failure reports dispatch phase | transport failure reports dispatch phase |
+| Capability                | TypeScript browser                                 | TypeScript Node.js                         | Python                                           | Rust                                                       |
+| ------------------------- | -------------------------------------------------- | ------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------------- |
+| Overall deadline          | SDK timer plus `AbortSignal`                       | SDK timer plus `AbortSignal`               | explicit timeout passed to transport             | explicit deadline passed to async transport                |
+| Caller cancellation       | `AbortSignal`                                      | `AbortSignal`                              | transport-specific; no false core claim          | task/transport cancellation with dispatched phase retained |
+| Redirect refusal          | Fetch `redirect: error`; user-agent policy applies | Fetch `redirect: error`                    | selected transport must not follow API redirects | selected transport must not follow API redirects           |
+| Trust roots/proxy         | user agent owned                                   | runtime/transport owned; no core override  | transport/platform owned                         | transport/platform owned                                   |
+| Decompression and pooling | user agent owned                                   | runtime owned                              | transport owned                                  | transport owned                                            |
+| Request phase             | before dispatch versus possibly dispatched         | before dispatch versus possibly dispatched | transport failure reports dispatch phase         | transport failure reports dispatch phase                   |
 
 An unavailable platform control is documented as unavailable, not emulated by changing the public protocol or by importing a platform-specific implementation into the shared TypeScript core.
 

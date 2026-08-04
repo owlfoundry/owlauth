@@ -2,8 +2,8 @@
 
 OwlAuth handles authentication state, provider credentials, sessions, and signing operations. Its target architecture is fail-closed and Project-scoped.
 
-::: danger Pre-alpha
-The current implementation includes the federated Project Auth, persistence, token/session, Control, signer, secret-store, Hosted UI, and SDK safeguards described for its delivered scope, with real PostgreSQL/provider/browser validation. It is still pre-alpha rather than production-supported: operators must independently review deployment TLS/proxy, secret management, database roles, backup/restore, egress, observability, upgrades, and deferred identity methods before relying on it.
+::: warning Beta security scope
+The current implementation includes the Project Auth, email, managed-provider, projection/webhook, persistence, token/session, Control, signer, secret-store, Hosted UI, and SDK safeguards described for its delivered scope, with real PostgreSQL/provider/browser validation. Beta is not security certification or a production support commitment. Operators must independently review deployment TLS/proxy, secret management, database roles, egress, observability, upgrades, and a tested PostgreSQL/external-store/key backup, PITR, and restore program before relying on it.
 :::
 
 Report suspected vulnerabilities through [GitHub private vulnerability reporting](https://github.com/owlfoundry/owlauth/security/advisories/new), not a public issue. Never include real credentials, tokens, provider callback values, or personal data in a report.
@@ -26,7 +26,7 @@ Control has a distinct listener and accepts only the single API key loaded from 
 
 Public IDs, Project access/refresh tokens, upstream provider credentials, network location, client-certificate identity, and forwarding headers are not Control credentials. Runtime never accepts the operator key.
 
-The optional self-hosted MCP endpoint is remote Streamable HTTP on Control and reauthenticates the operator Bearer key on every request. OwlAuth SaaS exposes a separate remote MCP endpoint that accepts only a SaaS API key and rechecks current tenant authority. A protected MCP host supplies the header; neither key enters prompts, model-visible context, tools/results, transport session IDs, or a local plugin/CLI process. Protocol tool discovery is not authorization.
+The optional remote Streamable HTTP MCP endpoint belongs to Control and reauthenticates the operator Bearer key on every request. A protected MCP host supplies the header; the key never enters prompts, model-visible context, tools/results, transport session IDs, or a local plugin/CLI process. Protocol tool discovery is not authorization.
 
 ### Provider and redirect boundary
 

@@ -40,8 +40,8 @@ features:
     details: PostgreSQL is the durable authority; Redis remains disposable, and private signing or data-protection keys stay behind provider interfaces.
 ---
 
-::: danger Pre-alpha implementation
-OwlAuth now implements one complete strict-OIDC Project Auth and session journey, isolated Runtime and Control APIs, PostgreSQL authority, embedded Hosted Authentication and Management Console surfaces, signing and configuration-secret stores, and TypeScript/Python/Rust protocol SDKs. It remains pre-alpha rather than production-supported. Passwordless email, managed provider synchronization, projection webhooks, SCIM/bulk directory, and remote MCP remain deferred.
+::: warning Beta
+OwlAuth is Beta for its delivered self-hosted server, CLI, Hosted Authentication and Management Console, and TypeScript/Python/Rust Project Auth SDK scope. It includes OIDC and passwordless-email login, managed provider profile synchronization, Project session/token lifecycles, revisioned Application projections with signed webhooks, and optional remote Control MCP. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment; operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and downstream OAuth authorization-server behavior are outside the current product.
 :::
 
 ## The product model
@@ -73,7 +73,8 @@ A Project access token is an OwlAuth application-session JWT. It is not an upstr
 ## Read next
 
 - [Architecture](/guide/architecture) — Projects, Applications, authentication flow, logical planes, storage, and deployment.
-- [Getting started](/guide/getting-started) — build, validate, and inspect the current pre-alpha implementation.
+- [Getting started](/guide/getting-started) — build, validate, and inspect the current Beta implementation.
 - [SDKs](/guide/sdks) — implemented protocol operations and the explicit Application-owned state boundary.
-- [CLI and agent integrations](/guide/agent-integrations) — endpoint-discovered CLI boundaries, documentation plugin, and deferred remote HTTP MCP capabilities.
+- [Building a SaaS](/guide/building-saas) — compose external tenant authorization, managed cells, reconciliation, and billing around self-hosted OwlAuth.
+- [CLI and agent integrations](/guide/agent-integrations) — endpoint-discovered CLI boundaries, documentation plugin, and remote HTTP MCP capabilities.
 - [Security](/guide/security) — target invariants, operational trust boundaries, and vulnerability reporting.

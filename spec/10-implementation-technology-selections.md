@@ -15,9 +15,9 @@ Architecture behavior remains owned by the concern-specific specs. This register
 
 ## Selection register
 
-| ID | Concern | Status | Selection | Requirement owner |
-| --- | --- | --- | --- | --- |
-| [`TS-001`](technology/ts-001-postgresql-repositories-and-migrations.md) | PostgreSQL repository and migration stack | Accepted | SeaORM 2 repositories plus SQLx 0.9 embedded SQL migrations | [`spec/04`](04-storage-and-migrations.md) |
-| [`TS-002`](technology/ts-002-hosted-web-and-asset-pipeline.md) | Hosted Authentication UI and Management Console toolchain | Accepted | React 19 + TypeScript + Vite 8, plane-specific OpenAPI clients/manifests, and `rust-embed` 8 | [`spec/09`](09-hosted-web-surfaces-and-control-auth.md) |
+| ID                                                                      | Concern                                                   | Status   | Selection                                                                                    | Requirement owner                                       |
+| ----------------------------------------------------------------------- | --------------------------------------------------------- | -------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| [`TS-001`](technology/ts-001-postgresql-repositories-and-migrations.md) | PostgreSQL repository and migration stack                 | Accepted | SeaORM 2 repositories plus SQLx 0.9 embedded SQL migrations                                  | [`spec/04`](04-storage-and-migrations.md)               |
+| [`TS-002`](technology/ts-002-hosted-web-and-asset-pipeline.md)          | Hosted Authentication UI and Management Console toolchain | Accepted | React 19 + TypeScript + Vite 8, plane-specific OpenAPI clients/manifests, and `rust-embed` 8 | [`spec/09`](09-hosted-web-surfaces-and-control-auth.md) |
 
 Detailed records are indexed in [`spec/technology/`](technology/README.md). This register remains the single list of approved implementation technologies.

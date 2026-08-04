@@ -191,18 +191,18 @@ Binding/projection, session/family, optional initial event targets, ticket consu
 
 The v1 protocol profile uses the fixed server safety bounds below. Only browser-session reuse authentication age and Project access-token lifetime are Project-configurable, within their listed ranges and owning revisions:
 
-| Value | Bound | Authority and revision behavior |
-| --- | --- | --- |
-| Login transaction | 10 minutes from generic start | Captured at creation; no policy change may extend it |
-| Handoff ticket | At most 60 seconds from issue | `expires_at = min(issued_at + 60 seconds, login_transaction.expires_at)`; one-use and bound to current authoritative revisions |
-| Project browser-session idle lifetime | 8 hours | Current activity and Project/user/session-policy revisions are checked |
-| Project browser-session absolute lifetime | 24 hours from authentication | Never extended by activity |
-| Browser-session reuse authentication age | Project-configurable from 0 through 24 hours; default 8 hours | Owned by `session_revision`, captured at start and revalidated at confirmation |
-| Application session and refresh-family absolute lifetime | 30 days | Project/Application/user/browser-session and policy revisions are checked on every refresh |
-| Project access-token lifetime | Current Project claims policy from 60 through 3,600 seconds | Owned by `claims_revision`; exact value is captured for each issuance |
-| Allowed clock skew | Deployment safety bound; default 60 seconds | Applied consistently to provider, token, and protocol-expiry validation |
-| Logout preparation | 60 seconds from issue | Purpose-bound and one-use; cannot outlive the source Application/browser session |
-| Replay evidence | At least the owning session/family lifetime plus allowed skew | Cleanup cannot recreate permission to use an old one-use credential |
+| Value                                                    | Bound                                                         | Authority and revision behavior                                                                                                |
+| -------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Login transaction                                        | 10 minutes from generic start                                 | Captured at creation; no policy change may extend it                                                                           |
+| Handoff ticket                                           | At most 60 seconds from issue                                 | `expires_at = min(issued_at + 60 seconds, login_transaction.expires_at)`; one-use and bound to current authoritative revisions |
+| Project browser-session idle lifetime                    | 8 hours                                                       | Current activity and Project/user/session-policy revisions are checked                                                         |
+| Project browser-session absolute lifetime                | 24 hours from authentication                                  | Never extended by activity                                                                                                     |
+| Browser-session reuse authentication age                 | Project-configurable from 0 through 24 hours; default 8 hours | Owned by `session_revision`, captured at start and revalidated at confirmation                                                 |
+| Application session and refresh-family absolute lifetime | 30 days                                                       | Project/Application/user/browser-session and policy revisions are checked on every refresh                                     |
+| Project access-token lifetime                            | Current Project claims policy from 60 through 3,600 seconds   | Owned by `claims_revision`; exact value is captured for each issuance                                                          |
+| Allowed clock skew                                       | Deployment safety bound; default 60 seconds                   | Applied consistently to provider, token, and protocol-expiry validation                                                        |
+| Logout preparation                                       | 60 seconds from issue                                         | Purpose-bound and one-use; cannot outlive the source Application/browser session                                               |
+| Replay evidence                                          | At least the owning session/family lifetime plus allowed skew | Cleanup cannot recreate permission to use an old one-use credential                                                            |
 
 A change to either configurable Project value invalidates stale pending work through the owning revision at its next authoritative decision but does not retroactively extend or silently rewrite an expiry. Fixed v1 bounds are not Project policy. A claims-policy reduction cannot shorten the verification overlap required by an access token validly issued under an older policy.
 
