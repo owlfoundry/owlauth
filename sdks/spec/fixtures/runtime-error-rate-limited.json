@@ -1,10 +1,19 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "synthetic": true,
-  "responseStatus": 429,
-  "response": {
-    "code": "rate_limited",
-    "message": "Synthetic admission rejection.",
-    "request_id": "req_conformance_rate_limited"
+  "exchange": {
+    "kind": "http",
+    "status": 429,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "json",
+      "value": {
+        "code": "rate_limited",
+        "message": "Synthetic admission rejection.",
+        "request_id": "req_conformance_rate_limited"
+      }
+    }
   }
 }

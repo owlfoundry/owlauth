@@ -2,7 +2,7 @@
 
 ## Current status
 
-All three pre-alpha official SDKs implement the Runtime Project Auth network operations described here through their platform-appropriate injectable transports. The TypeScript package uses one Web-standard core in Node.js and supported browsers.
+All three pre-alpha official SDKs implement the Runtime Project Auth network operations described here through their platform-appropriate injectable transports. The TypeScript package uses one Web-standard core in Node.js and supported browsers. The normative matrices below are the Block E convergence target; an existing pre-alpha implementation is not conformant evidence until its source, shared corpus, exact artifact, and real-server lanes all pass them.
 
 ## TypeScript runtime portability
 
@@ -34,6 +34,33 @@ Every public operation defines:
 
 Transport does not send provider credentials or provider tokens: OwlAuth Runtime owns upstream-provider interaction.
 
+## Claimed operation matrix
+
+The following table is normative for the initial SDK surface. An accepted success status is exact, not an arbitrary `2xx` range. Every success and Runtime error response is JSON and is subject to the common decoded-body bound below.
+
+| Operation ID | Method and path | Request parameters/body | Credential placement | Exact success |
+| --- | --- | --- | --- | --- |
+| `get_public_application_config` | `GET /v1/projects/{project_public_id}/auth/config` | required `application_id` query; no body | none | `200` |
+| `get_project_jwks` | `GET /projects/{project_public_id}/.well-known/jwks.json` | no body | none | `200` |
+| `start_login` | `POST /v1/projects/{project_public_id}/auth/login/start` | required JSON `LoginStartRequest` | publishable key in JSON | `201` |
+| `exchange_handoff` | `POST /v1/projects/{project_public_id}/auth/handoff/exchange` | required JSON `HandoffExchangeRequest` | publishable key, handoff, and verifier in JSON | `200` |
+| `refresh_session` | `POST /v1/projects/{project_public_id}/auth/sessions/refresh` | required JSON `RefreshRequest` | publishable key and refresh token in JSON | `200` |
+| `get_current_user` | `GET /v1/projects/{project_public_id}/auth/users/me` | no body | Project access token as Bearer | `200` |
+| `logout_application_session` | `POST /v1/projects/{project_public_id}/auth/sessions/logout` | no body and no invented `{}` | Project access token as Bearer | `200` |
+| `prepare_browser_logout` | `POST /v1/projects/{project_public_id}/auth/browser-logout/prepare` | no body and no invented `{}` | Project access token as Bearer | `201` |
+
+For requests with a JSON body, `Content-Type` is `application/json`; body fields and bounds come from the normalized OpenAPI 3.1 schema and unknown request fields are never added. Bodyless operations do not send a JSON placeholder or claim a content type for a body that is absent.
+
+For responses:
+
+- the maximum decoded body is 65,536 bytes for every claimed success or error; a larger declared or observed body fails before parsing, and a transport should stop reading once the bound is exceeded;
+- a non-empty body and media type `application/json` are required; media-type matching is ASCII case-insensitive and permits parameters such as `charset=utf-8`;
+- redirects are never followed and are not successes, including same-origin redirects;
+- malformed JSON, an empty body, an unexpected exact status, a wrong media type, or a structurally invalid success is a `Protocol` failure for reads; after a possibly dispatched sensitive mutation it is `Indeterminate` with the operation's quarantine action because Runtime may already have committed;
+- unknown object fields follow the selected schema exactly: objects with `additionalProperties: false` reject them, while open response objects ignore bounded additive fields and never re-export them as trusted data; an unknown value of a safety-relevant enum is a protocol failure until the contract, adapters, and shared cases explicitly support it;
+- an unknown Runtime error code is retained only as a bounded safe code and receives the conservative mapping in spec 05; and
+- `request_id` is exposed as optional allowlisted metadata even though the current Runtime schema emits it, so clients remain safe when an intermediary or compatible older response omits it.
+
 ## Redirect behavior
 
 Low-level API requests do not automatically follow redirects across origins. Generic login initiation returns the OwlAuth Hosted Authentication interaction target as data; only the Application or an external platform integration may navigate to it. The SDK does not select a provider. A provider authorization request is created only after the browser-bound Hosted UI commits an explicit same-origin method-selection transition; its upstream URL is never adopted as the SDK's API origin and never receives Project session credentials.
@@ -61,6 +88,19 @@ Logout may be designed as idempotent by the Runtime contract, but the SDK must n
 TypeScript accepts `AbortSignal`; Python and Rust expose their selected idiomatic cancellation/deadline mechanisms. Cancellation stops local waiting but does not assert that Runtime did not commit an exchange, refresh, or logout.
 
 Client instances document thread/task safety. Raw transport is stateless except for connection management. Pending PKCE state and access/refresh credentials are explicit caller-held values. Refresh serialization and durable atomic replacement belong to the Application or an external stateful integration layer and remain Project/Application scoped; the core transport does not imply a process-wide session coordinator.
+
+The initial platform capability matrix is:
+
+| Capability | TypeScript browser | TypeScript Node.js | Python | Rust |
+| --- | --- | --- | --- | --- |
+| Overall deadline | SDK timer plus `AbortSignal` | SDK timer plus `AbortSignal` | explicit timeout passed to transport | explicit deadline passed to async transport |
+| Caller cancellation | `AbortSignal` | `AbortSignal` | transport-specific; no false core claim | task/transport cancellation with dispatched phase retained |
+| Redirect refusal | Fetch `redirect: error`; user-agent policy applies | Fetch `redirect: error` | selected transport must not follow API redirects | selected transport must not follow API redirects |
+| Trust roots/proxy | user agent owned | runtime/transport owned; no core override | transport/platform owned | transport/platform owned |
+| Decompression and pooling | user agent owned | runtime owned | transport owned | transport owned |
+| Request phase | before dispatch versus possibly dispatched | before dispatch versus possibly dispatched | transport failure reports dispatch phase | transport failure reports dispatch phase |
+
+An unavailable platform control is documented as unavailable, not emulated by changing the public protocol or by importing a platform-specific implementation into the shared TypeScript core.
 
 ## Error responses
 

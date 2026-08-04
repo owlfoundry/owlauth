@@ -4,7 +4,9 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const packageRoot = process.env.OWLAUTH_TYPESCRIPT_PACKAGE_ROOT
+  ? path.resolve(process.env.OWLAUTH_TYPESCRIPT_PACKAGE_ROOT)
+  : path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 test("published runtime closure uses only Web-standard platform APIs", async () => {
   const files = ["index.js", "client.js", "errors.js", "types.js"];

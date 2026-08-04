@@ -7,8 +7,14 @@ import {
   verify,
   type KeyObject,
 } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFile } from "node:fs/promises";
+import {
+  createServer,
+  request as createHttpRequest,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import type { Server } from "node:net";
 import { resolve, sep } from "node:path";
@@ -70,31 +76,6 @@ interface BrowserDriverResult {
   readonly runId: string;
 }
 
-export async function typescriptSdkArtifactDigest(repository: string): Promise<string> {
-  const root = resolve(repository, "sdks/typescript/dist");
-  const hash = createHash("sha256");
-
-  async function visit(directory: string, prefix: string): Promise<void> {
-    const entries = await readdir(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
-      if (entry.isDirectory()) {
-        await visit(resolve(directory, entry.name), relative);
-      } else if (entry.isFile()) {
-        const content = await readFile(resolve(directory, entry.name));
-        hash.update(`${relative}\0${String(content.byteLength)}\0`);
-        hash.update(content);
-      } else {
-        throw new Error(`unsupported TypeScript SDK artifact entry: ${relative}`);
-      }
-    }
-  }
-
-  await visit(root, "");
-  return hash.digest("hex");
-}
-
 interface CapturedWebhook {
   readonly body: string;
   readonly eventId: string;
@@ -109,6 +90,8 @@ interface WebhookCaptureState {
 
 export interface ControlledServices {
   readonly applicationOrigin: string;
+  readonly faultProxyBase: string;
+  readonly faultProxyToken: string;
   readonly browserDriverToken: string;
   readonly browserDriverUrl: string;
   readonly providerClientId: string;
@@ -121,10 +104,11 @@ export interface ControlledServices {
 }
 
 export async function startControlledServices(
-  repository: string,
+  typescriptSdkRoot: string,
   providerPort: number,
   applicationPort: number,
   runtimePort: number,
+  faultProxyPort: number,
   smtpPort: number,
   webhookPort: number,
   smtpCertificateFile: string,
@@ -137,8 +121,11 @@ export async function startControlledServices(
   const providerIssuer = `${providerBase}/`;
   const applicationOrigin = `http://localhost:${String(applicationPort)}`;
   const runtimeOrigin = `http://127.0.0.1:${String(runtimePort)}`;
+  const runtimeProxyOrigin = `http://127.0.0.1:${String(faultProxyPort)}`;
   const browserDriverToken = opaque(32);
+  const faultProxyToken = opaque(32);
   const provider = createControlledProvider(providerBase, providerIssuer);
+  const faultProxy = createRuntimeFaultProxy(runtimeOrigin, faultProxyToken);
   const certificate = await readFile(smtpCertificateFile);
   const key = await readFile(smtpKeyFile);
   const capturedMail: string[] = [];
@@ -146,16 +133,17 @@ export async function startControlledServices(
   const smtp = createSmtpCapture(certificate, key, capturedMail);
   const webhook = createWebhookCapture(certificate, key, webhookState);
   const application = createApplicationServer(
-    repository,
+    typescriptSdkRoot,
     applicationOrigin,
     browserDriverToken,
-    runtimeOrigin,
+    runtimeProxyOrigin,
     capturedMail,
     webhookState,
   );
   await Promise.all([
     listen(provider, providerPort, "::1"),
     listen(application, applicationPort, "localhost"),
+    listen(faultProxy, faultProxyPort, "127.0.0.1"),
     // `IpAddr`'s stable ordering pins localhost's IPv4 address first. Bind the captures to that
     // exact address so the journeys exercise the same resolve-all/validate-all/pin-one path.
     listen(smtp, smtpPort, "127.0.0.1"),
@@ -165,6 +153,8 @@ export async function startControlledServices(
     applicationOrigin,
     browserDriverToken,
     browserDriverUrl: `${applicationOrigin}/sdk/browser-driver`,
+    faultProxyBase: `${runtimeProxyOrigin}/`,
+    faultProxyToken,
     providerClientId: PROVIDER_CLIENT_ID,
     providerClientSecret: PROVIDER_CLIENT_SECRET,
     providerOrigin: providerIssuer,
@@ -172,7 +162,13 @@ export async function startControlledServices(
     webhookCaptureUrl: `${applicationOrigin}/__e2e/webhooks`,
     webhookEndpointUrl: `https://localhost:${String(webhookPort)}/events`,
     async close() {
-      await Promise.all([close(provider), close(application), close(smtp), close(webhook)]);
+      await Promise.all([
+        close(provider),
+        close(application),
+        close(faultProxy),
+        close(smtp),
+        close(webhook),
+      ]);
     },
   };
 }
@@ -407,6 +403,315 @@ function createControlledProvider(origin: string, issuer: string) {
   });
 }
 
+type SdkOperation =
+  | "get_public_application_config"
+  | "get_project_jwks"
+  | "start_login"
+  | "exchange_handoff"
+  | "refresh_session"
+  | "get_current_user"
+  | "logout_application_session"
+  | "prepare_browser_logout";
+
+type FaultOperation = "exchange_handoff" | "logout_application_session" | "refresh_session";
+
+interface ArmedRuntimeFault {
+  readonly label: string;
+  readonly operation: FaultOperation;
+}
+
+interface RuntimeFaultEvent extends ArmedRuntimeFault {
+  readonly method: string;
+  readonly pathTemplate: string;
+  readonly projectId: string;
+  readonly upstreamStatus: number;
+}
+
+interface RuntimeOperationEvent {
+  readonly applicationId?: string;
+  readonly operation: SdkOperation;
+  readonly projectId: string;
+}
+
+function createRuntimeFaultProxy(runtimeOrigin: string, controlToken: string) {
+  let armed: ArmedRuntimeFault | undefined;
+  let faultEvents: RuntimeFaultEvent[] = [];
+  let operationEvents: RuntimeOperationEvent[] = [];
+  const faultDefinitions: Record<
+    FaultOperation,
+    { readonly method: string; readonly pattern: RegExp; readonly pathTemplate: string }
+  > = {
+    exchange_handoff: {
+      method: "POST",
+      pattern: /^\/v1\/projects\/[^/]+\/auth\/handoff\/exchange$/u,
+      pathTemplate: "/v1/projects/{project}/auth/handoff/exchange",
+    },
+    logout_application_session: {
+      method: "POST",
+      pattern: /^\/v1\/projects\/[^/]+\/auth\/sessions\/logout$/u,
+      pathTemplate: "/v1/projects/{project}/auth/sessions/logout",
+    },
+    refresh_session: {
+      method: "POST",
+      pattern: /^\/v1\/projects\/[^/]+\/auth\/sessions\/refresh$/u,
+      pathTemplate: "/v1/projects/{project}/auth/sessions/refresh",
+    },
+  };
+  const operationDefinitions: readonly {
+    readonly method: string;
+    readonly operation: SdkOperation;
+    readonly pattern: RegExp;
+    readonly status: number;
+  }[] = [
+    {
+      method: "GET",
+      operation: "get_public_application_config",
+      pattern: /^\/v1\/projects\/([^/]+)\/auth\/config$/u,
+      status: 200,
+    },
+    {
+      method: "GET",
+      operation: "get_project_jwks",
+      pattern: /^\/projects\/([^/]+)\/\.well-known\/jwks\.json$/u,
+      status: 200,
+    },
+    {
+      method: "POST",
+      operation: "start_login",
+      pattern: /^\/v1\/projects\/([^/]+)\/auth\/login\/start$/u,
+      status: 201,
+    },
+    {
+      method: "POST",
+      operation: "exchange_handoff",
+      pattern: /^\/v1\/projects\/([^/]+)\/auth\/handoff\/exchange$/u,
+      status: 200,
+    },
+    {
+      method: "POST",
+      operation: "refresh_session",
+      pattern: /^\/v1\/projects\/([^/]+)\/auth\/sessions\/refresh$/u,
+      status: 200,
+    },
+    {
+      method: "GET",
+      operation: "get_current_user",
+      pattern: /^\/v1\/projects\/([^/]+)\/auth\/users\/me$/u,
+      status: 200,
+    },
+    {
+      method: "POST",
+      operation: "logout_application_session",
+      pattern: /^\/v1\/projects\/([^/]+)\/auth\/sessions\/logout$/u,
+      status: 200,
+    },
+    {
+      method: "POST",
+      operation: "prepare_browser_logout",
+      pattern: /^\/v1\/projects\/([^/]+)\/auth\/browser-logout\/prepare$/u,
+      status: 201,
+    },
+  ];
+
+  return createServer((request, response) => {
+    void (async () => {
+      try {
+        const url = requestUrl(request, "http://127.0.0.1");
+        if (url.pathname.startsWith("/__e2e/")) {
+          if (request.headers.authorization !== `Bearer ${controlToken}`) {
+            json(response, 401, { error: "unauthorized" });
+            return;
+          }
+          if (request.method === "POST" && url.pathname === "/__e2e/arm") {
+            if (armed !== undefined) throw new Error("a Runtime fault is already armed");
+            const document = parseObject(await body(request));
+            const operation = stringField(document, "operation") as FaultOperation;
+            const label = stringField(document, "label");
+            if (!(operation in faultDefinitions) || label.length > 96) {
+              throw new Error("unsupported Runtime fault request");
+            }
+            armed = { label, operation };
+            json(response, 200, { armed: true });
+            return;
+          }
+          if (request.method === "GET" && url.pathname === "/__e2e/events") {
+            json(response, 200, { items: faultEvents });
+            return;
+          }
+          if (request.method === "POST" && url.pathname === "/__e2e/observations/reset") {
+            const projectId = required(url.searchParams.get("project_id"));
+            const applicationId = required(url.searchParams.get("application_id"));
+            const removedFaultEvents = faultEvents.filter((event) => event.projectId === projectId);
+            const removedOperationEvents = operationEvents.filter(
+              (event) =>
+                event.projectId === projectId &&
+                (event.applicationId === undefined || event.applicationId === applicationId),
+            );
+            faultEvents = faultEvents.filter((event) => event.projectId !== projectId);
+            operationEvents = operationEvents.filter(
+              (event) =>
+                event.projectId !== projectId ||
+                (event.applicationId !== undefined && event.applicationId !== applicationId),
+            );
+            json(response, 200, {
+              removedFaultInjectedOperationIds: unique(
+                removedFaultEvents.map((event) => event.operation),
+              ),
+              removedObservedOperationIds: unique(
+                removedOperationEvents.map((event) => event.operation),
+              ),
+            });
+            return;
+          }
+          if (request.method === "GET" && url.pathname === "/__e2e/observations") {
+            const projectId = required(url.searchParams.get("project_id"));
+            const applicationId = required(url.searchParams.get("application_id"));
+            json(response, 200, {
+              faultInjectedOperationIds: unique(
+                faultEvents
+                  .filter((event) => event.projectId === projectId && event.upstreamStatus === 200)
+                  .map((event) => event.operation),
+              ),
+              observedOperationIds: unique(
+                operationEvents
+                  .filter(
+                    (event) =>
+                      event.projectId === projectId &&
+                      (event.applicationId === undefined || event.applicationId === applicationId),
+                  )
+                  .map((event) => event.operation),
+              ),
+            });
+            return;
+          }
+          text(response, 404, "Not found");
+          return;
+        }
+
+        const target = new URL(`${url.pathname}${url.search}`, runtimeOrigin);
+        const method = request.method ?? "GET";
+        const requestBody = method === "GET" || method === "HEAD" ? undefined : await body(request);
+        const upstream = await forwardRuntimeRequest(target, method, request.headers, requestBody);
+        const responseBody = upstream.body;
+        const observed = operationDefinitions.find((definition) => {
+          definition.pattern.lastIndex = 0;
+          return definition.method === method && definition.pattern.test(url.pathname);
+        });
+        if (observed?.status === upstream.status) {
+          observed.pattern.lastIndex = 0;
+          const match = observed.pattern.exec(url.pathname);
+          const encodedProjectId = match?.[1];
+          if (encodedProjectId === undefined)
+            throw new Error("Runtime operation project is absent");
+          const applicationId = observedApplicationId(observed.operation, url, requestBody);
+          operationEvents.push({
+            ...(applicationId === undefined ? {} : { applicationId }),
+            operation: observed.operation,
+            projectId: decodeURIComponent(encodedProjectId),
+          });
+          if (operationEvents.length > 2048) operationEvents.shift();
+        }
+        const fault = armed;
+        const definition = fault === undefined ? undefined : faultDefinitions[fault.operation];
+        if (
+          definition?.method === method &&
+          definition.pattern.test(url.pathname) &&
+          fault !== undefined
+        ) {
+          const projectMatch = /^\/v1\/projects\/([^/]+)\//u.exec(url.pathname);
+          if (projectMatch?.[1] === undefined) throw new Error("fault project is absent");
+          armed = undefined;
+          faultEvents.push({
+            ...fault,
+            method,
+            pathTemplate: definition.pathTemplate,
+            projectId: decodeURIComponent(projectMatch[1]),
+            upstreamStatus: upstream.status,
+          });
+          if (faultEvents.length > 64) faultEvents.shift();
+          response.destroy();
+          return;
+        }
+        const responseHeaders = { ...upstream.headers };
+        delete responseHeaders.connection;
+        delete responseHeaders["transfer-encoding"];
+        response.writeHead(upstream.status, responseHeaders);
+        response.end(responseBody);
+      } catch {
+        if (!response.headersSent) json(response, 502, { error: "fault_proxy_failure" });
+        else response.destroy();
+      }
+    })();
+  });
+}
+
+function observedApplicationId(
+  operation: SdkOperation,
+  url: URL,
+  requestBody: string | undefined,
+): string | undefined {
+  if (operation === "get_public_application_config") {
+    return required(url.searchParams.get("application_id"));
+  }
+  if (
+    operation === "start_login" ||
+    operation === "exchange_handoff" ||
+    operation === "refresh_session"
+  ) {
+    if (requestBody === undefined) throw new Error("Runtime operation body is absent");
+    return stringField(parseObject(requestBody), "application_id");
+  }
+  return undefined;
+}
+
+function unique<T extends string>(values: readonly T[]): T[] {
+  return [...new Set(values)];
+}
+
+async function forwardRuntimeRequest(
+  target: URL,
+  method: string,
+  headers: IncomingHttpHeaders,
+  requestBody: string | undefined,
+): Promise<{
+  readonly body: Buffer;
+  readonly headers: IncomingHttpHeaders;
+  readonly status: number;
+}> {
+  return new Promise((resolveForward, reject) => {
+    const upstream = createHttpRequest(
+      target,
+      {
+        headers: { ...headers, connection: "close" },
+        method,
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 2 * 1024 * 1024) {
+            response.destroy(new Error("Runtime fault proxy response exceeded its bound"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.once("error", reject);
+        response.once("end", () => {
+          resolveForward({
+            body: Buffer.concat(chunks),
+            headers: response.headers,
+            status: response.statusCode ?? 502,
+          });
+        });
+      },
+    );
+    upstream.once("error", reject);
+    if (requestBody !== undefined) upstream.write(requestBody);
+    upstream.end();
+  });
+}
+
 function createWebhookCapture(certificate: Buffer, key: Buffer, state: WebhookCaptureState) {
   return createHttpsServer({ cert: certificate, key }, (request, response) => {
     void (async () => {
@@ -473,7 +778,7 @@ function createSmtpCapture(certificate: Buffer, key: Buffer, capturedMail: strin
 }
 
 function createApplicationServer(
-  repository: string,
+  typescriptSdkRoot: string,
   origin: string,
   browserDriverToken: string,
   runtimeOrigin: string,
@@ -483,7 +788,7 @@ function createApplicationServer(
   const pending = new Map<string, PendingBackendLogin>();
   const sessions = new Map<string, BackendSession>();
   const sdkBrowserEvidence = new Map<string, BrowserEvidenceSnapshot[]>();
-  const sdkRoot = resolve(repository, "sdks/typescript/dist");
+  const sdkRoot = resolve(typescriptSdkRoot);
 
   return createServer((request, response) => {
     void (async () => {
@@ -1017,7 +1322,7 @@ document.querySelector("#verify-browser-logout").addEventListener("click", async
     await client.refresh(credentials);
     throw new Error("refresh unexpectedly succeeded after browser logout");
   } catch (error) {
-    if (!(error instanceof OwlAuthError) || error.operation !== "refresh" ||
+    if (!(error instanceof OwlAuthError) || error.operation !== "refresh_session" ||
         error.category !== "Refresh" || error.action !== "invalidate_credentials") throw error;
   }
   credentials = undefined;

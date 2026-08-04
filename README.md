@@ -71,7 +71,7 @@ The two planes use distinct listeners and authentication policies even when one 
 
 Start with:
 
-- [User documentation](https://owlauth.owlfoundry.org)
+- [User documentation](https://owlauth-docs.owlfoundry.org)
 - [Server architecture specifications](spec/README.md)
 - [SaaS architecture specifications](spec/saas/README.md)
 - [Technology selection register](spec/10-implementation-technology-selections.md)

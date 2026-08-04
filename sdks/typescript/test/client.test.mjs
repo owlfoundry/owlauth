@@ -4,12 +4,18 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
+const packageSpecifier = process.env.OWLAUTH_TYPESCRIPT_PACKAGE ?? "../dist/index.js";
+const internalTypesSpecifier =
+  process.env.OWLAUTH_TYPESCRIPT_INTERNAL_TYPES ?? "../dist/types.js";
+const {
   AccessToken,
   Client,
   CredentialPair,
   OwlAuthError,
-} from "../dist/index.js";
+  PendingLogin,
+  ValidatedCallback,
+} = await import(packageSpecifier);
+const { createCredentialPair } = await import(internalTypesSpecifier);
 
 const NOW = Date.parse("2026-07-31T00:00:00Z");
 const PROJECT = "project_public";
@@ -201,6 +207,14 @@ test("callback validation is local, exact, expiring, and one-attempt", async () 
       error.action === "discard_pending",
   );
   assert.equal(calls.length, 1);
+  assert.equal(pending.consumed, false);
+  const callback = instance.validateCallback(
+    "https://app.example/callback?handoff=ticket&state=application-state",
+    pending,
+  );
+  assert.equal(pending.consumed, false);
+  responses.push(jsonResponse(credentialResponse(1)));
+  await instance.exchangeHandoff(callback);
   assert.equal(pending.consumed, true);
   assert.throws(
     () =>
@@ -299,7 +313,7 @@ test("public configuration and JWKS are bounded and context checked", async () =
       future: "ignored",
     }),
     jsonResponse({
-      keys: [{ kty: "OKP", crv: "Ed25519", alg: "EdDSA", use: "sig", kid: "kid", x: "abc" }],
+      keys: [{ kty: "OKP", crv: "Ed25519", alg: "EdDSA", use: "sig", kid: "kid", x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }],
       revision: 1,
       signing_epoch: 2,
     }),
@@ -377,8 +391,8 @@ test("handoff success-response failures quarantine pending state without retry",
 
       await assert.rejects(instance.exchangeHandoff(callback), (error) => {
         assert.ok(error instanceof OwlAuthError);
-        assert.equal(error.category, "Protocol");
-        assert.equal(error.code, fixture.code);
+        assert.equal(error.category, "Indeterminate");
+        assert.equal(error.code, "invalid_response_after_dispatch");
         assert.equal(error.status, 200);
         assert.equal(error.retry, "never");
         assert.equal(error.action, "quarantine_pending");
@@ -429,7 +443,7 @@ test("refresh success-response failures quarantine credentials without retry", a
     await t.test(fixture.name, async () => {
       const calls = [];
       const instance = client(queuedFetch([fixture.response()], calls));
-      const credentials = new CredentialPair({
+      const credentials = createCredentialPair({
         projectId: PROJECT,
         applicationId: APPLICATION,
         userId: "usr_public",
@@ -457,8 +471,8 @@ test("refresh success-response failures quarantine credentials without retry", a
 
       await assert.rejects(instance.refresh(credentials), (error) => {
         assert.ok(error instanceof OwlAuthError);
-        assert.equal(error.category, "Protocol");
-        assert.equal(error.code, fixture.code);
+        assert.equal(error.category, "Indeterminate");
+        assert.equal(error.code, "invalid_response_after_dispatch");
         assert.equal(error.status, 200);
         assert.equal(error.retry, "never");
         assert.equal(error.action, "quarantine_credentials");
@@ -478,7 +492,6 @@ test("unknown Runtime errors remain conservative and secret-free", async () => {
         code: "future_runtime_code",
         message: "unreviewed sentinel secret",
         request_id: "request-public",
-        future: true,
       },
       409,
     ),
@@ -495,10 +508,16 @@ test("unknown Runtime errors remain conservative and secret-free", async () => {
   });
 });
 
+test("secret-bearing lifecycle construction is reserved for Client results", () => {
+  assert.throws(() => new CredentialPair(Symbol("external"), {}), TypeError);
+  assert.throws(() => new PendingLogin(Symbol("external"), {}), TypeError);
+  assert.throws(() => new ValidatedCallback(Symbol("external"), "handoff", {}), TypeError);
+});
+
 test("credential context mismatch is a protocol error before refresh dispatch", async () => {
   const calls = [];
   const instance = client(queuedFetch([], calls));
-  const foreign = new CredentialPair({
+  const foreign = createCredentialPair({
     projectId: "another_project",
     applicationId: APPLICATION,
     userId: "usr_public",
@@ -530,7 +549,7 @@ test("credential context mismatch is a protocol error before refresh dispatch", 
 test("refresh transport ambiguity is quarantined and never replayed", async () => {
   const calls = [];
   const instance = client(queuedFetch([new Error("lost response")], calls));
-  const credentials = new CredentialPair({
+  const credentials = createCredentialPair({
     projectId: PROJECT,
     applicationId: APPLICATION,
     userId: "usr_public",

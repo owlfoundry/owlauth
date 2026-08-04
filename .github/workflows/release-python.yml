@@ -50,6 +50,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+      id-token: write
+      attestations: write
 
   publish:
     name: Publish owlauth-client
@@ -70,40 +72,73 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-      - name: Install uv
-        run: python -m pip install --disable-pip-version-check uv==0.11.32
-      - name: Install locked build tools
-        run: uv sync --all-packages --locked
-      - name: Build package
-        working-directory: sdks/python
+      - name: Install locked Python release tools
         run: |
-          rm -rf dist
-          uv run --locked hatchling build -d dist
-          uv run --locked twine check dist/*
-          wheel_contents="$(unzip -Z1 dist/*.whl)"
-          grep -Eq '\.dist-info/licenses/LICENSE$' <<< "$wheel_contents"
+          python -m pip install --disable-pip-version-check uv==0.11.32
+          uv sync --all-packages --locked
+      - name: Download immutable SDK candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.ci.outputs.python-candidate-artifact-name }}
+          path: candidate
+      - name: Download final SDK evidence
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
+          path: final-evidence
       - name: Download release changelog
         uses: actions/download-artifact@v7
         with:
           name: python-release-notes
           path: release-metadata
-      - name: Re-verify release eligibility
-        run: scripts/release/verify-release.sh python >/dev/null
+      - name: Re-verify release and exact candidate
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          CANDIDATE_VERSION: ${{ needs.ci.outputs.python-candidate-version }}
+          ARCHIVE_SHA256: ${{ needs.ci.outputs.python-candidate-archive-sha256 }}
+          DESCRIPTOR_SHA256: ${{ needs.ci.outputs.python-candidate-descriptor-sha256 }}
+        run: |
+          scripts/release/verify-release.sh python >/dev/null
+          [[ "$CANDIDATE_VERSION" == "$VERSION" ]]
+          archive="candidate/owlauth_client-${VERSION}-py3-none-any.whl"
+          verified_sha="$(python scripts/release/verify-sdk-candidate.py \
+            --component python --version "$VERSION" --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-configuration python-hatch-wheel-v1 --tag "$GITHUB_REF_NAME" \
+            --descriptor candidate/candidate.json --archive "$archive" \
+            --distribution-directory candidate)"
+          [[ "$verified_sha" == "$ARCHIVE_SHA256" ]]
+          actual_descriptor_sha="$(sha256sum candidate/candidate.json | cut -d ' ' -f 1)"
+          [[ "$actual_descriptor_sha" == "$DESCRIPTOR_SHA256" ]]
+          uv run --locked twine check "$archive"
+      - name: Verify final Block E evidence
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          python scripts/release/verify-sdk-evidence.py \
+            --component python --version "$VERSION" --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --tag "$GITHUB_REF_NAME" --descriptor candidate/candidate.json \
+            --manifest final-evidence/python-final-evidence.json >/dev/null
+          cat final-evidence/summary.md >> release-metadata/release-notes.md
       - name: Require PyPI token
         env:
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: test -n "$TWINE_PASSWORD"
-      - name: Publish package
-        working-directory: sdks/python
+      - name: Publish the qualified wheel
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: uv run --locked twine upload --non-interactive dist/*
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          uv run --locked twine upload --non-interactive \
+            "candidate/owlauth_client-${VERSION}-py3-none-any.whl"
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           gh release create "python-v${VERSION}" \
+            final-evidence/python-final-evidence.json \
             --notes-file release-metadata/release-notes.md \
             --title "Python SDK v${VERSION}"

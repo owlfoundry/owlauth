@@ -1,3 +1,5 @@
+export const VERSION = "0.0.1";
+
 export { Client, type BeginLoginOptions, type ClientOptions, type CryptoProvider } from "./client.js";
 export {
   OwlAuthError,
@@ -14,7 +16,6 @@ export {
   type LoginStartResult,
   type OperationOptions,
   PendingLogin,
-  PkceVerifier,
   type ProjectJwks,
   type PublicApplicationConfiguration,
   type PublicJwk,

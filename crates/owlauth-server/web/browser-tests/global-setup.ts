@@ -1,26 +1,23 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-import {
-  startControlledServices,
-  typescriptSdkArtifactDigest,
-  type ControlledServices,
-} from "./test-services";
+import { prepareSdkCandidates } from "./sdk-candidates";
+import { startControlledServices, type ControlledServices } from "./test-services";
 
 const operatorKey = `owl_ctrl_v1_${"A".repeat(43)}`;
 
 export default async function globalSetup() {
   const repository = resolve(import.meta.dirname, "../../../..");
-  const typescriptSdkDigest = await typescriptSdkArtifactDigest(repository);
   const temporaryRoot = await mkdtemp(resolve(tmpdir(), "owlauth-browser-e2e-"));
   const runtimePort = await freePort();
   const controlPort = await freePort();
   const providerPort = await freePort();
+  const faultProxyPort = await freePort();
   const applicationPort = await freePort();
   const smtpPort = await freePort();
   const webhookPort = await freePort();
@@ -118,11 +115,13 @@ export default async function globalSetup() {
   let controlServer: ReturnType<typeof spawn> | undefined;
   let services: ControlledServices | undefined;
   try {
+    const sdkCandidates = await prepareSdkCandidates(repository, temporaryRoot);
     services = await startControlledServices(
-      repository,
+      sdkCandidates.typescript.sdkRoot,
       providerPort,
       applicationPort,
       runtimePort,
+      faultProxyPort,
       smtpPort,
       webhookPort,
       smtpCertificateFile,
@@ -132,11 +131,15 @@ export default async function globalSetup() {
     const mapping = command("docker", ["port", container, "5432/tcp"]).trim();
     const postgresPort = mapping.slice(mapping.lastIndexOf(":") + 1);
     const postgresUrl = `postgresql://postgres:owlauth_browser@127.0.0.1:${postgresPort}/postgres`;
-    const runtimeBase = `http://127.0.0.1:${String(runtimePort)}/`;
+    const runtimeUpstreamBase = `http://127.0.0.1:${String(runtimePort)}/`;
+    const runtimeBase = services.faultProxyBase;
     const controlBase = `http://127.0.0.1:${String(controlPort)}/`;
 
+    const inheritedEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => !name.startsWith("OWLAUTH_")),
+    );
     const commonEnvironment = {
-      ...process.env,
+      ...inheritedEnvironment,
       OWLAUTH_INSTANCE_ID: "browser-e2e",
       OWLAUTH_POSTGRES_URL: postgresUrl,
       OWLAUTH_SIGNER_STORE_ROOT: resolve(temporaryRoot, "signers"),
@@ -225,7 +228,7 @@ export default async function globalSetup() {
       },
       stdio: ["ignore", controlLog, controlLog],
     });
-    await waitForUrl(`${runtimeBase}health`, runtimeServer);
+    await waitForUrl(`${runtimeUpstreamBase}health`, runtimeServer);
     await waitForUrl(`${controlBase}health`, controlServer);
     process.env["OWLAUTH_E2E_RUNTIME_BASE"] = runtimeBase;
     process.env["OWLAUTH_E2E_CONTROL_BASE"] = controlBase;
@@ -234,9 +237,25 @@ export default async function globalSetup() {
     process.env["OWLAUTH_E2E_PROVIDER_CLIENT_ID"] = services.providerClientId;
     process.env["OWLAUTH_E2E_PROVIDER_CLIENT_SECRET"] = services.providerClientSecret;
     process.env["OWLAUTH_E2E_APPLICATION_ORIGIN"] = services.applicationOrigin;
+    process.env["OWLAUTH_E2E_FAULT_PROXY_BASE"] = services.faultProxyBase;
+    process.env["OWLAUTH_E2E_FAULT_PROXY_TOKEN"] = services.faultProxyToken;
     process.env["OWLAUTH_E2E_BROWSER_DRIVER_URL"] = services.browserDriverUrl;
     process.env["OWLAUTH_E2E_BROWSER_DRIVER_TOKEN"] = services.browserDriverToken;
-    process.env["OWLAUTH_E2E_TYPESCRIPT_SDK_DIGEST"] = typescriptSdkDigest;
+    process.env["OWLAUTH_E2E_REPOSITORY"] = repository;
+    process.env["OWLAUTH_E2E_SOURCE_COMMIT"] = command("git", ["rev-parse", "HEAD"]).trim();
+    process.env["OWLAUTH_E2E_TYPESCRIPT_ARCHIVE"] = sdkCandidates.typescript.archive;
+    process.env["OWLAUTH_E2E_TYPESCRIPT_SDK_DIGEST"] = sdkCandidates.typescript.archiveSha256;
+    process.env["OWLAUTH_E2E_TYPESCRIPT_VERSION"] = sdkCandidates.typescript.version;
+    process.env["OWLAUTH_E2E_TYPESCRIPT_RUNNER"] = sdkCandidates.typescript.runner;
+    process.env["OWLAUTH_E2E_PYTHON_ARCHIVE"] = sdkCandidates.python.archive;
+    process.env["OWLAUTH_E2E_PYTHON_SDK_DIGEST"] = sdkCandidates.python.archiveSha256;
+    process.env["OWLAUTH_E2E_PYTHON_VERSION"] = sdkCandidates.python.version;
+    process.env["OWLAUTH_E2E_PYTHON_EXECUTABLE"] = sdkCandidates.python.executable;
+    process.env["OWLAUTH_E2E_PYTHON_RUNNER"] = sdkCandidates.python.runner;
+    process.env["OWLAUTH_E2E_RUST_ARCHIVE"] = sdkCandidates.rust.archive;
+    process.env["OWLAUTH_E2E_RUST_SDK_DIGEST"] = sdkCandidates.rust.archiveSha256;
+    process.env["OWLAUTH_E2E_RUST_VERSION"] = sdkCandidates.rust.version;
+    process.env["OWLAUTH_E2E_RUST_MANIFEST"] = sdkCandidates.rust.manifest;
     process.env["OWLAUTH_E2E_MAIL_CAPTURE_URL"] = services.mailCaptureUrl;
     process.env["OWLAUTH_E2E_WEBHOOK_CAPTURE_URL"] = services.webhookCaptureUrl;
     process.env["OWLAUTH_E2E_WEBHOOK_ENDPOINT_URL"] = services.webhookEndpointUrl;
@@ -251,8 +270,15 @@ export default async function globalSetup() {
     spawnSync("docker", ["rm", "-f", container], { stdio: "ignore" });
     closeSync(runtimeLog);
     closeSync(controlLog);
+    const diagnostics = await Promise.all([
+      boundedLogTail(runtimeLogFile),
+      boundedLogTail(controlLogFile),
+    ]);
     await rm(temporaryRoot, { recursive: true, force: true });
-    throw error;
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\nRuntime log tail:\n${diagnostics[0]}\nControl log tail:\n${diagnostics[1]}`,
+      { cause: error },
+    );
   }
 
   return async () => {
@@ -316,6 +342,15 @@ function command(executable: string, arguments_: string[]): string {
     throw new Error(`${executable} failed: ${result.stderr.trim()}`);
   }
   return result.stdout;
+}
+
+async function boundedLogTail(path: string): Promise<string> {
+  try {
+    const value = await readFile(path, "utf8");
+    return value.slice(-4096);
+  } catch (error) {
+    return `unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 async function freePort(): Promise<number> {

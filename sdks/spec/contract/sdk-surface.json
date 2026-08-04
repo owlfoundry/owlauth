@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "normalizerVersion": 1,
+  "runtimeOperations": [
+    "get_public_application_config",
+    "get_project_jwks",
+    "start_login",
+    "exchange_handoff",
+    "refresh_session",
+    "get_current_user",
+    "logout_application_session",
+    "prepare_browser_logout"
+  ],
+  "allowedSharedOperationIds": [
+    "get_liveness",
+    "get_readiness"
+  ],
+  "forbiddenSecuritySchemes": [
+    "operator_api_key"
+  ]
+}

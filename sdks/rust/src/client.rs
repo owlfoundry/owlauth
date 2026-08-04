@@ -1,5 +1,8 @@
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,7 +24,7 @@ use crate::{
     transport::default_transport,
 };
 
-const MAX_RESPONSE_BYTES: usize = 1_048_576;
+const MAX_RESPONSE_BYTES: usize = 65_536;
 const PENDING_SCHEMA_VERSION: u8 = 1;
 
 /// Immutable one-Project/one-Application client configuration.
@@ -79,7 +82,7 @@ impl EntropySource for OsEntropy {
                 "Secure randomness is unavailable.",
                 RetryPolicy::Never,
                 LocalAction::None,
-                "begin_login",
+                "start_login",
             )
         })
     }
@@ -196,10 +199,22 @@ impl Client {
         ))?;
         url.query_pairs_mut()
             .append_pair("application_id", &self.application_id);
-        let value: PublicConfiguration = self.get_json(url, "public_configuration").await?;
+        let value: PublicConfiguration = self
+            .get_json(url, "get_public_application_config", 200)
+            .await?;
         if value.project_public_id != self.project_id
             || value.application_public_id != self.application_id
-            || value.project_display_name.is_empty()
+            || !value
+                .publishable_keys
+                .iter()
+                .any(|key| key == &self.publishable_key)
+        {
+            return Err(protocol(
+                "get_public_application_config",
+                "context_mismatch",
+            ));
+        }
+        if value.project_display_name.is_empty()
             || value.project_display_name.len() > 128
             || value.application_display_name.is_empty()
             || value.application_display_name.len() > 128
@@ -214,11 +229,20 @@ impl Client {
                     || provider.key.len() > 64
                     || provider.display_name.is_empty()
                     || provider.display_name.len() > 128
-                    || provider.kind.is_empty()
-                    || provider.kind.len() > 32
+                    || !matches!(provider.kind.as_str(), "oidc" | "google" | "github")
             })
+            || {
+                let mut keys = std::collections::BTreeSet::new();
+                value
+                    .providers
+                    .iter()
+                    .any(|provider| !keys.insert(&provider.key))
+            }
         {
-            return Err(protocol("public_configuration", "context_mismatch"));
+            return Err(protocol(
+                "get_public_application_config",
+                "invalid_response",
+            ));
         }
         Ok(value)
     }
@@ -232,16 +256,25 @@ impl Client {
             "projects/{}/.well-known/jwks.json",
             encode_path(&self.project_id)
         ))?;
-        let value: JwksDocument = self.get_json(url, "project_jwks").await?;
+        let value: JwksDocument = self.get_json(url, "get_project_jwks", 200).await?;
         if value.keys.len() > 100
             || value.revision <= 0
             || value.signing_epoch <= 0
-            || value
-                .keys
-                .iter()
-                .any(|key| key.kid.len() > 128 || key.x.len() > 64)
+            || value.keys.iter().any(|key| {
+                key.kty != "OKP"
+                    || key.crv != "Ed25519"
+                    || key.alg != "EdDSA"
+                    || key.key_use != "sig"
+                    || key.kid.is_empty()
+                    || key.kid.len() > 128
+                    || !valid_ed25519_key(&key.x)
+            })
+            || {
+                let mut kids = std::collections::BTreeSet::new();
+                value.keys.iter().any(|key| !kids.insert(&key.kid))
+            }
         {
-            return Err(protocol("project_jwks", "invalid_jwks"));
+            return Err(protocol("get_project_jwks", "invalid_response"));
         }
         Ok(value)
     }
@@ -263,7 +296,7 @@ impl Client {
                 "The presentation hint is invalid.",
             ));
         }
-        let verifier = self.random_base64(32, "begin_login")?;
+        let verifier = self.random_base64(32, "start_login")?;
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = match application_state {
             Some(value) if !value.is_empty() && value.len() <= 1024 => value.to_owned(),
@@ -273,7 +306,7 @@ impl Client {
                     "The Application state is invalid.",
                 ));
             }
-            None => self.random_base64(32, "begin_login")?,
+            None => self.random_base64(32, "start_login")?,
         };
         let request = LoginStartRequest {
             application_id: &self.application_id,
@@ -291,25 +324,26 @@ impl Client {
             .post_json(
                 url,
                 &request,
-                "begin_login",
+                "start_login",
+                201,
                 false,
                 LocalAction::DiscardPendingLogin,
             )
             .await?;
         let hosted = Url::parse(&response.hosted_url)
-            .map_err(|_| protocol("begin_login", "invalid_hosted_url"))?;
+            .map_err(|_| protocol("start_login", "invalid_hosted_url"))?;
         if hosted.origin().ascii_serialization() != self.origin
             || !hosted.path().starts_with(self.base.path())
             || hosted.username() != ""
             || hosted.password().is_some()
             || hosted.fragment().is_some()
         {
-            return Err(protocol("begin_login", "invalid_hosted_url"));
+            return Err(protocol("start_login", "invalid_hosted_url"));
         }
-        let expires_at = parse_time(&response.expires_at, "begin_login")?;
+        let expires_at = parse_time(&response.expires_at, "start_login")?;
         let created_at = self.clock.now_unix_seconds();
-        if expires_at <= created_at || expires_at - created_at > 660 {
-            return Err(protocol("begin_login", "invalid_expiry"));
+        if expires_at < created_at - 60 || expires_at > created_at + 660 {
+            return Err(protocol("start_login", "invalid_expiry"));
         }
         Ok(LoginStart {
             hosted_url: hosted.to_string(),
@@ -323,18 +357,20 @@ impl Client {
                 state: Zeroizing::new(state),
                 created_at,
                 expires_at,
+                guard: Arc::new(AtomicBool::new(false)),
             },
         })
     }
 
-    /// Consumes and locally validates one pending login before any handoff request.
+    /// Validates local callback input without consuming pending state on malformed input.
+    /// A successful validation returns a value sharing the pending login's one-use guard.
     ///
     /// # Errors
     /// Returns a handoff error for expiry, state, redirect, or context mismatch.
     pub fn validate_callback(
         &self,
         callback_url: &str,
-        pending: PendingLogin,
+        pending: &PendingLogin,
     ) -> Result<ValidatedCallback, Error> {
         let fail = |code| {
             Error::new(
@@ -343,14 +379,17 @@ impl Client {
                 "The login callback is invalid or expired.",
                 RetryPolicy::Never,
                 LocalAction::DiscardPendingLogin,
-                "validate_callback",
+                "exchange_handoff",
             )
         };
+        if pending.consumed() {
+            return Err(fail("pending_consumed"));
+        }
         if pending.schema_version != PENDING_SCHEMA_VERSION
             || pending.runtime_origin != self.origin
             || pending.project_id != self.project_id
             || pending.application_id != self.application_id
-            || pending.expires_at <= self.clock.now_unix_seconds()
+            || self.clock.now_unix_seconds() > pending.expires_at.saturating_add(60)
         {
             return Err(fail("pending_context_mismatch"));
         }
@@ -364,38 +403,59 @@ impl Client {
             || callback.port_or_known_default() != expected.port_or_known_default()
             || callback.path() != expected.path()
             || callback.fragment().is_some()
+            || callback.username() != ""
+            || callback.password().is_some()
         {
             return Err(fail("redirect_mismatch"));
         }
-        let mut handoff = None;
-        let mut state = None;
         let expected_query: Vec<(String, String)> = expected
             .query_pairs()
             .map(|(a, b)| (a.into_owned(), b.into_owned()))
             .collect();
+        if expected_query
+            .iter()
+            .any(|(key, _)| matches!(key.as_str(), "handoff" | "state" | "error"))
+        {
+            return Err(fail("invalid_callback"));
+        }
+        let mut handoff = None;
+        let mut callback_error = None;
+        let mut state = None;
         let mut remaining = Vec::new();
         for (key, value) in callback.query_pairs() {
             match key.as_ref() {
                 "handoff" if handoff.is_none() => handoff = Some(value.into_owned()),
+                "error" if callback_error.is_none() => callback_error = Some(value.into_owned()),
                 "state" if state.is_none() => state = Some(value.into_owned()),
-                "handoff" | "state" => return Err(fail("invalid_callback")),
+                "handoff" | "error" | "state" => return Err(fail("invalid_callback")),
                 _ => remaining.push((key.into_owned(), value.into_owned())),
             }
         }
-        let handoff = handoff
-            .filter(|value| !value.is_empty() && value.len() <= 256)
-            .ok_or_else(|| fail("missing_handoff"))?;
         let state = state
             .filter(|value| !value.is_empty() && value.len() <= 1024)
             .ok_or_else(|| fail("state_mismatch"))?;
         if remaining != expected_query
             || !bool::from(state.as_bytes().ct_eq(pending.state.as_bytes()))
+            || handoff.is_some() == callback_error.is_some()
         {
-            return Err(fail("state_mismatch"));
+            return Err(fail("invalid_callback"));
         }
+        if callback_error
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 64)
+        {
+            return Err(fail("invalid_callback"));
+        }
+        if callback_error.is_some() {
+            return Err(fail("login_failed"));
+        }
+        let handoff = handoff
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .ok_or_else(|| fail("missing_handoff"))?;
         Ok(ValidatedCallback {
             handoff: Zeroizing::new(handoff),
-            verifier: pending.verifier,
+            verifier: pending.verifier.clone(),
+            guard: Arc::clone(&pending.guard),
         })
     }
 
@@ -407,6 +467,16 @@ impl Client {
         &self,
         callback: ValidatedCallback,
     ) -> Result<CredentialPair, Error> {
+        if callback.guard.swap(true, Ordering::AcqRel) {
+            return Err(Error::new(
+                ErrorCategory::Handoff,
+                "pending_consumed",
+                "The pending login has already been used.",
+                RetryPolicy::Never,
+                LocalAction::DiscardPendingLogin,
+                "exchange_handoff",
+            ));
+        }
         let request = HandoffRequest {
             application_id: &self.application_id,
             publishable_key: &self.publishable_key,
@@ -422,6 +492,7 @@ impl Client {
                 url,
                 &request,
                 "exchange_handoff",
+                200,
                 true,
                 LocalAction::QuarantinePendingLogin,
             )
@@ -442,7 +513,7 @@ impl Client {
         callback_url: &str,
         pending: PendingLogin,
     ) -> Result<CredentialPair, Error> {
-        let callback = self.validate_callback(callback_url, pending)?;
+        let callback = self.validate_callback(callback_url, &pending)?;
         self.exchange_handoff(callback).await
     }
 
@@ -451,7 +522,7 @@ impl Client {
     /// # Errors
     /// Returns a refresh, protocol, transport, or indeterminate error.
     pub async fn refresh(&self, current: &CredentialPair) -> Result<CredentialPair, Error> {
-        self.check_pair_context(current, "refresh")?;
+        self.check_pair_context(current, "refresh_session")?;
         let request = RefreshRequest {
             application_id: &self.application_id,
             publishable_key: &self.publishable_key,
@@ -465,21 +536,23 @@ impl Client {
             .post_json(
                 url,
                 &request,
-                "refresh",
+                "refresh_session",
+                200,
                 true,
                 LocalAction::QuarantineCredentials,
             )
             .await?;
         let next =
-            self.validate_credentials(wire, "refresh", LocalAction::QuarantineCredentials)?;
+            self.validate_credentials(wire, "refresh_session", LocalAction::QuarantineCredentials)?;
         if next.user_id() != current.user_id()
             || next.session_id() != current.session_id()
             || next.refresh_generation() != current.refresh_generation().saturating_add(1)
         {
-            return Err(protocol_with_action(
-                "refresh",
-                "credential_generation_mismatch",
+            return Err(indeterminate_response(
+                "refresh_session",
+                "invalid_response_after_dispatch",
                 LocalAction::QuarantineCredentials,
+                200,
             ));
         }
         Ok(next)
@@ -495,17 +568,26 @@ impl Client {
             encode_path(&self.project_id)
         ))?;
         let value: CurrentUser = self
-            .bearer_json(HttpMethod::Get, url, access_token, "current_user", false)
+            .bearer_json(
+                HttpMethod::Get,
+                url,
+                access_token,
+                "get_current_user",
+                200,
+                false,
+            )
             .await?;
         if value.project_id != self.project_id
             || value.application_id != self.application_id
             || value.user_id != value.projection.user_id
             || value.projection_revision != value.projection.projection_revision
             || !valid_projection(&value.projection)
-            || parse_time(&value.authenticated_at, "current_user").is_err()
-            || parse_time(&value.session_expires_at, "current_user").is_err()
+            || parse_time(&value.authenticated_at, "get_current_user").is_err()
+            || parse_time(&value.session_expires_at, "get_current_user").map_or(true, |expiry| {
+                expiry < self.clock.now_unix_seconds().saturating_sub(60)
+            })
         {
-            return Err(protocol("current_user", "context_mismatch"));
+            return Err(protocol("get_current_user", "context_mismatch"));
         }
         Ok(value)
     }
@@ -524,12 +606,18 @@ impl Client {
                 HttpMethod::Post,
                 url,
                 access_token,
-                "logout_application",
+                "logout_application_session",
+                200,
                 true,
             )
             .await?;
         if !value.completed {
-            return Err(protocol("logout_application", "logout_not_confirmed"));
+            return Err(indeterminate_response(
+                "logout_application_session",
+                "invalid_response_after_dispatch",
+                LocalAction::QuarantineCredentials,
+                200,
+            ));
         }
         Ok(())
     }
@@ -552,20 +640,50 @@ impl Client {
                 url,
                 access_token,
                 "prepare_browser_logout",
+                201,
                 true,
             )
             .await?;
-        let hosted = Url::parse(&value.hosted_url)
-            .map_err(|_| protocol("prepare_browser_logout", "invalid_hosted_url"))?;
+        let hosted = Url::parse(&value.hosted_url).map_err(|_| {
+            indeterminate_response(
+                "prepare_browser_logout",
+                "invalid_response_after_dispatch",
+                LocalAction::QuarantineCredentials,
+                201,
+            )
+        })?;
         if hosted.origin().ascii_serialization() != self.origin
             || !hosted.path().starts_with(self.base.path())
             || hosted.fragment().is_some()
             || hosted.username() != ""
             || hosted.password().is_some()
         {
-            return Err(protocol("prepare_browser_logout", "invalid_hosted_url"));
+            return Err(indeterminate_response(
+                "prepare_browser_logout",
+                "invalid_response_after_dispatch",
+                LocalAction::QuarantineCredentials,
+                201,
+            ));
         }
-        parse_time(&value.expires_at, "prepare_browser_logout")?;
+        let expires_at = parse_time(&value.expires_at, "prepare_browser_logout").map_err(|_| {
+            indeterminate_response(
+                "prepare_browser_logout",
+                "invalid_response_after_dispatch",
+                LocalAction::QuarantineCredentials,
+                201,
+            )
+        })?;
+        let received_at = self.clock.now_unix_seconds();
+        if expires_at < received_at.saturating_sub(60)
+            || expires_at > received_at.saturating_add(120)
+        {
+            return Err(indeterminate_response(
+                "prepare_browser_logout",
+                "invalid_response_after_dispatch",
+                LocalAction::QuarantineCredentials,
+                201,
+            ));
+        }
         Ok(value)
     }
 
@@ -594,6 +712,7 @@ impl Client {
         &self,
         url: Url,
         operation: &'static str,
+        expected_status: u16,
     ) -> Result<T, Error> {
         self.execute(
             HttpRequest {
@@ -604,6 +723,7 @@ impl Client {
                 max_response_bytes: MAX_RESPONSE_BYTES,
             },
             operation,
+            expected_status,
             false,
             LocalAction::None,
         )
@@ -615,6 +735,7 @@ impl Client {
         url: Url,
         body: &B,
         operation: &'static str,
+        expected_status: u16,
         sensitive: bool,
         action: LocalAction,
     ) -> Result<T, Error> {
@@ -632,6 +753,7 @@ impl Client {
                 max_response_bytes: MAX_RESPONSE_BYTES,
             },
             operation,
+            expected_status,
             sensitive,
             action,
         )
@@ -644,6 +766,7 @@ impl Client {
         url: Url,
         token: &AccessToken,
         operation: &'static str,
+        expected_status: u16,
         sensitive: bool,
     ) -> Result<T, Error> {
         self.execute(
@@ -654,12 +777,17 @@ impl Client {
                     ("accept".into(), "application/json".into()),
                     ("authorization".into(), format!("Bearer {}", token.expose())),
                 ],
-                body: (method == HttpMethod::Post).then(|| b"{}".to_vec()),
+                body: None,
                 max_response_bytes: MAX_RESPONSE_BYTES,
             },
             operation,
+            expected_status,
             sensitive,
-            LocalAction::QuarantineCredentials,
+            if sensitive {
+                LocalAction::QuarantineCredentials
+            } else {
+                LocalAction::None
+            },
         )
         .await
     }
@@ -668,6 +796,7 @@ impl Client {
         &self,
         request: HttpRequest,
         operation: &'static str,
+        expected_status: u16,
         sensitive: bool,
         action: LocalAction,
     ) -> Result<T, Error> {
@@ -676,7 +805,7 @@ impl Client {
             .send(request, self.deadline)
             .await
             .map_err(|failure| transport_error(failure, operation, sensitive, action))?;
-        parse_response(&response, operation, action)
+        parse_response(&response, operation, expected_status, sensitive, action)
     }
 
     fn validate_credentials(
@@ -701,12 +830,15 @@ impl Client {
             || wire.projection_revision != wire.projection.projection_revision
             || wire.user_id != wire.projection.user_id
             || !valid_projection(&wire.projection)
-            || parse_time(&wire.session_expires_at, operation).is_err()
+            || parse_time(&wire.session_expires_at, operation).map_or(true, |expiry| {
+                expiry < self.clock.now_unix_seconds().saturating_sub(60)
+            })
         {
-            return Err(protocol_with_action(
+            return Err(indeterminate_response(
                 operation,
-                "credential_context_mismatch",
+                "invalid_response_after_dispatch",
                 action,
+                200,
             ));
         }
         Ok(CredentialPair::from_wire(wire))
@@ -801,6 +933,12 @@ fn parse_time(value: &str, operation: &'static str) -> Result<i64, Error> {
         .map_err(|_| protocol(operation, "invalid_timestamp"))
 }
 
+fn valid_ed25519_key(value: &str) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .is_ok_and(|bytes| bytes.len() == 32 && URL_SAFE_NO_PAD.encode(bytes) == value)
+}
+
 fn valid_projection(value: &crate::UserProjection) -> bool {
     !value.user_id.is_empty()
         && value.user_id.len() <= 96
@@ -891,54 +1029,146 @@ fn protocol_with_action(operation: &'static str, code: &str, action: LocalAction
     )
 }
 
+fn indeterminate_response(
+    operation: &'static str,
+    code: &str,
+    action: LocalAction,
+    status: u16,
+) -> Error {
+    Error::new(
+        ErrorCategory::Indeterminate,
+        code,
+        "Runtime may have committed the operation; do not replay it.",
+        RetryPolicy::Never,
+        action,
+        operation,
+    )
+    .with_runtime(status, None)
+}
+
+fn invalid_response(
+    operation: &'static str,
+    _code: &str,
+    sensitive: bool,
+    action: LocalAction,
+    status: u16,
+) -> Error {
+    if sensitive {
+        indeterminate_response(operation, "invalid_response_after_dispatch", action, status)
+    } else {
+        protocol_with_action(operation, "invalid_response", action).with_runtime(status, None)
+    }
+}
+
 fn parse_response<T: DeserializeOwned>(
     response: &HttpResponse,
     operation: &'static str,
+    expected_status: u16,
+    sensitive: bool,
     action: LocalAction,
 ) -> Result<T, Error> {
     if response.body.len() > MAX_RESPONSE_BYTES {
-        return Err(protocol_with_action(
+        return Err(invalid_response(
             operation,
             "response_too_large",
+            sensitive,
             action,
+            response.status,
         ));
     }
-    if (200..300).contains(&response.status) {
-        return serde_json::from_slice(&response.body)
-            .map_err(|_| protocol_with_action(operation, "invalid_json_response", action));
+    let content_type = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.split(';').next().unwrap_or_default().trim());
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        return Err(invalid_response(
+            operation,
+            "invalid_content_type",
+            sensitive,
+            action,
+            response.status,
+        ));
     }
-    let wire = serde_json::from_slice::<RuntimeErrorWire>(&response.body).ok();
-    let request_id = wire
-        .as_ref()
-        .map(|value| value.request_id.clone())
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 128
-                && value.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-                })
+    if response.status == expected_status {
+        return serde_json::from_slice(&response.body).map_err(|_| {
+            invalid_response(
+                operation,
+                "invalid_json_response",
+                sensitive,
+                action,
+                response.status,
+            )
         });
-    let code = wire.as_ref().map_or_else(
-        || "runtime_error".to_owned(),
-        |value| {
-            if value.code.is_empty() || value.code.len() > 64 {
-                "runtime_error".to_owned()
-            } else {
-                value.code.clone()
-            }
-        },
-    );
-    let _safe_message = wire.as_ref().filter(|value| value.message.len() <= 256);
-    let (category, retry, local_action) =
-        runtime_error_semantics(response.status, operation, action);
-    let code = if code
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    }
+    if (200..300).contains(&response.status) {
+        return Err(invalid_response(
+            operation,
+            "unexpected_success_status",
+            sensitive,
+            action,
+            response.status,
+        ));
+    }
+    parse_runtime_error(response, operation, sensitive, action)
+}
+
+fn parse_runtime_error<T>(
+    response: &HttpResponse,
+    operation: &'static str,
+    sensitive: bool,
+    action: LocalAction,
+) -> Result<T, Error> {
+    let wire = serde_json::from_slice::<RuntimeErrorWire>(&response.body).map_err(|_| {
+        invalid_response(
+            operation,
+            "invalid_error_response",
+            sensitive,
+            action,
+            response.status,
+        )
+    })?;
+    if wire.message.is_empty() || wire.message.len() > 256 {
+        return Err(invalid_response(
+            operation,
+            "invalid_error_response",
+            sensitive,
+            action,
+            response.status,
+        ));
+    }
+    let request_id = wire.request_id.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+    });
+    let code = wire.code;
+    if code.is_empty()
+        || code.len() > 64
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
-        code
-    } else {
-        "runtime_error".to_owned()
-    };
+        return Err(invalid_response(
+            operation,
+            "invalid_error_response",
+            sensitive,
+            action,
+            response.status,
+        ));
+    }
+    if sensitive && response.status >= 500 {
+        return Err(indeterminate_response(
+            operation,
+            "runtime_5xx_after_dispatch",
+            action,
+            response.status,
+        ));
+    }
+    let (category, retry, local_action) =
+        runtime_error_semantics(response.status, &code, operation, action);
     let known = matches!(
         code.as_str(),
         "not_found"
@@ -950,8 +1180,9 @@ fn parse_response<T: DeserializeOwned>(
             | "invalid_preflight"
             | "forbidden_hosted_request"
             | "invalid_cookie"
+            | "rate_limited"
     );
-    if !known && category != ErrorCategory::RateLimited {
+    if !known {
         return Err(Error::new(
             ErrorCategory::Protocol,
             code,
@@ -975,18 +1206,31 @@ fn parse_response<T: DeserializeOwned>(
 
 fn runtime_error_semantics(
     status: u16,
+    code: &str,
     operation: &'static str,
     action: LocalAction,
 ) -> (ErrorCategory, RetryPolicy, LocalAction) {
-    if status == 429 {
-        return (
-            ErrorCategory::RateLimited,
-            RetryPolicy::SafeAfterDelay,
-            LocalAction::None,
-        );
+    if status == 429 && code == "rate_limited" {
+        return match operation {
+            "exchange_handoff" => (
+                ErrorCategory::RateLimited,
+                RetryPolicy::Never,
+                LocalAction::DiscardPendingLogin,
+            ),
+            "refresh_session" | "logout_application_session" | "prepare_browser_logout" => (
+                ErrorCategory::RateLimited,
+                RetryPolicy::ApplicationDecision,
+                LocalAction::None,
+            ),
+            _ => (
+                ErrorCategory::RateLimited,
+                RetryPolicy::SafeAfterDelay,
+                LocalAction::None,
+            ),
+        };
     }
     match operation {
-        "begin_login" => (
+        "start_login" => (
             ErrorCategory::Login,
             RetryPolicy::Never,
             LocalAction::DiscardPendingLogin,
@@ -996,17 +1240,17 @@ fn runtime_error_semantics(
             RetryPolicy::Never,
             LocalAction::DiscardPendingLogin,
         ),
-        "refresh" => (
+        "refresh_session" => (
             ErrorCategory::Refresh,
             RetryPolicy::Never,
             LocalAction::ClearCredentials,
         ),
-        "current_user" => (
+        "get_current_user" => (
             ErrorCategory::Authentication,
             RetryPolicy::Never,
             LocalAction::Reauthenticate,
         ),
-        "logout_application" | "prepare_browser_logout" => {
+        "logout_application_session" | "prepare_browser_logout" => {
             (ErrorCategory::Session, RetryPolicy::Never, action)
         }
         _ if status >= 500 => (

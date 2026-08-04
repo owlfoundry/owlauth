@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 3,
+  "synthetic": true,
+  "exchange": {
+    "kind": "http",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "empty"
+    }
+  }
+}

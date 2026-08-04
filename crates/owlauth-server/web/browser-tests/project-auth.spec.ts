@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
@@ -10,7 +11,6 @@ import {
   type LifecycleSample,
   type NetworkRecord,
 } from "./browser-evidence";
-import { typescriptSdkArtifactDigest } from "./test-services";
 
 const controlBase = requiredEnvironment("OWLAUTH_E2E_CONTROL_BASE");
 const runtimeBase = requiredEnvironment("OWLAUTH_E2E_RUNTIME_BASE");
@@ -21,7 +21,35 @@ const providerClientSecret = requiredEnvironment("OWLAUTH_E2E_PROVIDER_CLIENT_SE
 const applicationOrigin = requiredEnvironment("OWLAUTH_E2E_APPLICATION_ORIGIN");
 const browserDriverUrl = requiredEnvironment("OWLAUTH_E2E_BROWSER_DRIVER_URL");
 const browserDriverToken = requiredEnvironment("OWLAUTH_E2E_BROWSER_DRIVER_TOKEN");
+const faultProxyBase = requiredEnvironment("OWLAUTH_E2E_FAULT_PROXY_BASE");
+const faultProxyToken = requiredEnvironment("OWLAUTH_E2E_FAULT_PROXY_TOKEN");
+const typescriptArchive = requiredEnvironment("OWLAUTH_E2E_TYPESCRIPT_ARCHIVE");
+const typescriptRunner = requiredEnvironment("OWLAUTH_E2E_TYPESCRIPT_RUNNER");
+const typescriptVersion = requiredEnvironment("OWLAUTH_E2E_TYPESCRIPT_VERSION");
 const frozenTypescriptSdkDigest = requiredEnvironment("OWLAUTH_E2E_TYPESCRIPT_SDK_DIGEST");
+const pythonExecutable = requiredEnvironment("OWLAUTH_E2E_PYTHON_EXECUTABLE");
+const pythonRunner = requiredEnvironment("OWLAUTH_E2E_PYTHON_RUNNER");
+const pythonVersion = requiredEnvironment("OWLAUTH_E2E_PYTHON_VERSION");
+const rustManifest = requiredEnvironment("OWLAUTH_E2E_RUST_MANIFEST");
+const rustVersion = requiredEnvironment("OWLAUTH_E2E_RUST_VERSION");
+const pythonSdkDigest = requiredEnvironment("OWLAUTH_E2E_PYTHON_SDK_DIGEST");
+const rustSdkDigest = requiredEnvironment("OWLAUTH_E2E_RUST_SDK_DIGEST");
+const sourceCommit = requiredEnvironment("OWLAUTH_E2E_SOURCE_COMMIT");
+const expectedOperationIds = [
+  "get_public_application_config",
+  "get_project_jwks",
+  "start_login",
+  "exchange_handoff",
+  "refresh_session",
+  "get_current_user",
+  "logout_application_session",
+  "prepare_browser_logout",
+] as const;
+const expectedFaultOperationIds = [
+  "exchange_handoff",
+  "refresh_session",
+  "logout_application_session",
+] as const;
 
 interface Project {
   readonly id: string;
@@ -58,6 +86,20 @@ interface ProvisionedContext {
   readonly otherApplication: Application;
   readonly otherProject: Project;
   readonly project: Project;
+}
+
+interface SdkE2EResult {
+  readonly assignments: Readonly<
+    Record<string, { readonly application: string; readonly project: string }>
+  >;
+  readonly browserEvidence: readonly BrowserEvidenceSnapshot[];
+  readonly faultInjectedOperationIds: Readonly<Record<string, readonly string[]>>;
+  readonly observedOperationIds: Readonly<Record<string, readonly string[]>>;
+}
+
+interface MeasuredSdkEvidence {
+  readonly faultInjectedOperationIds: readonly string[];
+  readonly observedOperationIds: readonly string[];
 }
 
 type SecretKind = "access" | "csrf" | "handoff" | "preparation" | "refresh";
@@ -139,12 +181,11 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   page,
   browserName,
 }) => {
-  test.setTimeout(360_000);
+  test.setTimeout(900_000);
   if (browserName !== "chromium" && browserName !== "firefox") {
     throw new Error("browser project is outside the declared support matrix");
   }
-  const repository = resolve(import.meta.dirname, "../../../..");
-  expect(await typescriptSdkArtifactDigest(repository)).toBe(frozenTypescriptSdkDigest);
+  expect(await fileSha256(typescriptArchive)).toBe(frozenTypescriptSdkDigest);
   const evidence = await BrowserEvidence.create(browserContext);
   const context = await provision(page.request, `${browserName}-${Date.now().toString(36)}`);
   const publishableKey = context.application.configuration.publishable_keys[0];
@@ -262,6 +303,22 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   // bindings. The immediate managed sync may legitimately update the callback profile first.
   await expect(page.locator("#status")).toHaveText("Current user verified");
 
+  if (browserName === "firefox") {
+    // Firefox qualifies the same browser-direct and backend-custody surfaces plus the complete
+    // TypeScript exact artifact. Chromium alone carries the much longer managed-connection
+    // reauthorization/rotation/recovery journey, which is server behavior rather than an SDK
+    // browser-portability dimension.
+    await page.getByRole("button", { name: "Refresh session" }).click();
+    await expect(page.locator("#status")).toHaveText("Credentials replaced atomically");
+    await page.getByRole("button", { name: "Application logout" }).click();
+    await expect(page.locator("#status")).toHaveText("Application session ended");
+    await evidence.settle();
+    await assertPageSecretFree(page, await currentSecrets(evidence));
+    const backendContext = await completeBackendCustodyJourney(page, browserName);
+    await completeSdkQualification(page, evidence, browserName, context, backendContext);
+    return;
+  }
+
   // Control creates a fixed-provider, single-connection reauthorization. It is a separate
   // top-level journey: no Application sign-in or browser-session reuse is offered.
   const users = await controlGet<ProjectUserList>(
@@ -279,6 +336,11 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   const predecessor = managedBefore.items[0];
   if (predecessor === undefined) throw new Error("managed connection was not materialized");
   expect(predecessor.state).toBe("active");
+  const predecessorSynchronizedAt = predecessor.last_synchronized_at;
+  const predecessorProfileCommitted =
+    predecessor.last_safe_outcome === "read_succeeded" &&
+    typeof predecessorSynchronizedAt === "string" &&
+    !Number.isNaN(Date.parse(predecessorSynchronizedAt));
   await expect
     .poll(
       async () => {
@@ -292,8 +354,9 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
       { timeout: 45_000 },
     )
     .toBe(true);
-  // This Control outcome becomes visible only with the profile transaction commit. Requiring
-  // successor generations prevents an earlier read outcome from satisfying the barrier.
+  // The provider-count barrier proves the bounded managed-profile request occurred. Its transaction
+  // may commit immediately before or after the Control snapshot above, so require successor
+  // generations only when that snapshot did not already contain the successful outcome.
   let reauthorizationPredecessor: ManagedConnection | undefined;
   await expect
     .poll(
@@ -304,10 +367,16 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
         );
         const current = managed.items.find(({ id }) => id === predecessor.id);
         const synchronizedAt = current?.last_synchronized_at;
+        const generationsCommitted =
+          current !== undefined &&
+          (predecessorProfileCommitted
+            ? current.generation >= predecessor.generation &&
+              current.credential_generation >= predecessor.credential_generation
+            : current.generation > predecessor.generation &&
+              current.credential_generation > predecessor.credential_generation);
         const profileCommitted =
           current?.state === "active" &&
-          current.generation > predecessor.generation &&
-          current.credential_generation > predecessor.credential_generation &&
+          generationsCommitted &&
           current.last_safe_outcome === "read_succeeded" &&
           typeof synchronizedAt === "string" &&
           !Number.isNaN(Date.parse(synchronizedAt));
@@ -321,10 +390,16 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
     throw new Error("background-synchronized managed connection was not visible");
   }
   expect(reauthorizationPredecessor.state).toBe("active");
-  expect(reauthorizationPredecessor.generation).toBeGreaterThan(predecessor.generation);
-  expect(reauthorizationPredecessor.credential_generation).toBeGreaterThan(
+  expect(reauthorizationPredecessor.generation).toBeGreaterThanOrEqual(predecessor.generation);
+  expect(reauthorizationPredecessor.credential_generation).toBeGreaterThanOrEqual(
     predecessor.credential_generation,
   );
+  if (!predecessorProfileCommitted) {
+    expect(reauthorizationPredecessor.generation).toBeGreaterThan(predecessor.generation);
+    expect(reauthorizationPredecessor.credential_generation).toBeGreaterThan(
+      predecessor.credential_generation,
+    );
+  }
   expect(reauthorizationPredecessor.last_safe_outcome).toBe("read_succeeded");
   expect(Date.parse(reauthorizationPredecessor.last_synchronized_at ?? "")).not.toBeNaN();
   await page.getByRole("button", { name: "Read current user" }).click();
@@ -858,38 +933,8 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   expect(crossApplication.status()).toBe(403);
   expect(crossApplication.headers()["access-control-allow-origin"]).toBeUndefined();
 
-  const backendParameters = new URLSearchParams({
-    application: context.application.public_id,
-    claims_revision: String(context.claimsRevision),
-    key: publishableKey ?? "",
-    other_project: context.otherProject.public_id,
-    project: context.project.public_id,
-    runtime: runtimeBase,
-  });
-  await page.goto(`${applicationOrigin}/backend/start?${backendParameters.toString()}`);
-  await expect(page.getByRole("heading", { name: "E2E Application" })).toBeVisible();
-  await page.getByRole("button", { name: "Controlled Provider" }).click();
-  await expect(page.getByRole("heading", { name: "Backend-custody Application" })).toBeVisible();
-  await expect(page.getByText("Session verified")).toBeVisible();
-  await expect(page.getByText("verified", { exact: true })).toBeVisible();
-  await expect(page.getByText("rejected", { exact: true })).toHaveCount(2);
-  await expect(page.getByText("2", { exact: true })).toBeVisible();
-  expect(page.url()).not.toMatch(/handoff|access_token|refresh_token/u);
-  await expect(page.locator("body")).not.toContainText(/eyJ[A-Za-z0-9_-]+\./u);
-
-  await page.getByRole("button", { name: "Application logout" }).click();
-  await expect(page.getByRole("heading", { name: "Backend session ended" })).toBeVisible();
-  await expect(page.getByRole("status")).toHaveText("Application logout was confirmed.");
-  await assertEvidenceConfinement([evidence]);
-
-  const sdkBrowserSnapshots = await runSdkE2Es(context, publishableKey ?? "", browserName);
-  expect(sdkBrowserSnapshots).toHaveLength(2);
-  await assertEvidenceConfinement([evidence], sdkBrowserSnapshots);
-  const finalProviderCounts = await providerRequestCounts(page.request);
-  expect(finalProviderCounts.token_confinement_violations).toBe(0);
-  expect(finalProviderCounts.revocation_requests).toBeGreaterThan(0);
-  expect(finalProviderCounts.userinfo_requests).toBeGreaterThan(0);
-  expect(await typescriptSdkArtifactDigest(repository)).toBe(frozenTypescriptSdkDigest);
+  const backendContext = await completeBackendCustodyJourney(page, browserName);
+  await completeSdkQualification(page, evidence, browserName, context, backendContext);
 });
 
 test("browser evidence rejects unreviewed secret and cookie placements", async ({ browser }) => {
@@ -1213,7 +1258,7 @@ async function assertEvidenceConfinement(
     assertRuntimeCookieConfinement(snapshot, runtimeCookies);
     const initializedPages = new Set(
       snapshot.lifecycle
-        .filter(({ reason }) => reason !== "navigation")
+        .filter(({ reason }) => reason !== "navigation" && reason !== "final")
         .map(({ pageId }) => pageId),
     );
     expect(
@@ -1844,28 +1889,88 @@ async function assertPageSecretFree(page: Page, secrets: readonly SecretValue[])
     secrets,
   );
 }
-async function runSdkE2Es(
-  context: ProvisionedContext,
-  publishableKey: string,
+async function completeBackendCustodyJourney(
+  page: Page,
   browserName: "chromium" | "firefox",
-): Promise<readonly BrowserEvidenceSnapshot[]> {
+): Promise<ProvisionedContext> {
+  const backendContext = await provision(
+    page.request,
+    `${browserName}-backend-${Date.now().toString(36)}`,
+  );
+  const backendPublishableKey = backendContext.application.configuration.publishable_keys[0];
+  if (backendPublishableKey === undefined) throw new Error("backend Application has no key");
+  const backendParameters = new URLSearchParams({
+    application: backendContext.application.public_id,
+    claims_revision: String(backendContext.claimsRevision),
+    key: backendPublishableKey,
+    other_project: backendContext.otherProject.public_id,
+    project: backendContext.project.public_id,
+    runtime: runtimeBase,
+  });
+  await page.goto(`${applicationOrigin}/backend/start?${backendParameters.toString()}`);
+  await expect(page.getByRole("heading", { name: "E2E Application" })).toBeVisible();
+  await page.getByRole("button", { name: "Controlled Provider" }).click();
+  await expect(page.getByRole("heading", { name: "Backend-custody Application" })).toBeVisible();
+  await expect(page.getByText("Session verified")).toBeVisible();
+  await expect(page.getByText("verified", { exact: true })).toBeVisible();
+  await expect(page.getByText("rejected", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("2", { exact: true })).toBeVisible();
+  expect(page.url()).not.toMatch(/handoff|access_token|refresh_token/u);
+  await expect(page.locator("body")).not.toContainText(/eyJ[A-Za-z0-9_-]+\./u);
+
+  await page.getByRole("button", { name: "Application logout" }).click();
+  await expect(page.getByRole("heading", { name: "Backend session ended" })).toBeVisible();
+  await expect(page.getByRole("status")).toHaveText("Application logout was confirmed.");
+  return backendContext;
+}
+
+async function completeSdkQualification(
+  page: Page,
+  evidence: BrowserEvidence,
+  browserName: "chromium" | "firefox",
+  browserContext: ProvisionedContext,
+  backendContext: ProvisionedContext,
+): Promise<void> {
+  await assertEvidenceConfinement([evidence]);
+  const sdkResult = await runSdkE2Es(page.request, browserName);
+  expect(sdkResult.browserEvidence).toHaveLength(6);
+  await assertEvidenceConfinement([evidence], sdkResult.browserEvidence);
+  await writeBrowserEvidence(browserName, browserContext, backendContext, sdkResult);
+  const finalProviderCounts = await providerRequestCounts(page.request);
+  expect(finalProviderCounts.token_confinement_violations).toBe(0);
+  // Upstream credential revocation belongs to Chromium's managed-connection lifecycle. Firefox
+  // qualifies browser portability and the exact TypeScript artifact without repeating that server
+  // journey; Application and browser logout do not revoke the provider credential.
+  if (browserName === "chromium") {
+    expect(finalProviderCounts.revocation_requests).toBeGreaterThan(0);
+  }
+  expect(finalProviderCounts.userinfo_requests).toBeGreaterThan(0);
+  expect(await fileSha256(typescriptArchive)).toBe(frozenTypescriptSdkDigest);
+}
+
+async function runSdkE2Es(
+  request: APIRequestContext,
+  browserName: "chromium" | "firefox",
+): Promise<SdkE2EResult> {
   const repository = resolve(import.meta.dirname, "../../../..");
   const evidenceRunId = `${browserName}-${randomBytes(18).toString("base64url")}`;
-  const sharedEnvironment = {
-    ...process.env,
-    OWLAUTH_E2E_ALLOW_INSECURE_LOOPBACK: "1",
-    OWLAUTH_E2E_APPLICATION_ID: context.application.public_id,
-    OWLAUTH_E2E_PROJECT_ID: context.project.public_id,
-    OWLAUTH_E2E_PUBLISHABLE_KEY: publishableKey,
-    OWLAUTH_E2E_REDIRECT_URI: `${applicationOrigin}/sdk/callback`,
-  };
+  const typescriptContext = await provision(
+    request,
+    `${browserName}-sdk-typescript-${Date.now().toString(36)}`,
+  );
+  await resetSdkEvidence(typescriptContext);
+  const typescriptEnvironment = sdkEnvironment(typescriptContext);
   await runSdkCommand(
     repository,
     "TypeScript",
-    "pnpm",
-    ["--filter", "@owlauth/client", "test:e2e:built"],
+    "node",
+    [typescriptRunner],
     {
-      ...sharedEnvironment,
+      ...typescriptEnvironment,
+      OWLAUTH_E2E_EXPECTED_SDK_VERSION: typescriptVersion,
+      OWLAUTH_E2E_FAULT_PROXY_BASE: faultProxyBase,
+      OWLAUTH_E2E_FAULT_PROXY_TOKEN: faultProxyToken,
+      OWLAUTH_E2E_REPOSITORY: repository,
       OWLAUTH_E2E_BROWSER_DRIVER_TOKEN: browserDriverToken,
       OWLAUTH_E2E_BROWSER_DRIVER_URL: browserDriverUrl,
       OWLAUTH_E2E_BROWSER_EVIDENCE_RUN_ID: evidenceRunId,
@@ -1875,6 +1980,7 @@ async function runSdkE2Es(
     },
     "TypeScript real-server Project Auth E2E passed.",
   );
+  const typescriptMeasured = await measuredSdkEvidence(typescriptContext);
   const unauthorizedDrain = await fetch(new URL("/sdk/browser-evidence/drain", browserDriverUrl), {
     body: JSON.stringify({ runId: evidenceRunId }),
     headers: { "content-type": "application/json" },
@@ -1886,28 +1992,51 @@ async function runSdkE2Es(
   const browserEvidence = await drainSdkBrowserEvidence(evidenceRunId);
   expect(
     browserEvidence,
-    "TypeScript SDK must drive and report both browser journeys",
-  ).toHaveLength(2);
-  if (browserName !== "chromium") return browserEvidence;
+    "TypeScript SDK must report ordinary, replay/race, and fault-injected browser journeys",
+  ).toHaveLength(6);
+  if (browserName !== "chromium") {
+    return {
+      assignments: { typescript: assignment(typescriptContext) },
+      browserEvidence,
+      faultInjectedOperationIds: {
+        typescript: typescriptMeasured.faultInjectedOperationIds,
+      },
+      observedOperationIds: { typescript: typescriptMeasured.observedOperationIds },
+    };
+  }
 
   // Python and Rust exercise raw HTTP SDK transports; they are deliberately not
-  // represented as browser contexts in the confinement evidence union.
+  // represented as browser contexts in the confinement evidence union. Each receives
+  // a distinct Project/Application and therefore cannot share mutable credentials.
+  const pythonContext = await provision(request, `sdk-python-${Date.now().toString(36)}`);
+  await resetSdkEvidence(pythonContext);
   await runSdkCommand(
     repository,
     "Python",
-    "uv",
-    ["run", "--project", "sdks/python", "python", "sdks/python/tests/runtime_e2e.py"],
-    { ...sharedEnvironment, OWLAUTH_E2E_RUNTIME_URL: runtimeBase },
+    pythonExecutable,
+    [pythonRunner],
+    {
+      ...sdkEnvironment(pythonContext),
+      OWLAUTH_E2E_EXPECTED_SDK_VERSION: pythonVersion,
+      OWLAUTH_E2E_FAULT_PROXY_BASE: faultProxyBase,
+      OWLAUTH_E2E_FAULT_PROXY_TOKEN: faultProxyToken,
+      OWLAUTH_E2E_REPOSITORY: repository,
+      OWLAUTH_E2E_RUNTIME_URL: runtimeBase,
+      PYTHONNOUSERSITE: "1",
+    },
     "Python SDK real-Runtime Project Auth E2E passed",
   );
+  const pythonMeasured = await measuredSdkEvidence(pythonContext);
+  const rustContext = await provision(request, `sdk-rust-${Date.now().toString(36)}`);
+  await resetSdkEvidence(rustContext);
   await runSdkCommand(
     repository,
     "Rust",
     "cargo",
     [
       "test",
-      "-p",
-      "owlauth-client",
+      "--manifest-path",
+      rustManifest,
       "--test",
       "server_e2e",
       "--",
@@ -1916,13 +2045,191 @@ async function runSdkE2Es(
       "real_runtime_project_auth_lifecycle",
     ],
     {
-      ...sharedEnvironment,
+      ...sdkEnvironment(rustContext),
+      OWLAUTH_E2E_EXPECTED_SDK_VERSION: rustVersion,
+      OWLAUTH_E2E_FAULT_PROXY_BASE: faultProxyBase,
+      OWLAUTH_E2E_FAULT_PROXY_TOKEN: faultProxyToken,
       OWLAUTH_E2E_PROVIDER_KEY: "controlled-provider",
       OWLAUTH_E2E_RUNTIME_URL: runtimeBase,
     },
     "test real_runtime_project_auth_lifecycle ... ok",
   );
-  return browserEvidence;
+  const rustMeasured = await measuredSdkEvidence(rustContext);
+  return {
+    assignments: {
+      python: assignment(pythonContext),
+      rust: assignment(rustContext),
+      typescript: assignment(typescriptContext),
+    },
+    browserEvidence,
+    faultInjectedOperationIds: {
+      python: pythonMeasured.faultInjectedOperationIds,
+      rust: rustMeasured.faultInjectedOperationIds,
+      typescript: typescriptMeasured.faultInjectedOperationIds,
+    },
+    observedOperationIds: {
+      python: pythonMeasured.observedOperationIds,
+      rust: rustMeasured.observedOperationIds,
+      typescript: typescriptMeasured.observedOperationIds,
+    },
+  };
+}
+
+function assignment(context: ProvisionedContext): {
+  readonly application: string;
+  readonly project: string;
+} {
+  return {
+    application: context.application.public_id,
+    project: context.project.public_id,
+  };
+}
+
+function sdkEnvironment(context: ProvisionedContext): NodeJS.ProcessEnv {
+  const publishableKey = context.application.configuration.publishable_keys[0];
+  if (publishableKey === undefined) {
+    throw new Error("provisioned SDK Application has no publishable key");
+  }
+  const environment: NodeJS.ProcessEnv = {};
+  const inheritedNames = [
+    "ALL_PROXY",
+    "CARGO_HOME",
+    "CARGO_NET_OFFLINE",
+    "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+    "CARGO_TARGET_DIR",
+    "CI",
+    "DYLD_LIBRARY_PATH",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LD_LIBRARY_PATH",
+    "LOGNAME",
+    "NODE_OPTIONS",
+    "NO_COLOR",
+    "NO_PROXY",
+    "NPM_CONFIG_USERCONFIG",
+    "PATH",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+  ] as const;
+  for (const name of inheritedNames) {
+    const value = process.env[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  return {
+    ...environment,
+    OWLAUTH_E2E_ALLOW_INSECURE_LOOPBACK: "1",
+    OWLAUTH_E2E_APPLICATION_ID: context.application.public_id,
+    OWLAUTH_E2E_OTHER_APPLICATION_ID: context.otherApplication.public_id,
+    OWLAUTH_E2E_OTHER_PROJECT_ID: context.otherProject.public_id,
+    OWLAUTH_E2E_PROJECT_ID: context.project.public_id,
+    OWLAUTH_E2E_PUBLISHABLE_KEY: publishableKey,
+    OWLAUTH_E2E_REDIRECT_URI: `${applicationOrigin}/sdk/callback`,
+  };
+}
+
+async function resetSdkEvidence(context: ProvisionedContext): Promise<void> {
+  const url = sdkObservationUrl(context, "__e2e/observations/reset");
+  const response = await fetch(url, {
+    headers: { authorization: `Bearer ${faultProxyToken}` },
+    method: "POST",
+    redirect: "error",
+  });
+  expect(response.status).toBe(200);
+  const document = (await response.json()) as {
+    removedFaultInjectedOperationIds?: unknown;
+    removedObservedOperationIds?: unknown;
+  };
+  measuredOperationIds(
+    document.removedFaultInjectedOperationIds,
+    [],
+    "pre-candidate fault-injected",
+  );
+  measuredOperationIds(
+    document.removedObservedOperationIds,
+    ["get_project_jwks"],
+    "pre-candidate harness",
+  );
+
+  // This live mutation proves provisioning cannot satisfy candidate coverage. If a runner omits
+  // JWKS (or any other expected operation), the post-run exact-set check below must now fail.
+  const cleared = await sdkEvidenceDocument(context);
+  measuredOperationIds(cleared.faultInjectedOperationIds, [], "cleared fault-injected");
+  measuredOperationIds(cleared.observedOperationIds, [], "cleared ordinary");
+}
+
+async function measuredSdkEvidence(context: ProvisionedContext): Promise<MeasuredSdkEvidence> {
+  const document = await sdkEvidenceDocument(context);
+  return {
+    faultInjectedOperationIds: measuredOperationIds(
+      document.faultInjectedOperationIds,
+      expectedFaultOperationIds,
+      "fault-injected",
+    ),
+    observedOperationIds: measuredOperationIds(
+      document.observedOperationIds,
+      expectedOperationIds,
+      "ordinary",
+    ),
+  };
+}
+
+async function sdkEvidenceDocument(context: ProvisionedContext): Promise<{
+  readonly faultInjectedOperationIds?: unknown;
+  readonly observedOperationIds?: unknown;
+}> {
+  const response = await fetch(sdkObservationUrl(context, "__e2e/observations"), {
+    headers: { authorization: `Bearer ${faultProxyToken}` },
+    redirect: "error",
+  });
+  expect(response.status).toBe(200);
+  return (await response.json()) as {
+    faultInjectedOperationIds?: unknown;
+    observedOperationIds?: unknown;
+  };
+}
+
+function sdkObservationUrl(context: ProvisionedContext, path: string): URL {
+  const url = new URL(path, faultProxyBase);
+  url.searchParams.set("project_id", context.project.public_id);
+  url.searchParams.set("application_id", context.application.public_id);
+  return url;
+}
+
+function measuredOperationIds(
+  value: unknown,
+  expected: readonly string[],
+  label: string,
+): readonly string[] {
+  if (
+    !Array.isArray(value) ||
+    value.some((operation) => typeof operation !== "string") ||
+    new Set(value).size !== value.length
+  ) {
+    throw new Error(`${label} Runtime operation evidence is malformed`);
+  }
+  const measured = value as string[];
+  expect([...measured].sort(), `${label} Runtime operation evidence is incomplete`).toEqual(
+    [...expected].sort(),
+  );
+  return measured;
 }
 
 async function drainSdkBrowserEvidence(runId: string): Promise<readonly BrowserEvidenceSnapshot[]> {
@@ -2114,6 +2421,56 @@ async function control<T>(
   });
   expect(response.ok(), `${method} ${path}: ${await response.text()}`).toBe(true);
   return (await response.json()) as T;
+}
+
+async function writeBrowserEvidence(
+  browserName: "chromium" | "firefox",
+  browserContext: ProvisionedContext,
+  backendContext: ProvisionedContext,
+  sdkResult: SdkE2EResult,
+): Promise<void> {
+  const directory = process.env["OWLAUTH_E2E_EVIDENCE_DIRECTORY"];
+  if (directory === undefined || directory === "") return;
+  await mkdir(directory, { recursive: true });
+  const sdkNames = Object.keys(sdkResult.assignments).sort();
+  expect(Object.keys(sdkResult.faultInjectedOperationIds).sort()).toEqual(sdkNames);
+  expect(Object.keys(sdkResult.observedOperationIds).sort()).toEqual(sdkNames);
+  const document = {
+    assignments: {
+      backendCustody: assignment(backendContext),
+      browserDirect: assignment(browserContext),
+      sdks: Object.fromEntries(sdkNames.map((name) => [name, sdkResult.assignments[name]])),
+    },
+    browser: browserName,
+    candidates: {
+      python: { sha256: pythonSdkDigest, version: pythonVersion },
+      rust: { sha256: rustSdkDigest, version: rustVersion },
+      typescript: { sha256: frozenTypescriptSdkDigest, version: typescriptVersion },
+    },
+    evidence: {
+      exactArtifacts: true,
+      faultInjectedOperationIds: Object.fromEntries(
+        sdkNames.map((name) => [name, sdkResult.faultInjectedOperationIds[name]]),
+      ),
+      observedOperationIds: Object.fromEntries(
+        sdkNames.map((name) => [name, sdkResult.observedOperationIds[name]]),
+      ),
+      sharedRuntime: true,
+    },
+    schemaVersion: 1,
+    serverCommit: sourceCommit,
+    status: "passed",
+  };
+  await writeFile(
+    resolve(directory, `project-auth-${browserName}.json`),
+    `${JSON.stringify(document, null, 2)}\n`,
+  );
+}
+
+async function fileSha256(path: string): Promise<string> {
+  return createHash("sha256")
+    .update(await readFile(path))
+    .digest("hex");
 }
 
 function requiredEnvironment(name: string): string {

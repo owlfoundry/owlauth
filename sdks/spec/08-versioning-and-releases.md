@@ -10,7 +10,7 @@ The server, CLI, and every official SDK have separate SemVer, tags, artifacts, c
 | Python     | distribution `owlauth-client`, import `owlauth`  | `python-v{version}`     |
 | Rust       | crate `owlauth-client`, library `owlauth_client` | `rust-v{version}`       |
 
-An SDK release never requires synchronized server/CLI/other-SDK versions. Equal version numbers do not imply compatibility. Each SDK release identifies the Runtime Project Auth contract/server range it has actually tested.
+An SDK release never requires synchronized server/CLI/other-SDK versions. Equal version numbers do not imply compatibility. Current SDK evidence identifies one exact tested Runtime/source coordinate: source commit, Runtime contract digests, corpus digest, and archive digest. A broader server or contract range may be claimed only after separate evidence validates every supported boundary or an explicit compatibility rule.
 
 Current SDK packages are pre-alpha protocol clients with Project/Application-bound configuration and JWKS retrieval, Hosted login start, PKCE callback/handoff, atomic credential refresh, current-user, and logout operations. Pre-1.0 SemVer permits deliberate iteration but does not permit silent breaking changes or claims of framework session management, persistent storage, navigation, backend JWT verification, or production support.
 
@@ -31,7 +31,7 @@ Release notes and package metadata distinguish:
 - real-server E2E coverage;
 - production support, if and when explicitly declared.
 
-Compatibility is expressed by tested Runtime contract digest/range and required capability, not guessed from a server version string alone. An SDK fails clearly when a required Runtime capability is absent.
+Compatibility is expressed by tested Runtime contract coordinates and required capabilities, not guessed from a server version string alone. The initial evidence format proves an exact coordinate, not a range. An SDK fails clearly when a required Runtime capability is absent.
 
 ## Change classification
 
@@ -73,6 +73,23 @@ An SDK release branch/tag points at the current `main` commit under repository r
 
 A release that claims Project Auth behavior additionally starts a real `owlauth-server` Runtime and passes the corresponding SDK and cross-language E2E cases. Until then, CI labels package/unit/fixture/contract checks accurately; mocks are never promoted to E2E.
 
+### Immutable candidate and final evidence
+
+Release qualification is build-once and publish-the-same-bytes:
+
+1. The component job builds exactly one npm tarball, Python wheel, or Rust crate archive.
+2. A canonical candidate descriptor binds package coordinates, archive SHA-256 and bounded contents, source commit, workflow run/attempt, build configuration, full Runtime and claimed-surface contract digests, claimed operation IDs, and corpus digest. Rust also binds the exact crates.io upload metadata generated from that archive.
+3. Clean consumers download, digest-check, and install those exact bytes for every declared runtime/package matrix. A workspace import or rebuilt archive cannot satisfy this gate.
+4. The same tarball, wheel, and crate are installed into isolated consumers for the shared real-server Project Auth journey. Raw fragments record exact candidate identities, isolated Project/Application assignments, all observed operation IDs, and the allowlisted fault-injected operations.
+5. Aggregation requires complete package matrices, Chromium and Firefox TypeScript evidence, Chromium Python/Rust evidence, and one shared commit/run/contract/corpus coordinate. It emits one canonical final manifest per component.
+6. The release job verifies that manifest against its candidate, tag, version, source commit, run/attempt, matrices, capabilities, and same-server evidence.
+7. Registry publication uploads the already-qualified archive directly. It must not rebuild, repackage, or regenerate metadata between qualification and publication.
+8. The component final manifest is attached to the GitHub Release. Non-PR runs attest candidate archives/descriptors and final manifests through repository provenance.
+
+TypeScript publishes the qualified `.tgz` with `npm publish`; Python publishes the qualified wheel with the locked `uv`/Twine toolchain; Rust uploads the qualified `.crate` bytes through the reviewed direct-upload helper and its archive-bound metadata. Registry-specific trusted publishing authenticates the upload but does not replace the candidate/evidence binding.
+
+Final manifests list an operation as exact-artifact and same-server passed only when the raw same-server observed-operation set exactly equals the candidate's claimed operation set. TypeScript has Chromium and Firefox assignments; Python and Rust have Chromium assignments only. These manifests remain pre-alpha exact-coordinate evidence, not production certification.
+
 ## Generated contract coordination
 
 A server contract may change without an immediate SDK release. OpenAPI generation remains ephemeral. When an SDK does release generated changes, provenance records the exact contract and generator; drift review confirms Runtime-only surface and the required handwritten protocol-safety/error updates.
@@ -100,8 +117,8 @@ Clean installation verifies the public package/import/crate identity and only im
 ## Acceptance criteria
 
 - Tag, package metadata, and runtime-reported version agree.
-- Every release traces source, build, dependencies, generator, and Runtime contract digest.
-- Compatibility is explicit and independent of numeric equality.
+- Every release binds one immutable archive through its candidate descriptor, clean-consumer matrices, same-server fragments, final manifest, registry upload, and GitHub Release attachment; no post-qualification rebuild is permitted.
+- Compatibility is explicit, initially exact-coordinate, and independent of numeric equality.
 - Changelog and README truthfully distinguish scaffold, implemented operations, conformance, E2E, and production support.
 - The TypeScript release publishes one `@owlauth/client` artifact and does not imply a browser wrapper through package naming.
 - No SDK claims Project Auth capability before real-server validation of that capability.

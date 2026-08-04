@@ -88,6 +88,11 @@ def prepare_release(component: str, version: str, root: Path = Path(".")) -> Non
         set_locked_package_version(root / "Cargo.lock", "owlauth-cli", version)
     elif component == "typescript":
         set_json_version(root / "sdks/typescript/package.json", version)
+        replace_once(
+            root / "sdks/typescript/src/index.ts",
+            r'^export const VERSION = "[^"]+";$',
+            f'export const VERSION = "{version}";',
+        )
     elif component == "python":
         set_toml_version(root / "sdks/python/pyproject.toml", "project", version)
         set_locked_package_version(root / "uv.lock", "owlauth-client", version)

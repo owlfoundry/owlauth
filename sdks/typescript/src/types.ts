@@ -1,4 +1,5 @@
 const REDACTED = "[REDACTED]";
+const INTERNAL_CONSTRUCTOR = Symbol("owlauth.internal-constructor");
 
 abstract class SecretValue {
   readonly #value: string;
@@ -42,7 +43,7 @@ export class PkceVerifier extends SecretValue {
 export interface PublicProvider {
   readonly key: string;
   readonly displayName: string;
-  readonly kind: "oidc" | string;
+  readonly kind: "oidc" | "google" | "github";
 }
 
 export interface PublicApplicationConfiguration {
@@ -111,19 +112,23 @@ export class CredentialPair {
   readonly projectionRevision: number;
   readonly sessionExpiresAt: string;
 
-  constructor(value: {
-    projectId: string;
-    applicationId: string;
-    userId: string;
-    sessionId: string;
-    refreshGeneration: number;
-    accessToken: string;
-    refreshToken: string;
-    expiresIn: number;
-    projection: UserProjection;
-    projectionRevision: number;
-    sessionExpiresAt: string;
-  }) {
+  constructor(
+    token: typeof INTERNAL_CONSTRUCTOR,
+    value: {
+      projectId: string;
+      applicationId: string;
+      userId: string;
+      sessionId: string;
+      refreshGeneration: number;
+      accessToken: string;
+      refreshToken: string;
+      expiresIn: number;
+      projection: UserProjection;
+      projectionRevision: number;
+      sessionExpiresAt: string;
+    },
+  ) {
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("CredentialPair is created by Client.");
     this.projectId = value.projectId;
     this.applicationId = value.applicationId;
     this.userId = value.userId;
@@ -159,6 +164,10 @@ export class CredentialPair {
   }
 }
 
+export function createCredentialPair(value: ConstructorParameters<typeof CredentialPair>[1]): CredentialPair {
+  return new CredentialPair(INTERNAL_CONSTRUCTOR, value);
+}
+
 export class PendingLogin {
   readonly runtimeOrigin: string;
   readonly runtimeBasePath: string;
@@ -171,17 +180,21 @@ export class PendingLogin {
   readonly #verifier: PkceVerifier;
   #consumed = false;
 
-  constructor(value: {
-    runtimeOrigin: string;
-    runtimeBasePath: string;
-    projectId: string;
-    applicationId: string;
-    redirectUri: string;
-    state: string;
-    createdAt: number;
-    expiresAt: number;
-    verifier: PkceVerifier;
-  }) {
+  constructor(
+    token: typeof INTERNAL_CONSTRUCTOR,
+    value: {
+      runtimeOrigin: string;
+      runtimeBasePath: string;
+      projectId: string;
+      applicationId: string;
+      redirectUri: string;
+      state: string;
+      createdAt: number;
+      expiresAt: number;
+      verifier: PkceVerifier;
+    },
+  ) {
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("PendingLogin is created by Client.");
     this.runtimeOrigin = value.runtimeOrigin;
     this.runtimeBasePath = value.runtimeBasePath;
     this.projectId = value.projectId;
@@ -225,6 +238,10 @@ export class PendingLogin {
   }
 }
 
+export function createPendingLogin(value: ConstructorParameters<typeof PendingLogin>[1]): PendingLogin {
+  return new PendingLogin(INTERNAL_CONSTRUCTOR, value);
+}
+
 export interface LoginStartResult {
   readonly hostedUrl: string;
   readonly pending: PendingLogin;
@@ -232,19 +249,22 @@ export interface LoginStartResult {
 
 export class ValidatedCallback {
   readonly #handoff: string;
-  readonly #verifier: PkceVerifier;
+  readonly #pending: PendingLogin;
   #consumed = false;
 
-  constructor(handoff: string, verifier: PkceVerifier) {
+  constructor(token: typeof INTERNAL_CONSTRUCTOR, handoff: string, pending: PendingLogin) {
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("ValidatedCallback is created by Client.");
     this.#handoff = handoff;
-    this.#verifier = verifier;
+    this.#pending = pending;
   }
 
   /** @internal */
   consume(): { handoff: string; verifier: PkceVerifier } | null {
     if (this.#consumed) return null;
+    const verifier = this.#pending.consume();
+    if (verifier === null) return null;
     this.#consumed = true;
-    return { handoff: this.#handoff, verifier: this.#verifier };
+    return { handoff: this.#handoff, verifier };
   }
 
   toString(): string {
@@ -254,6 +274,10 @@ export class ValidatedCallback {
   toJSON(): Record<string, string> {
     return { handoff: REDACTED, verifier: REDACTED };
   }
+}
+
+export function createValidatedCallback(handoff: string, pending: PendingLogin): ValidatedCallback {
+  return new ValidatedCallback(INTERNAL_CONSTRUCTOR, handoff, pending);
 }
 
 export interface BrowserLogoutPreparation {

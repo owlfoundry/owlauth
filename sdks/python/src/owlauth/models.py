@@ -25,26 +25,41 @@ class _OneUseGuard:
                     "The pending login has already been used.",
                     retry=RetryDisposition.NEVER,
                     action=LocalAction.DISCARD_PENDING,
-                    operation="handoff",
+                    operation="exchange_handoff",
                 )
             self._consumed = True
 
 
-@dataclass(frozen=True, slots=True, repr=False)
 class SecretValue:
-    """A credential that is revealed only by an explicit method call."""
+    """A credential that is revealed only by an explicit method call.
 
-    _value: str
-    _kind: str = field(default="credential")
+    This is intentionally not a dataclass: generic ``dataclasses.asdict`` traversal must
+    preserve the redacted wrapper instead of expanding its private raw value.
+    """
+
+    __slots__ = ("__value", "__kind")
+
+    def __init__(self, value: str, kind: str = "credential") -> None:
+        if not isinstance(value, str) or not value:
+            raise ValueError("SecretValue requires non-empty text.")
+        self.__value = value
+        self.__kind = kind
 
     def reveal(self) -> str:
         """Return raw credential material for deliberate Application custody."""
-        return self._value
+        return self.__value
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(<redacted {self._kind}>)"
+        return f"{type(self).__name__}(<redacted {self.__kind}>)"
 
     __str__ = __repr__
+
+    def __copy__(self) -> SecretValue:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> SecretValue:
+        del memo
+        return self
 
 
 @dataclass(frozen=True, slots=True)

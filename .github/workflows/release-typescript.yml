@@ -50,6 +50,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+      id-token: write
+      attestations: write
 
   publish:
     name: Publish @owlauth/client
@@ -71,27 +73,63 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "24"
-      - name: Install pnpm
-        run: npm install --global pnpm@11.17.0
-      - name: Install and build
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm --filter @owlauth/client build
+      - name: Set up Python for candidate verification
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Download immutable SDK candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.ci.outputs.typescript-candidate-artifact-name }}
+          path: candidate
+      - name: Download final SDK evidence
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
+          path: final-evidence
       - name: Download release changelog
         uses: actions/download-artifact@v7
         with:
           name: typescript-release-notes
           path: release-metadata
-      - name: Re-verify release eligibility
-        run: scripts/release/verify-release.sh typescript >/dev/null
-      - name: Publish package with npm trusted publishing
-        working-directory: sdks/typescript
-        run: npm publish --access public --provenance
+      - name: Re-verify release and exact candidate
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          CANDIDATE_VERSION: ${{ needs.ci.outputs.typescript-candidate-version }}
+          ARCHIVE_SHA256: ${{ needs.ci.outputs.typescript-candidate-archive-sha256 }}
+          DESCRIPTOR_SHA256: ${{ needs.ci.outputs.typescript-candidate-descriptor-sha256 }}
+        run: |
+          scripts/release/verify-release.sh typescript >/dev/null
+          [[ "$CANDIDATE_VERSION" == "$VERSION" ]]
+          archive="candidate/owlauth-client-${VERSION}.tgz"
+          verified_sha="$(python scripts/release/verify-sdk-candidate.py \
+            --component typescript --version "$VERSION" --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-configuration typescript-npm-pack-v1 --tag "$GITHUB_REF_NAME" \
+            --descriptor candidate/candidate.json --archive "$archive")"
+          [[ "$verified_sha" == "$ARCHIVE_SHA256" ]]
+          actual_descriptor_sha="$(sha256sum candidate/candidate.json | cut -d ' ' -f 1)"
+          [[ "$actual_descriptor_sha" == "$DESCRIPTOR_SHA256" ]]
+      - name: Verify final Block E evidence
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          python scripts/release/verify-sdk-evidence.py \
+            --component typescript --version "$VERSION" --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --tag "$GITHUB_REF_NAME" --descriptor candidate/candidate.json \
+            --manifest final-evidence/typescript-final-evidence.json >/dev/null
+          cat final-evidence/summary.md >> release-metadata/release-notes.md
+      - name: Publish the qualified tarball with npm trusted publishing
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: npm publish "candidate/owlauth-client-${VERSION}.tgz" --access public --provenance
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           gh release create "typescript-v${VERSION}" \
+            final-evidence/typescript-final-evidence.json \
             --notes-file release-metadata/release-notes.md \
             --title "TypeScript SDK v${VERSION}"

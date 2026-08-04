@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "synthetic": true,
   "projection": {
     "user_id": "usr_conformance",
@@ -15,10 +15,30 @@
     "updated_at": "2099-01-01T00:00:00Z"
   },
   "invalidPatches": [
-    { "name": "non-canonical-status", "field": "status", "value": "disabled" },
-    { "name": "short-locale", "field": "locale", "value": "e" },
-    { "name": "structurally-invalid-locale", "field": "locale", "value": "en_US" },
-    { "name": "short-email", "field": "verified_email", "value": "ab" },
-    { "name": "control-character-email", "field": "verified_email", "value": "bad\u0007@example.test" }
+    {
+      "name": "non-canonical-status",
+      "field": "status",
+      "value": "disabled"
+    },
+    {
+      "name": "short-locale",
+      "field": "locale",
+      "value": "e"
+    },
+    {
+      "name": "structurally-invalid-locale",
+      "field": "locale",
+      "value": "en_US"
+    },
+    {
+      "name": "short-email",
+      "field": "verified_email",
+      "value": "ab"
+    },
+    {
+      "name": "control-character-email",
+      "field": "verified_email",
+      "value": "bad\u0007@example.test"
+    }
   ]
 }

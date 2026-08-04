@@ -1,13 +1,57 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
+  "requiredCaseNames": [
+    "public configuration preserves configured context",
+    "public configuration rejects context replacement",
+    "public configuration requires configured publishable key",
+    "public configuration rejects unknown provider kind",
+    "project JWKS accepts exact Ed25519 shape",
+    "project JWKS rejects duplicate key identifiers",
+    "login start accepts exact created status",
+    "unexpected success status is protocol failure",
+    "wrong response content type is rejected",
+    "missing response content type is rejected",
+    "malformed success JSON is rejected",
+    "empty success body is rejected",
+    "oversized success body is rejected",
+    "unknown runtime code without request id is conservative",
+    "public configuration rate limit is safely retryable",
+    "handoff rejection discards pending state",
+    "handoff rate limit does not permit replay",
+    "malformed handoff success is indeterminate",
+    "post-dispatch handoff timeout is indeterminate",
+    "refresh rejection invalidates credential family",
+    "refresh admission limit preserves submitted generation",
+    "refresh requires exact successor generation",
+    "post-dispatch refresh timeout is indeterminate",
+    "current user projection preserves context",
+    "current user unauthorized requires reauthentication",
+    "application logout sends no invented body",
+    "application logout admission limit preserves credentials",
+    "invalid logout success is indeterminate",
+    "browser logout preparation sends no invented body",
+    "malformed callback inspection preserves pending state",
+    "error callback never dispatches exchange",
+    "ambiguous callback is rejected before dispatch",
+    "pending expiry honors one minute skew then fails",
+    "read timeout before dispatch is caller decision",
+    "project JWKS rejects malformed Ed25519 material",
+    "handoff invalid UTF-8 success is indeterminate",
+    "refresh unexpected success status is indeterminate",
+    "refresh malformed rate limit is indeterminate",
+    "current user rejects expired session metadata"
+  ],
   "cases": [
     {
       "name": "public configuration preserves configured context",
-      "fixture": "../fixtures/public-application-config.json",
       "required": true,
       "capability": "public_configuration",
-      "operation": "public_configuration",
-      "minimumCorpusSchema": 2,
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/public-application-config.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
       "configuredContext": {
         "projectId": "prj_conformance",
         "applicationId": "app_conformance",
@@ -15,19 +59,28 @@
       },
       "expected": {
         "outcome": "success",
-        "projectId": "prj_conformance",
-        "applicationId": "app_conformance",
-        "providerKeys": ["oidc-main"],
-        "loginAvailable": true
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable",
+        "values": {
+          "projectId": "prj_conformance",
+          "applicationId": "app_conformance",
+          "providerKeys": [
+            "oidc-main"
+          ],
+          "loginAvailable": true
+        }
       }
     },
     {
       "name": "public configuration rejects context replacement",
-      "fixture": "../fixtures/public-application-config-context-mismatch.json",
       "required": true,
       "capability": "context_binding",
-      "operation": "public_configuration",
-      "minimumCorpusSchema": 2,
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/public-application-config-context-mismatch.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
       "configuredContext": {
         "projectId": "prj_conformance",
         "applicationId": "app_conformance",
@@ -38,113 +91,548 @@
         "category": "protocol",
         "code": "context_mismatch",
         "retry": "never",
-        "action": "none"
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
       }
     },
     {
-      "name": "handoff rejection discards pending state",
-      "fixture": "../fixtures/runtime-error-invalid-state.json",
+      "name": "public configuration requires configured publishable key",
       "required": true,
-      "capability": "handoff",
-      "operation": "handoff",
-      "minimumCorpusSchema": 2,
+      "capability": "context_binding",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/public-application-config-key-mismatch.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
       "expected": {
         "outcome": "error",
-        "category": "handoff",
-        "code": "invalid_state",
+        "category": "protocol",
+        "code": "context_mismatch",
         "retry": "never",
-        "action": "discard_pending"
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
       }
     },
     {
-      "name": "refresh rejection invalidates credential family",
-      "fixture": "../fixtures/runtime-error-invalid-state.json",
+      "name": "public configuration rejects unknown provider kind",
       "required": true,
-      "capability": "refresh",
-      "operation": "refresh",
-      "minimumCorpusSchema": 2,
+      "capability": "public_configuration",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/public-application-config-provider-unknown.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
       "expected": {
         "outcome": "error",
-        "category": "refresh",
-        "code": "invalid_state",
+        "category": "protocol",
+        "code": "invalid_response",
         "retry": "never",
-        "action": "invalidate_credentials"
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
       }
     },
     {
-      "name": "current user unauthorized requires reauthentication",
-      "fixture": "../fixtures/runtime-error-unauthorized.json",
+      "name": "project JWKS accepts exact Ed25519 shape",
       "required": true,
-      "capability": "current_user",
-      "operation": "current_user",
-      "minimumCorpusSchema": 2,
+      "capability": "project_jwks",
+      "operationId": "get_project_jwks",
+      "fixture": "../fixtures/project-jwks.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable",
+        "values": {
+          "keyIds": [
+            "synthetic-kid"
+          ],
+          "revision": 1,
+          "signingEpoch": 1
+        }
+      }
+    },
+    {
+      "name": "project JWKS rejects duplicate key identifiers",
+      "required": true,
+      "capability": "project_jwks",
+      "operationId": "get_project_jwks",
+      "fixture": "../fixtures/project-jwks-duplicate.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
       "expected": {
         "outcome": "error",
-        "category": "authentication",
-        "code": "unauthorized",
+        "category": "protocol",
+        "code": "invalid_response",
         "retry": "never",
-        "action": "reauthenticate"
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
       }
     },
     {
-      "name": "rate limit preserves bounded retry semantics",
-      "fixture": "../fixtures/runtime-error-rate-limited.json",
+      "name": "login start accepts exact created status",
+      "required": true,
+      "capability": "login_start",
+      "operationId": "start_login",
+      "fixture": "../fixtures/login-start.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "pendingDisposition": "preserved",
+        "credentialDisposition": "not_applicable",
+        "values": {
+          "pendingCreated": true
+        }
+      }
+    },
+    {
+      "name": "unexpected success status is protocol failure",
+      "required": true,
+      "capability": "response_framing",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/unexpected-success-status.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "wrong response content type is rejected",
+      "required": true,
+      "capability": "response_framing",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/wrong-content-type.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "missing response content type is rejected",
+      "required": true,
+      "capability": "response_framing",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/missing-content-type.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "malformed success JSON is rejected",
+      "required": true,
+      "capability": "response_framing",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/malformed-json.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "empty success body is rejected",
+      "required": true,
+      "capability": "response_framing",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/empty-body.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "oversized success body is rejected",
+      "required": true,
+      "capability": "response_framing",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/oversized-body.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "unknown runtime code without request id is conservative",
       "required": true,
       "capability": "errors",
-      "operation": "public_configuration",
-      "minimumCorpusSchema": 2,
-      "expected": {
-        "outcome": "error",
-        "category": "rate_limited",
-        "code": "rate_limited",
-        "retry": "safe_after_delay",
-        "action": "none"
-      }
-    },
-    {
-      "name": "unknown runtime code is conservative",
+      "operationId": "get_public_application_config",
       "fixture": "../fixtures/runtime-error-unknown.json",
-      "required": true,
-      "capability": "errors",
-      "operation": "public_configuration",
-      "minimumCorpusSchema": 2,
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
       "expected": {
         "outcome": "error",
         "category": "protocol",
         "code": "future_runtime_code",
         "retry": "never",
-        "action": "none"
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
       }
     },
     {
-      "name": "credential pair is atomic and redacted",
-      "fixture": "../fixtures/credential-pair.json",
+      "name": "public configuration rate limit is safely retryable",
       "required": true,
-      "capability": "credentials",
-      "operation": "credential_response",
-      "minimumCorpusSchema": 2,
+      "capability": "errors",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/runtime-error-rate-limited.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
       "configuredContext": {
         "projectId": "prj_conformance",
         "applicationId": "app_conformance",
         "publishableKey": "owl_app_conformance"
       },
       "expected": {
-        "outcome": "success",
+        "outcome": "error",
+        "category": "rate_limited",
+        "code": "rate_limited",
+        "retry": "safe_after_delay",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "handoff rejection discards pending state",
+      "required": true,
+      "capability": "handoff",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/runtime-error-invalid-state.json",
+      "precondition": "pending_login",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
         "projectId": "prj_conformance",
         "applicationId": "app_conformance",
-        "userId": "usr_conformance",
-        "refreshGeneration": 1,
-        "projectionRevision": 1,
-        "redacted": true
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "handoff",
+        "code": "invalid_state",
+        "retry": "never",
+        "action": "discard_pending",
+        "pendingDisposition": "discard_required",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "handoff rate limit does not permit replay",
+      "required": true,
+      "capability": "handoff",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/runtime-error-rate-limited.json",
+      "precondition": "pending_login",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "rate_limited",
+        "code": "rate_limited",
+        "retry": "never",
+        "action": "discard_pending",
+        "pendingDisposition": "discard_required",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "malformed handoff success is indeterminate",
+      "required": true,
+      "capability": "handoff",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/handoff-malformed-success.json",
+      "precondition": "pending_login",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_pending",
+        "pendingDisposition": "quarantined",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "post-dispatch handoff timeout is indeterminate",
+      "required": true,
+      "capability": "transport_phase",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/transport-timeout-after-dispatch.json",
+      "precondition": "pending_login",
+      "requestPhase": "possibly_dispatched",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "outcome_indeterminate",
+        "retry": "never",
+        "action": "quarantine_pending",
+        "pendingDisposition": "quarantined",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "refresh rejection invalidates credential family",
+      "required": true,
+      "capability": "refresh",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/runtime-error-invalid-state.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "refresh",
+        "code": "invalid_state",
+        "retry": "never",
+        "action": "invalidate_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "invalidated"
+      }
+    },
+    {
+      "name": "refresh admission limit preserves submitted generation",
+      "required": true,
+      "capability": "refresh",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/runtime-error-rate-limited.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "rate_limited",
+        "code": "rate_limited",
+        "retry": "application_decision",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "preserved"
+      }
+    },
+    {
+      "name": "refresh requires exact successor generation",
+      "required": true,
+      "capability": "refresh",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/credential-pair-skipped-generation.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
+      }
+    },
+    {
+      "name": "post-dispatch refresh timeout is indeterminate",
+      "required": true,
+      "capability": "transport_phase",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/transport-timeout-after-dispatch.json",
+      "precondition": "credential_pair",
+      "requestPhase": "possibly_dispatched",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "outcome_indeterminate",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
       }
     },
     {
       "name": "current user projection preserves context",
-      "fixture": "../fixtures/current-user.json",
       "required": true,
       "capability": "current_user",
-      "operation": "current_user_response",
-      "minimumCorpusSchema": 2,
+      "operationId": "get_current_user",
+      "fixture": "../fixtures/current-user.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
       "configuredContext": {
         "projectId": "prj_conformance",
         "applicationId": "app_conformance",
@@ -152,10 +640,386 @@
       },
       "expected": {
         "outcome": "success",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "preserved",
+        "values": {
+          "projectId": "prj_conformance",
+          "applicationId": "app_conformance",
+          "userId": "usr_conformance",
+          "projectionRevision": 1
+        }
+      }
+    },
+    {
+      "name": "current user unauthorized requires reauthentication",
+      "required": true,
+      "capability": "current_user",
+      "operationId": "get_current_user",
+      "fixture": "../fixtures/runtime-error-unauthorized.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
         "projectId": "prj_conformance",
         "applicationId": "app_conformance",
-        "userId": "usr_conformance",
-        "projectionRevision": 1
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "authentication",
+        "code": "unauthorized",
+        "retry": "never",
+        "action": "reauthenticate",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "reauthentication_required"
+      }
+    },
+    {
+      "name": "application logout sends no invented body",
+      "required": true,
+      "capability": "logout",
+      "operationId": "logout_application_session",
+      "fixture": "../fixtures/logout-success.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "cleared",
+        "values": {
+          "completed": true
+        }
+      }
+    },
+    {
+      "name": "application logout admission limit preserves credentials",
+      "required": true,
+      "capability": "logout",
+      "operationId": "logout_application_session",
+      "fixture": "../fixtures/runtime-error-rate-limited.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "rate_limited",
+        "code": "rate_limited",
+        "retry": "application_decision",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "preserved"
+      }
+    },
+    {
+      "name": "invalid logout success is indeterminate",
+      "required": true,
+      "capability": "logout",
+      "operationId": "logout_application_session",
+      "fixture": "../fixtures/logout-invalid-success.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
+      }
+    },
+    {
+      "name": "browser logout preparation sends no invented body",
+      "required": true,
+      "capability": "logout",
+      "operationId": "prepare_browser_logout",
+      "fixture": "../fixtures/browser-logout.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "preserved",
+        "values": {
+          "targetReturned": true
+        }
+      }
+    },
+    {
+      "name": "malformed callback inspection preserves pending state",
+      "required": true,
+      "capability": "callback",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/callback-malformed-then-success.json",
+      "precondition": "pending_login",
+      "requestPhase": "before_dispatch",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "pendingDisposition": "preserved",
+        "credentialDisposition": "not_applicable",
+        "values": {
+          "callbackValidated": true
+        }
+      }
+    },
+    {
+      "name": "error callback never dispatches exchange",
+      "required": true,
+      "capability": "callback",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/callback-error.json",
+      "precondition": "pending_login",
+      "requestPhase": "before_dispatch",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "handoff",
+        "code": "login_failed",
+        "retry": "never",
+        "action": "discard_pending",
+        "pendingDisposition": "discard_required",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "ambiguous callback is rejected before dispatch",
+      "required": true,
+      "capability": "callback",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/callback-ambiguous.json",
+      "precondition": "pending_login",
+      "requestPhase": "before_dispatch",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "handoff",
+        "code": "invalid_callback",
+        "retry": "never",
+        "action": "discard_pending",
+        "pendingDisposition": "preserved",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "pending expiry honors one minute skew then fails",
+      "required": true,
+      "capability": "callback",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/callback-expired.json",
+      "precondition": "pending_login",
+      "requestPhase": "before_dispatch",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "handoff",
+        "code": "pending_context_mismatch",
+        "retry": "never",
+        "action": "discard_pending",
+        "pendingDisposition": "preserved",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "read timeout before dispatch is caller decision",
+      "required": true,
+      "capability": "transport_phase",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/transport-timeout-before-dispatch.json",
+      "precondition": "none",
+      "requestPhase": "before_dispatch",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "timeout",
+        "code": "timeout",
+        "retry": "application_decision",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "project JWKS rejects malformed Ed25519 material",
+      "required": true,
+      "capability": "jwks",
+      "operationId": "get_project_jwks",
+      "fixture": "../fixtures/project-jwks-invalid-key.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "handoff invalid UTF-8 success is indeterminate",
+      "required": true,
+      "capability": "handoff",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/handoff-invalid-utf8.json",
+      "precondition": "pending_login",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_pending",
+        "pendingDisposition": "quarantined",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "refresh unexpected success status is indeterminate",
+      "required": true,
+      "capability": "refresh",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/refresh-unexpected-success-status.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
+      }
+    },
+    {
+      "name": "refresh malformed rate limit is indeterminate",
+      "required": true,
+      "capability": "refresh",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/refresh-malformed-rate-limit.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
+      }
+    },
+    {
+      "name": "current user rejects expired session metadata",
+      "required": true,
+      "capability": "current_user",
+      "operationId": "get_current_user",
+      "fixture": "../fixtures/current-user-expired-session.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "context_mismatch",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "preserved"
       }
     }
   ]

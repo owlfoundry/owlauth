@@ -52,8 +52,8 @@ jobs:
         run: |
           test -f docs/.vitepress/dist/sitemap.xml
           test -f docs/.vitepress/dist/robots.txt
-          grep -q 'https://owlauth.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
-          grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
+          grep -q 'https://owlauth-docs.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
+          grep -qx 'Sitemap: https://owlauth-docs.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
       - name: Dry-run documentation deployment
         run: pnpm --filter @owlauth/docs run deploy --dry-run
       - name: Upload documentation artifact

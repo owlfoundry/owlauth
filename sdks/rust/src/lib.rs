@@ -2,6 +2,9 @@
 
 //! Async, storage-free Project Auth protocol client for `OwlAuth` Runtime.
 
+/// Effective package version compiled into this crate.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod client;
 mod error;
 mod models;

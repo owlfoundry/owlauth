@@ -3,6 +3,9 @@ import {
   AccessToken,
   type BrowserLogoutPreparation,
   CredentialPair,
+  createCredentialPair,
+  createPendingLogin,
+  createValidatedCallback,
   type CurrentUser,
   type LoginStartResult,
   type OperationOptions,
@@ -85,6 +88,17 @@ function base64Url(bytes: Uint8Array): string {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
+function validEd25519Key(value: unknown): value is string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(value)) return false;
+  try {
+    const binary = atob(value.replaceAll("-", "+").replaceAll("_", "/") + "=");
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return bytes.byteLength === 32 && base64Url(bytes) === value;
+  } catch {
+    return false;
+  }
+}
+
 function exactState(left: string, right: string): boolean {
   const encoder = new TextEncoder();
   const a = encoder.encode(left);
@@ -134,13 +148,29 @@ function requireIdentifier(value: string, field: string, maximum = MAX_ID_LENGTH
 
 function parseProblem(value: unknown): RuntimeProblem | null {
   if (!isObject(value)) return null;
-  if (!boundedString(value["code"], 64) || !boundedString(value["message"], 256)) return null;
+  const fields = Object.keys(value);
+  if (
+    !fields.every((field) => ["code", "message", "request_id"].includes(field)) ||
+    !Object.hasOwn(value, "code") ||
+    !Object.hasOwn(value, "message") ||
+    !boundedString(value["code"], 64) ||
+    !/^[a-z][a-z0-9_]*$/u.test(value["code"]) ||
+    !boundedString(value["message"], 256)
+  ) {
+    return null;
+  }
   const requestId = value["request_id"];
-  if (requestId !== undefined && !boundedString(requestId, 128)) return null;
+  if (requestId !== undefined && typeof requestId !== "string") return null;
+  const allowedRequestId =
+    typeof requestId === "string" &&
+    boundedString(requestId, 128) &&
+    /^[A-Za-z0-9._:-]+$/u.test(requestId)
+      ? requestId
+      : undefined;
   return {
     code: value["code"],
     message: value["message"],
-    ...(typeof requestId === "string" ? { requestId } : {}),
+    ...(allowedRequestId === undefined ? {} : { requestId: allowedRequestId }),
   };
 }
 
@@ -149,16 +179,27 @@ function mapRuntimeError(
   status: number,
   policy: RequestPolicy,
 ): OwlAuthError {
-  const rateLimited = status === 429 || problem.code === "rate_limited";
+  if (status === 429 && problem.code === "rate_limited") {
+    const handoff = policy.operation === "exchange_handoff";
+    const callerDecision = [
+      "refresh_session",
+      "logout_application_session",
+      "prepare_browser_logout",
+    ].includes(policy.operation);
+    return new OwlAuthError({
+      category: "RateLimited",
+      code: problem.code,
+      message: "OwlAuth Runtime admission policy rejected the request.",
+      operation: policy.operation,
+      retry: handoff ? "never" : callerDecision ? "application_decision" : "safe_after_delay",
+      action: handoff ? "discard_pending" : "none",
+      ...(problem.requestId === undefined ? {} : { requestId: problem.requestId }),
+      status,
+    });
+  }
   const authentication = status === 401;
-  let category: ErrorCategory = rateLimited
-    ? "RateLimited"
-    : authentication
-      ? policy.operation === "refresh"
-        ? "Refresh"
-        : "Authentication"
-      : policy.category;
-  if (policy.operation === "refresh" && status >= 400 && status < 500) category = "Refresh";
+  let category: ErrorCategory = authentication ? "Authentication" : policy.category;
+  if (policy.operation === "refresh_session" && status >= 400 && status < 500) category = "Refresh";
   if (policy.operation === "exchange_handoff" && status >= 400 && status < 500) category = "Handoff";
   const action: CallerAction =
     category === "Refresh"
@@ -173,7 +214,7 @@ function mapRuntimeError(
     code: problem.code,
     message: "OwlAuth Runtime rejected the request.",
     operation: policy.operation,
-    retry: rateLimited ? "safe_after_delay" : "never",
+    retry: "never",
     action,
     ...(problem.requestId === undefined ? {} : { requestId: problem.requestId }),
     status,
@@ -206,7 +247,7 @@ async function readBounded(response: Response): Promise<unknown> {
     offset += chunk.byteLength;
   }
   if (length === 0) return null;
-  return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
 }
 
 function validProjectionLocale(value: unknown): value is string | null {
@@ -320,13 +361,13 @@ export class Client {
     const url = this.#url(path);
     url.searchParams.set("application_id", this.applicationId);
     const value = await this.#request(url, { method: "GET" }, options, {
-      operation: "get_public_configuration",
+      operation: "get_public_application_config",
       category: "Protocol",
       sensitive: false,
       action: "none",
       success: [200],
     });
-    if (!isObject(value)) throw this.#protocol("invalid_response", "get_public_configuration");
+    if (!isObject(value)) throw this.#protocol("invalid_response", "get_public_application_config");
     const providers = value["providers"];
     const keys = value["publishable_keys"];
     if (
@@ -345,18 +386,25 @@ export class Client {
       typeof value["email_magic_link_enabled"] !== "boolean" ||
       typeof value["login_available"] !== "boolean"
     ) {
-      throw this.#protocol("context_mismatch", "get_public_configuration");
+      throw this.#protocol("context_mismatch", "get_public_application_config");
     }
+    const providerKeys = new Set<string>();
     const mappedProviders: PublicProvider[] = providers.map((provider) => {
       if (
         !isObject(provider) ||
         !boundedString(provider["key"], 64) ||
+        providerKeys.has(provider["key"]) ||
         !boundedString(provider["display_name"], 128) ||
-        !boundedString(provider["kind"], 32)
+        !["oidc", "google", "github"].includes(String(provider["kind"]))
       ) {
-        throw this.#protocol("invalid_response", "get_public_configuration");
+        throw this.#protocol("invalid_response", "get_public_application_config");
       }
-      return { key: provider["key"], displayName: provider["display_name"], kind: provider["kind"] };
+      providerKeys.add(provider["key"]);
+      return {
+        key: provider["key"],
+        displayName: provider["display_name"],
+        kind: provider["kind"] as PublicProvider["kind"],
+      };
     });
     return {
       projectId: this.projectId,
@@ -390,18 +438,23 @@ export class Client {
     }
     const keys = value["keys"];
     if (!Array.isArray(keys) || keys.length > 100) throw this.#protocol("invalid_response", "get_project_jwks");
+    const keyIds = new Set<string>();
     const mapped: PublicJwk[] = keys.map((key) => {
       if (
         !isObject(key) ||
+        Object.keys(key).length !== 6 ||
+        !["kty", "crv", "alg", "use", "kid", "x"].every((field) => Object.hasOwn(key, field)) ||
         key["kty"] !== "OKP" ||
         key["crv"] !== "Ed25519" ||
         key["alg"] !== "EdDSA" ||
         key["use"] !== "sig" ||
         !boundedString(key["kid"], 128) ||
-        !boundedString(key["x"], 64)
+        keyIds.has(key["kid"]) ||
+        !validEd25519Key(key["x"])
       ) {
         throw this.#protocol("invalid_response", "get_project_jwks");
       }
+      keyIds.add(key["kid"]);
       return { kty: "OKP", crv: "Ed25519", alg: "EdDSA", use: "sig", kid: key["kid"], x: key["x"] };
     });
     return { keys: mapped, revision: value["revision"], signingEpoch: value["signing_epoch"] };
@@ -436,17 +489,19 @@ export class Client {
         }),
       },
       input,
-      { operation: "begin_login", category: "Login", sensitive: false, action: "discard_pending", success: [201] },
+      { operation: "start_login", category: "Login", sensitive: false, action: "discard_pending", success: [201] },
     );
     if (!isObject(value) || !boundedString(value["hosted_url"], 512) || !validDate(value["expires_at"])) {
-      throw this.#protocol("invalid_response", "begin_login");
+      throw this.#protocol("invalid_response", "start_login");
     }
-    const hosted = this.#serverUrl(value["hosted_url"], "begin_login");
+    const hosted = this.#serverUrl(value["hosted_url"], "start_login");
     const expiresAt = Date.parse(value["expires_at"]);
-    if (expiresAt <= createdAt) throw this.#protocol("invalid_response", "begin_login");
+    if (expiresAt < createdAt - 60_000 || expiresAt > createdAt + 660_000) {
+      throw this.#protocol("invalid_response", "start_login");
+    }
     return {
       hostedUrl: hosted.href,
-      pending: new PendingLogin({
+      pending: createPendingLogin({
         runtimeOrigin: this.#base.origin,
         runtimeBasePath: this.#base.pathname,
         projectId: this.projectId,
@@ -461,14 +516,13 @@ export class Client {
   }
 
   validateCallback(callbackUrl: string, pending: PendingLogin): ValidatedCallback {
-    const verifier = pending.consume();
-    if (verifier === null) throw this.#handoff("pending_consumed");
+    if (pending.consumed) throw this.#handoff("pending_consumed");
     if (
       pending.runtimeOrigin !== this.#base.origin ||
       pending.runtimeBasePath !== this.#base.pathname ||
       pending.projectId !== this.projectId ||
       pending.applicationId !== this.applicationId ||
-      this.#now() >= pending.expiresAt
+      this.#now() > pending.expiresAt + 60_000
     ) {
       throw this.#handoff("pending_context_mismatch");
     }
@@ -479,20 +533,26 @@ export class Client {
       throw this.#handoff("invalid_callback");
     }
     const handoffs = callback.searchParams.getAll("handoff");
+    const errors = callback.searchParams.getAll("error");
     const states = callback.searchParams.getAll("state");
     if (
       callback.hash !== "" ||
-      handoffs.length !== 1 ||
       states.length !== 1 ||
-      !boundedString(handoffs[0], MAX_HANDOFF_LENGTH) ||
-      !exactState(states[0] ?? "", pending.state)
+      !exactState(states[0] ?? "", pending.state) ||
+      (handoffs.length === 1) === (errors.length === 1) ||
+      handoffs.length > 1 ||
+      errors.length > 1 ||
+      (handoffs.length === 1 && !boundedString(handoffs[0], MAX_HANDOFF_LENGTH)) ||
+      (errors.length === 1 && !boundedString(errors[0], 64))
     ) {
       throw this.#handoff("invalid_callback");
     }
     callback.searchParams.delete("handoff");
+    callback.searchParams.delete("error");
     callback.searchParams.delete("state");
     if (callback.href !== pending.redirectUri) throw this.#handoff("redirect_mismatch");
-    return new ValidatedCallback(handoffs[0], verifier);
+    if (errors.length === 1) throw this.#handoff("login_failed");
+    return createValidatedCallback(handoffs[0]!, pending);
   }
 
   async exchangeHandoff(
@@ -528,7 +588,7 @@ export class Client {
   }
 
   async refresh(credentials: CredentialPair, options: OperationOptions = {}): Promise<CredentialPair> {
-    this.#credentialContext(credentials, "refresh");
+    this.#credentialContext(credentials, "refresh_session");
     const value = await this.#request(
       this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/sessions/refresh`),
       {
@@ -541,15 +601,15 @@ export class Client {
         }),
       },
       options,
-      { operation: "refresh", category: "Refresh", sensitive: true, action: "quarantine_credentials", success: [200] },
+      { operation: "refresh_session", category: "Refresh", sensitive: true, action: "quarantine_credentials", success: [200] },
     );
-    const successor = this.#credentials(value, "refresh", "quarantine_credentials");
+    const successor = this.#credentials(value, "refresh_session", "quarantine_credentials");
     if (
       successor.sessionId !== credentials.sessionId ||
       successor.userId !== credentials.userId ||
-      successor.refreshGeneration <= credentials.refreshGeneration
+      successor.refreshGeneration !== credentials.refreshGeneration + 1
     ) {
-      throw this.#protocol("credential_generation_mismatch", "refresh", 200, "quarantine_credentials");
+      throw this.#indeterminate("invalid_response_after_dispatch", "refresh_session", "quarantine_credentials", 200);
     }
     return successor;
   }
@@ -559,27 +619,28 @@ export class Client {
       this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/users/me`),
       { method: "GET", headers: { authorization: `Bearer ${accessToken.expose()}` } },
       options,
-      { operation: "current_user", category: "Authentication", sensitive: false, action: "reauthenticate", success: [200] },
+      { operation: "get_current_user", category: "Authentication", sensitive: false, action: "reauthenticate", success: [200] },
     );
-    if (!isObject(value)) throw this.#protocol("invalid_response", "current_user");
+    if (!isObject(value)) throw this.#protocol("invalid_response", "get_current_user");
     if (
       value["project_id"] !== this.projectId ||
       value["application_id"] !== this.applicationId ||
       !boundedString(value["user_id"], 96) ||
       !positiveInteger(value["projection_revision"]) ||
       !validDate(value["authenticated_at"]) ||
-      !validDate(value["session_expires_at"])
+      !validDate(value["session_expires_at"]) ||
+      Date.parse(value["session_expires_at"]) < this.#now() - 60_000
     ) {
-      throw this.#protocol("context_mismatch", "current_user");
+      throw this.#protocol("context_mismatch", "get_current_user");
     }
     let projection: UserProjection;
     try {
       projection = parseProjection(value["projection"]);
     } catch {
-      throw this.#protocol("invalid_response", "current_user");
+      throw this.#protocol("invalid_response", "get_current_user");
     }
     if (projection.userId !== value["user_id"] || projection.projectionRevision !== value["projection_revision"]) {
-      throw this.#protocol("context_mismatch", "current_user");
+      throw this.#protocol("context_mismatch", "get_current_user");
     }
     return {
       projectId: this.projectId,
@@ -597,9 +658,11 @@ export class Client {
       this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/sessions/logout`),
       { method: "POST", headers: { authorization: `Bearer ${accessToken.expose()}` } },
       options,
-      { operation: "logout_application", category: "Session", sensitive: true, action: "quarantine_credentials", success: [200] },
+      { operation: "logout_application_session", category: "Session", sensitive: true, action: "quarantine_credentials", success: [200] },
     );
-    if (!isObject(value) || value["completed"] !== true) throw this.#protocol("invalid_response", "logout_application");
+    if (!isObject(value) || value["completed"] !== true) {
+      throw this.#indeterminate("invalid_response_after_dispatch", "logout_application_session", "quarantine_credentials", 200);
+    }
   }
 
   async prepareBrowserLogout(
@@ -613,7 +676,12 @@ export class Client {
       { operation: "prepare_browser_logout", category: "Session", sensitive: true, action: "quarantine_credentials", success: [201] },
     );
     if (!isObject(value) || !boundedString(value["hosted_url"], 512) || !validDate(value["expires_at"])) {
-      throw this.#protocol("invalid_response", "prepare_browser_logout");
+      throw this.#indeterminate("invalid_response_after_dispatch", "prepare_browser_logout", "quarantine_credentials", 201);
+    }
+    const expiresAt = Date.parse(value["expires_at"]);
+    const receivedAt = this.#now();
+    if (expiresAt < receivedAt - 60_000 || expiresAt > receivedAt + 120_000) {
+      throw this.#indeterminate("invalid_response_after_dispatch", "prepare_browser_logout", "quarantine_credentials", 201);
     }
     return { hostedUrl: this.#serverUrl(value["hosted_url"], "prepare_browser_logout").href, expiresAt: value["expires_at"] };
   }
@@ -674,7 +742,7 @@ export class Client {
   }
 
   #credentials(value: unknown, operation: string, action: CallerAction): CredentialPair {
-    if (!isObject(value)) throw this.#protocol("invalid_response", operation, 200, action);
+    if (!isObject(value)) throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
     if (
       value["project_id"] !== this.projectId ||
       value["application_id"] !== this.applicationId ||
@@ -685,21 +753,26 @@ export class Client {
       !boundedString(value["refresh_token"], 256) ||
       value["token_type"] !== "Bearer" ||
       !positiveInteger(value["expires_in"]) ||
+      value["expires_in"] > 3_600 ||
       !positiveInteger(value["projection_revision"]) ||
       !validDate(value["session_expires_at"])
     ) {
-      throw this.#protocol("context_mismatch", operation, 200, action);
+      throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
     }
     let projection: UserProjection;
     try {
       projection = parseProjection(value["projection"]);
     } catch {
-      throw this.#protocol("invalid_response", operation, 200, action);
+      throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
     }
     if (projection.userId !== value["user_id"] || projection.projectionRevision !== value["projection_revision"]) {
-      throw this.#protocol("context_mismatch", operation, 200, action);
+      throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
     }
-    return new CredentialPair({
+    const sessionExpiresAt = Date.parse(value["session_expires_at"]);
+    if (sessionExpiresAt < this.#now() - 60_000) {
+      throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
+    }
+    return createCredentialPair({
       projectId: this.projectId,
       applicationId: this.applicationId,
       userId: value["user_id"],
@@ -761,45 +834,52 @@ export class Client {
         credentials: "omit",
         headers: { accept: "application/json", ...init.headers },
       });
-      const quarantineAction =
-        policy.sensitive && policy.success.includes(response.status) ? policy.action : "none";
-      const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim();
+      const invalidAction = policy.sensitive ? policy.action : "none";
+      const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
       if (response.redirected || contentType !== "application/json") {
-        throw this.#protocol("invalid_response", policy.operation, response.status, quarantineAction);
+        throw this.#invalidResponse(policy, response.status, invalidAction);
       }
       if (response.url !== "") {
         let responseUrl: URL;
         try {
           responseUrl = new URL(response.url);
         } catch {
-          throw this.#protocol("invalid_response", policy.operation, response.status, quarantineAction);
+          throw this.#invalidResponse(policy, response.status, invalidAction);
         }
         if (
           responseUrl.origin !== this.#base.origin ||
           !responseUrl.pathname.startsWith(this.#base.pathname)
         ) {
-          throw this.#protocol("response_origin_mismatch", policy.operation, response.status, quarantineAction);
+          throw this.#invalidResponse(policy, response.status, invalidAction);
         }
       }
       let value: unknown;
       try {
         value = await readBounded(response);
       } catch {
-        throw this.#protocol("invalid_response", policy.operation, response.status, quarantineAction);
+        throw this.#invalidResponse(policy, response.status, invalidAction);
       }
       if (!policy.success.includes(response.status)) {
+        if (response.status >= 200 && response.status < 300) {
+          throw this.#invalidResponse(policy, response.status, invalidAction);
+        }
         const problem = parseProblem(value);
-        if (problem === null) throw this.#protocol("invalid_error_response", policy.operation, response.status);
+        if (problem === null) throw this.#invalidResponse(policy, response.status, invalidAction);
+        if (policy.sensitive && response.status >= 500) {
+          throw this.#indeterminate("runtime_5xx_after_dispatch", policy.operation, policy.action, response.status);
+        }
         throw mapRuntimeError(problem, response.status, policy);
       }
       return value;
     } catch (error) {
       if (error instanceof OwlAuthError) throw error;
-      const cancelled = Boolean(options.signal?.aborted);
+      if (error instanceof DOMException && error.name === "TimeoutError") timedOut = true;
+      const cancelled = Boolean(options.signal?.aborted) ||
+        (error instanceof DOMException && error.name === "AbortError");
       if (policy.sensitive && dispatched) {
         throw new OwlAuthError({
           category: "Indeterminate",
-          code: timedOut ? "timeout_after_dispatch" : cancelled ? "cancelled_after_dispatch" : "transport_after_dispatch",
+          code: "outcome_indeterminate",
           message: "Runtime may have committed the one-use operation; do not retry it.",
           operation: policy.operation,
           retry: "never",
@@ -820,6 +900,24 @@ export class Client {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
     }
+  }
+
+  #invalidResponse(policy: RequestPolicy, status: number, action: CallerAction): OwlAuthError {
+    return policy.sensitive
+      ? this.#indeterminate("invalid_response_after_dispatch", policy.operation, action, status)
+      : this.#protocol("invalid_response", policy.operation, status);
+  }
+
+  #indeterminate(code: string, operation: string, action: CallerAction, status?: number): OwlAuthError {
+    return new OwlAuthError({
+      category: "Indeterminate",
+      code,
+      message: "Runtime may have committed the operation; do not replay it.",
+      operation,
+      retry: "never",
+      action,
+      ...(status === undefined ? {} : { status }),
+    });
   }
 
   #protocol(
@@ -844,7 +942,7 @@ export class Client {
       category: "Handoff",
       code,
       message: "The login callback cannot be used.",
-      operation: "validate_callback",
+      operation: "exchange_handoff",
       retry: "never",
       action: "discard_pending",
     });

@@ -1,11 +1,22 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "synthetic": true,
-  "responseStatus": 401,
-  "response": {
-    "code": "unauthorized",
-    "message": "Synthetic authentication rejection. SENTINEL_ACCESS_TOKEN_MUST_NOT_LEAK",
-    "request_id": "req_conformance_unauthorized"
+  "exchange": {
+    "kind": "http",
+    "status": 401,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "json",
+      "value": {
+        "code": "unauthorized",
+        "message": "Synthetic authentication rejection. SENTINEL_ACCESS_TOKEN_MUST_NOT_LEAK",
+        "request_id": "req_conformance_unauthorized"
+      }
+    }
   },
-  "redactionSentinels": ["SENTINEL_ACCESS_TOKEN_MUST_NOT_LEAK"]
+  "redactionSentinels": [
+    "SENTINEL_ACCESS_TOKEN_MUST_NOT_LEAK"
+  ]
 }

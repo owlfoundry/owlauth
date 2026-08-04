@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://owlauth.owlfoundry.org/sitemap.xml
+Sitemap: https://owlauth-docs.owlfoundry.org/sitemap.xml

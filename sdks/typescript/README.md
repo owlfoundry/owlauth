@@ -39,6 +39,10 @@ const credentials = await owlauth.completeLogin(window.location.href, pending);
 
 `PendingLogin`, `ValidatedCallback`, `CredentialPair`, and token wrappers redact protocol secrets from `toString()` and JSON output. Raw tokens are available only through the deliberate `expose()` method.
 
+### Migration notes
+
+`PendingLogin`, `CredentialPair`, and `ValidatedCallback` are Client-produced values and can no longer be constructed by callers. `PkceVerifier` is no longer exported from the package root. Applications should retain the values returned by `beginLogin`, `validateCallback`, `completeLogin`, and `refresh` rather than reconstructing secret-bearing lifecycle state. Malformed callback inspection preserves pending state, while exchange consumes it atomically. A malformed or context-invalid success response received after a sensitive operation was dispatched is now reported as `Indeterminate` with code `invalid_response_after_dispatch`, because the remote commit cannot be disproved.
+
 ## Credential lifecycle
 
 ```typescript
@@ -81,21 +85,21 @@ Every network method accepts `{ signal, timeoutMs }`. Client construction also a
 
 Unknown Runtime codes remain conservative and non-retryable. Raw response bodies, callback URLs, tokens, handoff tickets, and PKCE verifiers are never copied into public errors.
 
-## Explicit real-server E2E entry
+## Real-server and exact-artifact qualification
 
-`pnpm test:e2e` is a separate executable suite and never silently skips. It requires one already provisioned real Runtime, Application, signing key, and controlled standards-compatible provider:
+`pnpm test` and `pnpm check` exercise workspace source, mock transports, and the shared conformance corpus. They are not registry-artifact or end-to-end evidence.
 
-- `OWLAUTH_E2E_RUNTIME_BASE_URL`
-- `OWLAUTH_E2E_PROJECT_ID`
-- `OWLAUTH_E2E_APPLICATION_ID`
-- `OWLAUTH_E2E_PUBLISHABLE_KEY`
-- `OWLAUTH_E2E_REDIRECT_URI`
-- `OWLAUTH_E2E_BROWSER_DRIVER_URL`
-- optional `OWLAUTH_E2E_PROVIDER_KEY`
-- optional `OWLAUTH_E2E_BROWSER_DRIVER_TOKEN`
-- `OWLAUTH_E2E_ALLOW_INSECURE_LOOPBACK=1` only for explicit loopback development HTTP
+From a clean repository root, run:
 
-The browser-driver endpoint accepts `{ hostedUrl, redirectUri, providerKey }`, performs a real top-level browser journey through the embedded Hosted UI and controlled provider without intercepting Runtime, and returns bounded JSON `{ callbackUrl }`. The SDK suite then performs callback validation, handoff exchange, current-user, refresh rotation, replay-family rejection, Application logout, and post-logout rejection through the public SDK.
+```bash
+make web-e2e
+```
+
+The repository gate generates current Runtime contract provenance, builds one npm tarball and canonical candidate descriptor, verifies both digests, installs the tarball in an external consumer, and runs that exact package against one real OwlAuth topology in Chromium and Firefox. It provisions a distinct Project/Application for TypeScript, checks wrong-context rejection, and covers all eight claimed operations, one-use replay/concurrent-refresh behavior, Application and browser logout, and dropped committed responses for handoff, refresh, and logout.
+
+The internal `test/e2e-real-server.mjs` runner intentionally rejects a package resolved inside the repository. It is copied into the clean consumer by the product harness and receives bounded isolation, browser-driver, evidence-run, expected-version, and loopback fault-proxy values from that harness. The browser driver accepts `{ hostedUrl, redirectUri, providerKey, browserName, evidenceRunId }`, performs a real top-level journey without intercepting Runtime, and returns bounded `{ callbackUrl }` data. Do not invoke the workspace runner or a manually installed package as exact-artifact evidence.
+
+CI separately qualifies the same candidate under Node.js 20, 22, and 24 plus a Vite 8.1.5 production bundle, then binds those fragments and the Chromium/Firefox journeys into the component final evidence manifest. A final manifest proves one exact source/Runtime/archive coordinate; it is not a broad compatibility or production-support claim.
 
 ## Application responsibilities
 
@@ -109,6 +113,8 @@ The core SDK intentionally does not own:
 - JWT trust verification for an Application backend.
 
 See the language-neutral [SDK specifications](https://github.com/owlfoundry/owlauth/tree/main/sdks/spec) and [security policy](https://github.com/owlfoundry/owlauth/blob/main/SECURITY.md).
+
+The root package exports `VERSION`; exact-artifact qualification requires it to equal the installed npm package version.
 
 ## License
 

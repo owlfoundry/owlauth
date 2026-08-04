@@ -3,7 +3,7 @@
 This guide helps contributors run and inspect the current pre-alpha implementation. It is not a production deployment guide.
 
 ::: warning Current capability
-`owlauth-server` provides isolated Runtime and Control listeners over PostgreSQL, automatic or verification-only embedded migrations, strict OIDC Project login, Hosted Authentication, PKCE handoff, Project JWT/session/refresh/logout behavior, provisioning and lifecycle Control APIs, and an embedded Management Console. Three pre-alpha SDKs consume the Runtime protocol. Passwordless email, managed profile synchronization, projection webhooks, SCIM/bulk directory, and remote MCP are not implemented.
+`owlauth-server` provides isolated Runtime and Control listeners over PostgreSQL, automatic or verification-only embedded migrations, OIDC and passwordless-email Project login, Hosted Authentication, PKCE handoff, Project JWT/session/refresh/logout behavior, managed provider connections and bounded profile synchronization, revisioned Application projections with signed durable webhooks, provisioning/lifecycle Control APIs, an embedded Management Console, and an optional remote Control MCP endpoint. Three pre-alpha SDKs consume the Runtime protocol. These surfaces are implemented but not production-supported. SCIM, bulk directory/export, SaaS tenant control, and general downstream OAuth-provider behavior are not implemented.
 :::
 
 ## Prerequisites
@@ -38,9 +38,9 @@ make build
 make package-check
 ```
 
-The targets cover formatting and linting, Rust/Python/TypeScript unit tests, package metadata, release and installer checks, documentation, artifacts, and distribution contents. See the repository [`Makefile`](https://github.com/owlfoundry/owlauth/blob/main/Makefile) for the exact commands.
+These targets cover formatting and linting, Rust/Python/TypeScript unit tests, package metadata, release and installer tooling, documentation, generated assets, and distribution contents. See the repository [`Makefile`](https://github.com/owlfoundry/owlauth/blob/main/Makefile) for the exact commands.
 
-These checks include unit, conformance, package, generated-asset, real PostgreSQL/provider/browser, and product-topology evidence. They do not constitute production certification for a particular deployment.
+They do not run every CI runtime matrix or the long real PostgreSQL/provider/browser gate. Run `make web-e2e` separately for the local exact-artifact product topology. Neither local command set constitutes production certification for a deployment.
 
 ## Run the development topology
 
@@ -58,7 +58,7 @@ For the fastest executable proof of a correctly provisioned topology, run:
 make web-e2e
 ```
 
-That gate creates isolated PostgreSQL state, starts real Runtime and Control processes, provisions Project Auth resources, uses a controlled OIDC provider through the production adapter, and exercises browser-direct and backend-custody Application journeys. `/health` is liveness only; use `/ready` for selected-plane readiness.
+The command requires a clean worktree so archive bytes can be bound honestly to `HEAD`. It generates current Runtime contract provenance, builds one TypeScript tarball, Python wheel, and Rust crate, creates digest-bound candidate descriptors, installs the exact candidates into external clean consumers, and then runs Chromium and Firefox. The gate creates isolated PostgreSQL state, starts real Runtime and Control processes, provisions distinct Project Auth resources, uses a controlled OIDC provider through the production adapter, and exercises browser-direct, backend-custody, and all three SDK journeys against one server topology. `/health` is liveness only; use `/ready` for selected-plane readiness.
 
 ## Generate OpenAPI documents
 
@@ -88,7 +88,7 @@ Published images use `ghcr.io/owlfoundry/owlauth`:
 
 ## Install the CLI
 
-The published CLI currently supports release-backed self-update, not Project administration.
+The published CLI supports descriptor-pinned self-hosted administration and checksum-verified self-update. It discovers and pins the endpoint product/instance before reading a credential; it does not infer a product from command failures or access OwlAuth storage directly.
 
 ### Unix-like systems
 
@@ -106,11 +106,19 @@ Both installers download a native archive from a `cli-v{version}` GitHub Release
 
 ```bash
 owlauth --version
+owlauth profile add local --endpoint https://identity.example --yes
+owlauth --profile local system
+owlauth --profile local project list
+owlauth --profile local application list PROJECT_ID
+owlauth --profile local provider list PROJECT_ID
+owlauth --profile local signing-key list PROJECT_ID
+owlauth --profile local projection-policy get PROJECT_ID --application-id APPLICATION_ID
+owlauth --profile local webhook endpoint list PROJECT_ID APPLICATION_ID
 owlauth update --dry-run
 owlauth update
 ```
 
-Do not expect `project`, `application`, `provider`, `user`, or other Control commands. Those commands require an implemented, authenticated Control API and are intentionally absent.
+Self-hosted commands use the deployment operator credential and therefore carry full Control authority. Supply it only through an approved prompt, protected descriptor, OS credential store, or secret provider—not ordinary arguments, shell history, or agent context. Audit export and SaaS tenant commands remain deferred.
 
 ## Release identities
 
@@ -128,4 +136,4 @@ Tags point at the selected `main` commit; release workflows materialize componen
 
 ## Follow the architecture
 
-The architecture under [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec) is normative behavior, not a command reference. Start with [Architecture](/guide/architecture), [Security](/guide/security), and [SDKs](/guide/sdks). Explicitly deferred capabilities remain documented rather than implied by the implemented pre-alpha surface.
+The architecture under [`spec/`](https://github.com/owlfoundry/owlauth/tree/main/spec) is normative behavior, not a command reference. Start with [Architecture](/guide/architecture), [Security](/guide/security), and [SDKs](/guide/sdks). Implemented pre-alpha behavior and explicitly deferred capabilities are stated separately; implementation does not imply production support.

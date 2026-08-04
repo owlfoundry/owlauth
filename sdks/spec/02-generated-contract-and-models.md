@@ -2,16 +2,20 @@
 
 ## Contract authority
 
-SDK generation consumes an OpenAPI document emitted from the exact OwlAuth server revision under validation:
+The SDK contract pipeline exports OpenAPI 3.1 documents from the exact `owlauth-types` revision under validation:
 
 ```bash
 cargo run --locked --package owlauth-types --bin export-openapi -- \
   runtime <temporary-build-path>/runtime-openapi.json
+cargo run --locked --package owlauth-types --bin export-openapi -- \
+  control <temporary-build-path>/control-openapi.json
 ```
 
-The OpenAPI file is derived from reviewed public DTOs in `crates/owlauth-types` and is never committed. CI/release provenance records the source revision, server version, generator version/configuration, and contract digest.
+The complete documents are derived from reviewed public DTOs in `crates/owlauth-types`, are generated without compiling `owlauth-server`, and are never committed. `sdks/spec/contract/sdk-surface.json` explicitly selects the Runtime Project Auth operations claimed by the official SDKs. `scripts/sdk-contract.py` recursively selects their wire-relevant operation and component graph, removes non-wire document annotations, writes the reviewed deterministic snapshot `sdks/spec/contract/runtime-project-auth.normalized.json`, and checks it in CI.
 
-The current pre-alpha SDKs implement the reviewed Runtime Project Auth operations through handwritten protocol-safety layers over the public wire contract. Generated models alone are still not evidence of correct PKCE custody, one-use handoff/refresh behavior, context isolation, redaction, or server interoperability.
+The normalized snapshot is a reviewed derivative and drift baseline, not a second server contract. The full Runtime digest is provenance only: an unrelated additive Runtime operation changes provenance but does not silently expand or block the SDK surface. Any selected-surface drift fails CI with an explicit client-review diagnostic until compatibility, all three adapters, shared cases, and documentation are reviewed together. Any claimed Control operation or operator security scheme fails unconditionally.
+
+The pre-alpha SDKs retain handwritten narrow wire adapters and protocol-safety layers rather than generated public clients. This is intentional for the bounded eight-operation surface. Contract extraction proves structural authority; shared fixtures, semantic cases, exact-artifact tests, and real-server journeys prove the behavior that OpenAPI cannot express, including PKCE custody, one-use handoff/refresh behavior, context isolation, ambiguity, and redaction.
 
 ## Surface separation
 
@@ -23,18 +27,17 @@ The source contract distinguishes:
 
 Default SDK generation consumes Runtime only. It must not expose Control endpoints, management credentials/scopes, server storage models, provider payloads, key references, or internal health detail merely because one server binary contains those surfaces.
 
-## Generation boundary
+## Generated-contract and adapter boundary
 
-Generation may produce:
+The selected workflow generates and commits only the language-neutral normalized contract. It does not generate or expose public TypeScript, Python, or Rust clients. Each language keeps a narrow internal adapter that deterministically maps its idiomatic safety types to and from:
 
-- public Project/Application configuration models;
-- login-start and provider-selection wire models;
-- PKCE challenge and handoff-exchange request/response DTOs;
-- Project user, session, access-token metadata, refresh, and logout DTOs;
-- stable Runtime error wire shapes;
-- endpoint path/method declarations and low-level Runtime operations.
+- public Project/Application configuration;
+- login-start and PKCE-bound handoff requests/responses;
+- Project user, credential-pair, refresh, and logout DTOs;
+- stable Runtime error wire shapes; and
+- exact endpoint method/path/status/content-type declarations.
 
-Generation must not invent policy for:
+A future generator may replace an internal wire adapter only if repeated maintenance demonstrates a concrete need. Its output remains private, reproducible, and wrapped by the same public safety API. Generation must not invent policy for:
 
 - trusted Runtime origin selection;
 - PKCE verifier generation/custody;
@@ -64,7 +67,7 @@ A Project JWT may be carried as an opaque credential by an SDK. Decoding unverif
 
 ## Drift and compatibility
 
-CI regenerates from one ephemeral OpenAPI artifact and either compares checked-in generated source or builds/tests directly from generated output. Unexplained drift fails.
+CI exports both ephemeral plane documents, validates per-plane operation uniqueness and the explicit liveness/readiness overlap, recursively normalizes the selected Runtime graph, and byte-compares it with the tracked snapshot. The check also records the source commit, server/types versions, full Runtime digest, claimed-surface digest, policy digest, and normalizer version as ephemeral provenance. Unexplained selected drift fails with instructions to review and update all clients; full-Runtime-only drift remains visible in provenance.
 
 Compatibility review flags at least:
 
@@ -81,9 +84,10 @@ The server and each SDK release independently. Each SDK publishes a tested Runti
 
 ## Acceptance criteria
 
-- Generation is reproducible with pinned tools/configuration.
-- A clean generation job leaves no OpenAPI file in the source tree.
-- The generated default SDK surface contains Runtime Project Auth only.
-- Model tests cover omission/null, unknown fields/enums, bounds, Project/Application identifiers, and secret redaction.
-- Handwritten code imports generated output through a narrow adapter so the generator can be replaced.
-- Release provenance identifies the exact contract digest and server revision.
+- Two clean normalizations are byte-identical with the same claimed-surface digest.
+- A clean contract job leaves no complete OpenAPI file in the source tree.
+- The policy and normalized default SDK surface contain only the eight reviewed Runtime Project Auth operations and no Control authority.
+- Mutation tests cover selected drift, unclaimed additions, missing/duplicate operations, dangling/external references, plane leakage, and management security leakage.
+- Adapter/model tests cover omission/null, unknown fields/enums, bounds, Project/Application identifiers, exact request framing, and secret redaction.
+- Handwritten protocol code reaches wire models only through the narrow internal adapter boundary.
+- Release provenance identifies the full and claimed contract digests, exact source revision, and normalizer/policy versions.

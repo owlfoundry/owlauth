@@ -107,6 +107,9 @@ export class BrowserEvidence {
     });
 
     await context.exposeBinding(bindingName, (source, payload: unknown) => {
+      // The binding can arrive before Playwright emits the context's page event for a popup.
+      // Register its source first so lifecycle IDs and the owned-page set share one authority.
+      evidence.#observePage(source.page);
       const pageId = evidence.#pageId(source.page);
       const sample = browserSample(payload);
       if (sample !== null) evidence.lifecycle.push({ ...sample, pageId });
@@ -141,14 +144,61 @@ export class BrowserEvidence {
         // The init-script observer and synchronous frame URL event remain authoritative.
       }
     }
+    // A popup may close immediately after invoking the exposed init binding. Playwright can emit
+    // the page event before the asynchronous binding callback reaches Node, so drain that delivery
+    // race without manufacturing evidence. Exact page-ID coverage is enforced here rather than
+    // relying on a downstream count assertion.
+    await this.#waitForLifecycleCoverage();
+    const storageState = JSON.stringify(await this.context.storageState());
+    // storageState() and the bounded wait both yield to Playwright events. Drain any network record
+    // work they exposed, then repeat the coverage check before taking the no-await copy below.
+    await this.settle();
+    await this.#waitForLifecycleCoverage();
+    await this.settle();
+    this.#assertLifecycleCoverage();
     return {
       consoleMessages: [...this.consoleMessages],
       lifecycle: [...this.lifecycle],
       pageCount: this.#pages.size,
       requests: this.requests.map(copyNetworkRecord),
       responses: this.responses.map(copyNetworkRecord),
-      storageState: JSON.stringify(await this.context.storageState()),
+      storageState,
     };
+  }
+
+  async #waitForLifecycleCoverage(): Promise<void> {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (this.#hasExactLifecycleCoverage()) return;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+    }
+    this.#assertLifecycleCoverage();
+  }
+
+  #assertLifecycleCoverage(): void {
+    const expected = this.#expectedPageIds();
+    const observed = this.#observedLifecyclePageIds();
+    if (sameNumbers(expected, observed)) return;
+    throw new Error(
+      `lifecycle binding did not cover the owned browser pages: expected [${[...expected].join(
+        ", ",
+      )}], observed [${[...observed].join(", ")}]`,
+    );
+  }
+
+  #hasExactLifecycleCoverage(): boolean {
+    return sameNumbers(this.#expectedPageIds(), this.#observedLifecyclePageIds());
+  }
+
+  #expectedPageIds(): ReadonlySet<number> {
+    return new Set([...this.#pages].map((page) => this.#pageId(page)));
+  }
+
+  #observedLifecyclePageIds(): ReadonlySet<number> {
+    return new Set(
+      this.lifecycle
+        .filter(({ reason }) => reason !== "navigation" && reason !== "final")
+        .map(({ pageId }) => pageId),
+    );
   }
 
   #observePage(page: Page): void {
@@ -170,6 +220,10 @@ export class BrowserEvidence {
     this.#pageIds.set(page, created);
     return created;
   }
+}
+
+function sameNumbers(left: ReadonlySet<number>, right: ReadonlySet<number>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
 }
 
 function copyNetworkRecord(record: NetworkRecord): NetworkRecord {

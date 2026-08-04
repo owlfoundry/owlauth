@@ -9,7 +9,7 @@ OwlAuth separates documentation assistance, remote administration, and future ag
 | `owlauth` CLI           | Descriptor-pinned self-hosted Control commands and checksum-verified self-update are available |
 | Codex/Claude plugin     | Repository-distributed integration skill and reference material only                           |
 | Remote Control commands | Typed Project/Application/user/session/provider/key/projection/webhook commands are available  |
-| MCP server/tools        | Self-hosted Control reads plus one preview/commit mutation are available when enabled           |
+| MCP server/tools        | Self-hosted Control reads plus one preview/commit mutation are available when enabled          |
 
 The plugin does not bundle a server, launch a local MCP process, expose Project Auth operations, or create credentials. Treat it as documentation and guardrails for the pre-alpha repository.
 
@@ -22,6 +22,7 @@ The shared source under [`plugins/owlauth`](https://github.com/owlfoundry/owlaut
 - distinguish downstream Project Auth from upstream OAuth/OIDC federation;
 - understand that Project/Application IDs and publishable keys are public identifiers, not Control credentials;
 - inspect generated OpenAPI as an ephemeral contract view;
+- require the component's candidate-bound final evidence manifest before describing an SDK operation as release-qualified; exported methods, package versions, workspace tests, generated OpenAPI, and fixtures alone are insufficient, and current manifests prove one exact Runtime/source coordinate rather than a range;
 - direct security reports to the private disclosure path.
 
 Plugin text or model output is never authority. Do not paste provider secrets, `OWLAUTH_CONTROL_API_KEY`, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, private keys, full callback URLs, or user profiles into agent context.

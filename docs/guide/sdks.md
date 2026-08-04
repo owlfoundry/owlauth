@@ -14,7 +14,7 @@ The SDKs implement public configuration and JWKS retrieval, generic Hosted login
 | Python     | `owlauth-client`  | `owlauth`         | Python 3.11+             |
 | Rust       | `owlauth-client`  | `owlauth_client`  | repository Rust baseline |
 
-Each SDK follows independent SemVer and release tags (`typescript-v{version}`, `python-v{version}`, and `rust-v{version}`). Server and SDK versions do not move in lockstep; compatibility must be expressed as tested Runtime contract ranges rather than matching numbers.
+Each SDK follows independent SemVer and release tags (`typescript-v{version}`, `python-v{version}`, and `rust-v{version}`). Server and SDK versions do not move in lockstep. Current qualification proves one exact source commit, Runtime contract digest, corpus digest, and SDK archive digest rather than a broad server range; matching version numbers do not imply compatibility.
 
 TypeScript publishes one package, `@owlauth/client`. Its protocol API uses the same Web-standard core in the declared browser and Node.js matrices; there is no separately published browser package or `@owlauth/client/browser` entry point.
 
@@ -89,11 +89,40 @@ Public errors distinguish configuration, protocol, login, handoff, authenticatio
 
 Raw bodies, authorization headers, callback URLs, tokens, tickets, PKCE verifiers, cookies, provider details, and HTTP-library implementation exceptions are not stable public error data. Equivalent server responses map to equivalent semantic classes in every SDK.
 
-## Validation stages
+## Operation traceability
+
+The claimed surface is the following language-neutral set. The generated contract and shared corpus establish wire and semantic parity; the same-server journey exercises each public operation through exact installed candidate bytes.
+
+| Operation ID                    | TypeScript                                                          | Python                                                                 | Rust                                                                   | Same-server behavior                                                                                                      |
+| ------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `get_public_application_config` | `getPublicConfiguration()`                                          | `get_public_configuration()`                                           | `public_configuration()`                                               | Reads the admitted context and rejects wrong Project, Application, and publishable-key combinations                       |
+| `get_project_jwks`              | `getProjectJwks()`                                                  | `get_project_jwks()`                                                   | `project_jwks()`                                                       | Requires an authoritative non-empty key set with current revision metadata                                                |
+| `start_login`                   | `beginLogin()`                                                      | `begin_login()`                                                        | `begin_login()`                                                        | Starts ordinary, replay/race, logout, and fault journeys through Runtime and Hosted UI                                    |
+| `exchange_handoff`              | `validateCallback()` plus `exchangeHandoff()`, or `completeLogin()` | `validate_callback()` plus `exchange_handoff()`, or `complete_login()` | `validate_callback()` plus `exchange_handoff()`, or `complete_login()` | Confirms success, rejects local replay, and maps a dropped committed response to an indeterminate result without retry    |
+| `refresh_session`               | `refresh()`                                                         | `refresh()`                                                            | `refresh()`                                                            | Confirms successor rotation, predecessor replay rejection, concurrent family invalidation, and dropped-response ambiguity |
+| `get_current_user`              | `currentUser()`                                                     | `current_user()`                                                       | `current_user()`                                                       | Confirms the Project-user/Application-projection binding and denial after revocation where applicable                     |
+| `logout_application_session`    | `logoutApplication()`                                               | `logout_application()`                                                 | `logout_application()`                                                 | Confirms revocation and post-logout denial; a dropped committed response quarantines credentials                          |
+| `prepare_browser_logout`        | `prepareBrowserLogout()`                                            | `prepare_browser_logout()`                                             | `prepare_browser_logout()`                                             | Returns a Hosted confirmation target without navigation; the live journey confirms subsequent refresh denial              |
+
+The raw same-server fragments record the exact observed operation IDs for each participating SDK and the fault-injected subset. Final manifests may mark an operation `sameServer: passed` only when that list exactly equals the candidate descriptor's claimed operations.
+
+## Validation and release evidence
 
 Machine-readable fixtures and required schema-versioned conformance cases live under [`sdks/spec/`](https://github.com/owlfoundry/owlauth/tree/main/sdks/spec). Package builds, type/lint checks, unit tests, OpenAPI checks, and fixture conformance remain distinct from interoperability evidence.
 
-The real-server suite starts OwlAuth with isolated PostgreSQL and key/configuration stores, provisions Projects, Applications, an OIDC provider, and signing authority, and runs all three SDKs against that same Runtime. The TypeScript artifact additionally runs directly in a real browser. A separate Application-backend topology owns handoff and credential custody and verifies the full Project JWT trust namespace. Mock transport tests remain unit or contract tests, never end-to-end tests.
+One archive is built per component and bound to a canonical candidate descriptor containing its SHA-256 digest, version, source commit, workflow run/attempt, contract digests, claimed operations, and corpus digest. Clean consumers install those exact bytes rather than importing workspace source. The same archive then passes:
+
+| Component  | Exact-artifact package matrix                        | Same-server matrix   | Browser boundary                                                                                               |
+| ---------- | ---------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------- |
+| TypeScript | Node.js 20, 22, and 24; Vite 8.1.5 production bundle | Chromium and Firefox | The externally installed tarball's browser bundle executes in both real browsers                               |
+| Python     | Python 3.11, 3.12, 3.13, and 3.14                    | Chromium job         | The wheel uses its normal HTTP transport; a bounded raw helper drives Hosted/provider navigation               |
+| Rust       | Stable Rust                                          | Chromium job         | An external Cargo consumer uses the extracted `.crate`; a bounded raw helper drives Hosted/provider navigation |
+
+The real-server suite starts one OwlAuth Runtime/Control process topology with isolated PostgreSQL and key/configuration stores. Browser-direct product custody, backend product custody, TypeScript, Python, and Rust receive distinct Project/Application assignments and mutable credentials while sharing that server coordinate. Firefox runs the TypeScript assignment; Chromium runs all three SDK assignments. Backend-custody product evidence does not imply that every core SDK owns backend state.
+
+After all package and same-server fragments pass, CI creates `typescript-final-evidence.json`, `python-final-evidence.json`, and `rust-final-evidence.json`. Each manifest binds the candidate descriptor, exact archive, matrices, per-operation coverage, assignments, and same-server commit. Release workflows verify the component manifest against the tag/run candidate, attach it to the GitHub Release, and publish the already-qualified archive without rebuilding it. Non-PR runs attest candidate archives/descriptors and final manifests.
+
+Mock transport tests remain unit or contract tests, never end-to-end tests. Exported methods, generated OpenAPI, workspace tests, conformance fixtures, or a package version alone are not release qualification. Current manifests prove an exact Runtime/source coordinate, not a compatibility range or production support.
 
 ## Security expectations
 

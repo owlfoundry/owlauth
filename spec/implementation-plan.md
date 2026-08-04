@@ -984,6 +984,50 @@ and same-server conformance suites, supported runtime matrices exercise the publ
 package contents and licenses pass, and documentation links every claimed SDK operation to a real
 server route and tested journey.
 
+#### E.4 Closure record
+
+Block E is complete for the initial pre-alpha Project Auth SDK surface:
+
+- Rust DTOs and reproducibly exported Runtime/Control OpenAPI remain wire authority. Canonical
+  provenance binds the full Runtime and claimed-surface contract digests, while the reviewed schema
+  version 3 corpus binds `cases.json` and every fixture byte through one deterministic tree digest.
+- TypeScript, Python, and Rust implement the same eight operation identifiers: public Application
+  configuration, Project JWKS, login start, one-use handoff exchange, atomic refresh, current user,
+  Application logout, and browser-logout preparation. Shared fixtures and language runners enforce
+  equivalent context, projection, error, ambiguity, one-use, and redaction semantics.
+- One immutable npm tarball is qualified on Node.js 20, 22, and 24 and in Chromium and Firefox; one
+  immutable Python wheel is qualified on Python 3.11 through 3.14; and one immutable Rust crate is
+  qualified on stable Rust. Clean external consumers digest-check and install those archives, never
+  workspace source or a rebuilt substitute, and package-content gates require the license and
+  reviewed public files.
+- A single real Runtime topology exercises browser-direct and backend-custody Applications plus all
+  three exact SDK artifacts in isolated Project/Application assignments. The candidate evidence
+  window is reset and proved empty after provisioning; its observations then derive from successful
+  Runtime requests and require each SDK's exact eight-operation set. Actual post-dispatch
+  disconnects prove the handoff, refresh, and Application
+  logout ambiguity subset; one-use replay, concurrent refresh family invalidation, both logout
+  modes, wrong-context rejection, browser confinement, CORS, Web Crypto, and callback behavior are
+  exercised in the same journeys.
+- Candidate descriptors bind archive digest, source commit, workflow run/attempt, build inputs,
+  contract coordinate, corpus coordinate, capabilities, and claimed operations. Aggregation accepts
+  only complete package/browser matrices on one coordinate and emits component final manifests;
+  release workflows reverify those manifests and publish the already-qualified bytes without a
+  rebuild. Candidate archives, descriptors, Rust upload metadata, and final manifests are retained
+  or attested on the applicable non-PR path, and final manifests are attached to releases.
+- Proportional unit, conformance, package, hosted-web, documentation, workflow, and clean-worktree
+  Chromium/Firefox same-server gates passed. Cumulative independent review findings covering raw
+  evidence provenance, corpus completeness, child-process authority, documentation accuracy,
+  measurement-window isolation, asynchronous projection advancement, and snapshot ordering were
+  fixed; the final re-review reported no remaining P0–P3 finding.
+
+These results establish compatibility only for each manifest's exact source, server contract,
+corpus, artifact, and runtime coordinate. They do not establish a broad server-version range,
+production certification, or stability beyond the current pre-alpha packages. Core SDKs still do
+not own navigation, browser history, persistence, refresh coordination, framework session state,
+Application access-token verification, provider credentials, or downstream token brokering. The
+SaaS control layer, platform/framework integrations, and future compatibility-range promotion remain
+separate work and do not reopen Block E unless they invalidate one of these boundaries.
+
 ## 5. Journey-to-block traceability
 
 | Actor journey                                                                            | First complete block | Later extension                                               |
@@ -1054,8 +1098,7 @@ A capability is complete only when all applicable items below are true:
 | A final hardening block hides missing security                                    | Every earlier block ships its own security/operations exit gates; Block D integrates and qualifies rather than inventing them                                           |
 | Four large blocks are mistaken for four mandatory releases or giant commits       | Blocks express dependency and honest capability claims only; release timing and reviewable commit boundaries remain independent                                         |
 
-The next implementation work begins with a detailed `local-reference/` execution plan for
-Block A, then carries that complete provisioning-and-readiness journey through its exit
-criteria. It may prepare later compatibility seams only far enough to avoid foreclosing the
-canonical design and must not expose a later block's product journey before that block's
-full exit condition is met.
+Blocks A through E are complete for the capability and evidence boundaries recorded above.
+Subsequent work is independently scoped maintenance, release execution, compatibility promotion, or
+work governed by the separate SaaS plan; it does not reopen a completed block unless a change
+invalidates that block's stated contract, security, custody, or acceptance boundary.

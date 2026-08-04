@@ -29,12 +29,13 @@ check: web-verify ## Run formatting, lint, package metadata, and workflow checks
 	@python3 scripts/check-markdown-links.py
 	@pnpm --filter @owlauth/docs build
 	@test -f $(DOCS_DIR)/.vitepress/dist/sitemap.xml
-	@grep -q 'https://owlauth.owlfoundry.org/' $(DOCS_DIR)/.vitepress/dist/sitemap.xml
-	@grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' $(DOCS_DIR)/.vitepress/dist/robots.txt
+	@grep -q 'https://owlauth-docs.owlfoundry.org/' $(DOCS_DIR)/.vitepress/dist/sitemap.xml
+	@grep -qx 'Sitemap: https://owlauth-docs.owlfoundry.org/sitemap.xml' $(DOCS_DIR)/.vitepress/dist/robots.txt
 	@pnpm --filter @owlauth/docs run deploy --dry-run
 	@scripts/release/test-verify-release.sh
 	@python3 scripts/release/test-changelog.py
 	@sh -n scripts/install.sh
+	@bash -n scripts/run-web-e2e.sh
 	@scripts/test-installers.sh
 	@cmp scripts/install.sh crates/owlauth-cli/assets/install.sh
 	@cmp scripts/install.ps1 crates/owlauth-cli/assets/install.ps1
@@ -50,18 +51,30 @@ test: web-build ## Run Rust, Python, and TypeScript unit tests
 .PHONY: build
 build: web-build ## Build the server, CLI, SDK distributions, and documentation
 	@cargo build --release --locked --package owlauth-server --package owlauth-cli
-	@cd $(PYTHON_DIR) && rm -rf dist && uv run --locked hatchling build -d dist
+	@cd $(PYTHON_DIR) && rm -rf dist && uv run --locked hatchling build -t wheel -d dist
 	@pnpm --filter @owlauth/client build
 	@pnpm --filter @owlauth/docs build
 
 .PHONY: package-check
-package-check: web-build ## Verify exact registry distribution contents
-	@cd $(PYTHON_DIR) && uv run --locked twine check dist/*
+package-check: web-build ## Build once and inspect local registry package candidates
+	@rm -rf dist/package-check && mkdir -p dist/package-check/python dist/package-check/typescript
+	@cd $(PYTHON_DIR) && uv run --locked hatchling build -t wheel -d ../../dist/package-check/python
+	@wheel="$$(find dist/package-check/python -maxdepth 1 -type f -name '*.whl')"; \
+		test "$$(find dist/package-check/python -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1; \
+		uv run --locked twine check "$$wheel"; \
+		uv run --locked python scripts/sdk_artifact.py inspect --component python --archive "$$wheel"
+	@pnpm --filter @owlauth/client build
+	@cd $(TYPESCRIPT_DIR) && npm pack --pack-destination ../../dist/package-check/typescript
+	@tarball="$$(find dist/package-check/typescript -maxdepth 1 -type f -name '*.tgz')"; \
+		test "$$(find dist/package-check/typescript -maxdepth 1 -type f | wc -l | tr -d ' ')" = 1; \
+		uv run --locked python scripts/sdk_artifact.py inspect --component typescript --archive "$$tarball"
 	@cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty
-	@cargo package --manifest-path $(RUST_SDK_DIR)/Cargo.toml --locked --allow-dirty
+	@cargo package --manifest-path $(RUST_SDK_DIR)/Cargo.toml --locked --allow-dirty --no-verify
+	@version="$$(sed -n 's/^version = "\([^"]*\)"$$/\1/p' $(RUST_SDK_DIR)/Cargo.toml | head -n 1)"; \
+		uv run --locked python scripts/sdk_artifact.py inspect --component rust \
+			--archive "target/package/owlauth-client-$${version}.crate"
 	@scripts/test-cli-package.sh
 	@scripts/test-server-package.sh
-	@cd $(TYPESCRIPT_DIR) && npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
 
 .PHONY: openapi
 openapi: ## Export complete Runtime and Control OpenAPI documents
@@ -82,7 +95,7 @@ web-build: ## Rebuild deterministic Runtime and Control embedded assets
 	@pnpm --filter @owlauth/server-web build
 
 .PHONY: web-e2e
-web-e2e: web-build ## Run the real PostgreSQL/Rust/browser provisioning-readiness journey
+web-e2e: web-build ## Qualify exact SDK candidates in the real PostgreSQL/Rust/browser journey
 	@pnpm --filter @owlauth/server-web test:e2e
 
 .PHONY: web-verify

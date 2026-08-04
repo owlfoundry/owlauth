@@ -4,7 +4,7 @@
 
 [`fixtures/`](fixtures/) stores reviewed wire examples; [`conformance/`](conformance/) stores language-neutral behavior cases. Attachments use relative paths, stable names, and an explicit `schemaVersion`.
 
-The schema-version 2 corpus contains synthetic reviewed examples for public Project/Application configuration, context mismatch, atomic credential and current-user projection shapes, Runtime error mapping, retry/action semantics, unknown-code conservatism, and redaction, in addition to the basic health response. [`conformance/cases.json`](conformance/cases.json) marks each required capability and configured context explicitly.
+The schema-version 3 corpus contains synthetic reviewed examples for exact public configuration and JWKS parsing, login start, callback inspection, handoff exchange, atomic credential refresh, current user, both logout forms, response framing, transport ambiguity, Runtime error mapping, retry/action semantics, unknown-code conservatism, and redaction. [`conformance/cases.json`](conformance/cases.json) pins the complete required case-name manifest and binds every required case to a canonical operation identifier, configured context, precondition, request phase, response-received fact, evidence level, fixture envelope, and expected semantic outcome. Removing, renaming, duplicating, or replacing a required case fails every runner.
 
 The canonical flat projection schema is exactly `owlauth.user.v1`. Its `display_name`, `picture_url`, `locale`, and `verified_email` keys are always present and nullable: `null` means that the authoritative Application projection has no admitted value, not that an SDK omitted or failed to parse the field. `verified_email` is non-null only when both Project and Application policy admit it. Handoff, refresh, and current-user carry the same projection semantics and repeat its authoritative `projection_revision` only as matching envelope metadata. SDK parsers reject another schema identifier, missing nullable keys, and unknown projection fields.
 
@@ -12,7 +12,7 @@ The corpus exercises public protocol semantics through each language runner. It 
 
 ## Fixture families
 
-Shared attachments cover the stable cross-language semantic core. Language-specific unit suites additionally cover deterministic S256 generation, callback consumption, transport ambiguity, logout targets, and runtime idioms that cannot be represented safely as static credential-bearing fixtures. Real-server suites cover authoritative one-use, refresh-replay, browser, provider, and disablement behavior.
+Shared attachments cover the stable cross-language semantic core. A fixture envelope describes exactly one reviewed HTTP response, callback attempt sequence, or transport failure. HTTP envelopes include status, headers, bounded JSON, UTF-8 text, raw base64, empty, or repeated-byte body encoding, and any request assertion; callback envelopes include attempts and clock offset; transport-failure envelopes include failure kind and dispatch phase. Language-specific unit suites additionally cover deterministic S256 generation, callback ownership mechanics, concurrency, and runtime idioms that cannot be represented safely in shared data. Real-server suites cover authoritative one-use, refresh-replay, browser, provider, and disablement behavior.
 
 Fixtures describe public wire/semantic behavior only. They never copy internal rows, provider payloads, secret references, management DTOs, or a generated OpenAPI document.
 
@@ -24,11 +24,12 @@ Secret/redaction cases use unmistakable non-production sentinels and assert thos
 
 Each conformance case defines:
 
-- a unique stable name;
-- fixture/input reference;
-- required capability and minimum corpus schema;
-- configured Project/Application context where relevant;
-- expected semantic output/error and local credential action.
+- a unique stable name and required capability;
+- a canonical `operationId` and fixture/input reference;
+- a precondition and request phase, including whether a response was received;
+- an evidence level and configured Project/Application context where relevant;
+- an expected semantic value or error category, code, retry policy, and local action;
+- the expected pending-login or credential disposition when one-use state is involved.
 
 Corpus schema changes increment `schemaVersion`. Runners explain unsupported required versions instead of silently skipping them.
 
@@ -49,7 +50,7 @@ A case passing in one language is not cross-language conformance. Every SDK clai
 
 ### Package, unit, and conformance checks
 
-CI runs package builds, static checks, language-specific unit/contract tests, generated OpenAPI checks, strict JSON attachment validation, and every required schema-version 2 shared case. Mock/fake transport tests validate failure paths and coordination but do not establish interoperability.
+CI runs package builds, static checks, language-specific unit/contract tests, generated OpenAPI checks, strict JSON attachment validation, and every required schema-version 3 shared case. Each runner fails closed on unsupported schema versions or malformed required data. Mock/fake transport tests validate failure paths and coordination but do not establish interoperability.
 
 ### Real-server E2E
 

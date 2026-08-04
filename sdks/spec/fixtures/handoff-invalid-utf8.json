@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 3,
+  "synthetic": true,
+  "exchange": {
+    "kind": "http",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "base64",
+      "value": "eyJwcm9qZWN0X2lkIjoicHJqX2NvbmZvcm1hbmNlIiwiYXBwbGljYXRpb25faWQiOiJhcHBfY29uZm9ybWFuY2UiLCJ1c2VyX2lkIjoidXNyX2NvbmZvcm1hbmNlIiwic2Vzc2lvbl9pZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInJlZnJlc2hfZ2VuZXJhdGlvbiI6MSwiYWNjZXNzX3Rva2VuIjoiU1lOVEhFVElDX/9DQ0VTU19UT0tFTl9ORVZFUl9VU0FCTEUiLCJyZWZyZXNoX3Rva2VuIjoiU1lOVEhFVElDX1JFRlJFU0hfVE9LRU5fTkVWRVJfVVNBQkxFIiwidG9rZW5fdHlwZSI6IkJlYXJlciIsImV4cGlyZXNfaW4iOjMwMCwicHJvamVjdGlvbiI6eyJ1c2VyX2lkIjoidXNyX2NvbmZvcm1hbmNlIiwidXNlcl9yZXZpc2lvbiI6MSwicHJvamVjdGlvbl9zY2hlbWEiOiJvd2xhdXRoLnVzZXIudjEiLCJwcm9qZWN0aW9uX3JldmlzaW9uIjoxLCJkaXNwbGF5X25hbWUiOiJTeW50aGV0aWMgVXNlciIsInBpY3R1cmVfdXJsIjpudWxsLCJsb2NhbGUiOiJlbi1VUyIsInZlcmlmaWVkX2VtYWlsIjpudWxsLCJzdGF0dXMiOiJhY3RpdmUiLCJjcmVhdGVkX2F0IjoiMjA5OS0wMS0wMVQwMDowMDowMFoiLCJ1cGRhdGVkX2F0IjoiMjA5OS0wMS0wMVQwMDowMDowMFoifSwicHJvamVjdGlvbl9yZXZpc2lvbiI6MSwic2Vzc2lvbl9leHBpcmVzX2F0IjoiMjA5OS0wMS0wMlQwMDowMDowMFoifQ=="
+    }
+  },
+  "redactionSentinels": [
+    "SYNTHETIC_REFRESH_TOKEN_NEVER_USABLE"
+  ]
+}

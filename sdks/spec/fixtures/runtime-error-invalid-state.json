@@ -1,11 +1,22 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "synthetic": true,
-  "responseStatus": 409,
-  "response": {
-    "code": "invalid_state",
-    "message": "Synthetic runtime rejection. SENTINEL_RUNTIME_BODY_MUST_NOT_LEAK",
-    "request_id": "req_conformance_invalid_state"
+  "exchange": {
+    "kind": "http",
+    "status": 409,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "json",
+      "value": {
+        "code": "invalid_state",
+        "message": "Synthetic runtime rejection. SENTINEL_RUNTIME_BODY_MUST_NOT_LEAK",
+        "request_id": "req_conformance_invalid_state"
+      }
+    }
   },
-  "redactionSentinels": ["SENTINEL_RUNTIME_BODY_MUST_NOT_LEAK"]
+  "redactionSentinels": [
+    "SENTINEL_RUNTIME_BODY_MUST_NOT_LEAK"
+  ]
 }

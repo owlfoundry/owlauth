@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 3,
+  "synthetic": true,
+  "exchange": {
+    "kind": "http",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "json",
+      "value": {
+        "project_public_id": "prj_conformance",
+        "project_display_name": "Conformance Project",
+        "application_public_id": "app_conformance",
+        "application_display_name": "Conformance Application",
+        "publishable_keys": [
+          "owl_app_other"
+        ],
+        "providers": [
+          {
+            "key": "oidc-main",
+            "display_name": "Example identity",
+            "kind": "oidc"
+          }
+        ],
+        "email_available": false,
+        "email_otp_enabled": false,
+        "email_magic_link_enabled": false,
+        "login_available": true
+      }
+    }
+  }
+}

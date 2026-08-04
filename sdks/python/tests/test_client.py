@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from collections import deque
 from collections.abc import Mapping
+from copy import copy, deepcopy
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -190,14 +192,14 @@ def test_callback_mismatch_and_expiry_fail_before_network() -> None:
         APPLICATION,
         PUBLISHABLE,
         transport=transport,
-        _clock=lambda: NOW + timedelta(minutes=11),
+        _clock=lambda: NOW + timedelta(minutes=11, seconds=1),
     )
     with pytest.raises(HandoffError) as expired:
         expired_client.validate_callback(
             f"{REDIRECT}?handoff=ticket&state={started.pending._state.reveal()}",
             started.pending,
         )
-    assert expired.value.code == "pending_login_expired"
+    assert expired.value.code == "pending_context_mismatch"
     assert len(transport.requests) == 1
 
 
@@ -245,14 +247,14 @@ def test_malformed_handoff_success_quarantines_pending_without_retry_or_disclosu
         started.pending,
     )
 
-    with pytest.raises(ProtocolError) as captured:
+    with pytest.raises(IndeterminateError) as captured:
         client.exchange_handoff(callback, started.pending)
 
     error = captured.value
-    assert error.code == "invalid_json"
+    assert error.code == "invalid_response_after_dispatch"
     assert error.action == LocalAction.QUARANTINE_PENDING
     assert error.retry.value == "never"
-    assert error.operation == "handoff"
+    assert error.operation == "exchange_handoff"
     assert error.status == 200
     assert len(transport.requests) == 2
     for secret in ("handoff-secret", "response-refresh-secret"):
@@ -270,14 +272,14 @@ def test_mismatched_handoff_success_quarantines_pending_without_retry_or_disclos
         started.pending,
     )
 
-    with pytest.raises(ProtocolError) as captured:
+    with pytest.raises(IndeterminateError) as captured:
         client.exchange_handoff(callback, started.pending)
 
     error = captured.value
-    assert error.code == "context_mismatch"
+    assert error.code == "invalid_response_after_dispatch"
     assert error.action == LocalAction.QUARANTINE_PENDING
     assert error.retry.value == "never"
-    assert error.operation == "handoff"
+    assert error.operation == "exchange_handoff"
     assert error.status == 200
     assert len(transport.requests) == 2
     for secret in ("handoff-secret", "access-secret-1", "refresh-secret-1"):
@@ -295,14 +297,14 @@ def test_malformed_refresh_success_quarantines_credentials_without_retry_or_disc
     transport = FakeTransport(malformed)
     client = make_client(transport)
 
-    with pytest.raises(ProtocolError) as captured:
+    with pytest.raises(IndeterminateError) as captured:
         client.refresh(credentials)
 
     error = captured.value
-    assert error.code == "invalid_json"
+    assert error.code == "invalid_response_after_dispatch"
     assert error.action == LocalAction.QUARANTINE_CREDENTIALS
     assert error.retry.value == "never"
-    assert error.operation == "refresh"
+    assert error.operation == "refresh_session"
     assert error.status == 200
     assert len(transport.requests) == 1
     for secret in (credentials.refresh_token.reveal(), "response-refresh-secret"):
@@ -317,14 +319,14 @@ def test_mismatched_refresh_success_quarantines_credentials_without_retry_or_dis
     transport = FakeTransport(response(200, payload))
     client = make_client(transport)
 
-    with pytest.raises(ProtocolError) as captured:
+    with pytest.raises(IndeterminateError) as captured:
         client.refresh(credentials)
 
     error = captured.value
-    assert error.code == "context_mismatch"
+    assert error.code == "invalid_response_after_dispatch"
     assert error.action == LocalAction.QUARANTINE_CREDENTIALS
     assert error.retry.value == "never"
-    assert error.operation == "refresh"
+    assert error.operation == "refresh_session"
     assert error.status == 200
     assert len(transport.requests) == 1
     for secret in (
@@ -357,7 +359,7 @@ def test_refresh_current_user_and_logout_operations_have_exact_placement() -> No
             201,
             {
                 "hosted_url": "https://auth.example/runtime/auth/browser-logout/preparation",
-                "expires_at": (NOW + timedelta(minutes=5)).isoformat(),
+                "expires_at": (NOW + timedelta(minutes=1)).isoformat(),
             },
         ),
     )
@@ -508,19 +510,27 @@ def test_shared_conformance_corpus_and_referenced_fixtures_load() -> None:
         cases = Path(__file__).parents[3] / "sdks" / "spec" / "conformance" / "cases.json"
     corpus = load_conformance_corpus(cases)
 
-    assert corpus.schema_version == 2
+    assert corpus.schema_version == 3
     assert corpus.cases
     assert len({case.name for case in corpus.cases}) == len(corpus.cases)
-    health = next((case for case in corpus.cases if case.name == "health response"), None)
-    if health is not None:
-        assert health.fixture == health.expected
+    assert all(case.definition["operationId"] for case in corpus.cases)
 
 
-def test_secret_value_requires_explicit_reveal() -> None:
+def test_secret_value_resists_generic_dataclass_serialization() -> None:
     token = SecretValue("recognizable-secret", "access token")
     assert token.reveal() == "recognizable-secret"
+    assert copy(token) is token
+    assert deepcopy(token) is token
     assert "recognizable-secret" not in str(token)
     assert "recognizable-secret" not in repr(token)
+
+    _, _, credentials = exchange_once()
+    serialized = asdict(credentials)
+    assert isinstance(serialized["access_token"], SecretValue)
+    assert isinstance(serialized["refresh_token"], SecretValue)
+    rendered = json.dumps(serialized, default=repr)
+    assert "access-secret" not in rendered
+    assert "refresh-secret" not in rendered
 
 
 def test_user_projection_requires_exact_schema_and_explicit_nullable_fields() -> None:

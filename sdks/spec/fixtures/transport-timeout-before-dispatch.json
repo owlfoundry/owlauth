@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 3,
+  "synthetic": true,
+  "exchange": {
+    "kind": "transportFailure",
+    "failureKind": "timeout",
+    "requestPhase": "before_dispatch"
+  }
+}

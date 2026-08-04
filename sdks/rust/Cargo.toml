@@ -8,6 +8,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["authentication", "identity", "project-auth", "client"]
 categories = ["authentication", "api-bindings"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]
 async-trait = "0.1.91"

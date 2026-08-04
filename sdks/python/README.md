@@ -67,6 +67,15 @@ The SDK does not persist credentials, serialize refresh, or atomically replace A
 Applications must single-flight refresh per family and atomically replace or quarantine the full
 pair.
 
+### Migration notes
+
+`SecretValue` is intentionally not a dataclass. Generic dataclass serialization such as
+`dataclasses.asdict()` can no longer expose its backing value, and copy/deepcopy retain redacted
+representations. Use `reveal()` only at an explicit credential-release boundary. Canonical
+operation values now identify `exchange_handoff` and `refresh_session`; a malformed or
+context-invalid success response received after either sensitive dispatch raises
+`IndeterminateError` with code `invalid_response_after_dispatch` rather than `ProtocolError`.
+
 Application logout revokes the exact Application session. Project browser logout preparation
 returns a Hosted confirmation target as data; the SDK never navigates to it.
 
@@ -86,31 +95,37 @@ synchronous, verifies TLS, disables redirects, and bounds headers and JSON bodie
 specialized integrations may inject the exported narrow `Transport` protocol; a custom transport
 uses `TransportFailure(kind, dispatched=...)` to preserve ambiguity semantics.
 
-## Conformance and real-Runtime verification
+## Conformance and real-Runtime qualification
 
 `load_conformance_corpus()` loads the shared versioned fixtures with schema, required-field,
-duplicate-name, size, reference, and path-containment validation.
+duplicate-name, size, reference, and path-containment validation. `uv run --locked pytest` exercises
+workspace source and those cases; it is not wheel or end-to-end evidence.
 
-The real-server journey is a separate explicit command and is never silently skipped by unit tests:
+From a clean repository root, run:
 
 ```bash
-OWLAUTH_E2E_RUNTIME_URL=https://runtime.example/ \
-OWLAUTH_E2E_PROJECT_ID=project_public_id \
-OWLAUTH_E2E_APPLICATION_ID=application_public_id \
-OWLAUTH_E2E_PUBLISHABLE_KEY=publishable_key \
-OWLAUTH_E2E_REDIRECT_URI=https://application.example/callback \
-uv run --project sdks/python python sdks/python/tests/runtime_e2e.py
+make web-e2e
 ```
 
-The already provisioned Runtime must use a controlled provider that completes authorization by
-bounded redirects. The script uses the real SDK for config, start, callback exchange, current-user,
-refresh, replay rejection, Application logout, and Project browser logout. A narrow HTTP helper
-only drives Hosted/provider navigation with Fetch Metadata and manually preserves hardened Secure
-cookies on loopback. For an explicitly configured HTTP loopback Runtime, also set
-`OWLAUTH_E2E_ALLOW_INSECURE_LOOPBACK=1`.
+The repository gate generates current Runtime contract provenance, builds one wheel and canonical
+candidate descriptor, verifies both digests, installs the wheel without dependencies in a fresh
+external virtual environment, and copies the internal real-Runtime runner outside the repository.
+The runner intentionally rejects an `owlauth` import resolved from the workspace. It receives
+bounded expected-version, wrong-Project/Application, publishable-key, Hosted-navigation, and
+loopback fault-proxy values from the product harness; do not invoke the workspace runner as
+exact-artifact evidence.
 
-Python 3.11, 3.12, 3.13, and 3.14 are supported. The SDK is independently versioned from the
-server, CLI, and other language SDKs.
+Against its own Project/Application on the shared Chromium topology, the exact wheel covers all
+eight claimed operations, one-use handoff replay, concurrent refresh/family invalidation,
+Application and browser logout, and dropped committed responses for handoff, refresh, and logout.
+A narrow raw HTTP helper only drives Hosted/provider navigation with Fetch Metadata and hardened
+cookie handling; it is not an SDK transport or public API.
+
+CI separately qualifies the same wheel under Python 3.11, 3.12, 3.13, and 3.14, then binds those
+fragments and the Chromium journey into the component final evidence manifest. The SDK is
+independently versioned from the server, CLI, and other language SDKs. Exact-artifact qualification
+requires `owlauth.__version__` to equal installed wheel metadata. A final manifest proves one exact
+source/Runtime/archive coordinate, not a broad compatibility or production-support claim.
 
 This package is a Project Auth protocol client, not a downstream OAuth authorization server or a
 provider-token broker. Provider credentials and provider access/refresh tokens never enter its

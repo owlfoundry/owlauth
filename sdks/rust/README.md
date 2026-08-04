@@ -31,7 +31,9 @@ A `Client` is immutable and bound to one Runtime origin, Project, and Applicatio
 
 `begin_login` generates fresh OS-CSPRNG PKCE S256 and Application state, calls generic login start, and returns a Hosted URL plus explicit `PendingLogin`. It does not navigate, choose a provider, persist state, mutate history, or manage an Application session.
 
-After the Application receives Runtime's exact callback, pass the complete callback and caller-held pending value to `complete_login`. Local redirect/state/context/expiry validation happens before network dispatch. The pending value is consumed, and handoff exchange is never automatically retried.
+After the Application receives Runtime's exact callback, pass the complete callback and caller-held pending value to `complete_login`. Local redirect/state/context/expiry validation happens before network dispatch. Malformed inspection does not consume pending state; handoff exchange consumes it atomically and is never automatically retried.
+
+Callers that inspect callbacks separately may use `validate_callback(&pending)` and then `exchange_handoff(validated)`. Validation borrows `PendingLogin`, and the validated callback shares its one-attempt guard; the guard is consumed only when exchange starts. The owned `complete_login(callback, pending)` convenience remains available. A malformed or context-invalid success response received after a sensitive dispatch is `ErrorCategory::Indeterminate` with code `invalid_response_after_dispatch`, because the remote commit cannot be disproved.
 
 ```rust,no_run
 # use owlauth_client::{Client, ClientConfig};
@@ -63,27 +65,29 @@ A timeout, cancellation, or disconnect after handoff, refresh, or logout dispatc
 
 The public `Transport`, `EntropySource`, and `Clock` boundaries support deterministic contract testing without creating a fake end-to-end claim. The production transport verifies TLS, refuses redirects, enforces an overall deadline, and bounds responses.
 
-## Real-server conformance
+## Real-server and exact-crate qualification
 
-The ignored integration test drives the SDK, real Hosted UI endpoints, manually preserved hardened cookies, and a controlled auto-authorizing OIDC provider without depending on `owlauth-server`:
+Workspace `cargo test -p owlauth-client` exercises source-level unit and shared conformance behavior. The ignored `server_e2e` source test can help harness development, but running it against the workspace is not exact-crate evidence.
+
+From a clean repository root, run:
 
 ```bash
-OWLAUTH_E2E_RUNTIME_URL=https://runtime.example/ \
-OWLAUTH_E2E_PROJECT_ID=prj_public \
-OWLAUTH_E2E_APPLICATION_ID=app_public \
-OWLAUTH_E2E_PUBLISHABLE_KEY=owl_app_publishable \
-OWLAUTH_E2E_REDIRECT_URI=https://app.example/callback \
-OWLAUTH_E2E_PROVIDER_KEY=oidc-main \
-cargo test -p owlauth-client --test server_e2e -- --ignored --exact real_runtime_project_auth_lifecycle
+make web-e2e
 ```
 
-For a loopback HTTP Runtime, additionally set `OWLAUTH_E2E_ALLOW_INSECURE_LOOPBACK=1`. The provider must use Runtime's production OIDC adapter and immediately redirect its authorization request after validating PKCE/nonce/client/redirect inputs.
+The repository gate generates current Runtime contract provenance, packages one `.crate`, binds its crates.io upload metadata and canonical candidate descriptor, verifies all digests, extracts the archive, and creates a separate Cargo consumer with a path dependency on the extracted crate. The internal integration test is copied into that consumer. It receives bounded expected-version, wrong-Project/Application, publishable-key, controlled-provider, and loopback fault-proxy values from the product harness.
+
+Against its own Project/Application on the shared Chromium topology, the exact crate covers all eight claimed operations, one-use handoff replay, concurrent refresh/family invalidation, Application and browser logout, and dropped committed responses for handoff, refresh, and logout. A narrow raw helper drives Hosted/provider navigation; it does not depend on `owlauth-server` and is not a public SDK API.
+
+CI separately compiles, tests, and lints the same external consumer on stable Rust, then binds that fragment and the Chromium journey into the component final evidence manifest. `owlauth_client::VERSION` must equal the extracted crate metadata. A final manifest proves one exact source/Runtime/archive coordinate; it is not a broad compatibility or production-support claim.
 
 ## Security boundary
 
 The SDK never receives upstream provider tokens or secrets and is not a general OAuth authorization-server client. Application backends independently verify OwlAuth access-token signatures and trust namespace against the exact Project JWKS; merely possessing or decoding a token is not authorization verification.
 
 The crate has no dependency on `owlauth-server` and owns no browser, filesystem, keychain, framework, or session state.
+
+`owlauth_client::VERSION` is compiled from Cargo package metadata; exact-artifact qualification requires it to equal the installed crate version.
 
 ## License
 

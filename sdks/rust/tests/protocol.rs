@@ -1,7 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
-    fs,
-    path::{Path, PathBuf},
+    collections::VecDeque,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -12,7 +10,6 @@ use owlauth_client::{
     Client, ClientConfig, Clock, EntropySource, Error, ErrorCategory, HttpRequest, HttpResponse,
     LocalAction, RetryPolicy, Transport, TransportFailure, TransportFailureKind,
 };
-use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -95,7 +92,7 @@ impl Clock for FixedClock {
 fn response(status: u16, body: Value) -> Result<HttpResponse, TransportFailure> {
     Ok(HttpResponse {
         status,
-        headers: Vec::new(),
+        headers: vec![("content-type".into(), "application/json".into())],
         body: serde_json::to_vec(&body).unwrap(),
     })
 }
@@ -104,7 +101,7 @@ fn response(status: u16, body: Value) -> Result<HttpResponse, TransportFailure> 
 fn raw_response(status: u16, body: &[u8]) -> Result<HttpResponse, TransportFailure> {
     Ok(HttpResponse {
         status,
-        headers: Vec::new(),
+        headers: vec![("content-type".into(), "application/json".into())],
         body: body.to_vec(),
     })
 }
@@ -219,7 +216,7 @@ async fn begin_login_uses_deterministic_s256_and_keeps_provider_selection_out() 
 }
 
 #[tokio::test]
-async fn callback_mismatch_dispatches_nothing_and_consumes_only_local_value() {
+async fn callback_mismatch_dispatches_nothing_and_preserves_pending_value() {
     let transport = Arc::new(MockTransport::with(vec![begin_response()]));
     let client = client(Arc::clone(&transport));
     let login = client
@@ -229,7 +226,7 @@ async fn callback_mismatch_dispatches_nothing_and_consumes_only_local_value() {
     let error = client
         .validate_callback(
             "https://app.example/callback?handoff=ticket&state=wrong",
-            login.pending,
+            &login.pending,
         )
         .unwrap_err();
     assert_eq!(error.category(), ErrorCategory::Handoff);
@@ -340,7 +337,8 @@ async fn malformed_handoff_success_quarantines_pending_without_retry_or_secret_d
         .await
         .unwrap_err();
 
-    assert_eq!(error.category(), ErrorCategory::Protocol);
+    assert_eq!(error.category(), ErrorCategory::Indeterminate);
+    assert_eq!(error.code(), "invalid_response_after_dispatch");
     assert_eq!(error.retry_policy(), RetryPolicy::Never);
     assert_eq!(error.local_action(), LocalAction::QuarantinePendingLogin);
     assert_eq!(transport.request_count(), 2);
@@ -373,7 +371,8 @@ async fn mismatched_handoff_success_quarantines_pending_without_retry_or_secret_
         .await
         .unwrap_err();
 
-    assert_eq!(error.category(), ErrorCategory::Protocol);
+    assert_eq!(error.category(), ErrorCategory::Indeterminate);
+    assert_eq!(error.code(), "invalid_response_after_dispatch");
     assert_eq!(error.retry_policy(), RetryPolicy::Never);
     assert_eq!(error.local_action(), LocalAction::QuarantinePendingLogin);
     assert_eq!(transport.request_count(), 2);
@@ -404,7 +403,8 @@ async fn malformed_refresh_success_quarantines_without_retry_or_secret_disclosur
         .unwrap();
     let error = client.refresh(&pair).await.unwrap_err();
 
-    assert_eq!(error.category(), ErrorCategory::Protocol);
+    assert_eq!(error.category(), ErrorCategory::Indeterminate);
+    assert_eq!(error.code(), "invalid_response_after_dispatch");
     assert_eq!(error.retry_policy(), RetryPolicy::Never);
     assert_eq!(error.local_action(), LocalAction::QuarantineCredentials);
     assert_eq!(transport.request_count(), 3);
@@ -439,7 +439,8 @@ async fn mismatched_refresh_success_quarantines_without_retry_or_secret_disclosu
         .unwrap();
     let error = client.refresh(&pair).await.unwrap_err();
 
-    assert_eq!(error.category(), ErrorCategory::Protocol);
+    assert_eq!(error.category(), ErrorCategory::Indeterminate);
+    assert_eq!(error.code(), "invalid_response_after_dispatch");
     assert_eq!(error.retry_policy(), RetryPolicy::Never);
     assert_eq!(error.local_action(), LocalAction::QuarantineCredentials);
     assert_eq!(transport.request_count(), 3);
@@ -489,311 +490,6 @@ async fn unknown_runtime_error_is_conservative_and_safe() {
     assert_eq!(error.code(), "future_runtime_code");
     assert_eq!(error.retry_policy(), RetryPolicy::Never);
     assert!(!error.to_string().contains("provider detail"));
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ConformanceCorpus {
-    schema_version: u64,
-    cases: Vec<ConformanceCase>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ConformanceCase {
-    name: String,
-    fixture: String,
-    required: bool,
-    capability: String,
-    operation: String,
-    minimum_corpus_schema: u64,
-    configured_context: Option<ConfiguredContext>,
-    expected: ExpectedOutcome,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ConfiguredContext {
-    project_id: String,
-    application_id: String,
-    publishable_key: String,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ExpectedOutcome {
-    outcome: String,
-    category: Option<String>,
-    code: Option<String>,
-    retry: Option<String>,
-    action: Option<String>,
-    project_id: Option<String>,
-    application_id: Option<String>,
-    provider_keys: Option<Vec<String>>,
-    login_available: Option<bool>,
-    user_id: Option<String>,
-    refresh_generation: Option<i64>,
-    projection_revision: Option<i64>,
-    redacted: Option<bool>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FixtureEnvelope {
-    schema_version: u64,
-    synthetic: bool,
-    response_status: u16,
-    response: Value,
-    #[serde(default)]
-    redaction_sentinels: Vec<String>,
-}
-
-#[tokio::test]
-async fn shared_conformance_corpus_executes_every_required_case() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../spec");
-    let corpus_path = root.join("conformance/cases.json");
-    let bytes = fs::read(&corpus_path).expect("conformance corpus");
-    assert!(bytes.len() <= 1_048_576);
-    let corpus: ConformanceCorpus = serde_json::from_slice(&bytes).expect("valid strict corpus");
-    assert_eq!(corpus.schema_version, 2, "unsupported corpus schema");
-    let fixture_root = root.join("fixtures").canonicalize().expect("fixture root");
-    let credential_fixture: FixtureEnvelope =
-        load_bounded_json(&fixture_root.join("credential-pair.json"));
-    let mut names = BTreeSet::new();
-    for case in corpus.cases {
-        assert!(!case.name.is_empty() && names.insert(case.name.clone()));
-        assert!(case.required, "optional cases must be declared separately");
-        assert!(!case.capability.is_empty());
-        assert!(case.minimum_corpus_schema <= corpus.schema_version);
-        let referenced = corpus_path
-            .parent()
-            .unwrap()
-            .join(&case.fixture)
-            .canonicalize()
-            .expect("fixture reference");
-        assert!(referenced.starts_with(&fixture_root));
-        let fixture: FixtureEnvelope = load_bounded_json(&referenced);
-        assert_eq!(fixture.schema_version, 2);
-        assert!(fixture.synthetic);
-        execute_conformance_case(&case, &fixture, &credential_fixture).await;
-    }
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the strict shared-case dispatcher keeps each required observable assertion together"
-)]
-async fn execute_conformance_case(
-    case: &ConformanceCase,
-    fixture: &FixtureEnvelope,
-    credential_fixture: &FixtureEnvelope,
-) {
-    let context = case
-        .configured_context
-        .clone()
-        .unwrap_or(ConfiguredContext {
-            project_id: "prj_conformance".into(),
-            application_id: "app_conformance".into(),
-            publishable_key: "owl_app_conformance".into(),
-        });
-    let fixture_result = response(fixture.response_status, fixture.response.clone());
-    let credential_result = response(
-        credential_fixture.response_status,
-        credential_fixture.response.clone(),
-    );
-    let outcomes = match case.operation.as_str() {
-        "public_configuration" => vec![fixture_result],
-        "handoff" | "credential_response" => vec![begin_response(), fixture_result],
-        "refresh" | "current_user" | "current_user_response" => {
-            vec![begin_response(), credential_result, fixture_result]
-        }
-        other => panic!("unsupported required conformance operation: {other}"),
-    };
-    let transport = Arc::new(MockTransport::with(outcomes));
-    let sdk = conformance_client(&context, Arc::clone(&transport));
-    let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
-    let result: Result<String, Error> = match case.operation.as_str() {
-        "public_configuration" => sdk.public_configuration().await.map(|value| {
-            assert_eq!(
-                Some(value.project_public_id.as_str()),
-                case.expected.project_id.as_deref()
-            );
-            assert_eq!(
-                Some(value.application_public_id.as_str()),
-                case.expected.application_id.as_deref()
-            );
-            assert_eq!(
-                value
-                    .providers
-                    .iter()
-                    .map(|provider| provider.key.clone())
-                    .collect::<Vec<_>>(),
-                case.expected.provider_keys.clone().unwrap_or_default()
-            );
-            assert_eq!(Some(value.login_available), case.expected.login_available);
-            format!("{value:?}")
-        }),
-        "handoff" | "credential_response" => {
-            let login = sdk
-                .begin_login("https://app.example/callback", None, None)
-                .await
-                .unwrap();
-            sdk.complete_login(
-                &format!("https://app.example/callback?handoff=ticket&state={state}"),
-                login.pending,
-            )
-            .await
-            .map(|pair| {
-                assert_eq!(Some(pair.project_id()), case.expected.project_id.as_deref());
-                assert_eq!(
-                    Some(pair.application_id()),
-                    case.expected.application_id.as_deref()
-                );
-                assert_eq!(Some(pair.user_id()), case.expected.user_id.as_deref());
-                assert_eq!(
-                    Some(pair.refresh_generation()),
-                    case.expected.refresh_generation
-                );
-                assert_eq!(
-                    Some(pair.projection_revision()),
-                    case.expected.projection_revision
-                );
-                format!("{pair:?}")
-            })
-        }
-        "refresh" => {
-            let pair = conformance_credentials(&sdk, &state).await;
-            sdk.refresh(&pair).await.map(|value| format!("{value:?}"))
-        }
-        "current_user" | "current_user_response" => {
-            let pair = conformance_credentials(&sdk, &state).await;
-            sdk.current_user(pair.access_token()).await.map(|user| {
-                assert_eq!(
-                    Some(user.project_id.as_str()),
-                    case.expected.project_id.as_deref()
-                );
-                assert_eq!(
-                    Some(user.application_id.as_str()),
-                    case.expected.application_id.as_deref()
-                );
-                assert_eq!(
-                    Some(user.user_id.as_str()),
-                    case.expected.user_id.as_deref()
-                );
-                assert_eq!(
-                    Some(user.projection_revision),
-                    case.expected.projection_revision
-                );
-                format!("{user:?}")
-            })
-        }
-        _ => unreachable!(),
-    };
-    match (&case.expected.outcome[..], result) {
-        ("success", Ok(debug)) => {
-            if case.expected.redacted == Some(true) {
-                assert!(debug.contains("[REDACTED]"));
-            }
-            assert_sentinels_absent(&debug, &fixture.redaction_sentinels);
-        }
-        ("error", Err(error)) => {
-            assert_eq!(
-                category_name(error.category()),
-                case.expected.category.as_deref().unwrap()
-            );
-            assert_eq!(error.code(), case.expected.code.as_deref().unwrap());
-            assert_eq!(
-                retry_name(error.retry_policy()),
-                case.expected.retry.as_deref().unwrap()
-            );
-            assert_eq!(
-                action_name(error.local_action()),
-                case.expected.action.as_deref().unwrap()
-            );
-            let diagnostics = format!("{error:?} {error}");
-            assert_sentinels_absent(&diagnostics, &fixture.redaction_sentinels);
-        }
-        (expected, actual) => panic!("case {} expected {expected}, got {actual:?}", case.name),
-    }
-}
-
-async fn conformance_credentials(sdk: &Client, state: &str) -> owlauth_client::CredentialPair {
-    let login = sdk
-        .begin_login("https://app.example/callback", None, None)
-        .await
-        .unwrap();
-    sdk.complete_login(
-        &format!("https://app.example/callback?handoff=ticket&state={state}"),
-        login.pending,
-    )
-    .await
-    .unwrap()
-}
-
-fn conformance_client(context: &ConfiguredContext, transport: Arc<MockTransport>) -> Client {
-    Client::with_dependencies(
-        ClientConfig::new(
-            "https://runtime.example/base/",
-            &context.project_id,
-            &context.application_id,
-            &context.publishable_key,
-        ),
-        transport,
-        Arc::new(DeterministicEntropy::new()),
-        Arc::new(FixedClock(0)),
-    )
-    .unwrap()
-}
-
-fn category_name(value: ErrorCategory) -> &'static str {
-    match value {
-        ErrorCategory::Configuration => "configuration",
-        ErrorCategory::Protocol => "protocol",
-        ErrorCategory::Login => "login",
-        ErrorCategory::Handoff => "handoff",
-        ErrorCategory::Authentication => "authentication",
-        ErrorCategory::Session => "session",
-        ErrorCategory::Refresh => "refresh",
-        ErrorCategory::RateLimited => "rate_limited",
-        ErrorCategory::Transport => "transport",
-        ErrorCategory::Timeout => "timeout",
-        ErrorCategory::Cancelled => "cancelled",
-        ErrorCategory::Indeterminate => "indeterminate",
-        _ => "unknown",
-    }
-}
-
-fn retry_name(value: RetryPolicy) -> &'static str {
-    match value {
-        RetryPolicy::Never => "never",
-        RetryPolicy::SafeAfterDelay => "safe_after_delay",
-        RetryPolicy::ApplicationDecision => "application_decision",
-        _ => "unknown",
-    }
-}
-
-fn action_name(value: LocalAction) -> &'static str {
-    match value {
-        LocalAction::None => "none",
-        LocalAction::DiscardPendingLogin => "discard_pending",
-        LocalAction::QuarantinePendingLogin => "quarantine_pending",
-        LocalAction::ClearCredentials => "invalidate_credentials",
-        LocalAction::QuarantineCredentials => "quarantine_credentials",
-        LocalAction::Reauthenticate => "reauthenticate",
-        _ => "unknown",
-    }
-}
-
-fn assert_sentinels_absent(value: &str, sentinels: &[String]) {
-    for sentinel in sentinels {
-        assert!(!value.contains(sentinel), "sentinel leaked");
-    }
-}
-
-fn load_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> T {
-    let bytes = fs::read(path).expect("fixture");
-    assert!(bytes.len() <= 1_048_576);
-    serde_json::from_slice(&bytes).expect("valid strict fixture JSON")
 }
 
 #[tokio::test]

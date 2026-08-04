@@ -2,7 +2,7 @@
 
 ## Current status
 
-Public configuration retrieval, generic Hosted Project login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout are implemented by the pre-alpha official SDKs against the current Runtime contract. The packages remain explicit protocol cores rather than persistence, navigation, framework-session, or backend-token-verification libraries, and they must not be presented as production-supported until their independently versioned release criteria are met.
+Public configuration retrieval, generic Hosted Project login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout exist in the pre-alpha official SDKs. The normative rules below are the Block E convergence target and do not claim that every current implementation already conforms. The packages remain explicit protocol cores rather than persistence, navigation, framework-session, or backend-token-verification libraries, and they must not be presented as production-supported until their independently versioned source, corpus, exact-artifact, real-server, and release criteria are met.
 
 ## Lifecycle overview
 
@@ -39,7 +39,9 @@ A client is initialized for one Runtime base URL, `project_id`, and `application
 
 The SDK validates structural consistency with its configured Project/Application but does not treat configuration as authority. Provider secrets, provider tokens, management metadata, `belongs_to`, internal identifiers, user counts, policy internals, or Control URLs must not appear.
 
-Configuration may be cached only with the Runtime-defined revision/TTL semantics. A stale provider/redirect/config entry cannot override Runtime's authoritative login-start validation.
+Configuration may be cached only with the Runtime-defined revision/TTL semantics. A stale provider/redirect/config entry cannot override Runtime's authoritative login-start validation. The response must match the configured Project/Application and its bounded `publishable_keys` list must contain the configured publishable key; duplicate provider keys or unsupported provider-kind enum values are protocol failures.
+
+Project JWKS retrieval is a transport capability, not a claim that the core SDK authorizes backend requests. The document requires positive `revision` and `signing_epoch`, at most 100 unique `kid` values, and the selected `OKP`/`Ed25519`/`EdDSA`/`sig` key shape with bounded base64url `x`. Unknown algorithms, duplicate keys, or malformed key material are protocol failures until a reviewed compatibility change ships.
 
 ## Login initiation and PKCE custody
 
@@ -66,12 +68,13 @@ The Application supplies the callback value and its retained pending transaction
 - exact pending Project/Application/Runtime transaction context;
 - returned Application state using constant-time comparison where applicable;
 - transaction expiry;
-- exclusivity and bounds of success versus safe error fields;
-- expected redirect context.
+- exactly one bounded `state` and exactly one of bounded `handoff` success or bounded safe `error`, with no duplicate reserved field, fragment, credentials, or extra reserved callback field;
+- an error callback as a normalized `Handoff`/login failure that requires pending disposal and never dispatches exchange; and
+- expected redirect scheme, authority, path, and pre-registered non-reserved query fields.
 
 The Application or an external browser/native integration removes handoff values from browser history or platform-visible state before third-party resources can observe them. The core SDK performs no navigation or history mutation. A handoff ticket remains untrusted until Runtime exchanges it successfully.
 
-The pending transaction is one-attempt material. The Application removes or atomically marks it consumed before dispatching exchange and does not restore it after any definitive or ambiguous outcome. The SDK exposes no automatic retry path. If local callback validation fails, no handoff exchange occurs and secret-bearing values remain redacted.
+The pending transaction is one-attempt material. Local validation does not consume it merely because malformed input was inspected. A successful validation produces one one-use validated callback bound to that exact pending value; exchange atomically consumes the pending/validated material immediately before dispatch. The Application removes or marks its durable copy consumed at the same boundary and does not restore it after any definitive or ambiguous outcome. The SDK exposes no automatic retry path. If local callback validation fails, no handoff exchange occurs and secret-bearing values remain redacted.
 
 ## One-use handoff exchange
 
@@ -104,7 +107,7 @@ Runtime refresh tokens are opaque, one-use, and belong to one Project/Applicatio
 The core refresh API therefore:
 
 - accepts one explicit credential generation and sends its refresh token only to the configured Project-qualified operation;
-- returns the successor access/refresh pair in one typed credential-pair result;
+- returns the successor access/refresh pair in one typed credential-pair result whose `refresh_generation` is exactly the submitted generation plus one, never merely greater;
 - classifies definitive expired/revoked/replay/session errors so the caller can invalidate the family;
 - never automatically retries an old refresh token after an ambiguous outcome.
 
@@ -131,7 +134,7 @@ The SDK result distinguishes confirmed Runtime revocation from an ambiguous netw
 
 ## Clock, entropy, and diagnostics
 
-Production entropy comes only from an operating-system CSPRNG. Tests inject deterministic entropy/clock interfaces without weakening production defaults. Expiry scheduling uses receipt instants and a documented skew window, while Runtime remains authoritative.
+Production entropy comes only from an operating-system CSPRNG. Tests inject deterministic entropy/clock interfaces without weakening production defaults. Runtime remains authoritative. The initial client bounds follow the current server constants with an explicit one-minute clock-skew allowance: login `expires_at` must fall between 60 seconds before and 11 minutes after the client's pre-dispatch creation instant, and pending state becomes locally expired only when client time is more than 60 seconds past that timestamp. Browser-logout `expires_at` must fall between 60 seconds before and 2 minutes after the receipt instant; a value inside the lower skew window may be returned for an immediate Runtime-authoritative attempt rather than rejected as malformed. Access `expires_in` is an integer from 1 through 3,600 seconds, and session expiry receives the same 60-second lower skew tolerance. These bounds are compatibility policy and therefore change only with the selected contract/spec/corpus review.
 
 PKCE verifiers, handoff tickets, Project access tokens, refresh tokens, cookies, full callback URLs, and user profiles never enter default logs, errors, traces, metrics, snapshots, or telemetry.
 

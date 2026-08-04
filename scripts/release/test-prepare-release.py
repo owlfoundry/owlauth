@@ -28,6 +28,7 @@ FILES = (
     "sdks/python/src/owlauth/__init__.py",
     "sdks/rust/Cargo.toml",
     "sdks/typescript/package.json",
+    "sdks/typescript/src/index.ts",
 )
 
 
@@ -80,6 +81,9 @@ def test_components(root: Path) -> None:
     prepare_release("typescript", "3.4.5", root)
     package = json.loads((root / "sdks/typescript/package.json").read_text(encoding="utf-8"))
     assert package["version"] == "3.4.5"
+    assert 'export const VERSION = "3.4.5";' in (root / "sdks/typescript/src/index.ts").read_text(
+        encoding="utf-8"
+    )
 
     prepare_release("python", "4.5.6", root)
     assert toml_version(root / "sdks/python/pyproject.toml", "project") == "4.5.6"

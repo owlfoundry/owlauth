@@ -1,4 +1,10 @@
-use std::fmt;
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
@@ -39,6 +45,7 @@ secret_string!(RefreshToken, "RefreshToken");
 
 /// Public provider presentation returned by Runtime.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PublicProvider {
     pub key: String,
     pub display_name: String,
@@ -47,6 +54,7 @@ pub struct PublicProvider {
 
 /// Public Project/Application login configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "the public wire contract exposes orthogonal current capability facts"
@@ -66,6 +74,7 @@ pub struct PublicConfiguration {
 
 /// One public Project signing key.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PublicJwk {
     pub kty: String,
     pub crv: String,
@@ -78,6 +87,7 @@ pub struct PublicJwk {
 
 /// Project JWKS plus authoritative revision metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct JwksDocument {
     pub keys: Vec<PublicJwk>,
     pub revision: i64,
@@ -130,6 +140,7 @@ pub struct PendingLogin {
     pub(crate) state: Zeroizing<String>,
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
+    pub(crate) guard: Arc<AtomicBool>,
 }
 
 impl PendingLogin {
@@ -162,6 +173,11 @@ impl PendingLogin {
     pub const fn expires_at(&self) -> i64 {
         self.expires_at
     }
+
+    #[must_use]
+    pub fn consumed(&self) -> bool {
+        self.guard.load(Ordering::Acquire)
+    }
 }
 
 impl fmt::Debug for PendingLogin {
@@ -177,7 +193,8 @@ impl fmt::Debug for PendingLogin {
             .field("state", &"[REDACTED]")
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
-            .finish()
+            .field("consumed", &self.consumed())
+            .finish_non_exhaustive()
     }
 }
 
@@ -201,6 +218,7 @@ impl fmt::Debug for LoginStart {
 pub struct ValidatedCallback {
     pub(crate) handoff: Zeroizing<String>,
     pub(crate) verifier: Zeroizing<String>,
+    pub(crate) guard: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for ValidatedCallback {
@@ -315,6 +333,7 @@ impl fmt::Debug for CredentialPair {
 
 /// Current Project user and Application session view.
 #[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CurrentUser {
     pub project_id: String,
     pub application_id: String,
@@ -342,6 +361,7 @@ impl fmt::Debug for CurrentUser {
 
 /// Project browser logout target. The SDK never navigates to it.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserLogoutPreparation {
     pub hosted_url: String,
     pub expires_at: String,
@@ -368,6 +388,7 @@ pub(crate) struct LoginStartRequest<'a> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LoginStartResponse {
     pub hosted_url: String,
     pub expires_at: String,
@@ -389,6 +410,7 @@ pub(crate) struct RefreshRequest<'a> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CredentialPairWire {
     pub project_id: String,
     pub application_id: String,
@@ -405,13 +427,15 @@ pub(crate) struct CredentialPairWire {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CompletionResponse {
     pub completed: bool,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeErrorWire {
     pub code: String,
     pub message: String,
-    pub request_id: String,
+    pub request_id: Option<String>,
 }

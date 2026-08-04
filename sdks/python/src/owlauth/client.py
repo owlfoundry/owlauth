@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -12,7 +13,8 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, cast
+from functools import wraps
+from typing import Any, Literal, ParamSpec, TypeVar, cast
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 from owlauth.errors import (
@@ -53,7 +55,35 @@ from owlauth.transport import FailureKind, StdlibTransport, Transport, Transport
 _MAX_JSON_BYTES = 65_536
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]+$")
-_SENSITIVE_OPERATIONS = frozenset({"handoff", "refresh", "application_logout", "browser_logout"})
+_SENSITIVE_OPERATIONS = frozenset(
+    {
+        "exchange_handoff",
+        "refresh_session",
+        "logout_application_session",
+        "prepare_browser_logout",
+    }
+)
+_PROVIDER_KINDS = frozenset({"oidc", "google", "github"})
+_Parameters = ParamSpec("_Parameters")
+_Result = TypeVar("_Result")
+
+
+def _bind_protocol_operation(
+    operation: str,
+) -> Callable[[Callable[_Parameters, _Result]], Callable[_Parameters, _Result]]:
+    def decorate(function: Callable[_Parameters, _Result]) -> Callable[_Parameters, _Result]:
+        @wraps(function)
+        def wrapped(*args: _Parameters.args, **kwargs: _Parameters.kwargs) -> _Result:
+            try:
+                return function(*args, **kwargs)
+            except ProtocolError as error:
+                if error.operation is None:
+                    error.operation = operation
+                raise
+
+        return wrapped
+
+    return decorate
 
 
 def _utc_now() -> datetime:
@@ -99,12 +129,13 @@ class Client:
         if not isinstance(now, datetime) or now.tzinfo is None:
             raise ConfigurationError("invalid_clock", "The configured clock must return UTC time.")
 
+    @_bind_protocol_operation("get_public_application_config")
     def get_public_configuration(self, *, timeout: float | None = None) -> PublicApplicationConfig:
         payload = self._request_json(
             "GET",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/config?"
             + urlencode({"application_id": self.application_id}),
-            operation="public_config",
+            operation="get_public_application_config",
             expected_status=200,
             timeout=timeout,
         )
@@ -118,19 +149,24 @@ class Client:
             provider = _object(item)
             key = _string(provider, "key", 64)
             if key in seen:
-                raise _protocol("duplicate_provider", "Runtime returned duplicate providers.")
+                raise _protocol("invalid_response", "Runtime returned duplicate providers.")
             seen.add(key)
+            kind = _string(provider, "kind", 32)
+            if kind not in _PROVIDER_KINDS:
+                raise _protocol(
+                    "invalid_response", "Runtime returned an unsupported provider kind."
+                )
             providers.append(
                 PublicProvider(
                     key=key,
                     display_name=_string(provider, "display_name", 128),
-                    kind=_string(provider, "kind", 32),
+                    kind=kind,
                 )
             )
         keys = tuple(_string_value(value, 128) for value in _list(payload, "publishable_keys", 50))
         if self.publishable_key not in keys:
             raise _protocol(
-                "publishable_key_context_mismatch",
+                "context_mismatch",
                 "Runtime returned a different publishable-key context.",
             )
         return PublicApplicationConfig(
@@ -146,11 +182,12 @@ class Client:
             login_available=_boolean(payload, "login_available"),
         )
 
+    @_bind_protocol_operation("get_project_jwks")
     def get_project_jwks(self, *, timeout: float | None = None) -> JwksDocument:
         payload = self._request_json(
             "GET",
             f"projects/{quote(self.project_id, safe='')}/.well-known/jwks.json",
-            operation="jwks",
+            operation="get_project_jwks",
             expected_status=200,
             timeout=timeout,
         )
@@ -158,18 +195,38 @@ class Client:
         seen: set[str] = set()
         for value in _list(payload, "keys", 100):
             key = _object(value)
+            if set(key) != {"kty", "crv", "alg", "use", "kid", "x"}:
+                raise _protocol("invalid_response", "Runtime returned an invalid signing key.")
             kid = _string(key, "kid", 128)
             if kid in seen:
-                raise _protocol("duplicate_jwk", "Runtime returned duplicate signing keys.")
+                raise _protocol("invalid_response", "Runtime returned duplicate signing keys.")
             seen.add(kid)
+            key_type = _string(key, "kty", 16)
+            curve = _string(key, "crv", 16)
+            algorithm = _string(key, "alg", 16)
+            key_use = _string(key, "use", 16)
+            x = _string(key, "x", 64)
+            if (key_type, curve, algorithm, key_use) != ("OKP", "Ed25519", "EdDSA", "sig"):
+                raise _protocol("invalid_response", "Runtime returned an unsupported signing key.")
+            try:
+                decoded_x = base64.b64decode(x + "=", altchars=b"-_", validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise _protocol(
+                    "invalid_response", "Runtime returned invalid signing material."
+                ) from error
+            if (
+                len(decoded_x) != 32
+                or base64.urlsafe_b64encode(decoded_x).rstrip(b"=").decode("ascii") != x
+            ):
+                raise _protocol("invalid_response", "Runtime returned invalid signing material.")
             keys.append(
                 PublicJwk(
-                    key_type=_string(key, "kty", 16),
-                    curve=_string(key, "crv", 16),
-                    algorithm=_string(key, "alg", 16),
-                    use=_string(key, "use", 16),
+                    key_type=key_type,
+                    curve=curve,
+                    algorithm=algorithm,
+                    use=key_use,
                     kid=kid,
-                    x=_string(key, "x", 64),
+                    x=x,
                 )
             )
         return JwksDocument(
@@ -178,6 +235,7 @@ class Client:
             signing_epoch=_positive_int(payload, "signing_epoch"),
         )
 
+    @_bind_protocol_operation("start_login")
     def begin_login(
         self,
         redirect_uri: str,
@@ -199,7 +257,7 @@ class Client:
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/login/start",
-            operation="login_start",
+            operation="start_login",
             expected_status=201,
             body={
                 "application_id": self.application_id,
@@ -214,7 +272,7 @@ class Client:
         hosted_url = _string(payload, "hosted_url", 512)
         _require_runtime_url(self.base_url, hosted_url)
         expires_at = _timestamp(payload, "expires_at")
-        if expires_at <= now or expires_at > now + timedelta(minutes=15):
+        if expires_at < now - timedelta(seconds=60) or expires_at > now + timedelta(minutes=11):
             raise _protocol("invalid_login_expiry", "Runtime returned an invalid login expiry.")
         pending = PendingLogin(
             runtime_base_url=self.base_url,
@@ -229,14 +287,15 @@ class Client:
         )
         return LoginStart(hosted_url=hosted_url, pending=pending)
 
+    @_bind_protocol_operation("exchange_handoff")
     def validate_callback(self, callback_url: str, pending: PendingLogin) -> ValidatedCallback:
         self._validate_pending_context(pending)
-        if self._now() >= pending.expires_at:
+        if self._now() > pending.expires_at + timedelta(seconds=60):
             raise HandoffError(
-                "pending_login_expired",
+                "pending_context_mismatch",
                 "The pending login has expired.",
                 action=LocalAction.DISCARD_PENDING,
-                operation="handoff",
+                operation="exchange_handoff",
             )
         if not isinstance(callback_url, str) or len(callback_url) > 4096:
             raise _handoff_local("invalid_callback", "The callback URL is invalid.")
@@ -281,13 +340,14 @@ class Client:
                 "login_failed",
                 "Sign-in did not complete.",
                 action=LocalAction.DISCARD_PENDING,
-                operation="handoff",
+                operation="exchange_handoff",
             )
         handoff = values.get("handoff", [""])[0]
         if not (1 <= len(handoff) <= 256) or "state" not in values:
             raise _handoff_local("invalid_callback", "The callback URL is invalid.")
         return ValidatedCallback(SecretValue(handoff, "handoff ticket"), pending._marker)
 
+    @_bind_protocol_operation("exchange_handoff")
     def exchange_handoff(
         self,
         callback: ValidatedCallback,
@@ -302,7 +362,7 @@ class Client:
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/handoff/exchange",
-            operation="handoff",
+            operation="exchange_handoff",
             expected_status=200,
             body={
                 "application_id": self.application_id,
@@ -315,8 +375,9 @@ class Client:
         try:
             return self._credential_pair(payload, previous=None)
         except ProtocolError as error:
-            raise _quarantine_protocol(error, "handoff") from None
+            raise _indeterminate_protocol(error, "exchange_handoff", 200) from None
 
+    @_bind_protocol_operation("exchange_handoff")
     def complete_login(
         self,
         callback_url: str,
@@ -327,6 +388,7 @@ class Client:
         callback = self.validate_callback(callback_url, pending)
         return self.exchange_handoff(callback, pending, timeout=timeout)
 
+    @_bind_protocol_operation("refresh_session")
     def refresh(
         self, credentials: CredentialPair, *, timeout: float | None = None
     ) -> CredentialPair:
@@ -334,7 +396,7 @@ class Client:
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/sessions/refresh",
-            operation="refresh",
+            operation="refresh_session",
             expected_status=200,
             body={
                 "application_id": self.application_id,
@@ -346,8 +408,9 @@ class Client:
         try:
             return self._credential_pair(payload, previous=credentials)
         except ProtocolError as error:
-            raise _quarantine_protocol(error, "refresh") from None
+            raise _indeterminate_protocol(error, "refresh_session", 200) from None
 
+    @_bind_protocol_operation("get_current_user")
     def current_user(
         self, access: SecretValue | CredentialPair, *, timeout: float | None = None
     ) -> CurrentUser:
@@ -355,7 +418,7 @@ class Client:
         payload = self._request_json(
             "GET",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/users/me",
-            operation="current_user",
+            operation="get_current_user",
             expected_status=200,
             authorization=token.reveal(),
             timeout=timeout,
@@ -371,15 +434,20 @@ class Client:
             raise _protocol(
                 "projection_context_mismatch", "Runtime returned a mismatched projection."
             )
+        authenticated_at = _timestamp(payload, "authenticated_at")
+        session_expires_at = _timestamp(payload, "session_expires_at")
+        if session_expires_at < self._now() - timedelta(seconds=60):
+            raise _protocol("context_mismatch", "Runtime returned an expired session.")
         return CurrentUser(
             project_id=project_id,
             application_id=application_id,
             user_id=user_id,
             projection=projection,
-            authenticated_at=_timestamp(payload, "authenticated_at"),
-            session_expires_at=_timestamp(payload, "session_expires_at"),
+            authenticated_at=authenticated_at,
+            session_expires_at=session_expires_at,
         )
 
+    @_bind_protocol_operation("logout_application_session")
     def logout_application(
         self, access: SecretValue | CredentialPair, *, timeout: float | None = None
     ) -> Completion:
@@ -387,16 +455,22 @@ class Client:
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/sessions/logout",
-            operation="application_logout",
+            operation="logout_application_session",
             expected_status=200,
             authorization=token.reveal(),
             timeout=timeout,
         )
-        completed = _boolean(payload, "completed")
-        if not completed:
-            raise _protocol("logout_not_completed", "Runtime did not confirm Application logout.")
-        return Completion(completed=True)
+        try:
+            completed = _boolean(payload, "completed")
+            if not completed:
+                raise _protocol(
+                    "logout_not_completed", "Runtime did not confirm Application logout."
+                )
+            return Completion(completed=True)
+        except ProtocolError as error:
+            raise _indeterminate_protocol(error, "logout_application_session", 200) from None
 
+    @_bind_protocol_operation("prepare_browser_logout")
     def prepare_browser_logout(
         self, access: SecretValue | CredentialPair, *, timeout: float | None = None
     ) -> BrowserLogoutPreparation:
@@ -404,17 +478,25 @@ class Client:
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/browser-logout/prepare",
-            operation="browser_logout",
+            operation="prepare_browser_logout",
             expected_status=201,
             authorization=token.reveal(),
             timeout=timeout,
         )
-        hosted_url = _string(payload, "hosted_url", 512)
-        _require_runtime_url(self.base_url, hosted_url)
-        expires_at = _timestamp(payload, "expires_at")
-        if expires_at <= self._now() or expires_at > self._now() + timedelta(minutes=10):
-            raise _protocol("invalid_logout_expiry", "Runtime returned an invalid logout expiry.")
-        return BrowserLogoutPreparation(hosted_url=hosted_url, expires_at=expires_at)
+        try:
+            hosted_url = _string(payload, "hosted_url", 512)
+            _require_runtime_url(self.base_url, hosted_url)
+            expires_at = _timestamp(payload, "expires_at")
+            received_at = self._now()
+            if expires_at < received_at - timedelta(
+                seconds=60
+            ) or expires_at > received_at + timedelta(minutes=2):
+                raise _protocol(
+                    "invalid_logout_expiry", "Runtime returned an invalid logout expiry."
+                )
+            return BrowserLogoutPreparation(hosted_url=hosted_url, expires_at=expires_at)
+        except ProtocolError as error:
+            raise _indeterminate_protocol(error, "prepare_browser_logout", 201) from None
 
     def _credential_pair(
         self, payload: JsonObject, *, previous: CredentialPair | None
@@ -437,7 +519,7 @@ class Client:
                 or previous.application_id != application_id
                 or previous.user_id != user_id
                 or previous.session_id != session_id
-                or generation <= previous.refresh_generation
+                or generation != previous.refresh_generation + 1
             ):
                 raise _protocol(
                     "credential_context_mismatch", "Runtime returned mismatched credentials."
@@ -450,7 +532,7 @@ class Client:
             raise _protocol("invalid_token_expiry", "Runtime returned an invalid token expiry.")
         now = self._now()
         session_expires_at = _timestamp(payload, "session_expires_at")
-        if session_expires_at <= now:
+        if session_expires_at < now - timedelta(seconds=60):
             raise _protocol("invalid_session_expiry", "Runtime returned an invalid session expiry.")
         return CredentialPair(
             project_id=project_id,
@@ -535,21 +617,42 @@ class Client:
             raise _map_transport_failure(operation, failure) from None
         try:
             if not isinstance(response.body, bytes) or len(response.body) > _MAX_JSON_BYTES:
-                raise _protocol("response_too_large", "Runtime returned an oversized response.")
+                raise _protocol("invalid_response", "Runtime returned an oversized response.")
             if (
                 len(response.headers) > 64
                 or sum(len(str(name)) + len(str(value)) for name, value in response.headers.items())
                 > 16_384
             ):
-                raise _protocol("response_headers_too_large", "Runtime returned oversized headers.")
+                raise _protocol("invalid_response", "Runtime returned oversized headers.")
+            content_type = _header_value(response.headers, "content-type")
+            if (
+                content_type is None
+                or content_type.split(";", 1)[0].strip().lower() != "application/json"
+            ):
+                raise _protocol("invalid_response", "Runtime returned a non-JSON response.")
             payload = _decode_json(response.body)
         except ProtocolError as error:
-            if response.status == expected_status and operation in {"handoff", "refresh"}:
-                raise _quarantine_protocol(error, operation) from None
+            if operation in _SENSITIVE_OPERATIONS:
+                raise _indeterminate_protocol(error, operation, response.status) from None
             raise
         if response.status != expected_status:
+            if 200 <= response.status < 300:
+                error = _protocol(
+                    "invalid_response", "Runtime returned an unexpected success status."
+                )
+                if operation in _SENSITIVE_OPERATIONS:
+                    raise _indeterminate_protocol(error, operation, response.status) from None
+                raise error
             raise _map_runtime_error(operation, response.status, payload)
         return payload
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    lowered = name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == lowered and isinstance(value, str):
+            return value
+    return None
 
 
 def _validate_runtime_base(value: str, allow_loopback: bool) -> str:
@@ -641,7 +744,7 @@ def _decode_json(body: bytes) -> JsonObject:
     try:
         value = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise _protocol("invalid_json", "Runtime returned invalid JSON.") from error
+        raise _protocol("invalid_response", "Runtime returned invalid JSON.") from error
     return _object(value)
 
 
@@ -769,11 +872,11 @@ def _map_transport_failure(operation: str, failure: TransportFailure) -> OwlAuth
     if failure.dispatched and operation in _SENSITIVE_OPERATIONS:
         action = (
             LocalAction.QUARANTINE_PENDING
-            if operation == "handoff"
+            if operation == "exchange_handoff"
             else LocalAction.QUARANTINE_CREDENTIALS
         )
         return IndeterminateError(
-            "outcome_unknown",
+            "outcome_indeterminate",
             "The Runtime operation outcome is unknown. Do not retry the credential.",
             retry=RetryDisposition.NEVER,
             action=action,
@@ -781,7 +884,7 @@ def _map_transport_failure(operation: str, failure: TransportFailure) -> OwlAuth
         )
     if failure.kind == FailureKind.TIMEOUT:
         return OwlAuthTimeoutError(
-            "deadline_exceeded",
+            "timeout",
             "The Runtime request deadline elapsed.",
             retry=RetryDisposition.APPLICATION_DECISION,
             operation=operation,
@@ -802,28 +905,69 @@ def _map_transport_failure(operation: str, failure: TransportFailure) -> OwlAuth
 
 
 def _map_runtime_error(operation: str, status: int, payload: JsonObject) -> OwlAuthError:
+    fields = set(payload)
     code_value = payload.get("code")
+    message_value = payload.get("message")
+    if (
+        not {"code", "message"}.issubset(fields)
+        or not fields <= {"code", "message", "request_id"}
+        or not isinstance(code_value, str)
+        or not 1 <= len(code_value) <= 64
+        or re.fullmatch(r"[a-z][a-z0-9_]*", code_value) is None
+        or not isinstance(message_value, str)
+        or not 1 <= len(message_value) <= 256
+        or ("request_id" in payload and not isinstance(payload["request_id"], str))
+    ):
+        if operation in _SENSITIVE_OPERATIONS:
+            action = (
+                LocalAction.QUARANTINE_PENDING
+                if operation == "exchange_handoff"
+                else LocalAction.QUARANTINE_CREDENTIALS
+            )
+            return IndeterminateError(
+                "invalid_response_after_dispatch",
+                "Runtime may have committed the operation; do not replay it.",
+                action=action,
+                operation=operation,
+                status=status,
+            )
+        return ProtocolError(
+            "invalid_response",
+            "Runtime returned an invalid error response.",
+            retry=RetryDisposition.NEVER,
+            operation=operation,
+            status=status,
+        )
+    code = code_value
     request_value = payload.get("request_id")
-    code = (
-        code_value
-        if isinstance(code_value, str)
-        and 1 <= len(code_value) <= 64
-        and re.fullmatch(r"[a-z][a-z0-9_]*", code_value) is not None
-        else "unknown"
-    )
     request_id = (
         request_value
         if isinstance(request_value, str)
-        and len(request_value) <= 128
+        and 1 <= len(request_value) <= 128
         and _REQUEST_ID.fullmatch(request_value)
         else None
     )
     safe_message = "Runtime rejected the request."
-    if status == 429:
+    if status == 429 and code == "rate_limited":
+        handoff = operation == "exchange_handoff"
+        caller_decision = operation in {
+            "refresh_session",
+            "logout_application_session",
+            "prepare_browser_logout",
+        }
         return RateLimitedError(
             code,
             "Runtime admission policy rejected the request.",
-            retry=RetryDisposition.SAFE_AFTER_DELAY,
+            retry=(
+                RetryDisposition.NEVER
+                if handoff
+                else (
+                    RetryDisposition.APPLICATION_DECISION
+                    if caller_decision
+                    else RetryDisposition.SAFE_AFTER_DELAY
+                )
+            ),
+            action=LocalAction.DISCARD_PENDING if handoff else LocalAction.NONE,
             request_id=request_id,
             operation=operation,
             status=status,
@@ -831,11 +975,11 @@ def _map_runtime_error(operation: str, status: int, payload: JsonObject) -> OwlA
     if status >= 500 and operation in _SENSITIVE_OPERATIONS:
         action = (
             LocalAction.QUARANTINE_PENDING
-            if operation == "handoff"
+            if operation == "exchange_handoff"
             else LocalAction.QUARANTINE_CREDENTIALS
         )
         return IndeterminateError(
-            "outcome_unknown",
+            "outcome_indeterminate",
             "The Runtime operation outcome is unknown. Do not retry the credential.",
             action=action,
             request_id=request_id,
@@ -844,18 +988,18 @@ def _map_runtime_error(operation: str, status: int, payload: JsonObject) -> OwlA
         )
     error_type: type[OwlAuthError]
     action = LocalAction.NONE
-    if operation == "login_start":
+    if operation == "start_login":
         error_type = LoginError
-    elif operation == "handoff":
+    elif operation == "exchange_handoff":
         error_type = HandoffError
         action = LocalAction.DISCARD_PENDING
-    elif operation == "refresh":
+    elif operation == "refresh_session":
         error_type = RefreshError
         action = LocalAction.INVALIDATE_CREDENTIALS
-    elif operation == "current_user":
+    elif operation == "get_current_user":
         error_type = AuthenticationError
         action = LocalAction.REAUTHENTICATE
-    elif operation in {"application_logout", "browser_logout"}:
+    elif operation in {"logout_application_session", "prepare_browser_logout"}:
         error_type = SessionError
         action = LocalAction.REAUTHENTICATE
     elif code == "unknown" or status < 400 or status > 599:
@@ -880,21 +1024,29 @@ def _protocol(code: str, message: str) -> ProtocolError:
     return ProtocolError(code, message, retry=RetryDisposition.NEVER)
 
 
-def _quarantine_protocol(
-    error: ProtocolError, operation: Literal["handoff", "refresh"]
-) -> ProtocolError:
+def _indeterminate_protocol(
+    error: ProtocolError,
+    operation: Literal[
+        "exchange_handoff",
+        "refresh_session",
+        "logout_application_session",
+        "prepare_browser_logout",
+    ],
+    status: int,
+) -> IndeterminateError:
+    del error
     action = (
         LocalAction.QUARANTINE_PENDING
-        if operation == "handoff"
+        if operation == "exchange_handoff"
         else LocalAction.QUARANTINE_CREDENTIALS
     )
-    return ProtocolError(
-        error.code,
-        error.safe_message,
+    return IndeterminateError(
+        "invalid_response_after_dispatch",
+        "Runtime may have committed the operation; do not replay it.",
         retry=RetryDisposition.NEVER,
         action=action,
         operation=operation,
-        status=200,
+        status=status,
     )
 
 
@@ -904,5 +1056,5 @@ def _handoff_local(code: str, message: str) -> HandoffError:
         message,
         retry=RetryDisposition.NEVER,
         action=LocalAction.DISCARD_PENDING,
-        operation="handoff",
+        operation="exchange_handoff",
     )

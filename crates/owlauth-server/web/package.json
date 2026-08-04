@@ -18,7 +18,7 @@
     "format:check": "prettier --check .",
     "typecheck": "tsc --build --pretty false",
     "test": "vitest run",
-    "test:e2e": "pnpm --filter @owlauth/client build && playwright test",
+    "test:e2e": "../../../scripts/run-web-e2e.sh",
     "build:runtime": "vite build --config vite.runtime.config.ts",
     "build:control": "vite build --config vite.control.config.ts",
     "prepare:assets": "node scripts/prepare-assets.mjs",

@@ -6,6 +6,33 @@ on:
       - main
   pull_request:
   workflow_call:
+    outputs:
+      typescript-candidate-artifact-name:
+        value: ${{ jobs.typescript-candidate.outputs.artifact-name }}
+      typescript-candidate-archive-sha256:
+        value: ${{ jobs.typescript-candidate.outputs.archive-sha256 }}
+      typescript-candidate-descriptor-sha256:
+        value: ${{ jobs.typescript-candidate.outputs.descriptor-sha256 }}
+      typescript-candidate-version:
+        value: ${{ jobs.typescript-candidate.outputs.version }}
+      python-candidate-artifact-name:
+        value: ${{ jobs.python-candidate.outputs.artifact-name }}
+      python-candidate-archive-sha256:
+        value: ${{ jobs.python-candidate.outputs.archive-sha256 }}
+      python-candidate-descriptor-sha256:
+        value: ${{ jobs.python-candidate.outputs.descriptor-sha256 }}
+      python-candidate-version:
+        value: ${{ jobs.python-candidate.outputs.version }}
+      rust-candidate-artifact-name:
+        value: ${{ jobs.rust-candidate.outputs.artifact-name }}
+      rust-candidate-archive-sha256:
+        value: ${{ jobs.rust-candidate.outputs.archive-sha256 }}
+      rust-candidate-descriptor-sha256:
+        value: ${{ jobs.rust-candidate.outputs.descriptor-sha256 }}
+      rust-candidate-version:
+        value: ${{ jobs.rust-candidate.outputs.version }}
+      sdk-final-evidence-artifact-name:
+        value: ${{ jobs.sdk-evidence.outputs.artifact-name }}
 
 permissions:
   contents: read
@@ -42,10 +69,10 @@ jobs:
         run: git diff --exit-code -- crates/owlauth-server/web/src/generated crates/owlauth-server/web/dist
 
   project-auth-e2e:
-    name: Project Auth E2E
-    needs: hosted-web
+    name: Project Auth E2E exact SDK artifacts
+    needs: [hosted-web, typescript-candidate, python-candidate, rust-candidate]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -63,19 +90,52 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Install uv
-        run: python -m pip install --disable-pip-version-check uv==0.11.32
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
-      - name: Build embedded assets, SDK, and server
+      - name: Download immutable TypeScript candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.typescript-candidate.outputs.artifact-name }}
+          path: candidates/typescript
+      - name: Download immutable Python candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.python-candidate.outputs.artifact-name }}
+          path: candidates/python
+      - name: Download immutable Rust candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.rust-candidate.outputs.artifact-name }}
+          path: candidates/rust
+      - name: Build embedded assets and server
         run: |
           pnpm --filter @owlauth/server-web build
-          pnpm --filter @owlauth/client build
           cargo build --locked --package owlauth-server
       - name: Install declared browsers
         run: pnpm --filter @owlauth/server-web exec playwright install --with-deps chromium firefox
-      - name: Run real PostgreSQL Project Auth journeys
+      - name: Run real PostgreSQL Project Auth journeys from exact SDK artifacts
+        env:
+          OWLAUTH_E2E_TYPESCRIPT_ARCHIVE: ${{ github.workspace }}/candidates/typescript/${{ needs.typescript-candidate.outputs.archive-file }}
+          OWLAUTH_E2E_TYPESCRIPT_DESCRIPTOR: ${{ github.workspace }}/candidates/typescript/candidate.json
+          OWLAUTH_E2E_TYPESCRIPT_ARCHIVE_SHA256: ${{ needs.typescript-candidate.outputs.archive-sha256 }}
+          OWLAUTH_E2E_TYPESCRIPT_DESCRIPTOR_SHA256: ${{ needs.typescript-candidate.outputs.descriptor-sha256 }}
+          OWLAUTH_E2E_PYTHON_ARCHIVE: ${{ github.workspace }}/candidates/python/${{ needs.python-candidate.outputs.archive-file }}
+          OWLAUTH_E2E_PYTHON_DESCRIPTOR: ${{ github.workspace }}/candidates/python/candidate.json
+          OWLAUTH_E2E_PYTHON_ARCHIVE_SHA256: ${{ needs.python-candidate.outputs.archive-sha256 }}
+          OWLAUTH_E2E_PYTHON_DESCRIPTOR_SHA256: ${{ needs.python-candidate.outputs.descriptor-sha256 }}
+          OWLAUTH_E2E_RUST_ARCHIVE: ${{ github.workspace }}/candidates/rust/${{ needs.rust-candidate.outputs.archive-file }}
+          OWLAUTH_E2E_RUST_DESCRIPTOR: ${{ github.workspace }}/candidates/rust/candidate.json
+          OWLAUTH_E2E_RUST_UPLOAD_METADATA: ${{ github.workspace }}/candidates/rust/${{ needs.rust-candidate.outputs.upload-metadata-file }}
+          OWLAUTH_E2E_RUST_ARCHIVE_SHA256: ${{ needs.rust-candidate.outputs.archive-sha256 }}
+          OWLAUTH_E2E_RUST_DESCRIPTOR_SHA256: ${{ needs.rust-candidate.outputs.descriptor-sha256 }}
+          OWLAUTH_E2E_EVIDENCE_DIRECTORY: ${{ runner.temp }}/sdk-e2e-evidence
         run: pnpm --filter @owlauth/server-web exec playwright test
+      - name: Upload same-server exact-artifact evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: sdk-e2e-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sdk-e2e-evidence
+          if-no-files-found: error
 
   rust:
     name: Rust stable
@@ -99,17 +159,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
-      - name: Verify publishable Rust packages
+      - name: Verify publishable Rust product packages
         run: |
-          for manifest in \
-            crates/owlauth-types/Cargo.toml \
-            sdks/rust/Cargo.toml; do
-            cargo package --manifest-path "$manifest" --locked --allow-dirty
-            package_files="$(cargo package --manifest-path "$manifest" --locked --allow-dirty --list)"
-            grep -qx LICENSE <<< "$package_files"
-          done
-          # The CLI and server packages use the just-packaged unpublished owlauth-types
-          # through temporary local patches and must compile without network access.
+          cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty
+          package_files="$(cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty --list)"
+          grep -qx LICENSE <<< "$package_files"
+          # The SDK candidate is packaged exactly once in rust-candidate. The CLI and
+          # server use the just-packaged unpublished owlauth-types through temporary
+          # local patches and must compile without network access.
           scripts/test-cli-package.sh
           scripts/test-server-package.sh
       - name: Verify Rust product boundaries
@@ -168,10 +225,36 @@ jobs:
           }
           throw "updated CLI did not report version $env:RELEASE_VERSION"
 
-  python:
-    name: Python ${{ matrix.python-version }}
+  python-source:
+    name: Python source checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.32
+      - name: Install locked dependencies
+        run: uv sync --all-packages --locked
+      - name: Run source checks
+        run: |
+          uv run --locked ruff check sdks/python
+          uv run --locked ruff format --check sdks/python
+          uv run --locked pytest -q sdks/python/tests
+
+  python-artifact:
+    name: Python wheel ${{ matrix.python-version }}
+    needs: python-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -187,29 +270,67 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install uv
-        run: python -m pip install --disable-pip-version-check uv==0.11.32
-      - name: Install locked dependencies
-        run: uv sync --all-packages --locked
-      - name: Run Ruff
+      - name: Download immutable wheel candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.python-candidate.outputs.artifact-name }}
+          path: candidate
+      - name: Test the exact wheel in a clean consumer
         run: |
-          uv run --locked ruff check sdks/python
-          uv run --locked ruff format --check sdks/python
-      - name: Run tests
-        run: uv run --locked pytest
-      - name: Build and verify package
-        working-directory: sdks/python
+          scripts/test-python-package.sh \
+            "candidate/${{ needs.python-candidate.outputs.archive-file }}" \
+            candidate/candidate.json
+      - name: Emit digest-bound Python result
         run: |
-          rm -rf dist
-          uv run --locked hatchling build -d dist
-          uv run --locked twine check dist/*
-          wheel_contents="$(unzip -Z1 dist/*.whl)"
-          grep -Eq '\.dist-info/licenses/LICENSE$' <<< "$wheel_contents"
+          tag_args=()
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == python-v* ]]; then
+            tag_args=(--tag "$GITHUB_REF_NAME")
+          fi
+          python scripts/sdk_artifact.py result \
+            --component python --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-configuration python-hatch-wheel-v1 "${tag_args[@]}" \
+            --descriptor candidate/candidate.json \
+            --archive "candidate/${{ needs.python-candidate.outputs.archive-file }}" \
+            --distribution-directory candidate \
+            --matrix-kind python --matrix-value "${{ matrix.python-version }}" \
+            --output result.json
+      - name: Upload Python qualification result
+        uses: actions/upload-artifact@v6
+        with:
+          name: python-sdk-result-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: result.json
+          if-no-files-found: error
 
-  typescript:
-    name: TypeScript Node.js ${{ matrix.node-version }}
+  typescript-source:
+    name: TypeScript source checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run source checks
+        run: |
+          pnpm --filter @owlauth/client check
+          pnpm --filter @owlauth/client test
+
+  typescript-artifact:
+    name: TypeScript tarball Node.js ${{ matrix.node-version }}
+    needs: typescript-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -221,27 +342,44 @@ jobs:
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
-      - name: Set up tooling Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - name: Install pnpm
-        run: npm install --global pnpm@11.17.0
-      - name: Install locked dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Type-check
-        run: pnpm --filter @owlauth/client check
-      - name: Build package
-        run: pnpm --filter @owlauth/client build
-      - name: Verify npm package contents
-        working-directory: sdks/typescript
-        run: npm pack --dry-run --json | jq -e '.[0].files | any(.path == "LICENSE")'
-      - name: Set up runtime Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Run tests on supported Node.js
-        run: node --test sdks/typescript/test/*.test.mjs
+      - name: Set up Python for artifact verification
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Download immutable npm candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.typescript-candidate.outputs.artifact-name }}
+          path: candidate
+      - name: Test the exact tarball in a clean consumer
+        run: |
+          scripts/test-typescript-package.sh \
+            "candidate/${{ needs.typescript-candidate.outputs.archive-file }}" \
+            candidate/candidate.json
+      - name: Emit digest-bound Node.js result
+        run: |
+          tag_args=()
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == typescript-v* ]]; then
+            tag_args=(--tag "$GITHUB_REF_NAME")
+          fi
+          python scripts/sdk_artifact.py result \
+            --component typescript --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-configuration typescript-npm-pack-v1 "${tag_args[@]}" \
+            --descriptor candidate/candidate.json \
+            --archive "candidate/${{ needs.typescript-candidate.outputs.archive-file }}" \
+            --matrix-kind node --matrix-value "${{ matrix.node-version }}" \
+            --output result.json
+      - name: Upload Node.js qualification result
+        uses: actions/upload-artifact@v6
+        with:
+          name: typescript-sdk-result-node-${{ matrix.node-version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: result.json
+          if-no-files-found: error
 
   docs:
     name: Docs
@@ -270,8 +408,8 @@ jobs:
         run: |
           test -f docs/.vitepress/dist/sitemap.xml
           test -f docs/.vitepress/dist/robots.txt
-          grep -q 'https://owlauth.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
-          grep -qx 'Sitemap: https://owlauth.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
+          grep -q 'https://owlauth-docs.owlfoundry.org/' docs/.vitepress/dist/sitemap.xml
+          grep -qx 'Sitemap: https://owlauth-docs.owlfoundry.org/sitemap.xml' docs/.vitepress/dist/robots.txt
       - name: Dry-run documentation deployment
         run: pnpm --filter @owlauth/docs run deploy --dry-run
 
@@ -347,6 +485,10 @@ jobs:
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - name: Set up Go for workflow validation
         uses: actions/setup-go@v6
         with:
@@ -354,13 +496,19 @@ jobs:
           cache: false
       - name: Validate GitHub Actions workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
-      - name: Generate and validate OpenAPI
+      - name: Test SDK contract normalization
+        run: python3 scripts/test-sdk-contract.py
+      - name: Warn when the claimed SDK contract requires client updates
         run: |
-          for plane in runtime control; do
-            cargo run --locked --package owlauth-types --bin export-openapi -- \
-              "$plane" "${RUNNER_TEMP}/${plane}-openapi.json"
-            python3 -m json.tool "${RUNNER_TEMP}/${plane}-openapi.json" >/dev/null
-          done
+          python3 scripts/sdk-contract.py check \
+            --provenance "${RUNNER_TEMP}/sdk-contract-provenance.json"
+          python3 -m json.tool "${RUNNER_TEMP}/sdk-contract-provenance.json"
+      - name: Upload contract provenance
+        uses: actions/upload-artifact@v6
+        with:
+          name: sdk-contract-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sdk-contract-provenance.json
+          if-no-files-found: error
       - name: Validate JSON fixtures
         run: |
           for fixture in sdks/spec/fixtures/*.json sdks/spec/conformance/cases.json; do
@@ -371,6 +519,11 @@ jobs:
           scripts/release/test-verify-release.sh
           python3 scripts/release/test-changelog.py
           python3 scripts/release/test-prepare-release.py
+          python3 scripts/test-sdk-artifact.py
+          python3 scripts/test-sdk-evidence.py
+          python3 scripts/release/test-verify-sdk-candidate.py
+          python3 scripts/release/test-verify-sdk-evidence.py
+          python3 scripts/release/test-upload-crate.py
           sh -n scripts/install.sh
           scripts/test-installers.sh
           cmp scripts/install.sh crates/owlauth-cli/assets/install.sh
@@ -378,3 +531,390 @@ jobs:
           # shellcheck disable=SC2016
           pwsh -NoProfile -NonInteractive -Command \
             '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Out-String | Write-Error; exit 1 }'
+
+
+  typescript-candidate:
+    name: Build TypeScript SDK candidate
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
+      archive-file: ${{ steps.metadata.outputs.archive-file }}
+      archive-sha256: ${{ steps.metadata.outputs.archive-sha256 }}
+      descriptor-sha256: ${{ steps.metadata.outputs.descriptor-sha256 }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install pnpm
+        run: npm install --global pnpm@11.17.0
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Download contract provenance
+        uses: actions/download-artifact@v7
+        with:
+          name: sdk-contract-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contract
+      - name: Build and describe one npm tarball
+        id: metadata
+        run: |
+          set -euo pipefail
+          rm -rf candidate
+          mkdir candidate
+          pnpm --filter @owlauth/client check
+          pnpm --filter @owlauth/client build
+          version="$(node -p "require('./sdks/typescript/package.json').version")"
+          archive_file="owlauth-client-${version}.tgz"
+          (cd sdks/typescript && npm pack --pack-destination ../../candidate)
+          [[ -f "candidate/$archive_file" ]]
+          [[ "$(find candidate -maxdepth 1 -type f | wc -l | tr -d ' ')" == 1 ]]
+          python scripts/sdk_artifact.py describe --component typescript \
+            --archive "candidate/$archive_file" \
+            --contract-provenance contract/sdk-contract-provenance.json \
+            --source-commit "$GITHUB_SHA" --output candidate/candidate.json
+          archive_sha256="$(python -c 'import json; print(json.load(open("candidate/candidate.json"))["archive"]["sha256"])')"
+          descriptor_sha256="$(python -c 'import hashlib; print(hashlib.sha256(open("candidate/candidate.json", "rb").read()).hexdigest())')"
+          artifact_name="typescript-sdk-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "artifact-name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "archive-file=$archive_file" >> "$GITHUB_OUTPUT"
+          echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+          echo "descriptor-sha256=$descriptor_sha256" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Upload immutable TypeScript candidate
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.metadata.outputs.artifact-name }}
+          path: candidate
+          if-no-files-found: error
+
+  python-candidate:
+    name: Build Python SDK candidate
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
+      archive-file: ${{ steps.metadata.outputs.archive-file }}
+      archive-sha256: ${{ steps.metadata.outputs.archive-sha256 }}
+      descriptor-sha256: ${{ steps.metadata.outputs.descriptor-sha256 }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.32
+      - name: Download contract provenance
+        uses: actions/download-artifact@v7
+        with:
+          name: sdk-contract-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contract
+      - name: Build and describe one wheel
+        id: metadata
+        run: |
+          set -euo pipefail
+          rm -rf candidate
+          mkdir candidate
+          (cd sdks/python && uv run --locked hatchling build -t wheel -d ../../candidate)
+          version="$(python -c 'import tomllib; print(tomllib.load(open("sdks/python/pyproject.toml", "rb"))["project"]["version"])')"
+          archive_file="owlauth_client-${version}-py3-none-any.whl"
+          [[ -f "candidate/$archive_file" ]]
+          [[ "$(find candidate -maxdepth 1 -type f | wc -l | tr -d ' ')" == 1 ]]
+          uv run --locked twine check "candidate/$archive_file"
+          python scripts/sdk_artifact.py describe --component python \
+            --archive "candidate/$archive_file" \
+            --contract-provenance contract/sdk-contract-provenance.json \
+            --source-commit "$GITHUB_SHA" --output candidate/candidate.json
+          archive_sha256="$(python -c 'import json; print(json.load(open("candidate/candidate.json"))["archive"]["sha256"])')"
+          descriptor_sha256="$(python -c 'import hashlib; print(hashlib.sha256(open("candidate/candidate.json", "rb").read()).hexdigest())')"
+          artifact_name="python-sdk-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "artifact-name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "archive-file=$archive_file" >> "$GITHUB_OUTPUT"
+          echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+          echo "descriptor-sha256=$descriptor_sha256" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Upload immutable Python candidate
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.metadata.outputs.artifact-name }}
+          path: candidate
+          if-no-files-found: error
+
+  rust-candidate:
+    name: Build Rust SDK candidate
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    outputs:
+      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
+      archive-file: ${{ steps.metadata.outputs.archive-file }}
+      upload-metadata-file: ${{ steps.metadata.outputs.upload-metadata-file }}
+      archive-sha256: ${{ steps.metadata.outputs.archive-sha256 }}
+      descriptor-sha256: ${{ steps.metadata.outputs.descriptor-sha256 }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Keep downloaded build inputs outside Cargo VCS dirtiness
+        run: printf '/candidate\n/contract\n' >> .git/info/exclude
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Download contract provenance
+        uses: actions/download-artifact@v7
+        with:
+          name: sdk-contract-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: contract
+      - name: Build and describe one crate archive
+        id: metadata
+        run: |
+          set -euo pipefail
+          rm -rf candidate
+          mkdir candidate
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' sdks/rust/Cargo.toml | head -n 1)"
+          archive_file="owlauth-client-${version}.crate"
+          upload_metadata_file="owlauth-client-${version}.upload.json"
+          rm -f "target/package/$archive_file"
+          cargo package --manifest-path sdks/rust/Cargo.toml --locked --allow-dirty --no-verify
+          cp "target/package/$archive_file" "candidate/$archive_file"
+          python scripts/sdk_artifact.py rust-upload-metadata \
+            --archive "candidate/$archive_file" \
+            --output "candidate/$upload_metadata_file"
+          python scripts/sdk_artifact.py describe --component rust \
+            --archive "candidate/$archive_file" \
+            --upload-metadata "candidate/$upload_metadata_file" \
+            --contract-provenance contract/sdk-contract-provenance.json \
+            --source-commit "$GITHUB_SHA" --output candidate/candidate.json
+          archive_sha256="$(python -c 'import json; print(json.load(open("candidate/candidate.json"))["archive"]["sha256"])')"
+          descriptor_sha256="$(python -c 'import hashlib; print(hashlib.sha256(open("candidate/candidate.json", "rb").read()).hexdigest())')"
+          artifact_name="rust-sdk-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "artifact-name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "archive-file=$archive_file" >> "$GITHUB_OUTPUT"
+          echo "upload-metadata-file=$upload_metadata_file" >> "$GITHUB_OUTPUT"
+          echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+          echo "descriptor-sha256=$descriptor_sha256" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Upload immutable Rust candidate
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.metadata.outputs.artifact-name }}
+          path: candidate
+          if-no-files-found: error
+
+  rust-artifact:
+    name: Rust exact crate stable
+    needs: rust-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Download immutable crate candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.rust-candidate.outputs.artifact-name }}
+          path: candidate
+      - name: Test the exact crate in a clean consumer
+        run: |
+          scripts/test-rust-sdk-package.sh \
+            "candidate/${{ needs.rust-candidate.outputs.archive-file }}" \
+            candidate/candidate.json \
+            "candidate/${{ needs.rust-candidate.outputs.upload-metadata-file }}"
+      - name: Emit digest-bound Rust result
+        run: |
+          tag_args=()
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == rust-v* ]]; then
+            tag_args=(--tag "$GITHUB_REF_NAME")
+          fi
+          python scripts/sdk_artifact.py result \
+            --component rust --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-configuration rust-cargo-package-v1 "${tag_args[@]}" \
+            --descriptor candidate/candidate.json \
+            --archive "candidate/${{ needs.rust-candidate.outputs.archive-file }}" \
+            --upload-metadata "candidate/${{ needs.rust-candidate.outputs.upload-metadata-file }}" \
+            --matrix-kind rust --matrix-value stable --output result.json
+      - name: Upload Rust qualification result
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-sdk-result-stable-${{ github.run_id }}-${{ github.run_attempt }}
+          path: result.json
+          if-no-files-found: error
+
+  typescript-browser-artifact:
+    name: TypeScript exact tarball browser bundle
+    needs: typescript-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Download immutable npm candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.typescript-candidate.outputs.artifact-name }}
+          path: candidate
+      - name: Bundle the exact tarball for browsers
+        run: |
+          scripts/test-typescript-browser-package.sh \
+            "candidate/${{ needs.typescript-candidate.outputs.archive-file }}" \
+            candidate/candidate.json
+      - name: Emit digest-bound browser bundle result
+        run: |
+          tag_args=()
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == typescript-v* ]]; then
+            tag_args=(--tag "$GITHUB_REF_NAME")
+          fi
+          python scripts/sdk_artifact.py result \
+            --component typescript --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --build-configuration typescript-npm-pack-v1 "${tag_args[@]}" \
+            --descriptor candidate/candidate.json \
+            --archive "candidate/${{ needs.typescript-candidate.outputs.archive-file }}" \
+            --matrix-kind browser-bundle --matrix-value vite-8.1.5 --output result.json
+      - name: Upload browser bundle qualification result
+        uses: actions/upload-artifact@v6
+        with:
+          name: typescript-sdk-result-browser-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: result.json
+          if-no-files-found: error
+
+  sdk-evidence:
+    name: Aggregate final SDK evidence
+    needs:
+      - project-auth-e2e
+      - typescript-candidate
+      - typescript-artifact
+      - typescript-browser-artifact
+      - python-candidate
+      - python-artifact
+      - rust-candidate
+      - rust-artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Download TypeScript candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.typescript-candidate.outputs.artifact-name }}
+          path: candidates/typescript
+      - name: Download Python candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.python-candidate.outputs.artifact-name }}
+          path: candidates/python
+      - name: Download Rust candidate
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.rust-candidate.outputs.artifact-name }}
+          path: candidates/rust
+      - name: Download exact-artifact result fragments
+        uses: actions/download-artifact@v7
+        with:
+          pattern: "*-sdk-result-*-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: qualification-results
+      - name: Download same-server result fragments
+        uses: actions/download-artifact@v7
+        with:
+          name: sdk-e2e-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: e2e-results
+      - name: Aggregate candidate-bound final manifests
+        run: |
+          python scripts/sdk_evidence.py \
+            --typescript-descriptor candidates/typescript/candidate.json \
+            --python-descriptor candidates/python/candidate.json \
+            --rust-descriptor candidates/rust/candidate.json \
+            --results-directory qualification-results \
+            --e2e-directory e2e-results \
+            --output-directory final-evidence
+      - name: Select immutable evidence artifact name
+        id: metadata
+        run: echo "artifact-name=sdk-final-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - name: Upload final evidence manifests
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.metadata.outputs.artifact-name }}
+          path: final-evidence
+          if-no-files-found: error
+      - name: Attest exact candidates and final manifests
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            candidates/typescript/${{ needs.typescript-candidate.outputs.archive-file }}
+            candidates/typescript/candidate.json
+            candidates/python/${{ needs.python-candidate.outputs.archive-file }}
+            candidates/python/candidate.json
+            candidates/rust/${{ needs.rust-candidate.outputs.archive-file }}
+            candidates/rust/${{ needs.rust-candidate.outputs.upload-metadata-file }}
+            candidates/rust/candidate.json
+            final-evidence/*.json

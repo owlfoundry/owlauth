@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 3,
+  "synthetic": true,
+  "exchange": {
+    "kind": "http",
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "json",
+      "value": {
+        "keys": [
+          {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "alg": "EdDSA",
+            "use": "sig",
+            "kid": "synthetic-kid",
+            "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          },
+          {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "alg": "EdDSA",
+            "use": "sig",
+            "kid": "synthetic-kid",
+            "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          }
+        ],
+        "revision": 1,
+        "signing_epoch": 1
+      }
+    }
+  }
+}

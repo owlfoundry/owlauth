@@ -74,6 +74,26 @@ HTTP clients, generators, cryptographic packages, and transitive dependencies ar
 
 Publication uses least-privilege trusted publishing where available and repository-defined provenance. Every registry artifact includes the BSD license and excludes credentials, local paths, caches, temporary OpenAPI, and unrelated workspace contents.
 
+## Qualification and evidence custody
+
+Qualification treats package bytes and evidence as a custody chain, not as interchangeable workspace output:
+
+1. build one component archive and one canonical candidate descriptor;
+2. bind the archive SHA-256, package identity/version, source commit, workflow run/attempt, build configuration, Runtime contract digests, claimed operation IDs, and corpus digest;
+3. verify archive and descriptor digests at every artifact handoff;
+4. install the exact bytes in clean consumers outside the repository rather than importing workspace source;
+5. run package matrices and same-server journeys against those consumers;
+6. aggregate canonical final evidence only when every required fragment has the same source/run/contract/corpus coordinate and complete observed-operation set;
+7. verify the final manifest against the candidate before publishing the same archive bytes.
+
+Canonical parsing and closed field sets prevent an alternate descriptor or manifest shape from weakening the binding. No rebuild occurs after candidate qualification. Non-PR candidate archives, descriptors, and final manifests receive repository provenance attestations where the platform supports them.
+
+Test authority remains compartmentalized. The parent harness alone receives the Control operator and provider credentials used to provision isolated resources; exact-candidate child environments are explicit allowlists that exclude both. The external TypeScript runner receives a browser-driver token for bounded test-only navigation, and each external runner receives a separate loopback fault-proxy token that can arm only three allowlisted post-response disconnects. Those narrow test controls are runner-process inputs, not SDK constructor/method inputs, and no authority token enters candidate metadata, browser snapshots, or final evidence. Each SDK receives a distinct Project/Application assignment and mutable credential family even though all three share one server process topology.
+
+Evidence contains only archive/contract/corpus/source identities, bounded public Project/Application assignments, operation IDs, matrices, and pass status. It never contains tokens, callbacks, cookies, PKCE values, pending state, provider credentials, operator credentials, browser-driver/fault tokens, private keys, or user profiles.
+
+Raw Hosted/provider helpers in the E2E harness exist only to drive user-agent protocol boundaries. They do not become SDK APIs. Likewise, a separate backend-custody product journey proves that product topology; it does not imply that a core SDK owns persistence, confidential credentials, JWT authorization, or framework sessions.
+
 ## Security testing and disclosure
 
 Tests seed recognizable synthetic secrets through success, failure, cancellation, concurrency, formatting, persistence, and telemetry paths, then assert no disclosure. Fuzz/property tests target URLs, callback/handoff inputs, malformed Runtime responses, Project/Application mismatches, unknown enums/errors, and token-shaped data.
@@ -86,6 +106,6 @@ Vulnerabilities follow [`SECURITY.md`](../../SECURITY.md). Public issues and SDK
 - Production defaults reject insecure URLs/TLS and cross-origin credential redirects.
 - Stored/pending/session state cannot cross Runtime/Project/Application context.
 - Handoff and refresh ambiguity never causes blind replay.
-- Published artifacts trace source, dependencies, contract digest, and build job.
+- Candidate and final-evidence digests bind the exact archive to source, run/attempt, build configuration, contract/corpus digests, complete claimed/observed operations, and isolated same-server assignments; publication reuses those bytes without rebuilding.
 - The TypeScript core has no Node-only dependency in its browser closure and no implicit navigation, history, storage, or framework side effects.
 - Platform-specific redirect/storage support is documented only by the separate Application integration or library that owns its security review and real tests.

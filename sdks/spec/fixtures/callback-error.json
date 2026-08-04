@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 3,
+  "synthetic": true,
+  "exchange": {
+    "kind": "callback",
+    "attempts": [
+      "error"
+    ],
+    "clockOffsetSeconds": 0
+  }
+}
