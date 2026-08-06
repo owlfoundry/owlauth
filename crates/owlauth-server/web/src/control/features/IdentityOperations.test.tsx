@@ -342,9 +342,11 @@ describe("Control identity mutation orchestration", () => {
       candidate_proof_authority: { method_kind: "email", application_id: application.id },
     });
     expect(document.body.textContent).not.toContain("issuer.example");
-    const exactReview = screen.getByRole("heading", {
-      name: "Exact immutable create-time plan",
-    }).parentElement;
+    const exactReview = (
+      await screen.findByRole("heading", {
+        name: "Exact immutable create-time plan",
+      })
+    ).parentElement;
     expect(exactReview).toHaveTextContent(winner.id);
     expect(exactReview).toHaveTextContent("Expected user revision: 7");
     expect(exactReview).toHaveTextContent("Expected user security revision: 8");
@@ -417,9 +419,11 @@ describe("Control identity mutation orchestration", () => {
         expected_identity_revision: 11,
       },
     });
-    const unlinkReview = screen.getByRole("heading", {
-      name: "Exact immutable create-time plan",
-    }).parentElement;
+    const unlinkReview = (
+      await screen.findByRole("heading", {
+        name: "Exact immutable create-time plan",
+      })
+    ).parentElement;
     expect(unlinkReview).toHaveTextContent("Primary-source disposition: provider");
     expect(unlinkReview).toHaveTextContent(providerIdentity.id);
     expect(unlinkReview).toHaveTextContent("Expected identity revision: 11");
@@ -489,9 +493,11 @@ describe("Control identity mutation orchestration", () => {
       sessions_disposition: "loser_revoked",
       bindings_disposition: "winner_preferred",
     });
-    const mergeReview = screen.getByRole("heading", {
-      name: "Exact immutable create-time plan",
-    }).parentElement;
+    const mergeReview = (
+      await screen.findByRole("heading", {
+        name: "Exact immutable create-time plan",
+      })
+    ).parentElement;
     expect(mergeReview).toHaveTextContent(winner.id);
     expect(mergeReview).toHaveTextContent("Expected user revision: 7");
     expect(mergeReview).toHaveTextContent(loser.id);
