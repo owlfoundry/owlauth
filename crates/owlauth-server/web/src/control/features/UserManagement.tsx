@@ -58,6 +58,7 @@ export function UserManagement({
   const [users, setUsers] = useState<ProjectUser[]>([]);
   const [statusFilter, setStatusFilter] = useState<UserStatusFilter>("all");
   const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [selectedUser, setSelectedUser] = useState<ProjectUser | null>(null);
   const [sessions, setSessions] = useState<ProjectUserSessions | null>(null);
   const [connections, setConnections] = useState<ManagedProviderConnection[] | null>(null);
@@ -66,6 +67,9 @@ export function UserManagement({
   const [reauthorizationFallback, setReauthorizationFallback] = useState<string | null>(null);
   const reauthorizationAttempt = useRef(new IdempotencyAttempt());
   const reauthorizationAttemptOwner = useRef<string | null>(null);
+  const userListGeneration = useRef(0);
+  const userDetailGeneration = useRef(0);
+  const loadMoreController = useRef<AbortController | null>(null);
 
   const loadUsers = useCallback(
     async (
@@ -73,6 +77,7 @@ export function UserManagement({
       cursor?: string,
       append = false,
       signal?: AbortSignal,
+      requestGeneration = ++userListGeneration.current,
     ): Promise<ProjectUser | null> => {
       const result = await session.client.GET("/v1/projects/{project_id}/users", {
         params: {
@@ -85,12 +90,16 @@ export function UserManagement({
         },
         signal: signal ?? null,
       });
+      if (signal?.aborted === true || requestGeneration !== userListGeneration.current) return null;
       const page = requireData(result.data, result.error, result.response);
-      if (signal?.aborted === true) return null;
       setNextCursor(page.next_cursor ?? null);
       setLoadState("ready");
       if (append) {
-        setUsers((current) => [...current, ...page.items]);
+        setUsers((current) => {
+          const merged = new Map(current.map((user) => [user.id, user]));
+          for (const user of page.items) merged.set(user.id, user);
+          return [...merged.values()];
+        });
         return null;
       }
       setUsers(page.items);
@@ -107,6 +116,12 @@ export function UserManagement({
 
   const loadUser = useCallback(
     async (userId: string, signal?: AbortSignal): Promise<boolean> => {
+      const listGeneration = userListGeneration.current;
+      const detailGeneration = ++userDetailGeneration.current;
+      const isStale = () =>
+        signal?.aborted === true ||
+        listGeneration !== userListGeneration.current ||
+        detailGeneration !== userDetailGeneration.current;
       setPendingAction(`load:${userId}`);
       setIdentities(null);
       try {
@@ -131,7 +146,7 @@ export function UserManagement({
             signal: signal ?? null,
           }),
         ]);
-        if (signal?.aborted === true) return false;
+        if (isStale()) return false;
         const user = requireData(userResult.data, userResult.error, userResult.response);
         const nextSessions = requireData(
           sessionResult.data,
@@ -160,7 +175,7 @@ export function UserManagement({
         setIdentities(nextIdentities);
         return true;
       } catch (error) {
-        if (signal?.aborted === true) return false;
+        if (isStale()) return false;
         if (error instanceof ControlRequestError && error.status === 404) {
           setSelectedUser(null);
           setSessions(EMPTY_SESSIONS);
@@ -171,7 +186,7 @@ export function UserManagement({
         await onError(error);
         return false;
       } finally {
-        if (signal?.aborted !== true) setPendingAction(null);
+        if (detailGeneration === userDetailGeneration.current) setPendingAction(null);
       }
     },
     [onError, project.id, session],
@@ -179,6 +194,12 @@ export function UserManagement({
 
   const beginLoad = useCallback(
     async (signal?: AbortSignal) => {
+      loadMoreController.current?.abort();
+      loadMoreController.current = null;
+      setLoadingMore(false);
+      const requestGeneration = ++userListGeneration.current;
+      userDetailGeneration.current += 1;
+      setPendingAction(null);
       setLoadState("loading");
       setMessage(null);
       try {
@@ -189,7 +210,13 @@ export function UserManagement({
           if (signal?.aborted !== true) setLoadState(loaded ? "ready" : "failed");
           return;
         }
-        const selected = await loadUsers(initialUserId, undefined, false, signal);
+        const selected = await loadUsers(
+          initialUserId,
+          undefined,
+          false,
+          signal,
+          requestGeneration,
+        );
         if (selected !== null) await loadUser(selected.id, signal);
       } catch (error) {
         if (signal?.aborted !== true) {
@@ -211,6 +238,32 @@ export function UserManagement({
       controller.abort();
     };
   }, [beginLoad]);
+
+  useEffect(
+    () => () => {
+      loadMoreController.current?.abort();
+    },
+    [],
+  );
+
+  async function loadMoreUsers() {
+    if (nextCursor === null || loadingMore) return;
+    const controller = new AbortController();
+    loadMoreController.current?.abort();
+    loadMoreController.current = controller;
+    const requestGeneration = userListGeneration.current;
+    setLoadingMore(true);
+    try {
+      await loadUsers(undefined, nextCursor, true, controller.signal, requestGeneration);
+    } catch (error) {
+      if (!controller.signal.aborted) await onError(error);
+    } finally {
+      if (loadMoreController.current === controller) {
+        loadMoreController.current = null;
+        setLoadingMore(false);
+      }
+    }
+  }
 
   async function refreshAfterConflict(error: unknown) {
     if (error instanceof ControlRequestError && error.status === 409 && selectedUser !== null) {
@@ -526,7 +579,7 @@ export function UserManagement({
                 onChange={(event) => {
                   setStatusFilter(event.currentTarget.value as UserStatusFilter);
                 }}
-                disabled={loadState === "loading"}
+                disabled={loadState === "loading" || loadingMore || pendingAction !== null}
               >
                 <option value="all">All</option>
                 <option value="active">Active</option>
@@ -539,7 +592,7 @@ export function UserManagement({
             type="button"
             variant="secondary"
             onClick={() => void beginLoad()}
-            disabled={loadState === "loading"}
+            disabled={loadState === "loading" || loadingMore || pendingAction !== null}
           >
             {loadState === "loading" ? "Loading users" : "Refresh users"}
           </Button>
@@ -582,10 +635,10 @@ export function UserManagement({
                 <li>
                   <button
                     type="button"
-                    disabled={pendingAction !== null}
-                    onClick={() => void loadUsers(undefined, nextCursor, true).catch(onError)}
+                    disabled={pendingAction !== null || loadingMore}
+                    onClick={() => void loadMoreUsers()}
                   >
-                    Load more users
+                    {loadingMore ? "Loading more users" : "Load more users"}
                   </button>
                 </li>
               )}

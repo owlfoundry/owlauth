@@ -17,6 +17,7 @@ export type CreateProjectClientKeyResponse =
 export type Provider = components["schemas"]["Provider"];
 export type ProviderEgressPolicy = components["schemas"]["ProviderEgressPolicy"];
 export type OidcPreflightResult = components["schemas"]["OidcPreflightResult"];
+export type NamedProviderPreflightResult = components["schemas"]["NamedProviderPreflightResult"];
 export type EmailMethodPolicy = components["schemas"]["EmailMethodPolicy"];
 export type EmailAssignment = components["schemas"]["EmailAssignment"];
 export type SmtpConfiguration = components["schemas"]["SmtpConfiguration"];

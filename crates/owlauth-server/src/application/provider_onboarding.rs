@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use url::Url;
 use uuid::Uuid;
 
-use crate::domain::ProviderEgressPolicy;
+use crate::domain::{
+    NamedProviderProfile, ProviderEgressMode, ProviderEgressPolicy, ProviderKey, ProviderKind,
+    provider_callback_url,
+};
 
 use super::{ApplicationError, ProviderExchangeError};
-use crate::domain::ProviderEgressMode;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderEgressPolicyRecord {
@@ -34,6 +37,11 @@ pub(crate) trait ProviderEgressPolicyPort: Send + Sync {
         &self,
         project_id: Uuid,
     ) -> Result<ProviderEgressPolicyRecord, ApplicationError>;
+
+    async fn get_active_project_public_id(
+        &self,
+        project_id: Uuid,
+    ) -> Result<String, ApplicationError>;
 
     async fn update_provider_egress_policy(
         &self,
@@ -75,10 +83,18 @@ pub(crate) trait OidcPreflightPort: Send + Sync {
     ) -> Result<OidcPreflightSummary, ProviderExchangeError>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NamedProviderPreflight {
+    pub(crate) kind: ProviderKind,
+    pub(crate) profile: NamedProviderProfile,
+    pub(crate) callback_url: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProviderOnboardingService {
     policy: Arc<dyn ProviderEgressPolicyPort>,
     discovery: Arc<dyn OidcPreflightPort>,
+    runtime_base: Arc<Url>,
     allow_http_loopback: bool,
 }
 
@@ -86,11 +102,13 @@ impl ProviderOnboardingService {
     pub(crate) fn new(
         policy: Arc<dyn ProviderEgressPolicyPort>,
         discovery: Arc<dyn OidcPreflightPort>,
+        runtime_base: Arc<Url>,
         allow_http_loopback: bool,
     ) -> Self {
         Self {
             policy,
             discovery,
+            runtime_base,
             allow_http_loopback,
         }
     }
@@ -124,6 +142,24 @@ impl ProviderOnboardingService {
                 correlation_id,
             )
             .await
+    }
+
+    pub(crate) async fn preflight_named(
+        &self,
+        project_id: Uuid,
+        kind: ProviderKind,
+        provider_key: String,
+    ) -> Result<NamedProviderPreflight, ApplicationError> {
+        let profile = kind.named_profile().ok_or(ApplicationError::InvalidInput)?;
+        let provider_key = ProviderKey::parse(provider_key)?;
+        let project_public_id = self.policy.get_active_project_public_id(project_id).await?;
+        let callback_url =
+            provider_callback_url(&self.runtime_base, &project_public_id, &provider_key)?;
+        Ok(NamedProviderPreflight {
+            kind,
+            profile,
+            callback_url,
+        })
     }
 
     pub(crate) async fn preflight_for_create(
@@ -219,6 +255,19 @@ mod tests {
             }
         }
 
+        async fn get_active_project_public_id(
+            &self,
+            project_id: Uuid,
+        ) -> Result<String, ApplicationError> {
+            if project_id != self.record.project_id {
+                return Err(ApplicationError::NotFound);
+            }
+            if let Some(error) = self.active_error {
+                return Err(error);
+            }
+            Ok("prj_provider_test".to_owned())
+        }
+
         async fn update_provider_egress_policy(
             &self,
             _: Uuid,
@@ -294,6 +343,7 @@ mod tests {
         let service = ProviderOnboardingService::new(
             Arc::new(policy),
             Arc::new(FixedDiscovery(discovery_result)),
+            Arc::new(Url::parse("https://identity.example/runtime/").expect("runtime base")),
             false,
         );
         let result = service
@@ -308,6 +358,52 @@ mod tests {
             .expect("outcome recorder should not be poisoned")
             .clone();
         (result, recorded, correlation_id)
+    }
+
+    #[tokio::test]
+    async fn named_preflight_uses_runtime_registration_authority_without_discovery() {
+        let project_id = Uuid::new_v4();
+        let service = ProviderOnboardingService::new(
+            Arc::new(RecordingPolicy {
+                record: ProviderEgressPolicyRecord {
+                    project_id,
+                    mode: ProviderEgressMode::AllowAll,
+                    exact_origins: Vec::new(),
+                    revision: 3,
+                },
+                active_error: None,
+                outcomes: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(FixedDiscovery(Ok(summary()))),
+            Arc::new(Url::parse("https://identity.example/runtime/").expect("runtime base")),
+            false,
+        );
+
+        let google = service
+            .preflight_named(project_id, ProviderKind::Google, "google-main".to_owned())
+            .await
+            .expect("Google registration settings");
+        assert_eq!(google.profile.issuer, crate::domain::GOOGLE_ISSUER);
+        assert_eq!(
+            google.callback_url,
+            "https://identity.example/runtime/projects/prj_provider_test/auth/callback/google-main"
+        );
+        assert_eq!(
+            google.profile.login.exact_scopes,
+            crate::domain::GOOGLE_SCOPES
+        );
+        assert_eq!(
+            service
+                .preflight_named(project_id, ProviderKind::Oidc, "custom".to_owned())
+                .await,
+            Err(ApplicationError::InvalidInput)
+        );
+        assert_eq!(
+            service
+                .preflight_named(project_id, ProviderKind::Github, "GitHub".to_owned())
+                .await,
+            Err(ApplicationError::InvalidInput)
+        );
     }
 
     #[tokio::test]
@@ -327,6 +423,7 @@ mod tests {
                 outcomes: outcomes.clone(),
             }),
             Arc::new(FixedDiscovery(Ok(summary()))),
+            Arc::new(Url::parse("https://identity.example/runtime/").expect("runtime base")),
             false,
         );
 
@@ -375,6 +472,7 @@ mod tests {
                 outcomes: Arc::new(Mutex::new(Vec::new())),
             }),
             Arc::new(PanicDiscovery),
+            Arc::new(Url::parse("https://identity.example/runtime/").expect("runtime base")),
             false,
         );
 

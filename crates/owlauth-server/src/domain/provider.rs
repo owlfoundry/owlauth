@@ -72,6 +72,41 @@ pub(crate) struct ProviderCapabilities {
     pub(crate) adapter_key: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderConsentBehavior {
+    Standard,
+    ExplicitOfflineConsent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FixedProviderAuthorizationPolicy {
+    pub(crate) exact_scopes: &'static [&'static str],
+    pub(crate) consent_behavior: ProviderConsentBehavior,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NamedProviderProfile {
+    pub(crate) issuer: &'static str,
+    pub(crate) login: FixedProviderAuthorizationPolicy,
+    pub(crate) managed_profile: Option<FixedProviderAuthorizationPolicy>,
+}
+
+pub(crate) const GOOGLE_SCOPES: &[&str] = &["openid", "profile"];
+pub(crate) const GITHUB_SCOPES: &[&str] = &["read:user"];
+
+const STANDARD_OPENID_POLICY: FixedProviderAuthorizationPolicy = FixedProviderAuthorizationPolicy {
+    exact_scopes: GOOGLE_SCOPES,
+    consent_behavior: ProviderConsentBehavior::Standard,
+};
+const GOOGLE_MANAGED_POLICY: FixedProviderAuthorizationPolicy = FixedProviderAuthorizationPolicy {
+    exact_scopes: GOOGLE_SCOPES,
+    consent_behavior: ProviderConsentBehavior::ExplicitOfflineConsent,
+};
+const GITHUB_LOGIN_POLICY: FixedProviderAuthorizationPolicy = FixedProviderAuthorizationPolicy {
+    exact_scopes: GITHUB_SCOPES,
+    consent_behavior: ProviderConsentBehavior::Standard,
+};
+
 impl ProviderKind {
     pub(crate) fn parse(value: &str) -> Result<Self, DomainError> {
         match value {
@@ -113,14 +148,28 @@ impl ProviderKind {
         }
     }
 
-    pub(crate) fn issuer_matches(self, issuer: &str) -> bool {
+    pub(crate) const fn named_profile(self) -> Option<NamedProviderProfile> {
         match self {
-            Self::Oidc => {
-                let canonical_root = issuer.strip_suffix('/').unwrap_or(issuer);
-                !matches!(canonical_root, GOOGLE_ISSUER | GITHUB_ISSUER)
-            }
-            Self::Google => issuer == GOOGLE_ISSUER,
-            Self::Github => issuer == GITHUB_ISSUER,
+            Self::Oidc => None,
+            Self::Google => Some(NamedProviderProfile {
+                issuer: GOOGLE_ISSUER,
+                login: STANDARD_OPENID_POLICY,
+                managed_profile: Some(GOOGLE_MANAGED_POLICY),
+            }),
+            Self::Github => Some(NamedProviderProfile {
+                issuer: GITHUB_ISSUER,
+                login: GITHUB_LOGIN_POLICY,
+                managed_profile: None,
+            }),
+        }
+    }
+
+    pub(crate) fn issuer_matches(self, issuer: &str) -> bool {
+        if let Some(profile) = self.named_profile() {
+            issuer == profile.issuer
+        } else {
+            let canonical_root = issuer.strip_suffix('/').unwrap_or(issuer);
+            !matches!(canonical_root, GOOGLE_ISSUER | GITHUB_ISSUER)
         }
     }
 }
@@ -156,6 +205,20 @@ impl ProviderKey {
     pub(crate) fn into_inner(self) -> String {
         self.0
     }
+}
+
+pub(crate) fn provider_callback_url(
+    runtime_base: &Url,
+    project_public_id: &str,
+    provider_key: &ProviderKey,
+) -> Result<String, DomainError> {
+    runtime_base
+        .join(&format!(
+            "projects/{project_public_id}/auth/callback/{}",
+            provider_key.as_str()
+        ))
+        .map(|url| url.to_string())
+        .map_err(|_| DomainError::InvalidUrl)
 }
 
 pub(crate) const MAX_PROVIDER_EGRESS_ORIGINS: usize = 1024;
@@ -347,7 +410,35 @@ mod tests {
         assert!(github.capabilities().login);
         assert!(!github.capabilities().managed_profile);
         assert!(!github.capabilities().identity_proof);
+        let google_profile = google.named_profile().expect("Google profile");
+        assert_eq!(google_profile.issuer, GOOGLE_ISSUER);
+        assert_eq!(google_profile.login.exact_scopes, GOOGLE_SCOPES);
+        assert_eq!(
+            google_profile
+                .managed_profile
+                .expect("Google managed profile")
+                .consent_behavior,
+            ProviderConsentBehavior::ExplicitOfflineConsent
+        );
+        let github_profile = github.named_profile().expect("GitHub profile");
+        assert_eq!(github_profile.login.exact_scopes, GITHUB_SCOPES);
+        assert!(github_profile.managed_profile.is_none());
+        assert!(oidc.named_profile().is_none());
         assert!(ProviderKind::parse("custom").is_err());
+    }
+
+    #[test]
+    fn provider_callback_uses_the_configured_runtime_base_and_validated_key() {
+        let key = ProviderKey::parse("google-workforce".to_owned()).expect("provider key");
+        assert_eq!(
+            provider_callback_url(
+                &Url::parse("https://identity.example/runtime/").expect("Runtime base"),
+                "prj_public123",
+                &key,
+            )
+            .expect("callback URL"),
+            "https://identity.example/runtime/projects/prj_public123/auth/callback/google-workforce"
+        );
     }
 
     #[test]

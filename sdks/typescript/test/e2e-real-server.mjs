@@ -224,16 +224,26 @@ async function armFault(operation, label) {
 }
 
 async function assertFaultObserved(label, operation) {
-  const response = await fetch(new URL("__e2e/events", process.env.OWLAUTH_E2E_FAULT_PROXY_BASE), {
-    headers: { authorization: `Bearer ${process.env.OWLAUTH_E2E_FAULT_PROXY_TOKEN}` },
-  });
-  assert.equal(response.status, 200);
-  const document = await response.json();
-  assert.ok(
-    document.items.some(
-      (item) => item.label === label && item.operation === operation && item.upstreamStatus === 200,
-    ),
-  );
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const response = await fetch(new URL("__e2e/events", process.env.OWLAUTH_E2E_FAULT_PROXY_BASE), {
+      headers: { authorization: `Bearer ${process.env.OWLAUTH_E2E_FAULT_PROXY_TOKEN}` },
+    });
+    assert.equal(response.status, 200);
+    const document = await response.json();
+    if (
+      document.items.some(
+        (item) =>
+          item.label === label &&
+          item.operation === operation &&
+          item.projectId === process.env.OWLAUTH_E2E_PROJECT_ID &&
+          item.upstreamStatus === 200,
+      )
+    ) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Runtime fault ${label} for ${operation} was not observed for this Project.`);
 }
 
 function indeterminate(action) {

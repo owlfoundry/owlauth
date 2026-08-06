@@ -282,6 +282,7 @@ pub(crate) fn build_http_capabilities(
                             .expect("Control preflight client is composed once")
                             .clone(),
                     ),
+                    Arc::new(config.runtime.external_base.clone()),
                     config.provider_allow_http_loopback,
                 ))
             }),

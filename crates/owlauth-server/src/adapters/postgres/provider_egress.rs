@@ -71,6 +71,21 @@ impl ProviderEgressPolicyPort for PostgresProviderEgressPolicyRepository {
             .and_then(map_policy)
     }
 
+    async fn get_active_project_public_id(
+        &self,
+        project_id: Uuid,
+    ) -> Result<String, ApplicationError> {
+        let project = project::Entity::find_by_id(project_id)
+            .one(&self.database)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        if project.status != "active" {
+            return Err(ApplicationError::Disabled);
+        }
+        Ok(project.public_id)
+    }
+
     async fn update_provider_egress_policy(
         &self,
         project_id: Uuid,

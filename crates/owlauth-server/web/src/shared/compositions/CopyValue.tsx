@@ -43,7 +43,11 @@ export function CopyValue({ value, label, onCopied, block = false }: CopyValuePr
         {copyState === "copied" ? <CheckIcon /> : <CopyIcon />}
       </Button>
       <span className="visually-hidden" role="status" aria-live="polite">
-        {copyState === "failed" ? "Copy unavailable. Select the value and copy it manually." : ""}
+        {copyState === "copied" && onCopied === undefined
+          ? `${label} copied.`
+          : copyState === "failed"
+            ? "Copy unavailable. Select the value and copy it manually."
+            : ""}
       </span>
     </span>
   );

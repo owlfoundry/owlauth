@@ -609,6 +609,45 @@ pub struct OidcPreflightResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NamedProviderPreflightRequest {
+    /// Named server-owned adapter profile. Custom OIDC is rejected.
+    pub kind: ProviderKind,
+    #[schema(min_length = 1, max_length = 64)]
+    pub provider_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCallbackGuidance {
+    RegisterExactRedirectUri,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderConsentBehavior {
+    Standard,
+    ExplicitOfflineConsent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct FixedProviderAuthorizationPolicy {
+    #[schema(max_items = 8)]
+    pub exact_scopes: Vec<String>,
+    pub consent_behavior: ProviderConsentBehavior,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct NamedProviderPreflightResult {
+    pub kind: ProviderKind,
+    pub issuer: String,
+    pub callback_url: String,
+    pub callback_guidance: ProviderCallbackGuidance,
+    pub login: FixedProviderAuthorizationPolicy,
+    pub managed_profile: Option<FixedProviderAuthorizationPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct CreateProviderRequest {
     /// Closed server-owned adapter profile.
     pub kind: ProviderKind,
@@ -1760,6 +1799,15 @@ control_path!(
     OidcPreflightResult,
     "Advisory Custom OIDC discovery preflight",
     body = OidcPreflightRequest,
+    params(("project_id" = String, Path))
+);
+control_path!(
+    preflight_named_provider,
+    post,
+    "/v1/projects/{project_id}/providers/named/preflight",
+    NamedProviderPreflightResult,
+    "Advisory named-provider registration preflight",
+    body = NamedProviderPreflightRequest,
     params(("project_id" = String, Path))
 );
 control_path!(

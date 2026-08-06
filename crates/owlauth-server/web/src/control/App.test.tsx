@@ -499,7 +499,7 @@ describe("Control application shell", () => {
               kind: "oidc",
               issuer: "https://issuer.example/",
               client_id: "client-id",
-              callback_url: "https://control.example/callback",
+              callback_url: "https://identity.example/runtime/callback",
               status: "active",
               revision: 1,
               assigned_application_ids: [],
@@ -585,6 +585,166 @@ describe("Control application shell", () => {
     });
     expect(document.body.textContent).not.toContain("write-only-secret");
   });
+
+  it.each([
+    {
+      kind: "google" as const,
+      title: "Google",
+      issuer: "https://accounts.google.com",
+      loginScopes: ["openid", "profile"],
+      managedProfile: {
+        exact_scopes: ["openid", "profile"],
+        consent_behavior: "explicit_offline_consent" as const,
+      },
+    },
+    {
+      kind: "github" as const,
+      title: "GitHub",
+      issuer: "https://github.com",
+      loginScopes: ["read:user"],
+      managedProfile: null,
+    },
+  ])(
+    "reviews server-owned $title registration settings before accepting credentials",
+    async ({ kind, title, issuer, loginScopes, managedProfile }) => {
+      const preflightBodies: unknown[] = [];
+      const createBodies: Record<string, unknown>[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>(async (input) => {
+          const request = input as Request;
+          const url = new URL(request.url);
+          if (url.pathname.endsWith("/v1/system")) return systemResponse();
+          if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+            return Response.json({ items: [project] });
+          }
+          if (url.pathname.endsWith(`/v1/projects/${project.id}/applications`)) {
+            return Response.json({ items: [application] });
+          }
+          if (url.pathname.endsWith(`/v1/projects/${project.id}/providers/named/preflight`)) {
+            const body = (await request.clone().json()) as { provider_key: string };
+            preflightBodies.push(body);
+            return Response.json({
+              kind,
+              issuer,
+              callback_url: `https://identity.example/runtime/projects/${project.public_id}/auth/callback/${body.provider_key}`,
+              callback_guidance: "register_exact_redirect_uri",
+              login: { exact_scopes: loginScopes, consent_behavior: "standard" },
+              managed_profile: managedProfile,
+            });
+          }
+          if (url.pathname.endsWith(`/v1/projects/${project.id}/provider-egress-policy`)) {
+            return Response.json({
+              project_id: project.id,
+              mode: "allow_all",
+              exact_origins: [],
+              revision: 1,
+            });
+          }
+          if (url.pathname.endsWith(`/v1/projects/${project.id}/providers`)) {
+            if (request.method === "POST") {
+              const body = (await request.clone().json()) as Record<string, unknown>;
+              createBodies.push(body);
+              return Response.json({
+                id: `${kind}-provider-id`,
+                project_id: project.id,
+                provider_key: body["provider_key"],
+                display_name: `${title} workforce`,
+                kind,
+                issuer,
+                client_id: "client-id",
+                callback_url: `https://identity.example/runtime/projects/${project.public_id}/auth/callback/${String(body["provider_key"])}`,
+                status: "active",
+                revision: 1,
+                assigned_application_ids: [],
+                login_supported: true,
+                identity_proof_supported: kind === "google",
+                managed_profile: {
+                  supported: kind === "google",
+                  enabled: false,
+                  exact_scopes: managedProfile?.exact_scopes ?? [],
+                  profile_schema: kind === "google" ? "owlauth.provider-profile.v1" : "",
+                  read_retry_safe: kind === "google",
+                  renewal_idempotent_replay: false,
+                  supports_revocation: kind === "google",
+                },
+              });
+            }
+            return Response.json({ items: [] });
+          }
+          throw new Error(`Unexpected request: ${request.method} ${url.pathname}`);
+        }),
+      );
+      renderConsole(`/projects/${project.id}/authentication/providers`);
+      await unlock("owl_ctrl_v1_test", "Authentication providers");
+
+      fireEvent.click(await screen.findByRole("button", { name: "Add provider" }));
+      fireEvent.click(
+        within(screen.getByRole("dialog", { name: "Choose a provider" })).getByRole("button", {
+          name: new RegExp(title, "u"),
+        }),
+      );
+      const dialog = screen.getByRole("dialog", { name: `Add ${title}` });
+      const clientId = within(dialog).getByLabelText("Client ID");
+      const secret = within(dialog).getByLabelText("Client secret");
+      expect(clientId).toBeDisabled();
+      expect(secret).toBeDisabled();
+      fireEvent.change(within(dialog).getByLabelText("Provider key"), {
+        target: { value: `${kind}-main` },
+      });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Review registration settings" }));
+
+      expect(
+        await within(dialog).findByRole("heading", { name: "Registration settings" }),
+      ).toBeVisible();
+      expect(within(dialog).getByText(issuer)).toBeVisible();
+      expect(
+        within(dialog).getByText(
+          `https://identity.example/runtime/projects/${project.public_id}/auth/callback/${kind}-main`,
+        ),
+      ).toBeVisible();
+      expect(within(dialog).getByText(loginScopes.join(" "))).toBeVisible();
+      expect(clientId).toBeEnabled();
+      expect(secret).toBeEnabled();
+
+      fireEvent.change(secret, { target: { value: "discard-on-key-change" } });
+      fireEvent.change(within(dialog).getByLabelText("Provider key"), {
+        target: { value: `${kind}-replacement` },
+      });
+      expect(secret).toHaveValue("");
+      expect(within(dialog).queryByRole("heading", { name: "Registration settings" })).toBeNull();
+      expect(within(dialog).getByRole("button", { name: "Add provider" })).toBeDisabled();
+      fireEvent.click(within(dialog).getByRole("button", { name: "Review registration settings" }));
+      await within(dialog).findByRole("heading", { name: "Registration settings" });
+      fireEvent.change(within(dialog).getByLabelText("Display name"), {
+        target: { value: `${title} workforce` },
+      });
+      fireEvent.change(clientId, { target: { value: "client-id" } });
+      fireEvent.change(secret, { target: { value: "write-only-secret" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Add provider" }));
+
+      await waitFor(() => {
+        expect(createBodies).toHaveLength(1);
+      });
+      expect(preflightBodies).toEqual([
+        { kind, provider_key: `${kind}-main` },
+        { kind, provider_key: `${kind}-replacement` },
+      ]);
+      expect(createBodies[0]).toMatchObject({
+        kind,
+        provider_key: `${kind}-replacement`,
+        client_id: "client-id",
+        client_secret: "write-only-secret",
+      });
+      for (const forbidden of ["issuer", "callback_url", "exact_scopes", "consent_behavior"]) {
+        expect(createBodies[0]).not.toHaveProperty(forbidden);
+      }
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog", { name: `Add ${title}` })).toBeNull();
+      });
+      expect(document.body.textContent).not.toContain("write-only-secret");
+    },
+  );
 
   it("keeps a failed Project policy distinct from loading and offers a safe retry", async () => {
     let policyReads = 0;

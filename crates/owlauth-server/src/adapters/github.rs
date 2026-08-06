@@ -25,7 +25,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_LIMIT: usize = 32 * 1024;
 #[cfg(test)]
 const EXCHANGE_CONCURRENCY_LIMIT: usize = 16;
-const LOGIN_SCOPE: &str = "read:user";
 
 #[derive(Clone)]
 pub(crate) struct GithubOAuthProviderClient {
@@ -172,7 +171,7 @@ impl UpstreamProviderClient for GithubOAuthProviderClient {
         url.query_pairs_mut()
             .append_pair("client_id", &request.client_id)
             .append_pair("redirect_uri", &request.callback_url)
-            .append_pair("scope", LOGIN_SCOPE)
+            .append_pair("scope", crate::domain::GITHUB_SCOPES[0])
             .append_pair("state", &request.state)
             .append_pair("code_challenge", &request.pkce_challenge)
             .append_pair("code_challenge_method", "S256");
@@ -239,7 +238,7 @@ impl UpstreamProviderClient for GithubOAuthProviderClient {
         if token.access_token.is_empty()
             || token.access_token.len() > 8192
             || !token.token_type.eq_ignore_ascii_case("bearer")
-            || token.scope != LOGIN_SCOPE
+            || token.scope != crate::domain::GITHUB_SCOPES[0]
         {
             return Err(ProviderExchangeError::InvalidProof);
         }
@@ -325,7 +324,7 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(
             query.get("scope").map(std::convert::AsRef::as_ref),
-            Some(LOGIN_SCOPE)
+            Some(crate::domain::GITHUB_SCOPES[0])
         );
         assert_eq!(
             query

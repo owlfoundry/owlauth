@@ -26,6 +26,7 @@ import {
   type Application,
   ControlRequestError,
   IdempotencyAttempt,
+  type NamedProviderPreflightResult,
   type OidcPreflightResult,
   type Provider,
   type ProviderEgressPolicy,
@@ -52,6 +53,8 @@ export function ProvidersPage() {
   const [onboarding, setOnboarding] = useState<OnboardingKind | null>(null);
   const [preflight, setPreflight] = useState<OidcPreflightResult | null>(null);
   const [preflightIssuer, setPreflightIssuer] = useState("");
+  const [namedPreflight, setNamedPreflight] = useState<NamedProviderPreflightResult | null>(null);
+  const [providerKey, setProviderKey] = useState("");
   const [editingEgressPolicy, setEditingEgressPolicy] = useState(false);
   const [egressMode, setEgressMode] = useState<"allow_all" | "exact_origins">("allow_all");
   const [egressOrigins, setEgressOrigins] = useState<string[]>([""]);
@@ -139,6 +142,8 @@ export function ProvidersPage() {
     createAttempt.current.abandon();
     setPreflight(null);
     setPreflightIssuer("");
+    setNamedPreflight(null);
+    setProviderKey("");
     setOverlayError(null);
     setOnboarding(null);
   }
@@ -169,6 +174,39 @@ export function ProvidersPage() {
       await handleError(error, async () => {
         setPreflight(null);
         setPreflightIssuer("");
+        await Promise.all([refresh(), refreshProjects()]);
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function runNamedPreflight() {
+    if (
+      project === null ||
+      onboarding === null ||
+      onboarding === "oidc" ||
+      !/^[a-z][a-z0-9_-]{0,63}$/u.test(providerKey)
+    )
+      return;
+    clearOnboardingSecret();
+    setOverlayError(null);
+    setSubmitting(true);
+    setNamedPreflight(null);
+    try {
+      const result = await session.client.POST(
+        "/v1/projects/{project_id}/providers/named/preflight",
+        {
+          params: { path: { project_id: project.id } },
+          body: { kind: onboarding, provider_key: providerKey },
+        },
+      );
+      setNamedPreflight(requireData(result.data, result.error, result.response));
+      setMessage("Provider registration settings are ready for review.", "success");
+    } catch (error) {
+      setOverlayError(errorMessage(error, "Provider registration settings could not be loaded."));
+      await handleError(error, async () => {
+        setNamedPreflight(null);
         await Promise.all([refresh(), refreshProjects()]);
       });
     } finally {
@@ -252,16 +290,21 @@ export function ProvidersPage() {
     if (secretInput instanceof HTMLInputElement) secretInput.value = "";
     const idempotencyKey = createAttempt.current.begin();
     if (idempotencyKey === null) return;
-    if (onboarding === "oidc" && preflight === null) {
+    if (
+      (onboarding === "oidc" && preflight === null) ||
+      (onboarding !== "oidc" && namedPreflight === null)
+    ) {
       createAttempt.current.abandon();
       setOverlayError(
-        "Run Custom OIDC preflight and review its result before creating the provider.",
+        onboarding === "oidc"
+          ? "Run Custom OIDC preflight and review its result before creating the provider."
+          : "Review the provider registration settings before creating the provider.",
       );
       return;
     }
     const body = {
       kind: onboarding,
-      provider_key: text(fields, "provider_key"),
+      provider_key: providerKey,
       display_name: text(fields, "display_name"),
       ...(onboarding === "oidc" && preflight !== null
         ? { issuer: preflight.canonical_issuer }
@@ -299,6 +342,7 @@ export function ProvidersPage() {
       createAttempt.current.settle(error);
       setPreflight(null);
       setPreflightIssuer("");
+      setNamedPreflight(null);
       setOverlayError(errorMessage(error, "Provider setup could not be completed."));
       if (!createAttempt.current.retainsKey) form.reset();
       await handleError(error, async () => {
@@ -313,6 +357,8 @@ export function ProvidersPage() {
     createAttempt.current.abandon();
     setPreflight(null);
     setPreflightIssuer("");
+    setNamedPreflight(null);
+    setProviderKey("");
     setOnboarding(null);
   }
 
@@ -479,6 +525,8 @@ export function ProvidersPage() {
           setReconcileProvider(null);
           setPreflight(null);
           setPreflightIssuer("");
+          setNamedPreflight(null);
+          setProviderKey("");
           setEgressError(null);
           setOverlayError(null);
         }}
@@ -646,6 +694,11 @@ export function ProvidersPage() {
               className={styles["providerChoice"]}
               onClick={() => {
                 setChoosingProvider(false);
+                clearOnboardingSecret();
+                setPreflight(null);
+                setPreflightIssuer("");
+                setNamedPreflight(null);
+                setProviderKey("");
                 setOverlayError(null);
                 setOnboarding(kind);
               }}
@@ -731,6 +784,8 @@ export function ProvidersPage() {
         kind={onboarding}
         preflight={preflight}
         preflightIssuer={preflightIssuer}
+        namedPreflight={namedPreflight}
+        providerKey={providerKey}
         policy={policy}
         submitting={submitting}
         error={overlayError}
@@ -742,6 +797,12 @@ export function ProvidersPage() {
           setPreflightIssuer("");
         }}
         onPreflight={runPreflight}
+        onNamedPreflight={() => void runNamedPreflight()}
+        onProviderKeyChanged={(value) => {
+          clearOnboardingSecret();
+          setNamedPreflight(null);
+          setProviderKey(value);
+        }}
         onCreate={createProvider}
         onAdoptOrigins={() => void adoptPreflightOrigins()}
       />
@@ -960,6 +1021,8 @@ function ProviderOnboardingDialog({
   kind,
   preflight,
   preflightIssuer,
+  namedPreflight,
+  providerKey,
   policy,
   submitting,
   error,
@@ -967,12 +1030,16 @@ function ProviderOnboardingDialog({
   onClose,
   onIssuerChanged,
   onPreflight,
+  onNamedPreflight,
+  onProviderKeyChanged,
   onCreate,
   onAdoptOrigins,
 }: {
   readonly kind: OnboardingKind | null;
   readonly preflight: OidcPreflightResult | null;
   readonly preflightIssuer: string;
+  readonly namedPreflight: NamedProviderPreflightResult | null;
+  readonly providerKey: string;
   readonly policy: ProviderEgressPolicy | null;
   readonly submitting: boolean;
   readonly error: string | null;
@@ -980,12 +1047,15 @@ function ProviderOnboardingDialog({
   readonly onClose: () => void;
   readonly onIssuerChanged: () => void;
   readonly onPreflight: (event: SyntheticEvent<HTMLFormElement, SubmitEvent>) => Promise<void>;
+  readonly onNamedPreflight: () => void;
+  readonly onProviderKeyChanged: (value: string) => void;
   readonly onCreate: (event: SyntheticEvent<HTMLFormElement, SubmitEvent>) => Promise<void>;
   readonly onAdoptOrigins: () => void;
 }) {
   const title =
     kind === "google" ? "Add Google" : kind === "github" ? "Add GitHub" : "Add Custom OIDC";
   const formId = "provider-onboarding";
+  const registrationReady = kind === "oidc" ? preflight !== null : namedPreflight !== null;
   return (
     <SideSheet
       open={kind !== null}
@@ -1003,7 +1073,7 @@ function ProviderOnboardingDialog({
             variant="primary"
             form={formId}
             busy={submitting}
-            disabled={kind === "oidc" && preflight === null}
+            disabled={!registrationReady}
           >
             Add provider
           </Button>
@@ -1023,6 +1093,7 @@ function ProviderOnboardingDialog({
               name="issuer"
               type="url"
               required
+              disabled={submitting}
               onChange={onIssuerChanged}
               defaultValue={preflightIssuer}
             />
@@ -1033,9 +1104,8 @@ function ProviderOnboardingDialog({
         </form>
       ) : (
         <InlineAlert tone="info">
-          {kind === "google"
-            ? "Google uses OwlAuth's fixed issuer and adapter profile."
-            : "GitHub uses OwlAuth's fixed login-only profile; managed sync is unavailable."}
+          Enter a stable provider key, then review the exact registration settings generated by
+          OwlAuth before creating credentials with {kind === "google" ? "Google" : "GitHub"}.
         </InlineAlert>
       )}
       {preflight === null ? null : (
@@ -1106,13 +1176,78 @@ function ProviderOnboardingDialog({
             required
             pattern="[a-z][a-z0-9_-]*"
             maxLength={64}
+            value={providerKey}
+            disabled={submitting}
+            onChange={(event) => {
+              onProviderKeyChanged(event.currentTarget.value);
+            }}
           />
         </Field>
+        {kind === "oidc" ? null : (
+          <Button
+            type="button"
+            variant="secondary"
+            busy={submitting}
+            disabled={!/^[a-z][a-z0-9_-]{0,63}$/u.test(providerKey)}
+            onClick={onNamedPreflight}
+          >
+            Review registration settings
+          </Button>
+        )}
+        {namedPreflight === null ? null : (
+          <div className={styles["detailSurface"]}>
+            <h3>Registration settings</h3>
+            <DescriptionList
+              items={[
+                {
+                  term: "Exact issuer",
+                  detail: <span className={styles["machineValue"]}>{namedPreflight.issuer}</span>,
+                },
+                {
+                  term: "Callback URL",
+                  detail: (
+                    <CopyValue
+                      value={namedPreflight.callback_url}
+                      label="provider callback URL"
+                      block
+                    />
+                  ),
+                },
+                {
+                  term: "Callback registration",
+                  detail: "Register the callback URL above as an exact redirect URI.",
+                },
+                {
+                  term: "Login scopes",
+                  detail: namedPreflight.login.exact_scopes.join(" "),
+                },
+                {
+                  term: "Login consent",
+                  detail: consentDescription(namedPreflight.login.consent_behavior),
+                },
+                {
+                  term: "Managed profile",
+                  detail:
+                    namedPreflight.managed_profile === null ||
+                    namedPreflight.managed_profile === undefined
+                      ? "Unavailable; this provider uses a fixed login-only profile."
+                      : `${namedPreflight.managed_profile.exact_scopes.join(" ")}; ${consentDescription(namedPreflight.managed_profile.consent_behavior)}`,
+                },
+              ]}
+            />
+          </div>
+        )}
         <Field label="Display name" htmlFor="provider-name">
           <Input id="provider-name" name="display_name" required maxLength={128} />
         </Field>
         <Field label="Client ID" htmlFor="provider-client-id">
-          <Input id="provider-client-id" name="client_id" required maxLength={512} />
+          <Input
+            id="provider-client-id"
+            name="client_id"
+            required
+            maxLength={512}
+            disabled={!registrationReady}
+          />
         </Field>
         <Field
           label="Client secret"
@@ -1127,16 +1262,25 @@ function ProviderOnboardingDialog({
             required
             autoComplete="new-password"
             maxLength={4096}
+            disabled={!registrationReady}
           />
         </Field>
         {kind === "github" ? null : (
-          <Checkbox name="managed_profile_enabled">
+          <Checkbox name="managed_profile_enabled" disabled={!registrationReady}>
             Enable bounded managed profile synchronization
           </Checkbox>
         )}
       </form>
     </SideSheet>
   );
+}
+
+function consentDescription(
+  behavior: NamedProviderPreflightResult["login"]["consent_behavior"],
+): string {
+  return behavior === "explicit_offline_consent"
+    ? "OwlAuth requests explicit consent and offline access."
+    : "OwlAuth adds no forced consent or offline-access parameters.";
 }
 
 function errorMessage(error: unknown, fallback: string): string {

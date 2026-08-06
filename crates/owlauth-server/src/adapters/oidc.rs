@@ -664,7 +664,7 @@ const CONTROLLED_OIDC_MANAGED_CAPABILITY: ManagedProfileCapability = ManagedProf
 const GOOGLE_OIDC_MANAGED_CAPABILITY: ManagedProfileCapability = ManagedProfileCapability {
     adapter_key: "google_oidc_profile_v1",
     adapter_revision: 1,
-    exact_scopes: &["openid", "profile"],
+    exact_scopes: crate::domain::GOOGLE_SCOPES,
     provider_pkce_required: true,
     oidc_nonce_required: true,
     credential_rotates: true,
@@ -1289,23 +1289,30 @@ fn build_authorization_url(
     if endpoint.query().is_some() || endpoint.fragment().is_some() {
         return Err(ProviderExchangeError::UnavailableBeforeDispatch);
     }
+    let authorization_policy = named_authorization_policy(request.kind, request.profile);
+    let scope_parameter = authorization_policy.map_or_else(
+        || match request.profile {
+            ProviderRequestProfile::Login | ProviderRequestProfile::IdentityProof => {
+                "openid profile".to_owned()
+            }
+            ProviderRequestProfile::ManagedProfile => "offline_access openid profile".to_owned(),
+        },
+        |policy| policy.exact_scopes.join(" "),
+    );
     endpoint
         .query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("response_mode", "query")
         .append_pair("client_id", &request.client_id)
         .append_pair("redirect_uri", &request.callback_url)
-        .append_pair(
-            "scope",
-            requested_scope_parameter(request.kind, request.profile),
-        )
+        .append_pair("scope", &scope_parameter)
         .append_pair("state", &request.state)
         .append_pair("nonce", &request.nonce)
         .append_pair("code_challenge", &request.pkce_challenge)
         .append_pair("code_challenge_method", "S256");
-    if request.kind == crate::domain::ProviderKind::Google
-        && request.profile == ProviderRequestProfile::ManagedProfile
-    {
+    if authorization_policy.is_some_and(|policy| {
+        policy.consent_behavior == crate::domain::ProviderConsentBehavior::ExplicitOfflineConsent
+    }) {
         endpoint
             .query_pairs_mut()
             .append_pair("access_type", "offline")
@@ -1335,15 +1342,14 @@ fn managed_profile_scopes(kind: crate::domain::ProviderKind) -> Vec<String> {
     requested_scopes(kind, ProviderRequestProfile::ManagedProfile)
 }
 
-fn requested_scope_parameter(
+fn named_authorization_policy(
     kind: crate::domain::ProviderKind,
     profile: ProviderRequestProfile,
-) -> &'static str {
-    match (kind, profile) {
-        (crate::domain::ProviderKind::Oidc, ProviderRequestProfile::ManagedProfile) => {
-            "offline_access openid profile"
-        }
-        (_, _) => "openid profile",
+) -> Option<crate::domain::FixedProviderAuthorizationPolicy> {
+    let named = kind.named_profile()?;
+    match profile {
+        ProviderRequestProfile::Login | ProviderRequestProfile::IdentityProof => Some(named.login),
+        ProviderRequestProfile::ManagedProfile => named.managed_profile,
     }
 }
 
@@ -1351,10 +1357,25 @@ fn requested_scopes(
     kind: crate::domain::ProviderKind,
     profile: ProviderRequestProfile,
 ) -> Vec<String> {
-    requested_scope_parameter(kind, profile)
-        .split_ascii_whitespace()
-        .map(str::to_owned)
-        .collect()
+    named_authorization_policy(kind, profile).map_or_else(
+        || match profile {
+            ProviderRequestProfile::Login | ProviderRequestProfile::IdentityProof => {
+                vec!["openid".to_owned(), "profile".to_owned()]
+            }
+            ProviderRequestProfile::ManagedProfile => vec![
+                "offline_access".to_owned(),
+                "openid".to_owned(),
+                "profile".to_owned(),
+            ],
+        },
+        |policy| {
+            policy
+                .exact_scopes
+                .iter()
+                .map(|scope| (*scope).to_owned())
+                .collect()
+        },
+    )
 }
 
 fn canonical_scope_set(scopes: &[String]) -> Option<Vec<String>> {

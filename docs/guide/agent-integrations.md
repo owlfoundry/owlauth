@@ -73,7 +73,7 @@ owlauth --profile production project disable PROJECT_ID \
   --yes
 ```
 
-Use `owlauth COMMAND --help` at each command level for the complete typed surface. Client-key creation and rotation return credential material once; capture that JSON directly into approved backend secret custody and do not paste it into shell arguments, logs, tickets, or agent context. Resource secrets accepted by provider or webhook commands are also read from explicitly named environment variables and may not reuse the operator credential.
+Use `owlauth COMMAND --help` at each command level for the complete typed surface. Client-key creation reveals credential material once; capture that JSON directly into approved backend secret custody and do not paste it into shell arguments, logs, tickets, or agent context. Rotate a client key by creating and acknowledging a replacement, deploying it, and then revoking the predecessor. Resource secrets accepted by provider or webhook commands are also read from explicitly named environment variables and may not reuse the operator credential.
 
 ```bash
 owlauth update --dry-run

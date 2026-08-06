@@ -63,11 +63,13 @@ mod tests {
             );
         }
         assert!(runtime["paths"].get("/v1/projects").is_none());
-        assert!(
-            runtime["components"]["schemas"]
-                .get("CreateProviderRequest")
-                .is_none()
-        );
+        for forbidden_schema in ["CreateProviderRequest", "NamedProviderPreflightRequest"] {
+            assert!(
+                runtime["components"]["schemas"]
+                    .get(forbidden_schema)
+                    .is_none()
+            );
+        }
         assert!(
             runtime["components"]["schemas"]
                 .get("IntrospectProjectTokenRequest")
@@ -97,6 +99,7 @@ mod tests {
         );
         for forbidden_schema in [
             "CreateProviderRequest",
+            "NamedProviderPreflightRequest",
             "PublicApplicationConfig",
             "RefreshSessionRequest",
             "ProjectClientKey",
@@ -151,6 +154,15 @@ mod tests {
                 .is_none()
         );
         assert!(control["components"]["securitySchemes"]["operator_api_key"].is_object());
+        assert!(
+            control["paths"]["/v1/projects/{project_id}/providers/named/preflight"]["post"]
+                .is_object()
+        );
+        assert!(
+            control["components"]["schemas"]["NamedProviderPreflightRequest"]["properties"]
+                .get("client_secret")
+                .is_none()
+        );
         assert_eq!(
             control["components"]["schemas"]["CreateProviderRequest"]["properties"]["client_secret"]
                 ["writeOnly"],

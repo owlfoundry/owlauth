@@ -596,6 +596,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/providers/named/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["preflight_named_provider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/providers/oidc/preflight": {
         parameters: {
             query?: never;
@@ -1365,6 +1381,10 @@ export interface components {
             /** Format: int64 */
             expected_revision: number;
         };
+        FixedProviderAuthorizationPolicy: {
+            consent_behavior: components["schemas"]["ProviderConsentBehavior"];
+            exact_scopes: string[];
+        };
         /** @description Minimal response returned by listener liveness and readiness probes. */
         HealthResponse: {
             /** @description Stable probe status. Successful probes return `ok`. */
@@ -1499,6 +1519,19 @@ export interface components {
         };
         /** @enum {string} */
         MergeSessionsDisposition: "loser_revoked";
+        NamedProviderPreflightRequest: {
+            /** @description Named server-owned adapter profile. Custom OIDC is rejected. */
+            kind: components["schemas"]["ProviderKind"];
+            provider_key: string;
+        };
+        NamedProviderPreflightResult: {
+            callback_guidance: components["schemas"]["ProviderCallbackGuidance"];
+            callback_url: string;
+            issuer: string;
+            kind: components["schemas"]["ProviderKind"];
+            login: components["schemas"]["FixedProviderAuthorizationPolicy"];
+            managed_profile?: null | components["schemas"]["FixedProviderAuthorizationPolicy"];
+        };
         OidcPreflightRequest: {
             issuer: string;
         };
@@ -1663,6 +1696,10 @@ export interface components {
             /** Format: int64 */
             expected_application_revision: number;
         };
+        /** @enum {string} */
+        ProviderCallbackGuidance: "register_exact_redirect_uri";
+        /** @enum {string} */
+        ProviderConsentBehavior: "standard" | "explicit_offline_consent";
         /** @enum {string} */
         ProviderEgressMode: "allow_all" | "exact_origins";
         ProviderEgressPolicy: {
@@ -5657,6 +5694,86 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Provider"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    preflight_named_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NamedProviderPreflightRequest"];
+            };
+        };
+        responses: {
+            /** @description Advisory named-provider registration preflight */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamedProviderPreflightResult"];
                 };
             };
             /** @description Invalid request */

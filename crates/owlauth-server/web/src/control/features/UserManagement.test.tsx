@@ -114,11 +114,15 @@ function successful<T>(data: T) {
 }
 
 function renderPanel(options?: {
+  get?: (...args: unknown[]) => Promise<unknown>;
   post?: (...args: unknown[]) => Promise<unknown>;
   onError?: (error: unknown) => Promise<void>;
   connections?: ManagedProviderConnection[];
 }) {
-  const get = vi.fn((path: string) => {
+  const get = vi.fn((...args: unknown[]) => {
+    if (options?.get !== undefined) return options.get(...args);
+    const path = args[0];
+    if (typeof path !== "string") throw new Error("GET path is not a string");
     if (path.endsWith("/identities")) return Promise.resolve(successful({ items: [] }));
     if (path.endsWith("/managed-provider-connections")) {
       return Promise.resolve(successful({ items: options?.connections ?? [] }));
@@ -219,6 +223,84 @@ describe("Project user and session lifecycle", () => {
         params: { path: { project_id: project.id, user_id: user.id } },
       }),
     );
+  });
+
+  it("serializes pagination and deduplicates repeated users", async () => {
+    let resolveNextPage: (() => void) | undefined;
+    const get = vi.fn((path: unknown, options: unknown) => {
+      expect(path).toBe("/v1/projects/{project_id}/users");
+      const cursor = (options as { params: { query: { cursor?: string } } }).params.query.cursor;
+      if (cursor === undefined) {
+        return Promise.resolve(successful({ items: [user], next_cursor: "next-page" }));
+      }
+      expect(cursor).toBe("next-page");
+      return new Promise((resolve) => {
+        resolveNextPage = () => {
+          resolve(successful({ items: [user], next_cursor: null }));
+        };
+      });
+    });
+    renderPanel({ get });
+
+    const loadMore = await screen.findByRole("button", { name: "Load more users" });
+    fireEvent.click(loadMore);
+    fireEvent.click(loadMore);
+
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "Loading more users" })).toBeDisabled();
+    expect(screen.getByLabelText("Status")).toBeDisabled();
+    resolveNextPage?.();
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Loading more users" })).toBeNull();
+    });
+    expect(screen.getAllByRole("button", { name: /Ada Lovelace/u })).toHaveLength(1);
+  });
+
+  it("does not let a stale detail response pollute a newer status filter", async () => {
+    const disabledUser: ProjectUser = {
+      ...user,
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      public_id: "usr_disabled123",
+      display_name: "Grace Hopper",
+      status: "disabled",
+    };
+    let resolveDetail: (() => void) | undefined;
+    const get = vi.fn((path: unknown, options: unknown) => {
+      if (typeof path !== "string") throw new Error("GET path is not a string");
+      if (path.endsWith("/users")) {
+        const status = (options as { params: { query: { status?: string } } }).params.query.status;
+        return Promise.resolve(
+          successful({ items: [status === "disabled" ? disabledUser : user], next_cursor: null }),
+        );
+      }
+      if (path.endsWith("/{user_id}")) {
+        return new Promise((resolve) => {
+          resolveDetail = () => {
+            resolve(successful(user));
+          };
+        });
+      }
+      if (path.endsWith("/sessions")) return Promise.resolve(successful(sessions));
+      if (path.endsWith("/managed-provider-connections")) {
+        return Promise.resolve(successful({ items: [] }));
+      }
+      if (path.endsWith("/identities")) return Promise.resolve(successful({ items: [] }));
+      throw new Error(`Unexpected GET path: ${path}`);
+    });
+    renderPanel({ get });
+
+    fireEvent.click(await screen.findByRole("button", { name: /Ada Lovelace/u }));
+    const status = screen.getByLabelText("Status");
+    expect(status).toBeDisabled();
+    fireEvent.change(status, { target: { value: "disabled" } });
+    expect(await screen.findByRole("button", { name: /Grace Hopper/u })).toBeVisible();
+
+    resolveDetail?.();
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /Ada Lovelace/u })).toBeNull();
+    });
+    expect(screen.queryByRole("heading", { name: "Ada Lovelace" })).toBeNull();
+    expect(screen.getByRole("button", { name: /Grace Hopper/u })).toBeVisible();
   });
 
   it("renders safe managed metadata and sends generation-fenced actions", async () => {
@@ -469,7 +551,7 @@ describe("Project user and session lifecycle", () => {
       expect(onError).toHaveBeenCalledWith(conflict);
     });
     expect(
-      get.mock.calls.filter(([path]) => path.endsWith("/users")).length,
+      get.mock.calls.filter(([path]) => typeof path === "string" && path.endsWith("/users")).length,
     ).toBeGreaterThanOrEqual(2);
     expect(screen.getByRole("button", { name: "Disable Project user" })).toBeEnabled();
   });

@@ -306,12 +306,40 @@ test("Application sync Console is keyboard and accessibility safe", async ({
   const authority = await provision(page.request, suffix);
   await page.goto(`${controlBase}console/`);
   await page.getByLabel("Operator API key").fill(operatorKey);
-  await page.getByRole("button", { name: "Unlock console" }).press("Enter");
-  await page.getByRole("link", { name: new RegExp(`Block D ${suffix}`, "u") }).press("Enter");
-  await page.getByRole("link", { name: "Applications", exact: true }).press("Enter");
-  await page
-    .getByRole("link", { name: new RegExp(`Block D Application ${suffix}`, "u") })
-    .press("Enter");
+  const unlock = page.getByRole("button", { name: "Unlock console" });
+  await unlock.focus();
+  await expect(unlock).toBeFocused();
+  await unlock.press("Enter");
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+
+  const projectLink = page.getByRole("link", {
+    name: new RegExp(`Block D ${suffix}`, "u"),
+  });
+  await projectLink.focus();
+  await expect(projectLink).toBeFocused();
+  await projectLink.press("Enter");
+  await expect(page).toHaveURL(new RegExp(`/console/projects/${authority.project.id}$`, "u"));
+
+  const applicationsLink = page.getByRole("link", { name: "Applications", exact: true });
+  await applicationsLink.focus();
+  await expect(applicationsLink).toBeFocused();
+  await applicationsLink.press("Enter");
+  await expect(page).toHaveURL(
+    new RegExp(`/console/projects/${authority.project.id}/applications$`, "u"),
+  );
+
+  const applicationLink = page.getByRole("link", {
+    name: new RegExp(`Block D Application ${suffix}`, "u"),
+  });
+  await applicationLink.focus();
+  await expect(applicationLink).toBeFocused();
+  await applicationLink.press("Enter");
+  await expect(page).toHaveURL(
+    new RegExp(
+      `/console/projects/${authority.project.id}/applications/${authority.application.id}$`,
+      "u",
+    ),
+  );
   await expect(
     page.getByRole("heading", { name: new RegExp(`Block D Application ${suffix}`, "u") }),
   ).toBeVisible();

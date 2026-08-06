@@ -155,8 +155,8 @@ pub(crate) use passwordless_email::{
 };
 pub(crate) use provider_callback::{ProviderCallbackOwner, ProviderCallbackOwnerResolver};
 pub(crate) use provider_onboarding::{
-    OidcPreflightPort, OidcPreflightSummary, ProviderEgressPolicyPort, ProviderEgressPolicyRecord,
-    ProviderOnboardingService, UpdateProviderEgressPolicy,
+    NamedProviderPreflight, OidcPreflightPort, OidcPreflightSummary, ProviderEgressPolicyPort,
+    ProviderEgressPolicyRecord, ProviderOnboardingService, UpdateProviderEgressPolicy,
 };
 pub(crate) use provisioning::{
     ApplicationConfiguration, ApplicationProvisioningPort, ApplicationRecord,

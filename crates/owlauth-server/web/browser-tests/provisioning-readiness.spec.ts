@@ -98,8 +98,50 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   expect((await firstJwks.json()) as { keys: unknown[] }).toMatchObject({ keys: [{}] });
 
   await page.getByRole("link", { name: "Providers" }).click();
+
   await page.getByRole("button", { name: "Add provider" }).click();
-  const providerChooser = page.getByRole("dialog", { name: "Choose a provider" });
+  let providerChooser = page.getByRole("dialog", { name: "Choose a provider" });
+  await providerChooser.getByRole("button", { name: /Google/u }).click();
+  const googleDialog = page.getByRole("dialog", { name: "Add Google" });
+  const googleProviderKey = `google-${suffix}`;
+  await expect(googleDialog.getByLabel("Client ID")).toBeDisabled();
+  await googleDialog.getByLabel("Provider key").fill(googleProviderKey);
+  await googleDialog.getByRole("button", { name: "Review registration settings" }).click();
+  await expect(googleDialog.getByRole("heading", { name: "Registration settings" })).toBeVisible();
+  await expect(
+    googleDialog.getByText("https://accounts.google.com", { exact: true }),
+  ).toBeVisible();
+  await expect(googleDialog.getByText("openid profile", { exact: true })).toBeVisible();
+  await expect(
+    googleDialog.getByText(
+      `${runtimeBase}projects/${projectPublicId}/auth/callback/${googleProviderKey}`,
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(googleDialog.getByLabel("Client ID")).toBeEnabled();
+  await googleDialog.getByRole("button", { name: "Close provider setup" }).click();
+
+  await page.getByRole("button", { name: "Add provider" }).click();
+  providerChooser = page.getByRole("dialog", { name: "Choose a provider" });
+  await providerChooser.getByRole("button", { name: /GitHub/u }).click();
+  const githubDialog = page.getByRole("dialog", { name: "Add GitHub" });
+  const githubProviderKey = `github-${suffix}`;
+  await githubDialog.getByLabel("Provider key").fill(githubProviderKey);
+  await githubDialog.getByRole("button", { name: "Review registration settings" }).click();
+  await expect(githubDialog.getByRole("heading", { name: "Registration settings" })).toBeVisible();
+  await expect(githubDialog.getByText("https://github.com", { exact: true })).toBeVisible();
+  await expect(githubDialog.getByText("read:user", { exact: true })).toBeVisible();
+  await expect(githubDialog.getByText(/fixed login-only profile/u)).toBeVisible();
+  await expect(
+    githubDialog.getByText(
+      `${runtimeBase}projects/${projectPublicId}/auth/callback/${githubProviderKey}`,
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await githubDialog.getByRole("button", { name: "Close provider setup" }).click();
+
+  await page.getByRole("button", { name: "Add provider" }).click();
+  providerChooser = page.getByRole("dialog", { name: "Choose a provider" });
   await providerChooser.getByRole("button", { name: /Custom OIDC/u }).click();
   const providerDialog = page.getByRole("dialog", { name: "Add Custom OIDC" });
   await providerDialog.getByLabel("Canonical HTTPS issuer").fill(providerOrigin);

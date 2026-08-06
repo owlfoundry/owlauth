@@ -93,9 +93,16 @@ pub(crate) use project::{
 pub(crate) use projection::{
     ProjectionRevision, USER_PROJECTION_SCHEMA_V1, UserProjection, UserProjectionSource,
 };
+#[allow(
+    unused_imports,
+    reason = "Google issuer fixtures and invariant tests consume this domain authority"
+)]
+pub(crate) use provider::GOOGLE_ISSUER;
 pub(crate) use provider::{
-    GITHUB_ISSUER, GOOGLE_ISSUER, ManagedProfileCapabilities, ProviderEgressMode,
+    FixedProviderAuthorizationPolicy, GITHUB_ISSUER, GITHUB_SCOPES, GOOGLE_SCOPES,
+    ManagedProfileCapabilities, NamedProviderProfile, ProviderConsentBehavior, ProviderEgressMode,
     ProviderEgressPolicy, ProviderKey, ProviderKind, ProviderOrigin, ProviderStatus,
+    provider_callback_url,
 };
 #[allow(
     unused_imports,

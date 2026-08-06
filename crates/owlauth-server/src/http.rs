@@ -651,6 +651,10 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             post(preflight_oidc_provider),
         )
         .route(
+            "/projects/{project_id}/providers/named/preflight",
+            post(preflight_named_provider),
+        )
+        .route(
             "/projects/{project_id}/providers",
             get(list_providers).post(create_provider),
         )
@@ -7265,6 +7269,29 @@ async fn preflight_oidc_provider(
     }
 }
 
+async fn preflight_named_provider(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::NamedProviderPreflightRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let kind = domain_provider_kind(body.kind);
+    match provider_onboarding(&state) {
+        Ok(service) => match service
+            .preflight_named(project_id, kind, body.provider_key)
+            .await
+        {
+            Ok(preflight) => control_json(control_named_provider_preflight(preflight), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
 async fn list_providers(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -7627,22 +7654,61 @@ async fn project_jwks(
     }
 }
 
+fn domain_provider_kind(kind: runtime_types::ProviderKind) -> crate::domain::ProviderKind {
+    match kind {
+        runtime_types::ProviderKind::Oidc => crate::domain::ProviderKind::Oidc,
+        runtime_types::ProviderKind::Google => crate::domain::ProviderKind::Google,
+        runtime_types::ProviderKind::Github => crate::domain::ProviderKind::Github,
+    }
+}
+
+fn control_fixed_provider_policy(
+    policy: crate::domain::FixedProviderAuthorizationPolicy,
+) -> control_types::FixedProviderAuthorizationPolicy {
+    control_types::FixedProviderAuthorizationPolicy {
+        exact_scopes: policy
+            .exact_scopes
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect(),
+        consent_behavior: match policy.consent_behavior {
+            crate::domain::ProviderConsentBehavior::Standard => {
+                control_types::ProviderConsentBehavior::Standard
+            }
+            crate::domain::ProviderConsentBehavior::ExplicitOfflineConsent => {
+                control_types::ProviderConsentBehavior::ExplicitOfflineConsent
+            }
+        },
+    }
+}
+
+fn control_named_provider_preflight(
+    preflight: application::NamedProviderPreflight,
+) -> Result<control_types::NamedProviderPreflightResult, ApplicationError> {
+    Ok(control_types::NamedProviderPreflightResult {
+        kind: runtime_provider_kind(preflight.kind.as_str())?,
+        issuer: preflight.profile.issuer.to_owned(),
+        callback_url: preflight.callback_url,
+        callback_guidance: control_types::ProviderCallbackGuidance::RegisterExactRedirectUri,
+        login: control_fixed_provider_policy(preflight.profile.login),
+        managed_profile: preflight
+            .profile
+            .managed_profile
+            .map(control_fixed_provider_policy),
+    })
+}
+
 fn control_provider_create_variant(
     kind: runtime_types::ProviderKind,
     issuer: Option<String>,
 ) -> Result<(crate::domain::ProviderKind, String), ApplicationError> {
+    let kind = domain_provider_kind(kind);
     match (kind, issuer) {
-        (runtime_types::ProviderKind::Oidc, Some(issuer)) => {
-            Ok((crate::domain::ProviderKind::Oidc, issuer))
-        }
-        (runtime_types::ProviderKind::Google, None) => Ok((
-            crate::domain::ProviderKind::Google,
-            crate::domain::GOOGLE_ISSUER.to_owned(),
-        )),
-        (runtime_types::ProviderKind::Github, None) => Ok((
-            crate::domain::ProviderKind::Github,
-            crate::domain::GITHUB_ISSUER.to_owned(),
-        )),
+        (crate::domain::ProviderKind::Oidc, Some(issuer)) => Ok((kind, issuer)),
+        (kind, None) => kind
+            .named_profile()
+            .map(|profile| (kind, profile.issuer.to_owned()))
+            .ok_or(ApplicationError::InvalidInput),
         _ => Err(ApplicationError::InvalidInput),
     }
 }

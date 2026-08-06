@@ -90,14 +90,12 @@ impl PostgresProvisioningAdapter {
         } else {
             return Err(ApplicationError::InvalidInput);
         };
-        let callback_url = self
-            .runtime_base
-            .join(&format!(
-                "projects/{}/auth/callback/{}",
-                project.public_id, command.provider_key
-            ))
-            .map_err(|_| ApplicationError::InvalidInput)?
-            .to_string();
+        let provider_key = crate::domain::ProviderKey::parse(command.provider_key.clone())?;
+        let callback_url = crate::domain::provider_callback_url(
+            &self.runtime_base,
+            &project.public_id,
+            &provider_key,
+        )?;
         let provider_id = Uuid::new_v4();
         let material_id = Uuid::new_v4();
         let provider = provider_configuration::ActiveModel {
