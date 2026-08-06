@@ -13,19 +13,17 @@ use crate::{
     application::{
         AccessTokenSessionLookup, AdmittedProviderMethod, ApplicationError, BrowserLogoutContext,
         CurrentSession, HostedInteraction, HostedProviderMethod, LoginStartContext,
-        ProviderRuntimeContext, RuntimeAuthorityRepository, RuntimeProtector, VerificationKey,
-        VersionedDigest,
+        ProviderRuntimeContext, RuntimeAuthorityRepository, VerificationKey, VersionedDigest,
     },
     domain::{LoginTransactionStatus, ProviderKind},
 };
 
 fn validated_login_provider_kind(
-    legacy_kind: &str,
-    adapter_kind: Option<&str>,
+    kind: &str,
     issuer: &str,
     managed_profile_enabled: bool,
 ) -> Result<ProviderKind, ApplicationError> {
-    let kind = super::provider_row::effective_provider_kind(legacy_kind, adapter_kind, issuer)?;
+    let kind = super::provider_row::effective_provider_kind(kind, issuer)?;
     let capabilities = kind.capabilities();
     if !capabilities.login || (managed_profile_enabled && !capabilities.managed_profile) {
         return Err(ApplicationError::Integrity);
@@ -43,6 +41,7 @@ use super::{
         project_browser_session, project_key_ring, project_policy, project_provider_egress_policy,
         project_signing_key, project_user, provider_configuration, refresh_family,
     },
+    projection::IdentityProjectionMaterializer,
     runtime_incarnation::RuntimeIncarnationFence,
 };
 
@@ -51,20 +50,10 @@ pub(crate) struct PostgresRuntimeAuthorityRepository {
     database: DatabaseConnection,
     runtime_incarnation: RuntimeIncarnationFence,
     required_runtime_process_ids: Vec<String>,
-    runtime_protector: Option<Arc<dyn RuntimeProtector>>,
+    projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
 }
 
 impl PostgresRuntimeAuthorityRepository {
-    #[cfg(test)]
-    pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self::new_with_runtime_identity(
-            database,
-            "runtime-1".to_owned(),
-            Uuid::nil(),
-            vec!["runtime-1".to_owned()],
-        )
-    }
-
     #[allow(
         dead_code,
         reason = "tests and non-HTTP compositions may omit projection PII authority"
@@ -74,6 +63,7 @@ impl PostgresRuntimeAuthorityRepository {
         runtime_process_id: String,
         runtime_incarnation: Uuid,
         required_runtime_process_ids: Vec<String>,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
@@ -82,29 +72,29 @@ impl PostgresRuntimeAuthorityRepository {
                 runtime_incarnation,
             ),
             required_runtime_process_ids,
-            runtime_protector: None,
+            projection_materializer,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_runtime_protector(
+    pub(crate) fn with_projection_materializer(
         database: DatabaseConnection,
-        runtime_protector: Arc<dyn RuntimeProtector>,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
             runtime_incarnation: RuntimeIncarnationFence::test_default(),
             required_runtime_process_ids: vec!["runtime-1".to_owned()],
-            runtime_protector: Some(runtime_protector),
+            projection_materializer,
         }
     }
 
-    pub(crate) fn new_with_runtime_identity_and_protector(
+    pub(crate) fn new_with_runtime_identity_and_projection_materializer(
         database: DatabaseConnection,
         runtime_process_id: String,
         runtime_incarnation: Uuid,
         required_runtime_process_ids: Vec<String>,
-        runtime_protector: Arc<dyn RuntimeProtector>,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
@@ -113,7 +103,7 @@ impl PostgresRuntimeAuthorityRepository {
                 runtime_incarnation,
             ),
             required_runtime_process_ids,
-            runtime_protector: Some(runtime_protector),
+            projection_materializer,
         }
     }
 
@@ -208,13 +198,9 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                 .ok_or(ApplicationError::Integrity)?;
             let kind = validated_login_provider_kind(
                 &provider.kind,
-                provider.adapter_kind.as_deref(),
                 &provider.issuer,
                 provider.managed_profile_enabled,
             )?;
-            if provider.secret_ref.is_none() && provider.secret_material_id.is_none() {
-                return Err(ApplicationError::Integrity);
-            }
             let provider_egress_policy_revision = if kind == ProviderKind::Oidc {
                 if custom_policy_revision.is_none() {
                     custom_policy_revision = Some(
@@ -544,7 +530,6 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         }
         let provider_kind = validated_login_provider_kind(
             &provider.kind,
-            provider.adapter_kind.as_deref(),
             &provider.issuer,
             provider.managed_profile_enabled,
         )?;
@@ -583,11 +568,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             issuer: provider.issuer,
             client_id: provider.client_id,
             callback_url: provider.callback_url,
-            secret_ref: provider
-                .secret_material_id
-                .map(|material_id| material_id.to_string())
-                .or(provider.secret_ref)
-                .ok_or(ApplicationError::Integrity)?,
+            secret_material_id: provider.secret_material_id,
             managed_profile_enabled: provider.managed_profile_enabled,
             managed_profile_revision: provider.managed_profile_revision,
             egress_policy,
@@ -995,31 +976,15 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (_projection, material) = if let Some(protector) = self.runtime_protector.as_deref() {
-            super::projection::repair_runtime_projection(
-                &transaction,
-                projection,
-                application.id,
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-                policy.projection_verified_email_enabled,
-                application.projection_verified_email_enabled,
-                protector,
-                now,
-            )
-            .await?
-        } else {
-            super::projection::repair_projection(
-                &transaction,
-                projection,
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-                now,
-            )
-            .await?
-        };
+        let (_projection, material) = super::projection::repair_runtime_projection(
+            &transaction,
+            projection,
+            application.id,
+            &user,
+            self.projection_materializer.as_ref(),
+            now,
+        )
+        .await?;
         let result = CurrentSession {
             project_id,
             project_public_id: project.public_id,

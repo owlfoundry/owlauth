@@ -4,13 +4,14 @@ use super::{
     ProviderErrorClass, ProvisionSigningKeyRequest, ProvisionedProtectedSigningMaterial,
     ProvisionedSigningKey, ProvisioningInfrastructure, ProvisioningOperationState,
     ProvisioningService, RetryClassification, SIGNING_ALGORITHM, SIGNING_PROVIDER_LEASE_SECONDS,
-    SIGNING_PURPOSE, SigningAlgorithm, SigningKeyProvisioner, SigningKeyProvisioningPort,
-    SigningKeyRecord, SigningProviderAction, SigningProviderCall, SigningProviderLease, Uuid,
-    external_store_alias, json, map_provider_error, normalized_ed25519_jwk,
+    SIGNING_PURPOSE, SigningAlgorithm, SigningKeyMaintenanceItem, SigningKeyProvisioner,
+    SigningKeyProvisioningPort, SigningKeyRecord, SigningProviderAction, SigningProviderCall,
+    SigningProviderLease, Uuid, json, map_provider_error, normalized_ed25519_jwk,
     validate_idempotency_key,
 };
 
 impl ProvisioningService {
+    #[cfg(test)]
     pub(crate) async fn provision_signing_key(
         &self,
         project_id: Uuid,
@@ -34,26 +35,115 @@ impl ProvisioningService {
     ) -> Result<Vec<SigningKeyRecord>, ApplicationError> {
         self.signing_keys.list_signing_keys(project_id).await
     }
-    pub(crate) async fn reconcile_signing_key(
+    pub(crate) async fn request_signing_key_rotation(
         &self,
         project_id: Uuid,
-        key_id: Uuid,
+        operation_alias: String,
         expected_project_revision: i64,
-        correlation_id: Uuid,
     ) -> Result<SigningKeyRecord, ApplicationError> {
-        let recovery = self
+        validate_idempotency_key(&operation_alias)?;
+        let digest = self.infrastructure.digester.digest_json(&json!({
+            "project_id": project_id,
+            "algorithm": SIGNING_ALGORITHM,
+            "purpose": SIGNING_PURPOSE,
+        }))?;
+        let prepared = self
             .signing_keys
-            .signing_key_recovery(project_id, key_id)
+            .prepare_signing_key(
+                project_id,
+                operation_alias,
+                expected_project_revision,
+                digest.clone(),
+            )
             .await?;
-        provision_signing_key_workflow(
-            self.signing_keys.as_ref(),
-            &self.infrastructure,
-            project_id,
-            recovery.operation_alias,
-            expected_project_revision,
-            correlation_id,
-        )
-        .await
+        if prepared.request_digest != digest {
+            return Err(ApplicationError::IdempotencyConflict);
+        }
+        self.signing_keys
+            .get_signing_key(project_id, prepared.key_id)
+            .await
+    }
+    pub(crate) async fn reconcile_signing_key_lifecycle(
+        &self,
+        limit: usize,
+    ) -> Result<usize, ApplicationError> {
+        if !(1..=100).contains(&limit) {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let items = self
+            .signing_keys
+            .signing_key_maintenance_items(limit)
+            .await?;
+        let mut progressed = 0;
+        let mut first_hard_error = None;
+        for item in items {
+            let result = match item {
+                SigningKeyMaintenanceItem::Provision {
+                    project_id,
+                    operation_alias,
+                    expected_project_revision,
+                    ..
+                } => {
+                    provision_signing_key_workflow(
+                        self.signing_keys.as_ref(),
+                        &self.infrastructure,
+                        project_id,
+                        operation_alias,
+                        expected_project_revision,
+                        Uuid::new_v4(),
+                    )
+                    .await
+                }
+                SigningKeyMaintenanceItem::Activate {
+                    project_id,
+                    key_id,
+                    expected_ring_revision,
+                } => {
+                    self.activate_signing_key(
+                        project_id,
+                        key_id,
+                        expected_ring_revision,
+                        Uuid::new_v4(),
+                    )
+                    .await
+                }
+                SigningKeyMaintenanceItem::Retire {
+                    project_id,
+                    key_id,
+                    expected_ring_revision,
+                } => {
+                    self.retire_signing_key(
+                        project_id,
+                        key_id,
+                        expected_ring_revision,
+                        Uuid::new_v4(),
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(_) => progressed += 1,
+                Err(
+                    ApplicationError::Disabled
+                    | ApplicationError::ExternalStore
+                    | ApplicationError::InvalidTransition
+                    | ApplicationError::NotFound
+                    | ApplicationError::OperationInProgress
+                    | ApplicationError::PublicationPending
+                    | ApplicationError::RevisionConflict,
+                ) => {}
+                Err(error) => {
+                    if first_hard_error.is_none() {
+                        first_hard_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_hard_error {
+            Err(error)
+        } else {
+            Ok(progressed)
+        }
     }
     pub(crate) async fn activate_signing_key(
         &self,
@@ -62,21 +152,9 @@ impl ProvisioningService {
         expected_ring_revision: i64,
         correlation_id: Uuid,
     ) -> Result<SigningKeyRecord, ApplicationError> {
-        let candidate = self
-            .signing_keys
-            .signing_key_activation_candidate(project_id, key_id)
+        self.signing_keys
+            .ensure_signing_key_activatable(project_id, key_id)
             .await?;
-        if Uuid::parse_str(&candidate.signer_ref).is_err() {
-            #[cfg(not(test))]
-            return Err(ApplicationError::Integrity);
-            #[cfg(test)]
-            self.infrastructure
-                .signer_store
-                .as_ref()
-                .ok_or(ApplicationError::Integrity)?
-                .verify(candidate.signer_ref, &candidate.kid, &candidate.public_jwk)
-                .await?;
-        }
         self.signing_keys
             .activate_signing_key_if_ready(
                 project_id,
@@ -128,17 +206,10 @@ pub(super) async fn provision_signing_key_workflow(
         "algorithm": SIGNING_ALGORITHM,
         "purpose": SIGNING_PURPOSE,
     }))?;
-    let signer_ref = external_store_alias(
-        infrastructure.digester.as_ref(),
-        "signer",
-        project_id,
-        &operation_alias,
-    );
     let prepared = signing_keys
         .prepare_signing_key(
             project_id,
             operation_alias,
-            signer_ref,
             expected_project_revision,
             digest.clone(),
         )
@@ -159,13 +230,7 @@ pub(super) async fn provision_signing_key_workflow(
         let now = infrastructure.clock.now();
         if prepared.state == ProvisioningOperationState::Stored {
             return signing_keys
-                .publish_signing_key(
-                    project_id,
-                    &prepared,
-                    expected_project_revision,
-                    correlation_id,
-                    now,
-                )
+                .publish_signing_key(project_id, &prepared, correlation_id, now)
                 .await;
         }
         let provisioner = infrastructure
@@ -177,51 +242,12 @@ pub(super) async fn provision_signing_key_workflow(
             project_id,
             &prepared,
             material,
-            expected_project_revision,
             correlation_id,
         )
         .await;
     }
 
-    #[cfg(not(test))]
-    return Err(ApplicationError::Integrity);
-
-    #[cfg(test)]
-    {
-        let signer_store = infrastructure
-            .signer_store
-            .as_ref()
-            .ok_or(ApplicationError::Integrity)?;
-        let entropy = infrastructure
-            .entropy
-            .as_ref()
-            .ok_or(ApplicationError::Integrity)?;
-        signer_store
-            .put_if_absent(prepared.signer_ref.clone(), entropy.signing_seed()?)
-            .await?;
-        let public_jwk = signer_store
-            .public_jwk(prepared.signer_ref.clone(), &prepared.kid)
-            .await?;
-        let now = infrastructure.clock.now();
-        signing_keys
-            .record_signing_key_material(
-                project_id,
-                &prepared,
-                expected_project_revision,
-                public_jwk,
-                now,
-            )
-            .await?;
-        signing_keys
-            .publish_signing_key(
-                project_id,
-                &prepared,
-                expected_project_revision,
-                correlation_id,
-                now,
-            )
-            .await
-    }
+    Err(ApplicationError::Integrity)
 }
 
 #[allow(
@@ -237,7 +263,6 @@ async fn reconcile_protected_signing_key(
     project_id: Uuid,
     prepared: &PreparedSigningKey,
     material: PreparedSigningMaterial,
-    expected_project_revision: i64,
     correlation_id: Uuid,
 ) -> Result<SigningKeyRecord, ApplicationError> {
     let operation_id = OperationId::new(prepared.operation_id.as_bytes().to_vec())
@@ -279,7 +304,6 @@ async fn reconcile_protected_signing_key(
                     project_id,
                     prepared,
                     &material,
-                    expected_project_revision,
                     correlation_id,
                     lease,
                     provisioned,
@@ -302,7 +326,6 @@ async fn reconcile_protected_signing_key(
                             project_id,
                             prepared,
                             &material,
-                            expected_project_revision,
                             correlation_id,
                             lease,
                             provisioned,
@@ -473,7 +496,6 @@ async fn contain_signing_provider_result(
     project_id: Uuid,
     prepared: &PreparedSigningKey,
     material: &PreparedSigningMaterial,
-    expected_project_revision: i64,
     correlation_id: Uuid,
     lease: SigningProviderLease,
     provisioned: ProvisionedSigningKey,
@@ -492,7 +514,6 @@ async fn contain_signing_provider_result(
         .record_protected_signing_key_material(
             project_id,
             prepared,
-            expected_project_revision,
             lease,
             ProvisionedProtectedSigningMaterial {
                 material_id: material.material_id,
@@ -517,13 +538,7 @@ async fn contain_signing_provider_result(
         return Err(error);
     }
     signing_keys
-        .publish_signing_key(
-            project_id,
-            prepared,
-            expected_project_revision,
-            correlation_id,
-            now,
-        )
+        .publish_signing_key(project_id, prepared, correlation_id, now)
         .await
 }
 

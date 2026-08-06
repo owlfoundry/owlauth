@@ -4,7 +4,6 @@ import {
   type Application,
   ControlRequestError,
   type DisposableControlClient,
-  type ProjectionPolicy,
   type WebhookDelivery,
   type WebhookEndpoint,
 } from "../client";
@@ -25,14 +24,6 @@ const application: Application = {
   status: "active",
   metadata_revision: 1,
   security_revision: 1,
-};
-
-const policy: ProjectionPolicy = {
-  project_id: application.project_id,
-  application_id: application.id,
-  verified_email_enabled: false,
-  revision: 1,
-  expansion_operation_id: null,
 };
 
 const baseEndpoint: WebhookEndpoint = {
@@ -77,10 +68,8 @@ function renderPanel(options?: {
   failInitialEndpointRead?: boolean;
 }) {
   let endpoint = options?.endpoint;
-  let currentPolicy = policy;
   let endpointReads = 0;
   const get = vi.fn((path: string) => {
-    if (path.endsWith("/projection-policy")) return Promise.resolve(successful(currentPolicy));
     if (path.endsWith("/webhook-endpoints")) {
       endpointReads += 1;
       if (options?.failInitialEndpointRead === true && endpointReads === 1) {
@@ -94,16 +83,8 @@ function renderPanel(options?: {
     }
     throw new Error(`unexpected GET ${path}`);
   });
-  const put = vi.fn((path: string, request: { body: { verified_email_enabled?: boolean } }) => {
-    if (path.endsWith("/projection-policy")) {
-      currentPolicy = {
-        ...currentPolicy,
-        verified_email_enabled: request.body.verified_email_enabled ?? false,
-        revision: currentPolicy.revision + 1,
-        expansion_operation_id: "44444444-4444-4444-8444-444444444444",
-      };
-      return Promise.resolve(successful(currentPolicy));
-    }
+  const put = vi.fn((path: string, _request: { body: Record<string, unknown> }) => {
+    void _request;
     if (path.includes("/webhook-endpoints/") && options?.conflictEndpoint === true) {
       if (endpoint === undefined) throw new Error("missing endpoint");
       endpoint = {

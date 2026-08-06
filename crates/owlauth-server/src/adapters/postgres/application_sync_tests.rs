@@ -1,17 +1,8 @@
-use std::{
-    collections::BTreeMap,
-    env,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use owlauth_key_provider::{ProviderFormatVersion, ProviderId};
 use sea_orm::{Database, EntityTrait, TransactionTrait};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -19,19 +10,15 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 use time::OffsetDateTime;
-use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{
-    control_lifecycle::PostgresControlLifecycleRepository,
     entity::{application_user_projection, project_user},
     projection::{
         PostgresIdentityProjectionMaterializer, PostgresProjectionEmailKeyAuthority,
         projection_material, projection_material_with_verified_email, safe_projection_document,
     },
-    projection_expansion::PostgresProjectionExpansionRepository,
-    provisioning::PostgresProvisioningAdapter,
     webhook::{PostgresWebhookRepository, append_projection_event},
 };
 use crate::{
@@ -41,20 +28,14 @@ use crate::{
         runtime_security::{
             RuntimeKeyMaterial, SoftwareDurableEmailAddressReader,
             SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
-            UnavailableDurableEmailAddressReader,
         },
         system::SystemClock,
     },
     application::{
-        ApplicationError, ApplicationProvisioningPort, ConfigurationSecretProvisioner,
-        ConfirmedProjectionPolicyUpdate, ControlLifecyclePort, CreateWebhookEndpoint,
-        DisableProjectUser, McpConfirmationContext, McpConfirmationService,
-        PrepareWebhookSecretRotation, ProjectProvisioningPort, ProjectUserStatus,
-        ProjectionExpansionWorker, ProjectionPolicyPort, ProjectionPolicyService,
-        ProjectionVerifiedEmailProtector, ProtectedPurpose, RuntimeProtector,
-        UpdateProjectionPolicy, WebhookControlService, WebhookDeliveryRepository,
-        WebhookEndpointValidator, WebhookSecretPreparationState, WebhookSecretResolver,
-        WebhookTransportOutcome,
+        ApplicationError, ConfigurationSecretSealers, CreateWebhookEndpoint,
+        PrepareWebhookSecretRotation, ProjectionVerifiedEmailProtector, ProtectedPurpose,
+        RuntimeProtector, WebhookControlService, WebhookDeliveryRepository,
+        WebhookEndpointValidator, WebhookSecretResolver, WebhookTransportOutcome,
     },
     domain::{ApplicationUserEventType, WebhookDeliveryOutcome},
 };
@@ -109,38 +90,6 @@ async fn fixture() -> Option<(
         .await
         .expect("connect SeaORM application-sync database");
     Some((container, pool, database))
-}
-
-#[derive(Default)]
-struct TestSecretProvisioner {
-    failures_remaining: AtomicUsize,
-    calls: AtomicUsize,
-}
-
-#[async_trait]
-impl ConfigurationSecretProvisioner for TestSecretProvisioner {
-    fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
-        Sha256::digest(value).into()
-    }
-
-    async fn provision_if_absent(
-        &self,
-        _alias: String,
-        _value: Zeroizing<Vec<u8>>,
-    ) -> Result<(), ApplicationError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if self
-            .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            Err(ApplicationError::ExternalStore)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 struct TestEndpointValidator;
@@ -213,12 +162,23 @@ async fn seed_projection(
     let provider_id = Uuid::new_v4();
     let identity_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO provider_configurations
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('03',32),'hex'),decode('01','hex'),
+                     decode(repeat('02',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
             (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
-             secret_ref,status,revision)
-         VALUES ($1,$2,'oidc-sync','oidc','OIDC Sync','https://issuer.example.test',
-             'sync-client','https://runtime.example.test/callback','provider_sync_secret',
-             'active',1)",
+             secret_material_id,status,revision)
+         SELECT $1,$2,'oidc-sync','oidc','OIDC Sync','https://issuer.example.test',
+                'sync-client','https://runtime.example.test/callback',material.id,
+                'active',1 FROM material",
     )
     .bind(provider_id)
     .bind(project_id)
@@ -243,8 +203,8 @@ async fn seed_projection(
     sqlx::query(
         "INSERT INTO linked_identities
             (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,display_name,observed_at,created_at,updated_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.example.test','sync-subject','active',1,
+             status,identity_revision,source_profile_digest,display_name,observed_at,created_at,updated_at)
+         VALUES ($1,$2,$3,$4,'https://issuer.example.test','sync-subject','active',1,public.owlauth_provider_source_profile_digest('Ada',NULL,NULL),
              'Ada',$5::timestamptz,$5::timestamptz,$5::timestamptz)",
     )
     .bind(identity_id)
@@ -284,14 +244,14 @@ async fn seed_projection(
         .await
         .expect("read seeded user")
         .expect("seeded user exists");
-    let (document, digest) = projection_material(&user, 1, 1, 1).expect("initial projection");
+    let (document, digest) = projection_material(&user, 1).expect("initial projection");
     sqlx::query(
         "INSERT INTO application_user_projections
             (id,project_id,binding_id,application_id,user_id,schema_name,projection_revision,
-             source_user_revision,project_policy_revision,application_policy_revision,
-             canonical_digest,document,created_at,updated_at)
-         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,1,1,$6,$7,
-             $8::timestamptz,$8::timestamptz)",
+             source_user_revision,canonical_digest,source_base_profile_digest,document,
+             created_at,updated_at)
+         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,$6,$7,$8,
+             $9::timestamptz,$9::timestamptz)",
     )
     .bind(projection_id)
     .bind(project_id)
@@ -299,6 +259,7 @@ async fn seed_projection(
     .bind(application_id)
     .bind(user_id)
     .bind(digest)
+    .bind(user.base_profile_digest)
     .bind(document)
     .bind(created_at)
     .execute(pool)
@@ -477,12 +438,23 @@ async fn webhook_graph_rejects_cross_scope_events_deliveries_and_replay_parents(
     let provider_b = Uuid::new_v4();
     let identity_b = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO provider_configurations
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('03',32),'hex'),decode('01','hex'),
+                     decode(repeat('02',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
             (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
-             secret_ref,status,revision)
-         VALUES ($1,$2,'scope-test','oidc','Scope Test','https://issuer.scope.test',
-                 'scope-client','https://runtime.scope.test/callback','provider_scope_secret',
-                 'active',1)",
+             secret_material_id,status,revision)
+         SELECT $1,$2,'scope-test','oidc','Scope Test','https://issuer.scope.test',
+                'scope-client','https://runtime.scope.test/callback',material.id,
+                'active',1 FROM material",
     )
     .bind(provider_b)
     .bind(project_b)
@@ -504,8 +476,8 @@ async fn webhook_graph_rejects_cross_scope_events_deliveries_and_replay_parents(
     sqlx::query(
         "INSERT INTO linked_identities
             (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,observed_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.scope.test','scope-subject','active',1,
+             status,identity_revision,source_profile_digest,observed_at)
+         VALUES ($1,$2,$3,$4,'https://issuer.scope.test','scope-subject','active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),
                  transaction_timestamp())",
     )
     .bind(identity_b)
@@ -626,1280 +598,6 @@ async fn webhook_graph_rejects_cross_scope_events_deliveries_and_replay_parents(
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "one real PostgreSQL test keeps the complete one-use confirmation threat matrix visible"
-)]
-async fn mcp_projection_policy_confirmation_is_bound_one_use_and_atomic() {
-    let Some((_container, pool, database)) = fixture().await else {
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    let application_id = Uuid::new_v4();
-    seed_projection(
-        &pool,
-        &database,
-        project_id,
-        application_id,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-    )
-    .await;
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        Arc::new(UnavailableDurableEmailAddressReader),
-        projection_protector(),
-    ));
-    let repository = Arc::new(PostgresProjectionExpansionRepository::new(
-        database.clone(),
-        materializer.clone(),
-    ));
-    let context = McpConfirmationContext {
-        instance_id: "instance-confirmation-test".to_owned(),
-        control_endpoint: "https://control.example.test/mcp".to_owned(),
-    };
-    let service = McpConfirmationService::new(repository.clone(), context.clone())
-        .expect("valid confirmation service");
-    let command = ConfirmedProjectionPolicyUpdate {
-        project_id,
-        application_id: None,
-        verified_email_enabled: true,
-        expected_revision: 1,
-    };
-
-    let mismatched = service
-        .preview_projection_policy_update(command.clone())
-        .await
-        .expect("preview exact policy expansion");
-    assert!(mismatched.capability.starts_with("owl_mcp_confirm_v1_"));
-    let stored_digest: Vec<u8> = sqlx::query_scalar(
-        "SELECT capability_digest FROM mcp_confirmation_capabilities WHERE project_id=$1",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read digest-only capability authority");
-    assert_eq!(
-        stored_digest,
-        Sha256::digest(mismatched.capability.as_bytes()).to_vec()
-    );
-
-    sqlx::query(
-        "INSERT INTO mcp_confirmation_capabilities
-            (id,capability_digest,actor_kind,audience,instance_id,control_endpoint,tool_name,
-             command_digest,project_id,project_metadata_revision,application_id,target_revision,
-             created_at,expires_at,consumed_at)
-         SELECT md5('synthetic-mcp-capacity-' || value::text)::uuid,
-                decode(lpad(to_hex(value),64,'0'),'hex'),
-                'deployment_operator','control_mcp','synthetic-capacity',
-                'https://control.example.test/mcp','synthetic_commit',decode(repeat('00',32),'hex'),
-                $1,1,NULL,1,authority_clock.now,
-                authority_clock.now+interval '5 minutes',NULL
-           FROM generate_series(1,4095) AS value
-           CROSS JOIN (SELECT clock_timestamp() AS now) AS authority_clock",
-    )
-    .bind(project_id)
-    .execute(&pool)
-    .await
-    .expect("fill the hard confirmation capacity");
-    assert_eq!(
-        service
-            .preview_projection_policy_update(command.clone())
-            .await,
-        Err(ApplicationError::OperationInProgress)
-    );
-    sqlx::query("DELETE FROM mcp_confirmation_capabilities WHERE instance_id='synthetic-capacity'")
-        .execute(&pool)
-        .await
-        .expect("remove synthetic capacity rows");
-
-    let changed_command = ConfirmedProjectionPolicyUpdate {
-        verified_email_enabled: false,
-        ..command.clone()
-    };
-    assert_eq!(
-        service
-            .preview_projection_policy_update(changed_command.clone())
-            .await,
-        Err(ApplicationError::InvalidTransition),
-        "MCP expansion preview rejects a no-change request"
-    );
-    assert_eq!(
-        service
-            .commit_projection_policy_update(
-                changed_command,
-                &mismatched.capability,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-    let changed_project = ConfirmedProjectionPolicyUpdate {
-        project_id: Uuid::new_v4(),
-        ..command.clone()
-    };
-    assert_eq!(
-        service
-            .commit_projection_policy_update(
-                changed_project,
-                &mismatched.capability,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-    let other_endpoint = McpConfirmationService::new(
-        repository.clone(),
-        McpConfirmationContext {
-            control_endpoint: "https://other-control.example.test/mcp".to_owned(),
-            ..context.clone()
-        },
-    )
-    .expect("second endpoint context");
-    assert_eq!(
-        other_endpoint
-            .commit_projection_policy_update(
-                command.clone(),
-                &mismatched.capability,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-    let other_deployment = McpConfirmationService::new(
-        repository.clone(),
-        McpConfirmationContext {
-            instance_id: "other-deployment".to_owned(),
-            ..context.clone()
-        },
-    )
-    .expect("second deployment context");
-    assert_eq!(
-        other_deployment
-            .commit_projection_policy_update(
-                command.clone(),
-                &mismatched.capability,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-
-    let tampered = service
-        .preview_projection_policy_update(command.clone())
-        .await
-        .expect("preview capability for stored-binding tamper checks");
-    let tampered_digest = Sha256::digest(tampered.capability.as_bytes()).to_vec();
-    let audience_error = sqlx::query(
-        "UPDATE mcp_confirmation_capabilities SET audience='runtime' WHERE capability_digest=$1",
-    )
-    .bind(tampered_digest.clone())
-    .execute(&pool)
-    .await
-    .expect_err("database rejects a cross-audience capability");
-    assert_eq!(
-        audience_error
-            .as_database_error()
-            .expect("PostgreSQL constraint error")
-            .code()
-            .as_deref(),
-        Some("23514")
-    );
-    sqlx::query(
-        "UPDATE mcp_confirmation_capabilities SET tool_name='other_commit' WHERE capability_digest=$1",
-    )
-    .bind(tampered_digest)
-    .execute(&pool)
-    .await
-    .expect("tamper exact tool binding for commit rejection");
-    assert_eq!(
-        service
-            .commit_projection_policy_update(command.clone(), &tampered.capability, Uuid::new_v4())
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-
-    sqlx::query("UPDATE projects SET metadata_revision=2 WHERE id=$1")
-        .bind(project_id)
-        .execute(&pool)
-        .await
-        .expect("advance Project metadata authority");
-    assert_eq!(
-        service
-            .commit_projection_policy_update(
-                command.clone(),
-                &mismatched.capability,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict)
-    );
-    let consumed_after_stale: Option<OffsetDateTime> = sqlx::query_scalar(
-        "SELECT consumed_at FROM mcp_confirmation_capabilities WHERE capability_digest=$1",
-    )
-    .bind(Sha256::digest(mismatched.capability.as_bytes()).to_vec())
-    .fetch_one(&pool)
-    .await
-    .expect("stale capability remains unconsumed");
-    assert!(consumed_after_stale.is_none());
-    sqlx::query("UPDATE projects SET metadata_revision=1 WHERE id=$1")
-        .bind(project_id)
-        .execute(&pool)
-        .await
-        .expect("restore isolated test fixture revision");
-
-    let ordinary_policy = ProjectionPolicyService::new(repository.clone(), Arc::new(SystemClock));
-    let ordinary_update = ordinary_policy
-        .update_project(
-            project_id,
-            UpdateProjectionPolicy {
-                verified_email_enabled: true,
-                expected_revision: 1,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("advance target revision through the ordinary Control service");
-    assert_eq!(
-        service
-            .commit_projection_policy_update(
-                command.clone(),
-                &mismatched.capability,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict)
-    );
-    sqlx::query(
-        "UPDATE project_policies
-            SET projection_verified_email_enabled=false,projection_revision=1
-          WHERE project_id=$1",
-    )
-    .bind(project_id)
-    .execute(&pool)
-    .await
-    .expect("restore isolated policy fixture");
-    sqlx::query("DELETE FROM projection_expansion_operations WHERE id=$1")
-        .bind(
-            ordinary_update
-                .expansion_operation_id
-                .expect("ordinary update operation"),
-        )
-        .execute(&pool)
-        .await
-        .expect("remove isolated ordinary expansion operation");
-
-    let expired = service
-        .preview_projection_policy_update(command.clone())
-        .await
-        .expect("preview capability to expire under PostgreSQL authority");
-    sqlx::query(
-        "UPDATE mcp_confirmation_capabilities
-            SET created_at=clock_timestamp()-interval '10 minutes',
-                expires_at=clock_timestamp()-interval '6 minutes'
-          WHERE capability_digest=$1",
-    )
-    .bind(Sha256::digest(expired.capability.as_bytes()).to_vec())
-    .execute(&pool)
-    .await
-    .expect("expire capability within its original bounded lifetime");
-    assert_eq!(
-        service
-            .commit_projection_policy_update(command.clone(), &expired.capability, Uuid::new_v4())
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-
-    let accepted = service
-        .preview_projection_policy_update(command.clone())
-        .await
-        .expect("preview accepted exact command");
-    let expired_retained: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM mcp_confirmation_capabilities WHERE capability_digest=$1",
-    )
-    .bind(Sha256::digest(expired.capability.as_bytes()).to_vec())
-    .fetch_one(&pool)
-    .await
-    .expect("inspect bounded expiry cleanup");
-    assert_eq!(expired_retained, 0);
-
-    let restarted_repository = Arc::new(PostgresProjectionExpansionRepository::new(
-        database,
-        materializer,
-    ));
-    let restarted_service = McpConfirmationService::new(restarted_repository, context)
-        .expect("recreated confirmation service");
-    sqlx::query(
-        "CREATE FUNCTION reject_mcp_commit_audit_for_test()
-         RETURNS TRIGGER LANGUAGE plpgsql AS $$
-         BEGIN
-             IF NEW.action='mcp.projection_policy.update.commit' THEN
-                 RAISE EXCEPTION 'injected MCP audit failure' USING ERRCODE='23514';
-             END IF;
-             RETURN NEW;
-         END
-         $$",
-    )
-    .execute(&pool)
-    .await
-    .expect("install late-transaction audit failure function");
-    sqlx::query(
-        "CREATE TRIGGER reject_mcp_commit_audit_for_test
-         BEFORE INSERT ON audit_events
-         FOR EACH ROW EXECUTE FUNCTION reject_mcp_commit_audit_for_test()",
-    )
-    .execute(&pool)
-    .await
-    .expect("install late-transaction audit failure trigger");
-    assert_eq!(
-        restarted_service
-            .commit_projection_policy_update(command.clone(), &accepted.capability, Uuid::new_v4(),)
-            .await,
-        Err(ApplicationError::Persistence)
-    );
-    let rolled_back: (bool, i64, i64, i64) = sqlx::query_as(
-        "SELECT
-            (SELECT projection_verified_email_enabled FROM project_policies WHERE project_id=$1),
-            (SELECT projection_revision FROM project_policies WHERE project_id=$1),
-            (SELECT count(*) FROM projection_expansion_operations
-              WHERE project_id=$1 AND scope_kind='project' AND target_policy_revision=2),
-            (SELECT count(*) FROM mcp_confirmation_capabilities
-              WHERE capability_digest=$2 AND consumed_at IS NOT NULL)",
-    )
-    .bind(project_id)
-    .bind(Sha256::digest(accepted.capability.as_bytes()).to_vec())
-    .fetch_one(&pool)
-    .await
-    .expect("inspect rollback after audit failure");
-    assert_eq!(rolled_back, (false, 1, 0, 0));
-    sqlx::query("DROP TRIGGER reject_mcp_commit_audit_for_test ON audit_events")
-        .execute(&pool)
-        .await
-        .expect("remove late-transaction audit failure trigger");
-    sqlx::query("DROP FUNCTION reject_mcp_commit_audit_for_test()")
-        .execute(&pool)
-        .await
-        .expect("remove late-transaction audit failure function");
-
-    let first_service = service.clone();
-    let second_service = restarted_service;
-    let first_command = command.clone();
-    let second_command = command.clone();
-    let first_capability = accepted.capability.clone();
-    let second_capability = accepted.capability.clone();
-    let (first, second) = tokio::join!(
-        first_service.commit_projection_policy_update(
-            first_command,
-            &first_capability,
-            Uuid::new_v4(),
-        ),
-        second_service.commit_projection_policy_update(
-            second_command,
-            &second_capability,
-            Uuid::new_v4(),
-        )
-    );
-    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
-    let committed = first.or(second).expect("one exact commit wins");
-    assert!(committed.verified_email_enabled);
-    assert_eq!(committed.revision, 2);
-    assert!(committed.expansion_operation_id.is_some());
-    assert_eq!(
-        service
-            .commit_projection_policy_update(command, &accepted.capability, Uuid::new_v4())
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-
-    let application_command = ConfirmedProjectionPolicyUpdate {
-        project_id,
-        application_id: Some(application_id),
-        verified_email_enabled: true,
-        expected_revision: 1,
-    };
-    let application_preview = service
-        .preview_projection_policy_update(application_command.clone())
-        .await
-        .expect("preview Application-scoped policy expansion");
-    let application_policy = service
-        .commit_projection_policy_update(
-            application_command,
-            &application_preview.capability,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("commit Application-scoped policy expansion");
-    assert_eq!(application_policy.application_id, Some(application_id));
-    assert_eq!(application_policy.revision, 2);
-    assert!(application_policy.expansion_operation_id.is_some());
-
-    let (mcp_audits, operations, consumed): (i64, i64, i64) = sqlx::query_as(
-        "SELECT
-            (SELECT count(*) FROM audit_events
-              WHERE project_id=$1 AND action='mcp.projection_policy.update.commit'),
-            (SELECT count(*) FROM projection_expansion_operations
-              WHERE project_id=$1 AND target_policy_revision=2),
-            (SELECT count(*) FROM mcp_confirmation_capabilities
-              WHERE project_id=$1 AND consumed_at IS NOT NULL)",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read atomic confirmation evidence");
-    assert_eq!((mcp_audits, operations, consumed), (2, 2, 2));
-}
-
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one real PostgreSQL journey proves the coupled policy, event, endpoint, delivery, and replay invariants"
-)]
-async fn application_sync_lifecycle_is_atomic_fenced_and_resumable() {
-    let Some((_container, pool, database)) = fixture().await else {
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    let application_id = Uuid::new_v4();
-    let user_id = Uuid::new_v4();
-    let binding_id = Uuid::new_v4();
-    let projection_id = Uuid::new_v4();
-    seed_projection(
-        &pool,
-        &database,
-        project_id,
-        application_id,
-        user_id,
-        binding_id,
-        projection_id,
-    )
-    .await;
-
-    let protector = projection_protector();
-    let webhook_repository = Arc::new(PostgresWebhookRepository::new(
-        database.clone(),
-        protector.clone(),
-    ));
-    let secret_provisioner = Arc::new(TestSecretProvisioner {
-        failures_remaining: AtomicUsize::new(1),
-        calls: AtomicUsize::new(0),
-    });
-    let webhook_service = WebhookControlService::new(
-        webhook_repository.clone(),
-        secret_provisioner.clone(),
-        Arc::new(TestEndpointValidator),
-        Arc::new(SystemClock),
-    );
-    let create_endpoint = |idempotency_key: &str| CreateWebhookEndpoint {
-        url: "https://receiver.example.test/owlauth".to_owned(),
-        subscribed_event_types: vec![
-            "user.projection.created".to_owned(),
-            "user.projection.updated".to_owned(),
-            "user.projection.disabled".to_owned(),
-        ],
-        secret: Zeroizing::new(vec![11; 32]),
-        idempotency_key: idempotency_key.to_owned(),
-    };
-    assert_eq!(
-        webhook_service
-            .create_endpoint(
-                project_id,
-                application_id,
-                create_endpoint("endpoint-create-01"),
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::ExternalStore)
-    );
-    let endpoint = webhook_service
-        .list_endpoints(project_id, application_id)
-        .await
-        .expect("list prepared endpoint")
-        .into_iter()
-        .next()
-        .expect("prepared endpoint exists");
-    assert_eq!(endpoint.status, "pending");
-    assert_eq!(endpoint.revision, 1);
-    assert!(endpoint.current_secret_generation.is_none());
-
-    let endpoint = webhook_service
-        .test_endpoint(
-            project_id,
-            application_id,
-            endpoint.id,
-            endpoint.revision,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("test endpoint destination");
-    assert_eq!(endpoint.revision, 2);
-    assert!(endpoint.last_test_succeeded_at.is_some());
-    assert_eq!(
-        webhook_service
-            .activate_endpoint(
-                project_id,
-                application_id,
-                endpoint.id,
-                endpoint.revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition),
-        "an uncommitted external secret result must fence activation"
-    );
-    let endpoint = webhook_service
-        .create_endpoint(
-            project_id,
-            application_id,
-            create_endpoint("endpoint-create-recovery-02"),
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("reconcile provisioned endpoint secret");
-    assert_eq!(endpoint.revision, 2);
-    let endpoint = webhook_service
-        .activate_endpoint(
-            project_id,
-            application_id,
-            endpoint.id,
-            endpoint.revision,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("activate tested and provisioned endpoint");
-    assert_eq!(endpoint.status, "active");
-    assert_eq!(endpoint.revision, 3);
-    assert_eq!(endpoint.current_secret_generation, Some(1));
-
-    let prepared = webhook_service
-        .prepare_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            PrepareWebhookSecretRotation {
-                secret: Zeroizing::new(vec![12; 32]),
-                idempotency_key: "endpoint-rotate-02".to_owned(),
-                expected_revision: endpoint.revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("prepare secret rotation");
-    assert_eq!(prepared.generation, 2);
-    let recovered = webhook_service
-        .prepare_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            PrepareWebhookSecretRotation {
-                secret: Zeroizing::new(vec![12; 32]),
-                idempotency_key: "endpoint-rotate-recovery-03".to_owned(),
-                expected_revision: endpoint.revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("recover prepared rotation under a new browser idempotency key");
-    assert_eq!(recovered.generation, 2);
-    assert_eq!(
-        recovered.preparation_state,
-        WebhookSecretPreparationState::Provisioned
-    );
-    let prepared = webhook_service
-        .prepare_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            PrepareWebhookSecretRotation {
-                secret: Zeroizing::new(vec![13; 32]),
-                idempotency_key: "endpoint-rotate-supersede-04".to_owned(),
-                expected_revision: endpoint.revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("supersede an abandoned prepared rotation");
-    assert_eq!(prepared.generation, 3);
-    let endpoint = webhook_service
-        .activate_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            prepared.generation,
-            endpoint.revision,
-            600,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("activate secret rotation");
-    assert_eq!(endpoint.current_secret_generation, Some(3));
-    assert_eq!(endpoint.overlap_secret_generation, Some(1));
-    let replayed_activation = webhook_service
-        .activate_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            prepared.generation,
-            endpoint.revision - 1,
-            600,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("replay rotation activation after response loss");
-    assert_eq!(replayed_activation.revision, endpoint.revision);
-
-    let blocked_rotation = webhook_service
-        .prepare_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            PrepareWebhookSecretRotation {
-                secret: Zeroizing::new(vec![14; 32]),
-                idempotency_key: "endpoint-rotate-before-overlap-expiry-05".to_owned(),
-                expected_revision: endpoint.revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("prepare another rotation while overlap remains live");
-    assert_eq!(
-        webhook_service
-            .activate_secret_rotation(
-                project_id,
-                application_id,
-                endpoint.id,
-                blocked_rotation.generation,
-                endpoint.revision,
-                600,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition),
-        "a second activation cannot shorten a PostgreSQL-authored overlap"
-    );
-
-    secret_provisioner
-        .failures_remaining
-        .store(1, Ordering::SeqCst);
-    assert_eq!(
-        webhook_service
-            .prepare_secret_rotation(
-                project_id,
-                application_id,
-                endpoint.id,
-                PrepareWebhookSecretRotation {
-                    secret: Zeroizing::new(vec![15; 32]),
-                    idempotency_key: "endpoint-rotate-terminal-replay-06".to_owned(),
-                    expected_revision: endpoint.revision,
-                },
-                Uuid::new_v4(),
-            )
-            .await
-            .expect_err("interrupted rotation provisioning should fail"),
-        ApplicationError::ExternalStore
-    );
-    webhook_service
-        .prepare_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            PrepareWebhookSecretRotation {
-                secret: Zeroizing::new(vec![16; 32]),
-                idempotency_key: "endpoint-rotate-successor-07".to_owned(),
-                expected_revision: endpoint.revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("supersede interrupted rotation");
-    let calls_before_terminal_replay = secret_provisioner.calls.load(Ordering::SeqCst);
-    let terminal_replay = webhook_service
-        .prepare_secret_rotation(
-            project_id,
-            application_id,
-            endpoint.id,
-            PrepareWebhookSecretRotation {
-                secret: Zeroizing::new(vec![15; 32]),
-                idempotency_key: "endpoint-rotate-terminal-replay-06".to_owned(),
-                expected_revision: endpoint.revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("terminal rotation replay should remain stable");
-    assert_eq!(
-        terminal_replay.preparation_state,
-        WebhookSecretPreparationState::Terminal
-    );
-    assert!(!terminal_replay.already_active);
-    assert_eq!(
-        secret_provisioner.calls.load(Ordering::SeqCst),
-        calls_before_terminal_replay,
-        "terminal replay must not repeat external provisioning"
-    );
-
-    let projection = application_user_projection::Entity::find_by_id(projection_id)
-        .one(&database)
-        .await
-        .expect("read projection")
-        .expect("projection exists");
-    let transaction = database.begin().await.expect("begin event transaction");
-    let event = append_projection_event(
-        &transaction,
-        "prj_sync01",
-        "app_sync01",
-        binding_id,
-        &projection,
-        &projection.document,
-        ApplicationUserEventType::Created,
-    )
-    .await
-    .expect("append immutable event and delivery");
-    transaction
-        .commit()
-        .await
-        .expect("commit event transaction");
-
-    let deliveries = webhook_service
-        .list_deliveries(project_id, application_id, None, None, None)
-        .await
-        .expect("list delivery");
-    assert_eq!(deliveries.items.len(), 1);
-    assert_eq!(deliveries.items[0].event_id, event.event_id);
-    assert!(deliveries.next_cursor.is_none());
-    let now = OffsetDateTime::now_utc();
-    let skewed_worker_clock = now + time::Duration::days(365);
-    let claim = webhook_repository
-        .claim_one(
-            "runtime-sync-01",
-            Uuid::new_v4(),
-            skewed_worker_clock,
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("claim delivery")
-        .expect("pending delivery exists");
-    assert!(claim.primary_secret_ref.contains("_3"));
-    assert!(claim.overlap_secret_ref.is_some());
-    let mut stale_claim = claim.clone();
-    stale_claim.lease_generation += 1;
-    assert_eq!(
-        webhook_repository
-            .finish(
-                &stale_claim,
-                now.unix_timestamp(),
-                WebhookTransportOutcome {
-                    outcome: WebhookDeliveryOutcome::Accepted,
-                    http_status: Some(204),
-                    duration_millis: 2,
-                },
-                None,
-                now,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict)
-    );
-    let finish = webhook_repository.finish(
-        &claim,
-        now.unix_timestamp(),
-        WebhookTransportOutcome {
-            outcome: WebhookDeliveryOutcome::Accepted,
-            http_status: Some(204),
-            duration_millis: 2,
-        },
-        None,
-        now,
-        Uuid::new_v4(),
-    );
-    let replay = webhook_service.replay_delivery(
-        project_id,
-        application_id,
-        claim.delivery_id,
-        Uuid::new_v4(),
-    );
-    let (finish_result, replay_result) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(finish, replay)
-    })
-    .await
-    .expect("finish and replay cannot deadlock under canonical owner lock order");
-    finish_result.expect("finish exact fenced claim");
-    let replay = replay_result.expect("replay immutable event while finish races");
-    assert_eq!(replay.event_id, event.event_id);
-    assert_eq!(replay.replay_sequence, 1);
-    assert_eq!(replay.replay_of_delivery_id, Some(claim.delivery_id));
-    let after_overlap = now
-        .checked_add(time::Duration::seconds(601))
-        .expect("bounded overlap timestamp");
-    sqlx::query(
-        "UPDATE webhook_endpoints
-            SET overlap_expires_at=transaction_timestamp()-interval '1 second'
-          WHERE id=$1",
-    )
-    .bind(endpoint.id)
-    .execute(&pool)
-    .await
-    .expect("expire overlap under the PostgreSQL clock");
-    let replay_claim = webhook_repository
-        .claim_one(
-            "runtime-sync-01",
-            Uuid::new_v4(),
-            after_overlap,
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("claim replay after overlap expiry")
-        .expect("replay remains pending");
-    assert!(replay_claim.overlap_secret_ref.is_none());
-    let retired_overlap: String = sqlx::query_scalar(
-        "SELECT state FROM webhook_secret_generations WHERE endpoint_id=$1 AND generation=1",
-    )
-    .bind(endpoint.id)
-    .fetch_one(&pool)
-    .await
-    .expect("read retired overlap generation");
-    assert_eq!(retired_overlap, "retired");
-    sqlx::query(
-        "UPDATE webhook_deliveries
-            SET lease_expires_at=transaction_timestamp()-interval '1 second'
-          WHERE id=$1",
-    )
-    .bind(replay_claim.delivery_id)
-    .execute(&pool)
-    .await
-    .expect("expire replay lease for recovery lock-order race");
-    let recovery_and_claim = webhook_repository.claim_one(
-        "runtime-sync-recovery-race",
-        Uuid::new_v4(),
-        after_overlap + time::Duration::seconds(1),
-        Duration::from_secs(30),
-    );
-    let replay_expired = webhook_service.replay_delivery(
-        project_id,
-        application_id,
-        replay_claim.delivery_id,
-        Uuid::new_v4(),
-    );
-    let (recovered_claim_result, replay_expired_result) =
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(recovery_and_claim, replay_expired)
-        })
-        .await
-        .expect("expired recovery and replay cannot deadlock");
-    replay_expired_result.expect("replay remains coherent while expiry recovery races");
-    if let Some(recovered_claim) =
-        recovered_claim_result.expect("expired recovery produces a coherent claim result")
-    {
-        webhook_repository
-            .finish(
-                &recovered_claim,
-                (after_overlap + time::Duration::seconds(1)).unix_timestamp(),
-                WebhookTransportOutcome {
-                    outcome: WebhookDeliveryOutcome::Accepted,
-                    http_status: Some(204),
-                    duration_millis: 1,
-                },
-                None,
-                after_overlap + time::Duration::seconds(1),
-                Uuid::new_v4(),
-            )
-            .await
-            .expect("finish delivery after expiry recovery race");
-    }
-
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        Arc::new(UnavailableDurableEmailAddressReader),
-        protector,
-    ));
-    let projection_repository = Arc::new(PostgresProjectionExpansionRepository::new(
-        database.clone(),
-        materializer.clone(),
-    ));
-    let policy_service =
-        ProjectionPolicyService::new(projection_repository.clone(), Arc::new(SystemClock));
-    let project_policy = policy_service
-        .update_project(
-            project_id,
-            UpdateProjectionPolicy {
-                verified_email_enabled: true,
-                expected_revision: 1,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("expand Project projection policy");
-    assert!(project_policy.expansion_operation_id.is_some());
-    let application_policy = policy_service
-        .update_application(
-            project_id,
-            application_id,
-            UpdateProjectionPolicy {
-                verified_email_enabled: true,
-                expected_revision: 1,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("expand Application projection policy");
-    assert!(application_policy.expansion_operation_id.is_some());
-    assert_eq!(
-        projection_repository
-            .update_project_projection_policy(
-                project_id,
-                UpdateProjectionPolicy {
-                    verified_email_enabled: false,
-                    expected_revision: 2,
-                },
-                OffsetDateTime::now_utc(),
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
-
-    let worker = ProjectionExpansionWorker::new(
-        projection_repository,
-        Arc::new(SystemClock),
-        "runtime-sync-01".to_owned(),
-        Uuid::new_v4(),
-        Duration::from_secs(30),
-        1,
-    )
-    .expect("projection worker");
-    while worker.run_once().await.expect("process expansion batch") {}
-    let operation_states: Vec<String> = sqlx::query_scalar(
-        "SELECT status FROM projection_expansion_operations ORDER BY created_at,id",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("read expansion operations");
-    assert_eq!(operation_states, vec!["completed", "completed"]);
-    let snapshots: (i64, i64) = sqlx::query_as(
-        "SELECT project_policy_revision,application_policy_revision
-         FROM application_user_projections WHERE id=$1",
-    )
-    .bind(projection_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read converged projection snapshots");
-    assert_eq!(snapshots, (2, 2));
-    let event_types: Vec<String> = sqlx::query_scalar(
-        "SELECT event_type FROM application_user_events WHERE binding_id=$1
-         ORDER BY projection_revision",
-    )
-    .bind(binding_id)
-    .fetch_all(&pool)
-    .await
-    .expect("read immutable event sequence");
-    assert_eq!(
-        event_types,
-        vec![
-            "user.projection.created".to_owned(),
-            "user.projection.updated".to_owned(),
-        ],
-        "both policy operations must converge to one semantic update, not duplicate events"
-    );
-
-    let lifecycle = PostgresControlLifecycleRepository::new_with_projection_materializer(
-        database.clone(),
-        materializer,
-    );
-    let disabled_user = lifecycle
-        .disable_project_user(DisableProjectUser {
-            project_id,
-            user_id,
-            expected_security_revision: 1,
-            correlation_id: Uuid::new_v4(),
-            now: after_overlap + time::Duration::seconds(1),
-        })
-        .await
-        .expect("disable user through production projection materializer");
-    assert_eq!(disabled_user.status, ProjectUserStatus::Disabled);
-    let event_types_after_disable: Vec<String> = sqlx::query_scalar(
-        "SELECT event_type FROM application_user_events WHERE binding_id=$1
-         ORDER BY projection_revision",
-    )
-    .bind(binding_id)
-    .fetch_all(&pool)
-    .await
-    .expect("read disabled immutable event");
-    assert_eq!(
-        event_types_after_disable,
-        vec![
-            "user.projection.created".to_owned(),
-            "user.projection.updated".to_owned(),
-            "user.projection.disabled".to_owned(),
-        ]
-    );
-    let disabled_delivery_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM webhook_deliveries delivery
-           JOIN application_user_events event ON event.id=delivery.event_id
-          WHERE event.binding_id=$1 AND event.event_type='user.projection.disabled'",
-    )
-    .bind(binding_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count disabled-event delivery");
-    assert_eq!(disabled_delivery_count, 1);
-    lifecycle
-        .disable_project_user(DisableProjectUser {
-            project_id,
-            user_id,
-            expected_security_revision: disabled_user.security_revision,
-            correlation_id: Uuid::new_v4(),
-            now: after_overlap + time::Duration::seconds(2),
-        })
-        .await
-        .expect("replay disabled user command without a second event");
-    let event_count_after_noop: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM application_user_events WHERE binding_id=$1")
-            .bind(binding_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count immutable events after no-op disable");
-    assert_eq!(event_count_after_noop, 3);
-
-    let _finish_after_disable = webhook_service
-        .replay_delivery(
-            project_id,
-            application_id,
-            claim.delivery_id,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("queue transient-finish delivery before Application disable");
-    let transient_claim = webhook_repository
-        .claim_one(
-            "runtime-sync-disable",
-            Uuid::new_v4(),
-            after_overlap,
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("claim delivery before Application disable")
-        .expect("delivery is claimable");
-    let provisioning = PostgresProvisioningAdapter::new(
-        database.clone(),
-        Url::parse("https://runtime.example.test").expect("runtime URL"),
-        Vec::new(),
-        Duration::from_secs(1),
-        Duration::from_mins(1),
-    );
-    sqlx::query(
-        "UPDATE webhook_secret_generations
-            SET state='overlap',retired_at=NULL
-          WHERE endpoint_id=$1 AND generation=1",
-    )
-    .bind(endpoint.id)
-    .execute(&pool)
-    .await
-    .expect("restore expired overlap for lock-order race");
-    sqlx::query(
-        "UPDATE webhook_endpoints
-            SET overlap_secret_generation=1,
-                overlap_expires_at=transaction_timestamp()-interval '1 second'
-          WHERE id=$1",
-    )
-    .bind(endpoint.id)
-    .execute(&pool)
-    .await
-    .expect("arm expired overlap for lock-order race");
-    let disable_application =
-        provisioning.disable_application(project_id, application_id, 1, Uuid::new_v4());
-    let maintenance_and_claim = webhook_repository.claim_one(
-        "runtime-sync-race",
-        Uuid::new_v4(),
-        after_overlap + time::Duration::seconds(1),
-        Duration::from_secs(30),
-    );
-    let (disabled_result, race_claim_result) =
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(disable_application, maintenance_and_claim)
-        })
-        .await
-        .expect("overlap maintenance and Application disable cannot deadlock");
-    let disabled = disabled_result.expect("disable Application and its webhook surface atomically");
-    assert_eq!(disabled.status, "disabled");
-    assert!(
-        race_claim_result
-            .expect("overlap maintenance remains coherent")
-            .is_none(),
-        "the delivery was already leased before the disable race"
-    );
-
-    webhook_repository
-        .finish(
-            &transient_claim,
-            (after_overlap + time::Duration::seconds(2)).unix_timestamp(),
-            WebhookTransportOutcome {
-                outcome: WebhookDeliveryOutcome::Transient,
-                http_status: Some(503),
-                duration_millis: 1,
-            },
-            Some(after_overlap + time::Duration::seconds(10)),
-            after_overlap + time::Duration::seconds(2),
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("transient finish after disable settles as cancelled");
-    let transient_state: String =
-        sqlx::query_scalar("SELECT state FROM webhook_deliveries WHERE id=$1")
-            .bind(transient_claim.delivery_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read transient in-flight delivery");
-    assert_eq!(transient_state, "cancelled");
-
-    sqlx::query("UPDATE applications SET status='active' WHERE id=$1")
-        .bind(application_id)
-        .execute(&pool)
-        .await
-        .expect("reactivate Application for expired recovery proof");
-    sqlx::query("UPDATE webhook_endpoints SET status='active',disabled_at=NULL WHERE id=$1")
-        .bind(endpoint.id)
-        .execute(&pool)
-        .await
-        .expect("reactivate endpoint for expired recovery proof");
-    let recover_after_disable = webhook_service
-        .replay_delivery(
-            project_id,
-            application_id,
-            claim.delivery_id,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("queue expired-recovery delivery before second Application disable");
-    let expired_claim = webhook_repository
-        .claim_one(
-            "runtime-sync-disable",
-            Uuid::new_v4(),
-            after_overlap + time::Duration::seconds(3),
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("claim delivery before second Application disable")
-        .expect("expired-recovery delivery is claimable");
-    assert_ne!(expired_claim.delivery_id, Uuid::nil());
-    let _ = recover_after_disable;
-    provisioning
-        .disable_application(project_id, application_id, 2, Uuid::new_v4())
-        .await
-        .expect("disable Application with an in-flight lease for recovery proof");
-    sqlx::query(
-        "UPDATE webhook_deliveries
-            SET lease_expires_at=transaction_timestamp()-interval '1 second'
-          WHERE id=$1",
-    )
-    .bind(expired_claim.delivery_id)
-    .execute(&pool)
-    .await
-    .expect("expire in-flight lease under the PostgreSQL clock");
-    assert!(
-        webhook_repository
-            .claim_one(
-                "runtime-sync-disable",
-                Uuid::new_v4(),
-                after_overlap + time::Duration::seconds(34),
-                Duration::from_secs(30),
-            )
-            .await
-            .expect("expired lease recovery after disable is safe")
-            .is_none()
-    );
-    let expired_state: String =
-        sqlx::query_scalar("SELECT state FROM webhook_deliveries WHERE id=$1")
-            .bind(expired_claim.delivery_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read expired in-flight delivery");
-    assert_eq!(expired_state, "cancelled");
-
-    let endpoint_status: String =
-        sqlx::query_scalar("SELECT status FROM webhook_endpoints WHERE id=$1")
-            .bind(endpoint.id)
-            .fetch_one(&pool)
-            .await
-            .expect("read disabled endpoint");
-    assert_eq!(endpoint_status, "disabled");
-    sqlx::query("UPDATE applications SET status='active' WHERE id=$1")
-        .bind(application_id)
-        .execute(&pool)
-        .await
-        .expect("reactivate Application for isolated Project fence proof");
-    sqlx::query("UPDATE webhook_endpoints SET status='active',disabled_at=NULL WHERE id=$1")
-        .bind(endpoint.id)
-        .execute(&pool)
-        .await
-        .expect("reactivate endpoint for isolated Project fence proof");
-    webhook_service
-        .replay_delivery(
-            project_id,
-            application_id,
-            claim.delivery_id,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("queue delivery before Project disable");
-    provisioning
-        .disable_project(project_id, 1, Uuid::new_v4())
-        .await
-        .expect("disable Project through exclusive owner fence");
-    assert_eq!(
-        webhook_service
-            .create_endpoint(
-                project_id,
-                application_id,
-                create_endpoint("project-disabled-endpoint"),
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::Disabled),
-        "disabled Project must fence webhook mutation before endpoint state"
-    );
-    assert!(
-        webhook_repository
-            .claim_one(
-                "runtime-sync-01",
-                Uuid::new_v4(),
-                after_overlap + time::Duration::seconds(3),
-                Duration::from_secs(30),
-            )
-            .await
-            .expect("disabled Project claim is safe")
-            .is_none(),
-        "active Application and endpoint cannot bypass disabled Project"
-    );
-    let disabled_project_operation_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO projection_expansion_operations
-            (id,project_id,scope_kind,target_policy_revision,status,processed_count,
-             lease_generation,created_at,updated_at)
-         VALUES ($1,$2,'project',99,'pending',0,0,$3,$3)",
-    )
-    .bind(disabled_project_operation_id)
-    .bind(project_id)
-    .bind(after_overlap + time::Duration::seconds(3))
-    .execute(&pool)
-    .await
-    .expect("seed expansion operation owned by disabled Project");
-    assert!(
-        !worker
-            .run_once()
-            .await
-            .expect("disabled Project expansion claim is safe")
-    );
-    let disabled_project_operation_state: String =
-        sqlx::query_scalar("SELECT status FROM projection_expansion_operations WHERE id=$1")
-            .bind(disabled_project_operation_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read disabled Project expansion operation");
-    assert_eq!(disabled_project_operation_state, "pending");
-
-    database.close().await.expect("close SeaORM database");
-    pool.close().await;
-}
-
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
     reason = "one real PostgreSQL journey proves protected webhook sealing, exact delivery snapshots, replay conflict, and atomic erasure"
 )]
 async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
@@ -1935,13 +633,12 @@ async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
             )
             .expect("compose protected webhook repository"),
     );
-    let service = WebhookControlService::new(
+    let service = WebhookControlService::new_protected(
         repository.clone(),
-        Arc::new(TestSecretProvisioner::default()),
+        ConfigurationSecretSealers::single(custody.clone()),
         Arc::new(TestEndpointValidator),
         Arc::new(SystemClock),
-    )
-    .with_secret_sealer(custody.clone());
+    );
     let create = |secret_byte| CreateWebhookEndpoint {
         url: "https://receiver.example.test/owlauth".to_owned(),
         subscribed_event_types: vec!["user.projection.updated".to_owned()],
@@ -1952,14 +649,13 @@ async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
         .create_endpoint(project_id, application_id, create(91), Uuid::new_v4())
         .await
         .expect("create protected webhook endpoint");
-    let (material_id, alias, safe_fingerprint, first_envelope, material_state): (
+    let (material_id, safe_fingerprint, first_envelope, material_state): (
         Uuid,
-        String,
         Option<String>,
         Vec<u8>,
         String,
     ) = sqlx::query_as(
-        "SELECT secret.material_id,secret.secret_ref,secret.safe_fingerprint,
+        "SELECT secret.material_id,secret.safe_fingerprint,
                 material.opaque_value,material.state
            FROM webhook_secret_generations secret
            JOIN protected_materials material ON material.id=secret.material_id
@@ -1971,10 +667,6 @@ async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
     .expect("read protected webhook material");
     assert_eq!(material_state, "live");
     assert!(safe_fingerprint.is_some());
-    assert!(
-        Uuid::parse_str(&alias).is_err(),
-        "legacy alias remains non-authoritative"
-    );
     assert!(
         !first_envelope.windows(32).any(|window| window == [91; 32]),
         "PostgreSQL stores only the opaque envelope"
@@ -2010,7 +702,7 @@ async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
         custody,
     )
     .expect("compose protected Runtime custody");
-    let opened = WebhookSecretResolver::resolve(&protected_runtime, &material_id.to_string())
+    let opened = WebhookSecretResolver::resolve(&protected_runtime, material_id)
         .await
         .expect("open exact protected webhook generation");
     assert_eq!(opened.as_slice(), [91; 32]);
@@ -2069,7 +761,7 @@ async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
         .await
         .expect("claim protected webhook delivery")
         .expect("protected delivery exists");
-    assert_eq!(claim.primary_secret_ref, material_id.to_string());
+    assert_eq!(claim.primary_secret_material_id, material_id);
     let claimed_material: Option<Uuid> =
         sqlx::query_scalar("SELECT claimed_secret_material_id FROM webhook_deliveries WHERE id=$1")
             .bind(claim.delivery_id)
@@ -2113,9 +805,7 @@ async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
         .await
         .expect("claim protected webhook cleanup")
         .expect("protected cleanup exists");
-    assert_eq!(cleanup.material_id, Some(material_id));
-    assert_eq!(cleanup.secret_ref, material_id.to_string());
-    assert_eq!(cleanup.legacy_secret_ref.as_deref(), Some(alias.as_str()));
+    assert_eq!(cleanup.material_id, material_id);
     repository
         .finish_secret_cleanup(&cleanup, OffsetDateTime::now_utc())
         .await
@@ -2139,7 +829,7 @@ async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
             .expect("read protected webhook fingerprint tombstone");
     assert_eq!(retained_fingerprint.as_deref().map(<[u8]>::len), Some(32));
     assert!(
-        WebhookSecretResolver::resolve(&protected_runtime, &material_id.to_string())
+        WebhookSecretResolver::resolve(&protected_runtime, material_id)
             .await
             .is_err(),
         "an erased generation cannot be reopened"
@@ -2185,14 +875,22 @@ async fn webhook_history_retention_and_secret_cleanup_are_durable() {
     )
     .await;
 
-    let repository = Arc::new(PostgresWebhookRepository::new(
-        database.clone(),
-        projection_protector(),
-    ));
-    let secret_provisioner = Arc::new(TestSecretProvisioner::default());
-    let service = WebhookControlService::new(
+    let provider_id = ProviderId::new("software").expect("software provider ID");
+    let provider_format_version = ProviderFormatVersion::new(1).expect("provider format");
+    let custody = SoftwareCustodyProvider::new(provider_id.clone(), [74; 32])
+        .expect("software custody provider");
+    let repository = Arc::new(
+        PostgresWebhookRepository::new(database.clone(), projection_protector())
+            .with_custody(
+                "application-sync-durable-webhook",
+                provider_id,
+                provider_format_version,
+            )
+            .expect("compose durable webhook repository"),
+    );
+    let service = WebhookControlService::new_protected(
         repository.clone(),
-        secret_provisioner.clone(),
+        ConfigurationSecretSealers::single(custody),
         Arc::new(TestEndpointValidator),
         Arc::new(SystemClock),
     );
@@ -2723,7 +1421,6 @@ async fn webhook_history_retention_and_secret_cleanup_are_durable() {
     .expect("read overlap cleanup deadline");
     assert_eq!(delayed_overlap_cleanup, ("pending".to_owned(), true));
 
-    let calls_before_terminal_replay = secret_provisioner.calls.load(Ordering::SeqCst);
     let terminal_endpoint_replay = service
         .create_endpoint(
             project_id,
@@ -2739,12 +1436,6 @@ async fn webhook_history_retention_and_secret_cleanup_are_durable() {
         .await
         .expect("terminal endpoint replay should remain stable");
     assert_eq!(terminal_endpoint_replay.status, "disabled");
-    assert_eq!(
-        secret_provisioner.calls.load(Ordering::SeqCst),
-        calls_before_terminal_replay,
-        "terminal endpoint replay must not repeat external provisioning"
-    );
-
     let cleanup = repository
         .claim_secret_cleanup(
             "runtime-cleanup",
@@ -2755,14 +1446,6 @@ async fn webhook_history_retention_and_secret_cleanup_are_durable() {
         .await
         .expect("claim secret cleanup")
         .expect("retired secret is cleanup eligible");
-    let reservation_state: String = sqlx::query_scalar(
-        "SELECT state FROM webhook_secret_reference_reservations WHERE secret_ref=$1",
-    )
-    .bind(&cleanup.secret_ref)
-    .fetch_one(&pool)
-    .await
-    .expect("read reserved secret reference");
-    assert_eq!(reservation_state, "reserved");
     let mut stale_cleanup = cleanup.clone();
     stale_cleanup.lease_generation += 1;
     assert_eq!(
@@ -2774,10 +1457,9 @@ async fn webhook_history_retention_and_secret_cleanup_are_durable() {
         .await
         .expect("finish exact secret cleanup lease");
     let cleanup_state: (String, String) = sqlx::query_as(
-        "SELECT cleanup.state,reservation.state
+        "SELECT cleanup.state,material.state
            FROM webhook_secret_cleanup_operations cleanup
-           JOIN webhook_secret_reference_reservations reservation
-             ON reservation.secret_ref=cleanup.secret_ref
+           JOIN protected_materials material ON material.id=cleanup.material_id
           WHERE cleanup.id=$1",
     )
     .bind(cleanup.id)
@@ -2826,20 +1508,6 @@ async fn projection_email_rewrap_converges_storage_without_public_or_event_mutat
     .execute(&pool)
     .await
     .expect("install cut-over projection authority");
-    sqlx::query(
-        "UPDATE project_policies SET projection_verified_email_enabled=TRUE
-          WHERE project_id=$1",
-    )
-    .bind(project_id)
-    .execute(&pool)
-    .await
-    .expect("admit Project verified email");
-    sqlx::query("UPDATE applications SET projection_verified_email_enabled=TRUE WHERE id=$1")
-        .bind(application_id)
-        .execute(&pool)
-        .await
-        .expect("admit Application verified email");
-
     let durable_writer = SoftwareRuntimeProtector::new(
         "application-sync-durable".to_owned(),
         1,
@@ -2919,14 +1587,9 @@ async fn projection_email_rewrap_converges_storage_without_public_or_event_mutat
         .await
         .expect("read primary email user")
         .expect("primary email user exists");
-    let (wire_document, canonical_digest) = projection_material_with_verified_email(
-        &user,
-        1,
-        1,
-        1,
-        Some("ada@example.test".to_owned()),
-    )
-    .expect("materialize verified-email projection");
+    let (wire_document, canonical_digest) =
+        projection_material_with_verified_email(&user, 1, Some("ada@example.test".to_owned()))
+            .expect("materialize verified-email projection");
     let storage_document = safe_projection_document(&wire_document).expect("safe storage document");
     sqlx::query(
         "UPDATE application_user_projections
@@ -2972,17 +1635,15 @@ async fn projection_email_rewrap_converges_storage_without_public_or_event_mutat
     .await
     .expect("seed immutable old-version projection event");
 
-    let public_before: (i64, i64, i64, i64, Vec<u8>, serde_json::Value, Option<Uuid>) =
-        sqlx::query_as(
-            "SELECT projection_revision,source_user_revision,project_policy_revision,
-                    application_policy_revision,canonical_digest,document,
+    let public_before: (i64, i64, Vec<u8>, serde_json::Value, Option<Uuid>) = sqlx::query_as(
+        "SELECT projection_revision,source_user_revision,canonical_digest,document,
                     verified_email_source_identity_id
                FROM application_user_projections WHERE id=$1",
-        )
-        .bind(projection_id)
-        .fetch_one(&pool)
-        .await
-        .expect("snapshot public projection authority");
+    )
+    .bind(projection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot public projection authority");
     let event_before: (i64, Vec<u8>, i32) = sqlx::query_as(
         "SELECT projection_revision,verified_email_ciphertext,verified_email_key_version
            FROM application_user_events WHERE id=$1",
@@ -3031,17 +1692,15 @@ async fn projection_email_rewrap_converges_storage_without_public_or_event_mutat
             .as_str(),
         "ada@example.test"
     );
-    let public_after: (i64, i64, i64, i64, Vec<u8>, serde_json::Value, Option<Uuid>) =
-        sqlx::query_as(
-            "SELECT projection_revision,source_user_revision,project_policy_revision,
-                    application_policy_revision,canonical_digest,document,
+    let public_after: (i64, i64, Vec<u8>, serde_json::Value, Option<Uuid>) = sqlx::query_as(
+        "SELECT projection_revision,source_user_revision,canonical_digest,document,
                     verified_email_source_identity_id
                FROM application_user_projections WHERE id=$1",
-        )
-        .bind(projection_id)
-        .fetch_one(&pool)
-        .await
-        .expect("inspect storage-only public authority");
+    )
+    .bind(projection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect storage-only public authority");
     assert_eq!(public_after, public_before);
     let event_after: (i64, Vec<u8>, i32) = sqlx::query_as(
         "SELECT projection_revision,verified_email_ciphertext,verified_email_key_version
@@ -3172,13 +1831,13 @@ async fn projection_email_rewrap_converges_storage_without_public_or_event_mutat
         sqlx::query(
             "INSERT INTO application_user_projections
                 (id,project_id,binding_id,application_id,user_id,schema_name,
-                 projection_revision,source_user_revision,project_policy_revision,
-                 application_policy_revision,canonical_digest,source_base_profile_digest,
-                 verified_email_source_identity_id,verified_email_ciphertext,
+                 projection_revision,source_user_revision,canonical_digest,
+                 source_base_profile_digest,verified_email_source_identity_id,
+                 verified_email_ciphertext,
                  verified_email_key_version,document,created_at,updated_at)
              SELECT $1,project_id,$2,application_id,$3,schema_name,
-                    projection_revision,source_user_revision,project_policy_revision,
-                    application_policy_revision,canonical_digest,$4,$5,$6,1,document,
+                    projection_revision,source_user_revision,canonical_digest,
+                    $4,$5,$6,1,document,
                     clock_timestamp(),clock_timestamp()
                FROM application_user_projections WHERE id=$7",
         )
@@ -3254,17 +1913,15 @@ async fn projection_email_rewrap_converges_storage_without_public_or_event_mutat
         0
     );
 
-    let public_final: (i64, i64, i64, i64, Vec<u8>, serde_json::Value, Option<Uuid>) =
-        sqlx::query_as(
-            "SELECT projection_revision,source_user_revision,project_policy_revision,
-                    application_policy_revision,canonical_digest,document,
+    let public_final: (i64, i64, Vec<u8>, serde_json::Value, Option<Uuid>) = sqlx::query_as(
+        "SELECT projection_revision,source_user_revision,canonical_digest,document,
                     verified_email_source_identity_id
                FROM application_user_projections WHERE id=$1",
-        )
-        .bind(projection_id)
-        .fetch_one(&pool)
-        .await
-        .expect("inspect batch storage-only public authority");
+    )
+    .bind(projection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("inspect batch storage-only public authority");
     assert_eq!(public_final, public_before);
     let event_final: (i64, Vec<u8>, i32) = sqlx::query_as(
         "SELECT projection_revision,verified_email_ciphertext,verified_email_key_version

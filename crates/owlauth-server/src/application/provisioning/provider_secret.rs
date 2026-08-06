@@ -1,14 +1,8 @@
-#[cfg(test)]
-use base64::Engine as _;
-
 use super::{
     ApplicationError, CreateProvider, PrepareProvider, ProviderProvisioningPort, ProviderRecord,
     ProvisioningInfrastructure, ProvisioningOperationState, ProvisioningService, SealSecretRequest,
     SealedProtectedMaterial, SecretPlaintext, Uuid, Zeroizing, json, map_provider_error,
 };
-#[cfg(test)]
-use super::{URL_SAFE_NO_PAD, external_store_alias};
-
 impl ProvisioningService {
     pub(crate) async fn create_provider(
         &self,
@@ -129,28 +123,6 @@ pub(super) async fn create_provider_workflow(
     correlation_id: Uuid,
 ) -> Result<ProviderRecord, ApplicationError> {
     let command = command.normalize(infrastructure.allow_http_loopback_provider)?;
-    #[cfg(test)]
-    let digest = if infrastructure.secret_sealers.is_empty() {
-        let secret_digest = infrastructure
-            .secret_store
-            .as_ref()
-            .ok_or(ApplicationError::Integrity)?
-            .request_fingerprint(command.client_secret.as_bytes());
-        infrastructure.digester.digest_json(&json!({
-            "project_id": project_id,
-            "kind": command.kind.as_str(),
-            "provider_key": &command.provider_key,
-            "display_name": &command.display_name,
-            "issuer": &command.issuer,
-            "client_id": &command.client_id,
-            "managed_profile_enabled": command.managed_profile_enabled,
-            "egress_policy_revision": command.egress_policy_revision,
-            "secret_digest": URL_SAFE_NO_PAD.encode(secret_digest),
-        }))?
-    } else {
-        protected_provider_request_digest(infrastructure, project_id, &command)?
-    };
-    #[cfg(not(test))]
     let digest = protected_provider_request_digest(infrastructure, project_id, &command)?;
     let prepared = providers
         .prepare_provider(
@@ -208,48 +180,7 @@ pub(super) async fn create_provider_workflow(
             .await;
     }
 
-    #[cfg(not(test))]
-    return Err(ApplicationError::Integrity);
-
-    #[cfg(test)]
-    {
-        let secret_store = infrastructure
-            .secret_store
-            .as_ref()
-            .ok_or(ApplicationError::Integrity)?;
-        let secret_ref = external_store_alias(
-            infrastructure.digester.as_ref(),
-            "secret",
-            project_id,
-            &command.idempotency_key,
-        );
-        secret_store
-            .put_if_absent(
-                secret_ref.clone(),
-                Zeroizing::new(command.client_secret.as_bytes().to_vec()),
-            )
-            .await?;
-        secret_store.ensure_readable(secret_ref.clone()).await?;
-        let now = infrastructure.clock.now();
-        providers
-            .mark_provider_secret_stored(
-                project_id,
-                &prepared,
-                command.expected_project_revision,
-                now,
-            )
-            .await?;
-        providers
-            .finalize_provider(
-                project_id,
-                &prepared,
-                command.expected_project_revision,
-                secret_ref,
-                correlation_id,
-                now,
-            )
-            .await
-    }
+    Err(ApplicationError::Integrity)
 }
 
 fn protected_provider_request_digest(

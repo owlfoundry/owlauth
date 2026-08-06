@@ -98,18 +98,18 @@ impl PostgresProvisioningAdapter {
             ))
             .map_err(|_| ApplicationError::InvalidInput)?
             .to_string();
+        let provider_id = Uuid::new_v4();
+        let material_id = Uuid::new_v4();
         let provider = provider_configuration::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(provider_id),
             project_id: Set(project_id),
             provider_key: Set(command.provider_key),
-            kind: Set("oidc".to_owned()),
-            adapter_kind: Set(Some(command.kind.as_str().to_owned())),
+            kind: Set(command.kind.as_str().to_owned()),
             display_name: Set(command.display_name),
             issuer: Set(command.issuer),
             client_id: Set(command.client_id),
             callback_url: Set(callback_url),
-            secret_ref: Set(None),
-            secret_material_id: Set(None),
+            secret_material_id: Set(material_id),
             secret_generation: Set(1),
             status: Set("provisioning".to_owned()),
             revision: Set(1),
@@ -120,27 +120,22 @@ impl PostgresProvisioningAdapter {
         .insert(&transaction)
         .await
         .map_err(persistence)?;
-        let material_id = if let Some(custody) = self.optional_custody() {
-            let material_id = Uuid::new_v4();
-            custody
-                .materials
-                .reserve_project_in_transaction(
-                    &transaction,
-                    project_id,
-                    material_id,
-                    MaterialOwnerKind::ProviderSecret,
-                    provider.id,
-                    1,
-                    MaterialKind::ConfigurationSecret,
-                    MaterialPurpose::ProviderClientSecret,
-                    custody.secrets.provider_id.clone(),
-                    custody.secrets.provider_format_version,
-                )
-                .await?;
-            Some(material_id)
-        } else {
-            None
-        };
+        let custody = self.custody();
+        custody
+            .materials
+            .reserve_project_in_transaction(
+                &transaction,
+                project_id,
+                material_id,
+                MaterialOwnerKind::ProviderSecret,
+                provider.id,
+                1,
+                MaterialKind::ConfigurationSecret,
+                MaterialPurpose::ProviderClientSecret,
+                custody.secrets.provider_id.clone(),
+                custody.secrets.provider_format_version,
+            )
+            .await?;
         let operation = provider_secret_operation::ActiveModel {
             id: Set(Uuid::new_v4()),
             project_id: Set(project_id),
@@ -161,65 +156,6 @@ impl PostgresProvisioningAdapter {
         .map_err(persistence)?;
         transaction.commit().await.map_err(persistence)?;
         prepared_provider(operation)
-    }
-
-    #[cfg(test)]
-    async fn mark_provider_secret_stored_stage(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedProvider,
-        expected_project_revision: i64,
-        stored_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let project = locked_project(&transaction, project_id).await?;
-        let operation = provider_secret_operation::Entity::find_by_id(prepared.operation_id)
-            .filter(provider_secret_operation::Column::ProjectId.eq(project_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        if operation.provider_id != prepared.provider_id
-            || operation.request_digest != prepared.request_digest
-        {
-            return Err(ApplicationError::Integrity);
-        }
-        if operation.state == "completed" {
-            transaction.commit().await.map_err(persistence)?;
-            return Ok(());
-        }
-        enforce_project_fence(&project, expected_project_revision)?;
-        enforce_provider_egress_fence(&transaction, project_id, operation.egress_policy_revision)
-            .await?;
-        if operation.expected_project_revision != expected_project_revision {
-            return Err(ApplicationError::Integrity);
-        }
-        if !matches!(operation.state.as_str(), "prepared" | "stored") {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let provider = provider_configuration::Entity::find_by_id(prepared.provider_id)
-            .filter(provider_configuration::Column::ProjectId.eq(project_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        if provider.status != ProviderStatus::Provisioning.as_str()
-            || provider.revision != operation.expected_provider_revision
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let mut operation_active = operation.into_active_model();
-        operation_active.state = Set("stored".to_owned());
-        operation_active.attempt_count =
-            Set(operation_active.attempt_count.take().unwrap_or(0) + 1);
-        operation_active.last_attempt_at = Set(Some(stored_at));
-        operation_active
-            .update(&transaction)
-            .await
-            .map_err(persistence)?;
-        transaction.commit().await.map_err(persistence)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -247,11 +183,11 @@ impl PostgresProvisioningAdapter {
             .ok_or(ApplicationError::NotFound)?;
         if operation.provider_id != prepared.provider_id
             || operation.request_digest != prepared.request_digest
-            || operation.material_id != Some(material.material_id)
+            || operation.material_id != material.material_id
         {
             return Err(ApplicationError::Integrity);
         }
-        let custody = self.custody()?;
+        let custody = self.custody();
         let reservation = custody
             .materials
             .load_project_reservation_in_transaction(
@@ -286,7 +222,7 @@ impl PostgresProvisioningAdapter {
                 .await
                 .map_err(persistence)?
                 .ok_or(ApplicationError::NotFound)?;
-            if provider.secret_material_id != Some(material.material_id) {
+            if provider.secret_material_id != material.material_id {
                 return Err(ApplicationError::Integrity);
             }
             transaction.commit().await.map_err(persistence)?;
@@ -318,8 +254,7 @@ impl PostgresProvisioningAdapter {
             .provision()
             .map_err(|_| ApplicationError::InvalidTransition)?;
         let mut provider_active = provider.into_active_model();
-        provider_active.secret_ref = Set(None);
-        provider_active.secret_material_id = Set(Some(material.material_id));
+        provider_active.secret_material_id = Set(material.material_id);
         provider_active.status = Set(status.as_str().to_owned());
         provider_active.revision = Set(operation.expected_provider_revision + 1);
         let updated = provider_active
@@ -340,85 +275,6 @@ impl PostgresProvisioningAdapter {
         operation_active.attempt_count =
             Set(operation_active.attempt_count.take().unwrap_or(0) + 1);
         operation_active.last_attempt_at = Set(Some(finalized_at));
-        operation_active.completed_at = Set(Some(finalized_at));
-        operation_active
-            .update(&transaction)
-            .await
-            .map_err(persistence)?;
-        insert_audit(
-            &transaction,
-            Some(project_id),
-            "provider.configured",
-            "provider",
-            Some(updated.id),
-            correlation_id,
-        )
-        .await?;
-        transaction.commit().await.map_err(persistence)?;
-        self.provider_record(updated).await
-    }
-
-    #[cfg(test)]
-    async fn finalize_provider_stage(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedProvider,
-        expected_project_revision: i64,
-        secret_ref: String,
-        correlation_id: Uuid,
-        finalized_at: OffsetDateTime,
-    ) -> Result<ProviderRecord, ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let project = locked_project(&transaction, project_id).await?;
-        let operation = provider_secret_operation::Entity::find_by_id(prepared.operation_id)
-            .filter(provider_secret_operation::Column::ProjectId.eq(project_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        if operation.provider_id != prepared.provider_id
-            || operation.request_digest != prepared.request_digest
-        {
-            return Err(ApplicationError::Integrity);
-        }
-        if operation.state == "completed" {
-            transaction.commit().await.map_err(persistence)?;
-            return self.get_provider(project_id, prepared.provider_id).await;
-        }
-        enforce_project_fence(&project, expected_project_revision)?;
-        enforce_provider_egress_fence(&transaction, project_id, operation.egress_policy_revision)
-            .await?;
-        if operation.expected_project_revision != expected_project_revision {
-            return Err(ApplicationError::Integrity);
-        }
-        let provider = provider_configuration::Entity::find_by_id(prepared.provider_id)
-            .filter(provider_configuration::Column::ProjectId.eq(project_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        if operation.state != "stored"
-            || provider.status != ProviderStatus::Provisioning.as_str()
-            || provider.revision != operation.expected_provider_revision
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let mut status = ProviderStatus::Provisioning;
-        status
-            .provision()
-            .map_err(|_| ApplicationError::InvalidTransition)?;
-        let mut provider_active = provider.into_active_model();
-        provider_active.secret_ref = Set(Some(secret_ref));
-        provider_active.status = Set(status.as_str().to_owned());
-        provider_active.revision = Set(operation.expected_provider_revision + 1);
-        let updated = provider_active
-            .update(&transaction)
-            .await
-            .map_err(persistence)?;
-        let mut operation_active = operation.into_active_model();
-        operation_active.state = Set("completed".to_owned());
         operation_active.completed_at = Set(Some(finalized_at));
         operation_active
             .update(&transaction)
@@ -479,11 +335,8 @@ impl PostgresProvisioningAdapter {
             _ => return Err(ApplicationError::InvalidTransition),
         }
         transaction.commit().await.map_err(persistence)?;
-        let provider_kind = super::super::provider_row::effective_provider_kind(
-            &provider.kind,
-            provider.adapter_kind.as_deref(),
-            &provider.issuer,
-        )?;
+        let provider_kind =
+            super::super::provider_row::effective_provider_kind(&provider.kind, &provider.issuer)?;
         Ok(ProviderRecovery {
             operation_alias: operation.operation_alias,
             kind: provider_kind,
@@ -709,11 +562,8 @@ impl PostgresProvisioningAdapter {
             .into_iter()
             .map(|assignment| assignment.application_id)
             .collect();
-        let provider_kind = super::super::provider_row::effective_provider_kind(
-            &provider.kind,
-            provider.adapter_kind.as_deref(),
-            &provider.issuer,
-        )?;
+        let provider_kind =
+            super::super::provider_row::effective_provider_kind(&provider.kind, &provider.issuer)?;
         Ok(ProviderRecord {
             id: provider.id,
             project_id: provider.project_id,
@@ -766,10 +616,8 @@ impl ProviderProvisioningPort for PostgresProvisioningAdapter {
         {
             return Err(ApplicationError::Integrity);
         }
-        let Some(material_id) = operation.material_id else {
-            return Ok(None);
-        };
-        let custody = self.custody()?;
+        let material_id = operation.material_id;
+        let custody = self.custody();
         let reservation = custody
             .materials
             .load_project_reservation(
@@ -793,23 +641,6 @@ impl ProviderProvisioningPort for PostgresProvisioningAdapter {
         }))
     }
 
-    #[cfg(test)]
-    async fn mark_provider_secret_stored(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedProvider,
-        expected_project_revision: i64,
-        stored_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        self.mark_provider_secret_stored_stage(
-            project_id,
-            prepared,
-            expected_project_revision,
-            stored_at,
-        )
-        .await
-    }
-
     async fn finalize_protected_provider(
         &self,
         project_id: Uuid,
@@ -824,27 +655,6 @@ impl ProviderProvisioningPort for PostgresProvisioningAdapter {
             prepared,
             expected_project_revision,
             material,
-            correlation_id,
-            finalized_at,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn finalize_provider(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedProvider,
-        expected_project_revision: i64,
-        secret_ref: String,
-        correlation_id: Uuid,
-        finalized_at: OffsetDateTime,
-    ) -> Result<ProviderRecord, ApplicationError> {
-        self.finalize_provider_stage(
-            project_id,
-            prepared,
-            expected_project_revision,
-            secret_ref,
             correlation_id,
             finalized_at,
         )

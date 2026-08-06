@@ -6,7 +6,6 @@ import { assertSameOriginPlaneUrl } from "../shared/configured-base";
 export type Project = components["schemas"]["Project"];
 export type ProjectPolicy = components["schemas"]["ProjectPolicy"];
 export type Application = components["schemas"]["Application"];
-export type ProjectionPolicy = components["schemas"]["ProjectionPolicy"];
 export type WebhookEndpoint = components["schemas"]["WebhookEndpoint"];
 export type ApplicationUserEvent = components["schemas"]["ApplicationUserEvent"];
 export type WebhookDelivery = components["schemas"]["WebhookDelivery"];

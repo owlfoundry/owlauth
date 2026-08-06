@@ -206,6 +206,14 @@ impl ProjectUserStatus {
         *self = Self::Disabled;
         Ok(())
     }
+
+    pub(crate) fn enable(&mut self) -> Result<(), DomainError> {
+        if *self != Self::Disabled {
+            return Err(DomainError::InvalidTransition);
+        }
+        *self = Self::Active;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -5,19 +5,46 @@ use super::{
     OffsetDateTime, OpaqueHandle, PostgresProvisioningAdapter, PreparedSigningKey,
     PreparedSigningMaterial, ProviderErrorClass, ProvisionedProtectedSigningMaterial, QueryFilter,
     QueryOrder, QuerySelect, RetryClassification, SIGNING_ALGORITHM, SIGNING_PURPOSE, Set,
-    SigningKeyActivationCandidate, SigningKeyProvisioningPort, SigningKeyRecord,
-    SigningKeyRecovery, SigningKeyState, SigningProviderAction, SigningProviderCall,
-    SigningProviderLease, Statement, TransactionTrait, Uuid, Value, abandon_signing_key_operation,
-    active_project, async_trait, authenticate_committed_signing_provider_replay, bounded_list,
-    database_now, enforce_project_fence, ensure_capacity, ensure_project,
-    ensure_publishable_signing_key_capacity, ensure_signing_provider_lease,
+    SigningKeyMaintenanceItem, SigningKeyProvisioningPort, SigningKeyRecord, SigningKeyState,
+    SigningProviderAction, SigningProviderCall, SigningProviderLease, Statement, TransactionTrait,
+    Uuid, Value, abandon_signing_key_operation, active_project, async_trait,
+    authenticate_committed_signing_provider_replay, bounded_list, database_now, ensure_capacity,
+    ensure_project, ensure_publishable_signing_key_capacity, ensure_signing_provider_lease,
     finalize_pending_material, find_signing_key, generated_id, insert_audit,
     insert_key_state_event, json, key_provisioning_operation, locked_project, parse_signing_state,
     persistence, prepared_signing_key, project, project_key_ring, project_signing_key,
-    protected_material, provider_error_class_name, requires_project_reauthorization,
-    retry_classification_name, runtime_publication_lease, signing_key_record,
-    signing_public_key_from_jwk, validate_protected_signing_jwk, validate_signing_operation,
+    protected_material, provider_error_class_name, retry_classification_name,
+    runtime_publication_lease, signing_key_record, signing_public_key_from_jwk,
+    validate_protected_signing_jwk, validate_signing_operation,
 };
+
+async fn claim_maintenance_ids(
+    transaction: &DatabaseTransaction,
+    sql: &'static str,
+    values: Vec<sea_orm::Value>,
+) -> Result<Vec<Uuid>, ApplicationError> {
+    transaction
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .map_err(persistence)?
+        .into_iter()
+        .map(|row| row.try_get::<Uuid>("", "id").map_err(persistence))
+        .collect()
+}
+
+fn maintenance_category_limits(limit: u64) -> [u64; 3] {
+    let base = limit / 3;
+    let remainder = limit % 3;
+    [
+        base + u64::from(remainder >= 1),
+        base + u64::from(remainder >= 2),
+        base,
+    ]
+}
 
 impl PostgresProvisioningAdapter {
     async fn find_or_create_signing_ring(
@@ -63,7 +90,6 @@ impl PostgresProvisioningAdapter {
         &self,
         project_id: Uuid,
         operation_alias: String,
-        signer_ref: String,
         expected_project_revision: i64,
         digest: Vec<u8>,
     ) -> Result<
@@ -87,18 +113,6 @@ impl PostgresProvisioningAdapter {
             if operation.request_digest.as_slice() != digest.as_slice() {
                 return Err(ApplicationError::IdempotencyConflict);
             }
-            let operation = if requires_project_reauthorization(
-                &project,
-                &operation.state,
-                operation.expected_project_revision,
-                expected_project_revision,
-            )? {
-                let mut active = operation.into_active_model();
-                active.expected_project_revision = Set(expected_project_revision);
-                active.update(&transaction).await.map_err(persistence)?
-            } else {
-                operation
-            };
             let ring = project_key_ring::Entity::find_by_id(operation.ring_id)
                 .filter(project_key_ring::Column::ProjectId.eq(project_id))
                 .one(&transaction)
@@ -120,6 +134,19 @@ impl PostgresProvisioningAdapter {
         if project.metadata_revision != expected_project_revision {
             return Err(ApplicationError::RevisionConflict);
         }
+        let pending_candidate = project_signing_key::Entity::find()
+            .filter(project_signing_key::Column::ProjectId.eq(project_id))
+            .filter(project_signing_key::Column::State.is_in([
+                SigningKeyState::Provisioning.as_str(),
+                SigningKeyState::Published.as_str(),
+            ]))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(persistence)?;
+        if pending_candidate.is_some() {
+            return Err(ApplicationError::InvalidTransition);
+        }
         let keys = project_signing_key::Entity::find()
             .filter(project_signing_key::Column::ProjectId.eq(project_id))
             .limit(LIST_LIMIT + 1)
@@ -130,13 +157,15 @@ impl PostgresProvisioningAdapter {
         let ring = self
             .find_or_create_signing_ring(&transaction, &project)
             .await?;
+        let key_id = Uuid::new_v4();
+        let material_id = Uuid::new_v4();
         let key = project_signing_key::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(key_id),
             project_id: Set(project_id),
             ring_id: Set(ring.id),
             kid: Set(generated_id("kid")),
             public_jwk: Set(json!({})),
-            signer_ref: Set(signer_ref),
+            signer_material_id: Set(material_id),
             state: Set(SigningKeyState::Provisioning.as_str().to_owned()),
             ring_revision: Set(ring.revision),
             ..Default::default()
@@ -144,27 +173,22 @@ impl PostgresProvisioningAdapter {
         .insert(&transaction)
         .await
         .map_err(persistence)?;
-        let material_id = if let Some(custody) = self.optional_custody() {
-            let material_id = Uuid::new_v4();
-            custody
-                .materials
-                .reserve_project_in_transaction(
-                    &transaction,
-                    project_id,
-                    material_id,
-                    MaterialOwnerKind::SigningKey,
-                    key.id,
-                    1,
-                    MaterialKind::SigningKey,
-                    MaterialPurpose::SigningSeed,
-                    custody.signing.provider_id.clone(),
-                    custody.signing.provider_format_version,
-                )
-                .await?;
-            Some(material_id)
-        } else {
-            None
-        };
+        let custody = self.custody();
+        custody
+            .materials
+            .reserve_project_in_transaction(
+                &transaction,
+                project_id,
+                material_id,
+                MaterialOwnerKind::SigningKey,
+                key.id,
+                1,
+                MaterialKind::SigningKey,
+                MaterialPurpose::SigningSeed,
+                custody.signing.provider_id.clone(),
+                custody.signing.provider_format_version,
+            )
+            .await?;
         let operation = key_provisioning_operation::ActiveModel {
             id: Set(Uuid::new_v4()),
             project_id: Set(project_id),
@@ -176,6 +200,7 @@ impl PostgresProvisioningAdapter {
             attempt_count: Set(0),
             expected_project_revision: Set(expected_project_revision),
             expected_ring_revision: Set(ring.revision),
+            maintenance_claimed_at: Set(None),
             material_id: Set(material_id),
             provider_lease_token: Set(None),
             provider_lease_expires_at: Set(None),
@@ -201,7 +226,6 @@ impl PostgresProvisioningAdapter {
         &self,
         project_id: Uuid,
         operation_alias: String,
-        signer_ref: String,
         expected_project_revision: i64,
         request_digest: Vec<u8>,
     ) -> Result<PreparedSigningKey, ApplicationError> {
@@ -209,7 +233,6 @@ impl PostgresProvisioningAdapter {
             .prepare_signing_key_models(
                 project_id,
                 operation_alias,
-                signer_ref,
                 expected_project_revision,
                 request_digest,
             )
@@ -229,6 +252,7 @@ impl PostgresProvisioningAdapter {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
+        let project = locked_project(&transaction, project_id).await?;
         let now = database_now(&transaction).await?;
         let lease_until = now + lease_duration;
         let operation = key_provisioning_operation::Entity::find_by_id(prepared.operation_id)
@@ -239,6 +263,34 @@ impl PostgresProvisioningAdapter {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         validate_signing_operation(prepared, &operation)?;
+        if operation.state == "prepared" && project.status != "active" {
+            let ring_revision = project_key_ring::Entity::find_by_id(operation.ring_id)
+                .filter(project_key_ring::Column::ProjectId.eq(project_id))
+                .one(&transaction)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::NotFound)?
+                .revision;
+            let key_id = operation.key_id;
+            transaction.commit().await.map_err(persistence)?;
+            match self
+                .transition_signing_key(
+                    project_id,
+                    key_id,
+                    ring_revision,
+                    SigningKeyState::Revoked,
+                    "signing_key.revoked",
+                    Uuid::new_v4(),
+                )
+                .await
+            {
+                Ok(_)
+                | Err(ApplicationError::InvalidTransition | ApplicationError::RevisionConflict) => {
+                    return Err(ApplicationError::Disabled);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if operation
             .provider_lease_expires_at
             .is_some_and(|expires_at| expires_at > now)
@@ -318,11 +370,16 @@ impl PostgresProvisioningAdapter {
                 _ => "cleanup_pending",
             },
         };
+        let retry_at = (retry != RetryClassification::Never).then(|| {
+            let exponent = u32::try_from(operation.attempt_count.clamp(1, 6)).unwrap_or(6);
+            let seconds = 1_i64 << exponent;
+            recorded_at + time::Duration::seconds(seconds)
+        });
         let mut active = operation.into_active_model();
         active.state = Set(next_state.to_owned());
         active.provider_lease_token = Set(None);
         active.provider_lease_expires_at = Set(None);
-        active.next_attempt_at = Set(None);
+        active.next_attempt_at = Set(retry_at);
         active.last_provider_error_class =
             Set(Some(provider_error_class_name(error_class).to_owned()));
         active.last_retry_classification = Set(Some(retry_classification_name(retry).to_owned()));
@@ -473,7 +530,7 @@ impl PostgresProvisioningAdapter {
             transaction.commit().await.map_err(persistence)?;
             return Ok(());
         }
-        let material_id = operation.material_id.ok_or(ApplicationError::Integrity)?;
+        let material_id = operation.material_id;
         if key.state != SigningKeyState::Provisioning.as_str()
             && key.state != SigningKeyState::Abandoned.as_str()
         {
@@ -487,11 +544,11 @@ impl PostgresProvisioningAdapter {
         };
         let mut key_active = key.into_active_model();
         key_active.state = Set(SigningKeyState::Abandoned.as_str().to_owned());
-        key_active.signer_material_id = Set(Some(material_id));
+        key_active.signer_material_id = Set(material_id);
         key_active.ring_revision = Set(next_revision);
         key_active.updated_at = Set(completed_at);
         key_active.update(&transaction).await.map_err(persistence)?;
-        let custody = self.custody()?;
+        let custody = self.custody();
         custody
             .materials
             .erase_by_id_in_transaction(&transaction, material_id, completed_at)
@@ -543,13 +600,12 @@ impl PostgresProvisioningAdapter {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "containment carries exact operation, authorization, lease, provider result, and timestamp fences"
+        reason = "containment carries exact operation, active-Project, lease, provider result, and timestamp fences"
     )]
     async fn record_protected_signing_key_material_stage(
         &self,
         project_id: Uuid,
         prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
         lease: SigningProviderLease,
         material: ProvisionedProtectedSigningMaterial,
         public_jwk: Value,
@@ -565,7 +621,7 @@ impl PostgresProvisioningAdapter {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         validate_signing_operation(prepared, &operation)?;
-        if operation.material_id != Some(material.material_id) {
+        if operation.material_id != material.material_id {
             return Err(ApplicationError::Integrity);
         }
         if matches!(operation.state.as_str(), "stored" | "completed") {
@@ -584,15 +640,7 @@ impl PostgresProvisioningAdapter {
             return Err(ApplicationError::OperationInProgress);
         }
         ensure_signing_provider_lease(&transaction, &operation, lease).await?;
-        let containment_error = if project.status != "active" {
-            Some(ApplicationError::Disabled)
-        } else if project.metadata_revision != expected_project_revision
-            || operation.expected_project_revision != expected_project_revision
-        {
-            Some(ApplicationError::RevisionConflict)
-        } else {
-            None
-        };
+        let containment_error = (project.status != "active").then_some(ApplicationError::Disabled);
         let key = project_signing_key::Entity::find_by_id(prepared.key_id)
             .filter(project_signing_key::Column::ProjectId.eq(project_id))
             .filter(project_signing_key::Column::RingId.eq(prepared.ring_id))
@@ -602,17 +650,17 @@ impl PostgresProvisioningAdapter {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         if key.state != SigningKeyState::Provisioning.as_str()
-            || key.signer_ref != prepared.signer_ref
+            || key.signer_material_id != material.material_id
+            || key.signer_material_id != prepared.signer_material_id
             || key.kid != prepared.kid
             || key.signer_material_generation != 1
-            || key.signer_material_id.is_some()
         {
             return Err(ApplicationError::InvalidTransition);
         }
         validate_protected_signing_jwk(&prepared.kid, &material.public_key, &public_jwk)?;
         let mut key_active = key.into_active_model();
         key_active.public_jwk = Set(public_jwk);
-        key_active.signer_material_id = Set(Some(material.material_id));
+        key_active.signer_material_id = Set(material.material_id);
         key_active.provisioned_at = Set(Some(recorded_at));
         key_active.updated_at = Set(recorded_at);
         key_active.update(&transaction).await.map_err(persistence)?;
@@ -643,77 +691,14 @@ impl PostgresProvisioningAdapter {
         containment_error.map_or(Ok(()), Err)
     }
 
-    #[cfg(test)]
-    async fn record_signing_key_material_stage(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
-        public_jwk: Value,
-        recorded_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let project = locked_project(&transaction, project_id).await?;
-        let operation = key_provisioning_operation::Entity::find_by_id(prepared.operation_id)
-            .filter(key_provisioning_operation::Column::ProjectId.eq(project_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        if operation.key_id != prepared.key_id
-            || operation.ring_id != prepared.ring_id
-            || operation.request_digest != prepared.request_digest
-        {
-            return Err(ApplicationError::Integrity);
-        }
-        if operation.state == "completed" {
-            transaction.commit().await.map_err(persistence)?;
-            return Ok(());
-        }
-        enforce_project_fence(&project, expected_project_revision)?;
-        if operation.expected_project_revision != expected_project_revision {
-            return Err(ApplicationError::Integrity);
-        }
-        if !matches!(operation.state.as_str(), "prepared" | "stored") {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let key = project_signing_key::Entity::find_by_id(prepared.key_id)
-            .filter(project_signing_key::Column::ProjectId.eq(project_id))
-            .filter(project_signing_key::Column::RingId.eq(prepared.ring_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        if key.state != SigningKeyState::Provisioning.as_str()
-            || key.signer_ref != prepared.signer_ref
-            || key.kid != prepared.kid
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let mut key_active = key.into_active_model();
-        key_active.public_jwk = Set(public_jwk);
-        key_active.provisioned_at = Set(Some(recorded_at));
-        key_active.updated_at = Set(recorded_at);
-        key_active.update(&transaction).await.map_err(persistence)?;
-        let mut operation_active = operation.into_active_model();
-        operation_active.state = Set("stored".to_owned());
-        operation_active.attempt_count =
-            Set(operation_active.attempt_count.take().unwrap_or(0) + 1);
-        operation_active.last_attempt_at = Set(Some(recorded_at));
-        operation_active
-            .update(&transaction)
-            .await
-            .map_err(persistence)?;
-        transaction.commit().await.map_err(persistence)
-    }
-
+    #[allow(
+        clippy::too_many_lines,
+        reason = "publish atomically validates the accepted operation and contains stale or disabled material"
+    )]
     async fn publish_signing_key_stage(
         &self,
         project_id: Uuid,
         prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
         correlation_id: Uuid,
         published_at: OffsetDateTime,
     ) -> Result<SigningKeyRecord, ApplicationError> {
@@ -736,9 +721,18 @@ impl PostgresProvisioningAdapter {
             transaction.commit().await.map_err(persistence)?;
             return self.get_signing_key(project_id, prepared.key_id).await;
         }
-        enforce_project_fence(&project, expected_project_revision)?;
-        if operation.expected_project_revision != expected_project_revision {
-            return Err(ApplicationError::Integrity);
+        if project.status != "active" {
+            if operation.state == "stored" {
+                let mut operation_active = operation.into_active_model();
+                operation_active.state = Set("cleanup_pending".to_owned());
+                operation_active.next_attempt_at = Set(None);
+                operation_active
+                    .update(&transaction)
+                    .await
+                    .map_err(persistence)?;
+                transaction.commit().await.map_err(persistence)?;
+            }
+            return Err(ApplicationError::Disabled);
         }
         let ring = project_key_ring::Entity::find_by_id(prepared.ring_id)
             .filter(project_key_ring::Column::ProjectId.eq(project_id))
@@ -757,10 +751,21 @@ impl PostgresProvisioningAdapter {
             .ok_or(ApplicationError::NotFound)?;
         if operation.state != "stored"
             || key.state != SigningKeyState::Provisioning.as_str()
-            || key.signer_ref != prepared.signer_ref
+            || key.signer_material_id != prepared.signer_material_id
             || key.kid != prepared.kid
         {
             return Err(ApplicationError::InvalidTransition);
+        }
+        if ring.revision != operation.expected_ring_revision {
+            let mut operation_active = operation.into_active_model();
+            operation_active.state = Set("cleanup_pending".to_owned());
+            operation_active.next_attempt_at = Set(None);
+            operation_active
+                .update(&transaction)
+                .await
+                .map_err(persistence)?;
+            transaction.commit().await.map_err(persistence)?;
+            return Err(ApplicationError::RevisionConflict);
         }
         ensure_publishable_signing_key_capacity(&transaction, project_id).await?;
         let next_revision = ring.revision + 1;
@@ -827,73 +832,158 @@ impl PostgresProvisioningAdapter {
         Ok(records)
     }
 
-    async fn signing_key_recovery_stage(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded claim transaction keeps all three signing maintenance categories and their persistent fairness ordering visible"
+    )]
+    async fn signing_key_maintenance_items_stage(
         &self,
-        project_id: Uuid,
-        key_id: Uuid,
-    ) -> Result<SigningKeyRecovery, ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        ensure_project(&transaction, project_id).await?;
-        let key = find_signing_key(&transaction, project_id, key_id).await?;
-        let operation = key_provisioning_operation::Entity::find()
-            .filter(key_provisioning_operation::Column::ProjectId.eq(project_id))
-            .filter(key_provisioning_operation::Column::KeyId.eq(key_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::InvalidTransition)?;
-        let operation_alias = operation.operation_alias.clone();
-        match operation.state.as_str() {
-            "prepared" | "submitted" | "stored"
-                if parse_signing_state(&key.state)? == SigningKeyState::Provisioning => {}
-            "cleanup_pending" | "cleanup_leased"
-                if matches!(
-                    parse_signing_state(&key.state)?,
-                    SigningKeyState::Provisioning | SigningKeyState::Abandoned
-                ) => {}
-            "cleanup_blocked"
-                if matches!(
-                    parse_signing_state(&key.state)?,
-                    SigningKeyState::Provisioning | SigningKeyState::Abandoned
-                ) =>
-            {
-                let now = database_now(&transaction).await?;
-                let mut retry = operation.into_active_model();
-                retry.state = Set("cleanup_pending".to_owned());
-                retry.provider_lease_token = Set(None);
-                retry.provider_lease_expires_at = Set(None);
-                retry.next_attempt_at = Set(Some(now));
-                retry.update(&transaction).await.map_err(persistence)?;
-            }
-            "completed" => {}
-            _ => return Err(ApplicationError::InvalidTransition),
+        limit: usize,
+    ) -> Result<Vec<SigningKeyMaintenanceItem>, ApplicationError> {
+        let item_limit = limit;
+        let query_limit = u64::try_from(limit).map_err(|_| ApplicationError::InvalidInput)?;
+        if !(1..=LIST_LIMIT).contains(&query_limit) {
+            return Err(ApplicationError::InvalidInput);
         }
-        transaction.commit().await.map_err(persistence)?;
-        Ok(SigningKeyRecovery { operation_alias })
+        let mut items = Vec::with_capacity(item_limit);
+        let [operation_limit, published_limit, retiring_limit] =
+            maintenance_category_limits(query_limit).map(|category_limit| {
+                i64::try_from(category_limit).expect("maintenance limit is bounded to 100")
+            });
+        let now = database_now(&self.database).await?;
+
+        // Claim each category in persistent oldest-claim order. The short transaction and
+        // SKIP LOCKED make concurrent sweepers disjoint; committing the claim before inspecting
+        // owner rows ensures one corrupt or externally pending item cannot pin the first page.
+        let claim = self.database.begin().await.map_err(persistence)?;
+        let operation_ids = claim_maintenance_ids(
+            &claim,
+            "WITH candidates AS (
+                 SELECT id FROM key_provisioning_operations
+                 WHERE state IN ('prepared','submitted','stored','cleanup_pending','cleanup_leased')
+                   AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
+                   AND (provider_lease_expires_at IS NULL OR provider_lease_expires_at <= $1)
+                 ORDER BY maintenance_claimed_at NULLS FIRST, id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $2
+             )
+             UPDATE key_provisioning_operations AS operation
+                SET maintenance_claimed_at = $1
+               FROM candidates
+              WHERE operation.id = candidates.id
+             RETURNING operation.id",
+            vec![now.into(), operation_limit.into()],
+        )
+        .await?;
+        let published_ids = claim_maintenance_ids(
+            &claim,
+            "WITH candidates AS (
+                 SELECT id FROM project_signing_keys
+                 WHERE state = 'published'
+                 ORDER BY maintenance_claimed_at NULLS FIRST, id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $1
+             )
+             UPDATE project_signing_keys AS signing_key
+                SET maintenance_claimed_at = transaction_timestamp()
+               FROM candidates
+              WHERE signing_key.id = candidates.id
+             RETURNING signing_key.id",
+            vec![published_limit.into()],
+        )
+        .await?;
+        let retiring_ids = claim_maintenance_ids(
+            &claim,
+            "WITH candidates AS (
+                 SELECT id FROM project_signing_keys
+                 WHERE state = 'retiring' AND verify_not_after <= $1
+                 ORDER BY maintenance_claimed_at NULLS FIRST, verify_not_after, id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $2
+             )
+             UPDATE project_signing_keys AS signing_key
+                SET maintenance_claimed_at = $1
+               FROM candidates
+              WHERE signing_key.id = candidates.id
+             RETURNING signing_key.id",
+            vec![now.into(), retiring_limit.into()],
+        )
+        .await?;
+        claim.commit().await.map_err(persistence)?;
+
+        let operations = key_provisioning_operation::Entity::find()
+            .filter(key_provisioning_operation::Column::Id.is_in(operation_ids))
+            .all(&self.database)
+            .await
+            .map_err(persistence)?;
+        for operation in operations {
+            let project = project::Entity::find_by_id(operation.project_id)
+                .one(&self.database)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
+            items.push(SigningKeyMaintenanceItem::Provision {
+                project_id: operation.project_id,
+                key_id: operation.key_id,
+                operation_alias: operation.operation_alias,
+                expected_project_revision: project.metadata_revision,
+            });
+        }
+
+        let published = project_signing_key::Entity::find()
+            .filter(project_signing_key::Column::Id.is_in(published_ids))
+            .all(&self.database)
+            .await
+            .map_err(persistence)?;
+        for key in published {
+            let ring = project_key_ring::Entity::find_by_id(key.ring_id)
+                .filter(project_key_ring::Column::ProjectId.eq(key.project_id))
+                .one(&self.database)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
+            items.push(SigningKeyMaintenanceItem::Activate {
+                project_id: key.project_id,
+                key_id: key.id,
+                expected_ring_revision: ring.revision,
+            });
+        }
+
+        let retiring = project_signing_key::Entity::find()
+            .filter(project_signing_key::Column::Id.is_in(retiring_ids))
+            .all(&self.database)
+            .await
+            .map_err(persistence)?;
+        for key in retiring {
+            let ring = project_key_ring::Entity::find_by_id(key.ring_id)
+                .filter(project_key_ring::Column::ProjectId.eq(key.project_id))
+                .one(&self.database)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
+            items.push(SigningKeyMaintenanceItem::Retire {
+                project_id: key.project_id,
+                key_id: key.id,
+                expected_ring_revision: ring.revision,
+            });
+        }
+
+        debug_assert!(items.len() <= item_limit);
+        Ok(items)
     }
 
-    async fn signing_key_activation_candidate_stage(
+    async fn ensure_signing_key_activatable_stage(
         &self,
         project_id: Uuid,
         key_id: Uuid,
-    ) -> Result<SigningKeyActivationCandidate, ApplicationError> {
+    ) -> Result<(), ApplicationError> {
         let candidate = find_signing_key(&self.database, project_id, key_id).await?;
         if candidate.state != SigningKeyState::Published.as_str()
             || candidate.published_at.is_none()
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        Ok(SigningKeyActivationCandidate {
-            #[cfg(test)]
-            kid: candidate.kid,
-            signer_ref: candidate
-                .signer_material_id
-                .map(|material_id| material_id.to_string())
-                .unwrap_or(candidate.signer_ref),
-            #[cfg(test)]
-            public_jwk: candidate.public_jwk,
-        })
+        Ok(())
     }
 
     #[allow(
@@ -1175,7 +1265,6 @@ impl PostgresProvisioningAdapter {
                     .one(&transaction)
                     .await
                     .map_err(persistence)?
-                    .filter(|operation| operation.material_id.is_some())
                     .map(|operation| operation.state)
             } else {
                 None
@@ -1217,7 +1306,7 @@ impl PostgresProvisioningAdapter {
         let next_revision = ring.revision + 1;
         let mut key_active = key.into_active_model();
         if let Some(material_id) = abandoned_material_id {
-            key_active.signer_material_id = Set(Some(material_id));
+            key_active.signer_material_id = Set(material_id);
         }
         key_active.state = Set(target.as_str().to_owned());
         key_active.ring_revision = Set(next_revision);
@@ -1231,7 +1320,7 @@ impl PostgresProvisioningAdapter {
         }
         let updated = key_active.update(&transaction).await.map_err(persistence)?;
         if let Some(material_id) = abandoned_material_id {
-            let custody = self.custody()?;
+            let custody = self.custody();
             custody
                 .materials
                 .erase_by_id_in_transaction(&transaction, material_id, now)
@@ -1275,26 +1364,16 @@ impl SigningKeyProvisioningPort for PostgresProvisioningAdapter {
         &self,
         project_id: Uuid,
         operation_alias: String,
-        signer_ref: String,
         expected_project_revision: i64,
         request_digest: Vec<u8>,
     ) -> Result<PreparedSigningKey, ApplicationError> {
         self.prepare_signing_key_stage(
             project_id,
             operation_alias,
-            signer_ref,
             expected_project_revision,
             request_digest,
         )
         .await
-    }
-
-    async fn signing_key_recovery(
-        &self,
-        project_id: Uuid,
-        key_id: Uuid,
-    ) -> Result<SigningKeyRecovery, ApplicationError> {
-        self.signing_key_recovery_stage(project_id, key_id).await
     }
 
     async fn prepared_signing_material(
@@ -1314,10 +1393,8 @@ impl SigningKeyProvisioningPort for PostgresProvisioningAdapter {
         {
             return Err(ApplicationError::Integrity);
         }
-        let Some(material_id) = operation.material_id else {
-            return Ok(None);
-        };
-        let custody = self.custody()?;
+        let material_id = operation.material_id;
+        let custody = self.custody();
         let reservation = custody
             .materials
             .load_project_reservation(project_id, material_id, MaterialPurpose::SigningSeed)
@@ -1446,7 +1523,6 @@ impl SigningKeyProvisioningPort for PostgresProvisioningAdapter {
         &self,
         project_id: Uuid,
         prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
         lease: SigningProviderLease,
         material: ProvisionedProtectedSigningMaterial,
         public_jwk: Value,
@@ -1455,28 +1531,8 @@ impl SigningKeyProvisioningPort for PostgresProvisioningAdapter {
         self.record_protected_signing_key_material_stage(
             project_id,
             prepared,
-            expected_project_revision,
             lease,
             material,
-            public_jwk,
-            recorded_at,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    async fn record_signing_key_material(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
-        public_jwk: Value,
-        recorded_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        self.record_signing_key_material_stage(
-            project_id,
-            prepared,
-            expected_project_revision,
             public_jwk,
             recorded_at,
         )
@@ -1487,18 +1543,11 @@ impl SigningKeyProvisioningPort for PostgresProvisioningAdapter {
         &self,
         project_id: Uuid,
         prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
         correlation_id: Uuid,
         published_at: OffsetDateTime,
     ) -> Result<SigningKeyRecord, ApplicationError> {
-        self.publish_signing_key_stage(
-            project_id,
-            prepared,
-            expected_project_revision,
-            correlation_id,
-            published_at,
-        )
-        .await
+        self.publish_signing_key_stage(project_id, prepared, correlation_id, published_at)
+            .await
     }
 
     async fn get_signing_key(
@@ -1517,12 +1566,19 @@ impl SigningKeyProvisioningPort for PostgresProvisioningAdapter {
         PostgresProvisioningAdapter::list_signing_keys(self, project_id).await
     }
 
-    async fn signing_key_activation_candidate(
+    async fn signing_key_maintenance_items(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SigningKeyMaintenanceItem>, ApplicationError> {
+        self.signing_key_maintenance_items_stage(limit).await
+    }
+
+    async fn ensure_signing_key_activatable(
         &self,
         project_id: Uuid,
         key_id: Uuid,
-    ) -> Result<SigningKeyActivationCandidate, ApplicationError> {
-        self.signing_key_activation_candidate_stage(project_id, key_id)
+    ) -> Result<(), ApplicationError> {
+        self.ensure_signing_key_activatable_stage(project_id, key_id)
             .await
     }
 
@@ -1575,5 +1631,20 @@ impl SigningKeyProvisioningPort for PostgresProvisioningAdapter {
             correlation_id,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod maintenance_limit_tests {
+    use super::maintenance_category_limits;
+
+    #[test]
+    fn category_claim_quotas_never_exceed_or_drop_the_worker_limit() {
+        for limit in 1..=100 {
+            let quotas = maintenance_category_limits(limit);
+            assert_eq!(quotas.into_iter().sum::<u64>(), limit);
+            assert!(quotas.into_iter().max().unwrap() - quotas.into_iter().min().unwrap() <= 1);
+        }
+        assert_eq!(maintenance_category_limits(100), [34, 33, 33]);
     }
 }

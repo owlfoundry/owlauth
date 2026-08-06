@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::application::{
     ApplicationError, ControlIdentityMutationRepository, CreateIdentityMutationResult,
     IdentityMutationControlConfirmationPreparation, IdentityMutationRecord,
-    PreparedIdentityMutationConfirmation, PreparedIdentityMutationCreate, RuntimeProtector,
+    PreparedIdentityMutationConfirmation, PreparedIdentityMutationCreate,
 };
 use crate::domain::IdentityMutationKind;
 
@@ -15,7 +15,7 @@ use super::{
     identity_mutation::{
         PostgresControlIdentityMutationRepository, PostgresRuntimeIdentityMutationRepository,
     },
-    projection::LegacyRuntimeProjectionMaterializer,
+    projection::IdentityProjectionMaterializer,
 };
 
 #[derive(Clone)]
@@ -29,10 +29,9 @@ impl PostgresIdentityMutationRepository {
         database: DatabaseConnection,
         process_id: String,
         incarnation: Uuid,
-        protector: Arc<dyn RuntimeProtector>,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
         required_runtime_process_ids: Vec<String>,
     ) -> Self {
-        let materializer = Arc::new(LegacyRuntimeProjectionMaterializer::new(protector));
         Self {
             runtime: PostgresRuntimeIdentityMutationRepository::new(
                 database.clone(),
@@ -42,7 +41,7 @@ impl PostgresIdentityMutationRepository {
             ),
             control: PostgresControlIdentityMutationRepository::new(
                 database,
-                materializer,
+                projection_materializer,
                 required_runtime_process_ids,
             ),
         }

@@ -2,19 +2,26 @@ use super::{
     ActiveModelTrait, ApplicationConfiguration, ApplicationError, ApplicationProvisioningPort,
     ApplicationRecord, ApplicationStatus, BrowserOrigin, CONFIGURATION_VALUE_LIMIT, ColumnTrait,
     CreateApplication, CreateProject, EntityTrait, IntoActiveModel, LIST_LIMIT,
-    MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION, PostgresProvisioningAdapter, ProjectPolicyRecord,
-    ProjectProvisioningPort, ProjectRecord, ProjectStatus, QueryFilter, QueryOrder, QuerySelect,
-    RedirectUri, ReplaceApplicationConfiguration, Set, TransactionTrait, UpdateApplication,
-    UpdateProject, UpdateProjectPolicy, Uuid, Value, active_application, active_project,
-    active_provider, application, application_origin, application_provider_assignment,
-    application_publishable_key, application_redirect, async_trait, bounded_items, bounded_list,
-    bump_provider_revision, complete_idempotency, ensure_application_capacity, ensure_capacity,
-    ensure_project, find_application, generated_id, insert_audit, json, lock_idempotency_key,
-    lock_project_capacity, parse_application_type, persistence, project, project_policy,
-    project_policy_record, project_record, reject_duplicates, replay, webhook_endpoint,
+    MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION, MaterialKind, MaterialOwnerKind, MaterialPurpose,
+    PostgresProvisioningAdapter, ProjectPolicyRecord, ProjectProvisioningPort, ProjectRecord,
+    ProjectStatus, QueryFilter, QueryOrder, QuerySelect, RedirectUri,
+    ReplaceApplicationConfiguration, SIGNING_ALGORITHM, SIGNING_PURPOSE, Set, SigningKeyState,
+    TransactionTrait, UpdateApplication, UpdateProject, UpdateProjectPolicy, Uuid, Value,
+    active_application, active_project, active_provider, application, application_origin,
+    application_provider_assignment, application_publishable_key, application_redirect,
+    async_trait, bounded_items, bounded_list, bump_provider_revision, complete_idempotency,
+    ensure_application_capacity, ensure_capacity, ensure_project, find_application, generated_id,
+    insert_audit, json, key_provisioning_operation, lock_idempotency_key, lock_project_capacity,
+    parse_application_type, persistence, project, project_key_ring, project_policy,
+    project_policy_record, project_record, project_signing_key, reject_duplicates, replay,
+    webhook_endpoint,
 };
 
 impl PostgresProvisioningAdapter {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the atomic Project, policy, key-ring, initial-key, idempotency, and audit transaction stays visible"
+    )]
     async fn create_project(
         &self,
         command: CreateProject,
@@ -66,8 +73,6 @@ impl PostgresProvisioningAdapter {
             project_id: Set(id),
             claims_revision: Set(1),
             session_revision: Set(1),
-            projection_revision: Set(1),
-            projection_verified_email_enabled: Set(false),
             claims_policy: Set(json!({ "access_token_lifetime_seconds": 900 })),
             session_policy: Set(json!({
                 "browser_session_reuse": false,
@@ -77,6 +82,93 @@ impl PostgresProvisioningAdapter {
         .insert(&transaction)
         .await
         .map_err(persistence)?;
+
+        // Project creation owns the durable initial signing intent. Provider effects happen only
+        // after commit, under the ordinary provider lease state machine.
+        let ring = project_key_ring::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            project_id: Set(id),
+            issuer: Set(self
+                .runtime_base
+                .join(&format!("projects/{public_id}/"))
+                .map_err(|_| ApplicationError::InvalidInput)?
+                .to_string()),
+            purpose: Set(SIGNING_PURPOSE.to_owned()),
+            algorithm: Set(SIGNING_ALGORITHM.to_owned()),
+            revision: Set(1),
+            signing_epoch: Set(1),
+        }
+        .insert(&transaction)
+        .await
+        .map_err(persistence)?;
+        let operation_alias = format!("signing_initial_{}", id.simple());
+        let request_digest = self.digester.digest_json(&json!({
+            "project_id": id,
+            "algorithm": SIGNING_ALGORITHM,
+            "purpose": SIGNING_PURPOSE,
+        }))?;
+        let key_id = Uuid::new_v4();
+        let material_id = Uuid::new_v4();
+        let key = project_signing_key::ActiveModel {
+            id: Set(key_id),
+            project_id: Set(id),
+            ring_id: Set(ring.id),
+            kid: Set(generated_id("kid")),
+            public_jwk: Set(json!({})),
+            signer_material_id: Set(material_id),
+            state: Set(SigningKeyState::Provisioning.as_str().to_owned()),
+            ring_revision: Set(ring.revision),
+            ..Default::default()
+        }
+        .insert(&transaction)
+        .await
+        .map_err(persistence)?;
+        let custody = self.custody();
+        custody
+            .materials
+            .reserve_project_in_transaction(
+                &transaction,
+                id,
+                material_id,
+                MaterialOwnerKind::SigningKey,
+                key.id,
+                1,
+                MaterialKind::SigningKey,
+                MaterialPurpose::SigningSeed,
+                custody.signing.provider_id.clone(),
+                custody.signing.provider_format_version,
+            )
+            .await?;
+        key_provisioning_operation::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            project_id: Set(id),
+            ring_id: Set(ring.id),
+            key_id: Set(key.id),
+            operation_alias: Set(operation_alias),
+            request_digest: Set(request_digest),
+            state: Set("prepared".to_owned()),
+            attempt_count: Set(0),
+            expected_project_revision: Set(1),
+            expected_ring_revision: Set(ring.revision),
+            maintenance_claimed_at: Set(None),
+            material_id: Set(material_id),
+            provider_lease_token: Set(None),
+            provider_lease_expires_at: Set(None),
+            provider_lease_generation: Set(0),
+            destroy_attempt_count: Set(0),
+            next_attempt_at: Set(None),
+            last_provider_error_class: Set(None),
+            last_retry_classification: Set(None),
+            last_provider_error_code: Set(None),
+            abandoned_at: Set(None),
+            destroyed_at: Set(None),
+            last_attempt_at: Set(None),
+            completed_at: Set(None),
+        }
+        .insert(&transaction)
+        .await
+        .map_err(persistence)?;
+
         let record = ProjectRecord {
             id,
             public_id,
@@ -307,7 +399,6 @@ impl PostgresProvisioningAdapter {
             revision: Set(1),
             metadata_revision: Set(1),
             security_revision: Set(1),
-            projection_revision: Set(1),
             ..Default::default()
         }
         .insert(&transaction)

@@ -38,8 +38,6 @@ pub(crate) mod application {
         pub revision: i64,
         pub metadata_revision: i64,
         pub security_revision: i64,
-        pub projection_revision: i64,
-        pub projection_verified_email_enabled: bool,
         pub created_at: TimeDateTimeWithTimeZone,
         pub updated_at: TimeDateTimeWithTimeZone,
     }
@@ -146,8 +144,7 @@ pub(crate) mod project_signing_key {
         pub ring_id: Uuid,
         pub kid: String,
         pub public_jwk: Json,
-        pub signer_ref: String,
-        pub signer_material_id: Option<Uuid>,
+        pub signer_material_id: Uuid,
         pub signer_material_generation: i64,
         pub state: String,
         pub ring_revision: i64,
@@ -157,6 +154,7 @@ pub(crate) mod project_signing_key {
         pub sign_not_before: Option<TimeDateTimeWithTimeZone>,
         pub retiring_at: Option<TimeDateTimeWithTimeZone>,
         pub verify_not_after: Option<TimeDateTimeWithTimeZone>,
+        pub maintenance_claimed_at: Option<TimeDateTimeWithTimeZone>,
         pub retired_at: Option<TimeDateTimeWithTimeZone>,
         pub revoked_at: Option<TimeDateTimeWithTimeZone>,
         pub created_at: TimeDateTimeWithTimeZone,
@@ -179,8 +177,6 @@ pub(crate) mod project_policy {
         pub project_id: Uuid,
         pub claims_revision: i64,
         pub session_revision: i64,
-        pub projection_revision: i64,
-        pub projection_verified_email_enabled: bool,
         pub claims_policy: Json,
         pub session_policy: Json,
     }
@@ -232,7 +228,8 @@ pub(crate) mod key_provisioning_operation {
         pub attempt_count: i32,
         pub expected_project_revision: i64,
         pub expected_ring_revision: i64,
-        pub material_id: Option<Uuid>,
+        pub maintenance_claimed_at: Option<TimeDateTimeWithTimeZone>,
+        pub material_id: Uuid,
         pub provider_lease_token: Option<Uuid>,
         pub provider_lease_expires_at: Option<TimeDateTimeWithTimeZone>,
         pub provider_lease_generation: i64,
@@ -263,16 +260,12 @@ pub(crate) mod provider_configuration {
         pub id: Uuid,
         pub project_id: Uuid,
         pub provider_key: String,
-        /// Legacy N-1 compatibility discriminator; remains exactly `oidc` during overlap.
         pub kind: String,
-        /// Current closed adapter discriminator; nullable until bounded backfill contracts it.
-        pub adapter_kind: Option<String>,
         pub display_name: String,
         pub issuer: String,
         pub client_id: String,
         pub callback_url: String,
-        pub secret_ref: Option<String>,
-        pub secret_material_id: Option<Uuid>,
+        pub secret_material_id: Uuid,
         pub secret_generation: i64,
         pub status: String,
         pub revision: i64,
@@ -303,7 +296,7 @@ pub(crate) mod provider_secret_operation {
         pub attempt_count: i32,
         pub expected_project_revision: i64,
         pub expected_provider_revision: i64,
-        pub material_id: Option<Uuid>,
+        pub material_id: Uuid,
         pub egress_policy_revision: Option<i64>,
         pub last_attempt_at: Option<TimeDateTimeWithTimeZone>,
         pub completed_at: Option<TimeDateTimeWithTimeZone>,
@@ -336,26 +329,6 @@ pub(crate) mod project_provider_egress_policy {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-pub(crate) mod provider_egress_policy_bridge_authority {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "provider_egress_policy_bridge_authority")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub singleton: bool,
-        pub state: String,
-        pub revision: i64,
-        pub completed_at: Option<TimeDateTimeWithTimeZone>,
-        pub updated_at: TimeDateTimeWithTimeZone,
-    }
-
-    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
 pub(crate) mod protected_material {
     use sea_orm::entity::prelude::*;
 
@@ -374,8 +347,6 @@ pub(crate) mod protected_material {
         pub provider_format_version: i32,
         pub context_version: i32,
         pub context_digest: Vec<u8>,
-        pub custody_mode: String,
-        pub custody_revision: i64,
         pub opaque_value: Option<Vec<u8>>,
         pub safe_fingerprint: Option<Vec<u8>>,
         pub state: String,
@@ -390,52 +361,16 @@ pub(crate) mod protected_material {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-pub(crate) mod custody_cutover_authority {
+pub(crate) mod protected_material_inventory_authority {
     use sea_orm::entity::prelude::*;
 
     #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "custody_cutover_authority")]
+    #[sea_orm(table_name = "protected_material_inventory_authority")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub singleton: bool,
-        pub mode: String,
         pub revision: i64,
-        pub material_inventory_revision: i64,
-        pub legacy_inventory_completed_at: Option<TimeDateTimeWithTimeZone>,
-        pub protected_at: Option<TimeDateTimeWithTimeZone>,
         pub updated_at: TimeDateTimeWithTimeZone,
-    }
-
-    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-#[allow(
-    dead_code,
-    reason = "the listenerless custody importer owns this entity during the bridge phase"
-)]
-pub(crate) mod custody_import_operation {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "custody_import_operations")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub id: Uuid,
-        pub material_id: Uuid,
-        pub owner_kind: String,
-        pub owner_id: Uuid,
-        pub generation: i64,
-        pub legacy_reference: String,
-        pub cutover_revision: i64,
-        pub state: String,
-        pub attempt_count: i32,
-        pub failure_class: Option<String>,
-        pub created_at: TimeDateTimeWithTimeZone,
-        pub updated_at: TimeDateTimeWithTimeZone,
-        pub verified_at: Option<TimeDateTimeWithTimeZone>,
     }
 
     #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
@@ -678,7 +613,7 @@ pub(crate) mod linked_identity {
         pub identity_revision: i64,
         pub source_kind: String,
         pub source_schema: String,
-        pub source_profile_digest: Option<Vec<u8>>,
+        pub source_profile_digest: Vec<u8>,
         pub display_name: Option<String>,
         pub picture_url: Option<String>,
         pub locale: Option<String>,
@@ -910,10 +845,8 @@ pub(crate) mod application_user_projection {
         pub schema_name: String,
         pub projection_revision: i64,
         pub source_user_revision: i64,
-        pub project_policy_revision: i64,
-        pub application_policy_revision: i64,
         pub canonical_digest: Vec<u8>,
-        pub source_base_profile_digest: Option<Vec<u8>>,
+        pub source_base_profile_digest: Vec<u8>,
         pub verified_email_source_identity_id: Option<Uuid>,
         pub verified_email_ciphertext: Option<Vec<u8>>,
         pub verified_email_key_version: Option<i32>,
@@ -1068,37 +1001,6 @@ pub(crate) mod project_browser_logout_interaction {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-pub(crate) mod projection_expansion_operation {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "projection_expansion_operations")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub id: Uuid,
-        pub project_id: Uuid,
-        pub application_id: Option<Uuid>,
-        pub scope_kind: String,
-        pub target_policy_revision: i64,
-        pub status: String,
-        pub cursor_binding_id: Option<Uuid>,
-        pub processed_count: i64,
-        pub lease_owner: Option<String>,
-        pub lease_incarnation: Option<Uuid>,
-        pub lease_generation: i64,
-        pub lease_expires_at: Option<TimeDateTimeWithTimeZone>,
-        pub last_error_class: Option<String>,
-        pub created_at: TimeDateTimeWithTimeZone,
-        pub updated_at: TimeDateTimeWithTimeZone,
-        pub completed_at: Option<TimeDateTimeWithTimeZone>,
-    }
-
-    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
 pub(crate) mod webhook_endpoint {
     use sea_orm::entity::prelude::*;
 
@@ -1148,9 +1050,8 @@ pub(crate) mod webhook_secret_generation {
         pub generation: i32,
         pub idempotency_key: String,
         pub request_fingerprint: Vec<u8>,
-        pub secret_ref: String,
         pub safe_fingerprint: Option<String>,
-        pub material_id: Option<Uuid>,
+        pub material_id: Uuid,
         pub state: String,
         pub created_at: TimeDateTimeWithTimeZone,
         pub provisioned_at: Option<TimeDateTimeWithTimeZone>,

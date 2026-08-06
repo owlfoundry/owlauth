@@ -74,33 +74,13 @@ struct Profile {
     mcp_url: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProfileStore {
     schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     current_profile: Option<String>,
     profiles: BTreeMap<String, Profile>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProfileStore {
-    schema_version: u32,
-    current_profile: Option<String>,
-    profiles: BTreeMap<String, RawProfile>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProfile {
-    endpoint: String,
-    product: String,
-    instance_id: String,
-    api_base_url: String,
-    api_versions: Vec<String>,
-    credential_class: String,
-    credential_environment: String,
-    mcp_url: Option<String>,
 }
 
 impl Default for ProfileStore {
@@ -925,59 +905,22 @@ fn load_store(path: &Path) -> Result<ProfileStore, RemoteError> {
         return Err(RemoteError::ProfileStorage);
     }
     let bytes = fs::read(path).map_err(|_| RemoteError::ProfileStorage)?;
-    let raw: RawProfileStore =
+    let store: ProfileStore =
         serde_json::from_slice(&bytes).map_err(|_| RemoteError::ProfileStorage)?;
-    if raw.schema_version != STORE_SCHEMA_VERSION
-        || raw
+    if store.schema_version != STORE_SCHEMA_VERSION
+        || store
             .current_profile
             .as_ref()
-            .is_some_and(|name| !raw.profiles.contains_key(name))
-        || raw
-            .profiles
-            .keys()
-            .any(|name| validate_profile_name(name).is_err())
+            .is_some_and(|name| !store.profiles.contains_key(name))
+        || store.profiles.iter().any(|(name, profile)| {
+            validate_profile_name(name).is_err()
+                || validate_endpoint(&profile.endpoint).is_err()
+                || validate_credential_environment(&profile.credential_environment).is_err()
+        })
     {
         return Err(RemoteError::ProfileStorage);
     }
-
-    let mut profiles = BTreeMap::new();
-    for (name, raw_profile) in raw.profiles {
-        if raw_profile.product == "owlauth-saas" && raw_profile.credential_class == "saas-api-key" {
-            // Keep the legacy bytes on disk so a read cannot destroy profile state or race a
-            // concurrent writer. An explicit `profile add` with this name replaces the ignored
-            // entry when the operator binds it to a supported self-hosted endpoint.
-            continue;
-        }
-        if raw_profile.product != "owlauth-server"
-            || raw_profile.credential_class != "operator-api-key"
-        {
-            return Err(RemoteError::ProfileStorage);
-        }
-        let profile = Profile {
-            endpoint: raw_profile.endpoint,
-            product: Product::OwlauthServer,
-            instance_id: raw_profile.instance_id,
-            api_base_url: raw_profile.api_base_url,
-            api_versions: raw_profile.api_versions,
-            credential_class: CredentialClass::OperatorApiKey,
-            credential_environment: raw_profile.credential_environment,
-            mcp_url: raw_profile.mcp_url,
-        };
-        if validate_endpoint(&profile.endpoint).is_err()
-            || validate_credential_environment(&profile.credential_environment).is_err()
-        {
-            return Err(RemoteError::ProfileStorage);
-        }
-        profiles.insert(name, profile);
-    }
-    let current_profile = raw
-        .current_profile
-        .filter(|name| profiles.contains_key(name));
-    Ok(ProfileStore {
-        schema_version: raw.schema_version,
-        current_profile,
-        profiles,
-    })
+    Ok(store)
 }
 
 fn save_store(path: &Path, store: &ProfileStore) -> Result<(), RemoteError> {
@@ -1027,77 +970,11 @@ mod tests {
     }
 
     #[test]
-    fn store_load_ignores_exact_legacy_profiles_without_rewriting_them() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("profiles.json");
-        let server_profile = test_profile("http://127.0.0.1:8081/", "SERVER_OPERATOR_KEY");
-        let original = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": STORE_SCHEMA_VERSION,
-            "current_profile": "legacy",
-            "profiles": {
-                "server": server_profile,
-                "legacy": {
-                    "endpoint": "https://legacy.example/",
-                    "product": "owlauth-saas",
-                    "instance_id": "legacy-instance",
-                    "api_base_url": "https://legacy.example/v1/",
-                    "api_versions": ["v1"],
-                    "credential_class": "saas-api-key",
-                    "credential_environment": "LEGACY_API_KEY"
-                }
-            }
-        }))
-        .unwrap();
-        fs::write(&path, &original).unwrap();
-
-        let loaded = load_store(&path).unwrap();
-        assert_eq!(loaded.current_profile, None);
-        assert_eq!(loaded.profiles.len(), 1);
-        assert!(loaded.profiles.contains_key("server"));
-        assert!(!loaded.profiles.contains_key("legacy"));
-        assert_eq!(fs::read(path).unwrap(), original);
-    }
-
-    #[test]
-    fn confirmed_store_write_replaces_one_legacy_name_and_collects_the_rest() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("profiles.json");
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": STORE_SCHEMA_VERSION,
-                "current_profile": "first",
-                "profiles": {
-                    "first": legacy_profile_document("first"),
-                    "second": legacy_profile_document("second")
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let mut store = load_store(&path).unwrap();
-        store.profiles.insert(
-            "first".to_owned(),
-            test_profile("http://127.0.0.1:8081/", "SERVER_OPERATOR_KEY"),
-        );
-        store.current_profile = Some("first".to_owned());
-        save_store(&path, &store).unwrap();
-
-        let persisted = fs::read_to_string(&path).unwrap();
-        assert!(!persisted.contains("owlauth-saas"));
-        assert!(!persisted.contains("saas-api-key"));
-        let loaded = load_store(&path).unwrap();
-        assert_eq!(loaded.current_profile.as_deref(), Some("first"));
-        assert_eq!(loaded.profiles.len(), 1);
-        assert!(loaded.profiles.contains_key("first"));
-    }
-
-    #[test]
     fn store_load_rejects_unknown_and_crossed_profile_kinds_without_rewriting() {
         for (product, credential_class) in [
             ("owlauth-sever", "operator-api-key"),
             ("owlauth-server", "operator-key"),
+            ("owlauth-saas", "saas-api-key"),
             ("owlauth-saas", "operator-api-key"),
             ("owlauth-server", "saas-api-key"),
         ] {
@@ -1119,6 +996,40 @@ mod tests {
                 }
             }))
             .unwrap();
+            fs::write(&path, &original).unwrap();
+
+            assert!(matches!(
+                load_store(&path),
+                Err(RemoteError::ProfileStorage)
+            ));
+            assert_eq!(fs::read(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn store_load_rejects_non_current_schema_and_unknown_fields() {
+        let base = serde_json::json!({
+            "schema_version": STORE_SCHEMA_VERSION,
+            "current_profile": "server",
+            "profiles": {
+                "server": test_profile("http://127.0.0.1:8081/", "SERVER_OPERATOR_KEY")
+            }
+        });
+        let mut unsupported_version = base.clone();
+        unsupported_version["schema_version"] = serde_json::json!(STORE_SCHEMA_VERSION + 1);
+        let mut unknown_store_field = base.clone();
+        unknown_store_field["obsolete"] = serde_json::json!(true);
+        let mut unknown_profile_field = base;
+        unknown_profile_field["profiles"]["server"]["obsolete"] = serde_json::json!(true);
+
+        for document in [
+            unsupported_version,
+            unknown_store_field,
+            unknown_profile_field,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("profiles.json");
+            let original = serde_json::to_vec_pretty(&document).unwrap();
             fs::write(&path, &original).unwrap();
 
             assert!(matches!(
@@ -1218,28 +1129,31 @@ mod tests {
         };
         let first = confirmation_preview(
             &stored,
-            "projection-policy.replace",
-            "projects/project/projection-policy",
+            "project-user.disable",
+            "projects/project/users/user/disable",
             &serde_json::json!({
-                "verified_email_enabled": true,
-                "expected_revision": 7,
+                "effect": "disable the Project user and revoke its authority",
+                "expected_security_revision": 7,
             }),
         );
         let second = confirmation_preview(
             &stored,
-            "projection-policy.replace",
-            "projects/project/projection-policy",
+            "project-user.disable",
+            "projects/project/users/user/disable",
             &serde_json::json!({
-                "verified_email_enabled": true,
-                "expected_revision": 8,
+                "effect": "disable the Project user and revoke its authority",
+                "expected_security_revision": 8,
             }),
         );
         assert_ne!(first, second);
         assert_eq!(
-            first["confirmation"]["effect"]["verified_email_enabled"],
-            true
+            first["confirmation"]["effect"]["effect"],
+            "disable the Project user and revoke its authority"
         );
-        assert_eq!(first["confirmation"]["effect"]["expected_revision"], 7);
+        assert_eq!(
+            first["confirmation"]["effect"]["expected_security_revision"],
+            7
+        );
         let encoded = first.to_string();
         assert!(!encoded.contains("OWLAUTH_CONTROL_API_KEY"));
         assert!(!encoded.contains("owl_ctrl_v1_"));
@@ -1477,18 +1391,6 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer owl_ctrl_v1_")
         );
-    }
-
-    fn legacy_profile_document(label: &str) -> serde_json::Value {
-        serde_json::json!({
-            "endpoint": format!("https://{label}.example/"),
-            "product": "owlauth-saas",
-            "instance_id": format!("{label}-instance"),
-            "api_base_url": format!("https://{label}.example/v1/"),
-            "api_versions": ["v1"],
-            "credential_class": "saas-api-key",
-            "credential_environment": format!("{}_API_KEY", label.to_ascii_uppercase())
-        })
     }
 
     fn test_profile(endpoint: &str, credential_environment: &str) -> Profile {

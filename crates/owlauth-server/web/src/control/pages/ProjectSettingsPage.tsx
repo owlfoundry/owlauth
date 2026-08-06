@@ -8,7 +8,6 @@ import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Checkbox, Field, Input } from "../../shared/primitives/Field";
 import { Dialog } from "../../shared/primitives/Overlay";
 import { useControl, useProject } from "../app/ControlContext";
-import { ProjectionPolicySettings } from "../features/ApplicationDelivery";
 import { type ProjectPolicy, requireData } from "../client";
 import styles from "./pages.module.css";
 
@@ -297,15 +296,6 @@ export function ProjectSettingsPage() {
           />
         )}
       </Section>
-      <ProjectionPolicySettings
-        session={session}
-        projectId={project.id}
-        disabled={!active}
-        onError={handleError}
-        setMessage={(message) => {
-          setMessage(message, "success");
-        }}
-      />
       {active ? (
         <section className={styles["dangerZone"]}>
           <h2>Danger zone</h2>

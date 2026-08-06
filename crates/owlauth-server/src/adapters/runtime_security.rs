@@ -3,8 +3,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
-use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -25,12 +23,6 @@ use crate::application::{
     ManagedReauthorizationTargetVerifier, OpaquePurpose, ProtectedPurpose, ProtectedValue,
     RuntimeProtector, VersionedDigest,
 };
-#[cfg(test)]
-use crate::application::{ProviderSecretResolver, RuntimeSigner};
-
-#[cfg(test)]
-use super::software_store::EncryptedFileStore;
-
 const DIGEST_DOMAIN: &[u8] = b"owlauth-runtime-digest-v1\0";
 const DERIVATION_DOMAIN: &[u8] = b"owlauth-runtime-derived-opaque-v1\0";
 const PROTECTION_DOMAIN: &[u8] = b"owlauth-runtime-protection-v1\0";
@@ -272,11 +264,9 @@ impl RuntimeProtector for SoftwareRuntimeProtector {
 pub(crate) struct SplitRuntimeProtector {
     short_term: SoftwareRuntimeProtector,
     email_identity: Option<SoftwareRuntimeProtector>,
-    projection_email: Option<SoftwareProjectionVerifiedEmailProtector>,
 }
 
 impl SplitRuntimeProtector {
-    #[cfg(test)]
     pub(crate) fn new(
         short_term: SoftwareRuntimeProtector,
         email_identity: Option<SoftwareRuntimeProtector>,
@@ -284,19 +274,6 @@ impl SplitRuntimeProtector {
         Self {
             short_term,
             email_identity,
-            projection_email: None,
-        }
-    }
-
-    pub(crate) fn new_with_projection_email(
-        short_term: SoftwareRuntimeProtector,
-        email_identity: Option<SoftwareRuntimeProtector>,
-        projection_email: SoftwareProjectionVerifiedEmailProtector,
-    ) -> Self {
-        Self {
-            short_term,
-            email_identity,
-            projection_email: Some(projection_email),
         }
     }
 
@@ -348,7 +325,6 @@ impl SplitRuntimeProtector {
                 .email_identity
                 .as_ref()
                 .ok_or(ApplicationError::Disabled),
-            ProtectedPurpose::ApplicationProjectionVerifiedEmail => Err(ApplicationError::Disabled),
             ProtectedPurpose::ApplicationState
             | ProtectedPurpose::ProviderPkce
             | ProtectedPurpose::EmailChallengeAddress
@@ -416,13 +392,6 @@ impl RuntimeProtector for SplitRuntimeProtector {
         context: &[u8],
         value: &[u8],
     ) -> Result<ProtectedValue, ApplicationError> {
-        if purpose == ProtectedPurpose::ApplicationProjectionVerifiedEmail {
-            return self
-                .projection_email
-                .as_ref()
-                .ok_or(ApplicationError::Disabled)?
-                .protect_context(context, value);
-        }
         self.protected_ring(purpose)?
             .protect(purpose, context, value)
     }
@@ -433,32 +402,12 @@ impl RuntimeProtector for SplitRuntimeProtector {
         context: &[u8],
         value: &ProtectedValue,
     ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
-        if purpose == ProtectedPurpose::ApplicationProjectionVerifiedEmail {
-            return self
-                .projection_email
-                .as_ref()
-                .ok_or(ApplicationError::Disabled)?
-                .unprotect_context(context, value);
-        }
         self.protected_ring(purpose)?
             .unprotect(purpose, context, value)
     }
 
     fn readable_key_versions(&self) -> BTreeSet<i32> {
         RuntimeProtector::readable_key_versions(&self.short_term)
-    }
-
-    fn projection_email_write_version(&self) -> i32 {
-        self.projection_email
-            .as_ref()
-            .map_or(0, SoftwareProjectionVerifiedEmailProtector::active_version)
-    }
-
-    fn projection_email_readable_versions(&self) -> BTreeSet<i32> {
-        self.projection_email.as_ref().map_or_else(
-            BTreeSet::new,
-            SoftwareProjectionVerifiedEmailProtector::readable_versions,
-        )
     }
 }
 
@@ -586,18 +535,18 @@ impl SoftwareProjectionVerifiedEmailProtector {
         key_version: i32,
         context: &[u8],
     ) -> Result<Vec<u8>, ApplicationError> {
-        let purpose = ProtectedPurpose::ApplicationProjectionVerifiedEmail;
+        const PURPOSE: &[u8] = b"application_projection_verified_email_v1";
         let mut associated_data = Vec::with_capacity(
             PROJECTION_EMAIL_PROTECTION_DOMAIN.len()
                 + self.0.deployment_context.len()
-                + purpose.as_str().len()
+                + PURPOSE.len()
                 + context.len()
                 + 48,
         );
         associated_data.extend_from_slice(PROJECTION_EMAIL_PROTECTION_DOMAIN);
         append_framed(&mut associated_data, self.0.deployment_context.as_bytes())?;
         append_framed(&mut associated_data, &key_version.to_be_bytes())?;
-        append_framed(&mut associated_data, purpose.as_str().as_bytes())?;
+        append_framed(&mut associated_data, PURPOSE)?;
         append_framed(&mut associated_data, context)?;
         Ok(associated_data)
     }
@@ -1361,121 +1310,6 @@ impl ManagedCredentialProtector for SoftwareRuntimeProtector {
     }
 }
 
-/// A signer capability over an encrypted file store. It cannot read or return signing seeds.
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct EncryptedFileRuntimeSigner {
-    store: EncryptedFileStore,
-}
-
-#[cfg(test)]
-impl EncryptedFileRuntimeSigner {
-    pub(crate) fn new(store: EncryptedFileStore) -> Self {
-        Self { store }
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl RuntimeSigner for EncryptedFileRuntimeSigner {
-    async fn sign(
-        &self,
-        signer_ref: &str,
-        signing_input: &[u8],
-    ) -> Result<Vec<u8>, ApplicationError> {
-        self.store
-            .sign_ed25519(signer_ref, signing_input)
-            .await
-            .map_err(authoritative_reference_error)
-    }
-
-    fn verify(
-        &self,
-        public_jwk: &Value,
-        signing_input: &[u8],
-        signature: &[u8],
-    ) -> Result<(), ApplicationError> {
-        verify_ed25519(public_jwk, signing_input, signature)
-    }
-}
-
-/// A resolver capability over an encrypted file store. References are used exactly as supplied.
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct EncryptedFileProviderSecretResolver {
-    store: EncryptedFileStore,
-}
-
-#[cfg(test)]
-impl EncryptedFileProviderSecretResolver {
-    pub(crate) fn new(store: EncryptedFileStore) -> Self {
-        Self { store }
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl ProviderSecretResolver for EncryptedFileProviderSecretResolver {
-    async fn resolve(&self, secret_ref: &str) -> Result<Zeroizing<String>, ApplicationError> {
-        self.store
-            .read_utf8_secret(secret_ref)
-            .await
-            .map_err(authoritative_reference_error)
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl crate::application::WebhookSecretResolver for EncryptedFileProviderSecretResolver {
-    async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
-        let value = self
-            .store
-            .read_utf8_secret(reference)
-            .await
-            .map_err(authoritative_reference_error)?;
-        Ok(Zeroizing::new(value.as_bytes().to_vec()))
-    }
-
-    async fn erase(&self, reference: &str) -> Result<(), ApplicationError> {
-        self.store
-            .erase(reference.to_owned())
-            .await
-            .map_err(|_| ApplicationError::ExternalStore)
-    }
-}
-
-#[cfg(test)]
-#[async_trait]
-impl crate::application::SmtpCredentialResolver for EncryptedFileProviderSecretResolver {
-    async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
-        let value = self
-            .store
-            .read_utf8_secret(reference)
-            .await
-            .map_err(authoritative_reference_error)?;
-        Ok(Zeroizing::new(value.as_bytes().to_vec()))
-    }
-
-    async fn resolve_checked(
-        &self,
-        reference: &str,
-        expected_fingerprint: &[u8; 32],
-    ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
-        let value = crate::application::SmtpCredentialResolver::resolve(self, reference).await?;
-        if self.store.request_fingerprint(value.as_slice()) != *expected_fingerprint {
-            return Err(ApplicationError::Disabled);
-        }
-        Ok(value)
-    }
-
-    async fn erase(&self, reference: &str) -> Result<(), ApplicationError> {
-        self.store
-            .erase(reference.to_owned())
-            .await
-            .map_err(|_| ApplicationError::ExternalStore)
-    }
-}
-
 pub(crate) fn verify_ed25519(
     public_jwk: &Value,
     signing_input: &[u8],
@@ -1525,15 +1359,6 @@ fn validate_public_ed25519_jwk(jwk: &Map<String, Value>) -> Result<(), Applicati
     Ok(())
 }
 
-#[cfg(test)]
-fn authoritative_reference_error(error: ApplicationError) -> ApplicationError {
-    if error == ApplicationError::InvalidInput {
-        ApplicationError::Integrity
-    } else {
-        error
-    }
-}
-
 fn update_framed(mac: &mut HmacSha256, value: &[u8]) -> Result<(), ApplicationError> {
     let length = u64::try_from(value.len()).map_err(|_| ApplicationError::InvalidInput)?;
     mac.update(&length.to_be_bytes());
@@ -1550,10 +1375,7 @@ fn append_framed(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ApplicationEr
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
-
-    use ed25519_dalek::SigningKey;
-    use serde_json::json;
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     use super::*;
@@ -1570,10 +1392,6 @@ mod tests {
             BTreeMap::from([(1, material(1, 11))]),
         )
         .unwrap()
-    }
-
-    fn temporary_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("owlauth-{label}-{}", Uuid::new_v4()))
     }
 
     #[test]
@@ -2211,15 +2029,6 @@ mod tests {
             ),
             Err(ApplicationError::Integrity)
         );
-        assert_eq!(
-            source_ring.unprotect(
-                ProtectedPurpose::ApplicationProjectionVerifiedEmail,
-                b"irrelevant",
-                &protected,
-            ),
-            Err(ApplicationError::Integrity),
-            "durable source custody cannot decrypt the projection ring"
-        );
     }
 
     #[test]
@@ -2244,81 +2053,5 @@ mod tests {
         assert_ne!(first, second);
         assert!(!first.contains('='));
         assert_eq!(URL_SAFE_NO_PAD.decode(first.as_bytes()).unwrap().len(), 32);
-    }
-
-    #[tokio::test]
-    async fn signer_signs_and_strictly_verifies_without_exporting_seed() {
-        let root = temporary_root("runtime-signer");
-        let store = EncryptedFileStore::new(root.clone(), [31; 32]).unwrap();
-        let alias = "signer_opaque_reference".to_owned();
-        let seed = [7_u8; 32];
-        store
-            .put_if_absent(alias.clone(), Zeroizing::new(seed.to_vec()))
-            .await
-            .unwrap();
-        let signer = EncryptedFileRuntimeSigner::new(store);
-        let input = b"header.payload";
-        let signature = signer.sign(&alias, input).await.unwrap();
-        let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-        let jwk = json!({
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "alg": "EdDSA",
-            "use": "sig",
-            "kid": "key-1",
-            "x": URL_SAFE_NO_PAD.encode(public),
-        });
-        signer.verify(&jwk, input, &signature).unwrap();
-
-        let wrong_public = SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes();
-        let wrong_jwk = json!({
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "alg": "EdDSA",
-            "use": "sig",
-            "kid": "key-2",
-            "x": URL_SAFE_NO_PAD.encode(wrong_public),
-        });
-        assert_eq!(
-            signer.verify(&wrong_jwk, input, &signature),
-            Err(ApplicationError::InvalidTransition)
-        );
-        let private_jwk = json!({
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "alg": "EdDSA",
-            "use": "sig",
-            "x": URL_SAFE_NO_PAD.encode(public),
-            "d": URL_SAFE_NO_PAD.encode(seed),
-        });
-        assert_eq!(
-            signer.verify(&private_jwk, input, &signature),
-            Err(ApplicationError::Integrity)
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn provider_secret_resolver_reads_the_exact_reference() {
-        let root = temporary_root("runtime-secret");
-        let store = EncryptedFileStore::new(root.clone(), [41; 32]).unwrap();
-        let alias = "provider_secret_reference".to_owned();
-        store
-            .put_if_absent(
-                alias.clone(),
-                Zeroizing::new(b"exact-provider-secret".to_vec()),
-            )
-            .await
-            .unwrap();
-        let resolver = EncryptedFileProviderSecretResolver::new(store);
-        assert_eq!(
-            &*resolver.resolve(&alias).await.unwrap(),
-            "exact-provider-secret"
-        );
-        assert_eq!(
-            resolver.resolve("provider_secret_other").await,
-            Err(ApplicationError::Integrity)
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 }

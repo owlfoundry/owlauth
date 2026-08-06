@@ -2,8 +2,6 @@ pub(crate) mod client_key_security;
 pub(crate) mod custody;
 pub(crate) mod github;
 pub(crate) mod migrations;
-#[cfg(test)]
-mod migrations_checksum_tests;
 pub(crate) mod oidc;
 pub(crate) mod postgres;
 pub(crate) mod protected_runtime;
@@ -11,6 +9,5 @@ pub(crate) mod provider_registry;
 pub(crate) mod redis_admission;
 pub(crate) mod runtime_security;
 pub(crate) mod smtp;
-pub(crate) mod software_store;
 pub(crate) mod system;
 pub(crate) mod webhook_http;

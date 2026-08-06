@@ -13,7 +13,6 @@ import {
   type ApplicationUserEventType,
   type DisposableControlClient,
   IdempotencyAttempt,
-  type ProjectionPolicy,
   type WebhookDelivery,
   type WebhookEndpoint,
   requireData,
@@ -28,155 +27,6 @@ const EVENT_TYPES: readonly ApplicationUserEventType[] = [
 
 type ErrorHandler = (error: unknown, refreshConflict?: () => Promise<void>) => Promise<void>;
 type LoadState = "loading" | "ready" | "failed";
-
-interface ProjectionPolicySettingsProps {
-  readonly session: DisposableControlClient;
-  readonly projectId: string;
-  readonly disabled: boolean;
-  readonly onError: ErrorHandler;
-  readonly setMessage: (message: string | null) => void;
-}
-
-export function ProjectionPolicySettings({
-  session,
-  projectId,
-  disabled,
-  onError,
-  setMessage,
-}: ProjectionPolicySettingsProps) {
-  const [policy, setPolicy] = useState<ProjectionPolicy | null>(null);
-  const [loadState, setLoadState] = useState<LoadState>("loading");
-  const [editing, setEditing] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-
-  const refresh = useCallback(async () => {
-    setLoadState("loading");
-    try {
-      const result = await session.client.GET("/v1/projects/{project_id}/projection-policy", {
-        params: { path: { project_id: projectId } },
-      });
-      setPolicy(requireData(result.data, result.error, result.response));
-      setLoadState("ready");
-    } catch (error) {
-      setLoadState("failed");
-      throw error;
-    }
-  }, [projectId, session]);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setPolicy(null);
-      void refresh().catch(onError);
-    }, 0);
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [onError, refresh]);
-
-  async function update(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
-    event.preventDefault();
-    if (policy === null) return;
-    const fields = new FormData(event.currentTarget);
-    setSubmitting(true);
-    try {
-      const result = await session.client.PUT("/v1/projects/{project_id}/projection-policy", {
-        params: { path: { project_id: projectId } },
-        body: {
-          verified_email_enabled: fields.get("verified_email_enabled") === "on",
-          expected_revision: policy.revision,
-        },
-      });
-      const updated = requireData(result.data, result.error, result.response);
-      setPolicy(updated);
-      setEditing(false);
-      setMessage(
-        updated.expansion_operation_id === null
-          ? "Project projection policy is already converged."
-          : "Project projection expansion was scheduled.",
-      );
-    } catch (error) {
-      await onError(error, async () => {
-        await refresh();
-        setEditing(false);
-      });
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <Section
-      title="Project user projection"
-      description="Verified email expansion is asynchronous and monotonic."
-      action={
-        policy !== null && loadState === "ready" && !disabled && !editing ? (
-          <Button
-            type="button"
-            onClick={() => {
-              setEditing(true);
-            }}
-          >
-            Edit projection
-          </Button>
-        ) : undefined
-      }
-    >
-      {loadState === "failed" ? (
-        <InlineAlert tone="danger">
-          Project projection policy could not be loaded. Previously loaded values, if shown, may be
-          stale.{" "}
-          <Button type="button" variant="quiet" onClick={() => void refresh().catch(onError)}>
-            Retry Project projection policy
-          </Button>
-        </InlineAlert>
-      ) : null}
-      {policy === null ? (
-        loadState === "loading" ? (
-          <p role="status">Loading Project projection policy</p>
-        ) : null
-      ) : editing ? (
-        <form className={styles["form"]} onSubmit={(event) => void update(event)}>
-          <Checkbox
-            name="verified_email_enabled"
-            defaultChecked={policy.verified_email_enabled}
-            disabled={disabled}
-            data-owl-initial-focus
-          >
-            Allow verified email in Application projections
-          </Checkbox>
-          <div className={styles["actions"]}>
-            <Button
-              type="button"
-              variant="quiet"
-              disabled={submitting}
-              onClick={() => {
-                setEditing(false);
-              }}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" variant="primary" busy={submitting} disabled={disabled}>
-              Save projection policy
-            </Button>
-          </div>
-        </form>
-      ) : (
-        <DescriptionList
-          items={[
-            {
-              term: "Verified email",
-              detail: policy.verified_email_enabled
-                ? "Available for Application projection"
-                : "Excluded",
-            },
-            { term: "Revision", detail: String(policy.revision) },
-            { term: "Expansion operation", detail: policy.expansion_operation_id ?? "Converged" },
-          ]}
-        />
-      )}
-    </Section>
-  );
-}
 
 interface ApplicationDeliveryProps {
   readonly session: DisposableControlClient;
@@ -197,14 +47,12 @@ export function ApplicationDelivery({
   setMessage,
 }: ApplicationDeliveryProps) {
   const confirm = useControlConfirmation();
-  const [policy, setPolicy] = useState<ProjectionPolicy | null>(null);
   const [endpoints, setEndpoints] = useState<WebhookEndpoint[]>([]);
   const [events, setEvents] = useState<ApplicationUserEvent[]>([]);
   const [deliveries, setDeliveries] = useState<WebhookDelivery[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("loading");
   const [hasLoaded, setHasLoaded] = useState(false);
   const [preparedRotations, setPreparedRotations] = useState<Record<string, PreparedRotation>>({});
-  const [editingProjection, setEditingProjection] = useState(false);
   const [creatingEndpoint, setCreatingEndpoint] = useState(false);
   const [editingEndpointId, setEditingEndpointId] = useState<string | null>(null);
   const [rotatingEndpointId, setRotatingEndpointId] = useState<string | null>(null);
@@ -220,11 +68,7 @@ export function ApplicationDelivery({
   const refresh = useCallback(async () => {
     setLoadState("loading");
     try {
-      const [policyResult, endpointResult, eventResult, deliveryResult] = await Promise.all([
-        session.client.GET(
-          "/v1/projects/{project_id}/applications/{application_id}/projection-policy",
-          { params: { path } },
-        ),
+      const [endpointResult, eventResult, deliveryResult] = await Promise.all([
         session.client.GET(
           "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
           { params: { path } },
@@ -237,7 +81,6 @@ export function ApplicationDelivery({
           { params: { path, query: {} } },
         ),
       ]);
-      const nextPolicy = requireData(policyResult.data, policyResult.error, policyResult.response);
       const nextEndpoints = requireData(
         endpointResult.data,
         endpointResult.error,
@@ -254,7 +97,6 @@ export function ApplicationDelivery({
         deliveryResult.response,
       ).items;
 
-      setPolicy(nextPolicy);
       setEndpoints(nextEndpoints);
       setEvents(nextEvents);
       setDeliveries(nextDeliveries);
@@ -272,7 +114,6 @@ export function ApplicationDelivery({
     endpointAttempt.abandon();
     secretRotationAttempt.abandon();
     const timer = window.setTimeout(() => {
-      setPolicy(null);
       setEndpoints([]);
       setEvents([]);
       setDeliveries([]);
@@ -285,35 +126,6 @@ export function ApplicationDelivery({
       secretRotationAttempt.abandon();
     };
   }, [onError, refresh]);
-
-  async function updateProjection(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
-    event.preventDefault();
-    if (policy === null) return;
-    const fields = new FormData(event.currentTarget);
-    setSubmitting(true);
-    try {
-      const result = await session.client.PUT(
-        "/v1/projects/{project_id}/applications/{application_id}/projection-policy",
-        {
-          params: { path },
-          body: {
-            verified_email_enabled: fields.get("verified_email_enabled") === "on",
-            expected_revision: policy.revision,
-          },
-        },
-      );
-      setPolicy(requireData(result.data, result.error, result.response));
-      setEditingProjection(false);
-      setMessage("Application projection expansion was scheduled.");
-    } catch (error) {
-      await onError(error, async () => {
-        await refresh();
-        setEditingProjection(false);
-      });
-    } finally {
-      setSubmitting(false);
-    }
-  }
 
   async function createEndpoint(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();
@@ -545,42 +357,6 @@ export function ApplicationDelivery({
           </Button>
         </InlineAlert>
       ) : null}
-      <Section
-        title="Application user projection"
-        description="Committed projection shape for this Application."
-        action={
-          policy !== null && loadState === "ready" && !disabled ? (
-            <Button
-              type="button"
-              onClick={() => {
-                setEditingProjection(true);
-              }}
-            >
-              Edit projection
-            </Button>
-          ) : undefined
-        }
-      >
-        {policy === null ? (
-          loadState === "loading" ? (
-            <p role="status">Loading Application projection policy</p>
-          ) : (
-            <p>Application projection policy is unavailable.</p>
-          )
-        ) : (
-          <DescriptionList
-            items={[
-              {
-                term: "Verified email",
-                detail: policy.verified_email_enabled ? "Included" : "Excluded",
-              },
-              { term: "Revision", detail: String(policy.revision) },
-              { term: "Expansion operation", detail: policy.expansion_operation_id ?? "Converged" },
-            ]}
-          />
-        )}
-      </Section>
-
       <Section
         title="Webhook endpoints"
         description="Endpoint signing secrets are write-only and independently rotated."
@@ -814,53 +590,6 @@ export function ApplicationDelivery({
           </DataTable>
         )}
       </Section>
-
-      <Dialog
-        open={editingProjection}
-        title="Edit Application projection"
-        onClose={() => {
-          if (!submitting) setEditingProjection(false);
-        }}
-        actions={
-          <>
-            <Button
-              type="button"
-              variant="quiet"
-              disabled={submitting}
-              onClick={() => {
-                setEditingProjection(false);
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              form="application-projection-form"
-              variant="primary"
-              busy={submitting}
-            >
-              Save projection
-            </Button>
-          </>
-        }
-      >
-        {policy === null ? null : (
-          <form
-            id="application-projection-form"
-            className={styles["form"]}
-            onSubmit={(event) => void updateProjection(event)}
-          >
-            <Checkbox
-              name="verified_email_enabled"
-              defaultChecked={policy.verified_email_enabled}
-              disabled={disabled}
-              data-owl-initial-focus
-            >
-              Allow verified email for this Application
-            </Checkbox>
-          </form>
-        )}
-      </Dialog>
 
       <Dialog
         open={creatingEndpoint}

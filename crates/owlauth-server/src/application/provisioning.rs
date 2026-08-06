@@ -16,8 +16,6 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{ApplicationError, Clock, RequestDigester};
-#[cfg(test)]
-use super::{ConfigurationSecretStore, EntropySource, SignerStore};
 use crate::domain::{
     ApplicationType, DisplayName, MAX_ACCESS_TOKEN_LIFETIME_SECONDS,
     MIN_ACCESS_TOKEN_LIFETIME_SECONDS, OpaqueOwner, ProviderKey, ProviderKind, PublicId,
@@ -192,7 +190,7 @@ pub(crate) struct PreparedSigningKey {
     pub ring_id: Uuid,
     pub key_id: Uuid,
     pub kid: String,
-    pub signer_ref: String,
+    pub signer_material_id: Uuid,
     pub request_digest: Vec<u8>,
     pub state: ProvisioningOperationState,
 }
@@ -214,18 +212,24 @@ pub(crate) struct ProvisionedProtectedSigningMaterial {
     pub public_key: SigningPublicKey,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct SigningKeyRecovery {
-    pub operation_alias: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SigningKeyActivationCandidate {
-    #[cfg(test)]
-    pub kid: String,
-    pub signer_ref: String,
-    #[cfg(test)]
-    pub public_jwk: Value,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SigningKeyMaintenanceItem {
+    Provision {
+        project_id: Uuid,
+        key_id: Uuid,
+        operation_alias: String,
+        expected_project_revision: i64,
+    },
+    Activate {
+        project_id: Uuid,
+        key_id: Uuid,
+        expected_ring_revision: i64,
+    },
+    Retire {
+        project_id: Uuid,
+        key_id: Uuid,
+        expected_ring_revision: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -282,11 +286,6 @@ impl ConfigurationSecretSealers {
             provider_id,
             Arc::new(capability) as Arc<dyn ConfigurationSecretSealer>,
         )]))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.capabilities.is_empty()
     }
 
     pub(crate) fn resolve(
@@ -403,20 +402,6 @@ fn validate_idempotency_key(value: &str) -> Result<(), ApplicationError> {
     Ok(())
 }
 
-fn external_store_alias(
-    digester: &dyn RequestDigester,
-    purpose: &str,
-    project_id: Uuid,
-    operation_alias: &str,
-) -> String {
-    let digest = digester.digest_bytes(operation_alias.as_bytes());
-    format!(
-        "{purpose}_{}_{}",
-        project_id.simple(),
-        URL_SAFE_NO_PAD.encode(&digest[..16])
-    )
-}
-
 fn validate_provider_issuer(
     value: &str,
     allow_http_loopback: bool,
@@ -527,15 +512,9 @@ pub(crate) trait SigningKeyProvisioningPort: Send + Sync {
         &self,
         project_id: Uuid,
         operation_alias: String,
-        signer_ref: String,
         expected_project_revision: i64,
         request_digest: Vec<u8>,
     ) -> Result<PreparedSigningKey, ApplicationError>;
-    async fn signing_key_recovery(
-        &self,
-        project_id: Uuid,
-        key_id: Uuid,
-    ) -> Result<SigningKeyRecovery, ApplicationError>;
     async fn prepared_signing_material(
         &self,
         project_id: Uuid,
@@ -586,18 +565,8 @@ pub(crate) trait SigningKeyProvisioningPort: Send + Sync {
         &self,
         project_id: Uuid,
         prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
         lease: SigningProviderLease,
         material: ProvisionedProtectedSigningMaterial,
-        public_jwk: Value,
-        recorded_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError>;
-    #[cfg(test)]
-    async fn record_signing_key_material(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
         public_jwk: Value,
         recorded_at: OffsetDateTime,
     ) -> Result<(), ApplicationError>;
@@ -605,7 +574,6 @@ pub(crate) trait SigningKeyProvisioningPort: Send + Sync {
         &self,
         project_id: Uuid,
         prepared: &PreparedSigningKey,
-        expected_project_revision: i64,
         correlation_id: Uuid,
         published_at: OffsetDateTime,
     ) -> Result<SigningKeyRecord, ApplicationError>;
@@ -618,11 +586,15 @@ pub(crate) trait SigningKeyProvisioningPort: Send + Sync {
         &self,
         project_id: Uuid,
     ) -> Result<Vec<SigningKeyRecord>, ApplicationError>;
-    async fn signing_key_activation_candidate(
+    async fn signing_key_maintenance_items(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SigningKeyMaintenanceItem>, ApplicationError>;
+    async fn ensure_signing_key_activatable(
         &self,
         project_id: Uuid,
         key_id: Uuid,
-    ) -> Result<SigningKeyActivationCandidate, ApplicationError>;
+    ) -> Result<(), ApplicationError>;
     async fn activate_signing_key_if_ready(
         &self,
         project_id: Uuid,
@@ -663,30 +635,12 @@ pub(crate) trait ProviderProvisioningPort: Send + Sync {
         project_id: Uuid,
         prepared: &PreparedProvider,
     ) -> Result<Option<PreparedSecretMaterial>, ApplicationError>;
-    #[cfg(test)]
-    async fn mark_provider_secret_stored(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedProvider,
-        expected_project_revision: i64,
-        stored_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError>;
     async fn finalize_protected_provider(
         &self,
         project_id: Uuid,
         prepared: &PreparedProvider,
         expected_project_revision: i64,
         material: SealedProtectedMaterial,
-        correlation_id: Uuid,
-        finalized_at: OffsetDateTime,
-    ) -> Result<ProviderRecord, ApplicationError>;
-    #[cfg(test)]
-    async fn finalize_provider(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedProvider,
-        expected_project_revision: i64,
-        secret_ref: String,
         correlation_id: Uuid,
         finalized_at: OffsetDateTime,
     ) -> Result<ProviderRecord, ApplicationError>;
@@ -731,12 +685,6 @@ pub(crate) struct ProvisioningInfrastructure {
     clock: Arc<dyn Clock>,
     digester: Arc<dyn RequestDigester>,
     allow_http_loopback_provider: bool,
-    #[cfg(test)]
-    signer_store: Option<Arc<dyn SignerStore>>,
-    #[cfg(test)]
-    secret_store: Option<Arc<dyn ConfigurationSecretStore>>,
-    #[cfg(test)]
-    entropy: Option<Arc<dyn EntropySource>>,
 }
 
 impl ProvisioningInfrastructure {
@@ -757,40 +705,6 @@ impl ProvisioningInfrastructure {
             clock: Arc::new(clock),
             digester: Arc::new(digester),
             allow_http_loopback_provider,
-            #[cfg(test)]
-            signer_store: None,
-            #[cfg(test)]
-            secret_store: None,
-            #[cfg(test)]
-            entropy: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new<S, C, K, E, D>(
-        signer_store: S,
-        secret_store: C,
-        clock: K,
-        entropy: E,
-        digester: D,
-        allow_http_loopback_provider: bool,
-    ) -> Self
-    where
-        S: SignerStore + 'static,
-        C: ConfigurationSecretStore + 'static,
-        K: Clock + 'static,
-        E: EntropySource + 'static,
-        D: RequestDigester + 'static,
-    {
-        Self {
-            signing_provisioners: Arc::new(BTreeMap::new()),
-            secret_sealers: ConfigurationSecretSealers::default(),
-            clock: Arc::new(clock),
-            digester: Arc::new(digester),
-            allow_http_loopback_provider,
-            signer_store: Some(Arc::new(signer_store)),
-            secret_store: Some(Arc::new(secret_store)),
-            entropy: Some(Arc::new(entropy)),
         }
     }
 
@@ -804,15 +718,6 @@ impl ProvisioningInfrastructure {
             provider_id,
             Arc::new(signing_provisioner) as Arc<dyn SigningKeyProvisioner>,
         )]));
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_secret_sealer<S>(mut self, secret_sealer: S) -> Self
-    where
-        S: ConfigurationSecretSealer + 'static,
-    {
-        self.secret_sealers = ConfigurationSecretSealers::single(secret_sealer);
         self
     }
 
@@ -915,589 +820,8 @@ pub(super) fn map_provider_error(error: ProviderError) -> ApplicationError {
 }
 
 #[cfg(test)]
-use provider_secret::create_provider_workflow;
-#[cfg(test)]
-use signing::provision_signing_key_workflow;
-
-#[cfg(test)]
 mod tests {
-    use std::{
-        collections::{BTreeMap, VecDeque},
-        sync::{Arc, Mutex},
-    };
-
-    use sha2::{Digest, Sha256};
-    use subtle::ConstantTimeEq;
-
     use super::*;
-    use crate::adapters::system::Sha256RequestDigester;
-
-    #[derive(Clone, Copy)]
-    enum WriteFault {
-        BeforeWrite,
-        AfterWrite,
-    }
-
-    #[derive(Clone)]
-    struct FixedClock;
-
-    impl Clock for FixedClock {
-        fn now(&self) -> OffsetDateTime {
-            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1)
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingEntropy {
-        calls: Arc<Mutex<usize>>,
-    }
-
-    impl EntropySource for RecordingEntropy {
-        fn signing_seed(&self) -> Result<Zeroizing<[u8; 32]>, ApplicationError> {
-            *self.calls.lock().unwrap() += 1;
-            Ok(Zeroizing::new([7; 32]))
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingSignerStore {
-        log: Arc<Mutex<Vec<&'static str>>>,
-        values: Arc<Mutex<BTreeMap<String, [u8; 32]>>>,
-        faults: Arc<Mutex<VecDeque<WriteFault>>>,
-    }
-
-    #[async_trait]
-    impl SignerStore for RecordingSignerStore {
-        async fn put_if_absent(
-            &self,
-            alias: String,
-            seed: Zeroizing<[u8; 32]>,
-        ) -> Result<(), ApplicationError> {
-            self.log.lock().unwrap().push("signer.put");
-            let fault = self.faults.lock().unwrap().pop_front();
-            if matches!(fault, Some(WriteFault::BeforeWrite)) {
-                return Err(ApplicationError::ExternalStore);
-            }
-            self.values.lock().unwrap().entry(alias).or_insert(*seed);
-            if matches!(fault, Some(WriteFault::AfterWrite)) {
-                return Err(ApplicationError::ExternalStore);
-            }
-            Ok(())
-        }
-
-        async fn public_jwk(&self, _alias: String, kid: &str) -> Result<Value, ApplicationError> {
-            self.log.lock().unwrap().push("signer.public_jwk");
-            Ok(json!({ "kid": kid }))
-        }
-
-        async fn verify(
-            &self,
-            _alias: String,
-            _kid: &str,
-            _public_jwk: &Value,
-        ) -> Result<(), ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingSecretStore {
-        log: Arc<Mutex<Vec<&'static str>>>,
-        values: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-        faults: Arc<Mutex<VecDeque<WriteFault>>>,
-    }
-
-    #[async_trait]
-    impl ConfigurationSecretStore for RecordingSecretStore {
-        fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
-            Sha256::digest(value).into()
-        }
-
-        async fn put_if_absent(
-            &self,
-            alias: String,
-            value: Zeroizing<Vec<u8>>,
-        ) -> Result<(), ApplicationError> {
-            self.log.lock().unwrap().push("secret.put");
-            let fault = self.faults.lock().unwrap().pop_front();
-            if matches!(fault, Some(WriteFault::BeforeWrite)) {
-                return Err(ApplicationError::ExternalStore);
-            }
-            let mut values = self.values.lock().unwrap();
-            if let Some(existing) = values.get(&alias) {
-                if !bool::from(existing.as_slice().ct_eq(value.as_slice())) {
-                    return Err(ApplicationError::Integrity);
-                }
-            } else {
-                values.insert(alias, value.to_vec());
-            }
-            drop(values);
-            if matches!(fault, Some(WriteFault::AfterWrite)) {
-                return Err(ApplicationError::ExternalStore);
-            }
-            Ok(())
-        }
-
-        async fn ensure_readable(&self, alias: String) -> Result<(), ApplicationError> {
-            self.log.lock().unwrap().push("secret.ensure_readable");
-            if self.values.lock().unwrap().contains_key(&alias) {
-                Ok(())
-            } else {
-                Err(ApplicationError::Integrity)
-            }
-        }
-    }
-
-    struct RecordingSigningPort {
-        log: Arc<Mutex<Vec<&'static str>>>,
-        operation: Mutex<Option<PreparedSigningKey>>,
-        initial_state: ProvisioningOperationState,
-        conflicting_digest: bool,
-    }
-
-    impl RecordingSigningPort {
-        fn new(
-            log: Arc<Mutex<Vec<&'static str>>>,
-            initial_state: ProvisioningOperationState,
-            conflicting_digest: bool,
-        ) -> Self {
-            Self {
-                log,
-                operation: Mutex::new(None),
-                initial_state,
-                conflicting_digest,
-            }
-        }
-
-        fn record(&self) -> SigningKeyRecord {
-            let operation = self.operation.lock().unwrap();
-            let prepared = operation.as_ref().unwrap();
-            SigningKeyRecord {
-                id: prepared.key_id,
-                project_id: Uuid::from_u128(1),
-                kid: prepared.kid.clone(),
-                algorithm: SIGNING_ALGORITHM.to_owned(),
-                state: "published".to_owned(),
-                ring_revision: 2,
-                signing_epoch: 1,
-                sign_not_before: None,
-                verify_not_after: None,
-                public_jwk: json!({ "kid": prepared.kid }),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SigningKeyProvisioningPort for RecordingSigningPort {
-        async fn prepare_signing_key(
-            &self,
-            _project_id: Uuid,
-            _operation_alias: String,
-            signer_ref: String,
-            _expected_project_revision: i64,
-            request_digest: Vec<u8>,
-        ) -> Result<PreparedSigningKey, ApplicationError> {
-            self.log.lock().unwrap().push("key.prepare");
-            let mut operation = self.operation.lock().unwrap();
-            let prepared = operation.get_or_insert_with(|| PreparedSigningKey {
-                operation_id: Uuid::from_u128(2),
-                ring_id: Uuid::from_u128(3),
-                key_id: Uuid::from_u128(4),
-                kid: "kid_test".to_owned(),
-                signer_ref,
-                request_digest: if self.conflicting_digest {
-                    vec![0; 32]
-                } else {
-                    request_digest
-                },
-                state: self.initial_state,
-            });
-            Ok(prepared.clone())
-        }
-
-        async fn signing_key_recovery(
-            &self,
-            _project_id: Uuid,
-            _key_id: Uuid,
-        ) -> Result<SigningKeyRecovery, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn prepared_signing_material(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedSigningKey,
-        ) -> Result<Option<PreparedSigningMaterial>, ApplicationError> {
-            Ok(None)
-        }
-
-        async fn claim_signing_provider_action(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedSigningKey,
-            _now: OffsetDateTime,
-            _lease_until: OffsetDateTime,
-        ) -> Result<SigningProviderAction, ApplicationError> {
-            unimplemented!("legacy workflow fixture has no protected provider action")
-        }
-
-        async fn record_signing_provider_failure(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedSigningKey,
-            _lease: SigningProviderLease,
-            _provider_call: SigningProviderCall,
-            _error_class: ProviderErrorClass,
-            _retry: RetryClassification,
-            _error_code: Option<String>,
-            _recorded_at: OffsetDateTime,
-        ) -> Result<(), ApplicationError> {
-            unimplemented!("legacy workflow fixture has no protected provider failure")
-        }
-
-        async fn record_signing_provider_absence(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedSigningKey,
-            _lease: SigningProviderLease,
-            _recorded_at: OffsetDateTime,
-        ) -> Result<(), ApplicationError> {
-            unimplemented!("legacy workflow fixture has no protected provider absence")
-        }
-
-        async fn queue_signing_provider_cleanup(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedSigningKey,
-            _lease: SigningProviderLease,
-            _recorded_at: OffsetDateTime,
-        ) -> Result<(), ApplicationError> {
-            unimplemented!("legacy workflow fixture has no protected cleanup")
-        }
-
-        async fn complete_signing_provider_cleanup(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedSigningKey,
-            _lease: SigningProviderLease,
-            _destroyed: bool,
-            _correlation_id: Uuid,
-            _completed_at: OffsetDateTime,
-        ) -> Result<(), ApplicationError> {
-            unimplemented!("legacy workflow fixture has no protected cleanup")
-        }
-
-        async fn record_protected_signing_key_material(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedSigningKey,
-            _expected_project_revision: i64,
-            _lease: SigningProviderLease,
-            _material: ProvisionedProtectedSigningMaterial,
-            _public_jwk: Value,
-            _recorded_at: OffsetDateTime,
-        ) -> Result<(), ApplicationError> {
-            unimplemented!("legacy workflow fixture has no protected material")
-        }
-
-        async fn record_signing_key_material(
-            &self,
-            _project_id: Uuid,
-            prepared: &PreparedSigningKey,
-            _expected_project_revision: i64,
-            _public_jwk: Value,
-            _recorded_at: OffsetDateTime,
-        ) -> Result<(), ApplicationError> {
-            self.log.lock().unwrap().push("key.record_material");
-            let mut operation = self.operation.lock().unwrap();
-            assert_eq!(operation.as_ref().unwrap().key_id, prepared.key_id);
-            operation.as_mut().unwrap().state = ProvisioningOperationState::Stored;
-            Ok(())
-        }
-
-        async fn publish_signing_key(
-            &self,
-            _project_id: Uuid,
-            prepared: &PreparedSigningKey,
-            _expected_project_revision: i64,
-            _correlation_id: Uuid,
-            _published_at: OffsetDateTime,
-        ) -> Result<SigningKeyRecord, ApplicationError> {
-            self.log.lock().unwrap().push("key.publish");
-            let mut operation = self.operation.lock().unwrap();
-            assert_eq!(operation.as_ref().unwrap().key_id, prepared.key_id);
-            operation.as_mut().unwrap().state = ProvisioningOperationState::Completed;
-            drop(operation);
-            Ok(self.record())
-        }
-
-        async fn get_signing_key(
-            &self,
-            _project_id: Uuid,
-            _key_id: Uuid,
-        ) -> Result<SigningKeyRecord, ApplicationError> {
-            self.log.lock().unwrap().push("key.get");
-            Ok(self.record())
-        }
-
-        async fn list_signing_keys(
-            &self,
-            _project_id: Uuid,
-        ) -> Result<Vec<SigningKeyRecord>, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn signing_key_activation_candidate(
-            &self,
-            _project_id: Uuid,
-            _key_id: Uuid,
-        ) -> Result<SigningKeyActivationCandidate, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn activate_signing_key_if_ready(
-            &self,
-            _project_id: Uuid,
-            _key_id: Uuid,
-            _expected_ring_revision: i64,
-            _correlation_id: Uuid,
-        ) -> Result<SigningKeyRecord, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn retire_signing_key(
-            &self,
-            _project_id: Uuid,
-            _key_id: Uuid,
-            _expected_ring_revision: i64,
-            _correlation_id: Uuid,
-        ) -> Result<SigningKeyRecord, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn revoke_signing_key(
-            &self,
-            _project_id: Uuid,
-            _key_id: Uuid,
-            _expected_ring_revision: i64,
-            _correlation_id: Uuid,
-        ) -> Result<SigningKeyRecord, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-    }
-
-    struct RecordingProviderPort {
-        log: Arc<Mutex<Vec<&'static str>>>,
-        operation: Mutex<Option<PreparedProvider>>,
-        initial_state: ProvisioningOperationState,
-        conflicting_digest: bool,
-    }
-
-    impl RecordingProviderPort {
-        fn new(
-            log: Arc<Mutex<Vec<&'static str>>>,
-            initial_state: ProvisioningOperationState,
-            conflicting_digest: bool,
-        ) -> Self {
-            Self {
-                log,
-                operation: Mutex::new(None),
-                initial_state,
-                conflicting_digest,
-            }
-        }
-
-        fn record(&self) -> ProviderRecord {
-            let operation = self.operation.lock().unwrap();
-            ProviderRecord {
-                id: operation.as_ref().unwrap().provider_id,
-                project_id: Uuid::from_u128(1),
-                provider_key: "workforce".to_owned(),
-                kind: "oidc".to_owned(),
-                display_name: "Workforce".to_owned(),
-                issuer: "https://accounts.example/".to_owned(),
-                client_id: "client".to_owned(),
-                callback_url: "https://identity.example/callback".to_owned(),
-                status: "active".to_owned(),
-                revision: 2,
-                managed_profile_enabled: false,
-                managed_profile_revision: 1,
-                assigned_application_ids: Vec::new(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ProviderProvisioningPort for RecordingProviderPort {
-        async fn prepare_provider(
-            &self,
-            _project_id: Uuid,
-            command: PrepareProvider,
-        ) -> Result<PreparedProvider, ApplicationError> {
-            self.log.lock().unwrap().push("provider.prepare");
-            let mut operation = self.operation.lock().unwrap();
-            let prepared = operation.get_or_insert_with(|| PreparedProvider {
-                operation_id: Uuid::from_u128(5),
-                provider_id: Uuid::from_u128(6),
-                request_digest: if self.conflicting_digest {
-                    vec![0; 32]
-                } else {
-                    command.request_digest
-                },
-                state: self.initial_state,
-            });
-            Ok(prepared.clone())
-        }
-
-        async fn provider_recovery(
-            &self,
-            _project_id: Uuid,
-            _provider_id: Uuid,
-        ) -> Result<ProviderRecovery, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn prepared_provider_material(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedProvider,
-        ) -> Result<Option<PreparedSecretMaterial>, ApplicationError> {
-            Ok(None)
-        }
-
-        async fn finalize_protected_provider(
-            &self,
-            _project_id: Uuid,
-            _prepared: &PreparedProvider,
-            _expected_project_revision: i64,
-            _material: SealedProtectedMaterial,
-            _correlation_id: Uuid,
-            _finalized_at: OffsetDateTime,
-        ) -> Result<ProviderRecord, ApplicationError> {
-            unimplemented!("legacy workflow fixture has no protected material")
-        }
-
-        async fn mark_provider_secret_stored(
-            &self,
-            _project_id: Uuid,
-            prepared: &PreparedProvider,
-            _expected_project_revision: i64,
-            _stored_at: OffsetDateTime,
-        ) -> Result<(), ApplicationError> {
-            self.log.lock().unwrap().push("provider.mark_stored");
-            let mut operation = self.operation.lock().unwrap();
-            assert_eq!(
-                operation.as_ref().unwrap().provider_id,
-                prepared.provider_id
-            );
-            operation.as_mut().unwrap().state = ProvisioningOperationState::Stored;
-            Ok(())
-        }
-
-        async fn finalize_provider(
-            &self,
-            _project_id: Uuid,
-            prepared: &PreparedProvider,
-            _expected_project_revision: i64,
-            _secret_ref: String,
-            _correlation_id: Uuid,
-            _finalized_at: OffsetDateTime,
-        ) -> Result<ProviderRecord, ApplicationError> {
-            self.log.lock().unwrap().push("provider.finalize");
-            let mut operation = self.operation.lock().unwrap();
-            assert_eq!(
-                operation.as_ref().unwrap().provider_id,
-                prepared.provider_id
-            );
-            operation.as_mut().unwrap().state = ProvisioningOperationState::Completed;
-            drop(operation);
-            Ok(self.record())
-        }
-
-        async fn get_provider(
-            &self,
-            _project_id: Uuid,
-            _provider_id: Uuid,
-        ) -> Result<ProviderRecord, ApplicationError> {
-            self.log.lock().unwrap().push("provider.get");
-            Ok(self.record())
-        }
-
-        async fn list_providers(
-            &self,
-            _project_id: Uuid,
-        ) -> Result<Vec<ProviderRecord>, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn assign_provider(
-            &self,
-            _project_id: Uuid,
-            _provider_id: Uuid,
-            _application_id: Uuid,
-            _expected_application_revision: i64,
-            _correlation_id: Uuid,
-        ) -> Result<ProviderRecord, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn unassign_provider(
-            &self,
-            _project_id: Uuid,
-            _provider_id: Uuid,
-            _application_id: Uuid,
-            _expected_application_revision: i64,
-            _correlation_id: Uuid,
-        ) -> Result<ProviderRecord, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-
-        async fn disable_provider(
-            &self,
-            _project_id: Uuid,
-            _provider_id: Uuid,
-            _expected_provider_revision: i64,
-            _correlation_id: Uuid,
-        ) -> Result<ProviderRecord, ApplicationError> {
-            unimplemented!("not used by provisioning workflow tests")
-        }
-    }
-
-    fn infrastructure(
-        signer_store: RecordingSignerStore,
-        secret_store: RecordingSecretStore,
-        entropy_calls: Arc<Mutex<usize>>,
-    ) -> ProvisioningInfrastructure {
-        ProvisioningInfrastructure::new(
-            signer_store,
-            secret_store,
-            FixedClock,
-            RecordingEntropy {
-                calls: entropy_calls,
-            },
-            Sha256RequestDigester,
-            false,
-        )
-    }
-
-    fn stores(
-        log: Arc<Mutex<Vec<&'static str>>>,
-        signer_fault: Option<WriteFault>,
-        secret_fault: Option<WriteFault>,
-    ) -> (RecordingSignerStore, RecordingSecretStore) {
-        (
-            RecordingSignerStore {
-                log: log.clone(),
-                values: Arc::new(Mutex::new(BTreeMap::new())),
-                faults: Arc::new(Mutex::new(signer_fault.into_iter().collect())),
-            },
-            RecordingSecretStore {
-                log,
-                values: Arc::new(Mutex::new(BTreeMap::new())),
-                faults: Arc::new(Mutex::new(secret_fault.into_iter().collect())),
-            },
-        )
-    }
 
     fn provider_command() -> CreateProvider {
         CreateProvider {
@@ -1512,23 +836,6 @@ mod tests {
             expected_project_revision: 1,
             egress_policy_revision: Some(1),
         }
-    }
-
-    #[test]
-    fn protected_provider_fixture_is_valid() {
-        let command = CreateProvider {
-            kind: ProviderKind::Oidc,
-            provider_key: "custody-workforce".to_owned(),
-            display_name: "Protected OIDC".to_owned(),
-            issuer: "https://accounts.example/".to_owned(),
-            client_id: "protected-client".to_owned(),
-            client_secret: Zeroizing::new("protected-secret".to_owned()),
-            managed_profile_enabled: false,
-            idempotency_key: "provider-custody-12345678".to_owned(),
-            expected_project_revision: 1,
-            egress_policy_revision: Some(1),
-        };
-        command.normalize(false).expect("fixture should normalize");
     }
 
     #[test]
@@ -1581,227 +888,5 @@ mod tests {
             validate_provider_issuer("http://192.0.2.1:8080/", true),
             Err(ApplicationError::InvalidInput)
         );
-    }
-
-    #[tokio::test]
-    async fn signing_retry_converges_after_errors_before_and_after_external_write() {
-        for fault in [WriteFault::BeforeWrite, WriteFault::AfterWrite] {
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let (signer_store, secret_store) = stores(log.clone(), Some(fault), None);
-            let signer_values = signer_store.values.clone();
-            let entropy_calls = Arc::new(Mutex::new(0));
-            let infrastructure = infrastructure(signer_store, secret_store, entropy_calls.clone());
-            let port =
-                RecordingSigningPort::new(log.clone(), ProvisioningOperationState::Prepared, false);
-
-            let first = provision_signing_key_workflow(
-                &port,
-                &infrastructure,
-                Uuid::from_u128(1),
-                "signing-operation-12345678".to_owned(),
-                1,
-                Uuid::new_v4(),
-            )
-            .await;
-            assert_eq!(first, Err(ApplicationError::ExternalStore));
-            assert_eq!(
-                signer_values.lock().unwrap().len(),
-                usize::from(matches!(fault, WriteFault::AfterWrite))
-            );
-
-            let completed = provision_signing_key_workflow(
-                &port,
-                &infrastructure,
-                Uuid::from_u128(1),
-                "signing-operation-12345678".to_owned(),
-                1,
-                Uuid::new_v4(),
-            )
-            .await
-            .expect("retry should reconcile the stable signer alias");
-            assert_eq!(completed.id, Uuid::from_u128(4));
-            assert_eq!(signer_values.lock().unwrap().len(), 1);
-            assert_eq!(*entropy_calls.lock().unwrap(), 2);
-            assert_eq!(
-                *log.lock().unwrap(),
-                [
-                    "key.prepare",
-                    "signer.put",
-                    "key.prepare",
-                    "signer.put",
-                    "signer.public_jwk",
-                    "key.record_material",
-                    "key.publish",
-                ]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn signing_replay_and_digest_conflict_skip_external_effects() {
-        for (state, conflicting_digest, expected_log) in [
-            (
-                ProvisioningOperationState::Completed,
-                false,
-                vec!["key.prepare", "key.get"],
-            ),
-            (
-                ProvisioningOperationState::Prepared,
-                true,
-                vec!["key.prepare"],
-            ),
-        ] {
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let (signer_store, secret_store) = stores(log.clone(), None, None);
-            let signer_values = signer_store.values.clone();
-            let entropy_calls = Arc::new(Mutex::new(0));
-            let infrastructure = infrastructure(signer_store, secret_store, entropy_calls.clone());
-            let port = RecordingSigningPort::new(log.clone(), state, conflicting_digest);
-
-            let result = provision_signing_key_workflow(
-                &port,
-                &infrastructure,
-                Uuid::from_u128(1),
-                "signing-operation-12345678".to_owned(),
-                1,
-                Uuid::new_v4(),
-            )
-            .await;
-            if conflicting_digest {
-                assert_eq!(result, Err(ApplicationError::IdempotencyConflict));
-            } else {
-                assert!(result.is_ok());
-            }
-            assert!(signer_values.lock().unwrap().is_empty());
-            assert_eq!(*entropy_calls.lock().unwrap(), 0);
-            assert_eq!(*log.lock().unwrap(), expected_log);
-        }
-    }
-
-    #[tokio::test]
-    async fn provider_retry_converges_after_errors_before_and_after_external_write() {
-        for fault in [WriteFault::BeforeWrite, WriteFault::AfterWrite] {
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let (signer_store, secret_store) = stores(log.clone(), None, Some(fault));
-            let secret_values = secret_store.values.clone();
-            let infrastructure =
-                infrastructure(signer_store, secret_store, Arc::new(Mutex::new(0)));
-            let port = RecordingProviderPort::new(
-                log.clone(),
-                ProvisioningOperationState::Prepared,
-                false,
-            );
-
-            let first = create_provider_workflow(
-                &port,
-                &infrastructure,
-                Uuid::from_u128(1),
-                provider_command(),
-                Uuid::new_v4(),
-            )
-            .await;
-            assert_eq!(first, Err(ApplicationError::ExternalStore));
-            assert_eq!(
-                secret_values.lock().unwrap().len(),
-                usize::from(matches!(fault, WriteFault::AfterWrite))
-            );
-
-            let completed = create_provider_workflow(
-                &port,
-                &infrastructure,
-                Uuid::from_u128(1),
-                provider_command(),
-                Uuid::new_v4(),
-            )
-            .await
-            .expect("retry should reconcile the stable secret alias");
-            assert_eq!(completed.id, Uuid::from_u128(6));
-            assert_eq!(secret_values.lock().unwrap().len(), 1);
-            assert_eq!(
-                *log.lock().unwrap(),
-                [
-                    "provider.prepare",
-                    "secret.put",
-                    "provider.prepare",
-                    "secret.put",
-                    "secret.ensure_readable",
-                    "provider.mark_stored",
-                    "provider.finalize",
-                ]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn provider_secret_alias_mismatch_fails_before_database_finalization() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let (signer_store, secret_store) = stores(log.clone(), None, None);
-        let command = provider_command();
-        let alias = external_store_alias(
-            &Sha256RequestDigester,
-            "secret",
-            Uuid::from_u128(1),
-            &command.idempotency_key,
-        );
-        secret_store
-            .values
-            .lock()
-            .unwrap()
-            .insert(alias, b"other-secret".to_vec());
-        let infrastructure = infrastructure(signer_store, secret_store, Arc::new(Mutex::new(0)));
-        let port =
-            RecordingProviderPort::new(log.clone(), ProvisioningOperationState::Prepared, false);
-
-        assert_eq!(
-            create_provider_workflow(
-                &port,
-                &infrastructure,
-                Uuid::from_u128(1),
-                command,
-                Uuid::new_v4(),
-            )
-            .await,
-            Err(ApplicationError::Integrity)
-        );
-        assert_eq!(*log.lock().unwrap(), ["provider.prepare", "secret.put"]);
-    }
-
-    #[tokio::test]
-    async fn provider_replay_and_digest_conflict_skip_external_effects() {
-        for (state, conflicting_digest, expected_log) in [
-            (
-                ProvisioningOperationState::Completed,
-                false,
-                vec!["provider.prepare", "provider.get"],
-            ),
-            (
-                ProvisioningOperationState::Prepared,
-                true,
-                vec!["provider.prepare"],
-            ),
-        ] {
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let (signer_store, secret_store) = stores(log.clone(), None, None);
-            let secret_values = secret_store.values.clone();
-            let infrastructure =
-                infrastructure(signer_store, secret_store, Arc::new(Mutex::new(0)));
-            let port = RecordingProviderPort::new(log.clone(), state, conflicting_digest);
-
-            let result = create_provider_workflow(
-                &port,
-                &infrastructure,
-                Uuid::from_u128(1),
-                provider_command(),
-                Uuid::new_v4(),
-            )
-            .await;
-            if conflicting_digest {
-                assert_eq!(result, Err(ApplicationError::IdempotencyConflict));
-            } else {
-                assert!(result.is_ok());
-            }
-            assert!(secret_values.lock().unwrap().is_empty());
-            assert_eq!(*log.lock().unwrap(), expected_log);
-        }
     }
 }

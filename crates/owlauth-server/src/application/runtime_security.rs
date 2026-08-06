@@ -87,7 +87,6 @@ pub(crate) enum ProtectedPurpose {
     EmailOutboxEnvelope,
     EmailOutboxBody,
     EmailIdentityAddress,
-    ApplicationProjectionVerifiedEmail,
     ManagedProviderCredential,
     ManagedReauthorizationPkce,
     ManagedReauthorizationCreateResult,
@@ -106,7 +105,6 @@ impl ProtectedPurpose {
             Self::EmailOutboxEnvelope => "email_outbox_envelope_v1",
             Self::EmailOutboxBody => "email_outbox_body_v1",
             Self::EmailIdentityAddress => "email_identity_address_v1",
-            Self::ApplicationProjectionVerifiedEmail => "application_projection_verified_email_v1",
             Self::ManagedProviderCredential => "managed_provider_credential",
             Self::ManagedReauthorizationPkce => "managed_reauthorization_pkce",
             Self::ManagedReauthorizationCreateResult => "managed_reauthorization_create_result",
@@ -166,16 +164,6 @@ pub(crate) trait RuntimeProtector: Send + Sync {
     /// Immutable process-local key inventory used to fence durable claims before mutation.
     fn readable_key_versions(&self) -> BTreeSet<i32>;
 
-    /// Dedicated projection-email write authority. Legacy/test protectors default to their active
-    /// ring; production split protectors override this with the physically separate ring.
-    fn projection_email_write_version(&self) -> i32 {
-        self.active_version()
-    }
-
-    fn projection_email_readable_versions(&self) -> BTreeSet<i32> {
-        self.readable_key_versions()
-    }
-
     fn random_opaque(&self, bytes: usize) -> Result<Zeroizing<String>, ApplicationError>;
 
     fn digest(
@@ -219,7 +207,7 @@ pub(crate) trait RuntimeProtector: Send + Sync {
 pub(crate) trait RuntimeSigner: Send + Sync {
     async fn sign(
         &self,
-        signer_ref: &str,
+        signing_material_id: Uuid,
         signing_input: &[u8],
     ) -> Result<Vec<u8>, ApplicationError>;
 
@@ -233,7 +221,10 @@ pub(crate) trait RuntimeSigner: Send + Sync {
 
 #[async_trait]
 pub(crate) trait ProviderSecretResolver: Send + Sync {
-    async fn resolve(&self, secret_ref: &str) -> Result<Zeroizing<String>, ApplicationError>;
+    async fn resolve(
+        &self,
+        secret_material_id: Uuid,
+    ) -> Result<Zeroizing<String>, ApplicationError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,7 +379,7 @@ pub(crate) struct ProviderRuntimeContext {
     pub issuer: String,
     pub client_id: String,
     pub callback_url: String,
-    pub secret_ref: String,
+    pub secret_material_id: Uuid,
     pub managed_profile_enabled: bool,
     pub managed_profile_revision: i64,
     pub egress_policy: Option<crate::domain::ProviderEgressPolicy>,

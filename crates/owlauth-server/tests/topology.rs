@@ -1,7 +1,6 @@
 use std::{
-    env, fs,
+    env,
     net::TcpListener,
-    path::PathBuf,
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -15,8 +14,6 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 use tokio::time::sleep;
-use uuid::Uuid;
-
 const POSTGRES_PORT: u16 = 5432;
 const OPERATOR_KEY: &str = "owl_ctrl_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const DIGEST_KEY: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM";
@@ -31,8 +28,6 @@ const PROJECTION_EMAIL_PROTECTION_KEY: &str = "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR
 const MANAGED_CREDENTIAL_KEY: &str = "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY";
 const CLIENT_KEY_DIGEST_KEY: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo";
 const SOFTWARE_CUSTODY_KEY: &str = "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4";
-const SIGNER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
-const SECRET_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
 
 type Environment = Vec<(String, String)>;
 
@@ -66,19 +61,10 @@ async fn start_postgres() -> Option<ContainerAsync<GenericImage>> {
     }
 }
 
-struct TemporaryStores {
-    root: PathBuf,
-}
+struct TestEnvironment;
 
-impl TemporaryStores {
-    fn new() -> Self {
-        let root = env::temp_dir().join(format!("owlauth-topology-{}", Uuid::new_v4()));
-        fs::create_dir_all(root.join("signers")).expect("signer test directory should be created");
-        fs::create_dir_all(root.join("secrets")).expect("secret test directory should be created");
-        Self { root }
-    }
-
-    fn common_environment(&self, postgres_url: &str) -> Environment {
+impl TestEnvironment {
+    fn common_environment(postgres_url: &str) -> Environment {
         vec![
             ("OWLAUTH_INSTANCE_ID".to_owned(), "topology-test".to_owned()),
             ("OWLAUTH_POSTGRES_URL".to_owned(), postgres_url.to_owned()),
@@ -97,19 +83,6 @@ impl TemporaryStores {
             (
                 "OWLAUTH_SOFTWARE_CUSTODY_KEY".to_owned(),
                 SOFTWARE_CUSTODY_KEY.to_owned(),
-            ),
-            (
-                "OWLAUTH_SIGNER_STORE_ROOT".to_owned(),
-                self.root.join("signers").display().to_string(),
-            ),
-            ("OWLAUTH_SIGNER_STORE_KEY".to_owned(), SIGNER_KEY.to_owned()),
-            (
-                "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT".to_owned(),
-                self.root.join("secrets").display().to_string(),
-            ),
-            (
-                "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY".to_owned(),
-                SECRET_KEY.to_owned(),
             ),
             (
                 "OWLAUTH_DATABASE_CONNECT_TIMEOUT_MS".to_owned(),
@@ -149,12 +122,6 @@ impl TemporaryStores {
                 PROJECTION_EMAIL_PROTECTION_KEY.to_owned(),
             ),
         ]
-    }
-}
-
-impl Drop for TemporaryStores {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -339,10 +306,6 @@ fn runtime_environment(common: &Environment, port: u16) -> Environment {
         (
             "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
             ADMISSION_DIGEST_KEY.to_owned(),
-        ),
-        (
-            "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
-            "https://accounts.example/".to_owned(),
         ),
     ]);
     result
@@ -557,30 +520,83 @@ async fn create_and_acknowledge_client_key(
     credential
 }
 
-async fn provision_signing_key(
+async fn wait_for_active_signing_key(
+    client: &Client,
+    control_base: &str,
+    project_id: &str,
+    expected_key_id: Option<&str>,
+) {
+    for _ in 0..1_200 {
+        let response = client
+            .get(format!(
+                "{control_base}v1/projects/{project_id}/signing-keys"
+            ))
+            .bearer_auth(OPERATOR_KEY)
+            .send()
+            .await
+            .expect("Control signing-key inventory should respond");
+        if response.status() == StatusCode::OK {
+            let inventory = serde_json::from_slice::<Value>(
+                &response
+                    .bytes()
+                    .await
+                    .expect("signing-key inventory should be readable"),
+            )
+            .expect("signing-key inventory should be JSON");
+            if inventory["items"].as_array().is_some_and(|items| {
+                items.iter().any(|key| {
+                    key["state"] == "active"
+                        && expected_key_id
+                            .is_none_or(|expected| key["id"].as_str() == Some(expected))
+                })
+            }) {
+                return;
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("signing-key lifecycle did not activate the expected key");
+}
+
+async fn request_signing_key_rotation(
     client: &Client,
     control_base: &str,
     project: &ProjectIdentity,
     suffix: &str,
 ) {
+    wait_for_active_signing_key(client, control_base, &project.id, None).await;
     let response = client
         .post(format!(
-            "{control_base}v1/projects/{}/signing-keys",
+            "{control_base}v1/projects/{}/signing-keys/rotate",
             project.id
         ))
         .bearer_auth(OPERATOR_KEY)
-        .header("Idempotency-Key", format!("topology-{suffix}-signer"))
+        .header(
+            "Idempotency-Key",
+            format!("topology-{suffix}-signer-rotation"),
+        )
         .header("Content-Type", "application/json")
         .body(
             serde_json::to_vec(&json!({
                 "expected_project_revision": project.metadata_revision
             }))
-            .expect("signing-key request should serialize"),
+            .expect("signing-key rotation request should serialize"),
         )
         .send()
         .await
-        .expect("Control signing-key provisioning should respond");
+        .expect("Control signing-key rotation should respond");
     assert_eq!(response.status(), StatusCode::OK);
+    let accepted = serde_json::from_slice::<Value>(
+        &response
+            .bytes()
+            .await
+            .expect("signing-key rotation response should be readable"),
+    )
+    .expect("signing-key rotation response should be JSON");
+    let key_id = accepted["id"]
+        .as_str()
+        .expect("signing-key rotation response should contain id");
+    wait_for_active_signing_key(client, control_base, &project.id, Some(key_id)).await;
 }
 
 async fn assert_runtime_reads_project(client: &Client, runtime_base: &str, public_id: &str) {
@@ -596,11 +612,10 @@ async fn assert_runtime_reads_project(client: &Client, runtime_base: &str, publi
         .bytes()
         .await
         .expect("JWKS response body should be readable");
-    assert_eq!(
+    assert!(
         serde_json::from_slice::<Value>(&body).expect("JWKS response should be JSON")["keys"]
             .as_array()
-            .map(Vec::len),
-        Some(1)
+            .is_some_and(|keys| !keys.is_empty())
     );
 }
 
@@ -683,8 +698,7 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
         .await
         .expect("PostgreSQL port should be available");
     let primary_url = database_url(&host, port, "owlauth_topology");
-    let stores = TemporaryStores::new();
-    let common = stores.common_environment(&primary_url);
+    let common = TestEnvironment::common_environment(&primary_url);
     let client = Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -720,7 +734,7 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
         &combined_client_credential,
     )
     .await;
-    provision_signing_key(
+    request_signing_key_rotation(
         &client,
         &combined_control_base,
         &combined_project,
@@ -748,7 +762,7 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
     let split_project = create_project(&client, &control_base, "split").await;
     let split_client_credential =
         create_and_acknowledge_client_key(&client, &control_base, &split_project, "split").await;
-    provision_signing_key(&client, &control_base, &split_project, "split").await;
+    request_signing_key_rotation(&client, &control_base, &split_project, "split").await;
     assert_runtime_reads_project(&client, &runtime_base, &split_project.public_id).await;
     assert_client_reads_project(
         &client,
@@ -809,7 +823,7 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
 
     create_secondary_database(&primary_url).await;
     let secondary_url = database_url(&host, port, "owlauth_other");
-    let secondary_common = stores.common_environment(&secondary_url);
+    let secondary_common = TestEnvironment::common_environment(&secondary_url);
     let secondary_runtime_port = free_port();
     let secondary_client_port = free_port();
     let secondary_control_port = free_port();

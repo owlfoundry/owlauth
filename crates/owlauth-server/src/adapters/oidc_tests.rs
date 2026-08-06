@@ -902,9 +902,9 @@ struct TestSecretResolver;
 impl ProviderSecretResolver for TestSecretResolver {
     async fn resolve(
         &self,
-        secret_ref: &str,
+        secret_material_id: uuid::Uuid,
     ) -> Result<Zeroizing<String>, crate::application::ApplicationError> {
-        if secret_ref != "secret://managed-test" {
+        if secret_material_id != uuid::Uuid::from_u128(1) {
             return Err(crate::application::ApplicationError::NotFound);
         }
         Ok(Zeroizing::new("secret-123".to_owned()))
@@ -945,7 +945,7 @@ fn managed_guard(origin: &str) -> ConnectionGuard {
         issuer: origin.to_owned(),
         subject: "subject-123".to_owned(),
         client_id: "client-123".to_owned(),
-        secret_ref: "secret://managed-test".to_owned(),
+        secret_material_id: uuid::Uuid::from_u128(1),
     }
 }
 

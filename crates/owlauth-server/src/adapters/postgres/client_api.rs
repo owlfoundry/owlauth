@@ -258,39 +258,13 @@ impl PostgresClientApiRepository {
             .iter()
             .map(user_status)
             .collect::<Result<Vec<_>, _>>()?;
-        let needs_verified_email = users.iter().zip(&statuses).any(|(user, status)| {
-            *status == ClientUserStatus::Active && user.primary_source_kind == "email"
-        });
-        let email_projection_enabled = if needs_verified_email {
-            database
-                .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "SELECT projection_verified_email_enabled
-                       FROM project_policies WHERE project_id=$1",
-                    [users
-                        .first()
-                        .ok_or(ApplicationError::Integrity)?
-                        .project_id
-                        .into()],
-                ))
-                .await
-                .map_err(persistence)?
-                .ok_or(ApplicationError::Integrity)?
-                .try_get::<bool>("", "projection_verified_email_enabled")
-                .map_err(persistence)?
-        } else {
-            false
-        };
-
         let mut identity_ids = Vec::new();
-        if email_projection_enabled {
-            for (user, status) in users.iter().zip(&statuses) {
-                if *status == ClientUserStatus::Active && user.primary_source_kind == "email" {
-                    identity_ids.push(
-                        user.primary_email_identity_id
-                            .ok_or(ApplicationError::Integrity)?,
-                    );
-                }
+        for (user, status) in users.iter().zip(&statuses) {
+            if *status == ClientUserStatus::Active && user.primary_source_kind == "email" {
+                identity_ids.push(
+                    user.primary_email_identity_id
+                        .ok_or(ApplicationError::Integrity)?,
+                );
             }
         }
         identity_ids.sort_unstable();
@@ -337,41 +311,39 @@ impl PostgresClientApiRepository {
             .into_iter()
             .zip(statuses)
             .map(|(user, status)| {
-                let primary_verified_email = if email_projection_enabled
-                    && status == ClientUserStatus::Active
-                    && user.primary_source_kind == "email"
-                {
-                    let identity_id = user
-                        .primary_email_identity_id
-                        .ok_or(ApplicationError::Integrity)?;
-                    let (owner, identity_status, ciphertext, key_version, verified_at) =
-                        email_sources
-                            .get(&identity_id)
+                let primary_verified_email =
+                    if status == ClientUserStatus::Active && user.primary_source_kind == "email" {
+                        let identity_id = user
+                            .primary_email_identity_id
                             .ok_or(ApplicationError::Integrity)?;
-                    if *owner != user.id {
-                        return Err(ApplicationError::Integrity);
-                    }
-                    if identity_status == "disabled" && verified_at.is_some() {
-                        None
-                    } else if identity_status == "active" && verified_at.is_some() {
-                        Some(
-                            self.source_reader
-                                .read_durable_address(
-                                    user.project_id,
-                                    identity_id,
-                                    &ProtectedValue {
-                                        ciphertext: ciphertext.clone(),
-                                        key_version: *key_version,
-                                    },
-                                )?
-                                .to_string(),
-                        )
+                        let (owner, identity_status, ciphertext, key_version, verified_at) =
+                            email_sources
+                                .get(&identity_id)
+                                .ok_or(ApplicationError::Integrity)?;
+                        if *owner != user.id {
+                            return Err(ApplicationError::Integrity);
+                        }
+                        if identity_status == "disabled" && verified_at.is_some() {
+                            None
+                        } else if identity_status == "active" && verified_at.is_some() {
+                            Some(
+                                self.source_reader
+                                    .read_durable_address(
+                                        user.project_id,
+                                        identity_id,
+                                        &ProtectedValue {
+                                            ciphertext: ciphertext.clone(),
+                                            key_version: *key_version,
+                                        },
+                                    )?
+                                    .to_string(),
+                            )
+                        } else {
+                            return Err(ApplicationError::Integrity);
+                        }
                     } else {
-                        return Err(ApplicationError::Integrity);
-                    }
-                } else {
-                    None
-                };
+                        None
+                    };
                 Ok(ClientUser {
                     project_public_id: project_public_id.to_owned(),
                     user_public_id: user.public_id,

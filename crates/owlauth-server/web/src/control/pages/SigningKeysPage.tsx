@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 
 import { EmptyState, PageHeader } from "../../shared/layout/Layout";
@@ -14,31 +14,105 @@ export function SigningKeysPage() {
   const project = useProject(projectId);
   const { session, handleError, setMessage } = useControl();
   const [keys, setKeys] = useState<SigningKey[]>([]);
+  const [inventoryProjectId, setInventoryProjectId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "failed">("loading");
+  const requestGeneration = useRef(0);
+  const currentProjectId = project?.id ?? null;
+  const currentProjectIdRef = useRef(currentProjectId);
+  useLayoutEffect(() => {
+    currentProjectIdRef.current = currentProjectId;
+    return () => {
+      currentProjectIdRef.current = null;
+    };
+  }, [currentProjectId]);
 
-  const refresh = useCallback(async () => {
-    if (project === null) return;
-    setLoadState("loading");
-    try {
-      const result = await session.client.GET("/v1/projects/{project_id}/signing-keys", {
-        params: { path: { project_id: project.id } },
-      });
-      setKeys(requireData(result.data, result.error, result.response).items);
-      setLoadState("ready");
-    } catch (error) {
-      setLoadState("failed");
-      throw error;
-    }
-  }, [project, session]);
+  const refresh = useCallback(
+    async (showLoading = true, signal?: AbortSignal) => {
+      if (project === null) return;
+      const requestedProjectId = project.id;
+      if (currentProjectIdRef.current !== requestedProjectId) return;
+      const generation = requestGeneration.current + 1;
+      requestGeneration.current = generation;
+      if (showLoading) {
+        setInventoryProjectId(requestedProjectId);
+        setLoadState("loading");
+      }
+      try {
+        const result = await session.client.GET("/v1/projects/{project_id}/signing-keys", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        });
+        const items = requireData(result.data, result.error, result.response).items;
+        if (
+          signal?.aborted === true ||
+          generation !== requestGeneration.current ||
+          currentProjectIdRef.current !== requestedProjectId
+        )
+          return;
+        setKeys(items);
+        setInventoryProjectId(requestedProjectId);
+        setLoadState("ready");
+      } catch (error) {
+        if (
+          signal?.aborted === true ||
+          generation !== requestGeneration.current ||
+          currentProjectIdRef.current !== requestedProjectId
+        )
+          return;
+        setInventoryProjectId(requestedProjectId);
+        setLoadState("failed");
+        throw error;
+      }
+    },
+    [project, session],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void refresh().catch(handleError);
+      void refresh(true, controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void handleError(error);
+      });
     }, 0);
     return () => {
+      controller.abort();
       window.clearTimeout(timer);
     };
   }, [handleError, refresh]);
+
+  const visibleLoadState =
+    project !== null && inventoryProjectId === project.id ? loadState : "loading";
+  const maintenancePending =
+    visibleLoadState === "ready" &&
+    (keys.length === 0 ||
+      keys.some((key) => ["provisioning", "published", "retiring"].includes(key.state)));
+  useEffect(() => {
+    if (!maintenancePending) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const controller = new AbortController();
+    const poll = async () => {
+      try {
+        await refresh(false, controller.signal);
+      } catch (error) {
+        if (!cancelled && !controller.signal.aborted) await handleError(error);
+        return;
+      }
+      if (!cancelled && !controller.signal.aborted) {
+        timer = window.setTimeout(() => {
+          void poll();
+        }, 500);
+      }
+    };
+    timer = window.setTimeout(() => {
+      void poll();
+    }, 500);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [handleError, maintenancePending, refresh]);
 
   if (project === null) {
     return (
@@ -55,10 +129,10 @@ export function SigningKeysPage() {
     <div className={styles["page"]}>
       <PageHeader
         title="Signing keys"
-        description="Provision, activate, rotate, retire, and recover Project signing authority."
+        description="Review automatically managed Project signing authority and request rotations."
       />
-      {loadState === "loading" ? <p role="status">Loading signing keys</p> : null}
-      {loadState === "failed" ? (
+      {visibleLoadState === "loading" ? <p role="status">Loading signing keys</p> : null}
+      {visibleLoadState === "failed" ? (
         <InlineAlert tone="danger" role="alert">
           <p>The signing-key inventory could not be loaded.</p>
           <Button type="button" onClick={() => void refresh().catch(handleError)}>
@@ -66,15 +140,19 @@ export function SigningKeysPage() {
           </Button>
         </InlineAlert>
       ) : null}
-      {loadState === "ready" ? (
+      {visibleLoadState === "ready" ? (
         <SigningKeyManagement
           session={session}
           project={project}
           keys={keys}
           onChanged={refresh}
-          onError={(error) => handleError(error, refresh)}
+          onError={(error) =>
+            currentProjectIdRef.current === project.id
+              ? handleError(error, refresh)
+              : Promise.resolve()
+          }
           setMessage={(message) => {
-            setMessage(message, "success");
+            if (currentProjectIdRef.current === project.id) setMessage(message, "success");
           }}
         />
       ) : null}

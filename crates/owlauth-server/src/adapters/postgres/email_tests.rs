@@ -1,13 +1,23 @@
-use std::{
-    collections::BTreeMap,
-    env,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{collections::BTreeMap, env, sync::Arc};
 
-use async_trait::async_trait;
+use super::{
+    authentication::PostgresAuthenticationRepository, email::PostgresPasswordlessEmailRepository,
+    email_control::PostgresEmailControlRepository,
+    projection::PostgresIdentityProjectionMaterializer, readiness::PostgresReadinessAdapter,
+    runtime_authority::PostgresRuntimeAuthorityRepository,
+};
+use crate::adapters::runtime_security::{
+    RuntimeKeyMaterial, SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
+    UnavailableDurableEmailAddressReader,
+};
+use crate::application::{
+    AdmittedEmailMethod, AuthenticationRepository, BindHostedBrowser, CommitEmailGeneration,
+    CompleteEmailProof, CreateLoginTransaction, EmailControlPort, EmailProofKind,
+    EstablishMagicTransferContext, LoginRevisionSnapshot, MailOutboxRepository,
+    MailTransportOutcome, PasswordlessEmailRepository, ProtectedValue, ResolveMagicTransferContext,
+    RuntimeAuthorityRepository, RuntimeProtector, SelectEmailMethod, VerifyEmailProof,
+    VersionedDigest,
+};
 use sea_orm::Database;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -18,128 +28,9 @@ use testcontainers::{
 };
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
-use zeroize::Zeroizing;
-
-use super::{
-    authentication::PostgresAuthenticationRepository, email::PostgresPasswordlessEmailRepository,
-    email_control::PostgresEmailControlRepository, readiness::PostgresReadinessAdapter,
-    runtime_authority::PostgresRuntimeAuthorityRepository,
-};
-use crate::adapters::{
-    runtime_security::{
-        EncryptedFileProviderSecretResolver, RuntimeKeyMaterial, SoftwareRuntimeProtector,
-    },
-    software_store::EncryptedFileStore,
-    system::{Sha256RequestDigester, SystemClock},
-};
-use crate::application::{
-    AdmittedEmailMethod, AuthenticationRepository, BindHostedBrowser, CommitEmailGeneration,
-    CompleteEmailProof, ConfigurationSecretProvisioner, CreateLoginTransaction,
-    CreateSmtpConfiguration, DeploymentSmtpDesiredStatus, DeploymentSmtpGeneration,
-    DeploymentSmtpRegistry, EmailControlPort, EmailControlService, EmailProofKind,
-    EstablishMagicTransferContext, LoginRevisionSnapshot, MailOutboxRepository,
-    MailTransportOutcome, PasswordlessEmailRepository, PrepareSmtpConfiguration, PrepareSmtpTest,
-    ProtectedValue, ResolveMagicTransferContext, RuntimeAuthorityRepository, RuntimeProtector,
-    SelectEmailMethod, SmtpControlStatus, SmtpControlTlsMode, SmtpTlsMode, VerifyEmailProof,
-    VersionedDigest,
-};
 
 const POSTGRES_PORT: u16 = 5432;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
-async fn seed_legacy_deployment_smtp(pool: &PgPool, generation: &DeploymentSmtpGeneration) {
-    let tls_mode = match generation.tls_mode {
-        SmtpTlsMode::ImplicitTls => "implicit_tls",
-        SmtpTlsMode::StartTlsRequired => "starttls_required",
-        SmtpTlsMode::DevelopmentLoopbackPlaintext => {
-            panic!("legacy deployment fixture is TLS-only")
-        }
-    };
-    sqlx::query(
-        "INSERT INTO deployment_smtp_generations
-         (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
-          sender_address,credential_ref,safe_fingerprint,explicitly_allowed_private_ips,
-          material_owner_id)
-         VALUES ($1,'reconciled',1,1,$2,$3,$4,$5,$6,$7,$8,$9)",
-    )
-    .bind(generation.generation)
-    .bind(&generation.host)
-    .bind(i32::from(generation.port))
-    .bind(tls_mode)
-    .bind(&generation.sender_address)
-    .bind(&generation.credential_ref)
-    .bind(generation.safe_fingerprint.to_vec())
-    .bind(serde_json::json!(
-        generation
-            .explicitly_allowed_private_ips
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    ))
-    .bind(Uuid::new_v4())
-    .execute(pool)
-    .await
-    .expect("seed legacy deployment SMTP generation");
-}
-
-#[derive(Default)]
-struct CountingSmtpProvisioner {
-    writes: AtomicUsize,
-}
-
-struct BarrierSmtpProvisioner {
-    entered: tokio::sync::Semaphore,
-    release: tokio::sync::Semaphore,
-    writes: AtomicUsize,
-}
-
-impl BarrierSmtpProvisioner {
-    fn new() -> Self {
-        Self {
-            entered: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
-            writes: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait]
-impl ConfigurationSecretProvisioner for BarrierSmtpProvisioner {
-    fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
-        Sha256::digest(value).into()
-    }
-
-    async fn provision_if_absent(
-        &self,
-        _alias: String,
-        _value: Zeroizing<Vec<u8>>,
-    ) -> Result<(), crate::application::ApplicationError> {
-        self.writes.fetch_add(1, Ordering::SeqCst);
-        self.entered.add_permits(1);
-        self.release
-            .acquire()
-            .await
-            .expect("test provision barrier remains open")
-            .forget();
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ConfigurationSecretProvisioner for CountingSmtpProvisioner {
-    fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
-        Sha256::digest(value).into()
-    }
-
-    async fn provision_if_absent(
-        &self,
-        _alias: String,
-        _value: Zeroizing<Vec<u8>>,
-    ) -> Result<(), crate::application::ApplicationError> {
-        self.writes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
 
 fn digest(value: u8) -> VersionedDigest {
     digest_at(value, 1)
@@ -179,6 +70,21 @@ fn runtime_protector(
             .collect::<BTreeMap<_, _>>(),
     )
     .expect("test Runtime protector")
+}
+
+fn test_projection_materializer() -> Arc<PostgresIdentityProjectionMaterializer> {
+    Arc::new(PostgresIdentityProjectionMaterializer::new(
+        Arc::new(UnavailableDurableEmailAddressReader),
+        Arc::new(
+            SoftwareProjectionVerifiedEmailProtector::new(
+                "email-tests-projection".to_owned(),
+                1,
+                [73; 32],
+                BTreeMap::new(),
+            )
+            .expect("email test projection protector"),
+        ),
+    ))
 }
 
 fn docker_is_required() -> bool {
@@ -546,6 +452,77 @@ async fn start_postgres() -> Option<(testcontainers::ContainerAsync<GenericImage
 }
 
 #[allow(
+    clippy::too_many_arguments,
+    reason = "the SMTP generation fixture mirrors the complete persisted owner identity"
+)]
+async fn seed_project_smtp_generation(
+    pool: &PgPool,
+    project_id: Uuid,
+    source_id: Uuid,
+    configuration_id: Uuid,
+    generation: i32,
+    status: &str,
+    fingerprint: [u8; 32],
+    now: OffsetDateTime,
+) {
+    let material_id = Uuid::new_v4();
+    let mut transaction = pool
+        .begin()
+        .await
+        .expect("Project SMTP generation transaction should begin");
+    sqlx::query(
+        "INSERT INTO protected_materials
+         (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+          provider_id,provider_format_version,context_version,context_digest,state)
+         VALUES ($1,'project',$2,'project_smtp',$3,$4,'configuration_secret',
+                 'software',1,1,$5,'pending')",
+    )
+    .bind(material_id)
+    .bind(project_id)
+    .bind(configuration_id)
+    .bind(i64::from(generation))
+    .bind(vec![u8::try_from(generation).unwrap_or(1); 32])
+    .execute(&mut *transaction)
+    .await
+    .expect("reserve Project SMTP material");
+    sqlx::query(
+        "INSERT INTO project_smtp_configurations
+         (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
+          tls_mode,sender_address,sender_name,reply_to,safe_fingerprint,
+          credential_material_id,created_at,updated_at)
+         SELECT $1,project_id,$2,$3,1,1,host,port,tls_mode,sender_address,sender_name,reply_to,
+                $4,$5,$6,$6
+         FROM project_smtp_configurations WHERE project_id=$7 AND id=$8",
+    )
+    .bind(configuration_id)
+    .bind(status)
+    .bind(generation)
+    .bind(fingerprint.to_vec())
+    .bind(material_id)
+    .bind(now)
+    .bind(project_id)
+    .bind(source_id)
+    .execute(&mut *transaction)
+    .await
+    .expect("seed Project SMTP generation");
+    sqlx::query(
+        "UPDATE protected_materials
+         SET state='live',opaque_value=$2,safe_fingerprint=$3,updated_at=$4 WHERE id=$1",
+    )
+    .bind(material_id)
+    .bind(vec![u8::try_from(generation).unwrap_or(1); 64])
+    .bind(fingerprint.to_vec())
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .expect("finalize Project SMTP material");
+    transaction
+        .commit()
+        .await
+        .expect("Project SMTP generation owner and material should commit atomically");
+}
+
+#[allow(
     clippy::too_many_lines,
     reason = "the shared PostgreSQL fixture seeds one complete email authority graph"
 )]
@@ -620,21 +597,55 @@ async fn seed_email_authority(
     .execute(pool)
     .await
     .expect("seed email Project signing ring");
+    let signing_key_id = Uuid::new_v4();
+    let signing_material_id = Uuid::new_v4();
+    let mut signing_transaction = pool
+        .begin()
+        .await
+        .expect("signing fixture transaction should begin");
+    sqlx::query(
+        "INSERT INTO protected_materials
+         (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+          provider_id,provider_format_version,context_version,context_digest,state)
+         VALUES ($1,'project',$2,'signing_key',$3,1,'signing_key','software',1,1,$4,'pending')",
+    )
+    .bind(signing_material_id)
+    .bind(project_id)
+    .bind(signing_key_id)
+    .bind(vec![11_u8; 32])
+    .execute(&mut *signing_transaction)
+    .await
+    .expect("reserve active signing material");
     sqlx::query(
         "INSERT INTO project_signing_keys
-           (id,project_id,ring_id,kid,public_jwk,signer_ref,state,ring_revision,
-            provisioned_at,published_at,activated_at,sign_not_before)
+           (id,project_id,ring_id,kid,public_jwk,state,ring_revision,
+            provisioned_at,published_at,activated_at,sign_not_before,
+            signer_material_id,signer_material_generation)
          VALUES ($1,$2,$3,'kid_email_ready',
            '{\"alg\":\"EdDSA\",\"crv\":\"Ed25519\",\"kid\":\"kid_email_ready\",\"kty\":\"OKP\",\"use\":\"sig\",\"x\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}'::jsonb,
-           'signer/email/ready','active',1,$4,$4,$4,$4)",
+           'active',1,$4,$4,$4,$4,$5,1)",
     )
-    .bind(Uuid::new_v4())
+    .bind(signing_key_id)
     .bind(project_id)
     .bind(ring_id)
     .bind(now)
-    .execute(pool)
+    .bind(signing_material_id)
+    .execute(&mut *signing_transaction)
     .await
     .expect("seed active email Project signing key");
+    sqlx::query(
+        "UPDATE protected_materials SET state='live',opaque_value=$2,updated_at=$3 WHERE id=$1",
+    )
+    .bind(signing_material_id)
+    .bind(vec![12_u8; 64])
+    .bind(now)
+    .execute(&mut *signing_transaction)
+    .await
+    .expect("finalize active signing material");
+    signing_transaction
+        .commit()
+        .await
+        .expect("signing fixture owner and material should commit atomically");
     sqlx::query(
         "UPDATE project_email_policies SET status='enabled', policy_revision=2, security_revision=2,
          otp_enabled=TRUE, magic_link_enabled=TRUE, otp_digits=6, otp_validity_seconds=600,
@@ -654,20 +665,56 @@ async fn seed_email_authority(
     .execute(pool)
     .await
     .expect("seed email assignment");
+    let smtp_material_id = Uuid::new_v4();
+    let mut smtp_transaction = pool
+        .begin()
+        .await
+        .expect("SMTP fixture transaction should begin");
+    sqlx::query(
+        "INSERT INTO protected_materials
+         (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+          provider_id,provider_format_version,context_version,context_digest,state)
+         VALUES ($1,'project',$2,'project_smtp',$3,1,'configuration_secret',
+                 'software',1,1,$4,'pending')",
+    )
+    .bind(smtp_material_id)
+    .bind(project_id)
+    .bind(smtp_id)
+    .bind(vec![13_u8; 32])
+    .execute(&mut *smtp_transaction)
+    .await
+    .expect("reserve SMTP material");
     sqlx::query(
         "INSERT INTO project_smtp_configurations
          (id, project_id, status, generation, revision, security_eligibility_revision, host, port,
-          tls_mode, sender_address, sender_name, reply_to, credential_ref, safe_fingerprint, created_at, updated_at)
+          tls_mode, sender_address, sender_name, reply_to, safe_fingerprint,
+          credential_material_id, created_at, updated_at)
          VALUES ($1,$2,'active',1,1,1,'smtp.example.com',465,'implicit_tls','login@example.com',
-          'OwlAuth 登录','reply@example.com','smtp_test_ref',$3,$4,$4)",
+          'OwlAuth 登录','reply@example.com',$3,$4,$5,$5)",
     )
     .bind(smtp_id)
     .bind(project_id)
     .bind(vec![7_u8; 32])
+    .bind(smtp_material_id)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *smtp_transaction)
     .await
     .expect("seed SMTP");
+    sqlx::query(
+        "UPDATE protected_materials
+         SET state='live',opaque_value=$2,safe_fingerprint=$3,updated_at=$4 WHERE id=$1",
+    )
+    .bind(smtp_material_id)
+    .bind(vec![14_u8; 64])
+    .bind(vec![7_u8; 32])
+    .bind(now)
+    .execute(&mut *smtp_transaction)
+    .await
+    .expect("finalize SMTP material");
+    smtp_transaction
+        .commit()
+        .await
+        .expect("SMTP fixture owner and material should commit atomically");
     let runtime_incarnation = Uuid::nil();
     sqlx::query(
         "INSERT INTO runtime_process_incarnations
@@ -784,391 +831,8 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     let now = OffsetDateTime::now_utc();
     let (project_id, application_id, smtp_id, email_method) =
         seed_email_authority(&pool, now).await;
-    let email_control = PostgresEmailControlRepository::new(database.clone());
     let email = PostgresPasswordlessEmailRepository::new(database.clone());
-    sqlx::query(
-        "DELETE FROM project_smtp_runtime_readiness
-         WHERE project_id=$1 AND configuration_id=$2",
-    )
-    .bind(project_id)
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .expect("remove background readiness fixture before Runtime SMTP test");
-    let operation_id = Uuid::new_v4();
-    let smtp_test = PrepareSmtpTest {
-        id: operation_id,
-        configuration_id: smtp_id,
-        recipient_ref: "smtp_test_recipient_ref".to_owned(),
-        idempotency_key: "smtp-test-stable-1".to_owned(),
-        request_digest: vec![44; 32],
-        expected_revision: 1,
-        correlation_id: Uuid::new_v4(),
-    };
-    let prepared = email_control
-        .prepare_smtp_test(project_id, smtp_test.clone(), now)
-        .await
-        .expect("enqueue durable SMTP test");
-    assert_eq!(
-        prepared.record.state,
-        crate::application::SmtpTestState::Preparing
-    );
-    let test_barrier = Arc::new(BarrierSmtpProvisioner::new());
-    let paused_repository = PostgresEmailControlRepository::new(database.clone());
-    let paused_barrier = test_barrier.clone();
-    let paused_digest = smtp_test.request_digest.clone();
-    let paused = tokio::spawn(async move {
-        paused_repository
-            .provision_and_finalize_smtp_test_enqueue(
-                project_id,
-                operation_id,
-                &paused_digest,
-                paused_barrier.as_ref(),
-                Zeroizing::new(b"recipient@example.com".to_vec()),
-                now,
-            )
-            .await
-    });
-    test_barrier
-        .entered
-        .acquire()
-        .await
-        .expect("SMTP-test provisioning reaches external barrier")
-        .forget();
-    let concurrent = CountingSmtpProvisioner::default();
-    let prepared = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        email_control.provision_and_finalize_smtp_test_enqueue(
-            project_id,
-            operation_id,
-            &smtp_test.request_digest,
-            &concurrent,
-            Zeroizing::new(b"recipient@example.com".to_vec()),
-            now,
-        ),
-    )
-    .await
-    .expect("same-operation database claim progresses while external store is paused")
-    .expect("concurrent same-reference retry finalizes");
-    assert_eq!(prepared.state, crate::application::SmtpTestState::Pending);
-    test_barrier.release.add_permits(1);
-    let converged = paused
-        .await
-        .expect("join paused SMTP-test provisioning")
-        .expect("paused caller converges on concurrent finalize");
-    assert_eq!(converged.id, prepared.id);
-    assert_eq!(test_barrier.writes.load(Ordering::SeqCst), 1);
-    assert_eq!(concurrent.writes.load(Ordering::SeqCst), 1);
-    let replay = email_control
-        .prepare_smtp_test(project_id, smtp_test.clone(), now)
-        .await
-        .expect("idempotent pending replay");
-    assert_eq!(replay.record.id, operation_id);
-    let claimed = email
-        .claim_smtp_test("runtime-a", now, now + Duration::seconds(30))
-        .await
-        .expect("claim test")
-        .expect("test available");
-    assert_eq!(claimed.idempotency_key, "smtp-test-stable-1");
-    assert!(
-        email
-            .claim_smtp_test("runtime-b", now, now + Duration::seconds(30))
-            .await
-            .expect("second claim")
-            .is_none()
-    );
-    email
-        .finish_smtp_test(
-            &claimed,
-            MailTransportOutcome::Delivered,
-            now + Duration::seconds(1),
-        )
-        .await
-        .expect("finish Runtime SMTP test");
-    let test_readiness: (String, Uuid, bool) = sqlx::query_as(
-        "SELECT state,process_incarnation,lease_expires_at>$3
-         FROM project_smtp_runtime_readiness
-         WHERE project_id=$1 AND configuration_id=$2 AND process_id='runtime-1'",
-    )
-    .bind(project_id)
-    .bind(smtp_id)
-    .bind(now + Duration::seconds(1))
-    .fetch_one(&pool)
-    .await
-    .expect("delivered Runtime SMTP test publishes exact-generation readiness atomically");
-    assert_eq!(test_readiness, ("ready".to_owned(), Uuid::nil(), true));
-    let delivered = email_control
-        .get_smtp_test(project_id, operation_id)
-        .await
-        .expect("read result");
-    assert_eq!(
-        delivered.state,
-        crate::application::SmtpTestState::Delivered
-    );
-    assert_eq!(delivered.outcome, Some(MailTransportOutcome::Delivered));
-    let cleanup = email
-        .claim_smtp_secret_cleanup(
-            "runtime-cleanup",
-            now + Duration::seconds(2),
-            now + Duration::seconds(32),
-        )
-        .await
-        .expect("claim recipient cleanup")
-        .expect("terminal recipient requires erasure");
-    assert_eq!(cleanup.recipient_ref, "smtp_test_recipient_ref");
-    email
-        .finish_smtp_secret_cleanup(&cleanup, now + Duration::seconds(3))
-        .await
-        .expect("record recipient erasure");
-    assert!(matches!(
-        email_control
-            .prepare_smtp_test(
-                project_id,
-                PrepareSmtpTest {
-                    request_digest: vec![45; 32],
-                    ..smtp_test.clone()
-                },
-                now
-            )
-            .await,
-        Err(crate::application::ApplicationError::IdempotencyConflict)
-    ));
-
-    let abandoned_id = Uuid::new_v4();
-    let abandoned = email_control
-        .prepare_smtp_test(
-            project_id,
-            PrepareSmtpTest {
-                id: abandoned_id,
-                idempotency_key: "smtp-test-abandoned-1".to_owned(),
-                request_digest: vec![46; 32],
-                recipient_ref: "smtp_test_abandoned_recipient".to_owned(),
-                ..smtp_test.clone()
-            },
-            now,
-        )
-        .await
-        .expect("prepare abandoned test");
-    assert_eq!(
-        abandoned.record.state,
-        crate::application::SmtpTestState::Preparing
-    );
-    let abandoned = email_control
-        .provision_and_finalize_smtp_test_enqueue(
-            project_id,
-            abandoned_id,
-            &[46; 32],
-            &CountingSmtpProvisioner::default(),
-            Zeroizing::new(b"recipient@example.com".to_vec()),
-            now,
-        )
-        .await
-        .expect("enqueue abandoned test");
-    assert_eq!(abandoned.state, crate::application::SmtpTestState::Pending);
-    let _lost = email
-        .claim_smtp_test("runtime-lost", now, now + Duration::seconds(30))
-        .await
-        .expect("claim abandoned")
-        .expect("abandoned available");
-    assert!(
-        email
-            .claim_smtp_test(
-                "runtime-skewed",
-                now + Duration::hours(1),
-                now + Duration::hours(1) + Duration::seconds(30),
-            )
-            .await
-            .expect("caller clock cannot expire a database-clock lease")
-            .is_none()
-    );
-    assert_eq!(
-        email_control
-            .get_smtp_test(project_id, abandoned_id)
-            .await
-            .expect("live database lease remains submitting")
-            .state,
-        crate::application::SmtpTestState::Submitting
-    );
-    sqlx::query(
-        "UPDATE project_smtp_test_operations
-         SET lease_expires_at=clock_timestamp()-interval '1 second'
-         WHERE project_id=$1 AND id=$2",
-    )
-    .bind(project_id)
-    .bind(abandoned_id)
-    .execute(&pool)
-    .await
-    .expect("expire SMTP-test lease with PostgreSQL clock");
-    assert!(
-        email
-            .claim_smtp_test(
-                "runtime-restart",
-                now + Duration::seconds(31),
-                now + Duration::seconds(61),
-            )
-            .await
-            .expect("recover ambiguity")
-            .is_none()
-    );
-    let ambiguous = email_control
-        .get_smtp_test(project_id, abandoned_id)
-        .await
-        .expect("read ambiguity");
-    assert_eq!(
-        ambiguous.state,
-        crate::application::SmtpTestState::Ambiguous
-    );
-    assert_eq!(ambiguous.outcome, Some(MailTransportOutcome::Ambiguous));
-
-    let expired_id = Uuid::new_v4();
-    email_control
-        .prepare_smtp_test(
-            project_id,
-            PrepareSmtpTest {
-                id: expired_id,
-                idempotency_key: "smtp-test-expired-1".to_owned(),
-                request_digest: vec![47; 32],
-                recipient_ref: "smtp_test_expired_recipient".to_owned(),
-                ..smtp_test
-            },
-            now,
-        )
-        .await
-        .expect("prepare pending expiry");
-    email_control
-        .provision_and_finalize_smtp_test_enqueue(
-            project_id,
-            expired_id,
-            &[47; 32],
-            &CountingSmtpProvisioner::default(),
-            Zeroizing::new(b"recipient@example.com".to_vec()),
-            now,
-        )
-        .await
-        .expect("finalize pending expiry");
-    assert!(
-        email
-            .claim_smtp_test(
-                "runtime-after-restart",
-                now + Duration::minutes(11),
-                now + Duration::minutes(11) + Duration::seconds(30),
-            )
-            .await
-            .expect("terminalize expired pending test")
-            .is_none()
-    );
-    let expired = email_control
-        .get_smtp_test(project_id, expired_id)
-        .await
-        .expect("read terminal pending expiry");
-    assert_eq!(expired.state, crate::application::SmtpTestState::Failed);
-    assert_eq!(expired.outcome, Some(MailTransportOutcome::Transient));
-
-    // A process may disappear after recipient prepare and resume after stale terminalization and
-    // cleanup. Drain earlier terminal recipients too, then prove the exact stale tombstone blocks
-    // the delayed external writer before it reaches the provisioner.
-    let stale_id = Uuid::new_v4();
-    let stale_ref = "smtp_test_stale_recipient";
-    email_control
-        .prepare_smtp_test(
-            project_id,
-            PrepareSmtpTest {
-                id: stale_id,
-                configuration_id: smtp_id,
-                recipient_ref: stale_ref.to_owned(),
-                idempotency_key: "smtp-test-stale-provision-1".to_owned(),
-                request_digest: vec![48; 32],
-                expected_revision: 1,
-                correlation_id: Uuid::new_v4(),
-            },
-            now,
-        )
-        .await
-        .expect("durably prepare stale recipient");
-    let cleanup_now = now + Duration::minutes(12);
-    let mut erased_stale = false;
-    for sequence in 0..8 {
-        let Some(cleanup) = email
-            .claim_smtp_secret_cleanup(
-                &format!("runtime-stale-cleanup-{sequence}"),
-                cleanup_now + Duration::seconds(sequence),
-                cleanup_now + Duration::seconds(sequence + 30),
-            )
-            .await
-            .expect("claim terminal recipient cleanup")
-        else {
-            break;
-        };
-        erased_stale |= cleanup.recipient_ref == stale_ref;
-        email
-            .finish_smtp_secret_cleanup(&cleanup, cleanup_now + Duration::seconds(sequence + 1))
-            .await
-            .expect("tombstone terminal recipient");
-    }
-    assert!(erased_stale, "stale prepared recipient must be tombstoned");
-    let delayed_recipient_provisioner = CountingSmtpProvisioner::default();
-    assert_eq!(
-        PostgresEmailControlRepository::new(database.clone())
-            .provision_and_finalize_smtp_test_enqueue(
-                project_id,
-                stale_id,
-                &[48; 32],
-                &delayed_recipient_provisioner,
-                Zeroizing::new(b"stale@example.com".to_vec()),
-                cleanup_now + Duration::minutes(1),
-            )
-            .await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    );
-    assert_eq!(
-        delayed_recipient_provisioner.writes.load(Ordering::SeqCst),
-        0
-    );
-
     let authentication = PostgresAuthenticationRepository::new(database.clone());
-    let deployment = DeploymentSmtpGeneration {
-        generation: 7,
-        desired_status: DeploymentSmtpDesiredStatus::Active,
-        host: "smtp.default.example".to_owned(),
-        port: 465,
-        tls_mode: SmtpTlsMode::ImplicitTls,
-        sender_address: "login@default.example".to_owned(),
-        credential_ref: "deployment-smtp-7".to_owned(),
-        safe_fingerprint: [77; 32],
-        explicitly_allowed_private_ips: Vec::new(),
-    };
-    seed_legacy_deployment_smtp(&pool, &deployment).await;
-    email
-        .reconcile_deployment_smtp(&deployment, now)
-        .await
-        .expect("activate deployment SMTP");
-    let audit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE action='email.deployment_smtp.activated'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("deployment SMTP audit count");
-    email
-        .reconcile_deployment_smtp(&deployment, now + Duration::seconds(1))
-        .await
-        .expect("unchanged deployment SMTP converges");
-    let unchanged_audit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE action='email.deployment_smtp.activated'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("unchanged deployment SMTP audit count");
-    assert_eq!(audit_count, unchanged_audit_count);
-    email
-        .reconcile_deployment_smtp(
-            &DeploymentSmtpGeneration {
-                desired_status: DeploymentSmtpDesiredStatus::Compromised,
-                ..deployment
-            },
-            now + Duration::seconds(2),
-        )
-        .await
-        .expect("compromise deployment SMTP without credential access");
     let login_command = |id: Uuid, interaction_seed: u8| CreateLoginTransaction {
         id,
         project_id,
@@ -1859,295 +1523,6 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
             .expect("restore owner after claim fence");
     }
 
-    // A pinned generation remains authoritative while it is active, regardless of unrelated
-    // later lifecycle rows. Abandoned provisioning is represented by removing its never-active
-    // pending row; it likewise cannot revoke the captured predecessor.
-    for (status, label) in [("pending", "pending"), ("disabled", "disabled")] {
-        let newer_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO project_smtp_configurations
-             (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-              tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,created_at,updated_at)
-             SELECT $1,project_id,$2,2,1,1,host,port,tls_mode,sender_address,sender_name,reply_to,
-                    credential_ref,safe_fingerprint,created_at,updated_at
-             FROM project_smtp_configurations WHERE id=$3",
-        )
-        .bind(newer_id)
-        .bind(status)
-        .bind(smtp_id)
-        .execute(&pool)
-        .await
-        .unwrap_or_else(|error| panic!("insert {label} Project n+1: {error}"));
-        assert!(
-            email
-                .claim_due_mail(
-                    &format!("project-newer-{label}"),
-                    now + Duration::seconds(4),
-                    now + Duration::seconds(34),
-                )
-                .await
-                .unwrap_or_else(|error| panic!("claim past {label} Project n+1: {error}"))
-                .is_some(),
-            "unrelated {label} Project n+1 must not revoke pinned active n"
-        );
-        sqlx::query("DELETE FROM project_smtp_configurations WHERE id=$1")
-            .bind(newer_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        restore_claim_race_fixture(&pool, challenge_id, project_id, "SELECT $1", true).await;
-    }
-    let abandoned_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO project_smtp_configurations
-         (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-          tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,created_at,updated_at)
-         SELECT $1,project_id,'pending',2,1,1,host,port,tls_mode,sender_address,sender_name,reply_to,
-                credential_ref,safe_fingerprint,created_at,updated_at
-         FROM project_smtp_configurations WHERE id=$2",
-    )
-    .bind(abandoned_id)
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM project_smtp_configurations WHERE id=$1")
-        .bind(abandoned_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert!(
-        email
-            .claim_due_mail(
-                "project-newer-abandoned",
-                now + Duration::seconds(4),
-                now + Duration::seconds(34),
-            )
-            .await
-            .unwrap()
-            .is_some()
-    );
-    restore_claim_race_fixture(&pool, challenge_id, project_id, "SELECT $1", true).await;
-
-    // A pending outbox survives planned Project rotation while its exact predecessor remains in
-    // the bounded retained overlap, then becomes ineligible at the exact retained deadline.
-    let rotated_project_smtp_id = Uuid::new_v4();
-    sqlx::query(
-        "UPDATE project_smtp_configurations
-            SET status='retained',retained_until=clock_timestamp()+interval '10 minutes'
-          WHERE id=$1",
-    )
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO project_smtp_configurations
-         (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-          tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,created_at,updated_at)
-         SELECT $1,project_id,'active',2,1,1,host,port,tls_mode,sender_address,sender_name,reply_to,
-                'smtp_rotated_ref',safe_fingerprint,created_at,updated_at
-         FROM project_smtp_configurations WHERE id=$2",
-    )
-    .bind(rotated_project_smtp_id)
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert!(
-        email
-            .claim_due_mail(
-                "project-retained-overlap",
-                now + Duration::seconds(4),
-                now + Duration::seconds(34),
-            )
-            .await
-            .unwrap()
-            .is_some()
-    );
-    restore_claim_race_fixture(&pool, challenge_id, project_id, "SELECT $1", true).await;
-    sqlx::query(
-        "UPDATE project_smtp_configurations
-            SET retained_until=clock_timestamp()-interval '1 second'
-          WHERE id=$1",
-    )
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert!(
-        email
-            .claim_due_mail(
-                "project-retained-expired",
-                now + Duration::seconds(4),
-                now + Duration::seconds(34),
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    sqlx::query("DELETE FROM project_smtp_configurations WHERE id=$1")
-        .bind(rotated_project_smtp_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE project_smtp_configurations SET status='active',retained_until=NULL WHERE id=$1",
-    )
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Planned deployment rotation retains the captured predecessor for the overlap window.
-    sqlx::query(
-        "INSERT INTO deployment_smtp_generations
-         (generation,status,revision,security_eligibility_revision,host,port,tls_mode,sender_address,
-          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,material_owner_id,created_at,updated_at)
-         VALUES (1,'active',1,1,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'deployment_ref',$1,'[]'::jsonb,md5('email-test-deployment-1')::uuid,$2,$2),
-                (2,'reconciled',1,1,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'deployment_ref_2',$1,'[]'::jsonb,md5('email-test-deployment-2')::uuid,$2,$2)",
-    )
-    .bind(vec![8_u8; 32])
-    .bind(now)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let mut rewrite_smtp_fixture = pool.begin().await.unwrap();
-    sqlx::query("SET LOCAL session_replication_role = replica")
-        .execute(&mut *rewrite_smtp_fixture)
-        .await
-        .unwrap();
-    sqlx::query(
-        "WITH snapshot AS (
-           UPDATE login_email_method_snapshots SET smtp_selection_kind='deployment_default',
-             smtp_configuration_id=NULL,smtp_generation=1,smtp_security_eligibility_revision=1
-           WHERE transaction_id=$1 RETURNING transaction_id),
-         challenge AS (
-           UPDATE email_challenges SET smtp_selection_kind='deployment_default',
-             smtp_configuration_id=NULL,smtp_generation=1,smtp_security_eligibility_revision=1
-           WHERE transaction_id=$1 RETURNING transaction_id)
-         UPDATE mail_outbox SET smtp_selection_kind='deployment_default',smtp_configuration_id=NULL,
-           smtp_generation=1,smtp_security_eligibility_revision=1 WHERE transaction_id=$1",
-    )
-    .bind(transaction_id)
-    .execute(&mut *rewrite_smtp_fixture)
-    .await
-    .unwrap();
-    rewrite_smtp_fixture.commit().await.unwrap();
-    assert!(
-        email
-            .claim_due_mail(
-                "deployment-newer-reconciled",
-                now + Duration::seconds(4),
-                now + Duration::seconds(34),
-            )
-            .await
-            .unwrap()
-            .is_some()
-    );
-    restore_claim_race_fixture(&pool, challenge_id, project_id, "SELECT $1", true).await;
-    sqlx::query(
-        "UPDATE deployment_smtp_generations
-            SET status='retained',retained_until=clock_timestamp()+interval '10 minutes'
-          WHERE generation=1",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query("UPDATE deployment_smtp_generations SET status='active' WHERE generation=2")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert!(
-        email
-            .claim_due_mail(
-                "deployment-retained-overlap",
-                now + Duration::seconds(4),
-                now + Duration::seconds(34),
-            )
-            .await
-            .unwrap()
-            .is_some()
-    );
-    restore_claim_race_fixture(&pool, challenge_id, project_id, "SELECT $1", true).await;
-    sqlx::query(
-        "UPDATE deployment_smtp_generations
-            SET retained_until=clock_timestamp()-interval '1 second'
-          WHERE generation=1",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert!(
-        email
-            .claim_due_mail(
-                "deployment-retained-expired",
-                now + Duration::seconds(4),
-                now + Duration::seconds(34),
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    for terminal in ["disabled", "compromised"] {
-        sqlx::query(
-            "UPDATE deployment_smtp_generations SET status=$1,retained_until=NULL,
-             security_eligibility_revision=2 WHERE generation=1",
-        )
-        .bind(terminal)
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert!(
-            email
-                .claim_due_mail(
-                    &format!("deployment-{terminal}"),
-                    now + Duration::seconds(4),
-                    now + Duration::seconds(34),
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-        sqlx::query(
-            "UPDATE deployment_smtp_generations SET status='retained',retained_until=$1,
-             security_eligibility_revision=1 WHERE generation=1",
-        )
-        .bind(now + Duration::minutes(10))
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    let mut restore_smtp_fixture = pool.begin().await.unwrap();
-    sqlx::query("SET LOCAL session_replication_role = replica")
-        .execute(&mut *restore_smtp_fixture)
-        .await
-        .unwrap();
-    sqlx::query(
-        "WITH snapshot AS (
-           UPDATE login_email_method_snapshots SET smtp_selection_kind='project',
-             smtp_configuration_id=$1,smtp_generation=1,smtp_security_eligibility_revision=1
-           WHERE transaction_id=$2 RETURNING transaction_id),
-         challenge AS (
-           UPDATE email_challenges SET smtp_selection_kind='project',smtp_configuration_id=$1,
-             smtp_generation=1,smtp_security_eligibility_revision=1
-           WHERE transaction_id=$2 RETURNING transaction_id)
-         UPDATE mail_outbox SET smtp_selection_kind='project',smtp_configuration_id=$1,
-           smtp_generation=1,smtp_security_eligibility_revision=1 WHERE transaction_id=$2",
-    )
-    .bind(smtp_id)
-    .bind(transaction_id)
-    .execute(&mut *restore_smtp_fixture)
-    .await
-    .unwrap();
-    restore_smtp_fixture.commit().await.unwrap();
-    sqlx::query("DELETE FROM deployment_smtp_generations WHERE generation IN (1,2)")
-        .execute(&pool)
-        .await
-        .unwrap();
-
     // Every revoking claim authority participates in a real PostgreSQL commit-order race. If the
     // disable/compromise/supersession commits first, the later claim is inert; if the claim holds
     // every shared fence first, the transition waits and only the already-won lease may proceed.
@@ -2454,17 +1829,18 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         Ok(crate::application::EmailProofDecision::Accepted(_))
     ));
 
-    email_control
-        .terminate_smtp_configuration(
-            project_id,
-            smtp_id,
-            1,
-            true,
-            Uuid::new_v4(),
-            now + Duration::seconds(37),
-        )
-        .await
-        .expect("mark delivered generation compromised");
+    sqlx::query(
+        "UPDATE project_smtp_configurations
+         SET status='compromised',revision=revision+1,
+             security_eligibility_revision=security_eligibility_revision+1,updated_at=$3
+         WHERE project_id=$1 AND id=$2",
+    )
+    .bind(project_id)
+    .bind(smtp_id)
+    .bind(now + Duration::seconds(37))
+    .execute(&pool)
+    .await
+    .expect("mark delivered generation compromised");
     assert!(
         email
             .complete_email_proof(completion(
@@ -2906,11 +2282,10 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .await
         .expect("bounded abandoned cleanup");
     assert_eq!(maintained, 2);
-    let transfer_deleted = email
+    email
         .maintain_short_term_data(cleanup_time, 100)
         .await
         .expect("terminal transfer-context deletion");
-    assert_eq!(transfer_deleted, 8);
     let redaction: (String, bool, bool, i64) = sqlx::query_as(
         "SELECT challenge.status,challenge.address_ciphertext IS NULL,
                 outbox.envelope_ciphertext IS NULL AND outbox.body_ciphertext IS NULL,
@@ -2923,593 +2298,6 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     .await
     .expect("short-term payload redaction");
     assert_eq!(redaction, ("expired".to_owned(), true, true, 0));
-
-    sqlx::query(
-        "UPDATE project_smtp_configurations
-         SET status='retained',retained_until=$2 WHERE project_id=$1 AND id=$3",
-    )
-    .bind(project_id)
-    .bind(now + Duration::minutes(1))
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .expect("expire retained Project SMTP generation");
-    sqlx::query(
-        "UPDATE deployment_smtp_generations
-         SET status='retained',retained_until=$2 WHERE generation=$1",
-    )
-    .bind(7_i32)
-    .bind(now + Duration::minutes(1))
-    .execute(&pool)
-    .await
-    .expect("expire retained deployment SMTP generation");
-    let cleanup_now = now + Duration::minutes(12);
-    for _ in 0..2 {
-        let cleanup = email
-            .claim_smtp_credential_cleanup(
-                "runtime-cleanup",
-                cleanup_now,
-                cleanup_now + Duration::seconds(30),
-            )
-            .await
-            .expect("claim expired SMTP generation cleanup")
-            .expect("cleanup available");
-        email
-            .finish_smtp_credential_cleanup(&cleanup, cleanup_now)
-            .await
-            .expect("finish idempotent external credential erase ledger");
-    }
-    assert!(
-        email
-            .claim_smtp_credential_cleanup(
-                "runtime-cleanup",
-                cleanup_now,
-                cleanup_now + Duration::seconds(30),
-            )
-            .await
-            .expect("cleanup exhaustion")
-            .is_none()
-    );
-    let retirement_counts: (i64, i64, i64) = sqlx::query_as(
-        "SELECT
-          (SELECT COUNT(*) FROM project_smtp_configurations WHERE status='retired'),
-          (SELECT COUNT(*) FROM deployment_smtp_generations WHERE status='retired'),
-          (SELECT COUNT(*) FROM smtp_credential_cleanup_operations WHERE state='erased')",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("retirement closure inventory");
-    assert_eq!(retirement_counts, (1, 1, 2));
-
-    // Disabled and compromised generations enter the same durable retirement ledger as expired
-    // overlap rows. A still-live configuration sharing the credential reference blocks every
-    // external erase until all references are retired.
-    let disabled_smtp_id = Uuid::new_v4();
-    let compromised_smtp_id = Uuid::new_v4();
-    let shared_blocker_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO project_smtp_configurations
-         (id,project_id,status,generation,revision,security_eligibility_revision,host,port,tls_mode,
-          sender_address,credential_ref,safe_fingerprint,created_at,updated_at)
-         VALUES ($1,$2,'disabled',20,2,2,'smtp.example.com',465,'implicit_tls','login@example.com',
-                 'terminal_shared_ref',$5,$6,$6),
-                ($3,$2,'compromised',21,2,2,'smtp.example.com',465,'implicit_tls','login@example.com',
-                 'terminal_shared_ref',$5,$6,$6),
-                ($4,$2,'active',22,1,1,'smtp.example.com',465,'implicit_tls','login@example.com',
-                 'terminal_shared_ref',$5,$6,$6)",
-    )
-    .bind(disabled_smtp_id)
-    .bind(project_id)
-    .bind(compromised_smtp_id)
-    .bind(shared_blocker_id)
-    .bind(vec![9_u8; 32])
-    .bind(cleanup_now)
-    .execute(&pool)
-    .await
-    .expect("seed terminal Project cleanup matrix");
-    sqlx::query(
-        "INSERT INTO deployment_smtp_generations
-         (generation,status,revision,security_eligibility_revision,host,port,tls_mode,sender_address,
-          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,material_owner_id,created_at,updated_at)
-         VALUES (20,'disabled',2,2,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'terminal_shared_ref',$1,'[]'::jsonb,md5('email-test-deployment-20')::uuid,$2,$2),
-                (21,'compromised',2,2,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'terminal_shared_ref',$1,'[]'::jsonb,md5('email-test-deployment-21')::uuid,$2,$2)",
-    )
-    .bind(vec![10_u8; 32])
-    .bind(cleanup_now)
-    .execute(&pool)
-    .await
-    .expect("seed terminal deployment cleanup matrix");
-    assert!(
-        email
-            .claim_smtp_credential_cleanup(
-                "shared-ref-blocked",
-                cleanup_now + Duration::seconds(1),
-                cleanup_now + Duration::seconds(31),
-            )
-            .await
-            .expect("retire terminal generations while shared ref remains live")
-            .is_none()
-    );
-    let blocked: (i64, i64, i64) = sqlx::query_as(
-        "SELECT
-          (SELECT COUNT(*) FROM project_smtp_configurations
-           WHERE generation IN (20,21) AND status='retired'),
-          (SELECT COUNT(*) FROM deployment_smtp_generations
-           WHERE generation IN (20,21) AND status='retired'),
-          (SELECT COUNT(*) FROM smtp_credential_cleanup_operations
-           WHERE credential_ref='terminal_shared_ref' AND state='pending')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(blocked, (2, 2, 4));
-    sqlx::query(
-        "UPDATE project_smtp_configurations SET status='disabled',security_eligibility_revision=2
-         WHERE id=$1",
-    )
-    .bind(shared_blocker_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let cleanup = email
-        .claim_smtp_credential_cleanup(
-            "terminal-cleanup",
-            cleanup_now + Duration::seconds(2),
-            cleanup_now + Duration::seconds(32),
-        )
-        .await
-        .unwrap()
-        .expect("one shared-reference cleanup operation owns the external erase");
-    email
-        .finish_smtp_credential_cleanup(&cleanup, cleanup_now + Duration::seconds(2))
-        .await
-        .unwrap();
-    // Sibling operations converge against the durable erased tombstone without repeating the
-    // external erase or audit. One bounded call terminalizes one sibling operation.
-    for _ in 0..4 {
-        assert!(
-            email
-                .claim_smtp_credential_cleanup(
-                    "terminal-cleanup",
-                    cleanup_now + Duration::seconds(2),
-                    cleanup_now + Duration::seconds(32),
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    // A process loss after leasing does not lose the external erase. The same durable operation
-    // is recoverable after lease expiry and can then converge normally.
-    sqlx::query(
-        "INSERT INTO deployment_smtp_generations
-         (generation,status,revision,security_eligibility_revision,host,port,tls_mode,sender_address,
-          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,material_owner_id,created_at,updated_at)
-         VALUES (30,'compromised',2,2,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'crash_recovery_ref',$1,'[]'::jsonb,md5('email-test-deployment-30')::uuid,$2,$2)",
-    )
-    .bind(vec![11_u8; 32])
-    .bind(cleanup_now)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let crash_time = cleanup_now + Duration::seconds(3);
-    let abandoned_cleanup = email
-        .claim_smtp_credential_cleanup(
-            "cleanup-crashed",
-            crash_time,
-            crash_time + Duration::seconds(30),
-        )
-        .await
-        .unwrap()
-        .expect("lease crash-recoverable cleanup");
-    assert!(
-        email
-            .claim_smtp_credential_cleanup(
-                "cleanup-too-early",
-                crash_time + Duration::seconds(1),
-                crash_time + Duration::seconds(31),
-            )
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let recovered_cleanup = email
-        .claim_smtp_credential_cleanup(
-            "cleanup-recovered",
-            crash_time + Duration::seconds(31),
-            crash_time + Duration::seconds(61),
-        )
-        .await
-        .unwrap()
-        .expect("recover expired cleanup lease");
-    assert_eq!(recovered_cleanup.id, abandoned_cleanup.id);
-    email
-        .finish_smtp_credential_cleanup(&recovered_cleanup, crash_time + Duration::seconds(31))
-        .await
-        .unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM smtp_credential_cleanup_operations WHERE state='erased'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        8
-    );
-
-    // An exact completed create replay remains a stable retired tombstone after external erase.
-    // The controlled write-only store proves the old idempotency key never provisions again.
-    let replay_revision: i64 =
-        sqlx::query_scalar("SELECT security_revision FROM projects WHERE id=$1")
-            .bind(project_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let provisioner = Arc::new(CountingSmtpProvisioner::default());
-    let smtp_service = EmailControlService::new(
-        Arc::new(PostgresEmailControlRepository::new(database.clone())),
-        provisioner.clone(),
-        Arc::new(SystemClock),
-        Arc::new(Sha256RequestDigester),
-    );
-    let replay_command = || CreateSmtpConfiguration {
-        host: "replay.smtp.example".to_owned(),
-        port: 465,
-        tls_mode: SmtpControlTlsMode::ImplicitTls,
-        sender_address: "replay@example.com".to_owned(),
-        sender_name: None,
-        reply_to: None,
-        credential: Zeroizing::new(r#"{"username":"replay","password":"secret"}"#.to_owned()),
-        idempotency_key: "smtp-erased-replay-1".to_owned(),
-        expected_project_security_revision: replay_revision,
-        correlation_id: Uuid::new_v4(),
-    };
-    let replay_configuration = smtp_service
-        .create_smtp(project_id, replay_command())
-        .await
-        .expect("create SMTP operation before erased replay");
-    assert_eq!(provisioner.writes.load(Ordering::SeqCst), 1);
-    let replay_credential_ref: String =
-        sqlx::query_scalar("SELECT credential_ref FROM project_smtp_configurations WHERE id=$1")
-            .bind(replay_configuration.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    email_control
-        .terminate_smtp_configuration(
-            project_id,
-            replay_configuration.id,
-            replay_configuration.revision,
-            true,
-            Uuid::new_v4(),
-            cleanup_now + Duration::seconds(40),
-        )
-        .await
-        .expect("compromise replay generation");
-    let erased_replay_cleanup = email
-        .claim_smtp_credential_cleanup(
-            "erased-replay-cleanup",
-            cleanup_now + Duration::seconds(41),
-            cleanup_now + Duration::seconds(71),
-        )
-        .await
-        .unwrap()
-        .expect("claim erased replay credential");
-    assert_eq!(erased_replay_cleanup.credential_ref, replay_credential_ref);
-    email
-        .finish_smtp_credential_cleanup(&erased_replay_cleanup, cleanup_now + Duration::seconds(42))
-        .await
-        .unwrap();
-    let replay_audits_before: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE project_id=$1
-         AND action IN ('email.smtp.prepared','email.smtp.reconciled')",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let tombstone = smtp_service
-        .create_smtp(project_id, replay_command())
-        .await
-        .expect("exact old create replay returns durable tombstone");
-    assert_eq!(tombstone.status, SmtpControlStatus::Retired);
-    assert_eq!(provisioner.writes.load(Ordering::SeqCst), 1);
-    let replay_audits_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE project_id=$1
-         AND action IN ('email.smtp.prepared','email.smtp.reconciled')",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(replay_audits_before, replay_audits_after);
-
-    // A committed cleanup reservation wins over both Project registration and deployment
-    // reconciliation. Neither path can publish a live generation before the external erase and
-    // durable tombstone complete.
-    let race_ref = "smtp_cleanup_reserved_race_ref";
-    sqlx::query(
-        "INSERT INTO deployment_smtp_generations
-         (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
-          sender_address,credential_ref,safe_fingerprint,explicitly_allowed_private_ips,
-          material_owner_id,created_at,updated_at)
-         VALUES (40,'compromised',2,2,'race.smtp.example',465,'implicit_tls',
-                 'race@example.com',$1,$2,'[]'::jsonb,md5('email-test-deployment-40')::uuid,$3,$3)",
-    )
-    .bind(race_ref)
-    .bind(vec![40_u8; 32])
-    .bind(cleanup_now + Duration::seconds(50))
-    .execute(&pool)
-    .await
-    .unwrap();
-    let reserved_cleanup = email
-        .claim_smtp_credential_cleanup(
-            "reservation-paused-after-commit",
-            cleanup_now + Duration::seconds(51),
-            cleanup_now + Duration::seconds(81),
-        )
-        .await
-        .unwrap()
-        .expect("cleanup reservation committed before simulated external erase");
-    assert_eq!(reserved_cleanup.credential_ref, race_ref);
-    let current_project_revision: i64 =
-        sqlx::query_scalar("SELECT security_revision FROM projects WHERE id=$1")
-            .bind(project_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(matches!(
-        email_control
-            .prepare_smtp_configuration(
-                project_id,
-                PrepareSmtpConfiguration {
-                    id: Uuid::new_v4(),
-                    host: "race.smtp.example".to_owned(),
-                    port: 465,
-                    tls_mode: SmtpControlTlsMode::ImplicitTls,
-                    sender_address: "race@example.com".to_owned(),
-                    sender_name: None,
-                    reply_to: None,
-                    operation_alias: "reserved-project-race-1".to_owned(),
-                    credential_ref: race_ref.to_owned(),
-                    request_digest: vec![51; 32],
-                    safe_fingerprint: Some([51; 32]),
-                    expected_project_security_revision: current_project_revision,
-                    correlation_id: Uuid::new_v4(),
-                },
-                cleanup_now + Duration::seconds(52),
-            )
-            .await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    assert!(matches!(
-        email
-            .reconcile_deployment_smtp(
-                &DeploymentSmtpGeneration {
-                    generation: 41,
-                    desired_status: DeploymentSmtpDesiredStatus::Active,
-                    host: "race.smtp.example".to_owned(),
-                    port: 465,
-                    tls_mode: SmtpTlsMode::ImplicitTls,
-                    sender_address: "race@example.com".to_owned(),
-                    credential_ref: race_ref.to_owned(),
-                    safe_fingerprint: [51; 32],
-                    explicitly_allowed_private_ips: Vec::new(),
-                },
-                cleanup_now + Duration::seconds(52),
-            )
-            .await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    // Simulate a worker crash after the durable reservation. Once its lease expires, the same
-    // reservation owner is recovered rather than allowing a sibling operation to starve it.
-    let recovered_cleanup = email
-        .claim_smtp_credential_cleanup(
-            "reservation-crash-recovery",
-            cleanup_now + Duration::seconds(82),
-            cleanup_now + Duration::seconds(112),
-        )
-        .await
-        .unwrap()
-        .expect("expired reserved cleanup lease is recoverable");
-    assert_eq!(recovered_cleanup.id, reserved_cleanup.id);
-    assert_eq!(recovered_cleanup.credential_ref, race_ref);
-    email
-        .finish_smtp_credential_cleanup(&recovered_cleanup, cleanup_now + Duration::seconds(83))
-        .await
-        .unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM project_smtp_configurations
-             WHERE credential_ref=$1 AND status<>'retired'",
-        )
-        .bind(race_ref)
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT state FROM smtp_credential_reference_reservations WHERE credential_ref=$1",
-        )
-        .bind(race_ref)
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        "erased"
-    );
-
-    // Once provisioning enters its external write, no PostgreSQL transaction remains open.
-    // A concurrent disable must make deterministic progress while the external store is paused;
-    // the guarded finalize then loses to the terminal owner state.
-    let barrier_ref = format!("smtp_barrier_{}", Uuid::new_v4().simple());
-    let barrier_revision: i64 =
-        sqlx::query_scalar("SELECT security_revision FROM projects WHERE id=$1")
-            .bind(project_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let barrier_prepared = email_control
-        .prepare_smtp_configuration(
-            project_id,
-            PrepareSmtpConfiguration {
-                id: Uuid::new_v4(),
-                host: "barrier.smtp.example".to_owned(),
-                port: 465,
-                tls_mode: SmtpControlTlsMode::ImplicitTls,
-                sender_address: "barrier@example.com".to_owned(),
-                sender_name: None,
-                reply_to: None,
-                operation_alias: "barrier-provision-serialization-1".to_owned(),
-                credential_ref: barrier_ref.clone(),
-                request_digest: vec![60; 32],
-                safe_fingerprint: Some([60; 32]),
-                expected_project_security_revision: barrier_revision,
-                correlation_id: Uuid::new_v4(),
-            },
-            cleanup_now + Duration::seconds(100),
-        )
-        .await
-        .expect("prepare barrier-controlled SMTP provision");
-    let barrier = Arc::new(BarrierSmtpProvisioner::new());
-    let provision_repository = PostgresEmailControlRepository::new(database.clone());
-    let provision_barrier = barrier.clone();
-    let provision_prepared = barrier_prepared.clone();
-    let provision_task = tokio::spawn(async move {
-        provision_repository
-            .provision_and_finalize_smtp_configuration(
-                project_id,
-                &provision_prepared,
-                provision_barrier.as_ref(),
-                Zeroizing::new(b"barrier-secret".to_vec()),
-                cleanup_now + Duration::seconds(101),
-            )
-            .await
-    });
-    barrier
-        .entered
-        .acquire()
-        .await
-        .expect("provision reaches external barrier")
-        .forget();
-    let disable_repository = PostgresEmailControlRepository::new(database.clone());
-    let barrier_configuration_id = barrier_prepared.record.id;
-    let barrier_configuration_revision = barrier_prepared.record.revision;
-    let disable_task = tokio::spawn(async move {
-        disable_repository
-            .terminate_smtp_configuration(
-                project_id,
-                barrier_configuration_id,
-                barrier_configuration_revision,
-                false,
-                Uuid::new_v4(),
-                cleanup_now + Duration::seconds(102),
-            )
-            .await
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(2), disable_task)
-        .await
-        .expect("disable is not blocked by paused external provisioning")
-        .expect("join barrier disable")
-        .expect("disable commits while external provisioning is paused");
-    barrier.release.add_permits(1);
-    assert_eq!(
-        provision_task.await.expect("join barrier provision"),
-        Err(crate::application::ApplicationError::InvalidTransition),
-        "post-write finalize must lose to the committed terminal owner state"
-    );
-    assert_eq!(barrier.writes.load(Ordering::SeqCst), 1);
-    let barrier_cleanup = email
-        .claim_smtp_credential_cleanup(
-            "barrier-cleanup",
-            cleanup_now + Duration::seconds(103),
-            cleanup_now + Duration::seconds(133),
-        )
-        .await
-        .unwrap()
-        .expect("cleanup follows the committed disable and rejected finalize");
-    assert_eq!(barrier_cleanup.credential_ref, barrier_ref);
-    email
-        .finish_smtp_credential_cleanup(&barrier_cleanup, cleanup_now + Duration::seconds(104))
-        .await
-        .unwrap();
-
-    // Model process loss after durable prepare and a delayed writer resuming only after disable,
-    // cleanup reservation, external erase, and tombstone. The new repository instance must check
-    // the terminal owner/reference state before making any external write.
-    let delayed_ref = format!("smtp_delayed_{}", Uuid::new_v4().simple());
-    let delayed_revision: i64 =
-        sqlx::query_scalar("SELECT security_revision FROM projects WHERE id=$1")
-            .bind(project_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let delayed = email_control
-        .prepare_smtp_configuration(
-            project_id,
-            PrepareSmtpConfiguration {
-                id: Uuid::new_v4(),
-                host: "delayed.smtp.example".to_owned(),
-                port: 465,
-                tls_mode: SmtpControlTlsMode::ImplicitTls,
-                sender_address: "delayed@example.com".to_owned(),
-                sender_name: None,
-                reply_to: None,
-                operation_alias: "delayed-provision-after-erase-1".to_owned(),
-                credential_ref: delayed_ref.clone(),
-                request_digest: vec![61; 32],
-                safe_fingerprint: Some([61; 32]),
-                expected_project_security_revision: delayed_revision,
-                correlation_id: Uuid::new_v4(),
-            },
-            cleanup_now + Duration::seconds(120),
-        )
-        .await
-        .expect("durably prepare delayed SMTP provision");
-    email_control
-        .terminate_smtp_configuration(
-            project_id,
-            delayed.record.id,
-            delayed.record.revision,
-            false,
-            Uuid::new_v4(),
-            cleanup_now + Duration::seconds(121),
-        )
-        .await
-        .expect("disable before delayed provision resumes");
-    let delayed_cleanup = email
-        .claim_smtp_credential_cleanup(
-            "delayed-provision-cleanup",
-            cleanup_now + Duration::seconds(122),
-            cleanup_now + Duration::seconds(152),
-        )
-        .await
-        .unwrap()
-        .expect("reserve delayed reference for erase");
-    assert_eq!(delayed_cleanup.credential_ref, delayed_ref);
-    email
-        .finish_smtp_credential_cleanup(&delayed_cleanup, cleanup_now + Duration::seconds(123))
-        .await
-        .expect("tombstone delayed reference after erase");
-    let delayed_provisioner = CountingSmtpProvisioner::default();
-    assert_eq!(
-        PostgresEmailControlRepository::new(database.clone())
-            .provision_and_finalize_smtp_configuration(
-                project_id,
-                &delayed,
-                &delayed_provisioner,
-                Zeroizing::new(b"delayed-secret".to_vec()),
-                cleanup_now + Duration::seconds(124),
-            )
-            .await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    );
-    assert_eq!(delayed_provisioner.writes.load(Ordering::SeqCst), 0);
 
     // A locked old-key short-term row is skipped by the bounded terminalizer, but must remain
     // visible in inventory and keep readiness unavailable until a later retry can terminalize it.
@@ -3799,196 +2587,6 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
 
 #[tokio::test]
 #[allow(
-    clippy::too_many_lines,
-    reason = "one real restore journey proves missing-secret isolation, restart persistence, and reconciliation"
-)]
-async fn project_smtp_restore_readiness_is_project_scoped_and_restart_safe_in_postgres() {
-    let Some((_container, url)) = start_postgres().await else {
-        return;
-    };
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .expect("connect sqlx");
-    MIGRATOR.run(&pool).await.expect("migrate schema");
-    let now = OffsetDateTime::now_utc();
-    let (affected_project, affected_application, affected_smtp, _) =
-        seed_email_authority(&pool, now).await;
-    let (healthy_project, healthy_application, healthy_smtp, _) =
-        seed_email_authority(&pool, now).await;
-    let database = Database::connect(&url).await.expect("connect SeaORM");
-    let repository = PostgresPasswordlessEmailRepository::new(database.clone());
-    let secret_root =
-        env::temp_dir().join(format!("owlauth-project-smtp-restore-{}", Uuid::new_v4()));
-    let store = EncryptedFileStore::new(secret_root.clone(), [42; 32]).expect("test Runtime store");
-    let affected_credential = b"affected-restored-smtp-secret".to_vec();
-    let healthy_credential = b"healthy-restored-smtp-secret".to_vec();
-    let affected_ref = format!("restore_affected_{}", affected_project.simple());
-    let healthy_ref = format!("restore_healthy_{}", healthy_project.simple());
-    ConfigurationSecretProvisioner::provision_if_absent(
-        &store,
-        healthy_ref.clone(),
-        Zeroizing::new(healthy_credential.clone()),
-    )
-    .await
-    .expect("healthy restored SMTP secret");
-    sqlx::query(
-        "UPDATE project_smtp_configurations
-         SET credential_ref=CASE WHEN project_id=$1 THEN $2 ELSE $3 END,
-             safe_fingerprint=CASE WHEN project_id=$1 THEN $4 ELSE $5 END
-         WHERE (project_id=$1 AND id=$6) OR (project_id=$7 AND id=$8)",
-    )
-    .bind(affected_project)
-    .bind(&affected_ref)
-    .bind(&healthy_ref)
-    .bind(store.request_fingerprint(&affected_credential))
-    .bind(store.request_fingerprint(&healthy_credential))
-    .bind(affected_smtp)
-    .bind(healthy_project)
-    .bind(healthy_smtp)
-    .execute(&pool)
-    .await
-    .unwrap();
-    // Put one invalid active generation strictly beyond the first 100 candidates: one hundred
-    // retained predecessors have no observation, while the active row has a restored ready row.
-    // All predecessors share one valid external reference, which is safe because they are
-    // immutable generations of the same Project in this restore fixture.
-    for generation in 2..=101 {
-        sqlx::query(
-            "INSERT INTO project_smtp_configurations
-             (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-              tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,
-              retained_until,created_at,updated_at)
-             SELECT $1,project_id,'retained',$2,1,1,host,port,tls_mode,sender_address,sender_name,
-                    reply_to,$3,$4,$5,created_at,updated_at
-             FROM project_smtp_configurations WHERE project_id=$6 AND id=$7",
-        )
-        .bind(Uuid::new_v4())
-        .bind(generation)
-        .bind(&healthy_ref)
-        .bind(store.request_fingerprint(&healthy_credential))
-        .bind(now + Duration::minutes(30))
-        .bind(affected_project)
-        .bind(affected_smtp)
-        .execute(&pool)
-        .await
-        .expect("seed retained restore page");
-    }
-    let deployment = DeploymentSmtpGeneration {
-        generation: 91,
-        desired_status: DeploymentSmtpDesiredStatus::Active,
-        host: "smtp.default.example".to_owned(),
-        port: 465,
-        tls_mode: SmtpTlsMode::ImplicitTls,
-        sender_address: "login@default.example".to_owned(),
-        credential_ref: "restore-default-91".to_owned(),
-        safe_fingerprint: [91; 32],
-        explicitly_allowed_private_ips: Vec::new(),
-    };
-    seed_legacy_deployment_smtp(&pool, &deployment).await;
-    repository
-        .reconcile_deployment_smtp(&deployment, now)
-        .await
-        .expect("seed active deployment fallback");
-    let resolver = EncryptedFileProviderSecretResolver::new(store.clone());
-    let restored = crate::composition::reconcile_project_smtp_readiness_restore(
-        &repository,
-        &resolver,
-        now + Duration::seconds(1),
-    )
-    .await
-    .expect("complete every bounded Runtime restore page");
-    assert_eq!(restored, 102, "restore must inspect the page beyond 100");
-
-    let authority = PostgresRuntimeAuthorityRepository::new(database.clone());
-    assert!(matches!(
-        authority
-            .prepare_login_start(
-                &format!("prj_{}", affected_project.simple()),
-                &format!("app_{}", affected_application.simple()),
-                &format!("pk_{}", affected_application.simple()),
-                "https://app.example/callback",
-            )
-            .await,
-        Err(crate::application::ApplicationError::Disabled)
-    ));
-    let healthy = authority
-        .prepare_login_start(
-            &format!("prj_{}", healthy_project.simple()),
-            &format!("app_{}", healthy_application.simple()),
-            &format!("pk_{}", healthy_application.simple()),
-            "https://app.example/callback",
-        )
-        .await
-        .expect("unrelated Project remains Runtime-ready");
-    assert!(healthy.admitted_email.is_some());
-
-    // A fresh repository instance models Runtime restart. The durable unavailable observation
-    // remains fail-closed until a later bounded secret reconciliation proves the exact reference.
-    let restarted = PostgresPasswordlessEmailRepository::new(database.clone());
-    let observed: String = sqlx::query_scalar(
-        "SELECT state FROM project_smtp_runtime_readiness
-         WHERE project_id=$1 AND configuration_id=$2 AND generation=1",
-    )
-    .bind(affected_project)
-    .bind(affected_smtp)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(observed, "unavailable");
-    ConfigurationSecretProvisioner::provision_if_absent(
-        &store,
-        affected_ref,
-        Zeroizing::new(affected_credential),
-    )
-    .await
-    .expect("reconcile restored affected Project secret");
-    crate::composition::reconcile_project_smtp_readiness_restore(
-        &restarted,
-        &resolver,
-        now + Duration::seconds(2),
-    )
-    .await
-    .expect("complete restore epoch recovers exact Project SMTP eligibility");
-    assert!(
-        PostgresRuntimeAuthorityRepository::new(database.clone())
-            .prepare_login_start(
-                &format!("prj_{}", affected_project.simple()),
-                &format!("app_{}", affected_application.simple()),
-                &format!("pk_{}", affected_application.simple()),
-                "https://app.example/callback",
-            )
-            .await
-            .expect("affected Project recovers without global restart")
-            .admitted_email
-            .is_some()
-    );
-
-    // Unexpired retained predecessors remain in the bounded restore inventory even though only
-    // the active successor is advertised for new logins.
-    sqlx::query(
-        "UPDATE project_smtp_configurations SET status='retained',retained_until=$3
-         WHERE project_id=$1 AND id=$2",
-    )
-    .bind(affected_project)
-    .bind(affected_smtp)
-    .bind(now + Duration::minutes(5))
-    .execute(&pool)
-    .await
-    .unwrap();
-    let retained = restarted
-        .project_smtp_readiness_candidates(now + Duration::seconds(3), 100)
-        .await
-        .unwrap();
-    assert!(retained.iter().any(|candidate| {
-        candidate.project_id == affected_project && candidate.configuration_id == affected_smtp
-    }));
-    std::fs::remove_dir_all(secret_root).expect("remove test Runtime store");
-}
-
-#[tokio::test]
-#[allow(
     clippy::similar_names,
     clippy::too_many_lines,
     reason = "one PostgreSQL lifecycle names each Runtime incarnation while proving roster and restart fences"
@@ -4006,22 +2604,10 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
     let now = OffsetDateTime::now_utc();
     let (project_id, application_id, active_id, _) = seed_email_authority(&pool, now).await;
     let pending_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO project_smtp_configurations
-         (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-          tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,created_at,updated_at)
-         SELECT $1,project_id,'pending',2,1,1,host,port,tls_mode,sender_address,sender_name,
-                reply_to,'pending-roster-ref',$2,$3,$3
-         FROM project_smtp_configurations WHERE project_id=$4 AND id=$5",
+    seed_project_smtp_generation(
+        &pool, project_id, active_id, pending_id, 2, "pending", [8; 32], now,
     )
-    .bind(pending_id)
-    .bind(vec![8_u8; 32])
-    .bind(now)
-    .bind(project_id)
-    .bind(active_id)
-    .execute(&pool)
-    .await
-    .expect("seed pending SMTP generation");
+    .await;
     let database = Database::connect(&url).await.expect("connect SeaORM");
     let roster = vec!["runtime-a".to_owned(), "runtime-b".to_owned()];
     let control =
@@ -4117,6 +2703,7 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
         "runtime-a".to_owned(),
         runtime_a_incarnation,
         roster.clone(),
+        test_projection_materializer(),
     );
     assert!(matches!(
         runtime_a_authority
@@ -4132,12 +2719,23 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
 
     let provider_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO provider_configurations
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('03',32),'hex'),decode('01','hex'),
+                     decode(repeat('02',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
            (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
-            secret_ref,status,revision)
-         VALUES ($1,$2,'workforce','oidc','Workforce SSO','https://issuer.example/',
-                 'email-roster-client','https://runtime.example/callback',
-                 'provider/email-roster','active',1)",
+            secret_material_id,status,revision)
+         SELECT $1,$2,'workforce','oidc','Workforce SSO','https://issuer.example/',
+                'email-roster-client','https://runtime.example/callback',material.id,
+                'active',1 FROM material",
     )
     .bind(provider_id)
     .bind(project_id)
@@ -4291,22 +2889,17 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
     // A restarted process fail-closes its prior incarnation before it can serve. Old evidence
     // therefore cannot authorize a later pending generation even while its lease was unexpired.
     let pending_restart = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO project_smtp_configurations
-         (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-          tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,created_at,updated_at)
-         SELECT $1,project_id,'pending',3,1,1,host,port,tls_mode,sender_address,sender_name,
-                reply_to,'restart-ref',$2,$3,$3
-         FROM project_smtp_configurations WHERE project_id=$4 AND id=$5",
+    seed_project_smtp_generation(
+        &pool,
+        project_id,
+        pending_id,
+        pending_restart,
+        3,
+        "pending",
+        [9; 32],
+        now,
     )
-    .bind(pending_restart)
-    .bind(vec![9_u8; 32])
-    .bind(now)
-    .bind(project_id)
-    .bind(pending_id)
-    .execute(&pool)
-    .await
-    .expect("seed restart generation");
+    .await;
     let restart_candidate = runtime_a
         .project_smtp_readiness_candidates(now + Duration::seconds(4), 100)
         .await
@@ -4400,6 +2993,7 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
         "runtime-a".to_owned(),
         runtime_a2_incarnation,
         roster.clone(),
+        test_projection_materializer(),
     )
     .prepare_login_start(
         &format!("prj_{}", project_id.simple()),
@@ -4524,6 +3118,7 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
             "runtime-a".to_owned(),
             runtime_a2_incarnation,
             roster,
+            test_projection_materializer(),
         )
         .prepare_login_start(
             &format!("prj_{}", project_id.simple()),
@@ -4534,108 +3129,6 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
         .await,
         Err(crate::application::ApplicationError::Disabled)
     ));
-
-    // The normal lifecycle cannot grow beyond 32 live generations, and listing reserves space
-    // for every live authority before adding newer terminal history.
-    for generation in 4..=32 {
-        sqlx::query(
-            "INSERT INTO project_smtp_configurations
-             (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-              tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,created_at,updated_at)
-             SELECT $1,project_id,'pending',$2,1,1,host,port,tls_mode,sender_address,sender_name,
-                    reply_to,$3,$4,$5,$5
-             FROM project_smtp_configurations WHERE project_id=$6 AND id=$7",
-        )
-        .bind(Uuid::new_v4())
-        .bind(generation)
-        .bind(format!("bounded-live-{generation}"))
-        .bind(vec![u8::try_from(generation).unwrap(); 32])
-        .bind(now)
-        .bind(project_id)
-        .bind(pending_id)
-        .execute(&pool)
-        .await
-        .expect("seed bounded live SMTP generation");
-    }
-    let project_revision: i64 =
-        sqlx::query_scalar("SELECT security_revision FROM projects WHERE id=$1")
-            .bind(project_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(matches!(
-        control
-            .prepare_smtp_configuration(
-                project_id,
-                PrepareSmtpConfiguration {
-                    id: Uuid::new_v4(),
-                    host: "bounded.smtp.example".to_owned(),
-                    port: 465,
-                    tls_mode: SmtpControlTlsMode::ImplicitTls,
-                    sender_address: "bounded@example.com".to_owned(),
-                    sender_name: None,
-                    reply_to: None,
-                    operation_alias: "bounded-live-generation-33".to_owned(),
-                    credential_ref: "bounded-live-generation-33".to_owned(),
-                    request_digest: vec![33; 32],
-                    safe_fingerprint: Some([33; 32]),
-                    expected_project_security_revision: project_revision,
-                    correlation_id: Uuid::new_v4(),
-                },
-                now + Duration::seconds(7),
-            )
-            .await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    for generation in 33..=70 {
-        sqlx::query(
-            "INSERT INTO project_smtp_configurations
-             (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-              tls_mode,sender_address,sender_name,reply_to,credential_ref,safe_fingerprint,created_at,updated_at)
-             SELECT $1,project_id,'retired',$2,1,1,host,port,tls_mode,sender_address,sender_name,
-                    reply_to,$3,$4,$5,$5
-             FROM project_smtp_configurations WHERE project_id=$6 AND id=$7",
-        )
-        .bind(Uuid::new_v4())
-        .bind(generation)
-        .bind(format!("terminal-history-{generation}"))
-        .bind(vec![u8::try_from(generation).unwrap(); 32])
-        .bind(now)
-        .bind(project_id)
-        .bind(pending_id)
-        .execute(&pool)
-        .await
-        .expect("seed newer terminal SMTP history");
-    }
-    let listed = control
-        .list_smtp_configurations(project_id)
-        .await
-        .expect("bounded list contains every live generation");
-    assert_eq!(listed.len(), 32);
-    assert!(
-        listed.iter().any(|record| {
-            record.id == pending_id && record.status == SmtpControlStatus::Active
-        })
-    );
-    assert!(
-        listed.iter().any(|record| {
-            record.id == active_id && record.status == SmtpControlStatus::Retained
-        })
-    );
-    assert_eq!(
-        listed
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    SmtpControlStatus::Pending
-                        | SmtpControlStatus::Active
-                        | SmtpControlStatus::Retained
-                )
-            })
-            .count(),
-        32
-    );
 }
 
 #[tokio::test]

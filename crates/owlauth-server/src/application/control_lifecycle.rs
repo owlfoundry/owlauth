@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use super::{ApplicationError, Clock};
 
+pub(crate) const MAX_PROJECT_USER_PAGE_LIMIT: usize = 100;
+const DEFAULT_PROJECT_USER_PAGE_LIMIT: usize = 50;
 const MAX_CONTROL_RESULTS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +29,12 @@ pub(crate) struct ProjectUserRecord {
     pub picture_url: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectUserPage {
+    pub items: Vec<ProjectUserRecord>,
+    pub next_cursor: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +123,15 @@ pub(crate) struct DisableProjectUser {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EnableProjectUser {
+    pub project_id: Uuid,
+    pub user_id: Uuid,
+    pub expected_security_revision: i64,
+    pub correlation_id: Uuid,
+    pub now: OffsetDateTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RevokeApplicationSession {
     pub project_id: Uuid,
     pub user_id: Uuid,
@@ -139,8 +156,10 @@ pub(crate) trait ControlLifecyclePort: Send + Sync {
     async fn list_project_users(
         &self,
         project_id: Uuid,
+        status: Option<ProjectUserStatus>,
+        cursor: Option<Uuid>,
         limit: usize,
-    ) -> Result<Vec<ProjectUserRecord>, ApplicationError>;
+    ) -> Result<ProjectUserPage, ApplicationError>;
 
     async fn get_project_user(
         &self,
@@ -158,6 +177,11 @@ pub(crate) trait ControlLifecyclePort: Send + Sync {
     async fn disable_project_user(
         &self,
         command: DisableProjectUser,
+    ) -> Result<ProjectUserRecord, ApplicationError>;
+
+    async fn enable_project_user(
+        &self,
+        command: EnableProjectUser,
     ) -> Result<ProjectUserRecord, ApplicationError>;
 
     async fn list_project_user_sessions(
@@ -193,9 +217,16 @@ impl ControlLifecycleService {
     pub(crate) async fn list_project_users(
         &self,
         project_id: Uuid,
-    ) -> Result<Vec<ProjectUserRecord>, ApplicationError> {
+        status: Option<ProjectUserStatus>,
+        cursor: Option<Uuid>,
+        limit: Option<usize>,
+    ) -> Result<ProjectUserPage, ApplicationError> {
+        let limit = limit.unwrap_or(DEFAULT_PROJECT_USER_PAGE_LIMIT);
+        if !(1..=MAX_PROJECT_USER_PAGE_LIMIT).contains(&limit) {
+            return Err(ApplicationError::InvalidInput);
+        }
         self.port
-            .list_project_users(project_id, MAX_CONTROL_RESULTS)
+            .list_project_users(project_id, status, cursor, limit)
             .await
     }
 
@@ -227,6 +258,25 @@ impl ControlLifecycleService {
         positive_revision(expected_security_revision)?;
         self.port
             .disable_project_user(DisableProjectUser {
+                project_id,
+                user_id,
+                expected_security_revision,
+                correlation_id,
+                now: self.clock.now(),
+            })
+            .await
+    }
+
+    pub(crate) async fn enable_project_user(
+        &self,
+        project_id: Uuid,
+        user_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectUserRecord, ApplicationError> {
+        positive_revision(expected_security_revision)?;
+        self.port
+            .enable_project_user(EnableProjectUser {
                 project_id,
                 user_id,
                 expected_security_revision,

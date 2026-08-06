@@ -165,13 +165,13 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             .ok_or(ApplicationError::NotFound)?;
         let authority = transaction
             .query_one_raw(statement(
-                r"SELECT provider.id AS provider_id, provider.kind AS provider_legacy_kind, provider.adapter_kind AS provider_adapter_kind, provider.provider_key, provider.display_name AS provider_display_name, provider.issuer,
-                          provider.client_id, provider.secret_ref, provider.secret_material_id,
+                r"SELECT provider.id AS provider_id, provider.kind AS provider_kind, provider.provider_key, provider.display_name AS provider_display_name, provider.issuer,
+                          provider.client_id, provider.secret_material_id,
                           provider.callback_url,
                           provider.revision AS provider_revision,
                           provider.managed_profile_revision, application.revision AS application_revision,
                           assignment.security_revision AS assignment_security_revision,
-                          CASE WHEN provider.adapter_kind='oidc' THEN egress.revision ELSE NULL END
+                          CASE WHEN provider.kind='oidc' THEN egress.revision ELSE NULL END
                             AS egress_policy_revision
                      FROM managed_provider_connections AS connection
                      LEFT JOIN project_provider_egress_policies AS egress
@@ -255,8 +255,7 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             .map_err(persistence)?
             .ok_or(ApplicationError::RevisionConflict)?;
         let provider_kind = super::provider_row::effective_provider_kind(
-            &get::<String>(&authority, "provider_legacy_kind")?,
-            get::<Option<String>>(&authority, "provider_adapter_kind")?.as_deref(),
+            &get::<String>(&authority, "provider_kind")?,
             &get::<String>(&authority, "issuer")?,
         )?;
         if !provider_kind.capabilities().managed_profile {
@@ -278,7 +277,7 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             .execute_raw(statement(
                 r"INSERT INTO managed_provider_reauthorization_interactions
                   (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-                   provider_configuration_id,provider_key,issuer,subject,client_id,secret_ref,
+                   provider_configuration_id,provider_key,issuer,subject,client_id,
                    secret_material_id,application_id,expected_connection_generation,
                    expected_credential_generation,
                    expected_connection_revision,project_security_revision,user_security_revision,
@@ -287,10 +286,10 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
                    supports_revocation,required_scopes,provider_pkce_required,oidc_nonce_required,
                    interaction_digest,interaction_digest_key_version,revision,status,expires_at,created_at,
                    provider_kind,provider_egress_policy_revision,provider_display_name)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-                         $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
-                         ARRAY(SELECT jsonb_array_elements_text($29::jsonb)),$30,$31,$32,$33,1,
-                         'awaiting_browser_binding',$34,$35,$36,$37,$38)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                         $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,
+                         ARRAY(SELECT jsonb_array_elements_text($28::jsonb)),$29,$30,$31,$32,1,
+                         'awaiting_browser_binding',$33,$34,$35,$36,$37)",
                 vec![
                     prepared.interaction_id.into(),
                     prepared.command.project_id.into(),
@@ -303,8 +302,7 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
                     get::<String>(&authority, "issuer")?.into(),
                     get::<String>(&identity, "subject")?.into(),
                     get::<String>(&authority, "client_id")?.into(),
-                    get::<Option<String>>(&authority, "secret_ref")?.into(),
-                    get::<Option<Uuid>>(&authority, "secret_material_id")?.into(),
+                    get::<Uuid>(&authority, "secret_material_id")?.into(),
                     prepared.command.application_id.into(),
                     prepared.command.expected_connection_generation.into(),
                     prepared.command.expected_credential_generation.into(),
@@ -1051,7 +1049,7 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             issuer: claimed.issuer.clone(),
             subject: claimed.subject.clone(),
             client_id: claimed.client_id.clone(),
-            secret_ref: claimed.secret_ref.clone(),
+            secret_material_id: claimed.secret_material_id,
         };
         transaction.commit().await.map_err(persistence)?;
         Ok(CompletedManagedReauthorization {
@@ -1339,8 +1337,7 @@ async fn read_record_by_id<C: ConnectionTrait>(
             r"SELECT id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
                       provider_configuration_id,provider_key,provider_display_name,
                       provider_kind,
-                      issuer,subject,client_id,
-                      COALESCE(secret_material_id::TEXT,secret_ref) AS secret_ref,
+                      issuer,subject,client_id,secret_material_id,
                       application_id,expected_connection_generation,expected_credential_generation,
                       expected_connection_revision,project_security_revision,user_security_revision,
                       identity_revision,provider_revision,managed_profile_revision,application_revision,
@@ -1453,7 +1450,7 @@ fn record_from_row(
         issuer,
         subject: get(row, "subject")?,
         client_id: get(row, "client_id")?,
-        secret_ref: get(row, "secret_ref")?,
+        secret_material_id: get(row, "secret_material_id")?,
         callback_url: get(row, "callback_url")?,
         adapter_key: get(row, "adapter_key")?,
         adapter_capability_revision: get(row, "adapter_capability_revision")?,

@@ -73,7 +73,8 @@ interface ProjectPolicy {
 
 interface SigningKey {
   readonly id: string;
-  readonly ring_revision: number;
+  readonly kid: string;
+  readonly state: string;
 }
 
 interface Provider {
@@ -2358,24 +2359,7 @@ async function provision(request: APIRequestContext, suffix: string): Promise<Pr
     },
   );
 
-  const signingKey = await control<SigningKey>(
-    request,
-    "POST",
-    `projects/${project.id}/signing-keys`,
-    { expected_project_revision: project.metadata_revision },
-    `signing-key-${suffix}`,
-  );
-  const jwks = await request.get(
-    `${runtimeBase}projects/${encodeURIComponent(project.public_id)}/.well-known/jwks.json`,
-  );
-  expect(jwks.ok()).toBe(true);
-  await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
-  await control<SigningKey>(
-    request,
-    "POST",
-    `projects/${project.id}/signing-keys/${signingKey.id}/activate`,
-    { expected_ring_revision: signingKey.ring_revision },
-  );
+  await rotateSigningKey(request, project, `signing-key-${suffix}`);
 
   const provider = await control<Provider>(
     request,
@@ -2433,6 +2417,62 @@ async function control<T>(
   });
   expect(response.ok(), `${method} ${path}: ${await response.text()}`).toBe(true);
   return (await response.json()) as T;
+}
+
+async function rotateSigningKey(
+  request: APIRequestContext,
+  project: Project,
+  idempotencyKey: string,
+): Promise<void> {
+  await waitForSigningKey(request, project, undefined);
+  const currentProject = await controlGet<Project>(request, `projects/${project.id}`);
+  const rotated = await control<SigningKey>(
+    request,
+    "POST",
+    `projects/${project.id}/signing-keys/rotate`,
+    { expected_project_revision: currentProject.metadata_revision },
+    idempotencyKey,
+  );
+  const active = await waitForSigningKey(request, project, rotated.id);
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const response = await request.get(
+      `${runtimeBase}projects/${encodeURIComponent(project.public_id)}/.well-known/jwks.json`,
+    );
+    if (response.ok()) {
+      const body = (await response.json()) as { keys?: { kid?: string }[] };
+      if (body.keys?.some(({ kid }) => kid === active.kid) === true) return;
+    }
+    await delay(250);
+  }
+  throw new Error(`timed out waiting for signing key ${active.id} in Runtime JWKS`);
+}
+
+async function waitForSigningKey(
+  request: APIRequestContext,
+  project: Project,
+  keyId: string | undefined,
+): Promise<SigningKey> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const { items } = await controlGet<{ items: SigningKey[] }>(
+      request,
+      `projects/${project.id}/signing-keys`,
+    );
+    const candidate =
+      keyId === undefined
+        ? items.find(({ state }) => state === "active")
+        : items.find(({ id, state }) => id === keyId && state === "active");
+    if (candidate !== undefined) return candidate;
+    await delay(250);
+  }
+  throw new Error(
+    keyId === undefined
+      ? `timed out waiting for Project ${project.id} initial signing key`
+      : `timed out waiting for signing key ${keyId} to activate`,
+  );
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
 async function writeBrowserEvidence(

@@ -29,7 +29,7 @@ pub(in crate::adapters::postgres) async fn authenticate_committed_signing_provid
         .handle
         .expose(|returned| returned == committed_handle);
     validate_protected_signing_jwk(&prepared.kid, &material.public_key, public_jwk)?;
-    if key.signer_material_id != Some(material.material_id)
+    if key.signer_material_id != material.material_id
         || key.public_jwk != *public_jwk
         || committed.state != "live"
         || !handle_matches
@@ -155,7 +155,7 @@ pub(in crate::adapters::postgres) fn prepared_signing_key(
         ring_id: operation.ring_id,
         key_id: operation.key_id,
         kid: key.kid,
-        signer_ref: key.signer_ref,
+        signer_material_id: operation.material_id,
         request_digest: operation.request_digest,
         state: provisioning_operation_state(&operation.state)?,
     })
@@ -581,7 +581,7 @@ pub(in crate::adapters::postgres) async fn abandon_signing_key_operation(
     operation.next_attempt_at = Set(cleanup_required.then_some(abandoned_at));
     operation.abandoned_at = Set((!cleanup_required).then_some(abandoned_at));
     operation.update(transaction).await.map_err(persistence)?;
-    Ok((!cleanup_required).then_some(material_id).flatten())
+    Ok((!cleanup_required).then_some(material_id))
 }
 
 pub(in crate::adapters::postgres) async fn lock_advisory(

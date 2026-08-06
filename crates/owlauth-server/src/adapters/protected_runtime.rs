@@ -7,7 +7,6 @@ use owlauth_key_provider::{
     SigningAlgorithm, SigningInput,
 };
 use sea_orm::DatabaseConnection;
-use time::OffsetDateTime;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -93,10 +92,9 @@ impl PostgresProtectedRuntimeCustody {
 
     async fn material(
         &self,
-        reference: &str,
+        material_id: Uuid,
         expected_kind: MaterialKind,
     ) -> Result<super::postgres::custody::LiveProtectedMaterial, ApplicationError> {
-        let material_id = Uuid::parse_str(reference).map_err(|_| ApplicationError::Integrity)?;
         let material = self.materials.load_live_by_id(material_id).await?;
         if material.reservation.material_kind != expected_kind {
             return Err(ApplicationError::Integrity);
@@ -197,10 +195,12 @@ impl PostgresProtectedRuntimeCustody {
 impl RuntimeSigner for PostgresProtectedRuntimeCustody {
     async fn sign(
         &self,
-        signer_ref: &str,
+        signing_material_id: Uuid,
         signing_input: &[u8],
     ) -> Result<Vec<u8>, ApplicationError> {
-        let material = self.material(signer_ref, MaterialKind::SigningKey).await?;
+        let material = self
+            .material(signing_material_id, MaterialKind::SigningKey)
+            .await?;
         self.sign_material(material, signing_input).await
     }
 
@@ -216,9 +216,12 @@ impl RuntimeSigner for PostgresProtectedRuntimeCustody {
 
 #[async_trait]
 impl ProviderSecretResolver for PostgresProtectedRuntimeCustody {
-    async fn resolve(&self, secret_ref: &str) -> Result<Zeroizing<String>, ApplicationError> {
+    async fn resolve(
+        &self,
+        secret_material_id: Uuid,
+    ) -> Result<Zeroizing<String>, ApplicationError> {
         let material = self
-            .material(secret_ref, MaterialKind::ConfigurationSecret)
+            .material(secret_material_id, MaterialKind::ConfigurationSecret)
             .await?;
         if material.reservation.owner_kind != MaterialOwnerKind::ProviderSecret {
             return Err(ApplicationError::Integrity);
@@ -232,33 +235,22 @@ impl ProviderSecretResolver for PostgresProtectedRuntimeCustody {
 
 #[async_trait]
 impl WebhookSecretResolver for PostgresProtectedRuntimeCustody {
-    async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+    async fn resolve(&self, material_id: Uuid) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
         let material = self
-            .material(reference, MaterialKind::ConfigurationSecret)
+            .material(material_id, MaterialKind::ConfigurationSecret)
             .await?;
         if material.reservation.owner_kind != MaterialOwnerKind::WebhookSecret {
             return Err(ApplicationError::Integrity);
         }
         self.open_configuration_material(material).await
     }
-
-    async fn erase(&self, reference: &str) -> Result<(), ApplicationError> {
-        let material_id = Uuid::parse_str(reference).map_err(|_| ApplicationError::Integrity)?;
-        let material = self.materials.load_reservation_by_id(material_id).await?;
-        if material.owner_kind != MaterialOwnerKind::WebhookSecret {
-            return Err(ApplicationError::Integrity);
-        }
-        self.materials
-            .erase_by_id(material_id, OffsetDateTime::now_utc())
-            .await
-    }
 }
 
 #[async_trait]
 impl SmtpCredentialResolver for PostgresProtectedRuntimeCustody {
-    async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+    async fn resolve(&self, material_id: Uuid) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
         let material = self
-            .material(reference, MaterialKind::ConfigurationSecret)
+            .material(material_id, MaterialKind::ConfigurationSecret)
             .await?;
         if !matches!(
             material.reservation.owner_kind,
@@ -273,11 +265,11 @@ impl SmtpCredentialResolver for PostgresProtectedRuntimeCustody {
 
     async fn resolve_checked(
         &self,
-        reference: &str,
+        material_id: Uuid,
         expected_fingerprint: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
         let material = self
-            .material(reference, MaterialKind::ConfigurationSecret)
+            .material(material_id, MaterialKind::ConfigurationSecret)
             .await?;
         if !matches!(
             material.reservation.owner_kind,
@@ -287,22 +279,6 @@ impl SmtpCredentialResolver for PostgresProtectedRuntimeCustody {
             return Err(ApplicationError::Disabled);
         }
         self.open_configuration_material(material).await
-    }
-
-    async fn erase(&self, reference: &str) -> Result<(), ApplicationError> {
-        let material_id = Uuid::parse_str(reference).map_err(|_| ApplicationError::Integrity)?;
-        let material = self.materials.load_reservation_by_id(material_id).await?;
-        if !matches!(
-            material.owner_kind,
-            MaterialOwnerKind::ProjectSmtp
-                | MaterialOwnerKind::DeploymentSmtp
-                | MaterialOwnerKind::SmtpTestRecipient
-        ) {
-            return Err(ApplicationError::Integrity);
-        }
-        self.materials
-            .erase_by_id(material_id, OffsetDateTime::now_utc())
-            .await
     }
 }
 

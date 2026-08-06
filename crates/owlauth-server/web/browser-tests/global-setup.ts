@@ -153,10 +153,6 @@ export default async function globalSetup() {
       OWLAUTH_INSTANCE_ID: "browser-e2e",
       OWLAUTH_POSTGRES_URL: postgresUrl,
       OWLAUTH_SOFTWARE_CUSTODY_KEY: "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4",
-      OWLAUTH_SIGNER_STORE_ROOT: resolve(temporaryRoot, "signers"),
-      OWLAUTH_SIGNER_STORE_KEY: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
-      OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT: resolve(temporaryRoot, "secrets"),
-      OWLAUTH_CONFIGURATION_SECRET_STORE_KEY: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
       OWLAUTH_RUNTIME_PROCESS_ID: "browser-runtime",
       OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS: "browser-runtime",
       OWLAUTH_RUNTIME_KEY_VERSION: "1",
@@ -176,7 +172,6 @@ export default async function globalSetup() {
       OWLAUTH_IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY:
         "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw",
       OWLAUTH_ADMISSION_DIGEST_KEY: "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
-      OWLAUTH_PROVIDER_ALLOWED_ORIGINS: services.providerOrigin,
       OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK: "true",
       OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS: "127.0.0.1",
       OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE: smtpRootCertificateDerFile,
@@ -193,7 +188,7 @@ export default async function globalSetup() {
       OWLAUTH_DEPLOYMENT_SMTP_SENDER_ADDRESS: "login@owlauth.test",
       OWLAUTH_DEPLOYMENT_SMTP_ALLOWED_PRIVATE_IPS: "127.0.0.1,::1",
     };
-    const runtimeEmailIdentityEnvironment = {
+    const durableEmailIdentityEnvironment = {
       OWLAUTH_EMAIL_IDENTITY_KEY_VERSION: "1",
       OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY: "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0",
       OWLAUTH_EMAIL_IDENTITY_PROTECTION_KEY: "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
@@ -202,6 +197,7 @@ export default async function globalSetup() {
       cwd: repository,
       env: {
         ...commonEnvironment,
+        ...durableEmailIdentityEnvironment,
         ...deploymentMetadataEnvironment,
         OWLAUTH_MODE: "control",
         OWLAUTH_CONTROL_ADDR: `127.0.0.1:${String(controlPort)}`,
@@ -223,7 +219,7 @@ export default async function globalSetup() {
       cwd: repository,
       env: {
         ...commonEnvironment,
-        ...runtimeEmailIdentityEnvironment,
+        ...durableEmailIdentityEnvironment,
         ...deploymentEnvironment,
         OWLAUTH_SMTP_EXTRA_ROOT_CERT_DER_FILE: smtpRootCertificateDerFile,
         OWLAUTH_MODE: "runtime",
@@ -247,6 +243,7 @@ export default async function globalSetup() {
       cwd: repository,
       env: {
         ...commonEnvironment,
+        ...durableEmailIdentityEnvironment,
         ...deploymentEnvironment,
         OWLAUTH_MODE: "control",
         OWLAUTH_CONTROL_ADDR: `127.0.0.1:${String(controlPort)}`,

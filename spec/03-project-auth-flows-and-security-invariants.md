@@ -163,7 +163,7 @@ sequenceDiagram
 
     App->>Runtime: Exchange(ticket, application_id, PKCE verifier)
     Runtime->>Core: ExchangeHandoff(command)
-    Core->>PG: Read ticket and authoritative Project/Application/user/projection policy
+    Core->>PG: Read ticket and authoritative Project/Application/user state
     PG-->>Core: eligible snapshot and bounded candidate projection
     Core->>Signer: Sign prepared Project access-token claims
     Signer-->>Core: signed token output
@@ -180,7 +180,7 @@ The final transaction:
 - revalidates Project/Application/user status and policy revisions, plus the current Application-provider assignment only for a provider-authenticated handoff;
 - requires the Project signing-key epoch used for prepared claims to remain active;
 - consumes the ticket exactly once;
-- creates or reuses the unique `(project_id, application_id, user_id)` binding and materializes its authoritative bounded projection with `user_revision`, `projection_revision`, schema, digest, and current policy snapshot;
+- creates or reuses the unique `(project_id, application_id, user_id)` binding and materializes its authoritative bounded projection with `user_revision`, `projection_revision`, schema, digest, and current source snapshot;
 - creates one Application session and refresh-family generation;
 - when the webhook event contract is installed, emits `user.projection.created` only for a binding first created by this transaction and creates targets only for already-active eligible endpoints; deploying webhook support or adding an endpoint later never invents a historical created event;
 - appends the audit event atomically.

@@ -67,16 +67,13 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   ).toBeVisible();
 
   await page.getByRole("link", { name: "Signing keys" }).click();
-  await page.getByRole("button", { name: "Provision signing key" }).click();
-  await expect(page.getByRole("button", { name: "Activate" })).toBeVisible();
+  await expect(page.getByText(/active, ring revision/u)).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("button", { name: "Rotate signing key" })).toBeEnabled();
   const firstJwks = await page.request.get(
     `${runtimeBase}projects/${encodeURIComponent(projectPublicId)}/.well-known/jwks.json`,
   );
   expect(firstJwks.ok()).toBe(true);
   expect((await firstJwks.json()) as { keys: unknown[] }).toMatchObject({ keys: [{}] });
-  await page.waitForTimeout(150);
-  await page.getByRole("button", { name: "Activate" }).click();
-  await expect(page.getByText(/active, ring revision/u)).toBeVisible();
 
   await page.getByRole("link", { name: "Providers" }).click();
   await page.getByRole("button", { name: "Add Custom OIDC" }).click();
@@ -176,7 +173,21 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
     await candidate.emulateMedia({ reducedMotion: "reduce" });
     await expect(candidate.locator("body")).toHaveCSS("scroll-behavior", "auto");
     await candidate.emulateMedia({ forcedColors: "active", reducedMotion: "reduce" });
-    expect((await new AxeBuilder({ page: candidate }).analyze()).violations).toEqual([]);
+    await expect
+      .poll(() => candidate.evaluate(() => window.matchMedia("(forced-colors: active)").matches))
+      .toBe(true);
+    expect(
+      await candidate.evaluate(() =>
+        getComputedStyle(document.documentElement).getPropertyValue("--owl-text").trim(),
+      ),
+    ).toBe("CanvasText");
+    // Forced-colors paint-time substitutions are intentionally absent from computed RGB values,
+    // so axe cannot calculate meaningful contrast in this emulation. Keep every structural rule
+    // enabled while directly asserting the system-color token above.
+    expect(
+      (await new AxeBuilder({ page: candidate }).disableRules(["color-contrast"]).analyze())
+        .violations,
+    ).toEqual([]);
   }
 });
 

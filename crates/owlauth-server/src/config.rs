@@ -59,10 +59,6 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_CONTROL_MCP_MAX_REQUESTS_PER_SECOND",
     "OWLAUTH_CONTROL_MCP_MAX_RESULT_BYTES",
     "OWLAUTH_SOFTWARE_CUSTODY_KEY",
-    "OWLAUTH_SIGNER_STORE_ROOT",
-    "OWLAUTH_SIGNER_STORE_KEY",
-    "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
-    "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
     "OWLAUTH_RUNTIME_KEY_VERSION",
     "OWLAUTH_RUNTIME_DIGEST_KEY",
     "OWLAUTH_RUNTIME_PROTECTION_KEY",
@@ -91,7 +87,6 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_MANAGED_CREDENTIAL_KEY_VERSION",
     "OWLAUTH_MANAGED_CREDENTIAL_KEY",
     "OWLAUTH_MANAGED_CREDENTIAL_RETAINED_KEYS",
-    "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
     "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK",
     "OWLAUTH_RUNTIME_PROCESS_ID",
     "OWLAUTH_ADMISSION_REDIS_URL",
@@ -184,7 +179,7 @@ impl FromStr for PlaneMode {
 /// Startup migration behavior.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MigrationMode {
-    /// Apply compatible pending migrations before serving.
+    /// Apply this binary's exact pending migrations before serving.
     #[default]
     Auto,
     /// Perform a DDL-free exact history check.
@@ -329,14 +324,6 @@ pub struct ProvisioningConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct LegacyCustodyImportConfig {
-    pub signer_store_root: PathBuf,
-    pub signer_store_key: StoreMasterKey,
-    pub configuration_secret_store_root: PathBuf,
-    pub configuration_secret_store_key: StoreMasterKey,
-}
-
-#[derive(Clone, Debug)]
 pub struct RuntimeKeyConfig {
     pub digest_key: StoreMasterKey,
     pub protection_key: StoreMasterKey,
@@ -421,7 +408,6 @@ pub struct ServerConfig {
     pub control_api_key: Option<OperatorApiKey>,
     pub control_mcp: McpHttpConfig,
     pub provisioning: Option<ProvisioningConfig>,
-    pub legacy_custody_import: Option<LegacyCustodyImportConfig>,
     pub runtime_protection: Option<RuntimeProtectionConfig>,
     pub email_identity_protection: Option<EmailIdentityProtectionConfig>,
     pub projection_email_protection: ProjectionEmailProtectionConfig,
@@ -433,7 +419,6 @@ pub struct ServerConfig {
     pub identity_mutation_evidence_protection: RuntimeProtectionConfig,
     pub managed_credential_protection: Option<ManagedCredentialProtectionConfig>,
     pub client_key_digest: Option<ClientKeyDigestConfig>,
-    pub provider_allowed_origins: Vec<String>,
     pub provider_allow_http_loopback: bool,
     pub runtime_process_id: String,
     pub required_runtime_process_ids: Vec<String>,
@@ -457,13 +442,13 @@ impl ServerConfig {
     ///
     /// Unknown `OWLAUTH_*` variables are rejected. Runtime-only mode loads the configured
     /// `PostgreSQL` custody provider authority required for federated Project authentication, but it
-    /// deliberately does not load the Control operator credential or legacy file-store roots.
+    /// deliberately does not load the Control operator credential.
     ///
     /// # Errors
     ///
     /// Returns a bounded configuration error before any listener is bound.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_env_with_requirements(true, false)
+        Self::from_env_with_requirements(true)
     }
 
     /// Reads the core server environment without requiring the bundled software custody root.
@@ -475,22 +460,10 @@ impl ServerConfig {
     ///
     /// Returns a bounded core configuration error before any listener is bound.
     pub fn from_env_for_custom_providers() -> Result<Self, ConfigError> {
-        Self::from_env_with_requirements(false, false)
+        Self::from_env_with_requirements(false)
     }
 
-    /// Reads configuration for the listenerless one-way legacy custody importer.
-    ///
-    /// # Errors
-    ///
-    /// Returns a bounded configuration error before any database import effect.
-    pub fn from_env_for_custody_import() -> Result<Self, ConfigError> {
-        Self::from_env_with_requirements(true, true)
-    }
-
-    fn from_env_with_requirements(
-        require_software_custody: bool,
-        require_legacy_custody: bool,
-    ) -> Result<Self, ConfigError> {
+    fn from_env_with_requirements(require_software_custody: bool) -> Result<Self, ConfigError> {
         let mut values = BTreeMap::new();
         for (key, value) in env::vars_os() {
             let Some(key) = key.to_str() else {
@@ -505,11 +478,7 @@ impl ServerConfig {
             })?;
             values.insert(key.to_owned(), value);
         }
-        Self::from_values_with_requirements(
-            &values,
-            require_software_custody,
-            require_legacy_custody,
-        )
+        Self::from_values_with_requirements(&values, require_software_custody)
     }
 
     #[cfg(test)]
@@ -521,7 +490,7 @@ impl ServerConfig {
 
     #[cfg(test)]
     fn from_values(values: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
-        Self::from_values_with_requirements(values, true, false)
+        Self::from_values_with_requirements(values, true)
     }
 
     #[allow(
@@ -531,7 +500,6 @@ impl ServerConfig {
     fn from_values_with_requirements(
         values: &BTreeMap<String, String>,
         require_software_custody: bool,
-        require_legacy_custody: bool,
     ) -> Result<Self, ConfigError> {
         reject_unknown_keys(values)?;
 
@@ -599,7 +567,6 @@ impl ServerConfig {
         let control_mcp = parse_control_mcp(mode, values)?;
         validate_control_mcp_listener(&control_mcp, &control)?;
         let provisioning = parse_provisioning(mode, values, require_software_custody)?;
-        let legacy_custody_import = parse_legacy_custody_import(values, require_legacy_custody)?;
         let runtime_protection = parse_runtime_protection(mode, values)?;
         let email_identity_protection = parse_email_identity_protection(mode, values)?;
         let projection_email_protection = parse_projection_email_protection(values)?;
@@ -677,8 +644,6 @@ impl ServerConfig {
         let client_key_digest = parse_client_key_digest(mode, values)?;
         let provider_allow_http_loopback =
             parse_boolean(values, "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK", false)?;
-        let provider_allowed_origins =
-            parse_provider_allowed_origins(mode, values, provider_allow_http_loopback)?;
         let configured_runtime_process_id = optional(values, "OWLAUTH_RUNTIME_PROCESS_ID")
             .map(validate_process_id)
             .transpose()?;
@@ -794,7 +759,6 @@ impl ServerConfig {
             managed_credential_protection.as_ref(),
             client_key_digest.as_ref(),
             provisioning.as_ref(),
-            legacy_custody_import.as_ref(),
             admission.as_ref(),
         )?;
 
@@ -914,7 +878,6 @@ impl ServerConfig {
             control_api_key,
             control_mcp,
             provisioning,
-            legacy_custody_import,
             runtime_protection,
             email_identity_protection,
             projection_email_protection,
@@ -924,7 +887,6 @@ impl ServerConfig {
             identity_mutation_evidence_protection,
             managed_credential_protection,
             client_key_digest,
-            provider_allowed_origins,
             provider_allow_http_loopback,
             runtime_process_id,
             required_runtime_process_ids,
@@ -1412,49 +1374,6 @@ fn parse_provisioning(
     }))
 }
 
-fn parse_legacy_custody_import(
-    values: &BTreeMap<String, String>,
-    required_for_import: bool,
-) -> Result<Option<LegacyCustodyImportConfig>, ConfigError> {
-    if !required_for_import {
-        return Ok(None);
-    }
-    let signer_store_root = parse_store_root(
-        "OWLAUTH_SIGNER_STORE_ROOT",
-        required(values, "OWLAUTH_SIGNER_STORE_ROOT")?,
-    )?;
-    let configuration_secret_store_root = parse_store_root(
-        "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
-        required(values, "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT")?,
-    )?;
-    if signer_store_root == configuration_secret_store_root {
-        return Err(ConfigError::InvalidValue {
-            key: "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
-            reason: "must be separate from the signer store root".to_owned(),
-        });
-    }
-    let signer_store_key = StoreMasterKey::parse(
-        "OWLAUTH_SIGNER_STORE_KEY",
-        required(values, "OWLAUTH_SIGNER_STORE_KEY")?,
-    )?;
-    let configuration_secret_store_key = StoreMasterKey::parse(
-        "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
-        required(values, "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY")?,
-    )?;
-    if signer_store_key.0.as_ref() == configuration_secret_store_key.0.as_ref() {
-        return Err(ConfigError::InvalidValue {
-            key: "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
-            reason: "must be separate from the signer store wrapping key".to_owned(),
-        });
-    }
-    Ok(Some(LegacyCustodyImportConfig {
-        signer_store_root,
-        signer_store_key,
-        configuration_secret_store_root,
-        configuration_secret_store_key,
-    }))
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SerializedRuntimeKeyConfig {
@@ -1837,7 +1756,6 @@ fn validate_protection_root_separation(
     managed_credential: Option<&ManagedCredentialProtectionConfig>,
     client_key_digest: Option<&ClientKeyDigestConfig>,
     provisioning: Option<&ProvisioningConfig>,
-    legacy_custody: Option<&LegacyCustodyImportConfig>,
     admission: Option<&AdmissionConfig>,
 ) -> Result<(), ConfigError> {
     let mut fingerprints = BTreeSet::new();
@@ -1921,16 +1839,6 @@ fn validate_protection_root_separation(
         insert(
             software_custody_key.0.as_ref(),
             "OWLAUTH_SOFTWARE_CUSTODY_KEY",
-        )?;
-    }
-    if let Some(legacy_custody) = legacy_custody {
-        insert(
-            legacy_custody.signer_store_key.0.as_ref(),
-            "OWLAUTH_SIGNER_STORE_KEY",
-        )?;
-        insert(
-            legacy_custody.configuration_secret_store_key.0.as_ref(),
-            "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
         )?;
     }
     if let Some(admission) = admission {
@@ -2048,49 +1956,6 @@ fn parse_managed_credential_protection(
     }))
 }
 
-fn parse_provider_allowed_origins(
-    _mode: PlaneMode,
-    values: &BTreeMap<String, String>,
-    allow_http_loopback: bool,
-) -> Result<Vec<String>, ConfigError> {
-    let Some(configured) = optional(values, "OWLAUTH_PROVIDER_ALLOWED_ORIGINS") else {
-        return Ok(Vec::new());
-    };
-    let origins = configured
-        .split(',')
-        .map(|value| {
-            let invalid = || ConfigError::InvalidValue {
-                key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-                reason: "must contain comma-separated canonical HTTPS origins or explicitly enabled HTTP loopback origins".to_owned(),
-            };
-            let url = Url::parse(value).map_err(|_| invalid())?;
-            let accepted_scheme = url.scheme() == "https"
-                || (allow_http_loopback
-                    && url.scheme() == "http"
-                    && matches!(url.host_str(), Some("127.0.0.1" | "::1" | "[::1]")));
-            if !accepted_scheme
-                || url.username() != ""
-                || url.password().is_some()
-                || url.host_str().is_none()
-                || url.path() != "/"
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || url.as_str() != value
-            {
-                return Err(invalid());
-            }
-            Ok(value.to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if origins.is_empty() || origins.iter().collect::<BTreeSet<_>>().len() != origins.len() {
-        return Err(ConfigError::InvalidValue {
-            key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-            reason: "must contain unique canonical provider origins".to_owned(),
-        });
-    }
-    Ok(origins)
-}
-
 fn parse_boolean(
     values: &BTreeMap<String, String>,
     key: &'static str,
@@ -2105,21 +1970,6 @@ fn parse_boolean(
             reason: "must be `true` or `false`".to_owned(),
         }),
     }
-}
-
-fn parse_store_root(key: &'static str, value: String) -> Result<PathBuf, ConfigError> {
-    let path = PathBuf::from(value);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err(ConfigError::InvalidValue {
-            key,
-            reason: "must be an absolute path without parent traversal".to_owned(),
-        });
-    }
-    Ok(path)
 }
 
 fn validate_process_id(value: &str) -> Result<String, ConfigError> {
@@ -2395,10 +2245,6 @@ mod tests {
                 "ERERERERERERERERERERERERERERERERERERERERERE",
             ),
             (
-                "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-                "https://accounts.example/",
-            ),
-            (
                 "OWLAUTH_RUNTIME_DIGEST_KEY",
                 "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
             ),
@@ -2433,25 +2279,10 @@ mod tests {
     }
 
     fn control_store_values() -> BTreeMap<String, String> {
-        values(&[
-            (
-                "OWLAUTH_SOFTWARE_CUSTODY_KEY",
-                "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4",
-            ),
-            ("OWLAUTH_SIGNER_STORE_ROOT", "/tmp/owlauth-test-signers"),
-            (
-                "OWLAUTH_SIGNER_STORE_KEY",
-                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
-            ),
-            (
-                "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
-                "/tmp/owlauth-test-configuration-secrets",
-            ),
-            (
-                "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
-                "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
-            ),
-        ])
+        values(&[(
+            "OWLAUTH_SOFTWARE_CUSTODY_KEY",
+            "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4",
+        )])
     }
 
     #[test]
@@ -2776,13 +2607,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mode_loads_provider_authority_without_control_or_legacy_custody() {
+    fn runtime_mode_loads_provider_authority_without_control_credentials() {
         const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
         assert!(ServerConfig::from_values(&runtime_values()).is_err());
 
         let mut input = runtime_values();
         input.extend(control_store_values());
-        input.remove("OWLAUTH_PROVIDER_ALLOWED_ORIGINS");
         input.insert(
             "OWLAUTH_CONTROL_API_KEY".to_owned(),
             "this value must not be loaded".to_owned(),
@@ -2791,47 +2621,10 @@ mod tests {
             .expect("Runtime auth requires the bundled software provider root");
         assert_eq!(config.mode, PlaneMode::Runtime);
         assert!(config.control_api_key.is_none());
-        assert!(config.provider_allowed_origins.is_empty());
         assert!(config.provisioning.is_some());
-        assert!(config.legacy_custody_import.is_none());
         let debug = format!("{config:?}");
         assert!(!debug.contains("this value"));
-        assert!(!debug.contains("/tmp/owlauth-test-signers"));
-        assert!(!debug.contains("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"));
         assert!(!debug.contains("AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM"));
-    }
-
-    #[test]
-    fn custody_import_parser_requires_and_loads_all_legacy_authority() {
-        let mut input = runtime_values();
-        input.extend(control_store_values());
-        let config = ServerConfig::from_values_with_requirements(&input, true, true)
-            .expect("importer owns both legacy stores and the target software provider");
-        let legacy = config
-            .legacy_custody_import
-            .expect("importer-only legacy custody");
-        assert_eq!(
-            legacy.signer_store_root,
-            PathBuf::from("/tmp/owlauth-test-signers")
-        );
-        assert_eq!(
-            legacy.configuration_secret_store_root,
-            PathBuf::from("/tmp/owlauth-test-configuration-secrets")
-        );
-
-        for key in [
-            "OWLAUTH_SIGNER_STORE_ROOT",
-            "OWLAUTH_SIGNER_STORE_KEY",
-            "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT",
-            "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY",
-        ] {
-            let mut incomplete = input.clone();
-            incomplete.remove(key);
-            assert!(matches!(
-                ServerConfig::from_values_with_requirements(&incomplete, true, true),
-                Err(ConfigError::Missing(missing)) if missing == key
-            ));
-        }
     }
 
     #[test]
@@ -2840,7 +2633,7 @@ mod tests {
         input.extend(control_store_values());
         input.remove("OWLAUTH_SOFTWARE_CUSTODY_KEY");
         assert!(ServerConfig::from_values(&input).is_err());
-        let config = ServerConfig::from_values_with_requirements(&input, false, false)
+        let config = ServerConfig::from_values_with_requirements(&input, false)
             .expect("custom provider composition owns its provider configuration");
         assert!(
             config
@@ -2849,7 +2642,6 @@ mod tests {
                 .software_custody_key
                 .is_none()
         );
-        assert!(config.legacy_custody_import.is_none());
     }
 
     #[test]
@@ -3365,40 +3157,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_http_requires_explicit_loopback_only_development_policy() {
+    fn provider_http_loopback_policy_is_an_explicit_boolean() {
         let mut input = runtime_values();
         input.extend(control_store_values());
-        input.insert(
-            "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
-            "http://127.0.0.1:8090/".to_owned(),
-        );
-        assert!(matches!(
-            ServerConfig::from_values(&input),
-            Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-                ..
-            })
-        ));
+        let config = ServerConfig::from_values(&input)
+            .expect("provider HTTP loopback is disabled by default");
+        assert!(!config.provider_allow_http_loopback);
 
         input.insert(
             "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK".to_owned(),
             "true".to_owned(),
         );
         let config = ServerConfig::from_values(&input)
-            .expect("explicit development policy should admit canonical loopback HTTP");
+            .expect("explicit development policy enables loopback HTTP");
         assert!(config.provider_allow_http_loopback);
 
-        input.insert(
-            "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
-            "http://localhost:8090/".to_owned(),
-        );
-        assert!(matches!(
-            ServerConfig::from_values(&input),
-            Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_PROVIDER_ALLOWED_ORIGINS",
-                ..
-            })
-        ));
         input.insert(
             "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK".to_owned(),
             "yes".to_owned(),

@@ -33,6 +33,7 @@ interface UserManagementProps {
 }
 
 type LoadState = "idle" | "loading" | "ready";
+type UserStatusFilter = "all" | "active" | "disabled" | "merged";
 
 const EMPTY_SESSIONS: ProjectUserSessions = {
   application_sessions: [],
@@ -53,6 +54,8 @@ export function UserManagement({
   const confirm = useControlConfirmation();
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [users, setUsers] = useState<ProjectUser[]>([]);
+  const [statusFilter, setStatusFilter] = useState<UserStatusFilter>("all");
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [selectedUser, setSelectedUser] = useState<ProjectUser | null>(null);
   const [sessions, setSessions] = useState<ProjectUserSessions | null>(null);
   const [connections, setConnections] = useState<ManagedProviderConnection[] | null>(null);
@@ -63,22 +66,38 @@ export function UserManagement({
   const reauthorizationAttemptOwner = useRef<string | null>(null);
 
   const loadUsers = useCallback(
-    async (preferredUserId?: string): Promise<ProjectUser | null> => {
+    async (
+      preferredUserId?: string,
+      cursor?: string,
+      append = false,
+    ): Promise<ProjectUser | null> => {
       const result = await session.client.GET("/v1/projects/{project_id}/users", {
-        params: { path: { project_id: project.id } },
+        params: {
+          path: { project_id: project.id },
+          query: {
+            ...(statusFilter === "all" ? {} : { status: statusFilter }),
+            ...(cursor === undefined ? {} : { cursor }),
+            limit: 50,
+          },
+        },
       });
-      const nextUsers = requireData(result.data, result.error, result.response).items;
-      setUsers(nextUsers);
+      const page = requireData(result.data, result.error, result.response);
+      setNextCursor(page.next_cursor ?? null);
       setLoadState("ready");
+      if (append) {
+        setUsers((current) => [...current, ...page.items]);
+        return null;
+      }
+      setUsers(page.items);
       const preferred =
         preferredUserId === undefined
           ? null
-          : (nextUsers.find((user) => user.id === preferredUserId) ?? null);
+          : (page.items.find((user) => user.id === preferredUserId) ?? null);
       setSelectedUser(preferred);
       if (preferred === null) setSessions(EMPTY_SESSIONS);
       return preferred;
     },
-    [project.id, session],
+    [project.id, session, statusFilter],
   );
 
   const loadUser = useCallback(
@@ -107,7 +126,11 @@ export function UserManagement({
           sessionResult.error,
           sessionResult.response,
         );
-        setUsers((current) => current.map((item) => (item.id === user.id ? user : item)));
+        setUsers((current) =>
+          current.some((item) => item.id === user.id)
+            ? current.map((item) => (item.id === user.id ? user : item))
+            : [user],
+        );
         setSelectedUser(user);
         setSessions(nextSessions);
         setConnections(
@@ -136,13 +159,20 @@ export function UserManagement({
     setLoadState("loading");
     setMessage(null);
     try {
+      if (detailOnly && initialUserId !== undefined) {
+        setUsers([]);
+        setNextCursor(null);
+        await loadUser(initialUserId);
+        setLoadState("ready");
+        return;
+      }
       const selected = await loadUsers(initialUserId);
       if (selected !== null) await loadUser(selected.id);
     } catch (error) {
       setLoadState("idle");
       await onError(error);
     }
-  }, [initialUserId, loadUser, loadUsers, onError, setMessage]);
+  }, [detailOnly, initialUserId, loadUser, loadUsers, onError, setMessage]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -191,6 +221,34 @@ export function UserManagement({
       setUsers((current) => current.map((user) => (user.id === updated.id ? updated : user)));
       setSelectedUser(updated);
       setMessage("Project user disabled.");
+    } catch (error) {
+      await refreshAfterConflict(error);
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  async function enableSelectedUser() {
+    if (selectedUser?.status !== "disabled") return;
+    const label = selectedUser.display_name ?? selectedUser.public_id;
+    if (
+      !(await confirm({
+        title: "Enable Project user",
+        message: `Enable ${label} for fresh authentication? Credentials issued before disable remain invalid.`,
+        actionLabel: "Enable user",
+      }))
+    )
+      return;
+    setPendingAction(`enable:${selectedUser.id}`);
+    try {
+      const result = await session.client.POST("/v1/projects/{project_id}/users/{user_id}/enable", {
+        params: { path: { project_id: project.id, user_id: selectedUser.id } },
+        body: { expected_security_revision: selectedUser.security_revision },
+      });
+      const updated = requireData(result.data, result.error, result.response);
+      setUsers((current) => current.map((user) => (user.id === updated.id ? updated : user)));
+      setSelectedUser(updated);
+      setMessage("Project user enabled for fresh authentication.");
     } catch (error) {
       await refreshAfterConflict(error);
     } finally {
@@ -432,17 +490,36 @@ export function UserManagement({
               : "Select one bounded Project user to review its authority on a dedicated detail page."}
           </p>
         </div>
-        <button type="button" onClick={() => void beginLoad()} disabled={loadState === "loading"}>
-          {loadState === "loading" ? "Loading users" : "Refresh users"}
-        </button>
+        <div className={styles["actions"]}>
+          {detailOnly ? null : (
+            <label>
+              Status{" "}
+              <select
+                value={statusFilter}
+                onChange={(event) => {
+                  setStatusFilter(event.currentTarget.value as UserStatusFilter);
+                }}
+                disabled={loadState === "loading"}
+              >
+                <option value="all">All</option>
+                <option value="active">Active</option>
+                <option value="disabled">Disabled</option>
+                <option value="merged">Merged</option>
+              </select>
+            </label>
+          )}
+          <button type="button" onClick={() => void beginLoad()} disabled={loadState === "loading"}>
+            {loadState === "loading" ? "Loading users" : "Refresh users"}
+          </button>
+        </div>
       </div>
 
       {loadState === "idle" ? (
         <p>User records are loaded only when requested.</p>
       ) : loadState === "loading" ? (
         <p role="status">Loading Project users…</p>
-      ) : users.length === 0 ? (
-        <p>No Project users yet.</p>
+      ) : users.length === 0 && !detailOnly ? (
+        <p>No Project users match this status.</p>
       ) : detailOnly && selectedUser === null ? (
         <p>The requested Project user was not found.</p>
       ) : (
@@ -464,6 +541,17 @@ export function UserManagement({
                   </button>
                 </li>
               ))}
+              {nextCursor === null ? null : (
+                <li>
+                  <button
+                    type="button"
+                    disabled={pendingAction !== null}
+                    onClick={() => void loadUsers(undefined, nextCursor, true).catch(onError)}
+                  >
+                    Load more users
+                  </button>
+                </li>
+              )}
             </ul>
           )}
           {selectedUser === null ? null : (
@@ -491,8 +579,22 @@ export function UserManagement({
                   >
                     Disable Project user
                   </button>
+                ) : selectedUser.status === "disabled" ? (
+                  <button
+                    type="button"
+                    onClick={() => void enableSelectedUser()}
+                    disabled={pendingAction !== null}
+                  >
+                    Enable Project user
+                  </button>
                 ) : null}
               </div>
+              {selectedUser.status === "disabled" ? (
+                <p>
+                  Persisted session rows may still display as active, but their security revision is
+                  stale and Runtime and Client online checks reject them.
+                </p>
+              ) : null}
               {pendingAction === `load:${selectedUser.id}` || sessions === null ? (
                 <p role="status">Loading user sessions…</p>
               ) : (

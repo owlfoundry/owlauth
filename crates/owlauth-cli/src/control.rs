@@ -7,18 +7,17 @@ use owlauth_types::{
         Application, ApplicationList, ApplicationSession, ApplicationType, ApplicationUserEvent,
         ApplicationUserEventList, ApplicationUserEventType, BrowserSession,
         CreateApplicationRequest, CreateProjectClientKeyRequest, CreateProjectClientKeyResponse,
-        CreateProjectRequest, CreateProviderRequest, CreateSigningKeyRequest,
-        CreateWebhookEndpointRequest, ExpectedSecurityRevision, ExpectedSessionRevision,
-        ExpectedWebhookEndpointRevision, KeyTransitionRequest, OidcPreflightRequest,
-        OidcPreflightResult, PrepareWebhookSecretRotationRequest, PreparedWebhookSecretRotation,
-        Project, ProjectClientKey, ProjectClientKeyList, ProjectList, ProjectPolicy, ProjectUser,
-        ProjectUserIdentityList, ProjectUserList, ProjectUserSessions, ProjectUserStatus,
-        ProjectionPolicy, Provider, ProviderAssignmentRequest, ProviderEgressMode,
-        ProviderEgressPolicy, ProviderList, ProviderRevisionRequest, ReplayWebhookDeliveryRequest,
-        RevokeProjectClientKeyRequest, SigningKey, SigningKeyList, UpdateProjectPolicyRequest,
-        UpdateProjectionPolicyRequest, UpdateProviderEgressPolicyRequest,
-        UpdateWebhookEndpointRequest, WebhookDelivery, WebhookDeliveryList, WebhookEndpoint,
-        WebhookEndpointList,
+        CreateProjectRequest, CreateProviderRequest, CreateWebhookEndpointRequest,
+        ExpectedSecurityRevision, ExpectedSessionRevision, ExpectedWebhookEndpointRevision,
+        KeyTransitionRequest, OidcPreflightRequest, OidcPreflightResult,
+        PrepareWebhookSecretRotationRequest, PreparedWebhookSecretRotation, Project,
+        ProjectClientKey, ProjectClientKeyList, ProjectList, ProjectPolicy, ProjectUser,
+        ProjectUserIdentityList, ProjectUserList, ProjectUserSessions, ProjectUserStatus, Provider,
+        ProviderAssignmentRequest, ProviderEgressMode, ProviderEgressPolicy, ProviderList,
+        ProviderRevisionRequest, ReplayWebhookDeliveryRequest, RevokeProjectClientKeyRequest,
+        RotateSigningKeyRequest, SigningKey, SigningKeyList, UpdateProjectPolicyRequest,
+        UpdateProviderEgressPolicyRequest, UpdateWebhookEndpointRequest, WebhookDelivery,
+        WebhookDeliveryList, WebhookEndpoint, WebhookEndpointList,
     },
     runtime::ProviderKind,
 };
@@ -62,12 +61,14 @@ impl From<ProjectUser> for ProjectUserOutput {
 #[derive(Debug, Serialize)]
 struct ProjectUserListOutput {
     items: Vec<ProjectUserOutput>,
+    next_cursor: Option<String>,
 }
 
 impl From<ProjectUserList> for ProjectUserListOutput {
     fn from(value: ProjectUserList) -> Self {
         Self {
             items: value.items.into_iter().map(Into::into).collect(),
+            next_cursor: value.next_cursor,
         }
     }
 }
@@ -174,6 +175,14 @@ enum ProjectUserCommand {
         user_id: String,
     },
     Disable {
+        project_id: String,
+        user_id: String,
+        #[arg(long)]
+        expected_security_revision: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+    Enable {
         project_id: String,
         user_id: String,
         #[arg(long)]
@@ -463,15 +472,13 @@ enum SigningKeyCommand {
     List {
         project_id: String,
     },
-    Create {
+    Rotate {
         project_id: String,
         #[arg(long)]
         expected_project_revision: i64,
         #[arg(long)]
         idempotency_key: String,
     },
-    Activate(KeyTransitionArgs),
-    Retire(KeyTransitionArgs),
     Revoke(KeyTransitionArgs),
 }
 
@@ -483,32 +490,6 @@ struct KeyTransitionArgs {
     expected_ring_revision: i64,
     #[arg(long)]
     yes: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct ProjectionPolicyArgs {
-    #[command(subcommand)]
-    command: ProjectionPolicyCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum ProjectionPolicyCommand {
-    Get {
-        project_id: String,
-        #[arg(long)]
-        application_id: Option<String>,
-    },
-    Set {
-        project_id: String,
-        #[arg(long)]
-        application_id: Option<String>,
-        #[arg(long, required = true, action = clap::ArgAction::Set)]
-        verified_email_enabled: bool,
-        #[arg(long)]
-        expected_revision: i64,
-        #[arg(long)]
-        yes: bool,
-    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -870,6 +851,34 @@ fn run_project_user(profile: Option<&str>, args: ProjectUserArgs) -> Result<(), 
                 &target,
                 &serde_json::json!({
                     "effect": "disable the Project user and revoke its authority",
+                    "expected_security_revision": expected_security_revision,
+                }),
+            )?;
+            let value: ProjectUser = authenticated_server_snapshot(stored)?.send(
+                Method::POST,
+                &target,
+                &ExpectedSecurityRevision {
+                    expected_security_revision,
+                },
+                None,
+            )?;
+            print_json(&ProjectUserOutput::from(value))
+        }
+        ProjectUserCommand::Enable {
+            project_id,
+            user_id,
+            expected_security_revision,
+            yes,
+        } => {
+            resources(&[&project_id, &user_id])?;
+            let target = format!("projects/{project_id}/users/{user_id}/enable");
+            let stored = require_confirmation(
+                yes,
+                profile,
+                "project-user.enable",
+                &target,
+                &serde_json::json!({
+                    "effect": "enable fresh authentication without reviving prior credentials",
                     "expected_security_revision": expected_security_revision,
                 }),
             )?;
@@ -1318,7 +1327,7 @@ pub(crate) fn run_signing_key(
                 .get(&format!("projects/{project_id}/signing-keys"))?;
             print_json(&value)
         }
-        SigningKeyCommand::Create {
+        SigningKeyCommand::Rotate {
             project_id,
             expected_project_revision,
             idempotency_key,
@@ -1327,37 +1336,31 @@ pub(crate) fn run_signing_key(
             idem(&idempotency_key)?;
             let value: SigningKey = authenticated_server(profile)?.send(
                 Method::POST,
-                &format!("projects/{project_id}/signing-keys"),
-                &CreateSigningKeyRequest {
+                &format!("projects/{project_id}/signing-keys/rotate"),
+                &RotateSigningKeyRequest {
                     expected_project_revision,
                 },
                 Some(&idempotency_key),
             )?;
             print_json(&value)
         }
-        SigningKeyCommand::Activate(args) => key_transition(profile, "activate", &args),
-        SigningKeyCommand::Retire(args) => key_transition(profile, "retire", &args),
-        SigningKeyCommand::Revoke(args) => key_transition(profile, "revoke", &args),
+        SigningKeyCommand::Revoke(args) => revoke_signing_key(profile, &args),
     }
 }
 
-fn key_transition(
-    profile: Option<&str>,
-    transition: &str,
-    args: &KeyTransitionArgs,
-) -> Result<(), RemoteError> {
+fn revoke_signing_key(profile: Option<&str>, args: &KeyTransitionArgs) -> Result<(), RemoteError> {
     resources(&[&args.project_id, &args.key_id])?;
     let target = format!(
-        "projects/{}/signing-keys/{}/{}",
-        args.project_id, args.key_id, transition
+        "projects/{}/signing-keys/{}/revoke",
+        args.project_id, args.key_id
     );
     let stored = require_confirmation(
         args.yes,
         profile,
-        &format!("signing-key.{transition}"),
+        "signing-key.revoke",
         &target,
         &serde_json::json!({
-            "effect": "perform the irreversible or trust-changing signing-key transition",
+            "effect": "immediately revoke the signing key",
             "expected_ring_revision": args.expected_ring_revision,
         }),
     )?;
@@ -1370,65 +1373,6 @@ fn key_transition(
         None,
     )?;
     print_json(&value)
-}
-
-pub(crate) fn run_projection_policy(
-    profile: Option<&str>,
-    args: ProjectionPolicyArgs,
-) -> Result<(), RemoteError> {
-    match args.command {
-        ProjectionPolicyCommand::Get {
-            project_id,
-            application_id,
-        } => {
-            let path = projection_path(&project_id, application_id.as_deref())?;
-            let value: ProjectionPolicy = authenticated_server(profile)?.get(&path)?;
-            print_json(&value)
-        }
-        ProjectionPolicyCommand::Set {
-            project_id,
-            application_id,
-            verified_email_enabled,
-            expected_revision,
-            yes,
-        } => {
-            let path = projection_path(&project_id, application_id.as_deref())?;
-            let stored = require_confirmation(
-                yes,
-                profile,
-                "projection-policy.replace",
-                &path,
-                &serde_json::json!({
-                    "effect": "replace the complete projection policy",
-                    "verified_email_enabled": verified_email_enabled,
-                    "expected_revision": expected_revision,
-                }),
-            )?;
-            let value: ProjectionPolicy = authenticated_server_snapshot(stored)?.send(
-                Method::PUT,
-                &path,
-                &UpdateProjectionPolicyRequest {
-                    verified_email_enabled,
-                    expected_revision,
-                },
-                None,
-            )?;
-            print_json(&value)
-        }
-    }
-}
-
-fn projection_path(project_id: &str, application_id: Option<&str>) -> Result<String, RemoteError> {
-    resource(project_id)?;
-    match application_id {
-        Some(application_id) => {
-            resource(application_id)?;
-            Ok(format!(
-                "projects/{project_id}/applications/{application_id}/projection-policy"
-            ))
-        }
-        None => Ok(format!("projects/{project_id}/projection-policy")),
-    }
 }
 
 pub(crate) fn run_webhook(profile: Option<&str>, args: WebhookArgs) -> Result<(), RemoteError> {
@@ -1908,7 +1852,10 @@ mod tests {
         let list_source: ProjectUserList =
             serde_json::from_value(json!({ "items": [source_user] })).unwrap();
         let list_output = serde_json::to_value(ProjectUserListOutput::from(list_source)).unwrap();
-        assert_eq!(list_output, json!({ "items": [expected] }));
+        assert_eq!(
+            list_output,
+            json!({ "items": [expected], "next_cursor": null })
+        );
 
         let serialized = serde_json::to_string(&list_output).unwrap();
         assert!(!serialized.contains(DISPLAY_SENTINEL));
@@ -1988,8 +1935,6 @@ mod tests {
             format!("projects/{PROJECT}/providers"),
             format!("projects/{PROJECT}/provider-egress-policy"),
             format!("projects/{PROJECT}/signing-keys"),
-            format!("projects/{PROJECT}/projection-policy"),
-            format!("projects/{PROJECT}/applications/{APPLICATION}/projection-policy"),
             format!("projects/{PROJECT}/applications/{APPLICATION}/webhook-endpoints"),
             format!("projects/{PROJECT}/applications/{APPLICATION}/user-events"),
             format!("projects/{PROJECT}/applications/{APPLICATION}/webhook-deliveries"),
@@ -2232,42 +2177,22 @@ mod tests {
 
         assert_send(
             Method::POST,
-            &format!("projects/{PROJECT}/signing-keys"),
-            &CreateSigningKeyRequest {
+            &format!("projects/{PROJECT}/signing-keys/rotate"),
+            &RotateSigningKeyRequest {
                 expected_project_revision: 8,
             },
-            Some("signing_key_create_1"),
+            Some("signing_key_rotate_1"),
             json!({"expected_project_revision":8}),
         );
-        let transition = KeyTransitionRequest {
-            expected_ring_revision: 9,
-        };
-        for action in ["activate", "retire", "revoke"] {
-            assert_send(
-                Method::POST,
-                &format!("projects/{PROJECT}/signing-keys/{KEY}/{action}"),
-                &transition,
-                None,
-                json!({"expected_ring_revision":9}),
-            );
-        }
-
-        let projection = UpdateProjectionPolicyRequest {
-            verified_email_enabled: false,
-            expected_revision: 10,
-        };
-        for path in [
-            format!("projects/{PROJECT}/projection-policy"),
-            format!("projects/{PROJECT}/applications/{APPLICATION}/projection-policy"),
-        ] {
-            assert_send(
-                Method::PUT,
-                &path,
-                &projection,
-                None,
-                json!({"verified_email_enabled":false,"expected_revision":10}),
-            );
-        }
+        assert_send(
+            Method::POST,
+            &format!("projects/{PROJECT}/signing-keys/{KEY}/revoke"),
+            &KeyTransitionRequest {
+                expected_ring_revision: 9,
+            },
+            None,
+            json!({"expected_ring_revision":9}),
+        );
 
         let webhook = CreateWebhookEndpointRequest {
             url: "https://hooks.example/events".to_owned(),

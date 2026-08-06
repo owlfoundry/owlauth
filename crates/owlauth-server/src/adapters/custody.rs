@@ -153,30 +153,6 @@ impl SoftwareCustodyProvider {
             .map_err(|_| integrity())
     }
 
-    pub(crate) fn import_signing_seed(
-        &self,
-        context: &owlauth_key_provider::ProtectionContext,
-        seed: &[u8],
-    ) -> Result<ProvisionedSigningKey, ProviderError> {
-        self.validate_context(context, MaterialKind::SigningKey)?;
-        let seed: [u8; ED25519_SEED_LEN] = seed.try_into().map_err(|_| integrity())?;
-        let seed = Zeroizing::new(seed);
-        let signing_key = SigningKey::from_bytes(&seed);
-        Ok(ProvisionedSigningKey {
-            handle: OpaqueHandle::new(Self::seal_envelope(
-                &self.keys.signing,
-                context,
-                seed.as_ref(),
-            )?)
-            .map_err(|_| integrity())?,
-            public_key: SigningPublicKey::new(
-                SigningAlgorithm::Ed25519,
-                signing_key.verifying_key().to_bytes().to_vec(),
-            )
-            .map_err(|_| integrity())?,
-        })
-    }
-
     fn fingerprint(
         &self,
         context: &owlauth_key_provider::ProtectionContext,

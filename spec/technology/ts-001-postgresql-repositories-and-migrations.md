@@ -12,7 +12,7 @@
 
 - PostgreSQL as the sole authoritative transactional store;
 - SeaORM 2 for ordinary PostgreSQL repository and Unit-of-Work implementations;
-- SQLx 0.9 only for embedded SQL migrations, DDL-free serving-schema compatibility verification, and migration-focused tests;
+- SQLx 0.9 only for embedded SQL migrations, DDL-free exact serving-schema history verification, and migration-focused tests;
 - rustls-based Tokio runtime integration for both libraries;
 - ordered migration files under `crates/owlauth-server/migrations/`.
 
@@ -58,7 +58,7 @@ SQLx's own `_sqlx_migrations` history and checksum behavior is library infrastru
 
 ### Required validation evidence
 
-Before broad repository implementation, one disposable-PostgreSQL spike MUST prove concurrent migration locking/timeout behavior and one representative Unit-of-Work plus one-use conditional mutation. The remaining items are ordinary adapter, integration, and release-compatibility tests rather than separate PoCs. Together, validation MUST prove:
+Before broad repository implementation, one disposable-PostgreSQL spike MUST prove concurrent migration locking/timeout behavior and one representative Unit-of-Work plus one-use conditional mutation. The remaining items are ordinary adapter, integration, and release-history tests rather than separate PoCs. Together, validation MUST prove:
 
 1. concurrent startup serializes SQLx migrations and bounded `lock_timeout` failure releases the dedicated connection/session lock;
 2. configuration admits only one PostgreSQL server/database authority per deployment; migration configuration may replace only the login credential/owner role and cannot redirect DDL, while every Runtime/Client/Control pool against the same target detects pending, missing, modified, dirty, and database-ahead migration history in `auto` or DDL-free `verify` flow;
@@ -66,7 +66,7 @@ Before broad repository implementation, one disposable-PostgreSQL spike MUST pro
 4. Runtime, Client, and Control SeaORM pools remain separately bounded under exhaustion;
 5. one application-owned Unit of Work atomically spans representative cross-repository mutation and durable audit append, including rollback and error mapping;
 6. one-use conditional mutation/row-lock behavior is expressible without leaking ORM types;
-7. after the compatibility-aware bridge release, the specifically declared N-1 artifact starts in both `verify` and `auto` modes and operates safely against the expanded N schema during rolling overlap; the bridge's exact-history predecessor is drained before bridge migration instead of being misrepresented as compatible.
+7. the predeployment baseline applies from an empty PostgreSQL database, records the exact three-file SQLx history, verifies unchanged in DDL-free mode, and round-trips to the same final schema; after first deployment, modified, missing, dirty, reordered, or unexpected history fails closed.
 
 Failure of a gate pauses implementation. If failure is intrinsic to SeaORM rather than the adapter design, the fallback decision is SQLx-only repositories plus SQLx migrations; it is not an unbounded mixed stack.
 

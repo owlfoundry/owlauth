@@ -4,19 +4,16 @@ mod audit;
 pub(crate) mod authentication;
 pub(crate) mod client_api;
 pub(crate) mod client_key;
-#[cfg(test)]
-mod client_key_migration_tests;
 pub(crate) mod client_readiness;
 pub(crate) mod control_lifecycle;
 pub(crate) mod custody;
-pub(crate) mod custody_import;
 pub(crate) mod email;
 pub(crate) mod email_control;
 #[cfg(test)]
 mod email_tests;
 pub(crate) mod entity;
 #[cfg(test)]
-mod identity_lifecycle_migration_tests;
+mod identity_lifecycle_tests;
 pub(crate) mod identity_mutation;
 #[cfg(test)]
 mod identity_mutation_test_support;
@@ -25,7 +22,6 @@ mod identity_mutation_tests;
 pub(crate) mod managed_connection;
 pub(crate) mod managed_reauthorization;
 pub(crate) mod projection;
-pub(crate) mod projection_expansion;
 pub(crate) mod provider_callback;
 pub(crate) mod provider_egress;
 mod provider_row;

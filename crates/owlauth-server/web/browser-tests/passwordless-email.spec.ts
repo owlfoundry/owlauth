@@ -29,6 +29,11 @@ interface Policy {
   policy_revision: number;
   security_revision: number;
 }
+interface SigningKey {
+  id: string;
+  kid: string;
+  state: string;
+}
 interface SmtpConfiguration {
   id: string;
   revision: number;
@@ -594,21 +599,7 @@ async function provisionEmail(
       ],
     },
   );
-  const key = await control<{ id: string; ring_revision: number }>(
-    request,
-    "POST",
-    `projects/${project.id}/signing-keys`,
-    { expected_project_revision: project.metadata_revision },
-    `email-key-${suffix}`,
-  );
-  const jwks = await request.get(
-    `${runtimeBase}projects/${encodeURIComponent(project.public_id)}/.well-known/jwks.json`,
-  );
-  expect(jwks.ok()).toBe(true);
-  await pageDelay(150);
-  await control(request, "POST", `projects/${project.id}/signing-keys/${key.id}/activate`, {
-    expected_ring_revision: key.ring_revision,
-  });
+  await rotateSigningKey(request, project, `email-key-${suffix}`);
   const policy = await get<Policy>(request, `projects/${project.id}/email-method`);
   await control(request, "PUT", `projects/${project.id}/email-method`, {
     enabled: true,
@@ -764,6 +755,58 @@ async function control<T = unknown>(
   });
   expect(response.ok(), `${method} ${path}: ${await response.text()}`).toBe(true);
   return (await response.json()) as T;
+}
+
+async function rotateSigningKey(
+  request: APIRequestContext,
+  project: Project,
+  idempotencyKey: string,
+): Promise<void> {
+  await waitForSigningKey(request, project, undefined);
+  const currentProject = await get<Project>(request, `projects/${project.id}`);
+  const rotated = await control<SigningKey>(
+    request,
+    "POST",
+    `projects/${project.id}/signing-keys/rotate`,
+    { expected_project_revision: currentProject.metadata_revision },
+    idempotencyKey,
+  );
+  const active = await waitForSigningKey(request, project, rotated.id);
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const response = await request.get(
+      `${runtimeBase}projects/${encodeURIComponent(project.public_id)}/.well-known/jwks.json`,
+    );
+    if (response.ok()) {
+      const body = (await response.json()) as { keys?: { kid?: string }[] };
+      if (body.keys?.some(({ kid }) => kid === active.kid) === true) return;
+    }
+    await pageDelay(250);
+  }
+  throw new Error(`timed out waiting for signing key ${active.id} in Runtime JWKS`);
+}
+
+async function waitForSigningKey(
+  request: APIRequestContext,
+  project: Project,
+  keyId: string | undefined,
+): Promise<SigningKey> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const { items } = await get<{ items: SigningKey[] }>(
+      request,
+      `projects/${project.id}/signing-keys`,
+    );
+    const candidate =
+      keyId === undefined
+        ? items.find(({ state }) => state === "active")
+        : items.find(({ id, state }) => id === keyId && state === "active");
+    if (candidate !== undefined) return candidate;
+    await pageDelay(250);
+  }
+  throw new Error(
+    keyId === undefined
+      ? `timed out waiting for Project ${project.id} initial signing key`
+      : `timed out waiting for signing key ${keyId} to activate`,
+  );
 }
 
 function required(name: string): string {

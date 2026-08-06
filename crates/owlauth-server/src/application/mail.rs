@@ -191,16 +191,14 @@ impl MailRetryState {
 pub(crate) struct ClaimedSmtpSecretCleanup {
     pub project_id: uuid::Uuid,
     pub idempotency_key: String,
-    pub recipient_ref: String,
-    pub lifecycle_ref: String,
+    pub recipient_material_id: uuid::Uuid,
     pub lease_owner: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClaimedSmtpCredentialCleanup {
     pub id: uuid::Uuid,
-    pub credential_ref: String,
-    pub lifecycle_ref: String,
+    pub credential_material_id: uuid::Uuid,
     pub lease_owner: String,
 }
 
@@ -213,10 +211,10 @@ pub(crate) struct ClaimedSmtpTestJob {
     pub configuration_security_eligibility_revision: i64,
     pub idempotency_key: String,
     pub message_id: String,
-    pub recipient_ref: String,
+    pub recipient_material_id: uuid::Uuid,
     pub endpoint: SmtpEndpoint,
     pub envelope_from: String,
-    pub credential_ref: String,
+    pub credential_material_id: uuid::Uuid,
     pub safe_fingerprint: [u8; 32],
     pub lease_owner: String,
     pub lease_expires_at: OffsetDateTime,
@@ -247,7 +245,7 @@ pub(crate) struct ClaimedMailJob {
     pub envelope_from: String,
     pub sender_name: Option<String>,
     pub reply_to: Option<String>,
-    pub credential_ref: String,
+    pub credential_material_id: uuid::Uuid,
     pub safe_fingerprint: [u8; 32],
     pub lease_owner: String,
     pub lease_expires_at: OffsetDateTime,
@@ -272,7 +270,7 @@ pub(crate) struct DeploymentSmtpGeneration {
     pub port: u16,
     pub tls_mode: SmtpTlsMode,
     pub sender_address: String,
-    pub credential_ref: String,
+    pub credential_material_id: uuid::Uuid,
     pub safe_fingerprint: [u8; 32],
     pub explicitly_allowed_private_ips: Vec<IpAddr>,
 }
@@ -368,17 +366,15 @@ pub(crate) trait MailOutboxRepository: Send + Sync {
 
 #[async_trait]
 pub(crate) trait SmtpCredentialResolver: Send + Sync {
-    async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError>;
+    async fn resolve(&self, material_id: Uuid) -> Result<Zeroizing<Vec<u8>>, ApplicationError>;
 
     async fn resolve_checked(
         &self,
-        reference: &str,
+        material_id: Uuid,
         _expected_fingerprint: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
-        self.resolve(reference).await
+        self.resolve(material_id).await
     }
-
-    async fn erase(&self, reference: &str) -> Result<(), ApplicationError>;
 }
 
 pub(crate) struct MailWorker {
@@ -543,9 +539,6 @@ impl MailWorker {
         else {
             return Ok(false);
         };
-        if Uuid::parse_str(&cleanup.recipient_ref).is_err() {
-            self.credentials.erase(&cleanup.recipient_ref).await?;
-        }
         self.repository
             .finish_smtp_secret_cleanup(&cleanup, now)
             .await?;
@@ -563,9 +556,6 @@ impl MailWorker {
         else {
             return Ok(false);
         };
-        if Uuid::parse_str(&cleanup.credential_ref).is_err() {
-            self.credentials.erase(&cleanup.credential_ref).await?;
-        }
         self.repository
             .finish_smtp_credential_cleanup(&cleanup, now)
             .await?;
@@ -601,7 +591,7 @@ impl MailWorker {
             MailTransportOutcome::Transient
         } else {
             let prepared = tokio::time::timeout_at(dispatch_deadline, async {
-                let recipient = self.credentials.resolve(&job.recipient_ref).await?;
+                let recipient = self.credentials.resolve(job.recipient_material_id).await?;
                 if tokio::time::Instant::now() >= dispatch_deadline {
                     return Err(ApplicationError::ExternalStore);
                 }
@@ -609,7 +599,7 @@ impl MailWorker {
                     .map_err(|_| ApplicationError::InvalidInput)?;
                 let credential = self
                     .credentials
-                    .resolve_checked(&job.credential_ref, &job.safe_fingerprint)
+                    .resolve_checked(job.credential_material_id, &job.safe_fingerprint)
                     .await?;
                 let submission = MailSubmission {
                     endpoint: job.endpoint.clone(),
@@ -684,7 +674,7 @@ impl MailWorker {
             }
             let credential = self
                 .credentials
-                .resolve_checked(&job.credential_ref, &job.safe_fingerprint)
+                .resolve_checked(job.credential_material_id, &job.safe_fingerprint)
                 .await?;
             let submission = MailSubmission {
                 endpoint: job.endpoint.clone(),
@@ -1038,10 +1028,10 @@ mod tests {
                 configuration_security_eligibility_revision: 1,
                 idempotency_key: "late-smtp-test".to_owned(),
                 message_id: "<late-smtp-test@mail.owlauth.invalid>".to_owned(),
-                recipient_ref: "smtp-test-recipient".to_owned(),
+                recipient_material_id: uuid::Uuid::from_u128(101),
                 endpoint: endpoint(),
                 envelope_from: "sender@example.com".to_owned(),
-                credential_ref: "smtp-test-credential".to_owned(),
+                credential_material_id: uuid::Uuid::from_u128(102),
                 safe_fingerprint: [7; 32],
                 lease_owner: worker.to_owned(),
                 lease_expires_at: lease_until,
@@ -1237,11 +1227,17 @@ mod tests {
         }
     }
 
-    struct ActiveSubmission<'a>(&'a std::sync::atomic::AtomicUsize);
+    struct ActiveSubmission<'a> {
+        active: &'a std::sync::atomic::AtomicUsize,
+        clock: &'a TestClock,
+        completed_at: &'a std::sync::Mutex<Vec<OffsetDateTime>>,
+    }
 
     impl Drop for ActiveSubmission<'_> {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.completed_at.lock().unwrap().push(self.clock.now());
         }
     }
 
@@ -1249,6 +1245,9 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         active: std::sync::atomic::AtomicUsize,
         max_active: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Notify,
+        clock: std::sync::Arc<TestClock>,
+        completed_at: std::sync::Mutex<Vec<OffsetDateTime>>,
     }
 
     #[async_trait::async_trait]
@@ -1265,7 +1264,12 @@ mod tests {
                 + 1;
             self.max_active
                 .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
-            let _active = ActiveSubmission(&self.active);
+            let _active = ActiveSubmission {
+                active: &self.active,
+                clock: self.clock.as_ref(),
+                completed_at: &self.completed_at,
+            };
+            self.started.notify_one();
             tokio::time::sleep_until(_deadline).await;
             Ok(MailTransportOutcome::Ambiguous)
         }
@@ -1275,12 +1279,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for SuccessfulCredentials {
-        async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        async fn resolve(
+            &self,
+            _material_id: Uuid,
+        ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             Ok(Zeroizing::new(b"local-secret".to_vec()))
-        }
-
-        async fn erase(&self, _reference: &str) -> Result<(), ApplicationError> {
-            unreachable!("cleanup is not exercised")
         }
     }
 
@@ -1319,7 +1322,7 @@ mod tests {
                 envelope_from: "sender@example.com".to_owned(),
                 sender_name: None,
                 reply_to: None,
-                credential_ref: "smtp-generation".to_owned(),
+                credential_material_id: uuid::Uuid::from_u128(103),
                 safe_fingerprint: [7; 32],
                 lease_owner: String::new(),
                 lease_expires_at: now,
@@ -1337,6 +1340,9 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             active: std::sync::atomic::AtomicUsize::new(0),
             max_active: std::sync::atomic::AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            clock: clock.clone(),
+            completed_at: std::sync::Mutex::new(Vec::new()),
         });
         let make_worker = |worker_id: &str| {
             MailWorker::new(
@@ -1376,12 +1382,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for UnusedCredentials {
-        async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        async fn resolve(
+            &self,
+            _material_id: Uuid,
+        ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             unreachable!("claim returned no mail")
-        }
-
-        async fn erase(&self, _reference: &str) -> Result<(), ApplicationError> {
-            unreachable!("cleanup returned no work")
         }
     }
 
@@ -1389,13 +1394,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for SlowCredentials {
-        async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        async fn resolve(
+            &self,
+            _material_id: Uuid,
+        ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             tokio::time::sleep(StdDuration::from_secs(1)).await;
             Ok(Zeroizing::new(b"local-secret".to_vec()))
-        }
-
-        async fn erase(&self, _reference: &str) -> Result<(), ApplicationError> {
-            unreachable!("cleanup is not exercised")
         }
     }
 
@@ -1403,17 +1407,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for CountingCredentials {
-        async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        async fn resolve(&self, material_id: Uuid) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if reference == "smtp-test-recipient" {
+            if material_id == uuid::Uuid::from_u128(101) {
                 Ok(Zeroizing::new(b"recipient@example.com".to_vec()))
             } else {
                 Ok(Zeroizing::new(b"local-secret".to_vec()))
             }
-        }
-
-        async fn erase(&self, _reference: &str) -> Result<(), ApplicationError> {
-            unreachable!("cleanup is not exercised")
         }
     }
 
@@ -1421,7 +1421,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for BoundaryCredentials {
-        async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        async fn resolve(
+            &self,
+            _material_id: Uuid,
+        ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if call == 0 {
                 // Complete the recipient stage in the same child-first poll that crosses the
@@ -1432,30 +1435,25 @@ mod tests {
                 Ok(Zeroizing::new(b"local-secret".to_vec()))
             }
         }
-
-        async fn erase(&self, _reference: &str) -> Result<(), ApplicationError> {
-            unreachable!("cleanup is not exercised")
-        }
     }
 
     struct MismatchedCredentials;
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for MismatchedCredentials {
-        async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        async fn resolve(
+            &self,
+            _material_id: Uuid,
+        ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             Ok(Zeroizing::new(b"local-secret".to_vec()))
         }
 
         async fn resolve_checked(
             &self,
-            _reference: &str,
+            _material_id: Uuid,
             _expected_fingerprint: &[u8; 32],
         ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             Err(ApplicationError::Disabled)
-        }
-
-        async fn erase(&self, _reference: &str) -> Result<(), ApplicationError> {
-            unreachable!("cleanup is not exercised")
         }
     }
 
@@ -1652,7 +1650,7 @@ mod tests {
             envelope_from: "sender@example.com".to_owned(),
             sender_name: None,
             reply_to: None,
-            credential_ref: "smtp-generation".to_owned(),
+            credential_material_id: uuid::Uuid::from_u128(103),
             safe_fingerprint: [2; 32],
             lease_owner: "runtime-fingerprint-regression".to_owned(),
             lease_expires_at: OffsetDateTime::UNIX_EPOCH + Duration::minutes(1),
@@ -1707,7 +1705,7 @@ mod tests {
             envelope_from: "sender@example.com".to_owned(),
             sender_name: None,
             reply_to: None,
-            credential_ref: "smtp-generation".to_owned(),
+            credential_material_id: uuid::Uuid::from_u128(103),
             safe_fingerprint: [7; 32],
             lease_owner: "runtime-pre-dispatch-timeout".to_owned(),
             lease_expires_at: now + Duration::seconds(1),
@@ -1782,7 +1780,7 @@ mod tests {
         );
         let claim_lease = StdDuration::from_millis(300);
         let completion_reserve = StdDuration::from_millis(80);
-        let started = tokio::time::Instant::now();
+        let submission_started = transport.started.notified();
         let first = tokio::spawn({
             let worker = first_worker.clone();
             let clock = clock.clone();
@@ -1793,7 +1791,9 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(StdDuration::from_millis(120)).await;
+        tokio::time::timeout(StdDuration::from_secs(1), submission_started)
+            .await
+            .expect("the first worker should reach physical submission");
         assert_eq!(
             transport.active.load(std::sync::atomic::Ordering::SeqCst),
             1
@@ -1809,8 +1809,13 @@ mod tests {
             1
         );
 
-        assert_eq!(first.await.unwrap(), Err(ApplicationError::Persistence));
-        assert!(started.elapsed() < StdDuration::from_millis(360));
+        assert_eq!(
+            tokio::time::timeout(StdDuration::from_secs(1), first)
+                .await
+                .expect("the first worker must remain bounded by its claim lease")
+                .unwrap(),
+            Err(ApplicationError::Persistence)
+        );
         assert_eq!(
             transport.active.load(std::sync::atomic::Ordering::SeqCst),
             0
@@ -1821,6 +1826,17 @@ mod tests {
             .unwrap()
             .lease_until
             .expect("first authoritative lease");
+        let first_submission_completed_at = transport
+            .completed_at
+            .lock()
+            .unwrap()
+            .first()
+            .copied()
+            .expect("the first physical submission should record its terminal boundary");
+        assert!(
+            first_submission_completed_at < first_lease,
+            "physical submission must stop before its authoritative claim lease expires"
+        );
         while clock.now() <= first_lease {
             tokio::time::sleep(StdDuration::from_millis(5)).await;
         }

@@ -2,13 +2,10 @@ use std::{net::IpAddr, sync::Arc};
 
 use async_trait::async_trait;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(test)]
-use super::ConfigurationSecretProvisioner;
 use super::{
     ApplicationError, Clock, ConfigurationSecretSealers, MailTransportOutcome,
     PreparedSecretMaterial, RequestDigester, SealedProtectedMaterial,
@@ -175,9 +172,8 @@ pub(crate) struct PrepareSmtpConfiguration {
     pub sender_name: Option<String>,
     pub reply_to: Option<String>,
     pub operation_alias: String,
-    pub credential_ref: String,
+    pub credential_material_id: Uuid,
     pub request_digest: Vec<u8>,
-    pub safe_fingerprint: Option<[u8; 32]>,
     pub expected_project_security_revision: i64,
     pub correlation_id: Uuid,
 }
@@ -186,7 +182,7 @@ pub(crate) struct PrepareSmtpConfiguration {
 pub(crate) struct PrepareSmtpTest {
     pub id: Uuid,
     pub configuration_id: Uuid,
-    pub recipient_ref: String,
+    pub recipient_material_id: Uuid,
     pub idempotency_key: String,
     pub request_digest: Vec<u8>,
     pub expected_revision: i64,
@@ -212,27 +208,22 @@ pub(crate) struct SmtpTestOperationRecord {
     pub outcome: Option<MailTransportOutcome>,
     pub created_at: OffsetDateTime,
     pub completed_at: Option<OffsetDateTime>,
-    pub recipient_ref: String,
+    pub recipient_material_id: Uuid,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSmtpTest {
     pub record: SmtpTestOperationRecord,
-    pub material: Option<PreparedSecretMaterial>,
+    pub material: PreparedSecretMaterial,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSmtpConfiguration {
     pub record: SmtpConfigurationRecord,
     pub operation_alias: String,
-    #[cfg(test)]
-    pub credential_ref: String,
     pub request_digest: Vec<u8>,
     pub correlation_id: Uuid,
-    pub material: Option<PreparedSecretMaterial>,
-    /// True only while the durable operation is still waiting for its first external write.
-    /// Completed/retired replay must never recreate a credential after cleanup.
-    pub external_provisioning_required: bool,
+    pub material: PreparedSecretMaterial,
 }
 
 #[async_trait]
@@ -272,19 +263,6 @@ pub(crate) trait EmailControlPort: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<PreparedSmtpConfiguration, ApplicationError>;
 
-    /// Persist an authoritative provisioning claim, commit, perform the external write with no
-    /// `PostgreSQL` transaction held, then finalize by guarded CAS. The provisioner and Runtime
-    /// eraser must additionally share a permanent external per-alias tombstone fence.
-    #[cfg(test)]
-    async fn provision_and_finalize_smtp_configuration(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedSmtpConfiguration,
-        provisioner: &dyn ConfigurationSecretProvisioner,
-        credential: Zeroizing<Vec<u8>>,
-        now: OffsetDateTime,
-    ) -> Result<SmtpConfigurationRecord, ApplicationError>;
-
     async fn finalize_protected_smtp_configuration(
         &self,
         _project_id: Uuid,
@@ -306,17 +284,6 @@ pub(crate) trait EmailControlPort: Send + Sync {
         command: PrepareSmtpTest,
         now: OffsetDateTime,
     ) -> Result<PreparedSmtpTest, ApplicationError>;
-
-    #[cfg(test)]
-    async fn provision_and_finalize_smtp_test_enqueue(
-        &self,
-        project_id: Uuid,
-        operation_id: Uuid,
-        request_digest: &[u8],
-        provisioner: &dyn ConfigurationSecretProvisioner,
-        recipient: Zeroizing<Vec<u8>>,
-        now: OffsetDateTime,
-    ) -> Result<SmtpTestOperationRecord, ApplicationError>;
 
     async fn finalize_protected_smtp_test_enqueue(
         &self,
@@ -394,8 +361,6 @@ pub(crate) struct EmailControlService {
     secret_sealers: ConfigurationSecretSealers,
     clock: Arc<dyn Clock>,
     digester: Arc<dyn RequestDigester>,
-    #[cfg(test)]
-    secret_store: Option<Arc<dyn ConfigurationSecretProvisioner>>,
 }
 
 impl EmailControlService {
@@ -410,34 +375,7 @@ impl EmailControlService {
             secret_sealers,
             clock,
             digester,
-            #[cfg(test)]
-            secret_store: None,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new(
-        port: Arc<dyn EmailControlPort>,
-        secret_store: Arc<dyn ConfigurationSecretProvisioner>,
-        clock: Arc<dyn Clock>,
-        digester: Arc<dyn RequestDigester>,
-    ) -> Self {
-        Self {
-            port,
-            secret_sealers: ConfigurationSecretSealers::default(),
-            clock,
-            digester,
-            secret_store: Some(secret_store),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_secret_sealer<S>(mut self, secret_sealer: S) -> Self
-    where
-        S: owlauth_key_provider::ConfigurationSecretSealer + 'static,
-    {
-        self.secret_sealers = ConfigurationSecretSealers::single(secret_sealer);
-        self
     }
 
     pub(crate) async fn get_policy(
@@ -512,19 +450,6 @@ impl EmailControlService {
             .map(|value| value.expose().to_owned());
         let sender_name = normalize_optional_text(command.sender_name.take(), 128)?;
         let credential = normalize_smtp_credential(&mut command.credential)?;
-        #[cfg(test)]
-        let legacy_fingerprint = if self.secret_sealers.is_empty() {
-            Some(
-                self.secret_store
-                    .as_ref()
-                    .ok_or(ApplicationError::Integrity)?
-                    .request_fingerprint(&credential),
-            )
-        } else {
-            None
-        };
-        #[cfg(not(test))]
-        let legacy_fingerprint: Option<[u8; 32]> = None;
         let request_digest = self.digester.digest_json(&json!({
             "purpose": "smtp_configuration_v2",
             "project_id": project_id,
@@ -534,12 +459,9 @@ impl EmailControlService {
             "sender_address": sender_address,
             "sender_name": sender_name,
             "reply_to": reply_to,
-            "credential_fingerprint": legacy_fingerprint.map(|value| hex(&value)),
             "expected_project_security_revision": command.expected_project_security_revision,
             "idempotency_key": command.idempotency_key,
         }))?;
-        let alias_digest = Sha256::digest(command.idempotency_key.as_bytes());
-        let credential_ref = format!("smtp_{}_{}", project_id.simple(), hex(&alias_digest[..16]));
         let prepared = self
             .port
             .prepare_smtp_configuration(
@@ -553,55 +475,35 @@ impl EmailControlService {
                     sender_name,
                     reply_to,
                     operation_alias: command.idempotency_key,
-                    credential_ref: credential_ref.clone(),
+                    credential_material_id: Uuid::new_v4(),
                     request_digest,
-                    safe_fingerprint: legacy_fingerprint,
                     expected_project_security_revision: command.expected_project_security_revision,
                     correlation_id: command.correlation_id,
                 },
                 self.clock.now(),
             )
             .await?;
-        if let Some(material) = prepared.material.clone() {
-            let sealer = self.secret_sealers.resolve(&material)?;
-            let protected_secret = sealer
-                .seal(SealSecretRequest {
-                    context: material.context,
-                    plaintext: SecretPlaintext::from_zeroizing(Zeroizing::new(credential))
-                        .map_err(|_| ApplicationError::InvalidInput)?,
-                })
-                .await
-                .map_err(super::provisioning::map_provider_error)?;
-            return self
-                .port
-                .finalize_protected_smtp_configuration(
-                    project_id,
-                    &prepared,
-                    SealedProtectedMaterial {
-                        material_id: material.material_id,
-                        provider_id: material.provider_id,
-                        provider_format_version: material.provider_format_version,
-                        envelope: protected_secret.envelope,
-                        request_fingerprint: protected_secret.request_fingerprint,
-                    },
-                    self.clock.now(),
-                )
-                .await;
-        }
-        if !prepared.external_provisioning_required {
-            return Ok(prepared.record);
-        }
-        #[cfg(not(test))]
-        return Err(ApplicationError::Integrity);
-        #[cfg(test)]
+        let material = prepared.material.clone();
+        let sealer = self.secret_sealers.resolve(&material)?;
+        let protected_secret = sealer
+            .seal(SealSecretRequest {
+                context: material.context,
+                plaintext: SecretPlaintext::from_zeroizing(Zeroizing::new(credential))
+                    .map_err(|_| ApplicationError::InvalidInput)?,
+            })
+            .await
+            .map_err(super::provisioning::map_provider_error)?;
         self.port
-            .provision_and_finalize_smtp_configuration(
+            .finalize_protected_smtp_configuration(
                 project_id,
                 &prepared,
-                self.secret_store
-                    .as_deref()
-                    .ok_or(ApplicationError::Integrity)?,
-                Zeroizing::new(credential),
+                SealedProtectedMaterial {
+                    material_id: material.material_id,
+                    provider_id: material.provider_id,
+                    provider_format_version: material.provider_format_version,
+                    envelope: protected_secret.envelope,
+                    request_fingerprint: protected_secret.request_fingerprint,
+                },
                 self.clock.now(),
             )
             .await
@@ -629,35 +531,12 @@ impl EmailControlService {
             .map_err(|_| ApplicationError::InvalidInput)?
             .expose()
             .to_owned();
-        // Protected custody compares the context-bound keyed fingerprint only after reservation.
-        // Legacy mode retains its store-keyed commitment so a database snapshot cannot verify likely
-        // recipient addresses after erasure.
-        #[cfg(test)]
-        let recipient_fingerprint = if self.secret_sealers.is_empty() {
-            Some(
-                self.secret_store
-                    .as_ref()
-                    .ok_or(ApplicationError::Integrity)?
-                    .request_fingerprint(recipient.as_bytes()),
-            )
-        } else {
-            None
-        };
-        #[cfg(not(test))]
-        let recipient_fingerprint: Option<[u8; 32]> = None;
         let request_digest = self.digester.digest_json(&json!({
             "purpose": "smtp_test_v3",
             "project_id": project_id,
             "configuration_id": configuration_id,
-            "recipient_fingerprint": recipient_fingerprint.map(|value| hex(&value)),
             "expected_revision": expected_revision,
         }))?;
-        let alias_digest = Sha256::digest(idempotency_key.as_bytes());
-        let recipient_ref = format!(
-            "smtp_test_recipient_{}_{}",
-            project_id.simple(),
-            hex(&alias_digest[..16])
-        );
         let operation = self
             .port
             .prepare_smtp_test(
@@ -665,7 +544,7 @@ impl EmailControlService {
                 PrepareSmtpTest {
                     id: Uuid::new_v4(),
                     configuration_id,
-                    recipient_ref: recipient_ref.clone(),
+                    recipient_material_id: Uuid::new_v4(),
                     idempotency_key,
                     request_digest: request_digest.clone(),
                     expected_revision,
@@ -674,48 +553,28 @@ impl EmailControlService {
                 self.clock.now(),
             )
             .await?;
-        if let Some(material) = operation.material.clone() {
-            let sealer = self.secret_sealers.resolve(&material)?;
-            let protected_secret = sealer
-                .seal(SealSecretRequest {
-                    context: material.context,
-                    plaintext: SecretPlaintext::new(recipient.as_bytes().to_vec())
-                        .map_err(|_| ApplicationError::InvalidInput)?,
-                })
-                .await
-                .map_err(super::provisioning::map_provider_error)?;
-            return self
-                .port
-                .finalize_protected_smtp_test_enqueue(
-                    project_id,
-                    &operation,
-                    &request_digest,
-                    SealedProtectedMaterial {
-                        material_id: material.material_id,
-                        provider_id: material.provider_id,
-                        provider_format_version: material.provider_format_version,
-                        envelope: protected_secret.envelope,
-                        request_fingerprint: protected_secret.request_fingerprint,
-                    },
-                    self.clock.now(),
-                )
-                .await;
-        }
-        if operation.record.state != SmtpTestState::Preparing {
-            return Ok(operation.record);
-        }
-        #[cfg(not(test))]
-        return Err(ApplicationError::Integrity);
-        #[cfg(test)]
+        let material = operation.material.clone();
+        let sealer = self.secret_sealers.resolve(&material)?;
+        let protected_secret = sealer
+            .seal(SealSecretRequest {
+                context: material.context,
+                plaintext: SecretPlaintext::new(recipient.as_bytes().to_vec())
+                    .map_err(|_| ApplicationError::InvalidInput)?,
+            })
+            .await
+            .map_err(super::provisioning::map_provider_error)?;
         self.port
-            .provision_and_finalize_smtp_test_enqueue(
+            .finalize_protected_smtp_test_enqueue(
                 project_id,
-                operation.record.id,
+                &operation,
                 &request_digest,
-                self.secret_store
-                    .as_deref()
-                    .ok_or(ApplicationError::Integrity)?,
-                Zeroizing::new(recipient.as_bytes().to_vec()),
+                SealedProtectedMaterial {
+                    material_id: material.material_id,
+                    provider_id: material.provider_id,
+                    provider_format_version: material.provider_format_version,
+                    envelope: protected_secret.envelope,
+                    request_fingerprint: protected_secret.request_fingerprint,
+                },
                 self.clock.now(),
             )
             .await

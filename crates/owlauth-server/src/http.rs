@@ -50,8 +50,7 @@ use crate::{
         IdentityMutationControlService, IdentityMutationRuntimePort, ManagedConnectionMetadata,
         ManagedConnectionRepository, ManagedConnectionService, ManagedReauthorizationCallback,
         ManagedReauthorizationCallbackOutcome, ManagedReauthorizationControlService,
-        ManagedReauthorizationDenial, ManagedReauthorizationRuntimeService, McpConfirmationService,
-        ProjectionExpansionWorker, ProjectionPolicyService, ProviderCallback,
+        ManagedReauthorizationDenial, ManagedReauthorizationRuntimeService, ProviderCallback,
         ProviderCallbackDenial, ProviderCallbackOwner, ProviderCallbackOwnerResolver,
         ProviderOnboardingService, ProvisioningService, ReadinessService, RefreshSession,
         ReplaceApplicationConfiguration, RuntimeAuthService, SelectEmail, SelectProvider,
@@ -132,8 +131,6 @@ struct ControlState {
     managed_connections: Option<Arc<dyn ManagedConnectionRepository>>,
     managed_reauthorization: Option<Arc<ManagedReauthorizationControlService>>,
     identity_mutations: Option<Arc<IdentityMutationControlService>>,
-    projection_policy: Option<Arc<ProjectionPolicyService>>,
-    mcp_confirmation: Option<Arc<McpConfirmationService>>,
     webhooks: Option<Arc<WebhookControlService>>,
     provider_onboarding: Option<Arc<ProviderOnboardingService>>,
     client_keys: Option<Arc<application::ClientKeyLifecycleService>>,
@@ -145,7 +142,6 @@ pub(crate) struct PlaneRouters {
     pub control: Option<Router>,
     pub runtime_auth: Option<Arc<RuntimeAuthService>>,
     pub managed_sync: Option<Arc<ManagedConnectionService>>,
-    pub projection_expansion: Option<Arc<ProjectionExpansionWorker>>,
     pub webhook_delivery: Option<Arc<WebhookWorker>>,
     #[cfg(test)]
     pub(crate) runtime_identity_mutations: Option<Arc<IdentityMutationRuntimeService>>,
@@ -215,10 +211,6 @@ pub(crate) fn build_routers_with_capabilities(
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.managed_sync.clone());
-    let projection_expansion = capabilities
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.projection_expansion.clone());
     let webhook_delivery = capabilities
         .runtime
         .as_ref()
@@ -250,7 +242,6 @@ pub(crate) fn build_routers_with_capabilities(
         control,
         runtime_auth,
         managed_sync,
-        projection_expansion,
         webhook_delivery,
         #[cfg(test)]
         runtime_identity_mutations,
@@ -360,8 +351,6 @@ fn build_control_plane(
             managed_connections: capabilities.managed_connections,
             managed_reauthorization: capabilities.managed_reauthorization,
             identity_mutations: capabilities.identity_mutations,
-            projection_policy: capabilities.projection_policy,
-            mcp_confirmation: capabilities.mcp_confirmation,
             webhooks: capabilities.webhooks,
             provider_onboarding: capabilities.provider_onboarding,
             client_keys: capabilities.client_keys,
@@ -600,14 +589,6 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             post(disable_application),
         )
         .route(
-            "/projects/{project_id}/projection-policy",
-            get(get_project_projection_policy).put(update_project_projection_policy),
-        )
-        .route(
-            "/projects/{project_id}/applications/{application_id}/projection-policy",
-            get(get_application_projection_policy).put(update_application_projection_policy),
-        )
-        .route(
             "/projects/{project_id}/applications/{application_id}/webhook-endpoints",
             get(list_webhook_endpoints).post(create_webhook_endpoint),
         )
@@ -649,19 +630,11 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         )
         .route(
             "/projects/{project_id}/signing-keys",
-            get(list_signing_keys).post(create_signing_key),
+            get(list_signing_keys),
         )
         .route(
-            "/projects/{project_id}/signing-keys/{key_id}/reconcile",
-            post(reconcile_signing_key),
-        )
-        .route(
-            "/projects/{project_id}/signing-keys/{key_id}/activate",
-            post(activate_signing_key),
-        )
-        .route(
-            "/projects/{project_id}/signing-keys/{key_id}/retire",
-            post(retire_signing_key),
+            "/projects/{project_id}/signing-keys/rotate",
+            post(rotate_signing_key),
         )
         .route(
             "/projects/{project_id}/signing-keys/{key_id}/revoke",
@@ -833,6 +806,10 @@ fn control_lifecycle_router() -> Router<ControlState> {
         .route(
             "/projects/{project_id}/users/{user_id}/disable",
             post(disable_project_user),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}/enable",
+            post(enable_project_user),
         )
         .route(
             "/projects/{project_id}/users/{user_id}/sessions",
@@ -4175,13 +4152,6 @@ fn provider_onboarding(
         .ok_or(ApplicationError::Persistence)
 }
 
-fn projection_policy(state: &ControlState) -> Result<&ProjectionPolicyService, ApplicationError> {
-    state
-        .projection_policy
-        .as_deref()
-        .ok_or(ApplicationError::Persistence)
-}
-
 fn webhook_control(state: &ControlState) -> Result<&WebhookControlService, ApplicationError> {
     state
         .webhooks
@@ -5973,19 +5943,39 @@ async fn revoke_project_client_key(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ListProjectUsersQuery {
+    status: Option<control_types::ProjectUserStatus>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
 async fn list_project_users(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path(project_id): Path<String>,
+    Query(query): Query<ListProjectUsersQuery>,
 ) -> Response {
     let project_id = match resource_uuid(&project_id, &request_id) {
         Ok(id) => id,
         Err(response) => return response,
     };
+    let cursor = match query.cursor.as_deref() {
+        Some(value) => match resource_uuid(value, &request_id) {
+            Ok(cursor) => Some(cursor),
+            Err(response) => return response,
+        },
+        None => None,
+    };
+    let status = query.status.map(application_project_user_status);
     match control_lifecycle(&state) {
-        Ok(service) => match service.list_project_users(project_id).await {
-            Ok(users) => Json(control_types::ProjectUserList {
-                items: users.into_iter().map(control_project_user).collect(),
+        Ok(service) => match service
+            .list_project_users(project_id, status, cursor, query.limit)
+            .await
+        {
+            Ok(page) => Json(control_types::ProjectUserList {
+                items: page.items.into_iter().map(control_project_user).collect(),
+                next_cursor: page.next_cursor.map(|cursor| cursor.to_string()),
             })
             .into_response(),
             Err(error) => application_problem(error, &request_id),
@@ -6060,6 +6050,33 @@ async fn disable_project_user(
     match control_lifecycle(&state) {
         Ok(service) => match service
             .disable_project_user(
+                project_id,
+                user_id,
+                body.expected_security_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(user) => Json(control_project_user(user)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn enable_project_user(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, user_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::ExpectedSecurityRevision>,
+) -> Response {
+    let (project_id, user_id) = match resource_pair(&project_id, &user_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service
+            .enable_project_user(
                 project_id,
                 user_id,
                 body.expected_security_revision,
@@ -6250,6 +6267,16 @@ fn control_project_user_identity(
         verified_or_observed_at: timestamp(identity.verified_or_observed_at),
         created_at: timestamp(identity.created_at),
         updated_at: timestamp(identity.updated_at),
+    }
+}
+
+const fn application_project_user_status(
+    status: control_types::ProjectUserStatus,
+) -> application::ProjectUserStatus {
+    match status {
+        control_types::ProjectUserStatus::Active => application::ProjectUserStatus::Active,
+        control_types::ProjectUserStatus::Disabled => application::ProjectUserStatus::Disabled,
+        control_types::ProjectUserStatus::Merged => application::ProjectUserStatus::Merged,
     }
 }
 
@@ -6495,18 +6522,6 @@ async fn disable_application(
     }
 }
 
-fn control_projection_policy(
-    policy: &application::ProjectionPolicyRecord,
-) -> control_types::ProjectionPolicy {
-    control_types::ProjectionPolicy {
-        project_id: policy.project_id.to_string(),
-        application_id: policy.application_id.map(|value| value.to_string()),
-        verified_email_enabled: policy.verified_email_enabled,
-        revision: policy.revision,
-        expansion_operation_id: policy.expansion_operation_id.map(|value| value.to_string()),
-    }
-}
-
 fn webhook_event_type(value: control_types::ApplicationUserEventType) -> String {
     match value {
         control_types::ApplicationUserEventType::Created => "user.projection.created",
@@ -6619,101 +6634,6 @@ fn control_webhook_delivery(
         terminal_at: delivery.terminal_at.map(timestamp),
         created_at: timestamp(delivery.created_at),
     })
-}
-
-async fn get_project_projection_policy(
-    State(state): State<ControlState>,
-    Extension(request_id): Extension<String>,
-    Path(project_id): Path<String>,
-) -> Response {
-    let project_id = match resource_uuid(&project_id, &request_id) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let result = match projection_policy(&state) {
-        Ok(service) => service
-            .get_project(project_id)
-            .await
-            .map(|policy| control_projection_policy(&policy)),
-        Err(error) => Err(error),
-    };
-    control_json(result, &request_id)
-}
-
-async fn update_project_projection_policy(
-    State(state): State<ControlState>,
-    Extension(request_id): Extension<String>,
-    Path(project_id): Path<String>,
-    ControlJson(body): ControlJson<control_types::UpdateProjectionPolicyRequest>,
-) -> Response {
-    let project_id = match resource_uuid(&project_id, &request_id) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let result = match projection_policy(&state) {
-        Ok(service) => service
-            .update_project(
-                project_id,
-                application::UpdateProjectionPolicy {
-                    verified_email_enabled: body.verified_email_enabled,
-                    expected_revision: body.expected_revision,
-                },
-                request_uuid(&request_id),
-            )
-            .await
-            .map(|policy| control_projection_policy(&policy)),
-        Err(error) => Err(error),
-    };
-    control_json(result, &request_id)
-}
-
-async fn get_application_projection_policy(
-    State(state): State<ControlState>,
-    Extension(request_id): Extension<String>,
-    Path((project_id, application_id)): Path<(String, String)>,
-) -> Response {
-    let (project_id, application_id) =
-        match resource_pair(&project_id, &application_id, &request_id) {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-    let result = match projection_policy(&state) {
-        Ok(service) => service
-            .get_application(project_id, application_id)
-            .await
-            .map(|policy| control_projection_policy(&policy)),
-        Err(error) => Err(error),
-    };
-    control_json(result, &request_id)
-}
-
-async fn update_application_projection_policy(
-    State(state): State<ControlState>,
-    Extension(request_id): Extension<String>,
-    Path((project_id, application_id)): Path<(String, String)>,
-    ControlJson(body): ControlJson<control_types::UpdateProjectionPolicyRequest>,
-) -> Response {
-    let (project_id, application_id) =
-        match resource_pair(&project_id, &application_id, &request_id) {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-    let result = match projection_policy(&state) {
-        Ok(service) => service
-            .update_application(
-                project_id,
-                application_id,
-                application::UpdateProjectionPolicy {
-                    verified_email_enabled: body.verified_email_enabled,
-                    expected_revision: body.expected_revision,
-                },
-                request_uuid(&request_id),
-            )
-            .await
-            .map(|policy| control_projection_policy(&policy)),
-        Err(error) => Err(error),
-    };
-    control_json(result, &request_id)
 }
 
 #[allow(
@@ -7168,12 +7088,12 @@ async fn list_signing_keys(
     }
 }
 
-async fn create_signing_key(
+async fn rotate_signing_key(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
-    ControlJson(body): ControlJson<control_types::CreateSigningKeyRequest>,
+    ControlJson(body): ControlJson<control_types::RotateSigningKeyRequest>,
 ) -> Response {
     let project_id = match resource_uuid(&project_id, &request_id) {
         Ok(id) => id,
@@ -7184,11 +7104,10 @@ async fn create_signing_key(
     };
     match provisioning(&state) {
         Ok(service) => match service
-            .provision_signing_key(
+            .request_signing_key_rotation(
                 project_id,
                 operation_alias,
                 body.expected_project_revision,
-                request_uuid(&request_id),
             )
             .await
         {
@@ -7197,51 +7116,6 @@ async fn create_signing_key(
         },
         Err(error) => application_problem(error, &request_id),
     }
-}
-
-async fn reconcile_signing_key(
-    State(state): State<ControlState>,
-    Extension(request_id): Extension<String>,
-    Path((project_id, key_id)): Path<(String, String)>,
-    ControlJson(body): ControlJson<control_types::ReconcileSigningKeyRequest>,
-) -> Response {
-    let (project_id, key_id) = match resource_pair(&project_id, &key_id, &request_id) {
-        Ok(ids) => ids,
-        Err(response) => return response,
-    };
-    match provisioning(&state) {
-        Ok(service) => match service
-            .reconcile_signing_key(
-                project_id,
-                key_id,
-                body.expected_project_revision,
-                request_uuid(&request_id),
-            )
-            .await
-        {
-            Ok(key) => control_json(control_signing_key(key), &request_id),
-            Err(error) => application_problem(error, &request_id),
-        },
-        Err(error) => application_problem(error, &request_id),
-    }
-}
-
-async fn activate_signing_key(
-    State(state): State<ControlState>,
-    Extension(request_id): Extension<String>,
-    Path((project_id, key_id)): Path<(String, String)>,
-    ControlJson(body): ControlJson<control_types::KeyTransitionRequest>,
-) -> Response {
-    signing_key_transition(state, request_id, project_id, key_id, body, "activate").await
-}
-
-async fn retire_signing_key(
-    State(state): State<ControlState>,
-    Extension(request_id): Extension<String>,
-    Path((project_id, key_id)): Path<(String, String)>,
-    ControlJson(body): ControlJson<control_types::KeyTransitionRequest>,
-) -> Response {
-    signing_key_transition(state, request_id, project_id, key_id, body, "retire").await
 }
 
 async fn revoke_signing_key(
@@ -7250,57 +7124,22 @@ async fn revoke_signing_key(
     Path((project_id, key_id)): Path<(String, String)>,
     ControlJson(body): ControlJson<control_types::KeyTransitionRequest>,
 ) -> Response {
-    signing_key_transition(state, request_id, project_id, key_id, body, "revoke").await
-}
-
-async fn signing_key_transition(
-    state: ControlState,
-    request_id: String,
-    project_id: String,
-    key_id: String,
-    body: control_types::KeyTransitionRequest,
-    operation: &str,
-) -> Response {
     let (project_id, key_id) = match resource_pair(&project_id, &key_id, &request_id) {
         Ok(ids) => ids,
         Err(response) => return response,
     };
-    let service = match provisioning(&state) {
-        Ok(service) => service,
-        Err(error) => return application_problem(error, &request_id),
-    };
-    let correlation_id = request_uuid(&request_id);
-    let result = match operation {
-        "activate" => {
-            service
-                .activate_signing_key(
-                    project_id,
-                    key_id,
-                    body.expected_ring_revision,
-                    correlation_id,
-                )
-                .await
-        }
-        "retire" => {
-            service
-                .retire_signing_key(
-                    project_id,
-                    key_id,
-                    body.expected_ring_revision,
-                    correlation_id,
-                )
-                .await
-        }
-        _ => {
+    let result = match provisioning(&state) {
+        Ok(service) => {
             service
                 .revoke_signing_key(
                     project_id,
                     key_id,
                     body.expected_ring_revision,
-                    correlation_id,
+                    request_uuid(&request_id),
                 )
                 .await
         }
+        Err(error) => Err(error),
     };
     match result {
         Ok(key) => control_json(control_signing_key(key), &request_id),
@@ -9972,10 +9811,6 @@ pub(crate) mod tests {
                 "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
                 "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
             ),
-            (
-                "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
-                "https://accounts.example/".to_owned(),
-            ),
             ("OWLAUTH_CONTROL_API_KEY".to_owned(), key),
             ("OWLAUTH_INSTANCE_ID".to_owned(), instance_id.to_owned()),
             (
@@ -10018,26 +9853,6 @@ pub(crate) mod tests {
                 (
                     "OWLAUTH_MANAGED_CREDENTIAL_KEY".to_owned(),
                     "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY".to_owned(),
-                ),
-            ]);
-        }
-        if mode.has_control() || (mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE) {
-            values.extend([
-                (
-                    "OWLAUTH_SIGNER_STORE_ROOT".to_owned(),
-                    "/tmp/owlauth-http-test-signers".to_owned(),
-                ),
-                (
-                    "OWLAUTH_SIGNER_STORE_KEY".to_owned(),
-                    "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned(),
-                ),
-                (
-                    "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT".to_owned(),
-                    "/tmp/owlauth-http-test-secrets".to_owned(),
-                ),
-                (
-                    "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY".to_owned(),
-                    "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI".to_owned(),
                 ),
             ]);
         }
@@ -10805,7 +10620,7 @@ pub(crate) mod tests {
         let tools = tools["result"]["tools"]
             .as_array()
             .expect("tools/list returns a bounded catalog");
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 7);
         assert!(
             tools
                 .iter()
@@ -10816,30 +10631,12 @@ pub(crate) mod tests {
                 && tool["outputSchema"]["type"] == "object"
                 && tool["outputSchema"]["additionalProperties"] == false
         }));
-        let mut mutation_names = tools
-            .iter()
-            .filter(|tool| tool["annotations"]["readOnlyHint"] == false)
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        mutation_names.sort_unstable();
-        assert_eq!(
-            mutation_names,
-            vec![
-                "owlauth_projection_policy_update_commit",
-                "owlauth_projection_policy_update_preview",
-            ],
-            "the high-impact catalog has no direct or lower-impact mutation alias"
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool["annotations"]["readOnlyHint"] == true),
+            "the initial MCP catalog is read-only"
         );
-        let commit = tools
-            .iter()
-            .find(|tool| tool["name"] == "owlauth_projection_policy_update_commit")
-            .unwrap();
-        assert_eq!(commit["annotations"]["destructiveHint"], true);
-        let preview = tools
-            .iter()
-            .find(|tool| tool["name"] == "owlauth_projection_policy_update_preview")
-            .unwrap();
-        assert_eq!(preview["annotations"]["destructiveHint"], false);
 
         let called = control
             .clone()
@@ -11786,8 +11583,6 @@ pub(crate) mod tests {
         let application = Uuid::new_v4();
         let endpoint = Uuid::new_v4();
         let paths = [
-            format!("/control/v1/projects/{project}/projection-policy"),
-            format!("/control/v1/projects/{project}/applications/{application}/projection-policy"),
             format!("/control/v1/projects/{project}/applications/{application}/webhook-endpoints"),
             format!(
                 "/control/v1/projects/{project}/applications/{application}/webhook-endpoints/{endpoint}"

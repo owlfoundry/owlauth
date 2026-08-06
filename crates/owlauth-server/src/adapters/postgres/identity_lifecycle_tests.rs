@@ -108,8 +108,8 @@ async fn seed_user_with_provider_identity(
     sqlx::query(
         "INSERT INTO linked_identities
             (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,observed_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.example',$5,'active',1,
+             status,identity_revision,source_profile_digest,observed_at)
+         VALUES ($1,$2,$3,$4,'https://issuer.example',$5,'active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),
                  transaction_timestamp())",
     )
     .bind(identity_id)
@@ -167,11 +167,22 @@ async fn seed_authority(pool: &PgPool) -> AuthorityFixture {
     .await
     .expect("insert Project policy");
     sqlx::query(
-        "INSERT INTO provider_configurations
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('03',32),'hex'),decode('01','hex'),
+                     decode(repeat('02',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
             (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
-             secret_ref,status,revision)
-         VALUES ($1,$2,'oidc-main','oidc','OIDC','https://issuer.example','client',
-                 'https://runtime.example/callback','secret/ref/test','active',1)",
+             secret_material_id,status,revision)
+         SELECT $1,$2,'oidc-main','oidc','OIDC','https://issuer.example','client',
+                'https://runtime.example/callback',material.id,'active',1 FROM material",
     )
     .bind(provider_id)
     .bind(project_id)
@@ -446,21 +457,6 @@ async fn identity_lifecycle_schema_enforces_roles_callbacks_and_merge_attributio
     };
     let fixture = seed_authority(&pool).await;
 
-    let projection_flags: (bool, bool) = sqlx::query_as(
-        "SELECT policy.projection_verified_email_enabled,
-                application.projection_verified_email_enabled
-           FROM project_policies AS policy
-           JOIN applications AS application
-             ON application.project_id=policy.project_id
-          WHERE policy.project_id=$1 AND application.id=$2",
-    )
-    .bind(fixture.project_id)
-    .bind(fixture.application_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load projection defaults");
-    assert_eq!(projection_flags, (false, false));
-
     let forbidden_candidate_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns
           WHERE table_schema=current_schema()
@@ -603,9 +599,9 @@ async fn identity_lifecycle_schema_enforces_roles_callbacks_and_merge_attributio
     sqlx::query(
         "INSERT INTO application_user_projections
             (id,project_id,binding_id,application_id,user_id,schema_name,
-             projection_revision,source_user_revision,project_policy_revision,
-             application_policy_revision,canonical_digest,document)
-         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,1,1,$6,
+             projection_revision,source_user_revision,canonical_digest,
+             source_base_profile_digest,document)
+         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,$6,$7,
              jsonb_build_object(
                'user_id','usr_migration','user_revision',1,
                'projection_schema','owlauth.user.v1','projection_revision',1,
@@ -620,6 +616,7 @@ async fn identity_lifecycle_schema_enforces_roles_callbacks_and_merge_attributio
     .bind(fixture.application_id)
     .bind(fixture.loser_user_id)
     .bind(vec![6_u8; 32])
+    .bind(vec![7_u8; 32])
     .execute(&pool)
     .await
     .expect("insert losing projection");
@@ -1686,8 +1683,9 @@ async fn identity_lifecycle_schema_rejects_stale_proofs_live_evidence_and_merge_
     sqlx::query(
         "INSERT INTO managed_provider_reauthorization_interactions
             (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-             provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
-             provider_egress_policy_revision,application_id,expected_connection_generation,
+             provider_configuration_id,provider_key,issuer,provider_kind,provider_display_name,subject,client_id,
+             secret_material_id,provider_egress_policy_revision,application_id,
+             expected_connection_generation,
              expected_credential_generation,
              expected_connection_revision,project_security_revision,user_security_revision,
              identity_revision,provider_revision,managed_profile_revision,application_revision,
@@ -1696,7 +1694,8 @@ async fn identity_lifecycle_schema_rejects_stale_proofs_live_evidence_and_merge_
              provider_pkce_required,oidc_nonce_required,revision,status,expires_at,created_at)
          VALUES ($1,$2,(SELECT public_id FROM projects WHERE id=$2),$3,$4,$5,$6,
                  'oidc-main',
-                 'https://issuer.example','oidc','subject-winner01','client','secret/ref/test',
+                 'https://issuer.example','oidc','Main','subject-winner01','client',
+                 (SELECT secret_material_id FROM provider_configurations WHERE id=$6),
                  (SELECT revision FROM project_provider_egress_policies WHERE project_id=$2),$7,
                  1,1,1,1,1,1,1,1,1,1,'https://runtime.example/callback','oidc',1,true,
                  ARRAY['openid','profile']::text[],false,true,1,'awaiting_browser_binding',
@@ -1731,9 +1730,9 @@ async fn identity_lifecycle_schema_rejects_stale_proofs_live_evidence_and_merge_
     sqlx::query(
         "INSERT INTO linked_identities
             (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,observed_at)
+             status,identity_revision,source_profile_digest,observed_at)
          VALUES ($1,$2,$3,$4,'https://issuer.example','subject-replacement01',
-                 'active',1,transaction_timestamp())",
+                 'active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),transaction_timestamp())",
     )
     .bind(replacement_identity_id)
     .bind(fixture.project_id)
@@ -2810,9 +2809,9 @@ async fn identity_lifecycle_schema_keeps_merge_winner_active() {
     sqlx::query(
         "INSERT INTO linked_identities
             (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,observed_at)
+             status,identity_revision,source_profile_digest,observed_at)
          VALUES ($1,$2,$3,$4,'https://issuer.example','winner-primary-replacement',
-                 'active',1,transaction_timestamp())",
+                 'active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),transaction_timestamp())",
     )
     .bind(replacement_primary_identity_id)
     .bind(fixture.project_id)
@@ -2860,9 +2859,9 @@ async fn identity_lifecycle_schema_keeps_merge_winner_active() {
     sqlx::query(
         "INSERT INTO linked_identities
             (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,observed_at)
+             status,identity_revision,source_profile_digest,observed_at)
          VALUES ($1,$2,$3,$4,'https://issuer.example','merged-owner-edge',
-                 'active',1,transaction_timestamp())",
+                 'active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),transaction_timestamp())",
     )
     .bind(Uuid::new_v4())
     .bind(fixture.project_id)
@@ -3169,8 +3168,8 @@ async fn identity_lifecycle_schema_serializes_merge_against_identity_attach() {
     sqlx::query(
         "INSERT INTO linked_identities
             (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,observed_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.example',$5,'active',1,
+             status,identity_revision,source_profile_digest,observed_at)
+         VALUES ($1,$2,$3,$4,'https://issuer.example',$5,'active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),
                  transaction_timestamp())",
     )
     .bind(attached_identity_id)

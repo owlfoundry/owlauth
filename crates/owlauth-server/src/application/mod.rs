@@ -11,9 +11,7 @@ mod infrastructure;
 mod mail;
 mod managed_connection;
 mod managed_reauthorization;
-mod mcp_confirmation;
 mod passwordless_email;
-mod projection_expansion;
 mod provider_callback;
 mod provider_onboarding;
 mod provisioning;
@@ -60,9 +58,9 @@ pub(crate) use client_readiness::{
 };
 pub(crate) use control_lifecycle::{
     ApplicationSessionRecord, BrowserSessionRecord, ControlLifecyclePort, ControlLifecycleService,
-    DisableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind, ProjectUserIdentityRecord,
-    ProjectUserIdentityStatus, ProjectUserRecord, ProjectUserSessions, ProjectUserStatus,
-    RevokeApplicationSession, RevokeBrowserSession,
+    DisableProjectUser, EnableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind,
+    ProjectUserIdentityRecord, ProjectUserIdentityStatus, ProjectUserPage, ProjectUserRecord,
+    ProjectUserSessions, ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
 };
 pub(crate) use email_control::{
     CreateSmtpConfiguration, DeploymentSmtpGenerationRecord, EmailAssignmentRecord,
@@ -113,10 +111,6 @@ pub(crate) use identity_mutation::{
     VerifyIdentityMutationMagicTransferProof, VerifyRawIdentityMutationEmailProof,
 };
 pub(crate) use infrastructure::{Clock, RequestDigester};
-#[cfg(test)]
-pub(crate) use infrastructure::{
-    ConfigurationSecretProvisioner, ConfigurationSecretStore, EntropySource, SignerStore,
-};
 #[allow(
     unused_imports,
     reason = "mail worker composition follows the durable outbox repository"
@@ -152,21 +146,12 @@ pub(crate) use managed_reauthorization::{
     ManagedReauthorizationTargetIssuer, ManagedReauthorizationTargetVerifier,
     ManagedReauthorizationView, PreparedManagedReauthorizationCreate, StartManagedReauthorization,
 };
-pub(crate) use mcp_confirmation::{
-    ConfirmedProjectionPolicyUpdate, McpConfirmationContext, McpConfirmationPort,
-    McpConfirmationService, PROJECTION_POLICY_COMMIT_TOOL, PreparedProjectionPolicyConfirmation,
-};
 #[allow(unused_imports, reason = "passwordless email integration is additive")]
 pub(crate) use passwordless_email::{
     AdmittedEmailMethod, CommitEmailGeneration, CompleteEmailProof, EmailGenerationPreparation,
     EmailIdentityAliasAuthority, EmailProofDecision, EmailProofKind, EstablishMagicTransferContext,
     PasswordlessEmailRepository, ResolveMagicTransferContext, ResolvedMagicTransferContext,
     SelectEmailMethod, VerifiedEmailChallenge, VerifyEmailProof,
-};
-pub(crate) use projection_expansion::{
-    DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE, ProjectionExpansionRepository,
-    ProjectionExpansionWorker, ProjectionPolicyPort, ProjectionPolicyRecord,
-    ProjectionPolicyService, UpdateProjectionPolicy,
 };
 pub(crate) use provider_callback::{ProviderCallbackOwner, ProviderCallbackOwnerResolver};
 pub(crate) use provider_onboarding::{
@@ -180,10 +165,9 @@ pub(crate) use provisioning::{
     ProjectPolicyRecord, ProjectProvisioningPort, ProjectRecord, ProviderProvisioningPort,
     ProviderRecord, ProviderRecovery, ProvisionedProtectedSigningMaterial,
     ProvisioningInfrastructure, ProvisioningOperationState, ProvisioningService,
-    ReplaceApplicationConfiguration, SealedProtectedMaterial, SigningKeyActivationCandidate,
-    SigningKeyProvisioningPort, SigningKeyRecord, SigningKeyRecovery, SigningProviderAction,
-    SigningProviderCall, SigningProviderLease, UpdateApplication, UpdateProject,
-    UpdateProjectPolicy,
+    ReplaceApplicationConfiguration, SealedProtectedMaterial, SigningKeyMaintenanceItem,
+    SigningKeyProvisioningPort, SigningKeyRecord, SigningProviderAction, SigningProviderCall,
+    SigningProviderLease, UpdateApplication, UpdateProject, UpdateProjectPolicy,
 };
 pub(crate) use readiness::{
     JwksDocument, PublicApplicationConfig, PublicProvider, ReadinessPort, ReadinessService,
@@ -218,8 +202,6 @@ pub(crate) use session_authority::{
 };
 #[cfg(test)]
 pub(crate) use unit_of_work::{CompleteIdempotency, NewProject, ProjectUnitOfWork};
-#[cfg(test)]
-pub(crate) use webhook::ConfirmWebhookSecretProvisioned;
 pub(crate) use webhook::{
     ApplicationUserEventRecord, ClaimedWebhookDelivery, ClaimedWebhookSecretCleanup,
     CreateWebhookEndpoint, HistoryCursor, PrepareWebhookEndpoint, PrepareWebhookRotation,

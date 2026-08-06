@@ -850,7 +850,7 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         else {
             return ProviderRenewalResult::TransientBeforeDispatch;
         };
-        let Ok(secret) = self.secrets.resolve(&guard.secret_ref).await else {
+        let Ok(secret) = self.secrets.resolve(guard.secret_material_id).await else {
             return ProviderRenewalResult::TransientBeforeDispatch;
         };
         let Ok(refresh_token) = std::str::from_utf8(credential.as_ref()) else {
@@ -957,7 +957,7 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         let Some(endpoint) = discovery.revocation_endpoint else {
             return ProviderRevocationResult::Unsupported;
         };
-        let Ok(secret) = self.secrets.resolve(&guard.secret_ref).await else {
+        let Ok(secret) = self.secrets.resolve(guard.secret_material_id).await else {
             return ProviderRevocationResult::Ambiguous;
         };
         let Ok(refresh_token) = std::str::from_utf8(credential.as_ref()) else {

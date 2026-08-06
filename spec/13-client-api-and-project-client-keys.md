@@ -150,7 +150,7 @@ The base Client user is a bounded Project-owned read model containing:
 
 - stable user public ID and Project public ID; route `user_id` values use this public ID rather than an internal UUID;
 - status;
-- approved display name, avatar URL, primary verified email when materialized by current policy, and corresponding source-safe nullability;
+- approved display name, avatar URL, and the automatically eligible designated primary verified email with source-safe nullability;
 - monotonic `user_revision`;
 - created and updated timestamps.
 

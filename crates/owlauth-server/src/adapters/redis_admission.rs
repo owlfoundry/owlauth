@@ -220,7 +220,7 @@ mod tests {
     };
 
     use testcontainers::{
-        GenericImage, ImageExt,
+        GenericImage,
         core::{IntoContainerPort, WaitFor},
         runners::AsyncRunner,
     };
@@ -424,17 +424,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_initialized_manager_recovers_after_redis_eight_restart_without_adding_quota() {
-        let port_reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = port_reservation.local_addr().unwrap().port();
-        drop(port_reservation);
+    async fn same_initialized_manager_recovers_after_redis_eight_outage_without_adding_quota() {
         let container = GenericImage::new("redis", "8-bookworm")
             .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-            .with_mapped_port(port, 6379.tcp())
+            .with_exposed_port(6379.tcp())
             .start()
             .await
             .expect("Redis 8 test container must start");
-        let url = format!("redis://127.0.0.1:{port}/");
+        let host = container.get_host().await.expect("Redis 8 container host");
+        let port = container
+            .get_host_port_ipv4(6379.tcp())
+            .await
+            .expect("Redis 8 mapped port");
+        let url = format!("redis://{host}:{port}/");
         let counter = Arc::new(RedisAdmissionCounter::new(&url, Duration::from_secs(1)).unwrap());
         let distributed: Arc<dyn DistributedAdmissionCounter> = counter.clone();
         let clock = Arc::new(TestClock::new(59));
@@ -464,7 +466,7 @@ mod tests {
             AdmissionDecision::Allowed
         );
 
-        container.stop().await.unwrap();
+        container.pause().await.unwrap();
         assert_eq!(
             counter.evaluate(&[probe("outage")]).await,
             Err(DistributedAdmissionError)
@@ -480,7 +482,7 @@ mod tests {
             }
         ));
 
-        container.start().await.unwrap();
+        container.unpause().await.unwrap();
         let client = redis::Client::open(url.as_str()).unwrap();
         let mut fresh_connection = None;
         for _ in 0..30 {
@@ -490,7 +492,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let mut connection = fresh_connection.expect("restarted Redis 8 must become ready");
+        let mut connection = fresh_connection.expect("resumed Redis 8 must become ready");
 
         let mut recovered = false;
         for _ in 0..30 {

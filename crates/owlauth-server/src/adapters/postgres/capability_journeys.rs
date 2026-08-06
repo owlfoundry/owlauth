@@ -3,7 +3,7 @@ use std::{
     env,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -17,16 +17,14 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crc::{CRC_32_ISO_HDLC, Crc};
 use owlauth_key_provider::{
     ConfigurationSecretSealer, DestroyOutcome, DestroySigningKeyRequest, InspectSigningKeyRequest,
-    MaterialKind, OpaqueHandle, ProviderError, ProviderErrorClass, ProviderFormatVersion,
-    ProviderFormatVersions, ProviderId, ProvisionSigningKeyRequest, ProvisionedSigningKey,
-    RetryClassification, SigningAlgorithm, SigningKeyProvisioner, SigningProviderCapabilities,
-    SigningPublicKey,
+    OpaqueHandle, ProviderError, ProviderErrorClass, ProviderFormatVersion, ProviderFormatVersions,
+    ProviderId, ProvisionSigningKeyRequest, ProvisionedSigningKey, RetryClassification,
+    SigningAlgorithm, SigningKeyProvisioner, SigningProviderCapabilities, SigningPublicKey,
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait,
     IntoActiveModel, QueryFilter, QuerySelect, Statement, TransactionTrait,
 };
-use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -47,11 +45,7 @@ use crate::{
             client_api::RuntimeClientEmailLookupDigester,
             client_key::PostgresClientKeyRepository,
             client_readiness::PostgresClientDigestReadinessAdapter,
-            custody::{
-                MaterialOwnerKind, MaterialPurpose, ProtectedMaterialRepository,
-                finalize_pending_material, lock_material_inventory,
-            },
-            custody_import::PostgresCustodyImporter,
+            custody::ProtectedMaterialRepository,
             email_control::PostgresEmailControlRepository,
             entity::{
                 application, application_provider_assignment, application_publishable_key,
@@ -66,29 +60,26 @@ use crate::{
         },
         protected_runtime::PostgresProtectedRuntimeCustody,
         runtime_security::{RuntimeKeyMaterial, SoftwareRuntimeProtector},
-        software_store::EncryptedFileStore,
-        system::{Sha256RequestDigester, SystemClock, SystemEntropy},
+        system::{Sha256RequestDigester, SystemClock},
     },
     application::{
         AcknowledgeProjectClientKeyDelivery, ApplicationError, ApplicationProvisioningPort,
         ClientDigestReadinessService, ClientEmailLookupDigester, ClientKeyLifecycleService,
-        CompleteIdempotency, ConfigurationSecretProvisioner, ConfigurationSecretStore,
-        CreateApplication, CreateProject, CreateProjectClientKey, CreateProjectClientKeyResult,
-        CreateProvider, CreateSmtpConfiguration, EmailControlService, NewProject, PrepareProvider,
-        PreparedProvider, PreparedSigningKey, ProjectProvisioningPort, ProjectRecord,
-        ProviderEgressPolicyPort, ProviderProvisioningPort, ProvisionedProtectedSigningMaterial,
-        ProvisioningInfrastructure, ProvisioningOperationState, ProvisioningService,
-        ReadinessService, ReconcileDeploymentSmtpGeneration, ReplaceApplicationConfiguration,
-        RequestDigester, RevokeProjectClientKey, RuntimeProtector, SignerStore,
-        SigningKeyProvisioningPort, SigningProviderAction, SigningProviderCall,
-        SigningProviderLease, SmtpControlTlsMode, SmtpCredentialResolver, UpdateProject,
-        UpdateProjectPolicy,
+        CompleteIdempotency, ConfigurationSecretSealers, CreateApplication, CreateProject,
+        CreateProjectClientKey, CreateProjectClientKeyResult, CreateProvider,
+        CreateSmtpConfiguration, EmailControlService, NewProject, PreparedSigningKey,
+        ProjectProvisioningPort, ProjectRecord, ProviderEgressPolicyPort,
+        ProvisionedProtectedSigningMaterial, ProvisioningInfrastructure,
+        ProvisioningOperationState, ProvisioningService, ReadinessService,
+        ReconcileDeploymentSmtpGeneration, ReplaceApplicationConfiguration, RequestDigester,
+        RevokeProjectClientKey, RuntimeProtector, SigningKeyProvisioningPort,
+        SigningProviderAction, SigningProviderCall, SigningProviderLease, SmtpControlTlsMode,
+        SmtpCredentialResolver, UpdateProject, UpdateProjectPolicy,
     },
-    composition::{ServerError, build_http_capabilities, validate_provider_readiness},
+    composition::build_http_capabilities,
     config::{MigrationMode, PlaneMode, ServerConfig},
     domain::{ApplicationType, ProviderEgressMode, ProviderEgressPolicy, ProviderKind},
     http::{build_routers_with_capabilities, build_routers_with_runtime_incarnation},
-    providers::ProviderRegistrations,
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -152,81 +143,6 @@ async fn bump_project_metadata_revision(
         .map_err(|_| ApplicationError::Persistence)
 }
 
-#[derive(Clone)]
-struct RevisionBumpingSignerStore {
-    inner: EncryptedFileStore,
-    database: DatabaseConnection,
-    project_id: Uuid,
-    bumped: Arc<AtomicBool>,
-    put_calls: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl SignerStore for RevisionBumpingSignerStore {
-    async fn put_if_absent(
-        &self,
-        alias: String,
-        seed: zeroize::Zeroizing<[u8; 32]>,
-    ) -> Result<(), ApplicationError> {
-        self.put_calls.fetch_add(1, Ordering::SeqCst);
-        SignerStore::put_if_absent(&self.inner, alias, seed).await?;
-        if !self.bumped.swap(true, Ordering::SeqCst) {
-            bump_project_metadata_revision(&self.database, self.project_id).await?;
-        }
-        Ok(())
-    }
-
-    async fn public_jwk(
-        &self,
-        alias: String,
-        kid: &str,
-    ) -> Result<serde_json::Value, ApplicationError> {
-        SignerStore::public_jwk(&self.inner, alias, kid).await
-    }
-
-    async fn verify(
-        &self,
-        alias: String,
-        kid: &str,
-        public_jwk: &serde_json::Value,
-    ) -> Result<(), ApplicationError> {
-        SignerStore::verify(&self.inner, alias, kid, public_jwk).await
-    }
-}
-
-#[derive(Clone)]
-struct RevisionBumpingSecretStore {
-    inner: EncryptedFileStore,
-    database: DatabaseConnection,
-    project_id: Uuid,
-    bumped: Arc<AtomicBool>,
-    put_calls: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl ConfigurationSecretStore for RevisionBumpingSecretStore {
-    fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
-        ConfigurationSecretStore::request_fingerprint(&self.inner, value)
-    }
-
-    async fn put_if_absent(
-        &self,
-        alias: String,
-        value: zeroize::Zeroizing<Vec<u8>>,
-    ) -> Result<(), ApplicationError> {
-        self.put_calls.fetch_add(1, Ordering::SeqCst);
-        ConfigurationSecretStore::put_if_absent(&self.inner, alias, value).await?;
-        if !self.bumped.swap(true, Ordering::SeqCst) {
-            bump_project_metadata_revision(&self.database, self.project_id).await?;
-        }
-        Ok(())
-    }
-
-    async fn ensure_readable(&self, alias: String) -> Result<(), ApplicationError> {
-        ConfigurationSecretStore::ensure_readable(&self.inner, alias).await
-    }
-}
-
 #[derive(Default)]
 struct RemoteSigningState {
     object: Option<(Vec<u8>, Vec<u8>)>,
@@ -243,7 +159,7 @@ struct RemoteSigningState {
 struct StatefulRemoteSigningProvider {
     provider_id: ProviderId,
     state: Arc<Mutex<RemoteSigningState>>,
-    revision_bump: Option<(DatabaseConnection, Uuid, Arc<AtomicBool>)>,
+    project_disable: Option<(DatabaseConnection, Uuid, Arc<AtomicBool>)>,
 }
 
 impl StatefulRemoteSigningProvider {
@@ -251,12 +167,12 @@ impl StatefulRemoteSigningProvider {
         Self {
             provider_id,
             state,
-            revision_bump: None,
+            project_disable: None,
         }
     }
 
-    fn with_revision_bump(mut self, database: DatabaseConnection, project_id: Uuid) -> Self {
-        self.revision_bump = Some((database, project_id, Arc::new(AtomicBool::new(false))));
+    fn with_project_disable(mut self, database: DatabaseConnection, project_id: Uuid) -> Self {
+        self.project_disable = Some((database, project_id, Arc::new(AtomicBool::new(false))));
         self
     }
 
@@ -301,17 +217,32 @@ impl SigningKeyProvisioner for StatefulRemoteSigningProvider {
             let ambiguous = std::mem::take(&mut state.ambiguous_provision_once);
             (result.0, result.1, ambiguous)
         };
-        if let Some((database, project_id, bumped)) = &self.revision_bump
-            && !bumped.swap(true, Ordering::SeqCst)
+        if let Some((database, project_id, disabled)) = &self.project_disable
+            && !disabled.swap(true, Ordering::SeqCst)
         {
-            bump_project_metadata_revision(database, *project_id)
+            let project = project::Entity::find_by_id(*project_id)
+                .one(database)
                 .await
                 .map_err(|_| {
                     ProviderError::new(
                         ProviderErrorClass::Unavailable,
                         RetryClassification::Reconcile,
                     )
+                })?
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorClass::Unavailable,
+                        RetryClassification::Reconcile,
+                    )
                 })?;
+            let mut project = project.into_active_model();
+            project.status = Set("disabled".to_owned());
+            project.update(database).await.map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorClass::Unavailable,
+                    RetryClassification::Reconcile,
+                )
+            })?;
         }
         if ambiguous {
             return Err(ProviderError::new(
@@ -395,11 +326,19 @@ async fn assert_expired_signing_provider_lease_is_fenced(
         ring_id: operation.ring_id,
         key_id: operation.key_id,
         kid: key.kid,
-        signer_ref: key.signer_ref,
+        signer_material_id: operation.material_id,
         request_digest: operation.request_digest.clone(),
         state: ProvisioningOperationState::Submitted,
     };
     let now = time::OffsetDateTime::now_utc();
+    let mut due_operation = operation.clone().into_active_model();
+    due_operation.next_attempt_at = Set(Some(now - time::Duration::seconds(1)));
+    due_operation.provider_lease_token = Set(None);
+    due_operation.provider_lease_expires_at = Set(None);
+    due_operation
+        .update(database)
+        .await
+        .expect("submitted operation should be due before the lease-fencing fixture");
     let lease = match adapter
         .claim_signing_provider_action(
             project_id,
@@ -462,12 +401,9 @@ async fn assert_expired_signing_provider_lease_is_fenced(
             .record_protected_signing_key_material(
                 project_id,
                 &prepared,
-                operation.expected_project_revision,
                 lease,
                 ProvisionedProtectedSigningMaterial {
-                    material_id: operation
-                        .material_id
-                        .expect("remote operation should reserve material"),
+                    material_id: operation.material_id,
                     handle: OpaqueHandle::new(vec![7; 48]).unwrap(),
                     public_key: SigningPublicKey::new(SigningAlgorithm::Ed25519, vec![8; 32],)
                         .unwrap(),
@@ -558,22 +494,6 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
             "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4".to_owned(),
         ),
         (
-            "OWLAUTH_SIGNER_STORE_ROOT".to_owned(),
-            "/tmp/owlauth-postgres-test-signers".to_owned(),
-        ),
-        (
-            "OWLAUTH_SIGNER_STORE_KEY".to_owned(),
-            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned(),
-        ),
-        (
-            "OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT".to_owned(),
-            "/tmp/owlauth-postgres-test-secrets".to_owned(),
-        ),
-        (
-            "OWLAUTH_CONFIGURATION_SECRET_STORE_KEY".to_owned(),
-            "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI".to_owned(),
-        ),
-        (
             "OWLAUTH_MIGRATION_OWNER_ROLE".to_owned(),
             "owlauth_owner".to_owned(),
         ),
@@ -650,10 +570,6 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
         (
             "OWLAUTH_MANAGED_CREDENTIAL_KEY".to_owned(),
             "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY".to_owned(),
-        ),
-        (
-            "OWLAUTH_PROVIDER_ALLOWED_ORIGINS".to_owned(),
-            "https://accounts.example/".to_owned(),
         ),
         (
             "OWLAUTH_CLIENT_PROCESS_ID".to_owned(),
@@ -736,12 +652,24 @@ async fn verify_application_and_publication_journeys(
     readiness: ReadinessService,
     secondary_readiness: ReadinessService,
     unexpected_readiness: ReadinessService,
-    signer_store: EncryptedFileStore,
-    secret_store: EncryptedFileStore,
-    signer_root: std::path::PathBuf,
     admin_url: &str,
     control_url: String,
 ) -> Uuid {
+    let reservation_revision = created_project.metadata_revision;
+    let created_project = provisioning
+        .update_project(
+            created_project.id,
+            UpdateProject {
+                display_name: "Production project configured".to_owned(),
+                belongs_to: created_project.belongs_to.clone(),
+                expected_metadata_revision: reservation_revision,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("Project metadata should change while its initial signing reservation is pending");
+    assert_eq!(created_project.metadata_revision, reservation_revision + 1);
+
     let created_application = provisioning
         .create_application(
             created_project.id,
@@ -955,23 +883,35 @@ async fn verify_application_and_publication_journeys(
         .await
         .expect("direct constraint connection should close");
 
-    let signing_key = provisioning
-        .provision_signing_key(
-            created_project.id,
-            "signing-operation-12345678".to_owned(),
-            created_project.metadata_revision,
-            Uuid::new_v4(),
-        )
+    let initial_operation = key_provisioning_operation::Entity::find()
+        .filter(key_provisioning_operation::Column::ProjectId.eq(created_project.id))
+        .one(control)
         .await
-        .expect("signing material should reconcile and publish");
-    let operation = key_provisioning_operation::Entity::find()
-        .filter(key_provisioning_operation::Column::OperationAlias.eq("signing-operation-12345678"))
+        .expect("initial key operation should be queryable")
+        .expect("Project creation should persist its initial key operation");
+    let initial_operation_alias = initial_operation.operation_alias.clone();
+    let initial_expected_project_revision = initial_operation.expected_project_revision;
+    assert_eq!(initial_expected_project_revision, reservation_revision);
+    provisioning
+        .reconcile_signing_key_lifecycle(100)
+        .await
+        .expect("maintenance should continue an accepted initial signing reservation after metadata changes");
+    let signing_key = provisioning
+        .list_signing_keys(created_project.id)
+        .await
+        .expect("initial signing key should be queryable after maintenance")
+        .into_iter()
+        .find(|key| key.id == initial_operation.key_id)
+        .expect("initial signing maintenance should retain its exact key");
+    assert_eq!(signing_key.state, "published");
+    let operation = key_provisioning_operation::Entity::find_by_id(initial_operation.id)
         .one(control)
         .await
         .expect("key operation should be queryable")
         .expect("key operation should be durable");
     let mut operation_active = operation.into_active_model();
     operation_active.state = Set("stored".to_owned());
+    operation_active.expected_ring_revision = Set(signing_key.ring_revision);
     operation_active.completed_at = Set(None);
     operation_active
         .update(control)
@@ -988,31 +928,12 @@ async fn verify_application_and_publication_journeys(
         .update(control)
         .await
         .expect("stored recovery fixture should persist");
-    let restarted_provisioning = ProvisioningService::new(
-        Arc::new(PostgresProvisioningAdapter::new(
-            control.clone(),
-            url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec![
-                "runtime-test-process".to_owned(),
-                "runtime-secondary-process".to_owned(),
-            ],
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            false,
-        ),
-    );
+    let restarted_provisioning = provisioning.clone();
     let signing_key = restarted_provisioning
         .provision_signing_key(
             created_project.id,
-            "signing-operation-12345678".to_owned(),
-            created_project.metadata_revision,
+            initial_operation_alias.clone(),
+            initial_expected_project_revision,
             Uuid::new_v4(),
         )
         .await
@@ -1500,7 +1421,6 @@ async fn verify_application_and_publication_journeys(
         .expect("provider should exist");
     let mut provider_active = provider_model.into_active_model();
     provider_active.status = Set("provisioning".to_owned());
-    provider_active.secret_ref = Set(None);
     provider_active.revision = Set(1);
     provider_active
         .update(control)
@@ -1552,93 +1472,10 @@ async fn verify_application_and_publication_journeys(
     bump_project_metadata_revision(control, created_project.id)
         .await
         .expect("completed replay fence fixture should advance Project metadata");
-    let completed_key_operation = key_provisioning_operation::Entity::find()
-        .filter(key_provisioning_operation::Column::OperationAlias.eq("signing-operation-12345678"))
-        .one(control)
-        .await
-        .expect("completed key operation should be queryable")
-        .expect("completed key operation should exist");
-    let completed_key_model = project_signing_key::Entity::find_by_id(signing_key.id)
-        .one(control)
-        .await
-        .expect("completed key should be queryable")
-        .expect("completed key should exist");
-    let prepared_key = PreparedSigningKey {
-        operation_id: completed_key_operation.id,
-        ring_id: completed_key_operation.ring_id,
-        key_id: completed_key_operation.key_id,
-        kid: completed_key_model.kid,
-        signer_ref: completed_key_model.signer_ref,
-        request_digest: completed_key_operation.request_digest,
-        state: ProvisioningOperationState::Prepared,
-    };
-    let completed_provider_operation = provider_secret_operation::Entity::find()
-        .filter(provider_secret_operation::Column::OperationAlias.eq("provider-operation-12345678"))
-        .one(control)
-        .await
-        .expect("completed provider operation should be queryable")
-        .expect("completed provider operation should exist");
-    let prepared_provider = PreparedProvider {
-        operation_id: completed_provider_operation.id,
-        provider_id: completed_provider_operation.provider_id,
-        request_digest: completed_provider_operation.request_digest,
-        state: ProvisioningOperationState::Prepared,
-    };
-    let completed_stage_adapter = PostgresProvisioningAdapter::new(
-        control.clone(),
-        url::Url::parse("https://identity.example/runtime/").unwrap(),
-        vec!["runtime-test-process".to_owned()],
-        Duration::from_millis(10),
-        Duration::from_secs(1),
-    );
-    let replayed_at = time::OffsetDateTime::now_utc();
-    completed_stage_adapter
-        .record_signing_key_material(
-            created_project.id,
-            &prepared_key,
-            created_project.metadata_revision,
-            serde_json::json!({}),
-            replayed_at,
-        )
-        .await
-        .expect("an in-flight key record stage should observe concurrent completion");
-    let stage_replayed_key = completed_stage_adapter
-        .publish_signing_key(
-            created_project.id,
-            &prepared_key,
-            created_project.metadata_revision,
-            Uuid::new_v4(),
-            replayed_at,
-        )
-        .await
-        .expect("an in-flight key publish stage should observe concurrent completion");
-    assert_eq!(stage_replayed_key.id, signing_key.id);
-    completed_stage_adapter
-        .mark_provider_secret_stored(
-            created_project.id,
-            &prepared_provider,
-            created_project.metadata_revision,
-            replayed_at,
-        )
-        .await
-        .expect("an in-flight provider store stage should observe concurrent completion");
-    let stage_replayed_provider = completed_stage_adapter
-        .finalize_provider(
-            created_project.id,
-            &prepared_provider,
-            created_project.metadata_revision,
-            "unused-after-completion".to_owned(),
-            Uuid::new_v4(),
-            replayed_at,
-        )
-        .await
-        .expect("an in-flight provider finalize stage should observe concurrent completion");
-    assert_eq!(stage_replayed_provider.id, provider.id);
-
     let replayed_signing_key = restarted_provisioning
         .provision_signing_key(
             created_project.id,
-            "signing-operation-12345678".to_owned(),
+            initial_operation_alias,
             created_project.metadata_revision,
             Uuid::new_v4(),
         )
@@ -1687,46 +1524,6 @@ async fn verify_application_and_publication_journeys(
     assert_eq!(public_config.providers[0].key, "workforce");
     assert_eq!(public_config.publishable_keys.len(), 1);
     assert_eq!(assigned.revision, provider.revision + 1);
-
-    let mut changed_legacy_egress_config = config.clone();
-    changed_legacy_egress_config.provider_allowed_origins =
-        vec!["https://different-provider.example/".to_owned()];
-    let mut blocked_egress_routers = build_routers_with_runtime_incarnation(
-        &changed_legacy_egress_config,
-        Some(pools),
-        Uuid::from_u128(1),
-    );
-    blocked_egress_routers.mark_ready();
-    let blocked_egress_response = blocked_egress_routers
-        .runtime
-        .take()
-        .expect("Runtime router should be composed")
-        .oneshot(
-            Request::get(format!(
-                "/v1/projects/{}/auth/config?application_id={}",
-                created_project.public_id, created_application.public_id
-            ))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(blocked_egress_response.status(), StatusCode::OK);
-    let blocked_egress_json: serde_json::Value = serde_json::from_slice(
-        &to_bytes(blocked_egress_response.into_body(), 1_000_000)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        blocked_egress_json["providers"],
-        serde_json::json!([{
-            "key": "workforce",
-            "display_name": "Workforce SSO",
-            "kind": "oidc"
-        }])
-    );
-    assert_eq!(blocked_egress_json["login_available"], true);
 
     let snapshot_mutation = control
         .begin()
@@ -2118,25 +1915,6 @@ async fn verify_application_and_publication_journeys(
         renewed_primary_lease.last_observed_at
     );
     tokio::time::sleep(Duration::from_millis(15)).await;
-    let signer_model = project_signing_key::Entity::find_by_id(unavailable_signer_key.id)
-        .one(control)
-        .await
-        .expect("signing key should be queryable")
-        .expect("signing key should exist");
-    std::fs::remove_file(signer_root.join(format!("{}.owls", signer_model.signer_ref)))
-        .expect("signer material should be removable for the controlled failure");
-    assert_eq!(
-        provisioning
-            .activate_signing_key(
-                created_project.id,
-                unavailable_signer_key.id,
-                unavailable_signer_key.ring_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::Integrity)
-    );
-
     let lease_before_disable = runtime_publication_lease::Entity::find()
         .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
         .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-test-process"))
@@ -2197,1096 +1975,7 @@ async fn verify_application_and_publication_journeys(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the revision-fence journey preserves Project revisions across signing and provider external effects"
-)]
-async fn verify_project_and_external_effect_revision_fences(
-    created_project: ProjectRecord,
-    provisioning: &ProvisioningService,
-    store_root: &std::path::Path,
-    control: &DatabaseConnection,
-) -> (ProjectRecord, Uuid) {
-    let initial_policy = provisioning
-        .get_project_policy(created_project.id)
-        .await
-        .expect("new Projects should have an atomic default policy");
-    assert_eq!(initial_policy.access_token_lifetime_seconds, 900);
-    assert!(!initial_policy.browser_session_reuse);
-    assert_eq!(
-        (
-            initial_policy.claims_revision,
-            initial_policy.session_revision
-        ),
-        (1, 1)
-    );
-    let updated_policy = provisioning
-        .update_project_policy(
-            created_project.id,
-            UpdateProjectPolicy {
-                access_token_lifetime_seconds: 1_200,
-                browser_session_reuse: true,
-                expected_claims_revision: initial_policy.claims_revision,
-                expected_session_revision: initial_policy.session_revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("policy revisions should advance atomically");
-    assert_eq!(
-        (
-            updated_policy.claims_revision,
-            updated_policy.session_revision
-        ),
-        (2, 2)
-    );
-    assert_eq!(
-        provisioning
-            .update_project_policy(
-                created_project.id,
-                UpdateProjectPolicy {
-                    access_token_lifetime_seconds: 1_800,
-                    browser_session_reuse: false,
-                    expected_claims_revision: 1,
-                    expected_session_revision: 2,
-                },
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict)
-    );
-
-    assert_eq!(
-        provisioning
-            .list_projects(Some("customer-42".to_owned()))
-            .await
-            .expect("owner filtering should succeed")
-            .iter()
-            .map(|project| project.id)
-            .collect::<Vec<_>>(),
-        [created_project.id]
-    );
-    assert!(
-        provisioning
-            .list_projects(Some("customer".to_owned()))
-            .await
-            .expect("owner filtering is exact")
-            .is_empty()
-    );
-    let moved_project = provisioning
-        .update_project(
-            created_project.id,
-            UpdateProject {
-                display_name: created_project.display_name.clone(),
-                belongs_to: Some("customer-84".to_owned()),
-                expected_metadata_revision: created_project.metadata_revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("Project ownership metadata should be replaceable");
-    assert!(
-        provisioning
-            .list_projects(Some("customer-42".to_owned()))
-            .await
-            .expect("old owner filter should succeed")
-            .is_empty()
-    );
-    let created_project = provisioning
-        .update_project(
-            moved_project.id,
-            UpdateProject {
-                display_name: moved_project.display_name.clone(),
-                belongs_to: None,
-                expected_metadata_revision: moved_project.metadata_revision,
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("Project ownership metadata should be clearable");
-    assert_eq!(created_project.belongs_to, None);
-
-    let key_fence_project = provisioning
-        .create_project(
-            CreateProject {
-                display_name: "Key fence project".to_owned(),
-                belongs_to: None,
-                idempotency_key: "key-fence-project-12345678".to_owned(),
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("key fence Project should be created");
-    let key_fence_signer_root = store_root.join("key-fence-signers");
-    let key_fence_signer = EncryptedFileStore::new(key_fence_signer_root.clone(), [21; 32])
-        .expect("key fence signer store should initialize");
-    let key_fence_secret = EncryptedFileStore::new(store_root.join("key-fence-secrets"), [22; 32])
-        .expect("key fence secret store should initialize");
-    let key_fence_put_calls = Arc::new(AtomicUsize::new(0));
-    let key_revision_store = RevisionBumpingSignerStore {
-        inner: key_fence_signer,
-        database: control.clone(),
-        project_id: key_fence_project.id,
-        bumped: Arc::new(AtomicBool::new(false)),
-        put_calls: key_fence_put_calls.clone(),
-    };
-    let key_fence_service = ProvisioningService::new(
-        Arc::new(PostgresProvisioningAdapter::new(
-            control.clone(),
-            url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec!["runtime-test-process".to_owned()],
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )),
-        ProvisioningInfrastructure::new(
-            key_revision_store.clone(),
-            key_fence_secret.clone(),
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            false,
-        ),
-    );
-    assert_eq!(
-        key_fence_service
-            .provision_signing_key(
-                key_fence_project.id,
-                "key-fence-operation-12345678".to_owned(),
-                key_fence_project.metadata_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict),
-        "a Project metadata change after signer creation must fence material recording"
-    );
-    let key_fence_operation = key_provisioning_operation::Entity::find()
-        .filter(
-            key_provisioning_operation::Column::OperationAlias.eq("key-fence-operation-12345678"),
-        )
-        .one(control)
-        .await
-        .expect("key fence operation should be queryable")
-        .expect("key fence operation should remain durable");
-    assert_eq!(key_fence_operation.state, "prepared");
-    assert_eq!(
-        key_fence_operation.expected_project_revision,
-        key_fence_project.metadata_revision
-    );
-    let key_fence_resource_id = key_fence_operation.key_id;
-    assert_eq!(
-        std::fs::read_dir(&key_fence_signer_root)
-            .expect("key fence signer directory should exist")
-            .count(),
-        1
-    );
-    assert_eq!(key_fence_put_calls.load(Ordering::SeqCst), 1);
-    let restarted_key_fence_service = ProvisioningService::new(
-        Arc::new(PostgresProvisioningAdapter::new(
-            control.clone(),
-            url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec!["runtime-test-process".to_owned()],
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )),
-        ProvisioningInfrastructure::new(
-            key_revision_store,
-            key_fence_secret,
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            false,
-        ),
-    );
-    assert_eq!(
-        restarted_key_fence_service
-            .reconcile_signing_key(
-                key_fence_project.id,
-                key_fence_resource_id,
-                key_fence_project.metadata_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict),
-        "restart and retry must preserve the captured stale fence rather than overwrite it"
-    );
-    let retried_key_fence_operation = key_provisioning_operation::Entity::find()
-        .filter(
-            key_provisioning_operation::Column::OperationAlias.eq("key-fence-operation-12345678"),
-        )
-        .one(control)
-        .await
-        .expect("retried key fence operation should be queryable")
-        .expect("retried key fence operation should remain durable");
-    assert_eq!(retried_key_fence_operation.id, key_fence_operation.id);
-    assert_eq!(retried_key_fence_operation.key_id, key_fence_resource_id);
-    assert_eq!(
-        std::fs::read_dir(&key_fence_signer_root)
-            .expect("key fence signer directory should remain readable")
-            .count(),
-        1,
-        "retry must not create a replacement signer"
-    );
-    assert_eq!(
-        key_fence_put_calls.load(Ordering::SeqCst),
-        1,
-        "a stale prepared operation must fail before another signer call"
-    );
-    let mut stored_key_fence_operation = retried_key_fence_operation.into_active_model();
-    stored_key_fence_operation.state = Set("stored".to_owned());
-    stored_key_fence_operation
-        .update(control)
-        .await
-        .expect("stored stale key operation fixture should persist");
-    let reconciled_key = restarted_key_fence_service
-        .reconcile_signing_key(
-            key_fence_project.id,
-            key_fence_resource_id,
-            key_fence_project.metadata_revision + 1,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("current authorization should reconcile the same stored key operation");
-    assert_eq!(reconciled_key.id, key_fence_resource_id);
-    let reconciled_key_fence_operation = key_provisioning_operation::Entity::find()
-        .filter(
-            key_provisioning_operation::Column::OperationAlias.eq("key-fence-operation-12345678"),
-        )
-        .one(control)
-        .await
-        .expect("reconciled key operation should be queryable")
-        .expect("reconciled key operation should remain durable");
-    assert_eq!(reconciled_key_fence_operation.id, key_fence_operation.id);
-    assert_eq!(reconciled_key_fence_operation.state, "completed");
-    assert_eq!(
-        reconciled_key_fence_operation.expected_project_revision,
-        key_fence_project.metadata_revision + 1
-    );
-    assert_eq!(
-        std::fs::read_dir(&key_fence_signer_root)
-            .expect("reconciled signer directory should remain readable")
-            .count(),
-        1,
-        "reauthorization must reconcile the original signer alias"
-    );
-    assert_eq!(
-        key_fence_put_calls.load(Ordering::SeqCst),
-        2,
-        "reauthorization should verify the original external signer alias once"
-    );
-
-    let abandon_adapter = PostgresProvisioningAdapter::new(
-        control.clone(),
-        url::Url::parse("https://identity.example/runtime/").unwrap(),
-        vec!["runtime-test-process".to_owned()],
-        Duration::from_millis(10),
-        Duration::from_secs(1),
-    );
-    let incomplete = abandon_adapter
-        .prepare_signing_key(
-            key_fence_project.id,
-            "key-abandon-operation-12345678".to_owned(),
-            "signer/key-abandon-operation-12345678".to_owned(),
-            key_fence_project.metadata_revision + 1,
-            vec![7; 32],
-        )
-        .await
-        .expect("a durable pre-material key should be prepared");
-    let incomplete_record = abandon_adapter
-        .get_signing_key(key_fence_project.id, incomplete.key_id)
-        .await
-        .expect("the pre-material key should remain listable");
-    assert_eq!(incomplete_record.public_jwk, serde_json::json!({}));
-    let abandoned = restarted_key_fence_service
-        .revoke_signing_key(
-            key_fence_project.id,
-            incomplete.key_id,
-            incomplete_record.ring_revision,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("revoking a pre-material key should atomically abandon it");
-    assert_eq!(abandoned.state, "abandoned");
-    assert_eq!(abandoned.public_jwk, serde_json::json!({}));
-    let abandoned_operation =
-        key_provisioning_operation::Entity::find_by_id(incomplete.operation_id)
-            .one(control)
-            .await
-            .expect("abandoned key operation should be queryable")
-            .expect("abandoned key operation should remain durable");
-    assert_eq!(abandoned_operation.state, "abandoned");
-    assert_eq!(
-        restarted_key_fence_service
-            .reconcile_signing_key(
-                key_fence_project.id,
-                incomplete.key_id,
-                key_fence_project.metadata_revision + 1,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition),
-        "an abandoned key operation must not be resumed"
-    );
-
-    let provider_fence_project = provisioning
-        .create_project(
-            CreateProject {
-                display_name: "Provider fence project".to_owned(),
-                belongs_to: None,
-                idempotency_key: "provider-fence-project-12345678".to_owned(),
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("provider fence Project should be created");
-    let provider_fence_signer =
-        EncryptedFileStore::new(store_root.join("provider-fence-signers"), [23; 32])
-            .expect("provider fence signer store should initialize");
-    let provider_fence_secret_root = store_root.join("provider-fence-secrets");
-    let provider_fence_secret =
-        EncryptedFileStore::new(provider_fence_secret_root.clone(), [24; 32])
-            .expect("provider fence secret store should initialize");
-    let provider_fence_put_calls = Arc::new(AtomicUsize::new(0));
-    let provider_revision_store = RevisionBumpingSecretStore {
-        inner: provider_fence_secret,
-        database: control.clone(),
-        project_id: provider_fence_project.id,
-        bumped: Arc::new(AtomicBool::new(false)),
-        put_calls: provider_fence_put_calls.clone(),
-    };
-    let provider_fence_service = ProvisioningService::new(
-        Arc::new(PostgresProvisioningAdapter::new(
-            control.clone(),
-            url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec!["runtime-test-process".to_owned()],
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )),
-        ProvisioningInfrastructure::new(
-            provider_fence_signer.clone(),
-            provider_revision_store.clone(),
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            false,
-        ),
-    );
-    let provider_fence_command = || CreateProvider {
-        kind: crate::domain::ProviderKind::Oidc,
-        provider_key: "fenced-workforce".to_owned(),
-        display_name: "Fenced Workforce".to_owned(),
-        issuer: "https://fenced-accounts.example/".to_owned(),
-        client_id: "owlauth-fence-test".to_owned(),
-        client_secret: zeroize::Zeroizing::new("provider-fence-secret".to_owned()),
-        managed_profile_enabled: false,
-        idempotency_key: "provider-fence-operation-12345678".to_owned(),
-        expected_project_revision: provider_fence_project.metadata_revision,
-        egress_policy_revision: Some(1),
-    };
-    assert_eq!(
-        provider_fence_service
-            .create_provider(
-                provider_fence_project.id,
-                provider_fence_command(),
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict),
-        "a Project metadata change after secret creation must fence stored-state recording"
-    );
-    let provider_fence_operation = provider_secret_operation::Entity::find()
-        .filter(
-            provider_secret_operation::Column::OperationAlias
-                .eq("provider-fence-operation-12345678"),
-        )
-        .one(control)
-        .await
-        .expect("provider fence operation should be queryable")
-        .expect("provider fence operation should remain durable");
-    assert_eq!(provider_fence_operation.state, "prepared");
-    assert_eq!(
-        provider_fence_operation.expected_project_revision,
-        provider_fence_project.metadata_revision
-    );
-    let provider_fence_resource_id = provider_fence_operation.provider_id;
-    assert_eq!(
-        std::fs::read_dir(&provider_fence_secret_root)
-            .expect("provider fence secret directory should exist")
-            .count(),
-        1
-    );
-    assert_eq!(provider_fence_put_calls.load(Ordering::SeqCst), 1);
-    let restarted_provider_fence_service = ProvisioningService::new(
-        Arc::new(PostgresProvisioningAdapter::new(
-            control.clone(),
-            url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec!["runtime-test-process".to_owned()],
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )),
-        ProvisioningInfrastructure::new(
-            provider_fence_signer,
-            provider_revision_store,
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            false,
-        ),
-    );
-    assert_eq!(
-        restarted_provider_fence_service
-            .reconcile_provider(
-                provider_fence_project.id,
-                provider_fence_resource_id,
-                zeroize::Zeroizing::new("provider-fence-secret".to_owned()),
-                provider_fence_project.metadata_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::RevisionConflict),
-        "restart and retry must preserve the captured stale provider fence"
-    );
-    let retried_provider_fence_operation = provider_secret_operation::Entity::find()
-        .filter(
-            provider_secret_operation::Column::OperationAlias
-                .eq("provider-fence-operation-12345678"),
-        )
-        .one(control)
-        .await
-        .expect("retried provider fence operation should be queryable")
-        .expect("retried provider fence operation should remain durable");
-    assert_eq!(
-        retried_provider_fence_operation.id,
-        provider_fence_operation.id
-    );
-    assert_eq!(
-        retried_provider_fence_operation.provider_id,
-        provider_fence_resource_id
-    );
-    assert_eq!(
-        std::fs::read_dir(&provider_fence_secret_root)
-            .expect("provider fence secret directory should remain readable")
-            .count(),
-        1,
-        "retry must not create a replacement secret"
-    );
-    assert_eq!(
-        provider_fence_put_calls.load(Ordering::SeqCst),
-        1,
-        "a stale prepared operation must fail before another secret-store call"
-    );
-    let mut conflicting_provider_fence_command = provider_fence_command();
-    conflicting_provider_fence_command.display_name = "Different Workforce".to_owned();
-    assert_eq!(
-        restarted_provider_fence_service
-            .create_provider(
-                provider_fence_project.id,
-                conflicting_provider_fence_command,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::IdempotencyConflict),
-        "digest conflict must take precedence over a stale captured revision"
-    );
-    assert_eq!(
-        provider_fence_put_calls.load(Ordering::SeqCst),
-        1,
-        "digest conflict must fail before another secret-store call"
-    );
-    let mut stored_provider_fence_operation = retried_provider_fence_operation.into_active_model();
-    stored_provider_fence_operation.state = Set("stored".to_owned());
-    stored_provider_fence_operation
-        .update(control)
-        .await
-        .expect("stored stale provider operation fixture should persist");
-    assert_eq!(
-        restarted_provider_fence_service
-            .reconcile_provider(
-                provider_fence_project.id,
-                provider_fence_resource_id,
-                zeroize::Zeroizing::new("wrong-provider-fence-secret".to_owned()),
-                provider_fence_project.metadata_revision + 1,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::IdempotencyConflict),
-        "resource-keyed reconciliation must reject a different re-entered secret"
-    );
-    assert_eq!(
-        provider_fence_put_calls.load(Ordering::SeqCst),
-        1,
-        "wrong secret reconciliation must fail before another external write"
-    );
-    let reconciled_provider = restarted_provider_fence_service
-        .reconcile_provider(
-            provider_fence_project.id,
-            provider_fence_resource_id,
-            zeroize::Zeroizing::new("provider-fence-secret".to_owned()),
-            provider_fence_project.metadata_revision + 1,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("current authorization should reconcile the same stored provider operation");
-    assert_eq!(reconciled_provider.id, provider_fence_resource_id);
-    let reconciled_provider_fence_operation = provider_secret_operation::Entity::find()
-        .filter(
-            provider_secret_operation::Column::OperationAlias
-                .eq("provider-fence-operation-12345678"),
-        )
-        .one(control)
-        .await
-        .expect("reconciled provider operation should be queryable")
-        .expect("reconciled provider operation should remain durable");
-    assert_eq!(
-        reconciled_provider_fence_operation.id,
-        provider_fence_operation.id
-    );
-    assert_eq!(reconciled_provider_fence_operation.state, "completed");
-    assert_eq!(
-        reconciled_provider_fence_operation.expected_project_revision,
-        provider_fence_project.metadata_revision + 1
-    );
-    assert_eq!(
-        std::fs::read_dir(&provider_fence_secret_root)
-            .expect("reconciled provider secret directory should remain readable")
-            .count(),
-        1,
-        "reauthorization must reconcile the original provider secret alias"
-    );
-    assert_eq!(
-        provider_fence_put_calls.load(Ordering::SeqCst),
-        2,
-        "reauthorization should verify the original external secret alias once"
-    );
-
-    (created_project, key_fence_project.id)
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the listenerless import journey preserves its complete inventory, resume, and cutover sequence"
-)]
-async fn verify_listenerless_custody_import(
-    custody_project: ProjectRecord,
-    config: ServerConfig,
-    control: &DatabaseConnection,
-    provisioning: ProvisioningService,
-    signer_store: EncryptedFileStore,
-    secret_store: EncryptedFileStore,
-    secret_root: std::path::PathBuf,
-    software_custody: SoftwareCustodyProvider,
-) {
-    // The listenerless importer resumes from durable operations, verifies legacy plaintext,
-    // attaches every owner/snapshot, and performs the inventory check plus authority switch in
-    // one final transaction.
-    let legacy_import_project = provisioning
-        .get_project(custody_project.id)
-        .await
-        .expect("legacy import Project should remain active");
-    control
-        .execute_raw(Statement::from_string(
-            DbBackend::Postgres,
-            "UPDATE custody_cutover_authority
-            SET mode='legacy',revision=revision+1,legacy_inventory_completed_at=NULL,
-                protected_at=NULL,updated_at=transaction_timestamp()
-          WHERE singleton"
-                .to_owned(),
-        ))
-        .await
-        .expect("legacy upgrade fixture should enter legacy authority");
-    let mut control_only_config = config.clone();
-    control_only_config.mode = PlaneMode::Control;
-    let control_only_pools = DatabasePools {
-        runtime: None,
-        client: None,
-        control: Some(control.clone()),
-    };
-    assert_eq!(
-        validate_provider_readiness(
-            &control_only_config,
-            &control_only_pools,
-            &ProviderRegistrations::new(),
-        )
-        .await,
-        Err(ServerError::ProviderReadiness),
-        "Control-only business serving must remain stopped until custody cutover is protected"
-    );
-
-    let prepared_with_effect_id = Uuid::new_v4();
-    let prepared_without_effect_id = Uuid::new_v4();
-    let prepared_with_effect_alias = "legacy-prepared-effect-12345678";
-    let prepared_without_effect_alias = "legacy-prepared-no-effect-12345678";
-    for (provider_id, provider_key, operation_alias) in [
-        (
-            prepared_with_effect_id,
-            "legacy-prepared-effect",
-            prepared_with_effect_alias,
-        ),
-        (
-            prepared_without_effect_id,
-            "legacy-prepared-no-effect",
-            prepared_without_effect_alias,
-        ),
-    ] {
-        control
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "INSERT INTO provider_configurations
-                 (id,project_id,provider_key,kind,adapter_kind,display_name,issuer,client_id,
-                  callback_url,status,revision)
-                 VALUES ($1,$2,$3,'oidc','oidc',$4,$5,$6,$7,'provisioning',1)",
-                vec![
-                    provider_id.into(),
-                    legacy_import_project.id.into(),
-                    provider_key.into(),
-                    format!("Prepared {provider_key}").into(),
-                    format!("https://{provider_key}.example/").into(),
-                    format!("{provider_key}-client").into(),
-                    format!(
-                        "https://identity.example/runtime/projects/test/auth/callback/{provider_key}"
-                    )
-                    .into(),
-                ],
-            ))
-            .await
-            .expect("legacy prepared provider should insert");
-        control
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "INSERT INTO provider_secret_operations
-                 (id,project_id,provider_id,operation_alias,request_digest,state,
-                  expected_project_revision,expected_provider_revision)
-                 VALUES ($1,$2,$3,$4,$5,'prepared',$6,1)",
-                vec![
-                    Uuid::new_v4().into(),
-                    legacy_import_project.id.into(),
-                    provider_id.into(),
-                    operation_alias.into(),
-                    vec![71_u8; 32].into(),
-                    legacy_import_project.metadata_revision.into(),
-                ],
-            ))
-            .await
-            .expect("legacy prepared provider operation should insert");
-    }
-    let prepared_effect_digest = Sha256::digest(prepared_with_effect_alias.as_bytes());
-    let prepared_effect_reference = format!(
-        "secret_{}_{}",
-        legacy_import_project.id.simple(),
-        URL_SAFE_NO_PAD.encode(&prepared_effect_digest[..16])
-    );
-    ConfigurationSecretProvisioner::provision_if_absent(
-        &secret_store,
-        prepared_effect_reference,
-        zeroize::Zeroizing::new(b"prepared-provider-secret".to_vec()),
-    )
-    .await
-    .expect("legacy prepared provider effect should be written");
-
-    let legacy_provider = provisioning
-        .create_provider(
-            legacy_import_project.id,
-            CreateProvider {
-                kind: ProviderKind::Oidc,
-                provider_key: "legacy-import-provider".to_owned(),
-                display_name: "Legacy import provider".to_owned(),
-                issuer: "https://legacy-import.example/".to_owned(),
-                client_id: "legacy-import-client".to_owned(),
-                client_secret: zeroize::Zeroizing::new("legacy-import-secret".to_owned()),
-                managed_profile_enabled: false,
-                idempotency_key: "legacy-import-provider-12345678".to_owned(),
-                expected_project_revision: legacy_import_project.metadata_revision,
-                egress_policy_revision: Some(1),
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("legacy bridge fixture should write one file-backed provider");
-    let legacy_project_after_provider = provisioning
-        .get_project(legacy_import_project.id)
-        .await
-        .expect("legacy import Project should remain active after provider creation");
-    let legacy_smtp_control = EmailControlService::new(
-        Arc::new(PostgresEmailControlRepository::new(control.clone())),
-        Arc::new(secret_store.clone()),
-        Arc::new(SystemClock),
-        Arc::new(Sha256RequestDigester),
-    );
-    let legacy_smtp = legacy_smtp_control
-        .create_smtp(
-            legacy_import_project.id,
-            CreateSmtpConfiguration {
-                host: "smtp.legacy-import.example".to_owned(),
-                port: 465,
-                tls_mode: SmtpControlTlsMode::ImplicitTls,
-                sender_address: "login@legacy-import.example".to_owned(),
-                sender_name: Some("Legacy importer".to_owned()),
-                reply_to: None,
-                credential: zeroize::Zeroizing::new(
-                    r#"{"username":"legacy","password":"legacy-password"}"#.to_owned(),
-                ),
-                idempotency_key: "legacy-import-smtp-12345678".to_owned(),
-                expected_project_security_revision: legacy_project_after_provider.security_revision,
-                correlation_id: Uuid::new_v4(),
-            },
-        )
-        .await
-        .expect("legacy bridge fixture should write one file-backed SMTP credential");
-    let legacy_smtp_fingerprint = legacy_smtp
-        .safe_fingerprint
-        .expect("legacy SMTP should retain its safe request fingerprint");
-    let legacy_provider_owner = provider_configuration::Entity::find_by_id(legacy_provider.id)
-        .one(control)
-        .await
-        .expect("legacy provider owner query should work")
-        .expect("legacy provider owner should exist");
-    let legacy_reference = legacy_provider_owner
-        .secret_ref
-        .expect("legacy provider should retain its file alias before import");
-
-    // A live legacy ceremony snapshots the same provider alias. Import must atomically make the
-    // protected material live before switching both the provider owner and this historical
-    // interaction to the material ID.
-    let legacy_application_id = Uuid::new_v4();
-    let legacy_user_id = Uuid::new_v4();
-    let legacy_identity_id = Uuid::new_v4();
-    let legacy_connection_id = Uuid::new_v4();
-    let legacy_reauthorization_id = Uuid::new_v4();
-    let legacy_fixture = control
-        .begin()
-        .await
-        .expect("legacy managed reauthorization fixture transaction should begin");
-    legacy_fixture
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO applications (id,project_id,public_id,status,revision)
-             VALUES ($1,$2,'legacy_import_app','active',1)",
-            vec![
-                legacy_application_id.into(),
-                legacy_import_project.id.into(),
-            ],
-        ))
-        .await
-        .expect("legacy import Application should insert");
-    legacy_fixture
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO application_provider_assignments
-                (project_id,application_id,provider_id,status,security_revision)
-             VALUES ($1,$2,$3,'active',1)",
-            vec![
-                legacy_import_project.id.into(),
-                legacy_application_id.into(),
-                legacy_provider.id.into(),
-            ],
-        ))
-        .await
-        .expect("legacy import provider assignment should insert");
-    legacy_fixture
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO project_users
-                (id,project_id,public_id,status,base_profile_digest)
-             VALUES ($1,$2,'legacy_user_01','active',$3)",
-            vec![
-                legacy_user_id.into(),
-                legacy_import_project.id.into(),
-                vec![81_u8; 32].into(),
-            ],
-        ))
-        .await
-        .expect("legacy import user should insert");
-    legacy_fixture
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO linked_identities
-                (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-                 status,identity_revision,observed_at)
-             SELECT $1,$2,$3,$4,provider.issuer,'legacy-import-subject','active',1,
-                    transaction_timestamp()
-               FROM provider_configurations AS provider
-              WHERE provider.id=$4 AND provider.project_id=$2",
-            vec![
-                legacy_identity_id.into(),
-                legacy_import_project.id.into(),
-                legacy_user_id.into(),
-                legacy_provider.id.into(),
-            ],
-        ))
-        .await
-        .expect("legacy import identity should insert");
-    legacy_fixture
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE project_users SET primary_profile_identity_id=$2 WHERE id=$1",
-            vec![legacy_user_id.into(), legacy_identity_id.into()],
-        ))
-        .await
-        .expect("legacy import identity should become the primary provider source");
-    legacy_fixture
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO managed_provider_connections
-                (id,project_id,provider_configuration_id,linked_identity_id,user_id,state,
-                 revision,generation,credential_generation,project_security_revision,
-                 provider_revision,user_security_revision,identity_revision,
-                 managed_profile_revision,adapter_key,adapter_capability_revision,
-                 required_scopes,supports_revocation,last_safe_outcome,created_at,updated_at)
-             SELECT $1,$2,$3,$4,$5,'reauth_required',1,1,1,project.security_revision,
-                    provider.revision,1,1,provider.managed_profile_revision,
-                    'controlled_oidc_profile_v1',1,ARRAY['openid']::text[],true,
-                    'reauth_required',transaction_timestamp(),transaction_timestamp()
-               FROM projects AS project
-               JOIN provider_configurations AS provider
-                 ON provider.project_id=project.id AND provider.id=$3
-              WHERE project.id=$2",
-            vec![
-                legacy_connection_id.into(),
-                legacy_import_project.id.into(),
-                legacy_provider.id.into(),
-                legacy_identity_id.into(),
-                legacy_user_id.into(),
-            ],
-        ))
-        .await
-        .expect("legacy import managed connection should insert");
-    legacy_fixture
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO managed_provider_reauthorization_interactions
-                (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-                 provider_configuration_id,provider_key,provider_display_name,issuer,provider_kind,
-                 subject,client_id,secret_ref,provider_egress_policy_revision,application_id,
-                 expected_connection_generation,expected_credential_generation,
-                 expected_connection_revision,project_security_revision,user_security_revision,
-                 identity_revision,provider_revision,managed_profile_revision,application_revision,
-                 assignment_security_revision,callback_url,adapter_key,
-                 adapter_capability_revision,supports_revocation,required_scopes,
-                 provider_pkce_required,oidc_nonce_required,revision,status,expires_at,created_at)
-             SELECT $1,$2,project.public_id,$3,$4,$5,provider.id,provider.provider_key,
-                    provider.display_name,provider.issuer,'oidc','legacy-import-subject',
-                    provider.client_id,$6,1,$7,1,1,1,project.security_revision,1,1,
-                    provider.revision,provider.managed_profile_revision,application.revision,1,
-                    provider.callback_url,'controlled_oidc_profile_v1',1,true,
-                    ARRAY['openid']::text[],true,true,1,'awaiting_browser_binding',
-                    transaction_timestamp()+INTERVAL '10 minutes',transaction_timestamp()
-               FROM projects AS project
-               JOIN provider_configurations AS provider
-                 ON provider.project_id=project.id AND provider.id=$8
-               JOIN applications AS application
-                 ON application.project_id=project.id AND application.id=$7
-              WHERE project.id=$2",
-            vec![
-                legacy_reauthorization_id.into(),
-                legacy_import_project.id.into(),
-                legacy_connection_id.into(),
-                legacy_identity_id.into(),
-                legacy_user_id.into(),
-                legacy_reference.clone().into(),
-                legacy_application_id.into(),
-                legacy_provider.id.into(),
-            ],
-        ))
-        .await
-        .expect("legacy managed reauthorization snapshot should insert");
-    legacy_fixture
-        .commit()
-        .await
-        .expect("legacy managed reauthorization fixture should commit atomically");
-
-    let legacy_path = secret_root.join(format!("{legacy_reference}.owls"));
-    let interrupted_path = secret_root.join(format!("{legacy_reference}.interrupted"));
-    let importer = PostgresCustodyImporter::new(
-        control.clone(),
-        "test-deployment",
-        signer_store.clone(),
-        secret_store.clone(),
-        software_custody.clone(),
-    )
-    .expect("listenerless importer should compose");
-
-    control
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE project_smtp_configurations SET safe_fingerprint=$2 WHERE id=$1",
-            vec![legacy_smtp.id.into(), vec![99_u8; 32].into()],
-        ))
-        .await
-        .expect("legacy fingerprint mismatch fixture should install");
-    assert_eq!(
-        importer.run().await,
-        Err(ApplicationError::Integrity),
-        "a retained legacy fingerprint mismatch must block cutover"
-    );
-    let mismatched_operation = control
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT state,failure_class,attempt_count FROM custody_import_operations
-              WHERE owner_kind='project_smtp' AND owner_id=$1",
-            vec![legacy_smtp.id.into()],
-        ))
-        .await
-        .expect("mismatched import operation query should work")
-        .expect("mismatched import operation should remain durable");
-    assert_eq!(
-        mismatched_operation
-            .try_get::<String>("", "state")
-            .expect("operation state should decode"),
-        "failed"
-    );
-    assert_eq!(
-        mismatched_operation
-            .try_get::<String>("", "failure_class")
-            .expect("operation failure class should decode"),
-        "mismatch"
-    );
-    control
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE project_smtp_configurations SET safe_fingerprint=$2 WHERE id=$1",
-            vec![
-                legacy_smtp.id.into(),
-                legacy_smtp_fingerprint.to_vec().into(),
-            ],
-        ))
-        .await
-        .expect("legacy fingerprint should restore for resume");
-
-    std::fs::rename(&legacy_path, &interrupted_path)
-        .expect("legacy file should be temporarily unavailable");
-    assert_eq!(
-        importer.run().await,
-        Err(ApplicationError::Integrity),
-        "a missing retained legacy file must block cutover"
-    );
-    let failed_operation = control
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT state,attempt_count FROM custody_import_operations
-              WHERE owner_kind='provider_secret' AND owner_id=$1",
-            vec![legacy_provider.id.into()],
-        ))
-        .await
-        .expect("failed import operation query should work")
-        .expect("failed import operation should remain durable");
-    assert_eq!(
-        failed_operation
-            .try_get::<String>("", "state")
-            .expect("operation state should decode"),
-        "failed"
-    );
-    assert_eq!(
-        failed_operation
-            .try_get::<i32>("", "attempt_count")
-            .expect("operation attempt count should decode"),
-        1
-    );
-    let incomplete_authority = ProtectedMaterialRepository::new(control.clone(), "test-deployment")
-        .expect("custody authority repository should compose")
-        .authority()
-        .await
-        .expect("importing authority should remain readable");
-    assert_eq!(
-        importer.complete_cutover(incomplete_authority).await,
-        Err(ApplicationError::InvalidTransition),
-        "the authority-locking cutover transaction must reject incomplete inventory"
-    );
-    std::fs::rename(&interrupted_path, &legacy_path)
-        .expect("legacy file should be restored for resume");
-    let import_report = importer
-        .run()
-        .await
-        .expect("legacy inventory should resume and import");
-    assert!(import_report.imported >= 1);
-    validate_provider_readiness(
-        &control_only_config,
-        &control_only_pools,
-        &ProviderRegistrations::new(),
-    )
-    .await
-    .expect("Control-only readiness may pass after protected cutover");
-    let resumed_operation = control
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT state,attempt_count FROM custody_import_operations
-              WHERE owner_kind='provider_secret' AND owner_id=$1",
-            vec![legacy_provider.id.into()],
-        ))
-        .await
-        .expect("resumed import operation query should work")
-        .expect("resumed import operation should remain durable");
-    assert_eq!(
-        resumed_operation
-            .try_get::<String>("", "state")
-            .expect("operation state should decode"),
-        "verified"
-    );
-    assert_eq!(
-        resumed_operation
-            .try_get::<i32>("", "attempt_count")
-            .expect("operation attempt count should decode"),
-        2
-    );
-    let imported_provider = provider_configuration::Entity::find_by_id(legacy_provider.id)
-        .one(control)
-        .await
-        .expect("imported provider query should work")
-        .expect("imported provider should remain present");
-    assert!(imported_provider.secret_ref.is_none());
-    assert!(imported_provider.secret_material_id.is_some());
-    let imported_reauthorization = control
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT secret_ref,secret_material_id
-               FROM managed_provider_reauthorization_interactions
-              WHERE id=$1",
-            vec![legacy_reauthorization_id.into()],
-        ))
-        .await
-        .expect("imported managed reauthorization snapshot query should work")
-        .expect("imported managed reauthorization snapshot should remain readable");
-    assert!(
-        imported_reauthorization
-            .try_get::<Option<String>>("", "secret_ref")
-            .expect("legacy secret reference should decode")
-            .is_none()
-    );
-    assert_eq!(
-        imported_reauthorization
-            .try_get::<Option<Uuid>>("", "secret_material_id")
-            .expect("protected secret material ID should decode"),
-        imported_provider.secret_material_id,
-        "legacy interaction and provider must converge on the exact protected material"
-    );
-    let imported_prepared_provider =
-        provider_configuration::Entity::find_by_id(prepared_with_effect_id)
-            .one(control)
-            .await
-            .expect("prepared provider import query should work")
-            .expect("prepared provider with a durable file effect should be retained");
-    assert_eq!(imported_prepared_provider.status, "active");
-    assert_eq!(imported_prepared_provider.revision, 2);
-    assert!(imported_prepared_provider.secret_ref.is_none());
-    assert!(imported_prepared_provider.secret_material_id.is_some());
-    assert!(
-        provider_configuration::Entity::find_by_id(prepared_without_effect_id)
-            .one(control)
-            .await
-            .expect("abandoned prepared provider query should work")
-            .is_none(),
-        "a prepare-stage crash without a file effect should remove the unpublished reservation"
-    );
-    let abandoned_audit = audit_event::Entity::find()
-        .filter(audit_event::Column::ProjectId.eq(legacy_import_project.id))
-        .filter(audit_event::Column::TargetId.eq(prepared_without_effect_id))
-        .filter(audit_event::Column::Action.eq("custody.legacy_provider_abandoned"))
-        .one(control)
-        .await
-        .expect("legacy abandonment audit query should work");
-    assert!(abandoned_audit.is_some());
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the capacity journey compares concurrent creates and prepared-operation replay at each bound"
+    reason = "one bounded journey verifies capacity races and completed replay semantics"
 )]
 async fn verify_capacity_and_replay_limits(control_url: &str) {
     let mut capacity_sql = PgConnection::connect(control_url)
@@ -3325,7 +2014,13 @@ async fn verify_capacity_and_replay_limits(control_url: &str) {
         Vec::new(),
         Duration::from_millis(10),
         Duration::from_secs(1),
-    );
+    )
+    .with_custody(
+        "test-deployment",
+        ProviderId::new("software").expect("capacity custody provider ID"),
+        ProviderFormatVersion::new(1).expect("capacity custody format"),
+    )
+    .expect("capacity adapter should compose with protected custody");
     let left_project_command = CreateProject {
         display_name: "Capacity winner left".to_owned(),
         belongs_to: None,
@@ -3454,171 +2149,6 @@ async fn verify_capacity_and_replay_limits(control_url: &str) {
         first_capacity_application
     );
 
-    let first_provider_command = PrepareProvider {
-        kind: crate::domain::ProviderKind::Oidc,
-        provider_key: "capacity_replay".to_owned(),
-        display_name: "Capacity replay provider".to_owned(),
-        issuer: "https://accounts.example/".to_owned(),
-        client_id: "capacity-client".to_owned(),
-        managed_profile_enabled: false,
-        operation_alias: "provider-capacity-replay-12345678".to_owned(),
-        expected_project_revision: capacity_project.metadata_revision,
-        egress_policy_revision: Some(1),
-        request_digest: vec![31; 32],
-    };
-    let first_capacity_provider = capacity_adapter
-        .prepare_provider(capacity_project.id, first_provider_command.clone())
-        .await
-        .expect("first capacity provider should prepare");
-    let filler_provider_ids = (1..100).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
-    let filler_provider_keys = (1..100)
-        .map(|index| format!("capacity_{index}"))
-        .collect::<Vec<_>>();
-    sqlx::query(
-        "INSERT INTO provider_configurations \
-         (id, project_id, provider_key, kind, display_name, issuer, client_id, \
-          callback_url, secret_ref, status, revision) \
-         SELECT seed.id, $3, seed.provider_key, 'oidc', 'Capacity provider', \
-                'https://accounts.example/', 'capacity-client', \
-                'https://identity.example/runtime/capacity/' || seed.provider_key, \
-                NULL, 'provisioning', 1 \
-         FROM UNNEST($1::uuid[], $2::text[]) AS seed(id, provider_key)",
-    )
-    .bind(&filler_provider_ids)
-    .bind(&filler_provider_keys)
-    .bind(capacity_project.id)
-    .execute(&mut capacity_sql)
-    .await
-    .expect("provider capacity fixtures should insert");
-    assert!(matches!(
-        capacity_adapter
-            .prepare_provider(
-                capacity_project.id,
-                PrepareProvider {
-                    kind: crate::domain::ProviderKind::Oidc,
-                    provider_key: "capacity_overflow".to_owned(),
-                    display_name: "Over capacity".to_owned(),
-                    issuer: "https://accounts.example/".to_owned(),
-                    client_id: "capacity-client".to_owned(),
-                    managed_profile_enabled: false,
-                    operation_alias: "provider-over-capacity-12345678".to_owned(),
-                    expected_project_revision: capacity_project.metadata_revision,
-                    egress_policy_revision: Some(1),
-                    request_digest: vec![32; 32],
-                },
-            )
-            .await,
-        Err(ApplicationError::InvalidInput)
-    ));
-    let replayed_capacity_provider = capacity_adapter
-        .prepare_provider(capacity_project.id, first_provider_command)
-        .await
-        .expect("prepared provider replay must survive full capacity");
-    assert_eq!(
-        replayed_capacity_provider.provider_id,
-        first_capacity_provider.provider_id
-    );
-    assert_eq!(
-        replayed_capacity_provider.operation_id,
-        first_capacity_provider.operation_id
-    );
-
-    let first_capacity_key = capacity_adapter
-        .prepare_signing_key(
-            capacity_project.id,
-            "key-capacity-replay-12345678".to_owned(),
-            "signer-capacity-replay-12345678".to_owned(),
-            capacity_project.metadata_revision,
-            vec![41; 32],
-        )
-        .await
-        .expect("first capacity key should prepare");
-    let filler_key_ids = (1..100).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
-    let filler_kids = filler_key_ids
-        .iter()
-        .map(|id| format!("kid_capacity_{}", id.simple()))
-        .collect::<Vec<_>>();
-    let filler_signer_refs = filler_key_ids
-        .iter()
-        .map(|id| format!("signer_capacity_{}", id.simple()))
-        .collect::<Vec<_>>();
-    sqlx::query(
-        "INSERT INTO project_signing_keys \
-         (id, project_id, ring_id, kid, public_jwk, signer_ref, state, ring_revision) \
-         SELECT seed.id, $4, $5, seed.kid, '{}'::jsonb, seed.signer_ref, \
-                'provisioning', 1 \
-         FROM UNNEST($1::uuid[], $2::text[], $3::text[]) \
-              AS seed(id, kid, signer_ref)",
-    )
-    .bind(&filler_key_ids)
-    .bind(&filler_kids)
-    .bind(&filler_signer_refs)
-    .bind(capacity_project.id)
-    .bind(first_capacity_key.ring_id)
-    .execute(&mut capacity_sql)
-    .await
-    .expect("signing-key capacity fixtures should insert");
-    assert!(matches!(
-        capacity_adapter
-            .prepare_signing_key(
-                capacity_project.id,
-                "key-over-capacity-12345678".to_owned(),
-                "signer-over-capacity-12345678".to_owned(),
-                capacity_project.metadata_revision,
-                vec![42; 32],
-            )
-            .await,
-        Err(ApplicationError::InvalidInput)
-    ));
-    let replayed_capacity_key = capacity_adapter
-        .prepare_signing_key(
-            capacity_project.id,
-            "key-capacity-replay-12345678".to_owned(),
-            "signer-capacity-replay-12345678".to_owned(),
-            capacity_project.metadata_revision,
-            vec![41; 32],
-        )
-        .await
-        .expect("prepared key replay must survive full capacity");
-    assert_eq!(replayed_capacity_key.key_id, first_capacity_key.key_id);
-    assert_eq!(
-        replayed_capacity_key.operation_id,
-        first_capacity_key.operation_id
-    );
-
-    sqlx::query(
-        "UPDATE provider_configurations \
-         SET secret_ref = 'capacity-secret', status = 'active' \
-         WHERE id = ANY($1::uuid[])",
-    )
-    .bind(&filler_provider_ids[..51])
-    .execute(&mut capacity_sql)
-    .await
-    .expect("assignment provider fixtures should activate");
-    sqlx::query(
-        "INSERT INTO application_provider_assignments \
-         (project_id, application_id, provider_id, status, security_revision) \
-         SELECT $2, $3, provider_id, 'active', 1 \
-         FROM UNNEST($1::uuid[]) AS seed(provider_id)",
-    )
-    .bind(&filler_provider_ids[..50])
-    .bind(capacity_project.id)
-    .bind(first_capacity_application.id)
-    .execute(&mut capacity_sql)
-    .await
-    .expect("assignment capacity fixtures should insert");
-    assert_eq!(
-        capacity_adapter
-            .assign_provider(
-                capacity_project.id,
-                filler_provider_ids[50],
-                first_capacity_application.id,
-                first_capacity_application.security_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::InvalidTransition)
-    );
     capacity_sql
         .close()
         .await
@@ -3655,20 +2185,19 @@ async fn verify_provisioning_lock_timeout(
     let subject_alias = operation_alias.clone();
     let project_id = project.id;
     let expected_revision = project.metadata_revision;
+    let mut observer = PgConnection::connect(blocker_url)
+        .await
+        .expect("provisioning lock observer should open before the bounded wait begins");
     let subject = tokio::spawn(async move {
         SigningKeyProvisioningPort::prepare_signing_key(
             adapter.as_ref(),
             project_id,
             subject_alias,
-            "signer-lock-timeout-12345678".to_owned(),
             expected_revision,
             vec![91; 32],
         )
         .await
     });
-    let mut observer = PgConnection::connect(blocker_url)
-        .await
-        .expect("provisioning lock observer should open");
     wait_for_sqlx_backend_blocked_by(&mut observer, blocker_pid, "signing provisioning").await;
     assert!(
         matches!(
@@ -3698,178 +2227,6 @@ async fn verify_provisioning_lock_timeout(
         .close()
         .await
         .expect("provisioning blocker should close");
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the custody authority journey keeps stale-revision and lock-timeout rollback/retry evidence together"
-)]
-async fn verify_terminal_custody_authority_fence(
-    control: &DatabaseConnection,
-    blocker_url: &str,
-    project_id: Uuid,
-) {
-    // Every protected writer reserves under the locked custody authority and finalization
-    // rechecks the exact mode/revision after the external provider effect. A cutover race makes
-    // the losing writer retry instead of committing material under stale authority.
-    let authority_fence = ProtectedMaterialRepository::new(control.clone(), "test-deployment")
-        .expect("custody authority repository");
-    let stale_material_id = Uuid::new_v4();
-    authority_fence
-        .reserve_project(
-            project_id,
-            stale_material_id,
-            MaterialOwnerKind::ProviderSecret,
-            Uuid::new_v4(),
-            1,
-            MaterialKind::ConfigurationSecret,
-            MaterialPurpose::ProviderClientSecret,
-            ProviderId::new("software").expect("provider ID"),
-            ProviderFormatVersion::new(1).expect("format version"),
-        )
-        .await
-        .expect("protected reservation should snapshot authority");
-    control
-        .execute_raw(Statement::from_string(
-            DbBackend::Postgres,
-            "UPDATE custody_cutover_authority
-                SET mode='importing',revision=revision+1,protected_at=NULL,
-                    updated_at=transaction_timestamp()
-              WHERE singleton"
-                .to_owned(),
-        ))
-        .await
-        .expect("simulate an authority revision race");
-    let stale_finalize = control.begin().await.expect("finalize transaction");
-    assert_eq!(
-        finalize_pending_material(
-            &stale_finalize,
-            stale_material_id,
-            Some(project_id),
-            vec![7; 32],
-            Some(vec![8; 32]),
-            time::OffsetDateTime::now_utc(),
-        )
-        .await,
-        Err(ApplicationError::RevisionConflict)
-    );
-    stale_finalize
-        .rollback()
-        .await
-        .expect("stale finalize should roll back");
-    assert_eq!(
-        authority_fence
-            .reserve_project(
-                project_id,
-                Uuid::new_v4(),
-                MaterialOwnerKind::ProviderSecret,
-                Uuid::new_v4(),
-                1,
-                MaterialKind::ConfigurationSecret,
-                MaterialPurpose::ProviderClientSecret,
-                ProviderId::new("software").expect("provider ID"),
-                ProviderFormatVersion::new(1).expect("format version"),
-            )
-            .await,
-        Err(ApplicationError::Disabled)
-    );
-
-    control
-        .execute_raw(Statement::from_string(
-            DbBackend::Postgres,
-            "UPDATE custody_cutover_authority
-                SET mode='protected',revision=revision+1,
-                    legacy_inventory_completed_at=COALESCE(
-                        legacy_inventory_completed_at,transaction_timestamp()
-                    ),
-                    protected_at=COALESCE(protected_at,transaction_timestamp()),
-                    updated_at=transaction_timestamp()
-              WHERE singleton"
-                .to_owned(),
-        ))
-        .await
-        .expect("restore protected custody mode for contention retry");
-    let mut blocker = PgConnection::connect(blocker_url)
-        .await
-        .expect("independent custody blocker should open");
-    sqlx::query("BEGIN")
-        .execute(&mut blocker)
-        .await
-        .expect("custody blocker should begin");
-    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut blocker)
-        .await
-        .expect("custody blocker backend ID should be readable");
-    sqlx::query("SELECT revision FROM custody_cutover_authority WHERE singleton FOR UPDATE")
-        .execute(&mut blocker)
-        .await
-        .expect("custody blocker should own authority row");
-    let retry_material_id = Uuid::new_v4();
-    let retry_owner_id = Uuid::new_v4();
-    let subject_authority = authority_fence.clone();
-    let subject = tokio::spawn(async move {
-        subject_authority
-            .reserve_project(
-                project_id,
-                retry_material_id,
-                MaterialOwnerKind::ProviderSecret,
-                retry_owner_id,
-                1,
-                MaterialKind::ConfigurationSecret,
-                MaterialPurpose::ProviderClientSecret,
-                ProviderId::new("software").expect("provider ID"),
-                ProviderFormatVersion::new(1).expect("format version"),
-            )
-            .await
-    });
-    let mut observer = PgConnection::connect(blocker_url)
-        .await
-        .expect("custody lock observer should open");
-    wait_for_sqlx_backend_blocked_by(&mut observer, blocker_pid, "custody authority reservation")
-        .await;
-    assert_eq!(
-        subject.await.expect("custody subject task should join"),
-        Err(ApplicationError::Persistence),
-        "database lock timeout must roll back without implicit replay"
-    );
-    assert!(
-        protected_material::Entity::find_by_id(retry_material_id)
-            .one(control)
-            .await
-            .expect("timed-out custody reservation should be queryable")
-            .is_none()
-    );
-    observer
-        .close()
-        .await
-        .expect("custody observer should close");
-    sqlx::query("ROLLBACK")
-        .execute(&mut blocker)
-        .await
-        .expect("custody blocker should release");
-    blocker.close().await.expect("custody blocker should close");
-    authority_fence
-        .reserve_project(
-            project_id,
-            retry_material_id,
-            MaterialOwnerKind::ProviderSecret,
-            retry_owner_id,
-            1,
-            MaterialKind::ConfigurationSecret,
-            MaterialPurpose::ProviderClientSecret,
-            ProviderId::new("software").expect("provider ID"),
-            ProviderFormatVersion::new(1).expect("format version"),
-        )
-        .await
-        .expect("explicit custody retry should reserve exactly once");
-    authority_fence
-        .erase_project(
-            project_id,
-            retry_material_id,
-            time::OffsetDateTime::now_utc(),
-        )
-        .await
-        .expect("retry fixture should become an erased tombstone");
 }
 
 #[allow(
@@ -4171,7 +2528,7 @@ async fn verify_pools_unit_of_work_and_egress(config: &ServerConfig) -> Database
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the migration journey keeps lock, ownership, history, and compatibility checks together"
+    reason = "the migration journey keeps lock, ownership, and history checks together"
 )]
 async fn migrate_and_verify_main_database(
     admin_url: &str,
@@ -4260,7 +2617,6 @@ async fn migrate_and_verify_main_database(
         "SELECT conname, pg_get_constraintdef(oid) \
          FROM pg_constraint \
          WHERE conname IN (\
-             'provider_configurations_named_adapter_check', \
              'managed_reauthorization_provider_kind_check', \
              'linked_identities_github_numeric_subject_check'\
          ) ORDER BY conname",
@@ -4268,13 +2624,7 @@ async fn migrate_and_verify_main_database(
     .fetch_all(&mut ownership_connection)
     .await
     .expect("provider-kind constraints should be queryable");
-    assert_eq!(provider_constraints.len(), 3);
-    assert!(provider_constraints.iter().any(|(name, definition)| {
-        name == "provider_configurations_named_adapter_check"
-            && definition.contains("accounts.google.com")
-            && definition.contains("github.com")
-            && definition.contains("NOT managed_profile_enabled")
-    }));
+    assert_eq!(provider_constraints.len(), 2);
     assert!(provider_constraints.iter().any(|(name, definition)| {
         name == "managed_reauthorization_provider_kind_check"
             && definition.contains("'oidc'::text")
@@ -4295,406 +2645,45 @@ async fn migrate_and_verify_main_database(
         .await
         .expect("exact serving history should verify without DDL");
 
-    let mut compatibility_connection = PgConnection::connect(admin_url)
+    let mut history_connection = PgConnection::connect(admin_url)
         .await
-        .expect("compatibility test connection should open");
+        .expect("history strictness test connection should open");
     sqlx::query(
         "INSERT INTO _sqlx_migrations
              (version,description,success,checksum,execution_time)
-         VALUES ($1,'synthetic additive forward migration',TRUE,$2,1)",
+         VALUES ($1,'synthetic unexpected migration',TRUE,$2,1)",
     )
-    .bind(20_260_806_000_000_i64)
+    .bind(20_260_806_999_999_i64)
     .bind(vec![73_u8; 48])
-    .execute(&mut compatibility_connection)
+    .execute(&mut history_connection)
     .await
-    .expect("synthetic forward history should insert");
-    verify_url(admin_url, Duration::from_secs(5))
-        .await
-        .expect("baseline binary should accept its own compatibility floor");
-    sqlx::query("UPDATE schema_compatibility SET minimum_binary_schema_level=$1 WHERE singleton")
-        .bind(20_260_805_140_001_i64)
-        .execute(&mut compatibility_connection)
-        .await
-        .expect("newer compatibility floor should install");
+    .expect("synthetic unexpected history should insert");
     assert_eq!(
         verify_url(admin_url, Duration::from_secs(5))
             .await
-            .expect_err("newer compatibility floor must reject the baseline binary"),
+            .expect_err("any unexpected migration must reject this binary"),
         SchemaError::IncompatibleHistory
     );
-    sqlx::query("UPDATE schema_compatibility SET minimum_binary_schema_level=$1 WHERE singleton")
-        .bind(20_260_805_140_000_i64)
-        .execute(&mut compatibility_connection)
-        .await
-        .expect("current compatibility floor should restore");
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version=$1")
-        .bind(20_260_806_000_000_i64)
-        .execute(&mut compatibility_connection)
+        .bind(20_260_806_999_999_i64)
+        .execute(&mut history_connection)
         .await
-        .expect("synthetic forward history should clean up");
-    compatibility_connection
+        .expect("synthetic unexpected history should clean up");
+    history_connection
         .close()
         .await
-        .expect("compatibility test connection should close");
+        .expect("history strictness test connection should close");
 
     config
 }
 
-async fn apply_custody_migrations_direct(connection: &mut PgConnection) {
-    for migration in [
-        include_str!("../../../migrations/20260804000000_key_provider_custody.sql"),
-        include_str!("../../../migrations/20260804010000_signing_custody_expansion.sql"),
-        include_str!("../../../migrations/20260804020000_provider_custody_expansion.sql"),
-        include_str!("../../../migrations/20260804030000_smtp_custody_expansion.sql"),
-        include_str!("../../../migrations/20260804040000_webhook_custody_expansion.sql"),
-        include_str!("../../../migrations/20260804050000_key_custody_backfill.sql"),
-        include_str!("../../../migrations/20260804060000_identity_material_snapshot_backfill.sql"),
-        include_str!("../../../migrations/20260804070000_managed_material_snapshot_backfill.sql"),
-        include_str!("../../../migrations/20260804080000_deployment_smtp_owner_backfill.sql"),
-        include_str!("../../../migrations/20260804090000_key_recovery_index.sql"),
-        include_str!("../../../migrations/20260804100000_deployment_smtp_owner_index.sql"),
-        include_str!("../../../migrations/20260804110000_webhook_generation_material_index.sql"),
-        include_str!("../../../migrations/20260804120000_webhook_cleanup_material_index.sql"),
-        include_str!("../../../migrations/20260804130000_webhook_reservation_material_index.sql"),
-        include_str!("../../../migrations/20260804140000_custody_unique_constraints.sql"),
-        include_str!("../../../migrations/20260804150000_validate_signing_provider_custody.sql"),
-        include_str!("../../../migrations/20260804160000_validate_smtp_custody.sql"),
-        include_str!("../../../migrations/20260804170000_validate_webhook_custody.sql"),
-        include_str!("../../../migrations/20260804180000_deployment_smtp_owner_not_null.sql"),
-        include_str!("../../../migrations/20260804190000_protected_material_integrity.sql"),
-    ] {
-        sqlx::raw_sql(migration)
-            .execute(&mut *connection)
-            .await
-            .expect("ordered custody migration should install");
-    }
-}
-
-async fn apply_provider_authority_migrations_direct(connection: &mut PgConnection) {
-    for migration in [
-        include_str!("../../../migrations/20260805000000_provider_onboarding.sql"),
-        include_str!("../../../migrations/20260805010000_provider_policy_revision.sql"),
-        include_str!("../../../migrations/20260805020000_provider_secret_policy_revision.sql"),
-        include_str!("../../../migrations/20260805030000_identity_policy_revision.sql"),
-        include_str!(
-            "../../../migrations/20260805040000_managed_reauthorization_policy_revision.sql"
-        ),
-        include_str!("../../../migrations/20260805050000_managed_renewal_policy_revision.sql"),
-        include_str!("../../../migrations/20260805060000_login_method_provider_columns.sql"),
-        include_str!("../../../migrations/20260805070000_validate_provider_authority.sql"),
-        include_str!("../../../migrations/20260805080000_provider_custom_policy_index.sql"),
-        include_str!("../../../migrations/20260805090000_provider_authority_functions.sql"),
-        include_str!("../../../migrations/20260805100000_login_method_provider_contract.sql"),
-    ] {
-        sqlx::raw_sql(migration)
-            .execute(&mut *connection)
-            .await
-            .expect("ordered provider-authority migration should install");
-    }
-}
-
 #[allow(
     clippy::too_many_lines,
-    reason = "the legacy upgrade journey preserves the ordered partial migrations and bridge assertions"
-)]
-async fn verify_legacy_upgrade_journey(crash_window_url: &str) {
-    let mut crash_window = PgConnection::connect(crash_window_url)
-        .await
-        .expect("crash-window migration connection should open");
-    sqlx::raw_sql(include_str!(
-        "../../../migrations/20260803000000_initial.sql"
-    ))
-    .execute(&mut crash_window)
-    .await
-    .expect("pre-TS-003 schema should install");
-    let crash_project_id = Uuid::new_v4();
-    let crash_provider_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO projects
-         (id,public_id,status,metadata_revision,security_revision)
-         VALUES ($1,'project_crash_window','active',1,1)",
-    )
-    .bind(crash_project_id)
-    .execute(&mut crash_window)
-    .await
-    .expect("pre-TS-003 crash Project should insert");
-    sqlx::query(
-        "INSERT INTO provider_configurations
-         (id,project_id,provider_key,kind,adapter_kind,display_name,issuer,client_id,
-          callback_url,status,revision)
-         VALUES ($1,$2,'crash-window','oidc','oidc','Crash window',
-                 'https://crash-window.example/','crash-client',
-                 'https://identity.example/runtime/projects/crash/auth/callback/crash-window',
-                 'provisioning',1)",
-    )
-    .bind(crash_provider_id)
-    .bind(crash_project_id)
-    .execute(&mut crash_window)
-    .await
-    .expect("pre-TS-003 provisioning provider should insert");
-    sqlx::query(
-        "INSERT INTO provider_secret_operations
-         (id,project_id,provider_id,operation_alias,request_digest,state,
-          expected_project_revision,expected_provider_revision)
-         VALUES ($1,$2,$3,'crash-window-operation-12345678',$4,'prepared',1,1)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(crash_project_id)
-    .bind(crash_provider_id)
-    .bind(vec![44_u8; 32])
-    .execute(&mut crash_window)
-    .await
-    .expect("pre-TS-003 prepared provider operation should insert");
-    apply_custody_migrations_direct(&mut crash_window).await;
-    let crash_authority: String =
-        sqlx::query_scalar("SELECT mode FROM custody_cutover_authority WHERE singleton")
-            .fetch_one(&mut crash_window)
-            .await
-            .expect("crash-window custody authority should exist");
-    assert_eq!(
-        crash_authority, "legacy",
-        "a prepared provider operation is authoritative legacy inventory even before its file effect"
-    );
-    let crash_google_provider_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO provider_configurations
-         (id,project_id,provider_key,kind,adapter_kind,display_name,issuer,client_id,
-          callback_url,status,revision)
-         VALUES ($1,$2,'google','oidc','google','Google',
-                 'https://accounts.google.com','google-client',
-                 'https://identity.example/runtime/projects/crash/auth/callback/google',
-                 'provisioning',1)",
-    )
-    .bind(crash_google_provider_id)
-    .bind(crash_project_id)
-    .execute(&mut crash_window)
-    .await
-    .expect("pre-Block-F named provider should insert");
-    let legacy_reserved_google_id = Uuid::new_v4();
-    let legacy_reserved_github_id = Uuid::new_v4();
-    sqlx::query("ALTER TABLE provider_configurations ALTER COLUMN adapter_kind DROP NOT NULL")
-        .execute(&mut crash_window)
-        .await
-        .expect("simulate supported pre-discriminator provider inventory");
-    sqlx::query("SET session_replication_role='replica'")
-        .execute(&mut crash_window)
-        .await
-        .expect("disable current compatibility trigger for legacy NULL fixture");
-    for (id, key, issuer) in [
-        (
-            legacy_reserved_google_id,
-            "legacy-google-root",
-            crate::domain::GOOGLE_ISSUER,
-        ),
-        (
-            legacy_reserved_github_id,
-            "legacy-github-root",
-            crate::domain::GITHUB_ISSUER,
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO provider_configurations
-             (id,project_id,provider_key,kind,adapter_kind,display_name,issuer,client_id,
-              callback_url,status,revision)
-             VALUES ($1,$2,$3,'oidc',NULL,'Legacy reserved root',$4,'legacy-client',
-                     'https://identity.example/runtime/projects/crash/auth/callback/legacy',
-                     'provisioning',1)",
-        )
-        .bind(id)
-        .bind(crash_project_id)
-        .bind(key)
-        .bind(issuer)
-        .execute(&mut crash_window)
-        .await
-        .expect("pre-discriminator reserved-root provider should insert");
-    }
-    sqlx::query("SET session_replication_role='origin'")
-        .execute(&mut crash_window)
-        .await
-        .expect("restore compatibility trigger after legacy NULL fixture");
-    apply_provider_authority_migrations_direct(&mut crash_window).await;
-    let crash_database = Database::connect(crash_window_url)
-        .await
-        .expect("legacy bridge SeaORM connection should open");
-    let crash_egress = PostgresProviderEgressPolicyRepository::new(crash_database.clone());
-    assert!(
-        crash_egress
-            .legacy_provider_policy_bridge_pending()
-            .await
-            .expect("legacy bridge authority should be readable")
-    );
-    assert_eq!(
-        crash_egress
-            .bridge_legacy_provider_policy(
-                ProviderEgressPolicy::new(ProviderEgressMode::AllowAll, Vec::new(), false)
-                    .expect("allow-all policy should be valid"),
-            )
-            .await
-            .expect_err("legacy bridge must require explicit legacy origins"),
-        ApplicationError::InvalidInput
-    );
-    let legacy_policy = ProviderEgressPolicy::new(
-        ProviderEgressMode::ExactOrigins,
-        vec!["https://legacy-provider.example".to_owned()],
-        false,
-    )
-    .expect("legacy exact-origin input should be valid");
-    crash_egress
-        .bridge_legacy_provider_policy(legacy_policy.clone())
-        .await
-        .expect("legacy Project authority should bridge");
-    assert!(
-        !crash_egress
-            .legacy_provider_policy_bridge_pending()
-            .await
-            .expect("completed bridge authority should be readable")
-    );
-    let bridged_policy = crash_egress
-        .get_provider_egress_policy(crash_project_id)
-        .await
-        .expect("legacy Project should receive exact-origin authority");
-    assert_eq!(bridged_policy.mode, ProviderEgressMode::ExactOrigins);
-    assert_eq!(
-        bridged_policy.exact_origins,
-        ["https://legacy-provider.example".to_owned()]
-    );
-    assert_eq!(bridged_policy.revision, 1);
-    let bridged_operation_revision: Option<i64> = sqlx::query_scalar(
-        "SELECT egress_policy_revision FROM provider_secret_operations
-          WHERE project_id=$1 AND provider_id=$2",
-    )
-    .bind(crash_project_id)
-    .bind(crash_provider_id)
-    .fetch_one(&mut crash_window)
-    .await
-    .expect("prepared provider operation authority should be queryable");
-    assert_eq!(bridged_operation_revision, Some(1));
-    let recovery = PostgresProvisioningAdapter::new(
-        crash_database.clone(),
-        url::Url::parse("https://identity.example/runtime/").expect("recovery Runtime base"),
-        Vec::new(),
-        Duration::from_secs(1),
-        Duration::from_mins(5),
-    )
-    .provider_recovery(crash_project_id, crash_provider_id)
-    .await
-    .expect("bridged prepared Custom OIDC operation should be recoverable");
-    assert_eq!(recovery.kind, ProviderKind::Oidc);
-    assert_eq!(recovery.egress_policy_revision, Some(1));
-    let bridged_provider_revisions: Vec<(Uuid, Option<String>, Option<i64>)> = sqlx::query_as(
-        "SELECT id,adapter_kind,onboarding_policy_revision
-           FROM provider_configurations WHERE project_id=$1 ORDER BY id",
-    )
-    .bind(crash_project_id)
-    .fetch_all(&mut crash_window)
-    .await
-    .expect("bridged provider authority should be queryable");
-    assert!(
-        bridged_provider_revisions
-            .iter()
-            .any(|(id, kind, revision)| {
-                *id == crash_provider_id && kind.as_deref() == Some("oidc") && *revision == Some(1)
-            })
-    );
-    assert!(
-        bridged_provider_revisions
-            .iter()
-            .any(|(id, kind, revision)| {
-                *id == crash_google_provider_id
-                    && kind.as_deref() == Some("google")
-                    && revision.is_none()
-            })
-    );
-    for reserved_id in [legacy_reserved_google_id, legacy_reserved_github_id] {
-        let (_, adapter_kind, revision) = bridged_provider_revisions
-            .iter()
-            .find(|(id, _, _)| *id == reserved_id)
-            .expect("legacy reserved-root provider should remain inventoried");
-        assert!(adapter_kind.is_none());
-        assert!(revision.is_none());
-    }
-    assert_eq!(
-        super::provider_row::effective_provider_kind("oidc", None, crate::domain::GOOGLE_ISSUER,),
-        Err(ApplicationError::Integrity)
-    );
-    for reserved_id in [legacy_reserved_google_id, legacy_reserved_github_id] {
-        sqlx::query(
-            "UPDATE provider_configurations
-                SET managed_profile_enabled=managed_profile_enabled
-              WHERE project_id=$1 AND id=$2",
-        )
-        .bind(crash_project_id)
-        .bind(reserved_id)
-        .execute(&mut crash_window)
-        .await
-        .expect("unrelated update must preserve unavailable legacy adapter authority");
-        let adapter_kind: Option<String> = sqlx::query_scalar(
-            "SELECT adapter_kind FROM provider_configurations
-              WHERE project_id=$1 AND id=$2",
-        )
-        .bind(crash_project_id)
-        .bind(reserved_id)
-        .fetch_one(&mut crash_window)
-        .await
-        .expect("post-update legacy adapter authority should be readable");
-        assert!(adapter_kind.is_none());
-    }
-    sqlx::query(
-        "ALTER TABLE managed_provider_reauthorization_interactions
-         DISABLE TRIGGER managed_reauthorization_capture_original_authority",
-    )
-    .execute(&mut crash_window)
-    .await
-    .expect("isolate provider-kind compatibility trigger");
-    let managed_reauthorization_error = sqlx::query(
-        "INSERT INTO managed_provider_reauthorization_interactions
-            (id,project_id,provider_configuration_id)
-         VALUES ($1,$2,$3)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(crash_project_id)
-    .bind(legacy_reserved_google_id)
-    .execute(&mut crash_window)
-    .await
-    .expect_err("legacy reserved-root provider must not acquire managed authority");
-    sqlx::query(
-        "ALTER TABLE managed_provider_reauthorization_interactions
-         ENABLE TRIGGER managed_reauthorization_capture_original_authority",
-    )
-    .execute(&mut crash_window)
-    .await
-    .expect("restore managed reauthorization authority trigger");
-    let sqlx::Error::Database(managed_reauthorization_error) = managed_reauthorization_error else {
-        panic!("managed reauthorization rejection must be a database constraint error");
-    };
-    assert_eq!(
-        managed_reauthorization_error.code().as_deref(),
-        Some("23514")
-    );
-    assert_eq!(
-        managed_reauthorization_error.message(),
-        "provider does not support managed reauthorization"
-    );
-    crash_egress
-        .bridge_legacy_provider_policy(legacy_policy)
-        .await
-        .expect("completed bridge replay should be idempotent");
-    crash_database
-        .close()
-        .await
-        .expect("legacy bridge SeaORM connection should close");
-    crash_window
-        .close()
-        .await
-        .expect("crash-window migration connection should close");
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the Client journey keeps PostgreSQL lock evidence, one-time credentials, pagination, telemetry, and listener isolation together"
+    reason = "the PostgreSQL client-key and listener capability journey is intentionally end-to-end"
 )]
 async fn verify_client_key_and_listener_journeys(
     project: &ProjectRecord,
+    client_provider_id: Uuid,
     config: &ServerConfig,
     pools: &DatabasePools,
     admin_url: &str,
@@ -4985,21 +2974,7 @@ async fn verify_client_key_and_listener_journeys(
     .execute(&mut graph)
     .await
     .expect("Client directory Application should insert");
-    let client_provider_id = Uuid::new_v4();
     let client_identity_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO provider_configurations(
-             id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
-             secret_ref,status,revision)
-         VALUES($1,$2,'oidc-client-directory','oidc','Client directory provider',
-                'https://client-directory.example.test','client-directory',
-                'https://runtime.example.test/callback','client_directory_secret','active',1)",
-    )
-    .bind(client_provider_id)
-    .bind(project.id)
-    .execute(&mut graph)
-    .await
-    .expect("Client directory provider should insert");
     sqlx::query("BEGIN")
         .execute(&mut graph)
         .await
@@ -5017,18 +2992,23 @@ async fn verify_client_key_and_listener_journeys(
     .execute(&mut graph)
     .await
     .expect("Client directory user should insert");
+    let client_source_profile_digest =
+        session_authority::base_profile_digest(Some("Client User"), None, None, None)
+            .expect("Client directory source profile should canonicalize");
     sqlx::query(
         "INSERT INTO linked_identities(
              id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,display_name,observed_at,created_at,updated_at)
+             status,identity_revision,display_name,source_profile_digest,
+             observed_at,created_at,updated_at)
          VALUES($1,$2,$3,$4,'https://client-directory.example.test','client-user-subject',
-                'active',1,'Client User',transaction_timestamp(),transaction_timestamp(),
+                'active',1,'Client User',$5,transaction_timestamp(),transaction_timestamp(),
                 transaction_timestamp())",
     )
     .bind(client_identity_id)
     .bind(project.id)
     .bind(client_user_id)
     .bind(client_provider_id)
+    .bind(client_source_profile_digest)
     .execute(&mut graph)
     .await
     .expect("Client directory identity should insert");
@@ -5118,14 +3098,14 @@ async fn verify_client_key_and_listener_journeys(
         .expect("Client directory user query")
         .expect("Client directory user exists");
     let (projection_document, projection_digest) =
-        super::projection::projection_material(&user, 13, 1, 1)
+        super::projection::projection_material(&user, 13)
             .expect("Client directory projection should materialize");
     sqlx::query(
         "INSERT INTO application_user_projections(
              id,project_id,binding_id,application_id,user_id,schema_name,projection_revision,
-             source_user_revision,project_policy_revision,application_policy_revision,
-             canonical_digest,source_base_profile_digest,document,created_at,updated_at)
-         VALUES($1,$2,$3,$4,$5,'owlauth.user.v1',13,7,1,1,$6,$7,$8,$9,$9 + interval '5 minutes')",
+             source_user_revision,canonical_digest,source_base_profile_digest,document,
+             created_at,updated_at)
+         VALUES($1,$2,$3,$4,$5,'owlauth.user.v1',13,7,$6,$7,$8,$9,$9 + interval '5 minutes')",
     )
     .bind(client_projection_id)
     .bind(project.id)
@@ -5303,6 +3283,13 @@ async fn verify_client_key_and_listener_journeys(
         .map(|index| format!("usr_page_{index:03}"))
         .collect::<Vec<_>>();
     let page_identity_ids = (0..101).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+    let page_source_profile_digests = page_user_public_ids
+        .iter()
+        .map(|public_id| {
+            session_authority::base_profile_digest(Some(public_id.as_str()), None, None, None)
+                .expect("Client pagination source profile should canonicalize")
+        })
+        .collect::<Vec<_>>();
     let mut page_fixture = PgConnection::connect(admin_url)
         .await
         .expect("Client pagination fixture should connect");
@@ -5328,19 +3315,20 @@ async fn verify_client_key_and_listener_journeys(
     sqlx::query(
         "INSERT INTO linked_identities(
              id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-             status,identity_revision,display_name,observed_at,created_at,updated_at)
+             status,identity_revision,source_profile_digest,display_name,observed_at,created_at,updated_at)
          SELECT seed.identity_id,$4,seed.user_id,$5,
                 'https://client-directory.example.test',seed.public_id || '-subject',
-                'active',1,seed.public_id,transaction_timestamp(),transaction_timestamp(),
-                transaction_timestamp()
-           FROM UNNEST($1::uuid[],$2::uuid[],$3::text[])
-                AS seed(identity_id,user_id,public_id)",
+                'active',1,seed.source_profile_digest,seed.public_id,
+                transaction_timestamp(),transaction_timestamp(),transaction_timestamp()
+           FROM UNNEST($1::uuid[],$2::uuid[],$3::text[],$6::bytea[])
+                AS seed(identity_id,user_id,public_id,source_profile_digest)",
     )
     .bind(&page_identity_ids)
     .bind(&page_user_ids)
     .bind(&page_user_public_ids)
     .bind(project.id)
     .bind(client_provider_id)
+    .bind(&page_source_profile_digests)
     .execute(&mut page_fixture)
     .await
     .expect("Client pagination identities should insert");
@@ -5693,19 +3681,6 @@ async fn postgres_capability_journeys_are_real() {
             .await
             .expect("owner and serving-role setup should succeed");
     }
-    sqlx::query("CREATE DATABASE owlauth_crash_window")
-        .execute(&mut owner_setup)
-        .await
-        .expect("crash-window migration database should be created");
-    owner_setup
-        .close()
-        .await
-        .expect("owner setup connection should close");
-
-    let crash_window_url =
-        format!("postgres://owlauth:owlauth_test@{host}:{port}/owlauth_crash_window");
-    verify_legacy_upgrade_journey(&crash_window_url).await;
-
     let runtime_url = format!("postgres://owlauth_runtime:runtime_test@{host}:{port}/owlauth_test");
     let control_url = format!("postgres://owlauth_control:control_test@{host}:{port}/owlauth_test");
     let config = migrate_and_verify_main_database(&url, &runtime_url, &control_url).await;
@@ -5714,13 +3689,49 @@ async fn postgres_capability_journeys_are_real() {
     let runtime = pools.runtime.as_ref().expect("Runtime pool should exist");
     let control = pools.control.as_ref().expect("Control pool should exist");
 
-    let store_root = env::temp_dir().join(format!("owlauth-provisioning-test-{}", Uuid::new_v4()));
-    let signer_root = store_root.join("signers");
-    let secret_root = store_root.join("secrets");
-    let signer_store = EncryptedFileStore::new(signer_root.clone(), [11; 32]).unwrap();
-    let secret_store = EncryptedFileStore::new(secret_root.clone(), [12; 32]).unwrap();
-    let provisioning = ProvisioningService::new(
-        Arc::new(PostgresProvisioningAdapter::new(
+    let invalid_pending_owner = control
+        .begin()
+        .await
+        .expect("pending-owner integrity transaction should begin");
+    invalid_pending_owner
+        .execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "INSERT INTO projects(
+                 id,public_id,status,metadata_revision,security_revision,display_name)
+             VALUES(
+                 '10000000-0000-0000-0000-000000000001',
+                 'pending_owner_integrity_probe','active',1,1,'Pending owner probe')"
+                .to_owned(),
+        ))
+        .await
+        .expect("pending-owner probe Project should insert");
+    invalid_pending_owner
+        .execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "INSERT INTO protected_materials(
+                 id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,state)
+             VALUES(
+                 '10000000-0000-0000-0000-000000000002','project',
+                 '10000000-0000-0000-0000-000000000001','provider_secret',
+                 '10000000-0000-0000-0000-000000000003',1,'configuration_secret',
+                 'software',1,1,decode(repeat('00',32),'hex'),'pending')"
+                .to_owned(),
+        ))
+        .await
+        .expect("the deferred trigger should allow statement-local owner ordering");
+    assert!(
+        invalid_pending_owner.commit().await.is_err(),
+        "a committed pending material must reference its exact typed owner tuple"
+    );
+
+    let custody_provider_id =
+        ProviderId::new("software").expect("software provider ID should parse");
+    let custody_format = ProviderFormatVersion::new(1).expect("software format should be non-zero");
+    let software_custody = SoftwareCustodyProvider::new(custody_provider_id.clone(), [31; 32])
+        .expect("software custody should initialize");
+    let custody_adapter = Arc::new(
+        PostgresProvisioningAdapter::new(
             control.clone(),
             url::Url::parse("https://identity.example/runtime/").unwrap(),
             vec![
@@ -5729,14 +3740,28 @@ async fn postgres_capability_journeys_are_real() {
             ],
             Duration::from_millis(10),
             Duration::from_secs(1),
-        )),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+        )
+        .with_custody(
+            "test-deployment",
+            custody_provider_id.clone(),
+            custody_format,
+        )
+        .expect("custody adapter should compose"),
+    );
+    let provisioning = ProvisioningService::new(
+        custody_adapter.clone(),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::from([(
+                custody_provider_id.clone(),
+                Arc::new(software_custody.clone()) as Arc<dyn SigningKeyProvisioner>,
+            )]),
+            BTreeMap::from([(
+                custody_provider_id.clone(),
+                Arc::new(software_custody.clone()) as Arc<dyn ConfigurationSecretSealer>,
+            )]),
         ),
     );
     runtime
@@ -5808,7 +3833,8 @@ async fn postgres_capability_journeys_are_real() {
         .expect("same idempotent Project request should replay");
     assert_eq!(created_project, replayed_project);
 
-    let custody_project = provisioning
+    let custody_provisioning = provisioning.clone();
+    let custody_project = custody_provisioning
         .create_project(
             CreateProject {
                 display_name: "Protected custody project".to_owned(),
@@ -5818,232 +3844,9 @@ async fn postgres_capability_journeys_are_real() {
             Uuid::new_v4(),
         )
         .await
-        .expect("custody Project creation should commit");
-    let custody_provider_id =
-        ProviderId::new("software").expect("software provider ID should parse");
-    let custody_format = ProviderFormatVersion::new(1).expect("software format should be non-zero");
-    let software_custody = SoftwareCustodyProvider::new(custody_provider_id.clone(), [31; 32])
-        .expect("software custody should initialize");
-    let custody_adapter = Arc::new(
-        PostgresProvisioningAdapter::new(
-            control.clone(),
-            url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec!["runtime-test-process".to_owned()],
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )
-        .with_custody(
-            "test-deployment",
-            custody_provider_id.clone(),
-            custody_format,
-        )
-        .expect("custody adapter should compose"),
-    );
+        .expect("custody Project creation should atomically reserve its initial signing key");
     verify_provisioning_lock_timeout(custody_adapter.clone(), control, &url, &custody_project)
         .await;
-    let custody_provisioning = ProvisioningService::new(
-        custody_adapter.clone(),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            false,
-        )
-        .with_signing_provisioner(software_custody.clone())
-        .with_secret_sealer(software_custody.clone()),
-    );
-    let material_repository = ProtectedMaterialRepository::new(control.clone(), "test-deployment")
-        .expect("material repository should compose");
-    let inventory_before_pending = material_repository
-        .material_inventory_revision()
-        .await
-        .expect("material inventory revision should be readable");
-    let pending_secret_material_id = Uuid::new_v4();
-    material_repository
-        .reserve_project(
-            custody_project.id,
-            pending_secret_material_id,
-            MaterialOwnerKind::ProviderSecret,
-            Uuid::new_v4(),
-            1,
-            MaterialKind::ConfigurationSecret,
-            MaterialPurpose::ProviderClientSecret,
-            custody_provider_id.clone(),
-            custody_format,
-        )
-        .await
-        .expect("pending configuration-secret material should reserve");
-    let inventory_after_reserve = material_repository
-        .material_inventory_revision()
-        .await
-        .expect("reserved inventory revision should be readable");
-    assert!(inventory_after_reserve > inventory_before_pending);
-    material_repository
-        .erase_project(
-            custody_project.id,
-            pending_secret_material_id,
-            time::OffsetDateTime::now_utc(),
-        )
-        .await
-        .expect("a never-finalized secret reservation should become an erased tombstone");
-    let erased_pending_secret = protected_material::Entity::find_by_id(pending_secret_material_id)
-        .one(control)
-        .await
-        .expect("erased pending-secret query should work")
-        .expect("erased pending-secret tombstone should remain");
-    assert_eq!(erased_pending_secret.state, "erased");
-    assert!(erased_pending_secret.safe_fingerprint.is_none());
-    assert!(
-        material_repository
-            .material_inventory_revision()
-            .await
-            .expect("erased inventory revision should be readable")
-            > inventory_after_reserve
-    );
-    let late_finalize = control
-        .begin()
-        .await
-        .expect("late finalize transaction should open");
-    assert_eq!(
-        finalize_pending_material(
-            &late_finalize,
-            pending_secret_material_id,
-            Some(custody_project.id),
-            vec![7; 32],
-            Some(vec![8; 32]),
-            time::OffsetDateTime::now_utc(),
-        )
-        .await,
-        Err(ApplicationError::IdempotencyConflict),
-        "late sealing cannot resurrect an erased pending reservation"
-    );
-    late_finalize
-        .rollback()
-        .await
-        .expect("late finalize transaction should roll back");
-
-    let ownerless_signing_material_id = Uuid::new_v4();
-    material_repository
-        .reserve_project(
-            custody_project.id,
-            ownerless_signing_material_id,
-            MaterialOwnerKind::SigningKey,
-            Uuid::new_v4(),
-            1,
-            MaterialKind::SigningKey,
-            MaterialPurpose::SigningSeed,
-            custody_provider_id.clone(),
-            custody_format,
-        )
-        .await
-        .expect("pending signing material should reserve before its external effect");
-    assert_eq!(
-        material_repository
-            .erase_project(
-                custody_project.id,
-                ownerless_signing_material_id,
-                time::OffsetDateTime::now_utc(),
-            )
-            .await,
-        Err(ApplicationError::Persistence),
-        "ownerless signing material cannot bypass typed-owner integrity during erasure"
-    );
-    assert_eq!(
-        protected_material::Entity::find_by_id(ownerless_signing_material_id)
-            .one(control)
-            .await
-            .expect("ownerless signing material query should work")
-            .expect("failed erasure should roll back")
-            .state,
-        "pending"
-    );
-
-    let lock_order_material_id = Uuid::new_v4();
-    material_repository
-        .reserve_project(
-            custody_project.id,
-            lock_order_material_id,
-            MaterialOwnerKind::ProviderSecret,
-            Uuid::new_v4(),
-            1,
-            MaterialKind::ConfigurationSecret,
-            MaterialPurpose::ProviderClientSecret,
-            custody_provider_id.clone(),
-            custody_format,
-        )
-        .await
-        .expect("lock-order material should reserve");
-    let inventory_blocker = control
-        .begin()
-        .await
-        .expect("inventory blocker should begin");
-    lock_material_inventory(&inventory_blocker)
-        .await
-        .expect("inventory blocker should lock authority first");
-    let inventory_blocker_pid = inventory_blocker
-        .query_one_raw(Statement::from_string(
-            DbBackend::Postgres,
-            "SELECT pg_backend_pid() AS pid",
-        ))
-        .await
-        .expect("inventory blocker PID query should work")
-        .expect("inventory blocker PID should exist")
-        .try_get::<i32>("", "pid")
-        .expect("inventory blocker PID should decode");
-    let erasing_database = sea_orm::Database::connect(&control_url)
-        .await
-        .expect("independent erasure pool should open");
-    let erasing_repository =
-        ProtectedMaterialRepository::new(erasing_database.clone(), "test-deployment")
-            .expect("independent erasure repository should compose");
-    let erasing_project_id = custody_project.id;
-    let erase_task = tokio::spawn(async move {
-        erasing_repository
-            .erase_project(
-                erasing_project_id,
-                lock_order_material_id,
-                time::OffsetDateTime::now_utc(),
-            )
-            .await
-    });
-    let mut lock_order_observer = PgConnection::connect(&control_url)
-        .await
-        .expect("lock-order observer should open");
-    wait_for_sqlx_backend_blocked_by(
-        &mut lock_order_observer,
-        inventory_blocker_pid,
-        "protected-material erasure authority-first lock",
-    )
-    .await;
-    lock_order_observer
-        .close()
-        .await
-        .expect("lock-order observer should close");
-    timeout(
-        Duration::from_secs(2),
-        protected_material::Entity::find_by_id(lock_order_material_id)
-            .lock_exclusive()
-            .one(&inventory_blocker),
-    )
-    .await
-    .expect("authority-first erasure must not hold material while waiting for authority")
-    .expect("lock-order material query should work")
-    .expect("lock-order material should exist");
-    inventory_blocker
-        .commit()
-        .await
-        .expect("inventory blocker should release authority and material together");
-    timeout(Duration::from_secs(2), erase_task)
-        .await
-        .expect("blocked erasure should finish after authority release")
-        .expect("erasure task should not panic")
-        .expect("authority-first erasure should commit without deadlock");
-    erasing_database
-        .close()
-        .await
-        .expect("independent erasure pool should close");
 
     let rotated_provider_id =
         ProviderId::new("software-rotated").expect("rotated provider ID should parse");
@@ -6074,13 +3877,12 @@ async fn postgres_capability_journeys_are_real() {
     };
     let missing_historical_service = ProvisioningService::new(
         custody_adapter.clone(),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .with_provider_capabilities(
             BTreeMap::new(),
@@ -6128,13 +3930,12 @@ async fn postgres_capability_journeys_are_real() {
     ]);
     let rotated_service = ProvisioningService::new(
         rotated_adapter.clone(),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .with_provider_capabilities(BTreeMap::new(), retained_sealers),
     );
@@ -6158,22 +3959,18 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("rotated provider owner query should work")
         .expect("rotated provider owner should exist");
-    let rotated_material = protected_material::Entity::find_by_id(
-        rotated_owner
-            .secret_material_id
-            .expect("rotated provider should reference protected material"),
-    )
-    .one(control)
-    .await
-    .expect("rotated provider material query should work")
-    .expect("rotated provider material should exist");
+    let rotated_material = protected_material::Entity::find_by_id(rotated_owner.secret_material_id)
+        .one(control)
+        .await
+        .expect("rotated provider material query should work")
+        .expect("rotated provider material should exist");
     assert_eq!(
         rotated_material.provider_id,
         custody_provider_id.as_str(),
         "historical recovery must use the provider tuple stored by prepare, not the new active provider"
     );
 
-    let stateless_operation_alias = "stateless-recovery-key-12345678".to_owned();
+    let stateless_operation_alias = format!("signing_initial_{}", custody_project.id.simple());
     let stateless_digester = Sha256RequestDigester;
     let stateless_request_digest = stateless_digester
         .digest_json(&serde_json::json!({
@@ -6182,18 +3979,10 @@ async fn postgres_capability_journeys_are_real() {
             "purpose": "application_tokens",
         }))
         .expect("stateless signing request should be canonical");
-    let stateless_alias_digest =
-        stateless_digester.digest_bytes(stateless_operation_alias.as_bytes());
-    let stateless_signer_ref = format!(
-        "signer_{}_{}",
-        custody_project.id.simple(),
-        URL_SAFE_NO_PAD.encode(&stateless_alias_digest[..16])
-    );
     let stateless_recovery = custody_adapter
         .prepare_signing_key(
             custody_project.id,
             stateless_operation_alias,
-            stateless_signer_ref,
             custody_project.metadata_revision,
             stateless_request_digest,
         )
@@ -6219,7 +4008,7 @@ async fn postgres_capability_journeys_are_real() {
             .expect("submitted stateless operation query should work")
             .expect("submitted stateless operation should exist");
     assert_eq!(submitted_operation.state, "submitted");
-    assert!(submitted_operation.material_id.is_some());
+    let stateless_operation_alias = submitted_operation.operation_alias.clone();
     let mut expired_submission = submitted_operation.into_active_model();
     expired_submission.provider_lease_expires_at = Set(Some(
         time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
@@ -6229,9 +4018,9 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("simulated crash lease should expire before reconciliation");
     let recovered_stateless_key = custody_provisioning
-        .reconcile_signing_key(
+        .provision_signing_key(
             custody_project.id,
-            stateless_recovery.key_id,
+            stateless_operation_alias,
             custody_project.metadata_revision,
             Uuid::new_v4(),
         )
@@ -6245,35 +4034,22 @@ async fn postgres_capability_journeys_are_real() {
             .expect("recovered stateless operation query should work")
             .expect("recovered stateless operation should exist");
     assert_eq!(recovered_operation.state, "completed");
-    let recovered_material = protected_material::Entity::find_by_id(
-        recovered_operation
-            .material_id
-            .expect("recovered stateless operation should retain its reservation"),
-    )
-    .one(control)
-    .await
-    .expect("recovered stateless material query should work")
-    .expect("recovered stateless material should exist");
+    let recovered_material =
+        protected_material::Entity::find_by_id(recovered_operation.material_id)
+            .one(control)
+            .await
+            .expect("recovered stateless material query should work")
+            .expect("recovered stateless material should exist");
     assert_eq!(recovered_material.state, "live");
     assert!(recovered_material.opaque_value.is_some());
 
-    let protected_signing_key = custody_provisioning
-        .provision_signing_key(
-            custody_project.id,
-            "signing-custody-12345678".to_owned(),
-            custody_project.metadata_revision,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("signing handle, public key, and owner should commit before publication");
+    let protected_signing_key = recovered_stateless_key;
     let protected_signing_owner = project_signing_key::Entity::find_by_id(protected_signing_key.id)
         .one(control)
         .await
         .expect("protected signing owner query should work")
         .expect("protected signing owner should exist");
-    let signing_material_id = protected_signing_owner
-        .signer_material_id
-        .expect("protected signing key should reference one material");
+    let signing_material_id = protected_signing_owner.signer_material_id;
     let signing_material = protected_material::Entity::find_by_id(signing_material_id)
         .one(control)
         .await
@@ -6296,7 +4072,7 @@ async fn postgres_capability_journeys_are_real() {
         ring_id: completed_signing_operation.ring_id,
         key_id: completed_signing_operation.key_id,
         kid: protected_signing_owner.kid.clone(),
-        signer_ref: protected_signing_owner.signer_ref.clone(),
+        signer_material_id: signing_material_id,
         request_digest: completed_signing_operation.request_digest.clone(),
         state: ProvisioningOperationState::Completed,
     };
@@ -6313,7 +4089,6 @@ async fn postgres_capability_journeys_are_real() {
         .record_protected_signing_key_material(
             custody_project.id,
             &prepared_completed_signing,
-            custody_project.metadata_revision,
             SigningProviderLease {
                 token: Uuid::new_v4(),
             },
@@ -6342,7 +4117,6 @@ async fn postgres_capability_journeys_are_real() {
             .record_protected_signing_key_material(
                 custody_project.id,
                 &prepared_completed_signing,
-                custody_project.metadata_revision,
                 SigningProviderLease {
                     token: Uuid::new_v4(),
                 },
@@ -6370,7 +4144,7 @@ async fn postgres_capability_journeys_are_real() {
         .expect("unchanged signing material should exist");
     assert_eq!(unchanged_signing_material, signing_material);
 
-    let disabled_cleanup_project = provisioning
+    let disabled_cleanup_project = custody_provisioning
         .create_project(
             CreateProject {
                 display_name: "Disabled stored signing cleanup".to_owned(),
@@ -6384,7 +4158,7 @@ async fn postgres_capability_journeys_are_real() {
     let stored_cleanup_key = custody_provisioning
         .provision_signing_key(
             disabled_cleanup_project.id,
-            "disabled-stored-cleanup-key-12345678".to_owned(),
+            format!("signing_initial_{}", disabled_cleanup_project.id.simple()),
             disabled_cleanup_project.metadata_revision,
             Uuid::new_v4(),
         )
@@ -6395,9 +4169,7 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("disabled-cleanup key query should work")
         .expect("disabled-cleanup key should exist");
-    let stored_cleanup_material_id = stored_cleanup_owner
-        .signer_material_id
-        .expect("disabled-cleanup key should own material");
+    let stored_cleanup_material_id = stored_cleanup_owner.signer_material_id;
     let stored_cleanup_operation = key_provisioning_operation::Entity::find()
         .filter(key_provisioning_operation::Column::ProjectId.eq(disabled_cleanup_project.id))
         .filter(key_provisioning_operation::Column::KeyId.eq(stored_cleanup_key.id))
@@ -6407,6 +4179,7 @@ async fn postgres_capability_journeys_are_real() {
         .expect("stored-before-publish operation should exist");
     let mut stored_operation = stored_cleanup_operation.clone().into_active_model();
     stored_operation.state = Set("stored".to_owned());
+    stored_operation.expected_ring_revision = Set(stored_cleanup_key.ring_revision);
     stored_operation.completed_at = Set(None);
     stored_operation
         .update(control)
@@ -6430,6 +4203,25 @@ async fn postgres_capability_journeys_are_real() {
         .update(control)
         .await
         .expect("stored-before-publish Project should be disabled");
+    assert_eq!(
+        custody_provisioning
+            .provision_signing_key(
+                disabled_cleanup_project.id,
+                stored_cleanup_operation.operation_alias.clone(),
+                disabled_cleanup_project.metadata_revision,
+                Uuid::new_v4(),
+            )
+            .await,
+        Err(ApplicationError::Disabled),
+        "disabled stored material must enter cleanup instead of remaining publishable"
+    );
+    let disabled_stored_operation =
+        key_provisioning_operation::Entity::find_by_id(stored_cleanup_operation.id)
+            .one(control)
+            .await
+            .expect("disabled stored operation query should work")
+            .expect("disabled stored operation should remain durable");
+    assert_eq!(disabled_stored_operation.state, "cleanup_pending");
     let abandoned_stored_key = custody_provisioning
         .revoke_signing_key(
             disabled_cleanup_project.id,
@@ -6448,9 +4240,9 @@ async fn postgres_capability_journeys_are_real() {
             .expect("queued stored operation should exist");
     assert_eq!(queued_stored_operation.state, "cleanup_pending");
     let cleaned_stored_key = custody_provisioning
-        .reconcile_signing_key(
+        .provision_signing_key(
             disabled_cleanup_project.id,
-            stored_cleanup_key.id,
+            queued_stored_operation.operation_alias.clone(),
             disabled_cleanup_project.metadata_revision,
             Uuid::new_v4(),
         )
@@ -6465,19 +4257,99 @@ async fn postgres_capability_journeys_are_real() {
     assert_eq!(erased_stored_material.state, "erased");
     assert!(erased_stored_material.opaque_value.is_none());
 
-    let remote_provider_id = ProviderId::new("remote-test").unwrap();
-    let remote_format = ProviderFormatVersion::new(1).unwrap();
-    let ambiguous_project = provisioning
+    let stale_ring_project = custody_provisioning
         .create_project(
             CreateProject {
-                display_name: "Ambiguous remote signing".to_owned(),
+                display_name: "Stale ring stored signing cleanup".to_owned(),
                 belongs_to: None,
-                idempotency_key: "project-remote-ambiguous-12345678".to_owned(),
+                idempotency_key: "project-stale-ring-signing-cleanup-12345678".to_owned(),
             },
             Uuid::new_v4(),
         )
         .await
-        .expect("remote signing Project should commit");
+        .expect("stale-ring Project should commit");
+    let stale_ring_key = custody_provisioning
+        .provision_signing_key(
+            stale_ring_project.id,
+            format!("signing_initial_{}", stale_ring_project.id.simple()),
+            stale_ring_project.metadata_revision,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("stale-ring key should initially publish");
+    let stale_ring_operation = key_provisioning_operation::Entity::find()
+        .filter(key_provisioning_operation::Column::ProjectId.eq(stale_ring_project.id))
+        .one(control)
+        .await
+        .expect("stale-ring operation query should work")
+        .expect("stale-ring operation should exist");
+    let mut stale_operation = stale_ring_operation.clone().into_active_model();
+    stale_operation.state = Set("stored".to_owned());
+    stale_operation.completed_at = Set(None);
+    stale_operation
+        .update(control)
+        .await
+        .expect("stale-ring stored operation fixture should persist");
+    let stale_owner = project_signing_key::Entity::find_by_id(stale_ring_key.id)
+        .one(control)
+        .await
+        .expect("stale-ring key query should work")
+        .expect("stale-ring key should exist");
+    let stale_material_id = stale_owner.signer_material_id;
+    let mut stale_owner = stale_owner.into_active_model();
+    stale_owner.state = Set("provisioning".to_owned());
+    stale_owner
+        .update(control)
+        .await
+        .expect("stale-ring provisioning key fixture should persist");
+    assert_eq!(
+        custody_provisioning
+            .provision_signing_key(
+                stale_ring_project.id,
+                stale_ring_operation.operation_alias.clone(),
+                stale_ring_project.metadata_revision,
+                Uuid::new_v4(),
+            )
+            .await,
+        Err(ApplicationError::RevisionConflict),
+        "stored material captured at a stale ring revision must queue cleanup"
+    );
+    let stale_ring_operation =
+        key_provisioning_operation::Entity::find_by_id(stale_ring_operation.id)
+            .one(control)
+            .await
+            .expect("stale-ring cleanup operation query should work")
+            .expect("stale-ring cleanup operation should remain durable");
+    assert_eq!(stale_ring_operation.state, "cleanup_pending");
+    let abandoned_stale_key = custody_provisioning
+        .revoke_signing_key(
+            stale_ring_project.id,
+            stale_ring_key.id,
+            stale_ring_key.ring_revision,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("stale-ring candidate should remain cancellable");
+    assert_eq!(abandoned_stale_key.state, "abandoned");
+    custody_provisioning
+        .provision_signing_key(
+            stale_ring_project.id,
+            stale_ring_operation.operation_alias,
+            stale_ring_project.metadata_revision,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("stale-ring provider material should be destroyed");
+    let erased_stale_material = protected_material::Entity::find_by_id(stale_material_id)
+        .one(control)
+        .await
+        .expect("stale-ring material query should work")
+        .expect("stale-ring material tombstone should remain durable");
+    assert_eq!(erased_stale_material.state, "erased");
+    assert!(erased_stale_material.opaque_value.is_none());
+
+    let remote_provider_id = ProviderId::new("remote-test").unwrap();
+    let remote_format = ProviderFormatVersion::new(1).unwrap();
     let ambiguous_state = Arc::new(Mutex::new(RemoteSigningState {
         ambiguous_provision_once: true,
         ..Default::default()
@@ -6503,21 +4375,32 @@ async fn postgres_capability_journeys_are_real() {
     );
     let ambiguous_service = ProvisioningService::new(
         ambiguous_adapter.clone(),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .with_signing_provisioner(ambiguous_remote.clone()),
     );
+    let ambiguous_project = ambiguous_service
+        .create_project(
+            CreateProject {
+                display_name: "Ambiguous remote signing".to_owned(),
+                belongs_to: None,
+                idempotency_key: "project-remote-ambiguous-12345678".to_owned(),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("remote signing Project should atomically reserve its initial key");
+    let ambiguous_operation_alias = format!("signing_initial_{}", ambiguous_project.id.simple());
     assert_eq!(
         ambiguous_service
             .provision_signing_key(
                 ambiguous_project.id,
-                "remote-ambiguous-key-12345678".to_owned(),
+                ambiguous_operation_alias.clone(),
                 ambiguous_project.metadata_revision,
                 Uuid::new_v4(),
             )
@@ -6557,13 +4440,12 @@ async fn postgres_capability_journeys_are_real() {
     .expect("rotated custody adapter should compose");
     let absent_historical_service = ProvisioningService::new(
         Arc::new(rotated_adapter.clone()),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .with_signing_provisioner(software_custody.clone()),
     );
@@ -6571,7 +4453,7 @@ async fn postgres_capability_journeys_are_real() {
         absent_historical_service
             .provision_signing_key(
                 ambiguous_project.id,
-                "remote-ambiguous-key-12345678".to_owned(),
+                ambiguous_operation_alias.clone(),
                 ambiguous_project.metadata_revision,
                 Uuid::new_v4(),
             )
@@ -6592,13 +4474,12 @@ async fn postgres_capability_journeys_are_real() {
         ]);
     let rotated_service = ProvisioningService::new(
         Arc::new(rotated_adapter),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .with_provider_capabilities(
             historical_provisioners,
@@ -6611,7 +4492,7 @@ async fn postgres_capability_journeys_are_real() {
     let reconciled_remote_key = rotated_service
         .provision_signing_key(
             ambiguous_project.id,
-            "remote-ambiguous-key-12345678".to_owned(),
+            ambiguous_operation_alias.clone(),
             ambiguous_project.metadata_revision,
             Uuid::new_v4(),
         )
@@ -6637,9 +4518,7 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("reconciled remote owner query should work")
         .expect("reconciled remote owner should exist");
-    let reconciled_material_id = reconciled_remote_owner
-        .signer_material_id
-        .expect("reconciled remote key should own material");
+    let reconciled_material_id = reconciled_remote_owner.signer_material_id;
     let reconciled_operation = key_provisioning_operation::Entity::find()
         .filter(key_provisioning_operation::Column::ProjectId.eq(ambiguous_project.id))
         .filter(key_provisioning_operation::Column::KeyId.eq(reconciled_remote_key.id))
@@ -6670,18 +4549,16 @@ async fn postgres_capability_journeys_are_real() {
         )
         .await
         .expect("stored remote key should queue explicit cleanup");
-    let original_remote_object = ambiguous_state
-        .lock()
-        .unwrap()
-        .object
-        .clone()
-        .expect("stored remote object should exist");
+    assert!(
+        ambiguous_state.lock().unwrap().object.is_some(),
+        "stored remote object should exist"
+    );
     ambiguous_state.lock().unwrap().object = Some((vec![99; 48], vec![99; 32]));
     assert_eq!(
         ambiguous_service
-            .reconcile_signing_key(
+            .provision_signing_key(
                 ambiguous_project.id,
-                reconciled_remote_key.id,
+                reconciled_operation.operation_alias.clone(),
                 ambiguous_project.metadata_revision,
                 Uuid::new_v4(),
             )
@@ -6701,40 +4578,14 @@ async fn postgres_capability_journeys_are_real() {
         Some("never")
     );
     assert_eq!(ambiguous_state.lock().unwrap().destroy_calls, 0);
-    ambiguous_state.lock().unwrap().object = Some(original_remote_object);
-    ambiguous_service
-        .reconcile_signing_key(
-            ambiguous_project.id,
-            reconciled_remote_key.id,
-            ambiguous_project.metadata_revision,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("explicit reconcile should clean the repaired matching remote object");
-    let erased_reconciled_material = protected_material::Entity::find_by_id(reconciled_material_id)
+    let blocked_material = protected_material::Entity::find_by_id(reconciled_material_id)
         .one(control)
         .await
-        .expect("reconciled material query should work")
-        .expect("reconciled material tombstone should remain durable");
-    assert_eq!(erased_reconciled_material.state, "erased");
-    assert!(erased_reconciled_material.opaque_value.is_none());
-    {
-        let state = ambiguous_state.lock().unwrap();
-        assert_eq!(state.destroy_calls, 1);
-        assert!(state.object.is_none());
-    }
+        .expect("blocked material query should work")
+        .expect("blocked material should remain durable");
+    assert_eq!(blocked_material.state, "live");
+    assert!(blocked_material.opaque_value.is_some());
 
-    let failed_project = provisioning
-        .create_project(
-            CreateProject {
-                display_name: "Definitively absent remote signing".to_owned(),
-                belongs_to: None,
-                idempotency_key: "project-remote-absent-12345678".to_owned(),
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("definitive-absence Project should commit");
     let failed_state = Arc::new(Mutex::new(RemoteSigningState {
         provision_failure_once: Some((ProviderErrorClass::Unavailable, RetryClassification::Never)),
         ..Default::default()
@@ -6758,21 +4609,31 @@ async fn postgres_capability_journeys_are_real() {
     .expect("definitive-absence custody adapter should compose");
     let failed_service = ProvisioningService::new(
         Arc::new(failed_adapter),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .with_signing_provisioner(failed_remote),
     );
+    let failed_project = failed_service
+        .create_project(
+            CreateProject {
+                display_name: "Definitively absent remote signing".to_owned(),
+                belongs_to: None,
+                idempotency_key: "project-remote-absent-12345678".to_owned(),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("definitive-absence Project should atomically reserve its initial key");
     assert_eq!(
         failed_service
             .provision_signing_key(
                 failed_project.id,
-                "remote-definitive-absence-12345678".to_owned(),
+                format!("signing_initial_{}", failed_project.id.simple()),
                 failed_project.metadata_revision,
                 Uuid::new_v4(),
             )
@@ -6793,9 +4654,9 @@ async fn postgres_capability_journeys_are_real() {
     );
     assert_eq!(
         failed_service
-            .reconcile_signing_key(
+            .provision_signing_key(
                 failed_project.id,
-                failed_operation.key_id,
+                failed_operation.operation_alias.clone(),
                 failed_project.metadata_revision,
                 Uuid::new_v4(),
             )
@@ -6833,15 +4694,12 @@ async fn postgres_capability_journeys_are_real() {
             .expect("abandoned failed operation query should work")
             .expect("abandoned failed operation should remain durable");
     assert_eq!(abandoned_failed_operation.state, "abandoned");
-    let erased_failed_material = protected_material::Entity::find_by_id(
-        failed_operation
-            .material_id
-            .expect("failed operation should own pending material"),
-    )
-    .one(control)
-    .await
-    .expect("failed material query should work")
-    .expect("failed material tombstone should remain durable");
+    let erased_failed_material =
+        protected_material::Entity::find_by_id(failed_operation.material_id)
+            .one(control)
+            .await
+            .expect("failed material query should work")
+            .expect("failed material tombstone should remain durable");
     assert_eq!(erased_failed_material.state, "erased");
     assert!(erased_failed_material.opaque_value.is_none());
     {
@@ -6852,24 +4710,12 @@ async fn postgres_capability_journeys_are_real() {
         assert!(state.object.is_none());
     }
 
-    let cleanup_project = provisioning
-        .create_project(
-            CreateProject {
-                display_name: "Remote signing cleanup".to_owned(),
-                belongs_to: None,
-                idempotency_key: "project-remote-cleanup-12345678".to_owned(),
-            },
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("cleanup Project should commit");
     let cleanup_state = Arc::new(Mutex::new(RemoteSigningState {
         destroy_failure_once: Some((ProviderErrorClass::Unavailable, RetryClassification::Never)),
         ..Default::default()
     }));
-    let cleanup_remote =
-        StatefulRemoteSigningProvider::new(remote_provider_id.clone(), cleanup_state.clone())
-            .with_revision_bump(control.clone(), cleanup_project.id);
+    let initial_cleanup_remote =
+        StatefulRemoteSigningProvider::new(remote_provider_id.clone(), cleanup_state.clone());
     let cleanup_adapter = PostgresProvisioningAdapter::new(
         control.clone(),
         url::Url::parse("https://identity.example/runtime/").unwrap(),
@@ -6885,15 +4731,89 @@ async fn postgres_capability_journeys_are_real() {
         custody_format,
     )
     .expect("cleanup custody adapter should compose");
-    let cleanup_service = ProvisioningService::new(
-        Arc::new(cleanup_adapter),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
+    let cleanup_bootstrap = ProvisioningService::new(
+        Arc::new(cleanup_adapter.clone()),
+        ProvisioningInfrastructure::new_protected(
             SystemClock,
-            SystemEntropy,
             Sha256RequestDigester,
             false,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .with_signing_provisioner(initial_cleanup_remote.clone()),
+    );
+    let disabled_before_claim = cleanup_bootstrap
+        .create_project(
+            CreateProject {
+                display_name: "Disabled before signing claim".to_owned(),
+                belongs_to: None,
+                idempotency_key: "project-disabled-before-signing-claim-12345678".to_owned(),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("pre-claim disable Project should reserve its initial key");
+    cleanup_bootstrap
+        .disable_project(
+            disabled_before_claim.id,
+            disabled_before_claim.security_revision,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("pre-claim Project disable should commit");
+    assert_eq!(
+        cleanup_bootstrap
+            .provision_signing_key(
+                disabled_before_claim.id,
+                format!("signing_initial_{}", disabled_before_claim.id.simple()),
+                disabled_before_claim.metadata_revision,
+                Uuid::new_v4(),
+            )
+            .await,
+        Err(ApplicationError::Disabled),
+        "a disabled Project must not start a previously unclaimed provider effect"
+    );
+    {
+        let state = cleanup_state.lock().unwrap();
+        assert_eq!(state.provision_calls, 0);
+        assert!(state.object.is_none());
+    }
+    let abandoned_before_claim = key_provisioning_operation::Entity::find()
+        .filter(key_provisioning_operation::Column::ProjectId.eq(disabled_before_claim.id))
+        .one(control)
+        .await
+        .expect("pre-claim operation query should work")
+        .expect("pre-claim operation should remain durable");
+    assert_eq!(abandoned_before_claim.state, "abandoned");
+    let abandoned_before_claim_key =
+        project_signing_key::Entity::find_by_id(abandoned_before_claim.key_id)
+            .one(control)
+            .await
+            .expect("pre-claim key query should work")
+            .expect("pre-claim key should remain durable");
+    assert_eq!(abandoned_before_claim_key.state, "abandoned");
+
+    let cleanup_project = cleanup_bootstrap
+        .create_project(
+            CreateProject {
+                display_name: "Remote signing cleanup".to_owned(),
+                belongs_to: None,
+                idempotency_key: "project-remote-cleanup-12345678".to_owned(),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("cleanup Project should atomically reserve its initial key");
+    let cleanup_remote =
+        initial_cleanup_remote.with_project_disable(control.clone(), cleanup_project.id);
+    let cleanup_service = ProvisioningService::new(
+        Arc::new(cleanup_adapter),
+        ProvisioningInfrastructure::new_protected(
+            SystemClock,
+            Sha256RequestDigester,
+            false,
+            BTreeMap::new(),
+            BTreeMap::new(),
         )
         .with_signing_provisioner(cleanup_remote.clone()),
     );
@@ -6901,13 +4821,13 @@ async fn postgres_capability_journeys_are_real() {
         cleanup_service
             .provision_signing_key(
                 cleanup_project.id,
-                "remote-cleanup-key-12345678".to_owned(),
+                format!("signing_initial_{}", cleanup_project.id.simple()),
                 cleanup_project.metadata_revision,
                 Uuid::new_v4(),
             )
             .await,
-        Err(ApplicationError::RevisionConflict),
-        "a post-effect authorization change should durably queue cleanup"
+        Err(ApplicationError::Disabled),
+        "a post-effect Project disable should durably queue cleanup"
     );
     let cleanup_operation = key_provisioning_operation::Entity::find()
         .filter(key_provisioning_operation::Column::ProjectId.eq(cleanup_project.id))
@@ -6941,9 +4861,9 @@ async fn postgres_capability_journeys_are_real() {
     assert_eq!(cleanup_operation.state, "cleanup_pending");
     assert_eq!(
         cleanup_service
-            .reconcile_signing_key(
+            .provision_signing_key(
                 cleanup_project.id,
-                cleanup_operation.key_id,
+                cleanup_operation.operation_alias.clone(),
                 cleanup_project.metadata_revision + 1,
                 Uuid::new_v4(),
             )
@@ -6961,85 +4881,6 @@ async fn postgres_capability_journeys_are_real() {
         cleanup_operation.last_retry_classification.as_deref(),
         Some("never")
     );
-    let rotated_cleanup_adapter = PostgresProvisioningAdapter::new(
-        control.clone(),
-        url::Url::parse("https://identity.example/runtime/").unwrap(),
-        vec!["runtime-test-process".to_owned()],
-        Duration::from_millis(10),
-        Duration::from_secs(1),
-    )
-    .with_provider_custody(
-        "test-deployment",
-        rotated_provider_id.clone(),
-        custody_format,
-        custody_provider_id.clone(),
-        custody_format,
-    )
-    .expect("rotated cleanup custody adapter should compose");
-    let rotated_cleanup_service = ProvisioningService::new(
-        Arc::new(rotated_cleanup_adapter),
-        ProvisioningInfrastructure::new(
-            signer_store.clone(),
-            secret_store.clone(),
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            false,
-        )
-        .with_provider_capabilities(
-            BTreeMap::from([
-                (
-                    remote_provider_id.clone(),
-                    Arc::new(cleanup_remote.clone()) as Arc<dyn SigningKeyProvisioner>,
-                ),
-                (
-                    rotated_provider_id.clone(),
-                    Arc::new(rotated_custody.clone()) as Arc<dyn SigningKeyProvisioner>,
-                ),
-            ]),
-            BTreeMap::new(),
-        ),
-    );
-    let abandoned_remote_key = rotated_cleanup_service
-        .reconcile_signing_key(
-            cleanup_project.id,
-            cleanup_operation.key_id,
-            cleanup_project.metadata_revision + 1,
-            Uuid::new_v4(),
-        )
-        .await
-        .expect("explicit reconcile should route cleanup through the retained historical provider");
-    assert_eq!(abandoned_remote_key.state, "abandoned");
-    let completed_cleanup_operation =
-        key_provisioning_operation::Entity::find_by_id(cleanup_operation.id)
-            .one(control)
-            .await
-            .expect("completed cleanup operation query should work")
-            .expect("completed cleanup operation should retain a tombstone");
-    assert_eq!(completed_cleanup_operation.state, "abandoned");
-    assert_eq!(completed_cleanup_operation.provider_lease_generation, 3);
-    assert_eq!(completed_cleanup_operation.destroy_attempt_count, 2);
-    assert!(completed_cleanup_operation.destroyed_at.is_some());
-    let completed_cleanup_material = protected_material::Entity::find_by_id(
-        completed_cleanup_operation
-            .material_id
-            .expect("cleanup operation should retain material identity"),
-    )
-    .one(control)
-    .await
-    .expect("completed cleanup material query should work")
-    .expect("completed cleanup material should retain a tombstone");
-    assert_eq!(completed_cleanup_material.state, "erased");
-    assert!(completed_cleanup_material.opaque_value.is_none());
-    assert_eq!(completed_cleanup_material.owner_id, abandoned_remote_key.id);
-    {
-        let state = cleanup_state.lock().unwrap();
-        assert_eq!(state.provision_calls, 1);
-        assert_eq!(state.inspect_calls, 2);
-        assert_eq!(state.destroy_calls, 2);
-        assert!(state.object.is_none());
-    }
-
     let protected_provider_command = CreateProvider {
         kind: ProviderKind::Oidc,
         provider_key: "custody-workforce".to_owned(),
@@ -7065,10 +4906,7 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("protected provider owner query should work")
         .expect("protected provider owner should exist");
-    assert!(protected_owner.secret_ref.is_none());
-    let material_id = protected_owner
-        .secret_material_id
-        .expect("protected provider should reference one material");
+    let material_id = protected_owner.secret_material_id;
     let committed_material = protected_material::Entity::find_by_id(material_id)
         .one(control)
         .await
@@ -7118,13 +4956,12 @@ async fn postgres_capability_journeys_are_real() {
     let smtp_repository = PostgresEmailControlRepository::new(control.clone())
         .with_custody("test-deployment", custody_provider_id, custody_format)
         .expect("protected SMTP repository should compose");
-    let smtp_control = EmailControlService::new(
+    let smtp_control = EmailControlService::new_protected(
         Arc::new(smtp_repository),
-        Arc::new(secret_store.clone()),
+        ConfigurationSecretSealers::single(software_custody.clone()),
         Arc::new(SystemClock),
         Arc::new(Sha256RequestDigester),
-    )
-    .with_secret_sealer(software_custody.clone());
+    );
     let deployment_smtp_command = ReconcileDeploymentSmtpGeneration {
         generation: 37,
         host: "smtp.default.example.com".to_owned(),
@@ -7337,10 +5174,22 @@ async fn postgres_capability_journeys_are_real() {
         .expect("every live protected material should have an authoritative owner");
     assert!(!readiness_candidates.is_empty());
     for candidate in readiness_candidates {
-        protected_runtime_custody
-            .authenticate_readiness_candidate(candidate)
-            .await
-            .expect("the configured custody root should authenticate every live material");
+        if candidate.material.reservation.provider_id.as_str() == "software" {
+            protected_runtime_custody
+                .authenticate_readiness_candidate(candidate)
+                .await
+                .expect(
+                    "the matching configured custody root should authenticate its live material",
+                );
+        } else {
+            assert_eq!(
+                protected_runtime_custody
+                    .authenticate_readiness_candidate(candidate)
+                    .await,
+                Err(ApplicationError::Disabled),
+                "a Runtime custody provider must reject material owned by another provider"
+            );
+        }
     }
     let wrong_root = SoftwareCustodyProvider::new(ProviderId::new("software").unwrap(), [32; 32])
         .expect("wrong-root provider should initialize");
@@ -7358,10 +5207,11 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("readiness inventory should remain readable")
     {
-        if wrong_runtime_custody
-            .authenticate_readiness_candidate(candidate)
-            .await
-            .is_err()
+        if candidate.material.reservation.provider_id.as_str() == "software"
+            && wrong_runtime_custody
+                .authenticate_readiness_candidate(candidate)
+                .await
+                .is_err()
         {
             rejected_wrong_root = true;
             break;
@@ -7373,7 +5223,7 @@ async fn postgres_capability_journeys_are_real() {
     );
     let opened_deployment_smtp = SmtpCredentialResolver::resolve_checked(
         &protected_runtime_custody,
-        &deployment_material_id.to_string(),
+        deployment_material_id,
         &protected_deployment_smtp.safe_fingerprint,
     )
     .await
@@ -7388,7 +5238,7 @@ async fn postgres_capability_journeys_are_real() {
         .expect("finalized SMTP configuration has a safe fingerprint");
     let opened_smtp = SmtpCredentialResolver::resolve_checked(
         &protected_runtime_custody,
-        &smtp_material_id.to_string(),
+        smtp_material_id,
         &expected_smtp_fingerprint,
     )
     .await
@@ -7399,13 +5249,10 @@ async fn postgres_capability_journeys_are_real() {
             .any(|window| { window == b"protected-password" })
     );
     assert_eq!(
-        SmtpCredentialResolver::resolve(
-            &protected_runtime_custody,
-            &recipient_material_id.to_string(),
-        )
-        .await
-        .expect("Runtime should open the exact SMTP-test recipient")
-        .as_slice(),
+        SmtpCredentialResolver::resolve(&protected_runtime_custody, recipient_material_id,)
+            .await
+            .expect("Runtime should open the exact SMTP-test recipient")
+            .as_slice(),
         b"recipient@example.com"
     );
     assert_eq!(
@@ -7474,30 +5321,52 @@ async fn postgres_capability_journeys_are_real() {
             | (Err(ApplicationError::IdempotencyConflict), Ok(_))
     ));
 
-    verify_listenerless_custody_import(
-        custody_project.clone(),
-        config.clone(),
-        control,
-        provisioning.clone(),
-        signer_store.clone(),
-        secret_store.clone(),
-        secret_root.clone(),
-        software_custody.clone(),
+    let constraint_project = provisioning
+        .create_project(
+            CreateProject {
+                display_name: "Cross-project constraint fixture".to_owned(),
+                belongs_to: None,
+                idempotency_key: "cross-project-constraint-12345678".to_owned(),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("cross-Project constraint fixture should commit");
+    let key_fence_project_id = constraint_project.id;
+
+    let client_provider = provisioning
+        .create_provider(
+            created_project.id,
+            CreateProvider {
+                kind: ProviderKind::Oidc,
+                provider_key: "client-directory".to_owned(),
+                display_name: "Client directory provider".to_owned(),
+                issuer: "https://client-directory.example.test/".to_owned(),
+                client_id: "client-directory".to_owned(),
+                client_secret: zeroize::Zeroizing::new("client-directory-secret".to_owned()),
+                managed_profile_enabled: false,
+                idempotency_key: "client-directory-provider-12345678".to_owned(),
+                expected_project_revision: created_project.metadata_revision,
+                egress_policy_revision: Some(1),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("Client directory provider should use protected custody");
+    let created_project = provisioning
+        .get_project(created_project.id)
+        .await
+        .expect("Project should refresh after provider creation");
+    verify_client_key_and_listener_journeys(
+        &created_project,
+        client_provider.id,
+        &config,
+        &pools,
+        &url,
     )
     .await;
 
-    let (created_project, key_fence_project_id) =
-        verify_project_and_external_effect_revision_fences(
-            created_project,
-            &provisioning,
-            &store_root,
-            control,
-        )
-        .await;
-
-    verify_client_key_and_listener_journeys(&created_project, &config, &pools, &url).await;
-
-    let created_project_id = Box::pin(verify_application_and_publication_journeys(
+    let _created_project_id = Box::pin(verify_application_and_publication_journeys(
         created_project,
         key_fence_project_id,
         provisioning.clone(),
@@ -7507,17 +5376,75 @@ async fn postgres_capability_journeys_are_real() {
         readiness.clone(),
         secondary_readiness.clone(),
         unexpected_readiness.clone(),
-        signer_store.clone(),
-        secret_store.clone(),
-        signer_root.clone(),
         &url,
         control_url.clone(),
     ))
     .await;
 
-    verify_capacity_and_replay_limits(&control_url).await;
-    verify_terminal_custody_authority_fence(control, &url, created_project_id).await;
+    control
+        .execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            "UPDATE key_provisioning_operations
+             SET maintenance_claimed_at = transaction_timestamp()
+             WHERE state IN ('prepared','submitted','stored','cleanup_pending','cleanup_leased')"
+                .to_owned(),
+        ))
+        .await
+        .expect("pre-existing signing maintenance rows should move behind the fairness fixture");
+    let mut fairness_key_ids = BTreeSet::new();
+    for index in 0..35 {
+        let project = provisioning
+            .create_project(
+                CreateProject {
+                    display_name: format!("Signing fairness {index}"),
+                    belongs_to: None,
+                    idempotency_key: format!("signing-fairness-project-{index:02}-12345678"),
+                },
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("signing fairness Project should atomically create its initial operation");
+        let key = provisioning
+            .list_signing_keys(project.id)
+            .await
+            .expect("signing fairness initial key should list")
+            .into_iter()
+            .next()
+            .expect("signing fairness initial key should exist");
+        fairness_key_ids.insert(key.id);
+    }
+    let first_sweep =
+        SigningKeyProvisioningPort::signing_key_maintenance_items(custody_adapter.as_ref(), 100)
+            .await
+            .expect("first signing maintenance sweep should claim a bounded page");
+    let first_fairness_ids = first_sweep
+        .into_iter()
+        .filter_map(|item| match item {
+            crate::application::SigningKeyMaintenanceItem::Provision { key_id, .. }
+                if fairness_key_ids.contains(&key_id) =>
+            {
+                Some(key_id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(first_fairness_ids.len(), 34);
+    let initially_deferred = fairness_key_ids
+        .difference(&first_fairness_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(initially_deferred.len(), 1);
+    let second_sweep =
+        SigningKeyProvisioningPort::signing_key_maintenance_items(custody_adapter.as_ref(), 100)
+            .await
+            .expect("second signing maintenance sweep should rotate the persistent cursor");
+    assert!(second_sweep.into_iter().any(|item| matches!(
+        item,
+        crate::application::SigningKeyMaintenanceItem::Provision { key_id, .. }
+            if initially_deferred.contains(&key_id)
+    )));
 
-    std::fs::remove_dir_all(store_root).expect("temporary encrypted stores should clean up");
+    verify_capacity_and_replay_limits(&control_url).await;
+
     pools.close().await;
 }

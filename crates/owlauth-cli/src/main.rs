@@ -39,8 +39,6 @@ enum Command {
     Provider(control::ProviderArgs),
     /// Manage self-hosted Project signing keys.
     SigningKey(control::SigningKeyArgs),
-    /// Manage Project or Application projection policy.
-    ProjectionPolicy(control::ProjectionPolicyArgs),
     /// Manage webhook endpoints and inspect deliveries.
     Webhook(control::WebhookArgs),
     /// Update this CLI from an `OwlAuth` GitHub Release.
@@ -127,9 +125,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Command::Provider(args)) => control::run_provider(cli.profile.as_deref(), args)?,
         Some(Command::SigningKey(args)) => {
             control::run_signing_key(cli.profile.as_deref(), args)?;
-        }
-        Some(Command::ProjectionPolicy(args)) => {
-            control::run_projection_policy(cli.profile.as_deref(), args)?;
         }
         Some(Command::Webhook(args)) => control::run_webhook(cli.profile.as_deref(), args)?,
         Some(Command::Update(args)) => update::run(&args)?,
@@ -303,23 +298,6 @@ mod tests {
         assert!(project_policy(None).is_err());
         assert!(project_policy(Some("true")).is_ok());
         assert!(project_policy(Some("false")).is_ok());
-
-        let projection_policy = |value: Option<&str>| {
-            let mut arguments = vec![
-                "owlauth",
-                "projection-policy",
-                "set",
-                "11111111-1111-4111-8111-111111111111",
-            ];
-            if let Some(value) = value {
-                arguments.extend(["--verified-email-enabled", value]);
-            }
-            arguments.extend(["--expected-revision", "1", "--yes"]);
-            Cli::try_parse_from(arguments)
-        };
-        assert!(projection_policy(None).is_err());
-        assert!(projection_policy(Some("true")).is_ok());
-        assert!(projection_policy(Some("false")).is_ok());
     }
 
     #[test]

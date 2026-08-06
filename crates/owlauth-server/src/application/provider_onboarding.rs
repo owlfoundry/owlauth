@@ -49,13 +49,6 @@ pub(crate) trait ProviderEgressPolicyPort: Send + Sync {
         outcome: &'static str,
         correlation_id: Uuid,
     ) -> Result<(), ApplicationError>;
-
-    async fn legacy_provider_policy_bridge_pending(&self) -> Result<bool, ApplicationError>;
-
-    async fn bridge_legacy_provider_policy(
-        &self,
-        policy: ProviderEgressPolicy,
-    ) -> Result<(), ApplicationError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,17 +243,6 @@ mod tests {
                 .expect("outcome recorder should not be poisoned")
                 .push((outcome, correlation_id));
             Ok(())
-        }
-
-        async fn legacy_provider_policy_bridge_pending(&self) -> Result<bool, ApplicationError> {
-            Ok(false)
-        }
-
-        async fn bridge_legacy_provider_policy(
-            &self,
-            _: ProviderEgressPolicy,
-        ) -> Result<(), ApplicationError> {
-            Err(ApplicationError::InvalidTransition)
         }
     }
 

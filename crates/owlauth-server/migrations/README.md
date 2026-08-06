@@ -1,13 +1,14 @@
-# OwlAuth database migration
+# PostgreSQL migrations
 
-OwlAuth's authoritative PostgreSQL schema is embedded from this directory by SQLx 0.9.
+This directory is OwlAuth's clean pre-deployment schema baseline.
 
-No published server release contains the current consolidated initial migration, `20260803000000_initial.sql`. TS-003 deliberately freezes its current checksum as the pre-TS-003 source-deployment bridge baseline; do not edit it. It creates the Project/Application ownership graph, Control idempotency and audit authority, one-use MCP confirmation authority, signing and provider lifecycle state, Runtime authentication and session state, passwordless email, managed provider credentials, identity/projection lifecycle, Application synchronization, webhook delivery, durable secret cleanup, and the schema-compatibility floor.
+- `20260806000000_foundation.sql` creates functions and tables.
+- `20260806001000_authorities.sql` seeds the required singleton authorities.
+- `20260806002000_invariants.sql` installs keys, constraints, indexes, and triggers.
 
-Every later schema change uses an ordered additive migration. The current post-initial series is rewritten pre-alpha history: operators stop every older process first, and its first committed migration raises the compatibility floor so no older binary may restart against a partial prefix. Populated upgrades separate metadata expansion, bounded backfill, one ordinary index build, constraint attachment, DML-compatible validation, and final contract work when that materially shortens hot-table lock retention. Eligible FK/CHECK constraints are installed `NOT VALID` so they protect new writes immediately and are validated later. Destructive or irreversible changes after publication require an explicit compatibility, rollout, backup, and recovery design; SeaORM schema sync and `sea-orm-migration` never manage the production schema.
+The history was rebuilt before the first deployed schema and contains only the final model. Once
+any production database has applied this baseline, these files and checksums are immutable. Future
+changes must be new ordered migrations.
 
-Migration execution uses a dedicated connection with independent bounded PostgreSQL lock and statement timeouts plus a larger whole-run guard, transactional SQLx history, and bounded failure reporting. SQLx's session advisory lock and DDL locks use the same database-enforced lock bound. Timeout/cancellation closes the dedicated backend before serving, leaves only a successful additive history prefix, and requires operator remediation plus explicit restart; there is no silent migration replay or dirty-history bypass. Transactional ordinary indexes are preferred over crash-ambiguous no-transaction concurrent-index scripts. `auto` applies compatible pending migrations before either plane reports readiness. `verify` requires the binary's embedded migrations to be a checksum-matching prefix and applies no DDL; `schema_compatibility.minimum_binary_schema_level` separately controls qualified forward expansion history.
-
-Deployment operators own backup scheduling and restore orchestration. A usable recovery point must keep PostgreSQL, the separately preserved software custody root or custom-provider authority, process configuration, opaque protected material, and every still-referenced retained key version mutually consistent. Stop serving before rollback, restore that complete set, and restart with `OWLAUTH_MIGRATION_MODE=verify`. Missing external references or required retained keys intentionally fail closed for the affected capability.
-
-The target invariants are defined in [`spec/04-storage-and-migrations.md`](../../../spec/04-storage-and-migrations.md), with the selected repository and migration technology in [`spec/technology/ts-001-postgresql-repositories-and-migrations.md`](../../../spec/technology/ts-001-postgresql-repositories-and-migrations.md).
+OwlAuth verifies the applied SQLx history exactly: migration count, version, success state, and
+checksum must match the running binary.

@@ -85,5 +85,4 @@ export OWLAUTH_E2E_RUST_UPLOAD_METADATA="$rust_upload_metadata"
 export OWLAUTH_E2E_RUST_ARCHIVE_SHA256="$(sha256 "$rust_archive")"
 export OWLAUTH_E2E_RUST_DESCRIPTOR_SHA256="$(sha256 "$work/rust/candidate.json")"
 
-pnpm --filter @owlauth/server-web exec playwright test \
-  browser-tests/project-auth.spec.ts "$@"
+pnpm --filter @owlauth/server-web exec playwright test "$@"

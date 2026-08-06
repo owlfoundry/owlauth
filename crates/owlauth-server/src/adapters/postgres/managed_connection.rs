@@ -23,31 +23,20 @@ use super::{
     projection::IdentityProjectionMaterializer, session_authority::base_profile_digest,
 };
 
-#[cfg(test)]
-use super::session_authority::fan_out_user_projections;
-
 #[derive(Clone)]
 pub(crate) struct PostgresManagedConnectionRepository {
     database: DatabaseConnection,
-    projection_materializer: Option<Arc<dyn IdentityProjectionMaterializer>>,
+    projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
 }
 
 impl PostgresManagedConnectionRepository {
-    #[cfg(test)]
-    pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self {
-            database,
-            projection_materializer: None,
-        }
-    }
-
-    pub(crate) fn new_with_projection_materializer(
+    pub(crate) fn new(
         database: DatabaseConnection,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
-            projection_materializer: Some(projection_materializer),
+            projection_materializer,
         }
     }
 }
@@ -169,6 +158,12 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
             .picture_url
             .map(ProfilePictureUrl::into_inner);
         let locale = profile.profile.locale.map(ProfileLocale::into_inner);
+        let source_profile_digest = base_profile_digest(
+            display_name.as_deref(),
+            picture_url.as_deref(),
+            locale.as_deref(),
+            None,
+        )?;
         let transaction = self.database.begin().await.map_err(persistence)?;
         if !lock_guard_authority(&transaction, &claim.guard).await? {
             transaction.rollback().await.map_err(persistence)?;
@@ -212,7 +207,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                ), updated_identity AS (
                    UPDATE linked_identities AS identity
                       SET display_name = $12, picture_url = $13, locale = $14,
-                          observed_at = $15,
+                          observed_at = $15, source_profile_digest = $18,
                           identity_revision = identity.identity_revision
                             + CASE WHEN (identity.display_name, identity.picture_url, identity.locale)
                                 IS DISTINCT FROM ($12, $13, $14) THEN 1 ELSE 0 END,
@@ -238,7 +233,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                 claim.guard.managed_profile_revision.into(), claim.guard.user_security_revision.into(),
                 claim.guard.identity_revision.into(), claim.lease_owner.into(), now.into(),
                 display_name.clone().into(), picture_url.clone().into(), locale.clone().into(), profile.observed_at.into(),
-                claim.guard.linked_identity_id.into(), next_sync.into(),
+                claim.guard.linked_identity_id.into(), next_sync.into(), source_profile_digest.into(),
             ],
         )).await.map_err(persistence)?;
         if result.rows_affected() == 1 {
@@ -292,7 +287,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                     active.updated_at = Set(now);
                     let updated = active.update(&transaction).await.map_err(persistence)?;
                     materialize_user_projections(
-                        self.projection_materializer.as_deref(),
+                        self.projection_materializer.as_ref(),
                         &transaction,
                         &updated,
                         now,
@@ -375,9 +370,9 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                        AND provider.status='active' AND provider.managed_profile_enabled
                        AND provider.revision=connection.provider_revision
                        AND provider.managed_profile_revision=connection.managed_profile_revision
-                       AND ((provider.adapter_kind='oidc'
+                       AND ((provider.kind='oidc'
                              AND operation.provider_egress_policy_revision=egress.revision)
-                            OR (provider.adapter_kind<>'oidc'
+                            OR (provider.kind<>'oidc'
                                 AND operation.provider_egress_policy_revision IS NULL))
                        AND project_user.status='active'
                        AND project_user.security_revision=connection.user_security_revision
@@ -391,7 +386,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                       connection.adapter_key,connection.adapter_capability_revision,
                       to_json(connection.required_scopes) AS required_scopes,
                       connection.user_security_revision, connection.identity_revision,
-                      connection.consecutive_failures,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer, identity.subject, provider.client_id, COALESCE(provider.secret_material_id::TEXT, provider.secret_ref) AS secret_ref,
+                      connection.consecutive_failures,provider.kind AS provider_kind,provider.issuer, identity.subject, provider.client_id, provider.secret_material_id,
                       operation.provider_egress_policy_revision,
                       egress.mode AS current_egress_mode,
                       egress.exact_origins AS current_egress_exact_origins,
@@ -436,9 +431,9 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                       AND provider.status='active' AND provider.managed_profile_enabled
                       AND provider.revision=connection.provider_revision
                       AND provider.managed_profile_revision=connection.managed_profile_revision
-                      AND ((provider.adapter_kind='oidc'
+                      AND ((provider.kind='oidc'
                             AND operation.provider_egress_policy_revision=egress.revision)
-                           OR (provider.adapter_kind<>'oidc'
+                           OR (provider.kind<>'oidc'
                                AND operation.provider_egress_policy_revision IS NULL))
                       AND project_user.status='active'
                       AND project_user.security_revision=connection.user_security_revision
@@ -657,9 +652,9 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                     AND provider.revision=connection.provider_revision
                     AND provider.managed_profile_revision=connection.managed_profile_revision
                     AND operation.provider_egress_policy_revision IS NOT DISTINCT FROM $15
-                    AND ((provider.adapter_kind='oidc'
+                    AND ((provider.kind='oidc'
                           AND operation.provider_egress_policy_revision=egress.revision)
-                         OR (provider.adapter_kind<>'oidc'
+                         OR (provider.kind<>'oidc'
                              AND operation.provider_egress_policy_revision IS NULL))
                     AND project_user.status='active'
                     AND project_user.security_revision=connection.user_security_revision
@@ -751,7 +746,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
     ) -> Result<bool, ApplicationError> {
         commit_profile_for_guard(
             &self.database,
-            self.projection_materializer.as_deref(),
+            self.projection_materializer.as_ref(),
             &claim.guard,
             Some(claim),
             profile,
@@ -770,7 +765,7 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
     ) -> Result<bool, ApplicationError> {
         commit_profile_for_guard(
             &self.database,
-            self.projection_materializer.as_deref(),
+            self.projection_materializer.as_ref(),
             guard,
             None,
             profile,
@@ -1356,8 +1351,8 @@ impl ManagedConnectionRepository for PostgresManagedConnectionRepository {
                       claimed.adapter_key,claimed.adapter_capability_revision,
                       to_json(claimed.required_scopes) AS required_scopes,
                       claimed.user_security_revision, claimed.identity_revision,
-                      claimed.consecutive_failures,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer, identity.subject, provider.client_id, COALESCE(provider.secret_material_id::TEXT, provider.secret_ref) AS secret_ref,
-                      CASE WHEN provider.adapter_kind='oidc' THEN egress.revision ELSE NULL END
+                      claimed.consecutive_failures,provider.kind AS provider_kind,provider.issuer, identity.subject, provider.client_id, provider.secret_material_id,
+                      CASE WHEN provider.kind='oidc' THEN egress.revision ELSE NULL END
                         AS provider_egress_policy_revision,
                       egress.mode AS current_egress_mode,
                       egress.exact_origins AS current_egress_exact_origins,
@@ -2441,9 +2436,9 @@ async fn claim_connection_on<C: ConnectionTrait>(
                  claimed.adapter_key,claimed.adapter_capability_revision,
                  to_json(claimed.required_scopes) AS required_scopes,
                  claimed.user_security_revision, claimed.identity_revision,
-                 claimed.consecutive_failures,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer, identity.subject,
-                 provider.client_id, COALESCE(provider.secret_material_id::TEXT, provider.secret_ref) AS secret_ref,
-                 CASE WHEN provider.adapter_kind='oidc' THEN egress.revision ELSE NULL END
+                 claimed.consecutive_failures,provider.kind AS provider_kind,provider.issuer, identity.subject,
+                 provider.client_id, provider.secret_material_id,
+                 CASE WHEN provider.kind='oidc' THEN egress.revision ELSE NULL END
                    AS provider_egress_policy_revision,
                  egress.mode AS current_egress_mode,
                  egress.exact_origins AS current_egress_exact_origins,
@@ -2520,8 +2515,7 @@ fn claim_from_row(
     allow_stale_policy_for_terminalization: bool,
 ) -> Result<ClaimedManagedCredential, ApplicationError> {
     let provider_kind = super::provider_row::effective_provider_kind(
-        &get::<String>(row, "provider_legacy_kind")?,
-        get::<Option<String>>(row, "provider_adapter_kind")?.as_deref(),
+        &get::<String>(row, "provider_kind")?,
         &get::<String>(row, "issuer")?,
     )?;
     let provider_egress_policy_revision =
@@ -2571,8 +2565,7 @@ fn claim_from_row(
             issuer: get(row, "issuer")?,
             subject: get(row, "subject")?,
             client_id: get(row, "client_id")?,
-            secret_ref: get::<Option<String>>(row, "secret_ref")?
-                .ok_or(ApplicationError::Integrity)?,
+            secret_material_id: get(row, "secret_material_id")?,
         },
         protected: ProtectedValue {
             key_version: get(row, "key_version")?,
@@ -2639,7 +2632,7 @@ async fn lock_guard_authority<C: ConnectionTrait>(
     let policy_ok = lock_guard_egress_policy(connection, guard).await?;
     let provider_ok = lock_boolean(
         connection,
-        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 AND kind='oidc' AND adapter_kind=$5 FOR SHARE)",
+        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 AND kind=$5 FOR SHARE)",
         vec![guard.project_id.into(), guard.provider_configuration_id.into(), guard.provider_revision.into(), guard.managed_profile_revision.into(), guard.provider_kind.as_str().into()],
     )
     .await?;
@@ -2693,23 +2686,12 @@ async fn lock_boolean<C: ConnectionTrait>(
 }
 
 async fn materialize_user_projections(
-    materializer: Option<&dyn IdentityProjectionMaterializer>,
+    materializer: &dyn IdentityProjectionMaterializer,
     transaction: &sea_orm::DatabaseTransaction,
     user: &project_user::Model,
     now: OffsetDateTime,
 ) -> Result<(), ApplicationError> {
-    if let Some(materializer) = materializer {
-        materializer.fan_out_user(transaction, user, now).await
-    } else {
-        #[cfg(test)]
-        {
-            fan_out_user_projections(transaction, user, now).await
-        }
-        #[cfg(not(test))]
-        {
-            Err(ApplicationError::Integrity)
-        }
-    }
+    materializer.fan_out_user(transaction, user, now).await
 }
 
 #[allow(
@@ -2718,7 +2700,7 @@ async fn materialize_user_projections(
 )]
 async fn commit_profile_for_guard(
     database: &DatabaseConnection,
-    projection_materializer: Option<&dyn IdentityProjectionMaterializer>,
+    projection_materializer: &dyn IdentityProjectionMaterializer,
     guard: &ConnectionGuard,
     claim: Option<&SuccessorProfileClaim>,
     profile: BoundedManagedProfile,
@@ -2735,6 +2717,12 @@ async fn commit_profile_for_guard(
         .picture_url
         .map(ProfilePictureUrl::into_inner);
     let locale = profile.profile.locale.map(ProfileLocale::into_inner);
+    let source_profile_digest = base_profile_digest(
+        display_name.as_deref(),
+        picture_url.as_deref(),
+        locale.as_deref(),
+        None,
+    )?;
     let transaction = database.begin().await.map_err(persistence)?;
     // Canonical authority locks precede user, identity, then connection locks. Separate
     // statements make the order independent of the PostgreSQL join plan.
@@ -2747,7 +2735,7 @@ async fn commit_profile_for_guard(
     let policy_ok = lock_guard_egress_policy(&transaction, guard).await?;
     let provider_ok = lock_boolean(
         &transaction,
-        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 AND kind='oidc' AND adapter_kind=$5 FOR SHARE)",
+        "SELECT EXISTS (SELECT 1 FROM provider_configurations WHERE project_id=$1 AND id=$2 AND status='active' AND revision=$3 AND managed_profile_enabled AND managed_profile_revision=$4 AND kind=$5 FOR SHARE)",
         vec![guard.project_id.into(), guard.provider_configuration_id.into(), guard.provider_revision.into(), guard.managed_profile_revision.into(), guard.provider_kind.as_str().into()],
     )
     .await?;
@@ -2784,6 +2772,7 @@ async fn commit_profile_for_guard(
     }
     let identity_changed = transaction.execute_raw(statement(
         r"UPDATE linked_identities SET display_name=$1, picture_url=$2, locale=$3, observed_at=$4,
+                source_profile_digest=$10,
                 identity_revision=identity_revision + CASE WHEN (display_name,picture_url,locale)
                     IS DISTINCT FROM ($1,$2,$3) THEN 1 ELSE 0 END,
                 updated_at=CASE WHEN (display_name,picture_url,locale) IS DISTINCT FROM ($1,$2,$3)
@@ -2791,7 +2780,7 @@ async fn commit_profile_for_guard(
            WHERE project_id=$6 AND id=$7 AND user_id=$8 AND identity_revision=$9",
         vec![display_name.clone().into(), picture_url.clone().into(), locale.clone().into(),
              profile.observed_at.into(), now.into(), guard.project_id.into(), guard.linked_identity_id.into(),
-             guard.user_id.into(), guard.identity_revision.into()],
+             guard.user_id.into(), guard.identity_revision.into(), source_profile_digest.into()],
     )).await.map_err(persistence)?;
     if identity_changed.rows_affected() != 1 {
         transaction.rollback().await.map_err(persistence)?;

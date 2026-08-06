@@ -52,7 +52,7 @@ pub(crate) struct PostgresSessionAuthorityRepository {
     runtime_incarnation: RuntimeIncarnationFence,
     managed_protector: Option<Arc<dyn ManagedCredentialProtector>>,
     runtime_protector: Option<Arc<dyn RuntimeProtector>>,
-    projection_materializer: Option<Arc<dyn IdentityProjectionMaterializer>>,
+    projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
 }
 
 impl std::fmt::Debug for PostgresSessionAuthorityRepository {
@@ -63,46 +63,38 @@ impl std::fmt::Debug for PostgresSessionAuthorityRepository {
             .field("runtime_incarnation", &self.runtime_incarnation)
             .field("managed_protector", &self.managed_protector.is_some())
             .field("runtime_protector", &self.runtime_protector.is_some())
-            .field(
-                "projection_materializer",
-                &self.projection_materializer.is_some(),
-            )
+            .field("projection_materializer", &true)
             .finish()
     }
 }
 
 impl PostgresSessionAuthorityRepository {
     #[cfg(test)]
-    pub(crate) fn new(database: DatabaseConnection) -> Self {
+    pub(crate) fn new(
+        database: DatabaseConnection,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
+    ) -> Self {
         Self {
             database,
             runtime_incarnation: RuntimeIncarnationFence::test_default(),
             managed_protector: None,
             runtime_protector: None,
-            projection_materializer: None,
+            projection_materializer,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_projection_materializer(
-        mut self,
-        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-    ) -> Self {
-        self.projection_materializer = Some(projection_materializer);
-        self
     }
 
     #[cfg(test)]
     pub(crate) fn with_managed_protector(
         database: DatabaseConnection,
         managed_protector: Arc<dyn ManagedCredentialProtector>,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
             runtime_incarnation: RuntimeIncarnationFence::test_default(),
             managed_protector: Some(managed_protector),
             runtime_protector: None,
-            projection_materializer: None,
+            projection_materializer,
         }
     }
 
@@ -111,13 +103,14 @@ impl PostgresSessionAuthorityRepository {
         database: DatabaseConnection,
         managed_protector: Arc<dyn ManagedCredentialProtector>,
         runtime_protector: Arc<dyn RuntimeProtector>,
+        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
             runtime_incarnation: RuntimeIncarnationFence::test_default(),
             managed_protector: Some(managed_protector),
             runtime_protector: Some(runtime_protector),
-            projection_materializer: None,
+            projection_materializer,
         }
     }
 
@@ -137,7 +130,7 @@ impl PostgresSessionAuthorityRepository {
             ),
             managed_protector: Some(managed_protector),
             runtime_protector: Some(runtime_protector),
-            projection_materializer: Some(projection_materializer),
+            projection_materializer,
         }
     }
 
@@ -147,18 +140,9 @@ impl PostgresSessionAuthorityRepository {
         user: &project_user::Model,
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
-        if let Some(materializer) = &self.projection_materializer {
-            materializer.fan_out_user(transaction, user, now).await
-        } else {
-            #[cfg(test)]
-            {
-                fan_out_user_projections(transaction, user, now).await
-            }
-            #[cfg(not(test))]
-            {
-                Err(ApplicationError::Integrity)
-            }
-        }
+        self.projection_materializer
+            .fan_out_user(transaction, user, now)
+            .await
     }
 }
 
@@ -363,13 +347,12 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 let profile_changed = identity.display_name != display_name
                     || identity.picture_url != picture_url
                     || identity.locale != locale;
-                let source_digest_changed =
+                let source_digest_changed = !bool::from(
                     identity
                         .source_profile_digest
-                        .as_deref()
-                        .is_none_or(|digest| {
-                            !bool::from(digest.ct_eq(source_profile_digest.as_slice()))
-                        });
+                        .as_slice()
+                        .ct_eq(source_profile_digest.as_slice()),
+                );
                 let mut identity_active = identity.into_active_model();
                 if profile_changed {
                     identity_active.identity_revision =
@@ -380,8 +363,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     identity_active.updated_at = Set(command.now);
                 }
                 if profile_changed || source_digest_changed {
-                    identity_active.source_profile_digest =
-                        Set(Some(source_profile_digest.clone()));
+                    identity_active.source_profile_digest = Set(source_profile_digest.clone());
                 }
                 identity_active.observed_at = Set(command.now);
                 identity_active
@@ -503,7 +485,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                     identity_revision: Set(1),
                     source_kind: Set("provider".to_owned()),
                     source_schema: Set("owlauth.provider-profile.v1".to_owned()),
-                    source_profile_digest: Set(Some(source_profile_digest)),
+                    source_profile_digest: Set(source_profile_digest),
                     display_name: Set(display_name.clone()),
                     picture_url: Set(picture_url.clone()),
                     locale: Set(locale),
@@ -962,35 +944,15 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         if binding.is_some() && projection.is_none() {
             return Err(ApplicationError::Integrity);
         }
-        let (projection_revision, projection_document) = if policy.projection_verified_email_enabled
-            && application.projection_verified_email_enabled
-        {
-            let protector = self
-                .runtime_protector
-                .as_deref()
-                .ok_or(ApplicationError::Integrity)?;
-            let material = super::projection::authoritative_runtime_projection_material(
-                &transaction,
-                projection.as_ref(),
-                application.id,
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-                true,
-                true,
-                protector,
-            )
-            .await?;
-            (material.revision, material.document)
-        } else {
-            let (revision, document, _) = authoritative_projection_material(
-                projection.as_ref(),
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-            )?;
-            (revision, document)
-        };
+        let material = super::projection::authoritative_runtime_projection_material(
+            &transaction,
+            projection.as_ref(),
+            application.id,
+            &user,
+            self.projection_materializer.as_ref(),
+        )
+        .await?;
+        let (projection_revision, projection_document) = (material.revision, material.document);
         let signing =
             active_signing_snapshot(&transaction, command.project_id, command.now).await?;
         let preparation = HandoffPreparation {
@@ -1006,15 +968,13 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             application_security_revision: application.security_revision,
             claims_revision: policy.claims_revision,
             session_revision: policy.session_revision,
-            project_projection_revision: policy.projection_revision,
-            application_projection_revision: application.projection_revision,
             projection_revision,
             projection_document,
             signing_ring_id: signing.ring_id,
             signing_key_id: signing.key_id,
             signing_kid: signing.kid,
             signing_public_jwk: signing.public_jwk,
-            signer_ref: signing.signer_ref,
+            signing_material_id: signing.material_id,
             signing_epoch: signing.epoch,
             access_token_lifetime_seconds: access_token_lifetime(&policy)?,
             authenticated_at: ticket.authenticated_at,
@@ -1164,9 +1124,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             || policy.claims_revision != command.preparation.claims_revision
             || policy.session_revision != ticket.policy_session_revision
             || policy.session_revision != command.preparation.session_revision
-            || policy.projection_revision != command.preparation.project_projection_revision
-            || application.projection_revision
-                != command.preparation.application_projection_revision
             || ticket.authenticated_at != command.preparation.authenticated_at
             || access_token_lifetime(&policy)? != command.preparation.access_token_lifetime_seconds
             || browser_session.project_security_revision != project.security_revision
@@ -1260,27 +1217,14 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .one(&transaction)
             .await
             .map_err(persistence)?;
-        let material = if let Some(protector) = self.runtime_protector.as_deref() {
-            super::projection::authoritative_runtime_projection_material(
-                &transaction,
-                existing_projection.as_ref(),
-                application.id,
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-                policy.projection_verified_email_enabled,
-                application.projection_verified_email_enabled,
-                protector,
-            )
-            .await?
-        } else {
-            super::projection::authoritative_projection_material(
-                existing_projection.as_ref(),
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-            )?
-        };
+        let material = super::projection::authoritative_runtime_projection_material(
+            &transaction,
+            existing_projection.as_ref(),
+            application.id,
+            &user,
+            self.projection_materializer.as_ref(),
+        )
+        .await?;
         if material.revision != command.preparation.projection_revision
             || material.document != command.preparation.projection_document
         {
@@ -1299,31 +1243,13 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         };
         let event_document = material.document.clone();
         let projection = match existing_projection {
-            Some(projection) if self.runtime_protector.is_some() => {
+            Some(projection) => {
                 super::projection::repair_runtime_projection(
                     &transaction,
                     projection,
                     application.id,
                     &user,
-                    policy.projection_revision,
-                    application.projection_revision,
-                    policy.projection_verified_email_enabled,
-                    application.projection_verified_email_enabled,
-                    self.runtime_protector
-                        .as_deref()
-                        .ok_or(ApplicationError::Integrity)?,
-                    command.now,
-                )
-                .await?
-                .0
-            }
-            Some(projection) => {
-                super::projection::repair_projection(
-                    &transaction,
-                    projection,
-                    &user,
-                    policy.projection_revision,
-                    application.projection_revision,
+                    self.projection_materializer.as_ref(),
                     command.now,
                 )
                 .await?
@@ -1338,10 +1264,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
                 schema_name: Set(USER_PROJECTION_SCHEMA_V1.to_owned()),
                 projection_revision: Set(material.revision),
                 source_user_revision: Set(user.user_revision),
-                project_policy_revision: Set(policy.projection_revision),
-                application_policy_revision: Set(application.projection_revision),
                 canonical_digest: Set(material.digest),
-                source_base_profile_digest: Set(Some(user.base_profile_digest.clone())),
+                source_base_profile_digest: Set(user.base_profile_digest.clone()),
                 verified_email_source_identity_id: Set(material.verified_email_source_identity_id),
                 verified_email_ciphertext: Set(material.verified_email_ciphertext),
                 verified_email_key_version: Set(material.verified_email_key_version),
@@ -1637,31 +1561,15 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (_, projection_material) = if let Some(protector) = self.runtime_protector.as_deref() {
-            super::projection::repair_runtime_projection(
-                &transaction,
-                projection,
-                application.id,
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-                policy.projection_verified_email_enabled,
-                application.projection_verified_email_enabled,
-                protector,
-                command.now,
-            )
-            .await?
-        } else {
-            super::projection::repair_projection(
-                &transaction,
-                projection,
-                &user,
-                policy.projection_revision,
-                application.projection_revision,
-                command.now,
-            )
-            .await?
-        };
+        let (_, projection_material) = super::projection::repair_runtime_projection(
+            &transaction,
+            projection,
+            application.id,
+            &user,
+            self.projection_materializer.as_ref(),
+            command.now,
+        )
+        .await?;
         let projection_revision = projection_material.revision;
         let projection_document = projection_material.document;
         let signing =
@@ -1682,15 +1590,13 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             user_public_id: user.public_id,
             user_revision: user.user_revision,
             claims_revision: policy.claims_revision,
-            project_projection_revision: policy.projection_revision,
-            application_projection_revision: application.projection_revision,
             projection_revision,
             projection_document,
             signing_ring_id: signing.ring_id,
             signing_key_id: signing.key_id,
             signing_kid: signing.kid,
             signing_public_jwk: signing.public_jwk,
-            signer_ref: signing.signer_ref,
+            signing_material_id: signing.material_id,
             signing_epoch: signing.epoch,
             access_token_lifetime_seconds: access_token_lifetime(&policy)?,
             authenticated_at: session.authenticated_at,
@@ -1835,9 +1741,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             || user.public_id != command.preparation.user_public_id
             || user.user_revision != command.preparation.user_revision
             || policy.claims_revision != command.preparation.claims_revision
-            || policy.projection_revision != command.preparation.project_projection_revision
-            || application.projection_revision
-                != command.preparation.application_projection_revision
             || access_token_lifetime(&policy)? != command.preparation.access_token_lifetime_seconds
         {
             return Err(ApplicationError::RevisionConflict);
@@ -1865,34 +1768,28 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let (projection_document, projection_digest) =
-            if let Some(protector) = self.runtime_protector.as_deref() {
-                if projection.verified_email_ciphertext.is_some() {
-                    super::projection::assert_projection_crypto_authority(&transaction, protector)
-                        .await?;
-                }
-                (
-                    super::projection::wire_projection_document(&projection, protector)?,
-                    projection.canonical_digest.clone(),
-                )
-            } else {
-                super::projection::projection_material(
-                    &user,
-                    command.preparation.projection_revision,
-                    policy.projection_revision,
-                    application.projection_revision,
-                )?
-            };
+        if projection.verified_email_ciphertext.is_some() {
+            super::projection::assert_projection_crypto_authority(
+                &transaction,
+                self.projection_materializer.as_ref(),
+            )
+            .await?;
+        }
+        let projection_document = super::projection::wire_projection_document(
+            &projection,
+            self.projection_materializer.as_ref(),
+        )?;
+        let projection_digest = projection.canonical_digest.clone();
         let projection_storage_document =
             super::projection::safe_projection_document(&projection_document)?;
         if projection.projection_revision != command.preparation.projection_revision
             || projection.source_user_revision != user.user_revision
-            || projection.project_policy_revision != policy.projection_revision
-            || projection.application_policy_revision != application.projection_revision
-            || projection
-                .source_base_profile_digest
-                .as_deref()
-                .is_none_or(|digest| !bool::from(digest.ct_eq(user.base_profile_digest.as_slice())))
+            || !bool::from(
+                projection
+                    .source_base_profile_digest
+                    .as_slice()
+                    .ct_eq(user.base_profile_digest.as_slice()),
+            )
             || projection.document != projection_storage_document
             || projection_document != command.preparation.projection_document
             || !bool::from(
@@ -2708,22 +2605,13 @@ async fn record_refresh_replay(
     .await
 }
 
-#[cfg(test)]
-pub(super) async fn fan_out_user_projections(
-    transaction: &sea_orm::DatabaseTransaction,
-    user: &project_user::Model,
-    now: OffsetDateTime,
-) -> Result<(), ApplicationError> {
-    super::projection::fan_out_user_projections(transaction, user, now).await
-}
-
 struct SigningSnapshot {
     ring_id: uuid::Uuid,
     key_id: uuid::Uuid,
     issuer: String,
     kid: String,
     public_jwk: Value,
-    signer_ref: String,
+    material_id: uuid::Uuid,
     epoch: i64,
 }
 
@@ -2761,10 +2649,7 @@ async fn active_signing_snapshot(
         issuer: ring.issuer,
         kid: key.kid,
         public_jwk: key.public_jwk,
-        signer_ref: key
-            .signer_material_id
-            .map(|material_id| material_id.to_string())
-            .unwrap_or(key.signer_ref),
+        material_id: key.signer_material_id,
         epoch: ring.signing_epoch,
     })
 }
@@ -2785,21 +2670,6 @@ pub(super) fn base_profile_digest(
     verified_email: Option<&str>,
 ) -> Result<Vec<u8>, ApplicationError> {
     super::projection::base_profile_digest(display_name, picture_url, locale, verified_email)
-}
-
-fn authoritative_projection_material(
-    projection: Option<&application_user_projection::Model>,
-    user: &project_user::Model,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
-) -> Result<(i64, Value, Vec<u8>), ApplicationError> {
-    let material = super::projection::authoritative_projection_material(
-        projection,
-        user,
-        project_projection_revision,
-        application_projection_revision,
-    )?;
-    Ok((material.revision, material.document, material.digest))
 }
 
 async fn lock_signing_epoch(

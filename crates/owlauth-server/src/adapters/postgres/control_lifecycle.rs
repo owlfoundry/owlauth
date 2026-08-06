@@ -3,17 +3,17 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use sea_orm::sea_query::LockType;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
-    IntoActiveModel, QueryFilter, QueryOrder, QueryResult, QuerySelect, Set, Statement,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbBackend,
+    EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QueryResult, QuerySelect, Set,
+    Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
 use crate::application::{
     ApplicationError, ApplicationSessionRecord, BrowserSessionRecord, ControlLifecyclePort,
-    DisableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind, ProjectUserIdentityRecord,
-    ProjectUserIdentityStatus, ProjectUserRecord, ProjectUserSessions, ProjectUserStatus,
-    RevokeApplicationSession, RevokeBrowserSession,
+    DisableProjectUser, EnableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind,
+    ProjectUserIdentityRecord, ProjectUserIdentityStatus, ProjectUserPage, ProjectUserRecord,
+    ProjectUserSessions, ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
 };
 
 use super::{
@@ -26,25 +26,17 @@ use super::{
 #[derive(Clone)]
 pub(crate) struct PostgresControlLifecycleRepository {
     database: DatabaseConnection,
-    projection_materializer: Option<Arc<dyn IdentityProjectionMaterializer>>,
+    projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
 }
 
 impl PostgresControlLifecycleRepository {
-    #[cfg(test)]
-    pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self {
-            database,
-            projection_materializer: None,
-        }
-    }
-
-    pub(crate) fn new_with_projection_materializer(
+    pub(crate) fn new(
         database: DatabaseConnection,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
-            projection_materializer: Some(projection_materializer),
+            projection_materializer,
         }
     }
 
@@ -54,18 +46,9 @@ impl PostgresControlLifecycleRepository {
         user: &project_user::Model,
         now: time::OffsetDateTime,
     ) -> Result<(), ApplicationError> {
-        if let Some(materializer) = &self.projection_materializer {
-            materializer.fan_out_user(transaction, user, now).await
-        } else {
-            #[cfg(test)]
-            {
-                super::projection::fan_out_user_projections(transaction, user, now).await
-            }
-            #[cfg(not(test))]
-            {
-                Err(ApplicationError::Integrity)
-            }
-        }
+        self.projection_materializer
+            .fan_out_user(transaction, user, now)
+            .await
     }
 }
 
@@ -74,20 +57,56 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
     async fn list_project_users(
         &self,
         project_id: Uuid,
+        status: Option<ProjectUserStatus>,
+        cursor: Option<Uuid>,
         limit: usize,
-    ) -> Result<Vec<ProjectUserRecord>, ApplicationError> {
+    ) -> Result<ProjectUserPage, ApplicationError> {
         bounded_limit(limit)?;
         require_project(&self.database, project_id).await?;
-        let users = project_user::Entity::find()
-            .filter(project_user::Column::ProjectId.eq(project_id))
+        let cursor = match cursor {
+            Some(cursor_id) => Some(
+                project_user::Entity::find_by_id(cursor_id)
+                    .filter(project_user::Column::ProjectId.eq(project_id))
+                    .one(&self.database)
+                    .await
+                    .map_err(persistence)?
+                    .ok_or(ApplicationError::InvalidInput)?,
+            ),
+            None => None,
+        };
+        let mut query =
+            project_user::Entity::find().filter(project_user::Column::ProjectId.eq(project_id));
+        if let Some(status) = status {
+            query = query.filter(project_user::Column::Status.eq(project_user_status(status)));
+        }
+        if let Some(cursor) = cursor {
+            query = query.filter(
+                Condition::any()
+                    .add(project_user::Column::CreatedAt.gt(cursor.created_at))
+                    .add(
+                        Condition::all()
+                            .add(project_user::Column::CreatedAt.eq(cursor.created_at))
+                            .add(project_user::Column::Id.gt(cursor.id)),
+                    ),
+            );
+        }
+        let mut users = query
             .order_by_asc(project_user::Column::CreatedAt)
             .order_by_asc(project_user::Column::Id)
             .limit((limit + 1) as u64)
             .all(&self.database)
             .await
             .map_err(persistence)?;
-        enforce_bound(&users, limit)?;
-        users.into_iter().map(project_user_record).collect()
+        let has_more = users.len() > limit;
+        users.truncate(limit);
+        let next_cursor = has_more.then(|| users.last().expect("non-empty bounded page").id);
+        Ok(ProjectUserPage {
+            items: users
+                .into_iter()
+                .map(project_user_record)
+                .collect::<Result<_, _>>()?,
+            next_cursor,
+        })
     }
 
     async fn get_project_user(
@@ -207,6 +226,52 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
                 updated
             }
             "disabled" => user,
+            _ => return Err(ApplicationError::Integrity),
+        };
+        transaction.commit().await.map_err(persistence)?;
+        project_user_record(user)
+    }
+
+    async fn enable_project_user(
+        &self,
+        command: EnableProjectUser,
+    ) -> Result<ProjectUserRecord, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        lock_active_project(&transaction, command.project_id).await?;
+        let user = project_user::Entity::find_by_id(command.user_id)
+            .filter(project_user::Column::ProjectId.eq(command.project_id))
+            .lock(LockType::Update)
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        if user.security_revision != command.expected_security_revision {
+            return Err(ApplicationError::RevisionConflict);
+        }
+        let user = match user.status.as_str() {
+            "disabled" => {
+                let mut active = user.into_active_model();
+                active.status = Set("active".to_owned());
+                active.user_revision = Set(next_revision(active.user_revision.take())?);
+                active.security_revision = Set(next_revision(active.security_revision.take())?);
+                active.updated_at = Set(command.now);
+                let updated = active.update(&transaction).await.map_err(persistence)?;
+                self.fan_out_user(&transaction, &updated, command.now)
+                    .await?;
+                append_runtime_audit(
+                    &transaction,
+                    command.project_id,
+                    "deployment_operator",
+                    "project_user.enabled",
+                    "project_user",
+                    Some(command.user_id),
+                    command.correlation_id,
+                )
+                .await?;
+                updated
+            }
+            "active" => user,
+            "merged" => return Err(ApplicationError::InvalidTransition),
             _ => return Err(ApplicationError::Integrity),
         };
         transaction.commit().await.map_err(persistence)?;
@@ -458,6 +523,14 @@ where
         .await
         .map_err(persistence)?
         .ok_or(ApplicationError::NotFound)
+}
+
+const fn project_user_status(status: ProjectUserStatus) -> &'static str {
+    match status {
+        ProjectUserStatus::Active => "active",
+        ProjectUserStatus::Disabled => "disabled",
+        ProjectUserStatus::Merged => "merged",
+    }
 }
 
 fn project_user_identity_record(

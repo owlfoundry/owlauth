@@ -42,9 +42,9 @@ use crate::{
         ProjectProvisioningPort, ProjectRecord, ProviderProvisioningPort, ProviderRecord,
         ProviderRecovery, ProvisionedProtectedSigningMaterial, ProvisioningOperationState,
         ReplaceApplicationConfiguration, RequestDigester, SealedProtectedMaterial,
-        SigningKeyActivationCandidate, SigningKeyProvisioningPort, SigningKeyRecord,
-        SigningKeyRecovery, SigningProviderAction, SigningProviderCall, SigningProviderLease,
-        UpdateApplication, UpdateProject, UpdateProjectPolicy,
+        SigningKeyMaintenanceItem, SigningKeyProvisioningPort, SigningKeyRecord,
+        SigningProviderAction, SigningProviderCall, SigningProviderLease, UpdateApplication,
+        UpdateProject, UpdateProjectPolicy,
     },
     domain::{
         ApplicationStatus, ApplicationType, BrowserOrigin, MAX_ACCESS_TOKEN_LIFETIME_SECONDS,
@@ -75,10 +75,7 @@ pub(crate) struct PostgresProvisioningAdapter {
     required_runtime_process_ids: Arc<BTreeSet<String>>,
     propagation_delay: Duration,
     verification_retention: Duration,
-    #[cfg(not(test))]
     custody: ProvisioningCustody,
-    #[cfg(test)]
-    custody: Option<ProvisioningCustody>,
 }
 
 #[derive(Clone)]
@@ -132,10 +129,7 @@ impl PostgresProvisioningAdapter {
             ),
             propagation_delay,
             verification_retention,
-            #[cfg(not(test))]
             custody,
-            #[cfg(test)]
-            custody: Some(custody),
         })
     }
 
@@ -147,18 +141,22 @@ impl PostgresProvisioningAdapter {
         propagation_delay: Duration,
         verification_retention: Duration,
     ) -> Self {
-        Self {
+        let provider_id = ProviderId::new("software").expect("test provider ID is valid");
+        let provider_format_version =
+            ProviderFormatVersion::new(1).expect("test provider format is valid");
+        Self::new_protected(
             database,
-            clock: Arc::new(SystemClock),
-            digester: Arc::new(Sha256RequestDigester),
-            runtime_base: Arc::new(runtime_base),
-            required_runtime_process_ids: Arc::new(
-                required_runtime_process_ids.into_iter().collect(),
-            ),
+            runtime_base,
+            required_runtime_process_ids,
             propagation_delay,
             verification_retention,
-            custody: None,
-        }
+            "test-deployment",
+            provider_id.clone(),
+            provider_format_version,
+            provider_id,
+            provider_format_version,
+        )
+        .expect("test provisioning custody is valid")
     }
 
     #[cfg(test)]
@@ -186,7 +184,7 @@ impl PostgresProvisioningAdapter {
         secret_provider_id: ProviderId,
         secret_provider_format_version: ProviderFormatVersion,
     ) -> Result<Self, ApplicationError> {
-        self.custody = Some(ProvisioningCustody {
+        self.custody = ProvisioningCustody {
             materials: ProtectedMaterialRepository::new(self.database.clone(), deployment_id)?,
             signing: CustodySelection {
                 provider_id: signing_provider_id,
@@ -196,29 +194,11 @@ impl PostgresProvisioningAdapter {
                 provider_id: secret_provider_id,
                 provider_format_version: secret_provider_format_version,
             },
-        });
+        };
         Ok(self)
     }
 
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "production custody is mandatory while legacy unit fixtures deliberately omit it"
-    )]
-    fn custody(&self) -> Result<&ProvisioningCustody, ApplicationError> {
-        #[cfg(not(test))]
-        return Ok(&self.custody);
-        #[cfg(test)]
-        self.custody.as_ref().ok_or(ApplicationError::Integrity)
-    }
-
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "production custody is mandatory while legacy unit fixtures deliberately omit it"
-    )]
-    fn optional_custody(&self) -> Option<&ProvisioningCustody> {
-        #[cfg(not(test))]
-        return Some(&self.custody);
-        #[cfg(test)]
-        self.custody.as_ref()
+    fn custody(&self) -> &ProvisioningCustody {
+        &self.custody
     }
 }

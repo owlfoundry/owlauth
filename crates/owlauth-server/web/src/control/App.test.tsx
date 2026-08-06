@@ -194,6 +194,257 @@ describe("Control application shell", () => {
     });
   });
 
+  it("keeps polling serialized signing maintenance until the key becomes active", async () => {
+    let signingKeyReads = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return Promise.resolve(systemResponse());
+        if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+          return Promise.resolve(Response.json({ items: [project] }));
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/signing-keys`)) {
+          signingKeyReads += 1;
+          return Promise.resolve(
+            Response.json({
+              items: [
+                {
+                  id: "signing-key-1",
+                  project_id: project.id,
+                  kid: "kid_polling_regression",
+                  algorithm: "EdDSA",
+                  state: signingKeyReads < 3 ? "provisioning" : "active",
+                  ring_revision: signingKeyReads < 3 ? 1 : 2,
+                  signing_epoch: 1,
+                  sign_not_before: null,
+                  verify_not_after: null,
+                  public_jwk: signingKeyReads < 3 ? null : { kid: "kid_polling_regression" },
+                },
+              ],
+            }),
+          );
+        }
+        return Promise.resolve(Response.json({ items: [] }));
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/security/signing-keys`);
+    await unlock("owl_ctrl_v1_test", "Signing keys");
+    expect(await screen.findByText(/provisioning, ring revision 1/u)).toBeVisible();
+    expect(
+      await screen.findByText(/active, ring revision 2/u, {}, { timeout: 2_000 }),
+    ).toBeVisible();
+    expect(signingKeyReads).toBe(3);
+    expect(screen.getByRole("button", { name: "Rotate signing key" })).toBeEnabled();
+  });
+
+  it("aborts a stale signing inventory read and never renders it in another Project", async () => {
+    const otherProject = {
+      ...project,
+      id: "project-2",
+      public_id: "project_public_2",
+      display_name: "Second Project",
+    };
+    let staleRequest: Request | undefined;
+    let resolveStale: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return Promise.resolve(systemResponse());
+        if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+          return Promise.resolve(Response.json({ items: [project, otherProject] }));
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/signing-keys`)) {
+          staleRequest = request;
+          return new Promise<Response>((resolve) => {
+            resolveStale = resolve;
+          });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${otherProject.id}/signing-keys`)) {
+          return Promise.resolve(
+            Response.json({
+              items: [
+                {
+                  id: "second-signing-key",
+                  project_id: otherProject.id,
+                  kid: "kid_second_project",
+                  algorithm: "EdDSA",
+                  state: "active",
+                  ring_revision: 2,
+                  signing_epoch: 1,
+                  sign_not_before: null,
+                  verify_not_after: null,
+                  public_jwk: { kid: "kid_second_project" },
+                },
+              ],
+            }),
+          );
+        }
+        return Promise.resolve(Response.json({ items: [] }));
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/security/signing-keys`);
+    await unlock("owl_ctrl_v1_test", "Signing keys");
+    await waitFor(() => {
+      expect(staleRequest).toBeDefined();
+    });
+    fireEvent.change(screen.getByLabelText("Project context"), {
+      target: { value: otherProject.id },
+    });
+    fireEvent.click(
+      within(screen.getByRole("navigation", { name: "Resources" })).getByRole("link", {
+        name: "Signing keys",
+      }),
+    );
+    expect(await screen.findByText("kid_second_project")).toBeVisible();
+    expect(staleRequest?.signal.aborted).toBe(true);
+
+    await act(async () => {
+      resolveStale?.(
+        Response.json({
+          items: [
+            {
+              id: "stale-signing-key",
+              project_id: project.id,
+              kid: "kid_stale_project",
+              algorithm: "EdDSA",
+              state: "active",
+              ring_revision: 2,
+              signing_epoch: 1,
+              sign_not_before: null,
+              verify_not_after: null,
+              public_jwk: { kid: "kid_stale_project" },
+            },
+          ],
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("kid_stale_project")).not.toBeInTheDocument();
+    expect(screen.getByText("kid_second_project")).toBeVisible();
+  });
+
+  it("does not let a completed mutation refresh or message a different Project", async () => {
+    const otherProject = {
+      ...project,
+      id: "project-2",
+      public_id: "project_public_2",
+      display_name: "Second Project",
+    };
+    let firstProjectReads = 0;
+    let resolveRotation: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return Promise.resolve(systemResponse());
+        if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+          return Promise.resolve(Response.json({ items: [project, otherProject] }));
+        }
+        if (
+          url.pathname.endsWith(`/v1/projects/${project.id}/signing-keys/rotate`) &&
+          request.method === "POST"
+        ) {
+          return new Promise<Response>((resolve) => {
+            resolveRotation = resolve;
+          });
+        }
+        if (
+          url.pathname.endsWith(`/v1/projects/${project.id}/signing-keys`) &&
+          request.method === "GET"
+        ) {
+          firstProjectReads += 1;
+          return Promise.resolve(
+            Response.json({
+              items: [
+                {
+                  id: "first-signing-key",
+                  project_id: project.id,
+                  kid: "kid_first_project",
+                  algorithm: "EdDSA",
+                  state: "active",
+                  ring_revision: 2,
+                  signing_epoch: 1,
+                  sign_not_before: null,
+                  verify_not_after: null,
+                  public_jwk: { kid: "kid_first_project" },
+                },
+              ],
+            }),
+          );
+        }
+        if (url.pathname.endsWith(`/v1/projects/${otherProject.id}/signing-keys`)) {
+          return Promise.resolve(
+            Response.json({
+              items: [
+                {
+                  id: "second-signing-key",
+                  project_id: otherProject.id,
+                  kid: "kid_second_project",
+                  algorithm: "EdDSA",
+                  state: "active",
+                  ring_revision: 2,
+                  signing_epoch: 1,
+                  sign_not_before: null,
+                  verify_not_after: null,
+                  public_jwk: { kid: "kid_second_project" },
+                },
+              ],
+            }),
+          );
+        }
+        return Promise.resolve(Response.json({ items: [] }));
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/security/signing-keys`);
+    await unlock("owl_ctrl_v1_test", "Signing keys");
+    expect(await screen.findByText("kid_first_project")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Rotate signing key" }));
+    await waitFor(() => {
+      expect(resolveRotation).toBeDefined();
+    });
+
+    fireEvent.change(screen.getByLabelText("Project context"), {
+      target: { value: otherProject.id },
+    });
+    fireEvent.click(
+      within(screen.getByRole("navigation", { name: "Resources" })).getByRole("link", {
+        name: "Signing keys",
+      }),
+    );
+    expect(await screen.findByText("kid_second_project")).toBeVisible();
+    expect(screen.queryByText("kid_first_project")).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveRotation?.(
+        Response.json({
+          id: "pending-first-rotation",
+          project_id: project.id,
+          kid: "kid_pending_first_rotation",
+          algorithm: "EdDSA",
+          state: "provisioning",
+          ring_revision: 2,
+          signing_epoch: 1,
+          sign_not_before: null,
+          verify_not_after: null,
+          public_jwk: null,
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(firstProjectReads).toBe(1);
+    expect(screen.queryByText(/Signing key rotation accepted/u)).not.toBeInTheDocument();
+    expect(screen.queryByText("kid_first_project")).not.toBeInTheDocument();
+    expect(screen.getByText("kid_second_project")).toBeVisible();
+  });
+
   it("requires reviewed Custom OIDC preflight and discards its write-only secret", async () => {
     const submittedBodies: unknown[] = [];
     const policyUpdates: unknown[] = [];
@@ -336,9 +587,8 @@ describe("Control application shell", () => {
     expect(document.body.textContent).not.toContain("write-only-secret");
   });
 
-  it("keeps failed Project policies distinct from loading and offers safe retries", async () => {
+  it("keeps a failed Project policy distinct from loading and offers a safe retry", async () => {
     let policyReads = 0;
-    let projectionReads = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>((input) => {
@@ -365,23 +615,6 @@ describe("Control application shell", () => {
                 }),
           );
         }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/projection-policy`)) {
-          projectionReads += 1;
-          return Promise.resolve(
-            projectionReads === 1
-              ? Response.json(
-                  { code: "service_unavailable", detail: "temporary projection failure" },
-                  { status: 503 },
-                )
-              : Response.json({
-                  project_id: project.id,
-                  application_id: null,
-                  verified_email_enabled: true,
-                  revision: 4,
-                  expansion_operation_id: null,
-                }),
-          );
-        }
         throw new Error(`Unexpected request: ${request.method} ${url.pathname}`);
       }),
     );
@@ -389,18 +622,11 @@ describe("Control application shell", () => {
     renderConsole(`/projects/${project.id}/settings`);
     await unlock("owl_ctrl_v1_test", "Project settings");
     expect(await screen.findByRole("button", { name: "Retry Project policy" })).toBeVisible();
-    expect(
-      await screen.findByRole("button", { name: "Retry Project projection policy" }),
-    ).toBeVisible();
     expect(screen.queryByText("Loading Project policy")).toBeNull();
-    expect(screen.queryByText("Loading Project projection policy")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Retry Project policy" }));
-    fireEvent.click(screen.getByRole("button", { name: "Retry Project projection policy" }));
     expect(await screen.findByText("900 seconds")).toBeVisible();
-    expect(await screen.findByText("Available for Application projection")).toBeVisible();
     expect(policyReads).toBe(2);
-    expect(projectionReads).toBe(2);
   });
 
   it("routes client keys through one-time reveal, explicit disposal, and revisioned revoke", async () => {

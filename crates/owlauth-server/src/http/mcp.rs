@@ -27,18 +27,13 @@ use uuid::Uuid;
 
 use super::{ControlState, control_problem, timestamp, valid_control_authorization};
 use crate::{
-    application::{
-        ApplicationError, ConfirmedProjectionPolicyUpdate, McpConfirmationService,
-        ProjectionPolicyService, ProvisioningService, WebhookControlService,
-    },
+    application::{ApplicationError, ProvisioningService, WebhookControlService},
     config::{ListenerConfig, McpHttpConfig, OperatorApiKey},
 };
 
 #[derive(Clone)]
 struct McpApplicationServices {
     provisioning: Option<Arc<ProvisioningService>>,
-    projection_policy: Option<Arc<ProjectionPolicyService>>,
-    confirmation: Option<Arc<McpConfirmationService>>,
     webhooks: Option<Arc<WebhookControlService>>,
 }
 
@@ -46,8 +41,6 @@ impl From<&ControlState> for McpApplicationServices {
     fn from(state: &ControlState) -> Self {
         Self {
             provisioning: state.provisioning.clone(),
-            projection_policy: state.projection_policy.clone(),
-            confirmation: state.mcp_confirmation.clone(),
             webhooks: state.webhooks.clone(),
         }
     }
@@ -143,20 +136,6 @@ impl OwlAuthMcpServer {
     fn provisioning(&self) -> Result<&ProvisioningService, ApplicationError> {
         self.services
             .provisioning
-            .as_deref()
-            .ok_or(ApplicationError::Persistence)
-    }
-
-    fn projection_policy(&self) -> Result<&ProjectionPolicyService, ApplicationError> {
-        self.services
-            .projection_policy
-            .as_deref()
-            .ok_or(ApplicationError::Persistence)
-    }
-
-    fn confirmation(&self) -> Result<&McpConfirmationService, ApplicationError> {
-        self.services
-            .confirmation
             .as_deref()
             .ok_or(ApplicationError::Persistence)
     }
@@ -293,64 +272,6 @@ struct McpApplicationListOutput {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct McpProjectionPolicyOutput {
-    project_id: String,
-    application_id: Option<String>,
-    verified_email_enabled: bool,
-    revision: i64,
-    expansion_operation_id: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum McpProjectionPolicyUpdateEffect {
-    ExpandVerifiedEmail,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct McpProjectionPolicyPreviewOutput {
-    project_id: String,
-    application_id: Option<String>,
-    current_verified_email_enabled: bool,
-    current_revision: i64,
-    requested_verified_email_enabled: bool,
-    expected_revision: i64,
-    effect: McpProjectionPolicyUpdateEffect,
-    capability: String,
-    expires_at: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ProjectionPolicyUpdatePreviewInput {
-    /// Exact Project UUID returned by `OwlAuth` Control.
-    project_id: String,
-    /// Optional exact Application UUID. Omit to update the Project policy.
-    application_id: Option<String>,
-    /// Complete requested monotonic policy value.
-    verified_email_enabled: bool,
-    /// Exact current projection-policy revision.
-    expected_revision: i64,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ProjectionPolicyUpdateCommitInput {
-    /// Exact Project UUID supplied to preview.
-    project_id: String,
-    /// Exact optional Application UUID supplied to preview.
-    application_id: Option<String>,
-    /// Exact complete policy value supplied to preview.
-    verified_email_enabled: bool,
-    /// Exact projection-policy revision supplied to preview.
-    expected_revision: i64,
-    /// One-use capability returned by the matching preview tool call.
-    capability: String,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 struct McpWebhookEndpointOutput {
     id: String,
     public_id: String,
@@ -421,15 +342,6 @@ struct ApplicationInput {
     project_id: String,
     /// Exact Application UUID owned by the Project.
     application_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ProjectionPolicyInput {
-    /// Exact Project UUID returned by `OwlAuth` Control.
-    project_id: String,
-    /// Optional exact Application UUID. Omit to inspect the Project policy.
-    application_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -528,34 +440,6 @@ fn mcp_application(
         status: mcp_resource_status(&record.status)?,
         metadata_revision: record.metadata_revision,
         security_revision: record.security_revision,
-    })
-}
-
-fn mcp_projection_policy(
-    record: &crate::application::ProjectionPolicyRecord,
-) -> McpProjectionPolicyOutput {
-    McpProjectionPolicyOutput {
-        project_id: record.project_id.to_string(),
-        application_id: record.application_id.map(|value| value.to_string()),
-        verified_email_enabled: record.verified_email_enabled,
-        revision: record.revision,
-        expansion_operation_id: record.expansion_operation_id.map(|value| value.to_string()),
-    }
-}
-
-fn projection_policy_update_command(
-    project_id: &str,
-    application_id: Option<&str>,
-    verified_email_enabled: bool,
-    expected_revision: i64,
-) -> Result<ConfirmedProjectionPolicyUpdate, ErrorData> {
-    Ok(ConfirmedProjectionPolicyUpdate {
-        project_id: parse_uuid("project_id", project_id)?,
-        application_id: application_id
-            .map(|value| parse_uuid("application_id", value))
-            .transpose()?,
-        verified_email_enabled,
-        expected_revision,
     })
 }
 
@@ -754,118 +638,6 @@ impl OwlAuthMcpServer {
         self.result(result)
     }
 
-    /// Inspect the effective monotonic Project or Application projection policy.
-    #[tool(
-        name = "owlauth_projection_policy_get",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<McpProjectionPolicyOutput>(),
-        annotations(
-            title = "Get an OwlAuth projection policy",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn projection_policy_get(
-        &self,
-        Parameters(input): Parameters<ProjectionPolicyInput>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let project_id = parse_uuid("project_id", &input.project_id)?;
-        let application_id = input
-            .application_id
-            .as_deref()
-            .map(|value| parse_uuid("application_id", value))
-            .transpose()?;
-        let result = match self.projection_policy() {
-            Ok(service) => match application_id {
-                Some(application_id) => service
-                    .get_application(project_id, application_id)
-                    .await
-                    .map(|record| mcp_projection_policy(&record)),
-                None => service
-                    .get_project(project_id)
-                    .await
-                    .map(|record| mcp_projection_policy(&record)),
-            },
-            Err(error) => Err(error),
-        };
-        self.result(result)
-    }
-
-    /// Preview one exact monotonic projection-policy update and issue a short-lived one-use capability.
-    #[tool(
-        name = "owlauth_projection_policy_update_preview",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<McpProjectionPolicyPreviewOutput>(),
-        annotations(
-            title = "Preview an OwlAuth projection policy update",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn projection_policy_update_preview(
-        &self,
-        Parameters(input): Parameters<ProjectionPolicyUpdatePreviewInput>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let command = projection_policy_update_command(
-            &input.project_id,
-            input.application_id.as_deref(),
-            input.verified_email_enabled,
-            input.expected_revision,
-        )?;
-        let result = match self.confirmation() {
-            Ok(service) => service
-                .preview_projection_policy_update(command)
-                .await
-                .map(|preview| McpProjectionPolicyPreviewOutput {
-                    project_id: preview.policy.project_id.to_string(),
-                    application_id: preview.policy.application_id.map(|value| value.to_string()),
-                    current_verified_email_enabled: preview.policy.verified_email_enabled,
-                    current_revision: preview.policy.revision,
-                    requested_verified_email_enabled: input.verified_email_enabled,
-                    expected_revision: input.expected_revision,
-                    effect: McpProjectionPolicyUpdateEffect::ExpandVerifiedEmail,
-                    capability: preview.capability,
-                    expires_at: timestamp(preview.expires_at),
-                }),
-            Err(error) => Err(error),
-        };
-        self.result(result)
-    }
-
-    /// Commit only the exact command bound to a matching unexpired preview capability.
-    #[tool(
-        name = "owlauth_projection_policy_update_commit",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<McpProjectionPolicyOutput>(),
-        annotations(
-            title = "Commit an OwlAuth projection policy update",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn projection_policy_update_commit(
-        &self,
-        Parameters(input): Parameters<ProjectionPolicyUpdateCommitInput>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let command = projection_policy_update_command(
-            &input.project_id,
-            input.application_id.as_deref(),
-            input.verified_email_enabled,
-            input.expected_revision,
-        )?;
-        let result = match self.confirmation() {
-            Ok(service) => service
-                .commit_projection_policy_update(command, &input.capability, Uuid::new_v4())
-                .await
-                .map(|record| mcp_projection_policy(&record)),
-            Err(error) => Err(error),
-        };
-        self.result(result)
-    }
-
     /// List safe webhook endpoint lifecycle and secret-generation metadata.
     #[tool(
         name = "owlauth_webhook_endpoints_list",
@@ -955,7 +727,7 @@ impl ServerHandler for OwlAuthMcpServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("owlauth-server", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Bounded deployment-operator tools over OwlAuth Control application services. High-impact mutations require an exact preview capability and commit call.",
+                "Seven bounded, read-only deployment-operator inspection tools over OwlAuth Control application services.",
             )
     }
 }
@@ -1280,14 +1052,12 @@ mod tests {
         let server = OwlAuthMcpServer::new(
             McpApplicationServices {
                 provisioning: None,
-                projection_policy: None,
-                confirmation: None,
                 webhooks: None,
             },
             1024,
         );
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 7);
         for tool in tools {
             let schema = tool
                 .output_schema

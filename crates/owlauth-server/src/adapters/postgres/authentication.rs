@@ -154,11 +154,8 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
                 .await
                 .map_err(persistence)?
                 .ok_or(ApplicationError::RevisionConflict)?;
-            let provider_kind = super::provider_row::effective_provider_kind(
-                &provider.kind,
-                provider.adapter_kind.as_deref(),
-                &provider.issuer,
-            )?;
+            let provider_kind =
+                super::provider_row::effective_provider_kind(&provider.kind, &provider.issuer)?;
             if provider.status != "active"
                 || provider.revision != method.provider_revision
                 || provider.provider_key != method.method_key
@@ -920,11 +917,8 @@ pub(super) async fn revalidate_login_owners(
     if provider.status != "active" || Some(provider.revision) != method.provider_revision {
         return Err(ApplicationError::RevisionConflict);
     }
-    let provider_kind = super::provider_row::effective_provider_kind(
-        &provider.kind,
-        provider.adapter_kind.as_deref(),
-        &provider.issuer,
-    )?;
+    let provider_kind =
+        super::provider_row::effective_provider_kind(&provider.kind, &provider.issuer)?;
     let snapshot_kind = method
         .provider_kind
         .as_deref()
@@ -1235,11 +1229,22 @@ mod tests {
         .await
         .expect("seed policy");
         sqlx::query(
-            "INSERT INTO provider_configurations
+            "WITH material AS (
+                 INSERT INTO protected_materials
+                    (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                     provider_id,provider_format_version,context_version,context_digest,
+                     opaque_value,safe_fingerprint,state)
+                 VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                         'configuration_secret','software',1,1,
+                         decode(repeat('03',32),'hex'),decode('01','hex'),
+                         decode(repeat('02',32),'hex'),'live')
+                 RETURNING id
+             )
+             INSERT INTO provider_configurations
                 (id, project_id, provider_key, kind, display_name, issuer, client_id,
-                 callback_url, secret_ref, status, revision)
-             VALUES ($1, $2, 'oidc-main', 'oidc', 'OIDC', 'https://issuer.example',
-                 'client', $3, 'secret/ref/oidc-main', 'active', 1)",
+                 callback_url, secret_material_id, status, revision)
+             SELECT $1, $2, 'oidc-main', 'oidc', 'OIDC', 'https://issuer.example',
+                    'client', $3, material.id, 'active', 1 FROM material",
         )
         .bind(provider_id)
         .bind(project_id)

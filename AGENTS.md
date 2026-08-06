@@ -24,7 +24,7 @@ Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) for repository boundaries, devel
 - Official TypeScript, Python, and Rust SDKs cover Runtime Project Auth only. Client has a generated OpenAPI document but no official SDK and must never be imported into hosted-web code.
 - Keep Runtime, Client, and Control listeners, routers, readiness, admission, credentials, roles, serving pools, and pool bounds independently configurable, while all three planes remain bound to one PostgreSQL server/database authority. The Runtime Hosted Authentication UI and Control Management Console are the only browser surfaces.
 - PostgreSQL is the durable authority. Do not add browser credential persistence, file-store fallbacks, unreviewed secret delivery, or dependencies from CLI/SDKs into the server implementation.
-- Edit Rust DTOs in `owlauth-types`; regenerate derived OpenAPI/hosted-web contracts rather than hand-editing generated files. Add schema changes as ordered migrations; never edit the frozen initial migration.
+- Edit Rust DTOs in `owlauth-types`; regenerate derived OpenAPI/hosted-web contracts rather than hand-editing generated files. Until the first deployed schema is declared, rebuild clean module baselines instead of preserving pre-release migration history; after deployment, freeze those baselines and add ordered migrations only.
 
 ## Development quick start
 

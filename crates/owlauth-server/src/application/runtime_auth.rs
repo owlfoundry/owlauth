@@ -1018,7 +1018,10 @@ impl RuntimeAuthService {
                 &request.provider_key,
             )
             .await?;
-        let secret = self.provider_secrets.resolve(&provider.secret_ref).await?;
+        let secret = self
+            .provider_secrets
+            .resolve(provider.secret_material_id)
+            .await?;
         let verifier = self.protector.unprotect(
             ProtectedPurpose::ProviderPkce,
             transaction_id.as_bytes(),
@@ -1508,7 +1511,7 @@ impl RuntimeAuthService {
             preparation.access_token_lifetime_seconds,
             &preparation.signing_kid,
             &preparation.signing_public_jwk,
-            &preparation.signer_ref,
+            preparation.signing_material_id,
         )
         .await
     }
@@ -1528,7 +1531,7 @@ impl RuntimeAuthService {
             preparation.access_token_lifetime_seconds,
             &preparation.signing_kid,
             &preparation.signing_public_jwk,
-            &preparation.signer_ref,
+            preparation.signing_material_id,
         )
         .await
     }
@@ -1546,7 +1549,7 @@ impl RuntimeAuthService {
         lifetime_seconds: i64,
         kid: &str,
         public_jwk: &serde_json::Value,
-        signer_ref: &str,
+        signing_material_id: Uuid,
     ) -> Result<String, ApplicationError> {
         let now = self.clock.now();
         let header = AccessTokenHeader {
@@ -1572,7 +1575,10 @@ impl RuntimeAuthService {
         let payload = URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&claims).map_err(|_| ApplicationError::Integrity)?);
         let input = format!("{header}.{payload}");
-        let signature = self.signer.sign(signer_ref, input.as_bytes()).await?;
+        let signature = self
+            .signer
+            .sign(signing_material_id, input.as_bytes())
+            .await?;
         finish_signed_token(self.signer.as_ref(), public_jwk, &input, signature)
     }
 
@@ -2257,7 +2263,7 @@ mod tests {
     impl RuntimeSigner for RejectingGeneratedSignature {
         async fn sign(
             &self,
-            _signer_ref: &str,
+            _signing_material_id: Uuid,
             _signing_input: &[u8],
         ) -> Result<Vec<u8>, ApplicationError> {
             Ok(vec![7; 64])

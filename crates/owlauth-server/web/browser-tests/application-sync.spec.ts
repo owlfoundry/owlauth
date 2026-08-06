@@ -10,10 +10,8 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
 const controlBase = requiredEnvironment("OWLAUTH_E2E_CONTROL_BASE");
 const runtimeBase = requiredEnvironment("OWLAUTH_E2E_RUNTIME_BASE");
 const operatorKey = requiredEnvironment("OWLAUTH_E2E_OPERATOR_KEY");
-const providerOrigin = requiredEnvironment("OWLAUTH_E2E_PROVIDER_ORIGIN");
-const providerClientId = requiredEnvironment("OWLAUTH_E2E_PROVIDER_CLIENT_ID");
-const providerClientSecret = requiredEnvironment("OWLAUTH_E2E_PROVIDER_CLIENT_SECRET");
 const applicationOrigin = requiredEnvironment("OWLAUTH_E2E_APPLICATION_ORIGIN");
+const mailCaptureUrl = requiredEnvironment("OWLAUTH_E2E_MAIL_CAPTURE_URL");
 const webhookCaptureUrl = requiredEnvironment("OWLAUTH_E2E_WEBHOOK_CAPTURE_URL");
 const webhookEndpointUrl = requiredEnvironment("OWLAUTH_E2E_WEBHOOK_ENDPOINT_URL");
 
@@ -32,16 +30,13 @@ interface Application {
 
 interface SigningKey {
   readonly id: string;
-  readonly ring_revision: number;
+  readonly kid: string;
+  readonly state: string;
 }
 
-interface Provider {
-  readonly id: string;
-}
-
-interface ProjectionPolicy {
-  readonly revision: number;
-  readonly verified_email_enabled: boolean;
+interface EmailPolicy {
+  readonly policy_revision: number;
+  readonly security_revision: number;
 }
 
 interface WebhookEndpoint {
@@ -93,6 +88,7 @@ test("Block D public journey delivers immutable events and dispatches through Co
   const repository = resolve(import.meta.dirname, "../../../..");
   const configDirectory = await mkdtemp(resolve(tmpdir(), "owlauth-cli-e2e-"));
   await page.request.delete(webhookCaptureUrl);
+  await page.request.delete(mailCaptureUrl);
 
   try {
     const authority = await provision(page.request, suffix);
@@ -133,72 +129,53 @@ test("Block D public journey delivers immutable events and dispatches through Co
       project: authority.project.public_id,
       runtime: runtimeBase,
     });
+    const email = `block-d-${suffix}@example.test`;
     await page.goto(`${applicationOrigin}/backend/start?${parameters.toString()}`);
-    await page
-      .getByRole("button", { name: "Continue with Controlled Provider", exact: true })
-      .click();
+    await page.getByRole("button", { name: "Continue with email" }).click();
+    await page.getByRole("textbox", { name: "Email address", exact: true }).fill(email);
+    await page.getByRole("button", { name: "Send sign-in email" }).click();
+    const message = requiredValue(
+      (await waitForMail(page.request, 1)).at(-1),
+      "missing passwordless message",
+    );
+    await page.getByLabel("One-time code").fill(oneTimeCode(message));
+    await page.getByRole("button", { name: "Verify code" }).click();
     await expect(page.getByRole("heading", { name: "Backend-custody Application" })).toBeVisible();
 
     const retried = await waitForWebhookRetry(page.request);
     expect(retried.first.body).toBe(retried.retry.body);
     for (const item of retried.items) assertWebhookSignature(item, secret);
 
-    let events = await waitForEvents(
+    const events = await waitForEvents(
       page.request,
       authority.project.id,
       authority.application.id,
       1,
     );
-    const createdEvent = events.find((event) => event.event_type === "user.projection.created");
-    expect(createdEvent).toBeDefined();
-    const eventCountBeforeExpansion = events.length;
-    const captureCountBeforeExpansion = retried.items.length;
-
-    const projection = await controlGet<ProjectionPolicy>(
-      page.request,
-      `projects/${authority.project.id}/applications/${authority.application.id}/projection-policy`,
+    const createdEvent = requiredValue(
+      events.find((event) => event.event_type === "user.projection.created"),
+      "missing projection-created event",
     );
-    expect(projection.verified_email_enabled).toBe(false);
-    const preview = await mcpCall("owlauth_projection_policy_update_preview", {
-      application_id: authority.application.id,
-      expected_revision: projection.revision,
-      project_id: authority.project.id,
-      verified_email_enabled: true,
-    });
-    const capability = preview["capability"];
-    expect(typeof capability).toBe("string");
-    const committed = await mcpCall("owlauth_projection_policy_update_commit", {
-      application_id: authority.application.id,
-      capability,
-      expected_revision: projection.revision,
-      project_id: authority.project.id,
-      verified_email_enabled: true,
-    });
-    expect(committed["revision"]).toBe(projection.revision + 1);
-    expect(committed["verified_email_enabled"]).toBe(true);
-
-    events = await waitForEvents(
-      page.request,
+    expect(createdEvent.event_id).toBe(retried.first.eventId);
+    const createdBody = JSON.parse(retried.first.body) as {
+      data?: { projection?: { verified_email?: unknown } };
+    };
+    expect(createdBody.data?.projection?.verified_email).toBe(email);
+    const capturedAfterCreation = retried.items;
+    const mcpDelivery = await waitForMcpDelivery(
       authority.project.id,
       authority.application.id,
-      eventCountBeforeExpansion + 1,
+      endpoint.id,
+      createdEvent.event_id,
     );
-    expect(events[0]?.event_type).toBe("user.projection.updated");
-    expect(events.at(-1)?.event_type).toBe("user.projection.created");
-    expect(
-      events.filter((event) => event.event_type === "user.projection.updated").length,
-    ).toBeGreaterThanOrEqual(1);
+    expect(mcpDelivery["state"]).toBe("delivered");
+
     for (let index = 1; index < events.length; index += 1) {
       const previous = requiredValue(events[index - 1], "missing previous event");
       const current = requiredValue(events[index], "missing current event");
       expect(previous.projection_revision).toBeGreaterThan(current.projection_revision);
       expect(previous.user_revision).toBeGreaterThanOrEqual(current.user_revision);
     }
-    const afterExpansion = await waitForWebhookItems(page.request, captureCountBeforeExpansion + 1);
-    assertWebhookSignature(
-      requiredValue(afterExpansion.at(-1), "missing expanded webhook"),
-      secret,
-    );
 
     await run(repository, "cargo", ["build", "--quiet", "--locked", "-p", "owlauth-cli"]);
     const cli = resolve(
@@ -290,7 +267,7 @@ test("Block D public journey delivers immutable events and dispatches through Co
     ) as WebhookDelivery;
     expect(replay.replay_of_delivery_id).toBe(deliveredRetry.id);
     expect(replay.replay_sequence).toBe(1);
-    const replayed = await waitForWebhookItems(page.request, afterExpansion.length + 1);
+    const replayed = await waitForWebhookItems(page.request, capturedAfterCreation.length + 1);
     const replayAttempt = requiredValue(replayed.at(-1), "missing replay attempt");
     expect(replayAttempt.eventId).toBe(retried.first.eventId);
     expect(replayAttempt.body).toBe(retried.first.body);
@@ -310,9 +287,6 @@ test("Block D public journey delivers immutable events and dispatches through Co
     await expect(page.getByRole("heading", { name: "Immutable user events" })).toBeVisible();
     await expect(
       page.locator("code").filter({ hasText: "user.projection.created" }).first(),
-    ).toBeVisible();
-    await expect(
-      page.locator("code").filter({ hasText: "user.projection.updated" }).first(),
     ).toBeVisible();
     await expect(page.getByText(/Status: delivered/u).first()).toBeVisible();
     expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
@@ -385,49 +359,30 @@ async function provision(
       redirect_uris: [`${applicationOrigin}/backend/callback`],
     },
   );
-  const signingKey = await control<SigningKey>(
-    request,
-    "POST",
-    `projects/${project.id}/signing-keys`,
-    { expected_project_revision: project.metadata_revision },
-    `block-d-signing-${suffix}`,
-  );
-  expect(
-    (
-      await request.get(
-        `${runtimeBase}projects/${encodeURIComponent(project.public_id)}/.well-known/jwks.json`,
-      )
-    ).ok(),
-  ).toBe(true);
-  await delay(150);
-  await control<SigningKey>(
-    request,
-    "POST",
-    `projects/${project.id}/signing-keys/${signingKey.id}/activate`,
-    { expected_ring_revision: signingKey.ring_revision },
-  );
+  await rotateSigningKey(request, project, `block-d-signing-${suffix}`);
   project = await controlGet<Project>(request, `projects/${project.id}`);
-  const provider = await control<Provider>(
-    request,
-    "POST",
-    `projects/${project.id}/providers`,
-    {
-      client_id: providerClientId,
-      client_secret: providerClientSecret,
-      display_name: "Controlled Provider",
-      expected_project_revision: project.metadata_revision,
-      issuer: providerOrigin,
-      kind: "oidc",
-      managed_profile_enabled: true,
-      provider_key: "controlled-provider",
-    },
-    `block-d-provider-${suffix}`,
-  );
-  await control<Provider>(
+  const emailPolicy = await controlGet<EmailPolicy>(request, `projects/${project.id}/email-method`);
+  await control(request, "PUT", `projects/${project.id}/email-method`, {
+    allow_deployment_default: true,
+    enabled: true,
+    expected_policy_revision: emailPolicy.policy_revision,
+    expected_security_revision: emailPolicy.security_revision,
+    magic_link_enabled: true,
+    magic_validity_seconds: 300,
+    max_generations: 3,
+    otp_digits: 6,
+    otp_enabled: true,
+    otp_max_attempts: 3,
+    otp_validity_seconds: 300,
+    resend_after_seconds: 30,
+    signup_enabled: true,
+    transferred_magic_link_enabled: true,
+  });
+  await control(
     request,
     "PUT",
-    `projects/${project.id}/providers/${provider.id}/assignments/${application.id}`,
-    { expected_application_revision: application.security_revision },
+    `projects/${project.id}/applications/${application.id}/email-method`,
+    { enabled: true, expected_application_security_revision: application.security_revision },
   );
   application = await controlGet<Application>(
     request,
@@ -463,6 +418,58 @@ async function control<T>(
   return (await response.json()) as T;
 }
 
+async function rotateSigningKey(
+  request: APIRequestContext,
+  project: Project,
+  idempotencyKey: string,
+): Promise<void> {
+  await waitForSigningKey(request, project, undefined);
+  const currentProject = await controlGet<Project>(request, `projects/${project.id}`);
+  const rotated = await control<SigningKey>(
+    request,
+    "POST",
+    `projects/${project.id}/signing-keys/rotate`,
+    { expected_project_revision: currentProject.metadata_revision },
+    idempotencyKey,
+  );
+  const active = await waitForSigningKey(request, project, rotated.id);
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const response = await request.get(
+      `${runtimeBase}projects/${encodeURIComponent(project.public_id)}/.well-known/jwks.json`,
+    );
+    if (response.ok()) {
+      const body = (await response.json()) as { keys?: { kid?: string }[] };
+      if (body.keys?.some(({ kid }) => kid === active.kid) === true) return;
+    }
+    await delay(250);
+  }
+  throw new Error(`timed out waiting for signing key ${active.id} in Runtime JWKS`);
+}
+
+async function waitForSigningKey(
+  request: APIRequestContext,
+  project: Project,
+  keyId: string | undefined,
+): Promise<SigningKey> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const { items } = await controlGet<{ items: SigningKey[] }>(
+      request,
+      `projects/${project.id}/signing-keys`,
+    );
+    const candidate =
+      keyId === undefined
+        ? items.find(({ state }) => state === "active")
+        : items.find(({ id, state }) => id === keyId && state === "active");
+    if (candidate !== undefined) return candidate;
+    await delay(250);
+  }
+  throw new Error(
+    keyId === undefined
+      ? `timed out waiting for Project ${project.id} initial signing key`
+      : `timed out waiting for signing key ${keyId} to activate`,
+  );
+}
+
 async function mcpCall(
   name: string,
   arguments_: Record<string, unknown>,
@@ -493,6 +500,32 @@ async function mcpCall(
   return result.result?.structuredContent ?? {};
 }
 
+async function waitForMcpDelivery(
+  projectId: string,
+  applicationId: string,
+  endpointId: string,
+  eventId: string,
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const result = await mcpCall("owlauth_webhook_deliveries_list", {
+      application_id: applicationId,
+      cursor: null,
+      endpoint_id: endpointId,
+      limit: 10,
+      project_id: projectId,
+    });
+    const items = Array.isArray(result["items"])
+      ? (result["items"] as Record<string, unknown>[])
+      : [];
+    const delivered = items.find(
+      (item) => item["event_id"] === eventId && item["state"] === "delivered",
+    );
+    if (delivered !== undefined) return delivered;
+    await delay(250);
+  }
+  throw new Error(`timed out waiting for MCP delivery ${eventId}`);
+}
+
 async function waitForEvents(
   request: APIRequestContext,
   projectId: string,
@@ -508,6 +541,23 @@ async function waitForEvents(
     await delay(250);
   }
   throw new Error(`timed out waiting for ${String(count)} Application user events`);
+}
+
+async function waitForMail(request: APIRequestContext, count: number): Promise<string[]> {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    const response = await request.get(mailCaptureUrl);
+    expect(response.ok()).toBe(true);
+    const messages = ((await response.json()) as { messages: string[] }).messages;
+    if (messages.length >= count) return messages;
+    await delay(250);
+  }
+  throw new Error(`timed out waiting for ${String(count)} captured messages`);
+}
+
+function oneTimeCode(message: string): string {
+  const value = /One-time code: (\d{6,10})/u.exec(message)?.[1];
+  if (value === undefined) throw new Error("captured message has no OTP");
+  return value;
 }
 
 async function waitForWebhookRetry(request: APIRequestContext): Promise<{

@@ -5,20 +5,12 @@ use crate::{
     domain::{ProviderEgressMode, ProviderEgressPolicy, ProviderKind},
 };
 
-/// Decodes the strict live provider-row authority introduced by the provider-kind bridge.
-///
-/// Legacy reserved-root rows deliberately remain unavailable because a missing `adapter_kind`
-/// is an integrity failure; issuer inference is never a compatibility path.
+/// Decodes the closed provider kind and validates its issuer invariant.
 pub(super) fn effective_provider_kind(
-    legacy_kind: &str,
-    adapter_kind: Option<&str>,
+    stored_kind: &str,
     issuer: &str,
 ) -> Result<ProviderKind, ApplicationError> {
-    if legacy_kind != "oidc" {
-        return Err(ApplicationError::Integrity);
-    }
-    let kind = ProviderKind::parse(adapter_kind.ok_or(ApplicationError::Integrity)?)
-        .map_err(|_| ApplicationError::Integrity)?;
+    let kind = ProviderKind::parse(stored_kind).map_err(|_| ApplicationError::Integrity)?;
     if !kind.issuer_matches(issuer) {
         return Err(ApplicationError::Integrity);
     }
@@ -54,21 +46,17 @@ mod tests {
     use crate::domain::{GITHUB_ISSUER, GOOGLE_ISSUER};
 
     #[test]
-    fn live_provider_rows_require_explicit_kind_and_matching_issuer() {
+    fn live_provider_rows_require_a_closed_kind_and_matching_issuer() {
         assert_eq!(
-            effective_provider_kind("oidc", Some("google"), GOOGLE_ISSUER),
+            effective_provider_kind("google", GOOGLE_ISSUER),
             Ok(ProviderKind::Google)
         );
         assert_eq!(
-            effective_provider_kind("oidc", None, GOOGLE_ISSUER),
+            effective_provider_kind("google", GITHUB_ISSUER),
             Err(ApplicationError::Integrity)
         );
         assert_eq!(
-            effective_provider_kind("oidc", Some("google"), GITHUB_ISSUER),
-            Err(ApplicationError::Integrity)
-        );
-        assert_eq!(
-            effective_provider_kind("saml", Some("oidc"), "https://issuer.example"),
+            effective_provider_kind("saml", "https://issuer.example"),
             Err(ApplicationError::Integrity)
         );
     }

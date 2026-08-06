@@ -286,7 +286,7 @@ pub(crate) struct IdentityMutationProviderSlotAuthority {
     pub provider_key: String,
     pub issuer: String,
     pub client_id: String,
-    pub secret_ref: String,
+    pub secret_material_id: Uuid,
     pub callback_url: String,
     pub adapter_key: String,
     pub adapter_capability_revision: i64,
@@ -2378,7 +2378,10 @@ impl IdentityMutationRuntimeService {
         {
             return Err(ApplicationError::RevisionConflict);
         }
-        let secret = self.provider_secrets.resolve(&authority.secret_ref).await?;
+        let secret = self
+            .provider_secrets
+            .resolve(authority.secret_material_id)
+            .await?;
         let pkce = match &authority.provider_pkce {
             Some(value) => self.protector.unprotect(
                 ProtectedPurpose::IdentityMutationProviderPkce,
@@ -4086,7 +4089,10 @@ mod tests {
 
     #[async_trait]
     impl ProviderSecretResolver for TestSecrets {
-        async fn resolve(&self, _secret_ref: &str) -> Result<Zeroizing<String>, ApplicationError> {
+        async fn resolve(
+            &self,
+            _secret_material_id: Uuid,
+        ) -> Result<Zeroizing<String>, ApplicationError> {
             unreachable!()
         }
     }

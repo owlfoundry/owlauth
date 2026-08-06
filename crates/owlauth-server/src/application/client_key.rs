@@ -662,10 +662,6 @@ mod tests {
         fn digest_json(&self, _: &serde_json::Value) -> Result<Vec<u8>, ApplicationError> {
             Ok(vec![5_u8; 32])
         }
-
-        fn digest_bytes(&self, _: &[u8]) -> Vec<u8> {
-            vec![5_u8; 32]
-        }
     }
 
     struct CountingIssuer {

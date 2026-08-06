@@ -34,7 +34,7 @@ owlauth profile rebind local \
 
 Rebind requires `--credential-env`, rejects the existing reference, and shows the proposed new reference with both identities before confirmation. It never reads either credential. The confirmed operation replaces the complete identity pin and credential reference; no credential, typed client, or product context is carried across automatically.
 
-Profiles created by older CLI builds for the removed `owlauth-saas`/`saas-api-key` product pair are ignored in memory without rewriting `profiles.json`. Bind a name explicitly to a supported self-hosted endpoint with `profile add`; that confirmed profile mutation replaces the named entry and removes all other obsolete legacy entries from the next saved store. Any unknown product, credential class, or crossed pair fails closed as malformed profile storage rather than being discarded.
+Profile storage accepts only the current `owlauth-server`/`operator-api-key` schema. Any unknown product, credential class, crossed pair, field, or schema version fails closed as malformed profile storage.
 
 ## Typed dispatch
 
@@ -45,9 +45,8 @@ The self-hosted client supports typed commands for:
 - Project list/get/create/disable, token/session policy get/set, and Project-user list/get/identity/session inspection, disable, and exact session revoke;
 - Application list/get/create/disable and cursor-bounded immutable user-event history;
 - provider Project-egress get/set, Custom OIDC preflight, and list/create/disable/assign/unassign for the closed `oidc`, `google`, and `github` kinds;
-- signing-key list/create/activate/retire/revoke;
+- signing-key list/rotate/revoke, with provisioning, publication, activation, and retirement handled by the automatic lifecycle;
 - Project client-key list/create/acknowledge/revoke, with the credential emitted only by the original successful create;
-- Project- or Application-scoped projection-policy get/set;
 - webhook endpoint list/get/create/subscription update/test/activate/disable, write-only secret rotation prepare/activate, cursor-bounded delivery inspection, and explicit replay.
 
 Examples:
@@ -71,7 +70,7 @@ owlauth --profile local client-key acknowledge \
   --yes
 ```
 
-All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. `client-key create` leaves replacement creation blocked until the emitted credential is durably stored and the exact returned key revision is passed to `client-key acknowledge`, or the key is revoked. Acknowledgement is an explicit assertion about external secret-manager storage; successful stdout delivery alone does not make that assertion. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` and `--verified-email-enabled` require an explicit `true` or `false` value.
+All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. `client-key create` leaves replacement creation blocked until the emitted credential is durably stored and the exact returned key revision is passed to `client-key acknowledge`, or the key is revoked. Acknowledgement is an explicit assertion about external secret-manager storage; successful stdout delivery alone does not make that assertion. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` require an explicit `true` or `false` value.
 
 Provider client secrets and webhook signing secrets, including candidate rotation generations, are accepted only through named environment-variable references:
 
@@ -90,7 +89,7 @@ owlauth --profile local provider create \
 
 Named presets derive their fixed issuer and reject `--issuer`; Custom OIDC requires it. Before creating Custom OIDC, inspect or replace the Project policy with `provider egress-get` / `provider egress-set`, then run `provider preflight --issuer https://identity.example`. Raw secrets are never accepted as ordinary command arguments. Owned operator and resource-secret buffers are explicitly zeroized after use; the synchronous HTTP serializer may still create bounded transient transport-body copies that are dropped normally. A write-only resource secret must use a different environment reference and value from the active operator credential, preventing accidental operator-key submission to provider or webhook storage. Replace placeholders with real canonical values.
 
-The CLI intentionally omits generic HTTP/OpenAPI forwarding, Runtime and worker routes, raw database or key-store access, provider/key reconcile recovery, identity-mutation proof workflows, and operations absent from the reviewed public Control contract. Webhook replay is an explicit high-impact command: after an ambiguous transport outcome, inspect the paginated delivery history before deciding whether another replay is warranted.
+The CLI intentionally omits generic HTTP/OpenAPI forwarding, Runtime and worker routes, raw database or key-store access, provider reconcile and signing-lifecycle internals, identity-mutation proof workflows, and operations absent from the reviewed public Control contract. Webhook replay is an explicit high-impact command: after an ambiguous transport outcome, inspect the paginated delivery history before deciding whether another replay is warranted.
 
 ## Self-update
 

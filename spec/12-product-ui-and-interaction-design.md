@@ -414,7 +414,7 @@ The UI redesign is one source replacement capability delivered in reviewable ver
 4. **Hosted flow:** restyle method selection, email, identity mutation, reauthorization, logout, progress, and terminal states using the hosted composition and local provider visuals.
 5. **Qualification:** complete responsive, keyboard, focus, zoom, forced-color, reduced-motion, malicious-content, credential-disposal, screenshot review, and real-server browser gates at the canonical viewports.
 
-A stage MUST NOT leave a security-sensitive workflow reachable only through an unfinished visual affordance. Temporary compatibility routing MAY preserve direct links during the migration, but there is no second legacy application or alternate API.
+A stage MUST NOT leave a security-sensitive workflow reachable only through an unfinished visual affordance. The final route graph replaces obsolete routes directly; there is no compatibility router, second application, or alternate API.
 
 ## Acceptance criteria
 

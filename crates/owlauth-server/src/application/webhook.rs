@@ -16,8 +16,6 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-#[cfg(test)]
-use super::ConfigurationSecretProvisioner;
 use super::{
     ApplicationError, Clock, ConfigurationSecretSealers, PreparedSecretMaterial,
     SealedProtectedMaterial,
@@ -140,9 +138,7 @@ pub(crate) enum WebhookSecretPreparationState {
 pub(crate) struct PreparedWebhookSecret {
     pub endpoint: WebhookEndpointRecord,
     pub generation: i32,
-    #[cfg(test)]
-    pub secret_ref: String,
-    pub material: Option<PreparedSecretMaterial>,
+    pub material: PreparedSecretMaterial,
     pub preparation_state: WebhookSecretPreparationState,
     pub already_active: bool,
 }
@@ -150,9 +146,7 @@ pub(crate) struct PreparedWebhookSecret {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedWebhookEndpoint {
     pub endpoint: WebhookEndpointRecord,
-    #[cfg(test)]
-    pub secret_ref: String,
-    pub material: Option<PreparedSecretMaterial>,
+    pub material: PreparedSecretMaterial,
     pub preparation_state: WebhookSecretPreparationState,
 }
 
@@ -171,14 +165,6 @@ pub(crate) struct PrepareWebhookRotation {
     pub expected_revision: i64,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct ConfirmWebhookSecretProvisioned {
-    pub generation: i32,
-    pub expected_endpoint_revision: i64,
-    pub request_fingerprint: Vec<u8>,
-}
-
 #[async_trait]
 #[allow(
     clippy::too_many_arguments,
@@ -194,31 +180,18 @@ pub(crate) trait WebhookControlPort: Send + Sync {
         correlation_id: Uuid,
     ) -> Result<PreparedWebhookEndpoint, ApplicationError>;
 
-    #[cfg(test)]
-    async fn confirm_secret_provisioned(
+    async fn finalize_protected_secret(
         &self,
         project_id: Uuid,
         application_id: Uuid,
         endpoint_id: Uuid,
-        command: ConfirmWebhookSecretProvisioned,
+        generation: i32,
+        expected_endpoint_revision: i64,
+        request_fingerprint: &[u8],
+        material: SealedProtectedMaterial,
         now: OffsetDateTime,
         correlation_id: Uuid,
     ) -> Result<(), ApplicationError>;
-
-    async fn finalize_protected_secret(
-        &self,
-        _project_id: Uuid,
-        _application_id: Uuid,
-        _endpoint_id: Uuid,
-        _generation: i32,
-        _expected_endpoint_revision: i64,
-        _request_fingerprint: &[u8],
-        _material: SealedProtectedMaterial,
-        _now: OffsetDateTime,
-        _correlation_id: Uuid,
-    ) -> Result<(), ApplicationError> {
-        Err(ApplicationError::Integrity)
-    }
 
     async fn get_endpoint(
         &self,
@@ -332,8 +305,6 @@ pub(crate) struct WebhookControlService {
     secret_sealers: ConfigurationSecretSealers,
     validator: Arc<dyn WebhookEndpointValidator>,
     clock: Arc<dyn Clock>,
-    #[cfg(test)]
-    secrets: Option<Arc<dyn ConfigurationSecretProvisioner>>,
 }
 
 impl WebhookControlService {
@@ -348,34 +319,7 @@ impl WebhookControlService {
             secret_sealers,
             validator,
             clock,
-            #[cfg(test)]
-            secrets: None,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new(
-        port: Arc<dyn WebhookControlPort>,
-        secrets: Arc<dyn ConfigurationSecretProvisioner>,
-        validator: Arc<dyn WebhookEndpointValidator>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
-            port,
-            secret_sealers: ConfigurationSecretSealers::default(),
-            validator,
-            clock,
-            secrets: Some(secrets),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_secret_sealer<S>(mut self, secret_sealer: S) -> Self
-    where
-        S: owlauth_key_provider::ConfigurationSecretSealer + 'static,
-    {
-        self.secret_sealers = ConfigurationSecretSealers::single(secret_sealer);
-        self
     }
 
     #[allow(
@@ -403,17 +347,6 @@ impl WebhookControlService {
                 subscriptions.join("\0").as_bytes(),
             ])
         };
-        #[cfg(test)]
-        let fingerprint = if self.secret_sealers.is_empty() {
-            self.secrets
-                .as_ref()
-                .ok_or(ApplicationError::Integrity)?
-                .request_fingerprint(&command.secret)
-                .to_vec()
-        } else {
-            protected_fingerprint()
-        };
-        #[cfg(not(test))]
         let fingerprint = protected_fingerprint();
         let prepared = self
             .port
@@ -430,64 +363,36 @@ impl WebhookControlService {
                 correlation_id,
             )
             .await?;
-        if prepared.material.is_some()
-            || prepared.preparation_state == WebhookSecretPreparationState::Pending
-        {
-            if let Some(material) = prepared.material.clone() {
-                let sealer = self.secret_sealers.resolve(&material)?;
-                let protected_secret = sealer
-                    .seal(SealSecretRequest {
-                        context: material.context,
-                        plaintext: SecretPlaintext::from_zeroizing(command.secret)
-                            .map_err(|_| ApplicationError::InvalidInput)?,
-                    })
-                    .await
-                    .map_err(super::provisioning::map_provider_error)?;
-                self.port
-                    .finalize_protected_secret(
-                        project_id,
-                        application_id,
-                        prepared.endpoint.id,
-                        1,
-                        prepared.endpoint.revision,
-                        &fingerprint,
-                        SealedProtectedMaterial {
-                            material_id: material.material_id,
-                            provider_id: material.provider_id,
-                            provider_format_version: material.provider_format_version,
-                            envelope: protected_secret.envelope,
-                            request_fingerprint: protected_secret.request_fingerprint,
-                        },
-                        self.clock.now(),
-                        correlation_id,
-                    )
-                    .await?;
-            } else {
-                #[cfg(not(test))]
-                return Err(ApplicationError::Integrity);
-                #[cfg(test)]
-                {
-                    self.secrets
-                        .as_ref()
-                        .ok_or(ApplicationError::Integrity)?
-                        .provision_if_absent(prepared.secret_ref.clone(), command.secret)
-                        .await?;
-                    self.port
-                        .confirm_secret_provisioned(
-                            project_id,
-                            application_id,
-                            prepared.endpoint.id,
-                            ConfirmWebhookSecretProvisioned {
-                                generation: 1,
-                                expected_endpoint_revision: prepared.endpoint.revision,
-                                request_fingerprint: fingerprint,
-                            },
-                            self.clock.now(),
-                            correlation_id,
-                        )
-                        .await?;
-                }
-            }
+        if prepared.preparation_state != WebhookSecretPreparationState::Terminal {
+            let material = prepared.material.clone();
+            let sealer = self.secret_sealers.resolve(&material)?;
+            let protected_secret = sealer
+                .seal(SealSecretRequest {
+                    context: material.context,
+                    plaintext: SecretPlaintext::from_zeroizing(command.secret)
+                        .map_err(|_| ApplicationError::InvalidInput)?,
+                })
+                .await
+                .map_err(super::provisioning::map_provider_error)?;
+            self.port
+                .finalize_protected_secret(
+                    project_id,
+                    application_id,
+                    prepared.endpoint.id,
+                    1,
+                    prepared.endpoint.revision,
+                    &fingerprint,
+                    SealedProtectedMaterial {
+                        material_id: material.material_id,
+                        provider_id: material.provider_id,
+                        provider_format_version: material.provider_format_version,
+                        envelope: protected_secret.envelope,
+                        request_fingerprint: protected_secret.request_fingerprint,
+                    },
+                    self.clock.now(),
+                    correlation_id,
+                )
+                .await?;
         }
         Ok(prepared.endpoint)
     }
@@ -638,17 +543,6 @@ impl WebhookControlService {
                 command.idempotency_key.as_bytes(),
             ])
         };
-        #[cfg(test)]
-        let fingerprint = if self.secret_sealers.is_empty() {
-            self.secrets
-                .as_ref()
-                .ok_or(ApplicationError::Integrity)?
-                .request_fingerprint(&command.secret)
-                .to_vec()
-        } else {
-            protected_fingerprint()
-        };
-        #[cfg(not(test))]
         let fingerprint = protected_fingerprint();
         let prepared = self
             .port
@@ -665,64 +559,36 @@ impl WebhookControlService {
                 correlation_id,
             )
             .await?;
-        if prepared.material.is_some()
-            || prepared.preparation_state == WebhookSecretPreparationState::Pending
-        {
-            if let Some(material) = prepared.material.clone() {
-                let sealer = self.secret_sealers.resolve(&material)?;
-                let protected_secret = sealer
-                    .seal(SealSecretRequest {
-                        context: material.context,
-                        plaintext: SecretPlaintext::from_zeroizing(command.secret)
-                            .map_err(|_| ApplicationError::InvalidInput)?,
-                    })
-                    .await
-                    .map_err(super::provisioning::map_provider_error)?;
-                self.port
-                    .finalize_protected_secret(
-                        project_id,
-                        application_id,
-                        endpoint_id,
-                        prepared.generation,
-                        prepared.endpoint.revision,
-                        &fingerprint,
-                        SealedProtectedMaterial {
-                            material_id: material.material_id,
-                            provider_id: material.provider_id,
-                            provider_format_version: material.provider_format_version,
-                            envelope: protected_secret.envelope,
-                            request_fingerprint: protected_secret.request_fingerprint,
-                        },
-                        self.clock.now(),
-                        correlation_id,
-                    )
-                    .await?;
-            } else {
-                #[cfg(not(test))]
-                return Err(ApplicationError::Integrity);
-                #[cfg(test)]
-                {
-                    self.secrets
-                        .as_ref()
-                        .ok_or(ApplicationError::Integrity)?
-                        .provision_if_absent(prepared.secret_ref.clone(), command.secret)
-                        .await?;
-                    self.port
-                        .confirm_secret_provisioned(
-                            project_id,
-                            application_id,
-                            endpoint_id,
-                            ConfirmWebhookSecretProvisioned {
-                                generation: prepared.generation,
-                                expected_endpoint_revision: prepared.endpoint.revision,
-                                request_fingerprint: fingerprint,
-                            },
-                            self.clock.now(),
-                            correlation_id,
-                        )
-                        .await?;
-                }
-            }
+        if prepared.preparation_state != WebhookSecretPreparationState::Terminal {
+            let material = prepared.material.clone();
+            let sealer = self.secret_sealers.resolve(&material)?;
+            let protected_secret = sealer
+                .seal(SealSecretRequest {
+                    context: material.context,
+                    plaintext: SecretPlaintext::from_zeroizing(command.secret)
+                        .map_err(|_| ApplicationError::InvalidInput)?,
+                })
+                .await
+                .map_err(super::provisioning::map_provider_error)?;
+            self.port
+                .finalize_protected_secret(
+                    project_id,
+                    application_id,
+                    endpoint_id,
+                    prepared.generation,
+                    prepared.endpoint.revision,
+                    &fingerprint,
+                    SealedProtectedMaterial {
+                        material_id: material.material_id,
+                        provider_id: material.provider_id,
+                        provider_format_version: material.provider_format_version,
+                        envelope: protected_secret.envelope,
+                        request_fingerprint: protected_secret.request_fingerprint,
+                    },
+                    self.clock.now(),
+                    correlation_id,
+                )
+                .await?;
         }
         Ok(prepared)
     }
@@ -827,9 +693,7 @@ impl WebhookControlService {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClaimedWebhookSecretCleanup {
     pub id: Uuid,
-    pub secret_ref: String,
-    pub legacy_secret_ref: Option<String>,
-    pub material_id: Option<Uuid>,
+    pub material_id: Uuid,
     pub lease_owner: String,
     pub lease_incarnation: Uuid,
     pub lease_generation: i64,
@@ -844,8 +708,8 @@ pub(crate) struct ClaimedWebhookDelivery {
     pub event_id: String,
     pub endpoint_url: String,
     pub raw_body: Vec<u8>,
-    pub primary_secret_ref: String,
-    pub overlap_secret_ref: Option<String>,
+    pub primary_secret_material_id: Uuid,
+    pub overlap_secret_material_id: Option<Uuid>,
     pub attempt_number: i32,
 }
 
@@ -896,8 +760,7 @@ pub(crate) trait WebhookDeliveryRepository: Send + Sync {
 
 #[async_trait]
 pub(crate) trait WebhookSecretResolver: Send + Sync {
-    async fn resolve(&self, secret_ref: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError>;
-    async fn erase(&self, secret_ref: &str) -> Result<(), ApplicationError>;
+    async fn resolve(&self, material_id: Uuid) -> Result<Zeroizing<Vec<u8>>, ApplicationError>;
 }
 
 #[async_trait]
@@ -987,7 +850,7 @@ impl WebhookWorker {
             return Ok(false);
         };
         let attempt_timestamp = now.unix_timestamp();
-        let Ok(primary) = self.secrets.resolve(&claim.primary_secret_ref).await else {
+        let Ok(primary) = self.secrets.resolve(claim.primary_secret_material_id).await else {
             return self
                 .finish_claim(
                     &claim,
@@ -1013,8 +876,8 @@ impl WebhookWorker {
                 .await;
         };
         let mut signatures = vec![primary_signature];
-        if let Some(overlap_ref) = claim.overlap_secret_ref.as_deref() {
-            let Ok(overlap) = self.secrets.resolve(overlap_ref).await else {
+        if let Some(overlap_material_id) = claim.overlap_secret_material_id {
+            let Ok(overlap) = self.secrets.resolve(overlap_material_id).await else {
                 return self
                     .finish_claim(
                         &claim,
@@ -1069,9 +932,6 @@ impl WebhookWorker {
         else {
             return Ok(false);
         };
-        if cleanup.material_id.is_none() {
-            self.secrets.erase(&cleanup.secret_ref).await?;
-        }
         self.repository
             .finish_secret_cleanup(&cleanup, self.clock.now())
             .await?;
@@ -1344,11 +1204,10 @@ mod tests {
 
     #[async_trait]
     impl WebhookSecretResolver for UnavailableSecretResolver {
-        async fn resolve(&self, _secret_ref: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
-            Err(ApplicationError::ExternalStore)
-        }
-
-        async fn erase(&self, _secret_ref: &str) -> Result<(), ApplicationError> {
+        async fn resolve(
+            &self,
+            _material_id: Uuid,
+        ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             Err(ApplicationError::ExternalStore)
         }
     }
@@ -1381,8 +1240,8 @@ mod tests {
                 event_id: "evt_12345678".to_owned(),
                 endpoint_url: "https://hooks.example/events".to_owned(),
                 raw_body: b"{}".to_vec(),
-                primary_secret_ref: "missing".to_owned(),
-                overlap_secret_ref: None,
+                primary_secret_material_id: Uuid::from_u128(3),
+                overlap_secret_material_id: None,
                 attempt_number: 1,
             })),
             finished: Mutex::new(None),

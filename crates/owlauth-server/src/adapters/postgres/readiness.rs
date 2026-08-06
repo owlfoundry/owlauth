@@ -334,7 +334,6 @@ impl PostgresReadinessAdapter {
                 .map(|provider| {
                     let kind = super::provider_row::effective_provider_kind(
                         &provider.kind,
-                        provider.adapter_kind.as_deref(),
                         &provider.issuer,
                     )?;
                     Ok(PublicProvider {
@@ -466,6 +465,39 @@ impl PostgresReadinessAdapter {
         Ok(())
     }
 
+    async fn observe_signing_revisions(&self, limit: usize) -> Result<usize, ApplicationError> {
+        let limit = u64::try_from(limit).map_err(|_| ApplicationError::InvalidInput)?;
+        if !(1..=100).contains(&limit) {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let rings = project_key_ring::Entity::find()
+            .filter(project_key_ring::Column::Purpose.eq("application_tokens"))
+            .filter(project_key_ring::Column::Algorithm.eq("EdDSA"))
+            .order_by_asc(project_key_ring::Column::ProjectId)
+            .order_by_asc(project_key_ring::Column::Id)
+            .limit(limit)
+            .all(&self.database)
+            .await
+            .map_err(persistence)?;
+        let mut observed = 0;
+        for ring in rings {
+            let Some(project) = project::Entity::find_by_id(ring.project_id)
+                .filter(project::Column::Status.eq("active"))
+                .one(&self.database)
+                .await
+                .map_err(persistence)?
+            else {
+                continue;
+            };
+            match self.project_jwks(&project.public_id).await {
+                Ok(_) => observed += 1,
+                Err(ApplicationError::NotFound | ApplicationError::RevisionConflict) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(observed)
+    }
+
     async fn lock_local_runtime_incarnation<C: ConnectionTrait>(
         &self,
         connection: &C,
@@ -531,5 +563,9 @@ impl ReadinessPort for PostgresReadinessAdapter {
         project_public_id: &str,
     ) -> Result<JwksDocument, ApplicationError> {
         PostgresReadinessAdapter::project_jwks(self, project_public_id).await
+    }
+
+    async fn observe_signing_revisions(&self, limit: usize) -> Result<usize, ApplicationError> {
+        PostgresReadinessAdapter::observe_signing_revisions(self, limit).await
     }
 }

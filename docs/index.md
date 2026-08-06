@@ -41,7 +41,7 @@ features:
 ---
 
 ::: warning Beta
-OwlAuth is Beta for its delivered self-hosted server, backend-only Client API, CLI, Hosted Authentication and Management Console, and TypeScript/Python/Rust Runtime Project Auth SDK scope. It includes OIDC and passwordless-email login, managed provider profile synchronization, Project session/token lifecycles, revisioned Application projections with signed webhooks, and optional remote Control MCP. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment; operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and downstream OAuth authorization-server behavior are outside the current product.
+OwlAuth is pre-1.0. APIs and deployment requirements may change; review the deployment and security guides before operating it.
 :::
 
 ## The product model

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::{
     application::{
         ApplicationError, DurableEmailAddressReader, ProjectionVerifiedEmailProtector,
-        ProtectedPurpose, ProtectedValue, RuntimeProtector,
+        ProtectedValue,
     },
     domain::{
         ProfileDisplayName, ProfileLocale, ProfilePictureUrl, ProjectUserStatus,
@@ -24,14 +24,13 @@ use crate::{
 use super::{
     authentication::persistence,
     entity::{
-        application, application_user_binding, application_user_projection, project,
-        project_policy, project_user,
+        application, application_user_binding, application_user_projection, project, project_user,
     },
 };
 
 pub(super) const MAX_APPLICATION_BINDINGS_PER_USER: usize = 64;
 
-pub(super) trait ProjectionCryptography: Send + Sync {
+pub(crate) trait ProjectionCryptography: Send + Sync {
     fn projection_write_version(&self) -> i32;
     fn projection_readable_versions(&self) -> std::collections::BTreeSet<i32>;
     fn read_durable_email(
@@ -56,81 +55,6 @@ pub(super) trait ProjectionCryptography: Send + Sync {
         projection_revision: i64,
         value: &ProtectedValue,
     ) -> Result<zeroize::Zeroizing<String>, ApplicationError>;
-}
-
-impl<T: RuntimeProtector + ?Sized> ProjectionCryptography for T {
-    fn projection_write_version(&self) -> i32 {
-        self.projection_email_write_version()
-    }
-
-    fn projection_readable_versions(&self) -> std::collections::BTreeSet<i32> {
-        self.projection_email_readable_versions()
-    }
-
-    fn read_durable_email(
-        &self,
-        project_id: uuid::Uuid,
-        identity_id: uuid::Uuid,
-        value: &ProtectedValue,
-    ) -> Result<zeroize::Zeroizing<String>, ApplicationError> {
-        let plaintext = self.unprotect(
-            ProtectedPurpose::EmailIdentityAddress,
-            &email_identity_context(project_id, identity_id),
-            value,
-        )?;
-        let text =
-            std::str::from_utf8(plaintext.as_slice()).map_err(|_| ApplicationError::Integrity)?;
-        let canonical = crate::domain::CanonicalEmail::parse_v1(text)
-            .map_err(|_| ApplicationError::Integrity)?;
-        Ok(zeroize::Zeroizing::new(canonical.expose().to_owned()))
-    }
-
-    fn protect_projection_email(
-        &self,
-        project_id: uuid::Uuid,
-        application_id: uuid::Uuid,
-        user_id: uuid::Uuid,
-        projection_revision: i64,
-        email: &[u8],
-    ) -> Result<ProtectedValue, ApplicationError> {
-        self.protect(
-            ProtectedPurpose::ApplicationProjectionVerifiedEmail,
-            &projection_verified_email_context(
-                project_id,
-                application_id,
-                user_id,
-                projection_revision,
-            )?,
-            email,
-        )
-    }
-
-    fn unprotect_projection_email(
-        &self,
-        project_id: uuid::Uuid,
-        application_id: uuid::Uuid,
-        user_id: uuid::Uuid,
-        projection_revision: i64,
-        value: &ProtectedValue,
-    ) -> Result<zeroize::Zeroizing<String>, ApplicationError> {
-        self.unprotect(
-            ProtectedPurpose::ApplicationProjectionVerifiedEmail,
-            &projection_verified_email_context(
-                project_id,
-                application_id,
-                user_id,
-                projection_revision,
-            )?,
-            value,
-        )
-        .and_then(|plaintext| {
-            let text = std::str::from_utf8(plaintext.as_slice())
-                .map_err(|_| ApplicationError::Integrity)?;
-            let canonical = crate::domain::CanonicalEmail::parse_v1(text)
-                .map_err(|_| ApplicationError::Integrity)?;
-            Ok(zeroize::Zeroizing::new(canonical.expose().to_owned()))
-        })
-    }
 }
 
 struct NarrowProjectionCryptography {
@@ -193,7 +117,9 @@ impl ProjectionCryptography for NarrowProjectionCryptography {
 }
 
 #[async_trait]
-pub(crate) trait IdentityProjectionMaterializer: Send + Sync {
+pub(crate) trait IdentityProjectionMaterializer:
+    ProjectionCryptography + Send + Sync
+{
     async fn fan_out_user(
         &self,
         transaction: &sea_orm::DatabaseTransaction,
@@ -219,8 +145,7 @@ impl PostgresIdentityProjectionMaterializer {
         }
     }
 
-    /// Converge one existing binding to the current monotonic projection policies. The immutable
-    /// event is appended in the caller's transaction only when public projection semantics change.
+    #[cfg(test)]
     pub(crate) async fn converge_binding(
         &self,
         transaction: &sea_orm::DatabaseTransaction,
@@ -246,12 +171,6 @@ impl PostgresIdentityProjectionMaterializer {
         if project.status != "active" {
             return Ok(());
         }
-        let policy = project_policy::Entity::find_by_id(hint.project_id)
-            .lock_shared()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
         let application = application::Entity::find_by_id(hint.application_id)
             .filter(application::Column::ProjectId.eq(hint.project_id))
             .lock_shared()
@@ -294,10 +213,6 @@ impl PostgresIdentityProjectionMaterializer {
             projection,
             application.id,
             &user,
-            policy.projection_revision,
-            application.projection_revision,
-            policy.projection_verified_email_enabled,
-            application.projection_verified_email_enabled,
             &self.cryptography,
             now,
         )
@@ -323,28 +238,57 @@ impl PostgresIdentityProjectionMaterializer {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct LegacyRuntimeProjectionMaterializer {
-    protector: Arc<dyn RuntimeProtector>,
-}
-
-#[cfg(test)]
-impl LegacyRuntimeProjectionMaterializer {
-    pub(crate) fn new(protector: Arc<dyn RuntimeProtector>) -> Self {
-        Self { protector }
+impl ProjectionCryptography for PostgresIdentityProjectionMaterializer {
+    fn projection_write_version(&self) -> i32 {
+        self.cryptography.projection_write_version()
     }
-}
 
-#[cfg(test)]
-#[async_trait]
-impl IdentityProjectionMaterializer for LegacyRuntimeProjectionMaterializer {
-    async fn fan_out_user(
+    fn projection_readable_versions(&self) -> std::collections::BTreeSet<i32> {
+        self.cryptography.projection_readable_versions()
+    }
+
+    fn read_durable_email(
         &self,
-        transaction: &sea_orm::DatabaseTransaction,
-        user: &project_user::Model,
-        now: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        fan_out_projected_user(transaction, user, self.protector.as_ref(), now).await
+        project_id: uuid::Uuid,
+        identity_id: uuid::Uuid,
+        value: &ProtectedValue,
+    ) -> Result<zeroize::Zeroizing<String>, ApplicationError> {
+        self.cryptography
+            .read_durable_email(project_id, identity_id, value)
+    }
+
+    fn protect_projection_email(
+        &self,
+        project_id: uuid::Uuid,
+        application_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        projection_revision: i64,
+        email: &[u8],
+    ) -> Result<ProtectedValue, ApplicationError> {
+        self.cryptography.protect_projection_email(
+            project_id,
+            application_id,
+            user_id,
+            projection_revision,
+            email,
+        )
+    }
+
+    fn unprotect_projection_email(
+        &self,
+        project_id: uuid::Uuid,
+        application_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        projection_revision: i64,
+        value: &ProtectedValue,
+    ) -> Result<zeroize::Zeroizing<String>, ApplicationError> {
+        self.cryptography.unprotect_projection_email(
+            project_id,
+            application_id,
+            user_id,
+            projection_revision,
+            value,
+        )
     }
 }
 
@@ -396,33 +340,22 @@ pub(super) fn base_profile_digest(
     Ok(Sha256::digest(canonical).to_vec())
 }
 
+#[cfg(test)]
 pub(super) fn projection_material(
     user: &project_user::Model,
     projection_revision: i64,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
 ) -> Result<(Value, Vec<u8>), ApplicationError> {
-    let (wire_document, digest) = projection_material_with_verified_email(
-        user,
-        projection_revision,
-        project_projection_revision,
-        application_projection_revision,
-        None,
-    )?;
+    let (wire_document, digest) =
+        projection_material_with_verified_email(user, projection_revision, None)?;
     Ok((safe_projection_document(&wire_document)?, digest))
 }
 
 pub(super) fn projection_material_with_verified_email(
     user: &project_user::Model,
     projection_revision: i64,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
     verified_email: Option<String>,
 ) -> Result<(Value, Vec<u8>), ApplicationError> {
-    if projection_revision <= 0
-        || project_projection_revision <= 0
-        || application_projection_revision <= 0
-    {
+    if projection_revision <= 0 {
         return Err(ApplicationError::Integrity);
     }
     let source = UserProjectionSource {
@@ -488,42 +421,20 @@ pub(super) fn safe_projection_document(wire_document: &Value) -> Result<Value, A
     Ok(document)
 }
 
-pub(super) fn projection_verified_email_context(
-    project_id: uuid::Uuid,
-    application_id: uuid::Uuid,
-    user_id: uuid::Uuid,
-    projection_revision: i64,
-) -> Result<Vec<u8>, ApplicationError> {
-    if projection_revision <= 0 {
-        return Err(ApplicationError::Integrity);
-    }
-    let mut context = Vec::with_capacity(80);
-    context.extend_from_slice(b"owlauth-application-projection-email-v1\0");
-    context.extend_from_slice(project_id.as_bytes());
-    context.extend_from_slice(application_id.as_bytes());
-    context.extend_from_slice(user_id.as_bytes());
-    context.extend_from_slice(&projection_revision.to_be_bytes());
-    context.extend_from_slice(crate::domain::USER_PROJECTION_SCHEMA_V1.as_bytes());
-    Ok(context)
-}
-
 #[cfg(test)]
 pub(super) fn protect_projection_verified_email(
-    protector: &dyn RuntimeProtector,
+    protector: &dyn ProjectionVerifiedEmailProtector,
     project_id: uuid::Uuid,
     application_id: uuid::Uuid,
     user_id: uuid::Uuid,
     projection_revision: i64,
     email: &str,
 ) -> Result<ProtectedValue, ApplicationError> {
-    protector.protect(
-        ProtectedPurpose::ApplicationProjectionVerifiedEmail,
-        &projection_verified_email_context(
-            project_id,
-            application_id,
-            user_id,
-            projection_revision,
-        )?,
+    protector.protect_verified_email(
+        project_id,
+        application_id,
+        user_id,
+        projection_revision,
         email.as_bytes(),
     )
 }
@@ -625,82 +536,9 @@ pub(super) async fn primary_verified_email<P: ProjectionCryptography + ?Sized>(
     Ok(Some((identity_id, (*plaintext).clone())))
 }
 
-fn email_identity_context(project_id: uuid::Uuid, identity_id: uuid::Uuid) -> Vec<u8> {
-    let mut context = Vec::with_capacity(58);
-    context.extend_from_slice(b"owlauth-email-identity-v1\0");
-    context.extend_from_slice(project_id.as_bytes());
-    context.extend_from_slice(identity_id.as_bytes());
-    context
-}
-
-pub(super) fn authoritative_projection_material(
-    projection: Option<&application_user_projection::Model>,
-    user: &project_user::Model,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
-) -> Result<ProjectionMaterial, ApplicationError> {
-    let Some(existing) = projection else {
-        let (document, digest) = projection_material(
-            user,
-            1,
-            project_projection_revision,
-            application_projection_revision,
-        )?;
-        return Ok(ProjectionMaterial {
-            revision: 1,
-            storage_document: document.clone(),
-            document,
-            digest,
-            verified_email_source_identity_id: None,
-            verified_email_ciphertext: None,
-            verified_email_key_version: None,
-            semantic_change: true,
-            storage_repair_required: true,
-        });
-    };
-
-    let semantic_change = existing.user_id != user.id
-        || existing.source_user_revision != user.user_revision
-        || existing.project_policy_revision != project_projection_revision
-        || existing.application_policy_revision != application_projection_revision;
-    let revision = if semantic_change {
-        existing
-            .projection_revision
-            .checked_add(1)
-            .ok_or(ApplicationError::Integrity)?
-    } else {
-        existing.projection_revision
-    };
-    let (document, digest) = projection_material(
-        user,
-        revision,
-        project_projection_revision,
-        application_projection_revision,
-    )?;
-    let storage_repair_required = semantic_change
-        || existing.document != document
-        || !bool::from(existing.canonical_digest.as_slice().ct_eq(&digest[..]))
-        || existing
-            .source_base_profile_digest
-            .as_deref()
-            .is_none_or(|digest| !bool::from(digest.ct_eq(user.base_profile_digest.as_slice())));
-    Ok(ProjectionMaterial {
-        revision,
-        storage_document: document.clone(),
-        document,
-        digest,
-        verified_email_source_identity_id: None,
-        verified_email_ciphertext: None,
-        verified_email_key_version: None,
-        semantic_change,
-        storage_repair_required,
-    })
-}
-
 #[allow(
-    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "Runtime projection materialization keeps exact policy, authority version, and encryption decisions visible"
+    reason = "Runtime projection materialization keeps authority version and encryption decisions visible"
 )]
 pub(super) async fn authoritative_runtime_projection_material<
     P: ProjectionCryptography + ?Sized,
@@ -709,18 +547,9 @@ pub(super) async fn authoritative_runtime_projection_material<
     projection: Option<&application_user_projection::Model>,
     application_id: uuid::Uuid,
     user: &project_user::Model,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
-    project_email_admitted: bool,
-    application_email_admitted: bool,
     protector: &P,
 ) -> Result<ProjectionMaterial, ApplicationError> {
-    let admitted = project_email_admitted && application_email_admitted;
-    let source_email = if admitted {
-        primary_verified_email(transaction, user, protector).await?
-    } else {
-        None
-    };
+    let source_email = primary_verified_email(transaction, user, protector).await?;
     let projection_write_version = if source_email.is_some()
         || projection.is_some_and(|existing| existing.verified_email_ciphertext.is_some())
     {
@@ -732,8 +561,6 @@ pub(super) async fn authoritative_runtime_projection_material<
     let semantic_change = projection.is_none_or(|existing| {
         existing.user_id != user.id
             || existing.source_user_revision != user.user_revision
-            || existing.project_policy_revision != project_projection_revision
-            || existing.application_policy_revision != application_projection_revision
             || existing.verified_email_source_identity_id != source_identity_id
             || existing.verified_email_ciphertext.is_some() != source_email.is_some()
             || existing.verified_email_key_version.is_some() != source_email.is_some()
@@ -775,13 +602,8 @@ pub(super) async fn authoritative_runtime_projection_material<
         }
     };
     let email = source_email.map(|(_, email)| email);
-    let (document, digest) = projection_material_with_verified_email(
-        user,
-        revision,
-        project_projection_revision,
-        application_projection_revision,
-        email.clone(),
-    )?;
+    let (document, digest) =
+        projection_material_with_verified_email(user, revision, email.clone())?;
     if can_reuse_protected {
         let existing = projection.ok_or(ApplicationError::Integrity)?;
         if decrypted_projection_verified_email(existing, protector)? != email {
@@ -801,10 +623,12 @@ pub(super) async fn authoritative_runtime_projection_material<
                     .as_slice()
                     .ct_eq(digest.as_slice()),
             )
-            || existing
-                .source_base_profile_digest
-                .as_deref()
-                .is_none_or(|stored| !bool::from(stored.ct_eq(user.base_profile_digest.as_slice())))
+            || !bool::from(
+                existing
+                    .source_base_profile_digest
+                    .as_slice()
+                    .ct_eq(user.base_profile_digest.as_slice()),
+            )
     });
     Ok(ProjectionMaterial {
         revision,
@@ -819,19 +643,11 @@ pub(super) async fn authoritative_runtime_projection_material<
     })
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Runtime projection repair keeps exact policy and encryption authority visible"
-)]
 pub(super) async fn repair_runtime_projection<P: ProjectionCryptography + ?Sized>(
     transaction: &sea_orm::DatabaseTransaction,
     projection: application_user_projection::Model,
     application_id: uuid::Uuid,
     user: &project_user::Model,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
-    project_email_admitted: bool,
-    application_email_admitted: bool,
     protector: &P,
     now: OffsetDateTime,
 ) -> Result<(application_user_projection::Model, ProjectionMaterial), ApplicationError> {
@@ -840,10 +656,6 @@ pub(super) async fn repair_runtime_projection<P: ProjectionCryptography + ?Sized
         Some(&projection),
         application_id,
         user,
-        project_projection_revision,
-        application_projection_revision,
-        project_email_admitted,
-        application_email_admitted,
         protector,
     )
     .await?;
@@ -852,51 +664,8 @@ pub(super) async fn repair_runtime_projection<P: ProjectionCryptography + ?Sized
         active.user_id = Set(user.id);
         active.projection_revision = Set(material.revision);
         active.source_user_revision = Set(user.user_revision);
-        active.project_policy_revision = Set(project_projection_revision);
-        active.application_policy_revision = Set(application_projection_revision);
         active.canonical_digest = Set(material.digest.clone());
-        active.source_base_profile_digest = Set(Some(user.base_profile_digest.clone()));
-        active.verified_email_source_identity_id = Set(material.verified_email_source_identity_id);
-        active.verified_email_ciphertext = Set(material.verified_email_ciphertext.clone());
-        active.verified_email_key_version = Set(material.verified_email_key_version);
-        active.document = Set(material.storage_document.clone());
-        active.updated_at = Set(now);
-        active.update(transaction).await.map_err(persistence)?
-    } else {
-        projection
-    };
-    Ok((projection, material))
-}
-
-pub(super) async fn repair_projection(
-    transaction: &sea_orm::DatabaseTransaction,
-    projection: application_user_projection::Model,
-    user: &project_user::Model,
-    project_projection_revision: i64,
-    application_projection_revision: i64,
-    now: OffsetDateTime,
-) -> Result<(application_user_projection::Model, ProjectionMaterial), ApplicationError> {
-    if projection.verified_email_source_identity_id.is_some()
-        || projection.verified_email_ciphertext.is_some()
-        || projection.verified_email_key_version.is_some()
-    {
-        return Err(ApplicationError::Integrity);
-    }
-    let material = authoritative_projection_material(
-        Some(&projection),
-        user,
-        project_projection_revision,
-        application_projection_revision,
-    )?;
-    let projection = if material.storage_repair_required {
-        let mut active = projection.into_active_model();
-        active.user_id = Set(user.id);
-        active.projection_revision = Set(material.revision);
-        active.source_user_revision = Set(user.user_revision);
-        active.project_policy_revision = Set(project_projection_revision);
-        active.application_policy_revision = Set(application_projection_revision);
-        active.canonical_digest = Set(material.digest.clone());
-        active.source_base_profile_digest = Set(Some(user.base_profile_digest.clone()));
+        active.source_base_profile_digest = Set(user.base_profile_digest.clone());
         active.verified_email_source_identity_id = Set(material.verified_email_source_identity_id);
         active.verified_email_ciphertext = Set(material.verified_email_ciphertext.clone());
         active.verified_email_key_version = Set(material.verified_email_key_version);
@@ -927,12 +696,6 @@ async fn fan_out_projected_user<P: ProjectionCryptography + ?Sized>(
     if project.status != "active" {
         return Ok(());
     }
-    let policy = project_policy::Entity::find_by_id(user.project_id)
-        .lock_shared()
-        .one(transaction)
-        .await
-        .map_err(persistence)?
-        .ok_or(ApplicationError::Integrity)?;
     let bindings = application_user_binding::Entity::find()
         .filter(application_user_binding::Column::ProjectId.eq(user.project_id))
         .filter(application_user_binding::Column::UserId.eq(user.id))
@@ -971,10 +734,6 @@ async fn fan_out_projected_user<P: ProjectionCryptography + ?Sized>(
             projection,
             application.id,
             user,
-            policy.projection_revision,
-            application.projection_revision,
-            policy.projection_verified_email_enabled,
-            application.projection_verified_email_enabled,
             protector,
             now,
         )
@@ -1476,63 +1235,6 @@ async fn assert_required_projection_observations(
         {
             return Err(ApplicationError::Disabled);
         }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-pub(super) async fn fan_out_user_projections(
-    transaction: &sea_orm::DatabaseTransaction,
-    user: &project_user::Model,
-    now: OffsetDateTime,
-) -> Result<(), ApplicationError> {
-    let policy = project_policy::Entity::find_by_id(user.project_id)
-        .lock_shared()
-        .one(transaction)
-        .await
-        .map_err(persistence)?
-        .ok_or(ApplicationError::Integrity)?;
-    let bindings = application_user_binding::Entity::find()
-        .filter(application_user_binding::Column::ProjectId.eq(user.project_id))
-        .filter(application_user_binding::Column::UserId.eq(user.id))
-        .filter(application_user_binding::Column::Status.eq("active"))
-        .order_by_asc(application_user_binding::Column::ApplicationId)
-        .limit((MAX_APPLICATION_BINDINGS_PER_USER + 1) as u64)
-        .lock_exclusive()
-        .all(transaction)
-        .await
-        .map_err(persistence)?;
-    if bindings.len() > MAX_APPLICATION_BINDINGS_PER_USER {
-        return Err(ApplicationError::Integrity);
-    }
-    for binding in bindings {
-        // The caller already holds the Project user exclusively, which serializes binding
-        // creation and user mutations. Do not lock the Application after binding rows: Runtime
-        // reads lock Application before user/binding, and the inverse order could deadlock.
-        // A concurrent projection-policy revision is repaired lazily on the next Runtime read.
-        let application = application::Entity::find_by_id(binding.application_id)
-            .filter(application::Column::ProjectId.eq(user.project_id))
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let projection = application_user_projection::Entity::find()
-            .filter(application_user_projection::Column::ProjectId.eq(user.project_id))
-            .filter(application_user_projection::Column::BindingId.eq(binding.id))
-            .lock_exclusive()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        repair_projection(
-            transaction,
-            projection,
-            user,
-            policy.projection_revision,
-            application.projection_revision,
-            now,
-        )
-        .await?;
     }
     Ok(())
 }

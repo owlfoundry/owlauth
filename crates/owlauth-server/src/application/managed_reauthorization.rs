@@ -99,7 +99,7 @@ pub(crate) struct ManagedReauthorizationRecord {
     pub issuer: String,
     pub subject: String,
     pub client_id: String,
-    pub secret_ref: String,
+    pub secret_material_id: Uuid,
     pub callback_url: String,
     pub adapter_key: String,
     pub adapter_capability_revision: i64,
@@ -935,7 +935,7 @@ impl ManagedReauthorizationRuntimeService {
         let secret = self
             .provider_secrets
             .as_ref()
-            .resolve(&claimed.secret_ref)
+            .resolve(claimed.secret_material_id)
             .await?;
         let verifier = match &claimed.provider_pkce {
             Some(value) => self.protector.as_ref().unprotect(
@@ -1242,7 +1242,7 @@ mod tests {
             issuer: "https://issuer.example".to_owned(),
             subject: "subject-1".to_owned(),
             client_id: "client".to_owned(),
-            secret_ref: "secret/ref/oidc-main".to_owned(),
+            secret_material_id: Uuid::from_u128(92),
             callback_url: "https://runtime.example/callback".to_owned(),
             adapter_key: "controlled_oidc_profile_v1".to_owned(),
             adapter_capability_revision: 1,

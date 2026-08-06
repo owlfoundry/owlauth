@@ -11,5 +11,5 @@ mod http;
 mod providers;
 mod web_assets;
 
-pub use composition::{SchemaFailure, ServerError, import_legacy_custody, run, run_with_providers};
+pub use composition::{SchemaFailure, ServerError, run, run_with_providers};
 pub use providers::{ActiveProvider, ProviderCompositionError, ProviderRegistrations};

@@ -193,23 +193,6 @@ pub struct ReplaceApplicationConfigurationRequest {
     pub expected_security_revision: i64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
-pub struct ProjectionPolicy {
-    pub project_id: String,
-    pub application_id: Option<String>,
-    pub verified_email_enabled: bool,
-    #[schema(minimum = 1)]
-    pub revision: i64,
-    pub expansion_operation_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
-pub struct UpdateProjectionPolicyRequest {
-    pub verified_email_enabled: bool,
-    #[schema(minimum = 1)]
-    pub expected_revision: i64,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebhookEndpointStatus {
@@ -517,7 +500,7 @@ pub struct RevokeProjectClientKeyRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
-pub struct CreateSigningKeyRequest {
+pub struct RotateSigningKeyRequest {
     #[schema(minimum = 1)]
     pub expected_project_revision: i64,
 }
@@ -643,12 +626,6 @@ pub struct CreateProviderRequest {
     /// Enables only adapter-declared fixed least scopes; callers cannot supply scopes.
     #[serde(default)]
     pub managed_profile_enabled: bool,
-    #[schema(minimum = 1)]
-    pub expected_project_revision: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
-pub struct ReconcileSigningKeyRequest {
     #[schema(minimum = 1)]
     pub expected_project_revision: i64,
 }
@@ -1233,6 +1210,8 @@ pub struct ProjectUser {
 pub struct ProjectUserList {
     #[schema(max_items = 100)]
     pub items: Vec<ProjectUser>,
+    #[schema(max_length = 36)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -1573,46 +1552,6 @@ control_path!(
     )
 );
 control_path!(
-    get_project_projection_policy,
-    get,
-    "/v1/projects/{project_id}/projection-policy",
-    ProjectionPolicy,
-    "Project projection policy",
-    params(("project_id" = String, Path))
-);
-control_path!(
-    update_project_projection_policy,
-    put,
-    "/v1/projects/{project_id}/projection-policy",
-    ProjectionPolicy,
-    "Updated Project projection policy and scheduled bounded convergence",
-    body = UpdateProjectionPolicyRequest,
-    params(("project_id" = String, Path))
-);
-control_path!(
-    get_application_projection_policy,
-    get,
-    "/v1/projects/{project_id}/applications/{application_id}/projection-policy",
-    ProjectionPolicy,
-    "Application projection policy",
-    params(
-        ("project_id" = String, Path),
-        ("application_id" = String, Path)
-    )
-);
-control_path!(
-    update_application_projection_policy,
-    put,
-    "/v1/projects/{project_id}/applications/{application_id}/projection-policy",
-    ProjectionPolicy,
-    "Updated Application projection policy and scheduled bounded convergence",
-    body = UpdateProjectionPolicyRequest,
-    params(
-        ("project_id" = String, Path),
-        ("application_id" = String, Path)
-    )
-);
-control_path!(
     list_webhook_endpoints,
     get,
     "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
@@ -1777,43 +1716,16 @@ control_path!(
     params(("project_id" = String, Path))
 );
 control_path!(
-    create_signing_key,
+    rotate_signing_key,
     post,
-    "/v1/projects/{project_id}/signing-keys",
+    "/v1/projects/{project_id}/signing-keys/rotate",
     SigningKey,
-    "Provisioned and published signing key",
-    body = CreateSigningKeyRequest,
+    "Accepted a durable signing key rotation",
+    body = RotateSigningKeyRequest,
     params(
         ("project_id" = String, Path),
         ("Idempotency-Key" = String, Header)
     )
-);
-control_path!(
-    reconcile_signing_key,
-    post,
-    "/v1/projects/{project_id}/signing-keys/{key_id}/reconcile",
-    SigningKey,
-    "Reconciled signing key provisioning",
-    body = ReconcileSigningKeyRequest,
-    params(("project_id" = String, Path), ("key_id" = String, Path))
-);
-control_path!(
-    activate_signing_key,
-    post,
-    "/v1/projects/{project_id}/signing-keys/{key_id}/activate",
-    SigningKey,
-    "Activated signing key",
-    body = KeyTransitionRequest,
-    params(("project_id" = String, Path), ("key_id" = String, Path))
-);
-control_path!(
-    retire_signing_key,
-    post,
-    "/v1/projects/{project_id}/signing-keys/{key_id}/retire",
-    SigningKey,
-    "Retired signing key",
-    body = KeyTransitionRequest,
-    params(("project_id" = String, Path), ("key_id" = String, Path))
 );
 control_path!(
     revoke_signing_key,
@@ -2071,7 +1983,12 @@ control_path!(
     "/v1/projects/{project_id}/users",
     ProjectUserList,
     "Project users",
-    params(("project_id" = String, Path))
+    params(
+        ("project_id" = String, Path),
+        ("status" = Option<ProjectUserStatus>, Query),
+        ("cursor" = Option<String>, Query),
+        ("limit" = Option<usize>, Query)
+    )
 );
 control_path!(
     get_project_user,
@@ -2095,6 +2012,15 @@ control_path!(
     "/v1/projects/{project_id}/users/{user_id}/disable",
     ProjectUser,
     "Disabled Project user",
+    body = ExpectedSecurityRevision,
+    params(("project_id" = String, Path), ("user_id" = String, Path))
+);
+control_path!(
+    enable_project_user,
+    post,
+    "/v1/projects/{project_id}/users/{user_id}/enable",
+    ProjectUser,
+    "Enabled Project user",
     body = ExpectedSecurityRevision,
     params(("project_id" = String, Path), ("user_id" = String, Path))
 );

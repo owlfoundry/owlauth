@@ -32,7 +32,6 @@ use crate::{
             managed_connection::PostgresManagedConnectionRepository,
             managed_reauthorization::PostgresManagedReauthorizationRepository,
             projection::PostgresIdentityProjectionMaterializer,
-            projection_expansion::PostgresProjectionExpansionRepository,
             provider_callback::PostgresProviderCallbackOwnerResolver,
             provider_egress::PostgresProviderEgressPolicyRepository,
             provisioning::PostgresProvisioningAdapter,
@@ -61,14 +60,12 @@ use crate::{
     application::{
         self, AdmissionService, ClientApiService, ClientDigestReadinessService,
         ClientEmailLookupDigester, ClientKeyLifecycleService, ClientKeyVerifier,
-        ConfigurationSecretSealers, ControlLifecycleService,
-        DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE, DurableEmailAddressReader, EmailControlService,
-        IdentityMutationControlService, IdentityMutationProviderCapabilities,
+        ConfigurationSecretSealers, ControlLifecycleService, DurableEmailAddressReader,
+        EmailControlService, IdentityMutationControlService, IdentityMutationProviderCapabilities,
         IdentityMutationRuntimeService, MailWorker, ManagedConnectionRepository,
         ManagedConnectionService, ManagedInteractionCleanupService,
         ManagedReauthorizationControlService, ManagedReauthorizationRuntimeService,
-        ManagedReauthorizationTargetVerifier, McpConfirmationContext, McpConfirmationService,
-        ProjectionExpansionWorker, ProjectionPolicyService, ProjectionVerifiedEmailProtector,
+        ManagedReauthorizationTargetVerifier, ProjectionVerifiedEmailProtector,
         ProviderCallbackOwnerResolver, ProviderOnboardingService, ProvisioningInfrastructure,
         ProvisioningService, ReadinessService, RuntimeAuthService, RuntimeProtector,
         WebhookControlService, WebhookWorker,
@@ -85,7 +82,6 @@ pub(crate) struct RuntimeHttpCapabilities {
     pub(crate) managed_reauthorization: Option<Arc<ManagedReauthorizationRuntimeService>>,
     pub(crate) identity_mutations: Option<Arc<IdentityMutationRuntimeService>>,
     pub(crate) managed_sync: Option<Arc<ManagedConnectionService>>,
-    pub(crate) projection_expansion: Option<Arc<ProjectionExpansionWorker>>,
     pub(crate) webhook_delivery: Option<Arc<WebhookWorker>>,
 }
 
@@ -103,8 +99,6 @@ pub(crate) struct ControlHttpCapabilities {
     pub(crate) managed_connections: Option<Arc<dyn ManagedConnectionRepository>>,
     pub(crate) managed_reauthorization: Option<Arc<ManagedReauthorizationControlService>>,
     pub(crate) identity_mutations: Option<Arc<IdentityMutationControlService>>,
-    pub(crate) projection_policy: Option<Arc<ProjectionPolicyService>>,
-    pub(crate) mcp_confirmation: Option<Arc<McpConfirmationService>>,
     pub(crate) webhooks: Option<Arc<WebhookControlService>>,
     pub(crate) provider_onboarding: Option<Arc<ProviderOnboardingService>>,
     pub(crate) client_keys: Option<Arc<ClientKeyLifecycleService>>,
@@ -192,9 +186,6 @@ pub(crate) fn build_http_capabilities(
                         .expect("Runtime provider clients are composed once"),
                 )
             }),
-            projection_expansion: database.clone().map(|database| {
-                build_projection_expansion_worker(database, config, runtime_incarnation)
-            }),
             webhook_delivery: database.map(|database| {
                 build_webhook_worker(database, config, runtime_incarnation, custody_providers)
             }),
@@ -257,12 +248,10 @@ pub(crate) fn build_http_capabilities(
                 .map(|database| build_provisioning_service(database, config, custody_providers)),
             lifecycle: database.clone().map(|database| {
                 Arc::new(ControlLifecycleService::new(
-                    Arc::new(
-                        PostgresControlLifecycleRepository::new_with_projection_materializer(
-                            database,
-                            build_identity_projection_materializer(config),
-                        ),
-                    ),
+                    Arc::new(PostgresControlLifecycleRepository::new(
+                        database,
+                        build_identity_projection_materializer(config),
+                    )),
                     Arc::new(SystemClock),
                 ))
             }),
@@ -270,12 +259,10 @@ pub(crate) fn build_http_capabilities(
                 .clone()
                 .map(|database| build_email_control_service(database, config, custody_providers)),
             managed_connections: database.clone().map(|database| {
-                Arc::new(
-                    PostgresManagedConnectionRepository::new_with_projection_materializer(
-                        database,
-                        build_identity_projection_materializer(config),
-                    ),
-                ) as Arc<dyn ManagedConnectionRepository>
+                Arc::new(PostgresManagedConnectionRepository::new(
+                    database,
+                    build_identity_projection_materializer(config),
+                )) as Arc<dyn ManagedConnectionRepository>
             }),
             managed_reauthorization: database
                 .clone()
@@ -283,18 +270,6 @@ pub(crate) fn build_http_capabilities(
             identity_mutations: database
                 .clone()
                 .map(|database| build_identity_mutation_control_service(database, config)),
-            projection_policy: database
-                .clone()
-                .map(|database| build_projection_policy_service(database, config)),
-            mcp_confirmation: config
-                .control_mcp
-                .enabled
-                .then(|| {
-                    database
-                        .clone()
-                        .map(|database| build_mcp_confirmation_service(database, config))
-                })
-                .flatten(),
             webhooks: database
                 .clone()
                 .map(|database| build_webhook_control_service(database, config, custody_providers)),
@@ -478,56 +453,6 @@ fn build_email_control_service(
     ))
 }
 
-fn build_projection_policy_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-) -> Arc<ProjectionPolicyService> {
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        source_reader,
-        projection_protector,
-    ));
-    Arc::new(ProjectionPolicyService::new(
-        Arc::new(PostgresProjectionExpansionRepository::new(
-            database,
-            materializer,
-        )),
-        Arc::new(SystemClock),
-    ))
-}
-
-fn build_mcp_confirmation_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-) -> Arc<McpConfirmationService> {
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        source_reader,
-        projection_protector,
-    ));
-    Arc::new(
-        McpConfirmationService::new(
-            Arc::new(PostgresProjectionExpansionRepository::new(
-                database,
-                materializer,
-            )),
-            McpConfirmationContext {
-                instance_id: config
-                    .instance_id
-                    .clone()
-                    .expect("validated Control configuration has an instance ID"),
-                control_endpoint: config
-                    .control
-                    .external_base
-                    .join("mcp")
-                    .expect("validated Control base accepts the MCP path")
-                    .to_string(),
-            },
-        )
-        .expect("validated Control identity forms an MCP confirmation context"),
-    )
-}
-
 fn build_webhook_control_service(
     database: DatabaseConnection,
     config: &ServerConfig,
@@ -558,32 +483,6 @@ fn build_webhook_control_service(
         )),
         Arc::new(SystemClock),
     ))
-}
-
-fn build_projection_expansion_worker(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-    runtime_incarnation: Uuid,
-) -> Arc<ProjectionExpansionWorker> {
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        source_reader,
-        projection_protector,
-    ));
-    Arc::new(
-        ProjectionExpansionWorker::new(
-            Arc::new(PostgresProjectionExpansionRepository::new(
-                database,
-                materializer,
-            )),
-            Arc::new(SystemClock),
-            config.runtime_process_id.clone(),
-            runtime_incarnation,
-            config.publication_lease_ttl,
-            DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE,
-        )
-        .expect("validated projection expansion worker configuration"),
-    )
 }
 
 fn build_webhook_worker(
@@ -824,11 +723,7 @@ fn build_identity_runtime_protector(config: &ServerConfig) -> Arc<SplitRuntimePr
         };
         build(&runtime_shape)
     });
-    Arc::new(SplitRuntimeProtector::new_with_projection_email(
-        build(runtime),
-        email,
-        build_projection_email_protector(config),
-    ))
+    Arc::new(SplitRuntimeProtector::new(build(runtime), email))
 }
 
 fn build_identity_mutation_control_service(
@@ -1049,7 +944,7 @@ fn build_runtime_auth_service(
             )
             .expect("validated Runtime protection configuration")
         };
-    let protector = SplitRuntimeProtector::new_with_projection_email(
+    let protector = SplitRuntimeProtector::new(
         build_ring(
             protection.active_version,
             &protection.active,
@@ -1065,7 +960,6 @@ fn build_runtime_auth_service(
                     &email_identity.retained,
                 )
             }),
-        build_projection_email_protector(config),
     );
     let interaction_readable_key_versions = protector.readable_key_versions();
     let protector = Arc::new(protector);
@@ -1152,12 +1046,10 @@ fn build_runtime_auth_service(
         secret_resolver.clone(),
     ));
     let projection_materializer = build_identity_projection_materializer(config);
-    let managed_repository = Arc::new(
-        PostgresManagedConnectionRepository::new_with_projection_materializer(
-            database.clone(),
-            projection_materializer.clone(),
-        ),
-    );
+    let managed_repository = Arc::new(PostgresManagedConnectionRepository::new(
+        database.clone(),
+        projection_materializer.clone(),
+    ));
     let interaction_cleanup = Arc::new(
         ManagedInteractionCleanupService::new(
             managed_repository.clone(),
@@ -1206,16 +1098,16 @@ fn build_runtime_auth_service(
                 runtime_incarnation,
                 managed_protector,
                 protector.clone(),
-                projection_materializer,
+                projection_materializer.clone(),
             ),
         ),
         Arc::new(
-            PostgresRuntimeAuthorityRepository::new_with_runtime_identity_and_protector(
+            PostgresRuntimeAuthorityRepository::new_with_runtime_identity_and_projection_materializer(
                 database,
                 config.runtime_process_id.clone(),
                 runtime_incarnation,
                 config.required_runtime_process_ids.clone(),
-                protector.clone(),
+                projection_materializer,
             ),
         ),
         email,

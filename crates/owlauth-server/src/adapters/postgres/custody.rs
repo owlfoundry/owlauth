@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::entity::{custody_cutover_authority, project_signing_key, protected_material};
+use super::entity::{
+    project_signing_key, protected_material, protected_material_inventory_authority,
+};
 use crate::application::ApplicationError;
 use owlauth_key_provider::{
     ContextVersion, DeploymentId, FieldPurpose, MaterialId, MaterialKind, OwnerId, OwnerKind,
@@ -94,7 +96,6 @@ pub(crate) struct ProtectedMaterialReservation {
     pub provider_id: ProviderId,
     pub provider_format_version: ProviderFormatVersion,
     pub context: ProtectionContext,
-    pub authority: CustodyAuthority,
     pub state: ProtectedMaterialState,
 }
 
@@ -144,38 +145,6 @@ pub(crate) struct RuntimeReadinessCandidate {
     pub signing_public_jwk: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CustodyMode {
-    Legacy,
-    Importing,
-    Protected,
-}
-
-impl CustodyMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::Importing => "importing",
-            Self::Protected => "protected",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, ApplicationError> {
-        match value {
-            "legacy" => Ok(Self::Legacy),
-            "importing" => Ok(Self::Importing),
-            "protected" => Ok(Self::Protected),
-            _ => Err(ApplicationError::Integrity),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CustodyAuthority {
-    pub mode: CustodyMode,
-    pub revision: i64,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ProtectedMaterialRepository {
     database: DatabaseConnection,
@@ -195,35 +164,6 @@ impl ProtectedMaterialRepository {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub(crate) async fn reserve_project(
-        &self,
-        project_id: Uuid,
-        material_id: Uuid,
-        owner_kind: MaterialOwnerKind,
-        owner_id: Uuid,
-        generation: i64,
-        material_kind: MaterialKind,
-        purpose: MaterialPurpose,
-        provider_id: ProviderId,
-        provider_format_version: ProviderFormatVersion,
-    ) -> Result<ProtectedMaterialReservation, ApplicationError> {
-        self.reserve(
-            Some(project_id),
-            material_id,
-            owner_kind,
-            owner_id,
-            generation,
-            material_kind,
-            purpose,
-            provider_id,
-            provider_format_version,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn reserve_deployment_in_transaction(
         &self,
         transaction: &DatabaseTransaction,
@@ -238,7 +178,6 @@ impl ProtectedMaterialRepository {
     ) -> Result<ProtectedMaterialReservation, ApplicationError> {
         self.reserve_in_transaction(
             transaction,
-            CustodyMode::Protected,
             None,
             material_id,
             owner_kind,
@@ -268,7 +207,6 @@ impl ProtectedMaterialRepository {
     ) -> Result<ProtectedMaterialReservation, ApplicationError> {
         self.reserve_in_transaction(
             transaction,
-            CustodyMode::Protected,
             Some(project_id),
             material_id,
             owner_kind,
@@ -283,74 +221,9 @@ impl ProtectedMaterialRepository {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn reserve_import_in_transaction(
-        &self,
-        transaction: &DatabaseTransaction,
-        project_id: Option<Uuid>,
-        material_id: Uuid,
-        owner_kind: MaterialOwnerKind,
-        owner_id: Uuid,
-        generation: i64,
-        material_kind: MaterialKind,
-        purpose: MaterialPurpose,
-        provider_id: ProviderId,
-        provider_format_version: ProviderFormatVersion,
-    ) -> Result<ProtectedMaterialReservation, ApplicationError> {
-        self.reserve_in_transaction(
-            transaction,
-            CustodyMode::Importing,
-            project_id,
-            material_id,
-            owner_kind,
-            owner_id,
-            generation,
-            material_kind,
-            purpose,
-            provider_id,
-            provider_format_version,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    async fn reserve(
-        &self,
-        project_id: Option<Uuid>,
-        material_id: Uuid,
-        owner_kind: MaterialOwnerKind,
-        owner_id: Uuid,
-        generation: i64,
-        material_kind: MaterialKind,
-        purpose: MaterialPurpose,
-        provider_id: ProviderId,
-        provider_format_version: ProviderFormatVersion,
-    ) -> Result<ProtectedMaterialReservation, ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let reservation = self
-            .reserve_in_transaction(
-                &transaction,
-                CustodyMode::Protected,
-                project_id,
-                material_id,
-                owner_kind,
-                owner_id,
-                generation,
-                material_kind,
-                purpose,
-                provider_id,
-                provider_format_version,
-            )
-            .await?;
-        transaction.commit().await.map_err(persistence)?;
-        Ok(reservation)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn reserve_in_transaction(
         &self,
         transaction: &DatabaseTransaction,
-        required_mode: CustodyMode,
         project_id: Option<Uuid>,
         material_id: Uuid,
         owner_kind: MaterialOwnerKind,
@@ -361,7 +234,7 @@ impl ProtectedMaterialRepository {
         provider_id: ProviderId,
         provider_format_version: ProviderFormatVersion,
     ) -> Result<ProtectedMaterialReservation, ApplicationError> {
-        let authority = lock_authority(transaction, required_mode).await?;
+        lock_material_inventory(transaction).await?;
         let context = self.context(
             project_id,
             material_id,
@@ -400,7 +273,6 @@ impl ProtectedMaterialRepository {
                 || reservation.provider_id != provider_id
                 || reservation.provider_format_version != provider_format_version
                 || reservation.context != context
-                || reservation.authority != authority
             {
                 return Err(ApplicationError::IdempotencyConflict);
             }
@@ -425,8 +297,6 @@ impl ProtectedMaterialRepository {
             provider_format_version: Set(i32::from(provider_format_version.get())),
             context_version: Set(i32::from(ContextVersion::V1.get())),
             context_digest: Set(context_digest),
-            custody_mode: Set(authority.mode.as_str().to_owned()),
-            custody_revision: Set(authority.revision),
             opaque_value: Set(None),
             safe_fingerprint: Set(None),
             state: Set(ProtectedMaterialState::Pending.as_str().to_owned()),
@@ -468,23 +338,6 @@ impl ProtectedMaterialRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         map_reservation(model, &self.deployment_id, purpose)
-    }
-
-    pub(crate) async fn load_reservation_by_id(
-        &self,
-        material_id: Uuid,
-    ) -> Result<ProtectedMaterialReservation, ApplicationError> {
-        let model = protected_material::Entity::find_by_id(material_id)
-            .one(&self.database)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        let owner_kind = MaterialOwnerKind::parse(&model.owner_kind)?;
-        map_reservation(
-            model,
-            &self.deployment_id,
-            MaterialPurpose::for_owner(owner_kind),
-        )
     }
 
     pub(crate) async fn load_live_by_id(
@@ -568,10 +421,10 @@ impl ProtectedMaterialRepository {
                 .await
                 .map_err(persistence)?
             {
-                let material_id = owner
-                    .signer_material_id
-                    .ok_or(ApplicationError::Integrity)?;
-                signing_owners.entry(material_id).or_default().push(owner);
+                signing_owners
+                    .entry(owner.signer_material_id)
+                    .or_default()
+                    .push(owner);
             }
         }
         let mut candidates = Vec::with_capacity(rows.len());
@@ -647,49 +500,6 @@ impl ProtectedMaterialRepository {
         map_reservation(model, &self.deployment_id, purpose)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn erase_project(
-        &self,
-        project_id: Uuid,
-        material_id: Uuid,
-        erased_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        lock_material_inventory(&transaction).await?;
-        let model = protected_material::Entity::find_by_id(material_id)
-            .filter(protected_material::Column::ProjectId.eq(project_id))
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::NotFound)?;
-        match ProtectedMaterialState::parse(&model.state)? {
-            ProtectedMaterialState::Erased => {
-                transaction.commit().await.map_err(persistence)?;
-                return Ok(());
-            }
-            ProtectedMaterialState::Pending | ProtectedMaterialState::Live => {}
-        }
-        let mut active = model.into_active_model();
-        active.opaque_value = Set(None);
-        active.state = Set(ProtectedMaterialState::Erased.as_str().to_owned());
-        active.erased_at = Set(Some(erased_at));
-        active.updated_at = Set(erased_at);
-        active.update(&transaction).await.map_err(persistence)?;
-        transaction.commit().await.map_err(persistence)
-    }
-
-    pub(crate) async fn erase_by_id(
-        &self,
-        material_id: Uuid,
-        erased_at: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        self.erase_by_id_in_transaction(&transaction, material_id, erased_at)
-            .await?;
-        transaction.commit().await.map_err(persistence)
-    }
-
     pub(crate) async fn erase_by_id_in_transaction(
         &self,
         transaction: &DatabaseTransaction,
@@ -716,22 +526,10 @@ impl ProtectedMaterialRepository {
         Ok(())
     }
 
-    pub(crate) async fn authority(&self) -> Result<CustodyAuthority, ApplicationError> {
-        let model = custody_cutover_authority::Entity::find_by_id(true)
-            .one(&self.database)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        Ok(CustodyAuthority {
-            mode: CustodyMode::parse(&model.mode)?,
-            revision: model.revision,
-        })
-    }
-
     pub(crate) async fn material_inventory_revision(&self) -> Result<i64, ApplicationError> {
-        let revision = custody_cutover_authority::Entity::find_by_id(true)
+        let revision = protected_material_inventory_authority::Entity::find_by_id(true)
             .select_only()
-            .column(custody_cutover_authority::Column::MaterialInventoryRevision)
+            .column(protected_material_inventory_authority::Column::Revision)
             .into_tuple::<i64>()
             .one(&self.database)
             .await
@@ -741,55 +539,6 @@ impl ProtectedMaterialRepository {
             return Err(ApplicationError::Integrity);
         }
         Ok(revision)
-    }
-
-    pub(crate) async fn compare_and_set_authority(
-        &self,
-        expected: CustodyAuthority,
-        target: CustodyMode,
-        inventory_completed_at: Option<OffsetDateTime>,
-        changed_at: OffsetDateTime,
-    ) -> Result<CustodyAuthority, ApplicationError> {
-        let valid_transition = matches!(
-            (expected.mode, target),
-            (CustodyMode::Legacy, CustodyMode::Importing)
-                | (
-                    CustodyMode::Importing,
-                    CustodyMode::Legacy | CustodyMode::Protected,
-                )
-        );
-        if !valid_transition
-            || (target == CustodyMode::Protected && inventory_completed_at.is_none())
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let model = custody_cutover_authority::Entity::find_by_id(true)
-            .lock_exclusive()
-            .one(&transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if model.revision != expected.revision || CustodyMode::parse(&model.mode)? != expected.mode
-        {
-            return Err(ApplicationError::RevisionConflict);
-        }
-        let mut active = model.into_active_model();
-        active.mode = Set(target.as_str().to_owned());
-        active.revision = Set(expected.revision + 1);
-        active.legacy_inventory_completed_at = Set(if target == CustodyMode::Legacy {
-            None
-        } else {
-            inventory_completed_at
-        });
-        active.protected_at = Set((target == CustodyMode::Protected).then_some(changed_at));
-        active.updated_at = Set(changed_at);
-        let updated = active.update(&transaction).await.map_err(persistence)?;
-        transaction.commit().await.map_err(persistence)?;
-        Ok(CustodyAuthority {
-            mode: CustodyMode::parse(&updated.mode)?,
-            revision: updated.revision,
-        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -836,33 +585,13 @@ impl ProtectedMaterialRepository {
 pub(crate) async fn lock_material_inventory(
     transaction: &DatabaseTransaction,
 ) -> Result<(), ApplicationError> {
-    lock_current_authority(transaction).await.map(|_| ())
-}
-
-async fn lock_current_authority(
-    transaction: &DatabaseTransaction,
-) -> Result<CustodyAuthority, ApplicationError> {
-    let model = custody_cutover_authority::Entity::find_by_id(true)
+    protected_material_inventory_authority::Entity::find_by_id(true)
         .lock_exclusive()
         .one(transaction)
         .await
         .map_err(persistence)?
         .ok_or(ApplicationError::Integrity)?;
-    Ok(CustodyAuthority {
-        mode: CustodyMode::parse(&model.mode)?,
-        revision: model.revision,
-    })
-}
-
-async fn lock_authority(
-    transaction: &DatabaseTransaction,
-    required_mode: CustodyMode,
-) -> Result<CustodyAuthority, ApplicationError> {
-    let authority = lock_current_authority(transaction).await?;
-    if authority.mode != required_mode {
-        return Err(ApplicationError::Disabled);
-    }
-    Ok(authority)
+    Ok(())
 }
 
 pub(crate) async fn finalize_pending_material(
@@ -873,7 +602,7 @@ pub(crate) async fn finalize_pending_material(
     safe_fingerprint: Option<Vec<u8>>,
     finalized_at: OffsetDateTime,
 ) -> Result<(), ApplicationError> {
-    let authority = lock_current_authority(transaction).await?;
+    lock_material_inventory(transaction).await?;
     let model = protected_material::Entity::find_by_id(material_id)
         .filter(match project_id {
             Some(project_id) => protected_material::Column::ProjectId.eq(project_id),
@@ -884,11 +613,6 @@ pub(crate) async fn finalize_pending_material(
         .await
         .map_err(persistence)?
         .ok_or(ApplicationError::NotFound)?;
-    if CustodyMode::parse(&model.custody_mode)? != authority.mode
-        || model.custody_revision != authority.revision
-    {
-        return Err(ApplicationError::RevisionConflict);
-    }
     match ProtectedMaterialState::parse(&model.state)? {
         ProtectedMaterialState::Pending => {
             let mut active = model.into_active_model();
@@ -1001,10 +725,6 @@ fn map_reservation(
         provider_id,
         provider_format_version,
         context,
-        authority: CustodyAuthority {
-            mode: CustodyMode::parse(&model.custody_mode)?,
-            revision: model.custody_revision,
-        },
         state: ProtectedMaterialState::parse(&model.state)?,
     })
 }

@@ -119,7 +119,6 @@ owlauth --profile local project list
 owlauth --profile local application list PROJECT_ID
 owlauth --profile local provider list PROJECT_ID
 owlauth --profile local signing-key list PROJECT_ID
-owlauth --profile local projection-policy get PROJECT_ID --application-id APPLICATION_ID
 owlauth --profile local webhook endpoint list PROJECT_ID APPLICATION_ID
 owlauth update --dry-run
 owlauth update

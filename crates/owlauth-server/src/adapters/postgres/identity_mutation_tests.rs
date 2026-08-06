@@ -25,12 +25,15 @@ use super::{
     email::PostgresPasswordlessEmailRepository,
     identity_mutation::PostgresControlIdentityMutationRepository,
     identity_mutation_test_support::PostgresIdentityMutationRepository,
-    projection::{IdentityProjectionMaterializer, PostgresIdentityProjectionMaterializer},
+    projection::{
+        IdentityProjectionMaterializer, PostgresIdentityProjectionMaterializer,
+        ProjectionCryptography,
+    },
 };
 use crate::{
     adapters::runtime_security::{
         RuntimeKeyMaterial, SoftwareDurableEmailAddressReader,
-        SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector, SplitRuntimeProtector,
+        SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
         UnavailableDurableEmailAddressReader,
     },
     application::{
@@ -67,7 +70,86 @@ use crate::{
 const POSTGRES_PORT: u16 = 5432;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+fn fixture_projection_materializer() -> Arc<PostgresIdentityProjectionMaterializer> {
+    Arc::new(PostgresIdentityProjectionMaterializer::new(
+        Arc::new(
+            SoftwareDurableEmailAddressReader::new(
+                "identity-mutation-test".to_owned(),
+                1,
+                RuntimeKeyMaterial::new([11; 32], [12; 32]),
+                BTreeMap::new(),
+            )
+            .expect("identity mutation durable email reader"),
+        ),
+        Arc::new(
+            SoftwareProjectionVerifiedEmailProtector::new(
+                "identity-mutation-projection-test".to_owned(),
+                1,
+                [104; 32],
+                BTreeMap::new(),
+            )
+            .expect("identity mutation projection protector"),
+        ),
+    ))
+}
+
+fn test_projection_materializer() -> Arc<PostgresIdentityProjectionMaterializer> {
+    Arc::new(PostgresIdentityProjectionMaterializer::new(
+        Arc::new(UnavailableDurableEmailAddressReader),
+        Arc::new(
+            SoftwareProjectionVerifiedEmailProtector::new(
+                "identity-mutation-inventory-test".to_owned(),
+                1,
+                [104; 32],
+                BTreeMap::new(),
+            )
+            .expect("identity mutation projection protector"),
+        ),
+    ))
+}
+
 struct FailingProjectionMaterializer;
+
+impl ProjectionCryptography for FailingProjectionMaterializer {
+    fn projection_write_version(&self) -> i32 {
+        1
+    }
+
+    fn projection_readable_versions(&self) -> std::collections::BTreeSet<i32> {
+        std::collections::BTreeSet::from([1])
+    }
+
+    fn read_durable_email(
+        &self,
+        _project_id: Uuid,
+        _identity_id: Uuid,
+        _value: &ProtectedValue,
+    ) -> Result<zeroize::Zeroizing<String>, ApplicationError> {
+        Err(ApplicationError::ExternalStore)
+    }
+
+    fn protect_projection_email(
+        &self,
+        _project_id: Uuid,
+        _application_id: Uuid,
+        _user_id: Uuid,
+        _projection_revision: i64,
+        _email: &[u8],
+    ) -> Result<ProtectedValue, ApplicationError> {
+        Err(ApplicationError::ExternalStore)
+    }
+
+    fn unprotect_projection_email(
+        &self,
+        _project_id: Uuid,
+        _application_id: Uuid,
+        _user_id: Uuid,
+        _projection_revision: i64,
+        _value: &ProtectedValue,
+    ) -> Result<zeroize::Zeroizing<String>, ApplicationError> {
+        Err(ApplicationError::ExternalStore)
+    }
+}
 
 #[async_trait]
 impl IdentityProjectionMaterializer for FailingProjectionMaterializer {
@@ -124,6 +206,18 @@ async fn wait_for_backend_blocked_by(pool: &PgPool, blocker_pid: i32, label: &st
 }
 
 async fn fixture() -> Option<Fixture> {
+    fixture_with_provider("main", "oidc", "https://issuer.example").await
+}
+
+async fn google_fixture() -> Option<Fixture> {
+    fixture_with_provider("google-main", "google", crate::domain::GOOGLE_ISSUER).await
+}
+
+async fn fixture_with_provider(
+    provider_key: &str,
+    provider_kind: &str,
+    provider_issuer: &str,
+) -> Option<Fixture> {
     let container = match GenericImage::new("postgres", "17-bookworm")
         .with_exposed_port(POSTGRES_PORT.tcp())
         .with_wait_for(WaitFor::log(LogWaitStrategy::stderr(
@@ -191,7 +285,7 @@ async fn fixture() -> Option<Fixture> {
         database.clone(),
         "identity-mutation-test".to_owned(),
         incarnation,
-        protector.clone(),
+        fixture_projection_materializer(),
         Vec::new(),
     );
     let project_id = Uuid::new_v4();
@@ -231,14 +325,30 @@ async fn fixture() -> Option<Fixture> {
     .await
     .expect("seed Project policy");
     sqlx::query(
-        "INSERT INTO provider_configurations
-         (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
-          secret_ref,status,revision)
-         VALUES ($1,$2,'main','oidc','Main','https://issuer.example','client',
-                 'https://runtime.example/projects/x/auth/callback/main','secret/test','active',1)",
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('03',32),'hex'),decode('01','hex'),
+                     decode(repeat('02',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
+            (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
+             secret_material_id,status,revision)
+         SELECT $1,$2,$3,$4,'Main',$5,'client',$6,material.id,'active',1 FROM material",
     )
     .bind(provider_id)
     .bind(project_id)
+    .bind(provider_key)
+    .bind(provider_kind)
+    .bind(provider_issuer)
+    .bind(format!(
+        "https://runtime.example/projects/x/auth/callback/{provider_key}"
+    ))
     .execute(&sqlx)
     .await
     .expect("seed provider");
@@ -271,11 +381,21 @@ async fn fixture() -> Option<Fixture> {
     .await
     .expect("seed email assignment");
     sqlx::query(
-        "INSERT INTO deployment_smtp_generations
-         (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
-          sender_address,credential_ref,safe_fingerprint,material_owner_id)
-         VALUES (1,'active',1,1,'smtp.example',465,'implicit_tls',
-                 'sender@example.test','secret/smtp',$1,$2)",
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'deployment','deployment_smtp',$2,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('19',32),'hex'),decode(repeat('18',64),'hex'),$1,'live')
+             RETURNING id
+         )
+         INSERT INTO deployment_smtp_generations
+            (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
+             sender_address,safe_fingerprint,material_owner_id,credential_material_id)
+         SELECT 1,'active',1,1,'smtp.example',465,'implicit_tls',
+                'sender@example.test',$1,$2,material.id FROM material",
     )
     .bind(vec![17_u8; 32])
     .bind(Uuid::new_v4())
@@ -308,13 +428,14 @@ async fn fixture() -> Option<Fixture> {
     sqlx::query(
         "INSERT INTO linked_identities
          (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,status,
-          identity_revision,observed_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.example','existing','active',1,clock_timestamp())",
+          identity_revision,source_profile_digest,observed_at)
+         VALUES ($1,$2,$3,$4,$5,'existing','active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),clock_timestamp())",
     )
     .bind(identity_id)
     .bind(project_id)
     .bind(user_id)
     .bind(provider_id)
+    .bind(provider_issuer)
     .execute(&mut *seed)
     .await
     .expect("seed identity");
@@ -364,7 +485,7 @@ async fn seed_application_projection(
         .expect("read projection user")
         .expect("projection user exists");
     let (document, canonical_digest) =
-        super::projection::projection_material(&user, 1, 1, 1).expect("materialize projection");
+        super::projection::projection_material(&user, 1).expect("materialize projection");
     let binding_id = Uuid::new_v4();
     let projection_id = Uuid::new_v4();
     sqlx::query(
@@ -382,9 +503,8 @@ async fn seed_application_projection(
     sqlx::query(
         "INSERT INTO application_user_projections
          (id,project_id,binding_id,application_id,user_id,schema_name,projection_revision,
-          source_user_revision,project_policy_revision,application_policy_revision,
-          canonical_digest,source_base_profile_digest,document)
-         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,1,1,$6,$7,$8)",
+          source_user_revision,canonical_digest,source_base_profile_digest,document)
+         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,$6,$7,$8)",
     )
     .bind(projection_id)
     .bind(fixture.project_id)
@@ -946,40 +1066,9 @@ async fn committed_login_email_challenge(
 
 #[tokio::test]
 async fn google_identity_proof_is_named_authority_and_ignores_custom_oidc_policy_revision() {
-    let Some(fixture) = fixture().await else {
+    let Some(fixture) = google_fixture().await else {
         return;
     };
-    let mut provider_setup = fixture
-        .sqlx
-        .begin()
-        .await
-        .expect("begin Google identity-proof fixture setup");
-    sqlx::query("SET LOCAL session_replication_role='replica'")
-        .execute(&mut *provider_setup)
-        .await
-        .expect("disable compatibility trigger for preselected Google fixture");
-    sqlx::query(
-        "UPDATE provider_configurations
-            SET adapter_kind='google',issuer=$1,onboarding_policy_revision=NULL
-          WHERE project_id=$2 AND id=$3",
-    )
-    .bind(crate::domain::GOOGLE_ISSUER)
-    .bind(fixture.project_id)
-    .bind(fixture.provider_id)
-    .execute(&mut *provider_setup)
-    .await
-    .expect("select Google identity-proof authority");
-    provider_setup
-        .commit()
-        .await
-        .expect("commit Google identity-proof fixture setup");
-    sqlx::query("UPDATE linked_identities SET issuer=$1 WHERE project_id=$2 AND id=$3")
-        .bind(crate::domain::GOOGLE_ISSUER)
-        .bind(fixture.project_id)
-        .bind(fixture.identity_id)
-        .execute(&fixture.sqlx)
-        .await
-        .expect("align seeded Google identity namespace");
     let subject: String = sqlx::query_scalar("SELECT subject FROM linked_identities WHERE id=$1")
         .bind(fixture.identity_id)
         .fetch_one(&fixture.sqlx)
@@ -1057,7 +1146,7 @@ async fn google_identity_proof_is_named_authority_and_ignores_custom_oidc_policy
             intent_id,
             slot_id,
             &project_public_id,
-            "main",
+            "google-main",
             &digest(84),
             &digest(82),
             OffsetDateTime::UNIX_EPOCH,
@@ -2525,8 +2614,8 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     sqlx::query(
         "INSERT INTO linked_identities
          (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,status,
-          identity_revision,observed_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.example','removable','active',1,clock_timestamp())",
+          identity_revision,source_profile_digest,observed_at)
+         VALUES ($1,$2,$3,$4,'https://issuer.example','removable','active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),clock_timestamp())",
     )
     .bind(removable_id)
     .bind(fixture.project_id)
@@ -2562,18 +2651,6 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     .execute(&fixture.sqlx)
     .await
     .expect("seed durable email source");
-    sqlx::query(
-        "UPDATE project_policies SET projection_verified_email_enabled=TRUE WHERE project_id=$1",
-    )
-    .bind(fixture.project_id)
-    .execute(&fixture.sqlx)
-    .await
-    .expect("admit Project verified email projection");
-    sqlx::query("UPDATE applications SET projection_verified_email_enabled=TRUE WHERE id=$1")
-        .bind(fixture.application_id)
-        .execute(&fixture.sqlx)
-        .await
-        .expect("admit Application verified email projection");
     let binding_id = Uuid::new_v4();
     let projection_id = Uuid::new_v4();
     let user = super::entity::project_user::Entity::find_by_id(fixture.user_id)
@@ -2582,7 +2659,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         .expect("read user for initial projection")
         .expect("fixture user");
     let (initial_document, initial_digest) =
-        super::projection::projection_material(&user, 1, 1, 1).expect("initial safe projection");
+        super::projection::projection_material(&user, 1).expect("initial safe projection");
     sqlx::query(
         "INSERT INTO application_user_bindings
          (id,project_id,application_id,user_id,status,binding_revision)
@@ -2598,9 +2675,8 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     sqlx::query(
         "INSERT INTO application_user_projections
          (id,project_id,binding_id,application_id,user_id,schema_name,projection_revision,
-          source_user_revision,project_policy_revision,application_policy_revision,
-          canonical_digest,source_base_profile_digest,document)
-         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,1,1,$6,$7,$8)",
+          source_user_revision,canonical_digest,source_base_profile_digest,document)
+         VALUES ($1,$2,$3,$4,$5,'owlauth.user.v1',1,1,$6,$7,$8)",
     )
     .bind(projection_id)
     .bind(fixture.project_id)
@@ -2945,30 +3021,17 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         .as_str(),
         "control-only@example.com"
     );
-    let runtime_projection_reader = SplitRuntimeProtector::new_with_projection_email(
-        SoftwareRuntimeProtector::new(
-            "identity-mutation-test".to_owned(),
-            1,
-            RuntimeKeyMaterial::new([1; 32], [2; 32]),
-            BTreeMap::new(),
-        )
-        .expect("Runtime short-term ring"),
-        Some(
-            SoftwareRuntimeProtector::new(
+    let runtime_projection_reader = PostgresIdentityProjectionMaterializer::new(
+        Arc::new(
+            SoftwareDurableEmailAddressReader::new(
                 "identity-mutation-test".to_owned(),
                 1,
                 RuntimeKeyMaterial::new([11; 32], [12; 32]),
                 BTreeMap::new(),
             )
-            .expect("Runtime durable email ring"),
+            .expect("Runtime durable email reader"),
         ),
-        SoftwareProjectionVerifiedEmailProtector::new(
-            "identity-mutation-test".to_owned(),
-            1,
-            [62; 32],
-            BTreeMap::new(),
-        )
-        .expect("Runtime dedicated projection email ring"),
+        projection_protector,
     );
     let stored_projection =
         super::entity::application_user_projection::Entity::find_by_id(projection_id)
@@ -3029,8 +3092,8 @@ async fn final_merge_has_one_concurrent_winner_moves_graph_and_writes_exact_tomb
     sqlx::query(
         "INSERT INTO linked_identities
          (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,status,
-          identity_revision,observed_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.example','loser','active',1,clock_timestamp())",
+          identity_revision,source_profile_digest,observed_at)
+         VALUES ($1,$2,$3,$4,'https://issuer.example','loser','active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),clock_timestamp())",
     )
     .bind(loser_identity_id)
     .bind(fixture.project_id)
@@ -3078,9 +3141,8 @@ async fn final_merge_has_one_concurrent_winner_moves_graph_and_writes_exact_tomb
     let disabled_application_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO applications
-         (id,project_id,public_id,status,revision,metadata_revision,security_revision,
-          projection_verified_email_enabled)
-         VALUES ($1,$2,$3,'active',1,1,1,TRUE)",
+         (id,project_id,public_id,status,revision,metadata_revision,security_revision)
+         VALUES ($1,$2,$3,'active',1,1,1)",
     )
     .bind(disabled_application_id)
     .bind(fixture.project_id)
@@ -3088,19 +3150,6 @@ async fn final_merge_has_one_concurrent_winner_moves_graph_and_writes_exact_tomb
     .execute(&fixture.sqlx)
     .await
     .expect("seed disabled loser-only Application");
-    sqlx::query(
-        "UPDATE project_policies SET projection_verified_email_enabled=TRUE WHERE project_id=$1",
-    )
-    .bind(fixture.project_id)
-    .execute(&fixture.sqlx)
-    .await
-    .expect("admit Project verified email projection");
-    sqlx::query("UPDATE applications SET projection_verified_email_enabled=TRUE WHERE id=$1")
-        .bind(fixture.application_id)
-        .execute(&fixture.sqlx)
-        .await
-        .expect("admit shared-Application verified email projection");
-
     // Both users already reached the same Application and the loser has immutable delivery
     // history. Merge must retain that history through its binding while deleting the loser's
     // mutable projection, which may contain stale protected PII.
@@ -3121,15 +3170,20 @@ async fn final_merge_has_one_concurrent_winner_moves_graph_and_writes_exact_tomb
         super::projection::projection_material_with_verified_email(
             &loser_user,
             1,
-            1,
-            1,
             Some("merge-loser@example.com".to_owned()),
         )
         .expect("materialize disabled-branch PII projection");
     let disabled_storage_document = super::projection::safe_projection_document(&disabled_document)
         .expect("redact disabled-branch stored projection");
+    let disabled_projection_protector = SoftwareProjectionVerifiedEmailProtector::new(
+        "identity-mutation-projection-test".to_owned(),
+        1,
+        [104; 32],
+        BTreeMap::new(),
+    )
+    .expect("disabled-branch projection protector");
     let disabled_protected_email = super::projection::protect_projection_verified_email(
-        fixture.protector.as_ref(),
+        &disabled_projection_protector,
         fixture.project_id,
         disabled_application_id,
         loser_id,
@@ -4280,7 +4334,10 @@ async fn control_identity_inventory_is_mixed_safe_exact_and_fails_closed_on_row_
     .await
     .expect("seed encrypted email identity");
 
-    let repository = PostgresControlLifecycleRepository::new(fixture.database.clone());
+    let repository = PostgresControlLifecycleRepository::new(
+        fixture.database.clone(),
+        test_projection_materializer(),
+    );
     let inventory = repository
         .list_project_user_identities(fixture.project_id, fixture.user_id, 100)
         .await
@@ -4303,9 +4360,9 @@ async fn control_identity_inventory_is_mixed_safe_exact_and_fails_closed_on_row_
     sqlx::query(
         "INSERT INTO linked_identities
          (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,status,
-          identity_revision,observed_at)
+          identity_revision,source_profile_digest,observed_at)
          SELECT md5($1::TEXT || series::TEXT)::UUID,$1,$2,$3,
-                'https://issuer.example','inventory-' || series::TEXT,'active',1,clock_timestamp()
+                'https://issuer.example','inventory-' || series::TEXT,'active',1,public.owlauth_provider_source_profile_digest(NULL,NULL,NULL),clock_timestamp()
            FROM generate_series(1,99) AS series",
     )
     .bind(fixture.project_id)

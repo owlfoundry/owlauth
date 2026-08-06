@@ -1,3 +1,10 @@
+use super::{
+    custody::{
+        MaterialOwnerKind, MaterialPurpose, ProtectedMaterialRepository,
+        ProtectedMaterialReservation, finalize_pending_material,
+    },
+    provisioning::insert_audit,
+};
 use async_trait::async_trait;
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, Statement,
@@ -6,21 +13,9 @@ use sea_orm::{
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
-#[cfg(test)]
-use zeroize::Zeroizing;
-
-use super::{
-    custody::{
-        MaterialOwnerKind, MaterialPurpose, ProtectedMaterialRepository,
-        ProtectedMaterialReservation, finalize_pending_material,
-    },
-    provisioning::insert_audit,
-};
 
 const MAX_LIVE_PROJECT_SMTP_GENERATIONS: i64 = 32;
 
-#[cfg(test)]
-use crate::application::ConfigurationSecretProvisioner;
 use crate::application::{
     ApplicationError, EmailAssignmentRecord, EmailControlPort, EmailPolicyRecord,
     PrepareSmtpConfiguration, PreparedDeploymentSmtpGeneration, PreparedSecretMaterial,
@@ -34,10 +29,7 @@ use owlauth_key_provider::{MaterialKind, ProviderFormatVersion, ProviderId};
 pub(crate) struct PostgresEmailControlRepository {
     database: DatabaseConnection,
     required_runtime_process_ids: Vec<String>,
-    #[cfg(not(test))]
     custody: EmailControlCustody,
-    #[cfg(test)]
-    custody: Option<EmailControlCustody>,
 }
 
 #[derive(Clone)]
@@ -63,10 +55,7 @@ impl PostgresEmailControlRepository {
         Ok(Self {
             database,
             required_runtime_process_ids,
-            #[cfg(not(test))]
             custody,
-            #[cfg(test)]
-            custody: Some(custody),
         })
     }
 
@@ -80,11 +69,17 @@ impl PostgresEmailControlRepository {
         database: DatabaseConnection,
         required_runtime_process_ids: Vec<String>,
     ) -> Self {
-        Self {
+        let provider_id = ProviderId::new("software").expect("test provider ID is valid");
+        let provider_format_version =
+            ProviderFormatVersion::new(1).expect("test provider format is valid");
+        Self::new_protected(
             database,
             required_runtime_process_ids,
-            custody: None,
-        }
+            "test-deployment",
+            provider_id,
+            provider_format_version,
+        )
+        .expect("test SMTP custody is valid")
     }
 
     #[cfg(test)]
@@ -94,34 +89,16 @@ impl PostgresEmailControlRepository {
         provider_id: ProviderId,
         provider_format_version: ProviderFormatVersion,
     ) -> Result<Self, ApplicationError> {
-        self.custody = Some(EmailControlCustody {
+        self.custody = EmailControlCustody {
             materials: ProtectedMaterialRepository::new(self.database.clone(), deployment_id)?,
             provider_id,
             provider_format_version,
-        });
+        };
         Ok(self)
     }
 
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "production custody is mandatory while legacy unit fixtures deliberately omit it"
-    )]
-    fn custody(&self) -> Result<&EmailControlCustody, ApplicationError> {
-        #[cfg(not(test))]
-        return Ok(&self.custody);
-        #[cfg(test)]
-        self.custody.as_ref().ok_or(ApplicationError::Integrity)
-    }
-
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "production custody is mandatory while legacy unit fixtures deliberately omit it"
-    )]
-    fn optional_custody(&self) -> Option<&EmailControlCustody> {
-        #[cfg(not(test))]
-        return Some(&self.custody);
-        #[cfg(test)]
-        self.custody.as_ref()
+    fn custody(&self) -> &EmailControlCustody {
+        &self.custody
     }
 
     async fn prepared_smtp_material(
@@ -129,7 +106,7 @@ impl PostgresEmailControlRepository {
         project_id: Uuid,
         configuration_id: Uuid,
         request_digest: &[u8],
-    ) -> Result<Option<PreparedSecretMaterial>, ApplicationError> {
+    ) -> Result<PreparedSecretMaterial, ApplicationError> {
         let row = self
             .database
             .query_one_raw(statement(
@@ -149,13 +126,10 @@ impl PostgresEmailControlRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        let Some(material_id) = row
-            .try_get::<Option<Uuid>>("", "material_id")
-            .map_err(persistence)?
-        else {
-            return Ok(None);
-        };
-        let custody = self.custody()?;
+        let material_id = row
+            .try_get::<Uuid>("", "material_id")
+            .map_err(persistence)?;
+        let custody = self.custody();
         let reservation = custody
             .materials
             .load_project_reservation(project_id, material_id, MaterialPurpose::SmtpCredential)
@@ -168,12 +142,12 @@ impl PostgresEmailControlRepository {
         {
             return Err(ApplicationError::Integrity);
         }
-        Ok(Some(PreparedSecretMaterial {
+        Ok(PreparedSecretMaterial {
             material_id,
             provider_id: reservation.provider_id,
             provider_format_version: reservation.provider_format_version,
             context: reservation.context,
-        }))
+        })
     }
 
     async fn prepared_smtp_test_material(
@@ -181,7 +155,7 @@ impl PostgresEmailControlRepository {
         project_id: Uuid,
         operation_id: Uuid,
         request_digest: &[u8],
-    ) -> Result<Option<PreparedSecretMaterial>, ApplicationError> {
+    ) -> Result<PreparedSecretMaterial, ApplicationError> {
         let row = self
             .database
             .query_one_raw(statement(
@@ -196,13 +170,10 @@ impl PostgresEmailControlRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        let Some(material_id) = row
-            .try_get::<Option<Uuid>>("", "recipient_material_id")
-            .map_err(persistence)?
-        else {
-            return Ok(None);
-        };
-        let custody = self.custody()?;
+        let material_id = row
+            .try_get::<Uuid>("", "recipient_material_id")
+            .map_err(persistence)?;
+        let custody = self.custody();
         let reservation = custody
             .materials
             .load_project_reservation(project_id, material_id, MaterialPurpose::SmtpTestRecipient)
@@ -214,19 +185,19 @@ impl PostgresEmailControlRepository {
         {
             return Err(ApplicationError::Integrity);
         }
-        Ok(Some(PreparedSecretMaterial {
+        Ok(PreparedSecretMaterial {
             material_id,
             provider_id: reservation.provider_id,
             provider_format_version: reservation.provider_format_version,
             context: reservation.context,
-        }))
+        })
     }
 }
 
 #[async_trait]
 #[allow(
     clippy::too_many_lines,
-    reason = "SMTP preparation keeps owner revision, reference reservation, idempotency, and audit in one transaction"
+    reason = "SMTP preparation keeps owner revision, material reservation, idempotency, and audit in one transaction"
 )]
 impl EmailControlPort for PostgresEmailControlRepository {
     async fn get_email_policy(
@@ -413,14 +384,20 @@ impl EmailControlPort for PostgresEmailControlRepository {
         let project_security_revision = project
             .try_get::<i64>("", "security_revision")
             .map_err(persistence)?;
-        if let Some(mut existing) =
+        if let Some(record) =
             find_prepared_smtp_operation(&transaction, project_id, &prepared).await?
         {
             transaction.commit().await.map_err(persistence)?;
-            existing.material = self
-                .prepared_smtp_material(project_id, existing.record.id, &existing.request_digest)
+            let material = self
+                .prepared_smtp_material(project_id, record.id, &prepared.request_digest)
                 .await?;
-            return Ok(existing);
+            return Ok(PreparedSmtpConfiguration {
+                record,
+                operation_alias: prepared.operation_alias,
+                request_digest: prepared.request_digest,
+                correlation_id: prepared.correlation_id,
+                material,
+            });
         }
         if project_security_revision != prepared.expected_project_security_revision {
             return Err(ApplicationError::RevisionConflict);
@@ -440,97 +417,51 @@ impl EmailControlPort for PostgresEmailControlRepository {
         if live_generations >= MAX_LIVE_PROJECT_SMTP_GENERATIONS {
             return Err(ApplicationError::InvalidTransition);
         }
-        lock_smtp_credential_reference(&transaction, &prepared.credential_ref).await?;
-        transaction
-            .execute_raw(statement(
-                "INSERT INTO smtp_credential_reference_reservations
-                 (credential_ref,state,created_at,updated_at)
-                 VALUES ($1,'live',$2,$2) ON CONFLICT (credential_ref) DO NOTHING",
-                vec![prepared.credential_ref.clone().into(), now.into()],
-            ))
-            .await
-            .map_err(persistence)?;
-        let reference = transaction
-            .query_one_raw(statement(
-                "SELECT state FROM smtp_credential_reference_reservations
-                 WHERE credential_ref=$1 FOR UPDATE",
-                vec![prepared.credential_ref.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if reference
-            .try_get::<String>("", "state")
-            .map_err(persistence)?
-            != "live"
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
         let generation = transaction.query_one_raw(statement(
             "SELECT COALESCE(MAX(generation), 0) + 1 AS generation FROM project_smtp_configurations WHERE project_id = $1",
             vec![project_id.into()],
         )).await.map_err(persistence)?.ok_or(ApplicationError::Persistence)?
             .try_get::<i32>("", "generation").map_err(persistence)?;
-        let material = if let Some(custody) = self.optional_custody() {
-            let material_id = Uuid::new_v4();
-            let reservation = custody
-                .materials
-                .reserve_project_in_transaction(
-                    &transaction,
-                    project_id,
-                    material_id,
-                    MaterialOwnerKind::ProjectSmtp,
-                    prepared.id,
-                    i64::from(generation),
-                    MaterialKind::ConfigurationSecret,
-                    MaterialPurpose::SmtpCredential,
-                    custody.provider_id.clone(),
-                    custody.provider_format_version,
-                )
-                .await?;
-            Some(PreparedSecretMaterial {
-                material_id,
-                provider_id: reservation.provider_id,
-                provider_format_version: reservation.provider_format_version,
-                context: reservation.context,
-            })
-        } else {
-            None
+        let custody = self.custody();
+        let reservation = custody
+            .materials
+            .reserve_project_in_transaction(
+                &transaction,
+                project_id,
+                prepared.credential_material_id,
+                MaterialOwnerKind::ProjectSmtp,
+                prepared.id,
+                i64::from(generation),
+                MaterialKind::ConfigurationSecret,
+                MaterialPurpose::SmtpCredential,
+                custody.provider_id.clone(),
+                custody.provider_format_version,
+            )
+            .await?;
+        let material = PreparedSecretMaterial {
+            material_id: prepared.credential_material_id,
+            provider_id: reservation.provider_id,
+            provider_format_version: reservation.provider_format_version,
+            context: reservation.context,
         };
         transaction.execute_raw(statement(
             "INSERT INTO project_smtp_configurations
              (id, project_id, status, generation, revision, security_eligibility_revision, host, port, tls_mode,
-              sender_address, sender_name, reply_to, credential_ref, safe_fingerprint, credential_material_id,
+              sender_address, sender_name, reply_to, safe_fingerprint, credential_material_id,
               created_at, updated_at)
-             VALUES ($1, $2, 'pending', $3, 1, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)",
+             VALUES ($1, $2, 'pending', $3, 1, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)",
             vec![prepared.id.into(), project_id.into(), generation.into(), prepared.host.clone().into(),
                 i32::from(prepared.port).into(), prepared.tls_mode.as_str().into(), prepared.sender_address.clone().into(),
-                prepared.sender_name.clone().into(), prepared.reply_to.clone().into(), prepared.credential_ref.clone().into(),
-                prepared.safe_fingerprint.map(|value| value.to_vec()).into(),
-                material.as_ref().map(|value| value.material_id).into(), now.into()],
+                prepared.sender_name.clone().into(), prepared.reply_to.clone().into(),
+                Option::<Vec<u8>>::None.into(), material.material_id.into(), now.into()],
         )).await.map_err(persistence)?;
         transaction.execute_raw(statement(
             "INSERT INTO project_smtp_secret_operations
-             (project_id, operation_alias, configuration_id, request_digest, credential_ref, material_id, state, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, 'prepared', $7)",
+             (project_id, operation_alias, configuration_id, request_digest, material_id, state, created_at)
+             VALUES ($1, $2, $3, $4, $5, 'prepared', $6)",
             vec![project_id.into(), prepared.operation_alias.clone().into(), prepared.id.into(),
-                prepared.request_digest.clone().into(), prepared.credential_ref.clone().into(),
-                material.as_ref().map(|value| value.material_id).into(), now.into()],
+                prepared.request_digest.clone().into(), material.material_id.into(), now.into()],
         )).await.map_err(persistence)?;
-        if let Some(material) = &material {
-            transaction
-                .execute_raw(statement(
-                    "UPDATE smtp_credential_reference_reservations SET material_id=$2,updated_at=$3
-                 WHERE credential_ref=$1 AND state='live'",
-                    vec![
-                        prepared.credential_ref.clone().into(),
-                        material.material_id.into(),
-                        now.into(),
-                    ],
-                ))
-                .await
-                .map_err(persistence)?;
-        }
         let advanced = transaction
             .execute_raw(statement(
                 "UPDATE projects SET security_revision = security_revision + 1, updated_at = $3
@@ -568,198 +499,10 @@ impl EmailControlPort for PostgresEmailControlRepository {
         Ok(PreparedSmtpConfiguration {
             record,
             operation_alias: prepared.operation_alias,
-            #[cfg(test)]
-            credential_ref: prepared.credential_ref,
             request_digest: prepared.request_digest,
             correlation_id: prepared.correlation_id,
             material,
-            external_provisioning_required: true,
         })
-    }
-
-    #[cfg(test)]
-    async fn provision_and_finalize_smtp_configuration(
-        &self,
-        project_id: Uuid,
-        prepared: &PreparedSmtpConfiguration,
-        provisioner: &dyn ConfigurationSecretProvisioner,
-        credential: Zeroizing<Vec<u8>>,
-        now: OffsetDateTime,
-    ) -> Result<SmtpConfigurationRecord, ApplicationError> {
-        let proposed_token = Uuid::new_v4();
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let owner = transaction
-            .query_one_raw(statement(
-                "SELECT operation.state AS operation_state,operation.provisioning_token,
-                        configuration.status AS configuration_status
-                 FROM project_smtp_secret_operations operation
-                 JOIN project_smtp_configurations configuration
-                   ON configuration.project_id=operation.project_id
-                  AND configuration.id=operation.configuration_id
-                 WHERE operation.project_id=$1 AND operation.operation_alias=$2
-                   AND operation.configuration_id=$3 AND operation.request_digest=$4
-                   AND operation.credential_ref=$5
-                 FOR UPDATE OF operation,configuration",
-                vec![
-                    project_id.into(),
-                    prepared.operation_alias.clone().into(),
-                    prepared.record.id.into(),
-                    prepared.request_digest.clone().into(),
-                    prepared.credential_ref.clone().into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::InvalidTransition)?;
-        lock_smtp_credential_reference(&transaction, &prepared.credential_ref).await?;
-        let operation_state: String = owner.try_get("", "operation_state").map_err(persistence)?;
-        if operation_state == "completed" {
-            let row = transaction
-                .query_one_raw(statement(
-                    "SELECT * FROM project_smtp_configurations WHERE project_id=$1 AND id=$2",
-                    vec![project_id.into(), prepared.record.id.into()],
-                ))
-                .await
-                .map_err(persistence)?
-                .ok_or(ApplicationError::Integrity)?;
-            let record = smtp_record(&row)?;
-            transaction.commit().await.map_err(persistence)?;
-            return Ok(record);
-        }
-        if !matches!(operation_state.as_str(), "prepared" | "provisioning")
-            || owner
-                .try_get::<String>("", "configuration_status")
-                .map_err(persistence)?
-                != "pending"
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let reference = transaction
-            .query_one_raw(statement(
-                "SELECT state FROM smtp_credential_reference_reservations
-                 WHERE credential_ref=$1 FOR UPDATE",
-                vec![prepared.credential_ref.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if reference
-            .try_get::<String>("", "state")
-            .map_err(persistence)?
-            != "live"
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let token = owner
-            .try_get::<Option<Uuid>>("", "provisioning_token")
-            .map_err(persistence)?
-            .unwrap_or(proposed_token);
-        let claimed = transaction
-            .execute_raw(statement(
-                "UPDATE project_smtp_secret_operations
-                 SET state='provisioning',provisioning_token=$6
-                 WHERE project_id=$1 AND operation_alias=$2 AND configuration_id=$3
-                   AND request_digest=$4 AND credential_ref=$5
-                   AND state IN ('prepared','provisioning')",
-                vec![
-                    project_id.into(),
-                    prepared.operation_alias.clone().into(),
-                    prepared.record.id.into(),
-                    prepared.request_digest.clone().into(),
-                    prepared.credential_ref.clone().into(),
-                    token.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?;
-        if claimed.rows_affected() != 1 {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        // The durable claim is visible before any external call. No PostgreSQL transaction or
-        // business lock survives this commit.
-        transaction.commit().await.map_err(persistence)?;
-
-        provisioner
-            .provision_if_absent(prepared.credential_ref.clone(), credential)
-            .await?;
-
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let owner = transaction
-            .query_one_raw(statement(
-                "SELECT operation.state AS operation_state,configuration.status AS configuration_status
-                 FROM project_smtp_secret_operations operation
-                 JOIN project_smtp_configurations configuration
-                   ON configuration.project_id=operation.project_id
-                  AND configuration.id=operation.configuration_id
-                 WHERE operation.project_id=$1 AND operation.operation_alias=$2
-                   AND operation.configuration_id=$3 AND operation.request_digest=$4
-                   AND operation.credential_ref=$5 FOR UPDATE OF operation,configuration",
-                vec![project_id.into(),prepared.operation_alias.clone().into(),prepared.record.id.into(),
-                     prepared.request_digest.clone().into(),prepared.credential_ref.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::InvalidTransition)?;
-        lock_smtp_credential_reference(&transaction, &prepared.credential_ref).await?;
-        if owner
-            .try_get::<String>("", "operation_state")
-            .map_err(persistence)?
-            == "completed"
-        {
-            let row = transaction
-                .query_one_raw(statement(
-                    "SELECT * FROM project_smtp_configurations WHERE project_id=$1 AND id=$2",
-                    vec![project_id.into(), prepared.record.id.into()],
-                ))
-                .await
-                .map_err(persistence)?
-                .ok_or(ApplicationError::Integrity)?;
-            let record = smtp_record(&row)?;
-            transaction.commit().await.map_err(persistence)?;
-            return Ok(record);
-        }
-        if owner
-            .try_get::<String>("", "configuration_status")
-            .map_err(persistence)?
-            != "pending"
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        let result = transaction.execute_raw(statement(
-            "UPDATE project_smtp_secret_operations operation
-             SET state='completed',completed_at=$4,provisioning_token=NULL
-             WHERE operation.project_id=$1 AND operation.operation_alias=$2
-               AND operation.configuration_id=$3 AND operation.request_digest=$5
-               AND operation.credential_ref=$6 AND operation.state='provisioning'
-               AND operation.provisioning_token=$7
-               AND EXISTS (SELECT 1 FROM smtp_credential_reference_reservations reservation
-                           WHERE reservation.credential_ref=operation.credential_ref AND reservation.state='live')",
-            vec![project_id.into(),prepared.operation_alias.clone().into(),prepared.record.id.into(),now.into(),
-                 prepared.request_digest.clone().into(),prepared.credential_ref.clone().into(),token.into()],
-        )).await.map_err(persistence)?;
-        if result.rows_affected() != 1 {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        insert_audit(
-            &transaction,
-            Some(project_id),
-            "email.smtp.reconciled",
-            "smtp_configuration",
-            Some(prepared.record.id),
-            prepared.correlation_id,
-        )
-        .await?;
-        let row = transaction
-            .query_one_raw(statement(
-                "SELECT * FROM project_smtp_configurations WHERE project_id=$1 AND id=$2",
-                vec![project_id.into(), prepared.record.id.into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let record = smtp_record(&row)?;
-        transaction.commit().await.map_err(persistence)?;
-        Ok(record)
     }
 
     async fn finalize_protected_smtp_configuration(
@@ -769,7 +512,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
         material: SealedProtectedMaterial,
         now: OffsetDateTime,
     ) -> Result<SmtpConfigurationRecord, ApplicationError> {
-        if prepared.material.as_ref().map(|value| value.material_id) != Some(material.material_id) {
+        if prepared.material.material_id != material.material_id {
             return Err(ApplicationError::Integrity);
         }
         let fingerprint = material.request_fingerprint.into_bytes();
@@ -800,13 +543,13 @@ impl EmailControlPort for PostgresEmailControlRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::InvalidTransition)?;
         if owner
-            .try_get::<Option<Uuid>>("", "material_id")
+            .try_get::<Uuid>("", "material_id")
             .map_err(persistence)?
-            != Some(material.material_id)
+            != material.material_id
             || owner
-                .try_get::<Option<Uuid>>("", "credential_material_id")
+                .try_get::<Uuid>("", "credential_material_id")
                 .map_err(persistence)?
-                != Some(material.material_id)
+                != material.material_id
         {
             return Err(ApplicationError::Integrity);
         }
@@ -820,7 +563,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        let custody = self.custody()?;
+        let custody = self.custody();
         let reservation = custody
             .materials
             .load_project_reservation_in_transaction(
@@ -981,90 +724,69 @@ impl EmailControlPort for PostgresEmailControlRepository {
         {
             return Err(ApplicationError::RevisionConflict);
         }
-        let material = if let Some(custody) = self.optional_custody() {
-            let material_id = Uuid::new_v4();
-            let reservation = custody
-                .materials
-                .reserve_project_in_transaction(
-                    &transaction,
-                    project_id,
-                    material_id,
-                    MaterialOwnerKind::SmtpTestRecipient,
-                    command.id,
-                    1,
-                    MaterialKind::ConfigurationSecret,
-                    MaterialPurpose::SmtpTestRecipient,
-                    custody.provider_id.clone(),
-                    custody.provider_format_version,
-                )
-                .await?;
-            Some(PreparedSecretMaterial {
-                material_id,
-                provider_id: reservation.provider_id,
-                provider_format_version: reservation.provider_format_version,
-                context: reservation.context,
-            })
-        } else {
-            None
+        let custody = self.custody();
+        let reservation = custody
+            .materials
+            .reserve_project_in_transaction(
+                &transaction,
+                project_id,
+                command.recipient_material_id,
+                MaterialOwnerKind::SmtpTestRecipient,
+                command.id,
+                1,
+                MaterialKind::ConfigurationSecret,
+                MaterialPurpose::SmtpTestRecipient,
+                custody.provider_id.clone(),
+                custody.provider_format_version,
+            )
+            .await?;
+        let material = PreparedSecretMaterial {
+            material_id: command.recipient_material_id,
+            provider_id: reservation.provider_id,
+            provider_format_version: reservation.provider_format_version,
+            context: reservation.context,
         };
-        lock_smtp_credential_reference(&transaction, &command.recipient_ref).await?;
-        transaction
-            .execute_raw(statement(
-                "INSERT INTO smtp_test_recipient_reference_reservations
-                 (recipient_ref,state,operation_id,material_id,created_at,updated_at)
-                 VALUES ($1,'live',$2,$3,$4,$4) ON CONFLICT (recipient_ref) DO NOTHING",
-                vec![
-                    command.recipient_ref.clone().into(),
-                    command.id.into(),
-                    material.as_ref().map(|value| value.material_id).into(),
-                    now.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?;
-        let recipient_reference = transaction
-            .query_one_raw(statement(
-                "SELECT state,operation_id FROM smtp_test_recipient_reference_reservations
-                 WHERE recipient_ref=$1 FOR UPDATE",
-                vec![command.recipient_ref.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if recipient_reference
-            .try_get::<String>("", "state")
-            .map_err(persistence)?
-            != "live"
-            || recipient_reference
-                .try_get::<Uuid>("", "operation_id")
-                .map_err(persistence)?
-                != command.id
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
         let message_id = format!("<{}@runtime-test.owlauth.invalid>", command.id);
         transaction
             .execute_raw(statement(
                 "INSERT INTO project_smtp_test_operations
              (id,project_id,idempotency_key,configuration_id,configuration_generation,
               configuration_revision,configuration_security_eligibility_revision,host,port,tls_mode,
-              sender_address,credential_ref,credential_material_id,request_digest,message_id,
-              recipient_ref,recipient_material_id,provisioning_token,state,correlation_id,created_at,expires_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$1,
-                     'preparing',$18,$19,$20)",
+              sender_address,credential_material_id,request_digest,message_id,
+              recipient_material_id,provisioning_token,state,correlation_id,created_at,expires_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$1,
+                     'preparing',$16,$17,$18)",
                 vec![
-                    command.id.into(), project_id.into(), command.idempotency_key.clone().into(),
-                    command.configuration_id.into(), row.try_get::<i32>("", "generation").map_err(persistence)?.into(),
-                    revision.into(), row.try_get::<i64>("", "security_eligibility_revision").map_err(persistence)?.into(),
-                    row.try_get::<String>("", "host").map_err(persistence)?.into(),
+                    command.id.into(),
+                    project_id.into(),
+                    command.idempotency_key.clone().into(),
+                    command.configuration_id.into(),
+                    row.try_get::<i32>("", "generation")
+                        .map_err(persistence)?
+                        .into(),
+                    revision.into(),
+                    row.try_get::<i64>("", "security_eligibility_revision")
+                        .map_err(persistence)?
+                        .into(),
+                    row.try_get::<String>("", "host")
+                        .map_err(persistence)?
+                        .into(),
                     row.try_get::<i32>("", "port").map_err(persistence)?.into(),
-                    row.try_get::<String>("", "tls_mode").map_err(persistence)?.into(),
-                    row.try_get::<String>("", "sender_address").map_err(persistence)?.into(),
-                    row.try_get::<String>("", "credential_ref").map_err(persistence)?.into(),
-                    row.try_get::<Option<Uuid>>("", "credential_material_id").map_err(persistence)?.into(),
-                    command.request_digest.clone().into(), message_id.into(), command.recipient_ref.clone().into(),
-                    material.as_ref().map(|value| value.material_id).into(), command.correlation_id.into(),
-                    now.into(), (now + Duration::minutes(10)).into(),
+                    row.try_get::<String>("", "tls_mode")
+                        .map_err(persistence)?
+                        .into(),
+                    row.try_get::<String>("", "sender_address")
+                        .map_err(persistence)?
+                        .into(),
+                    row.try_get::<Uuid>("", "credential_material_id")
+                        .map_err(persistence)?
+                        .into(),
+                    command.request_digest.clone().into(),
+                    message_id.into(),
+                    material.material_id.into(),
+                    command.correlation_id.into(),
+                    now.into(),
+                    (now + Duration::minutes(10)).into(),
                 ],
             ))
             .await
@@ -1079,180 +801,10 @@ impl EmailControlPort for PostgresEmailControlRepository {
                 outcome: None,
                 created_at: now,
                 completed_at: None,
-                recipient_ref: command.recipient_ref,
+                recipient_material_id: command.recipient_material_id,
             },
             material,
         })
-    }
-
-    #[cfg(test)]
-    async fn provision_and_finalize_smtp_test_enqueue(
-        &self,
-        project_id: Uuid,
-        operation_id: Uuid,
-        request_digest: &[u8],
-        provisioner: &dyn ConfigurationSecretProvisioner,
-        recipient: Zeroizing<Vec<u8>>,
-        now: OffsetDateTime,
-    ) -> Result<crate::application::SmtpTestOperationRecord, ApplicationError> {
-        // Discovering the alias is non-authoritative. The claim transaction reloads and locks the
-        // operation owner first, then takes the shared per-reference lifecycle lock.
-        let recipient_ref = self
-            .database
-            .query_one_raw(statement(
-                "SELECT recipient_ref FROM project_smtp_test_operations
-             WHERE project_id=$1 AND id=$2 AND request_digest=$3",
-                vec![
-                    project_id.into(),
-                    operation_id.into(),
-                    request_digest.to_vec().into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::InvalidTransition)?
-            .try_get::<String>("", "recipient_ref")
-            .map_err(persistence)?;
-
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let owner = transaction
-            .query_one_raw(statement(
-                "SELECT * FROM project_smtp_test_operations
-             WHERE project_id=$1 AND id=$2 AND request_digest=$3 FOR UPDATE",
-                vec![
-                    project_id.into(),
-                    operation_id.into(),
-                    request_digest.to_vec().into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::InvalidTransition)?;
-        let state: String = owner.try_get("", "state").map_err(persistence)?;
-        if state != "preparing"
-            || owner
-                .try_get::<OffsetDateTime>("", "created_at")
-                .map_err(persistence)?
-                + Duration::minutes(5)
-                <= now
-            || owner
-                .try_get::<String>("", "recipient_ref")
-                .map_err(persistence)?
-                != recipient_ref
-            || owner
-                .try_get::<Option<Uuid>>("", "provisioning_token")
-                .map_err(persistence)?
-                != Some(operation_id)
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        lock_smtp_credential_reference(&transaction, &recipient_ref).await?;
-        let reference = transaction
-            .query_one_raw(statement(
-                "SELECT state,operation_id FROM smtp_test_recipient_reference_reservations
-             WHERE recipient_ref=$1 FOR UPDATE",
-                vec![recipient_ref.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if reference
-            .try_get::<String>("", "state")
-            .map_err(persistence)?
-            != "live"
-            || reference
-                .try_get::<Uuid>("", "operation_id")
-                .map_err(persistence)?
-                != operation_id
-        {
-            return Err(ApplicationError::InvalidTransition);
-        }
-        // `preparing` plus its stable token is the durable claim/barrier. Commit before touching
-        // the external store; retries after a crash repeat the same create-if-absent safely.
-        transaction.commit().await.map_err(persistence)?;
-
-        provisioner
-            .provision_if_absent(recipient_ref.clone(), recipient)
-            .await?;
-
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let owner = transaction
-            .query_one_raw(statement(
-                "SELECT 1 AS present FROM project_smtp_test_operations
-             WHERE project_id=$1 AND id=$2 AND request_digest=$3 AND state='preparing'
-               AND provisioning_token=$4 FOR UPDATE",
-                vec![
-                    project_id.into(),
-                    operation_id.into(),
-                    request_digest.to_vec().into(),
-                    operation_id.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?;
-        if owner.is_none() {
-            let completed = transaction
-                .query_one_raw(statement(
-                    "SELECT * FROM project_smtp_test_operations
-                 WHERE project_id=$1 AND id=$2 AND request_digest=$3 AND state='pending' FOR SHARE",
-                    vec![
-                        project_id.into(),
-                        operation_id.into(),
-                        request_digest.to_vec().into(),
-                    ],
-                ))
-                .await
-                .map_err(persistence)?;
-            let Some(completed) = completed else {
-                return Err(ApplicationError::InvalidTransition);
-            };
-            let result = smtp_test_record(&completed)?;
-            transaction.commit().await.map_err(persistence)?;
-            return Ok(result);
-        }
-        lock_smtp_credential_reference(&transaction, &recipient_ref).await?;
-        let row = transaction
-            .query_one_raw(statement(
-                "UPDATE project_smtp_test_operations test
-             SET state='pending',provisioning_token=NULL
-             WHERE test.project_id=$1 AND test.id=$2 AND test.request_digest=$3
-               AND test.state='preparing' AND test.provisioning_token=$5
-               AND test.created_at + INTERVAL '5 minutes'>$4
-               AND EXISTS (SELECT 1 FROM smtp_test_recipient_reference_reservations reservation
-                           WHERE reservation.recipient_ref=test.recipient_ref
-                             AND reservation.operation_id=test.id AND reservation.state='live')
-             RETURNING test.*",
-                vec![
-                    project_id.into(),
-                    operation_id.into(),
-                    request_digest.to_vec().into(),
-                    now.into(),
-                    operation_id.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::InvalidTransition)?;
-        let correlation_id: Uuid = row.try_get("", "correlation_id").map_err(persistence)?;
-        let configuration_id: Uuid = row.try_get("", "configuration_id").map_err(persistence)?;
-        let exists=transaction.query_one_raw(statement(
-            "SELECT 1 AS present FROM audit_events WHERE project_id=$1 AND action='email.smtp.test_enqueued' AND correlation_id=$2",
-            vec![project_id.into(),correlation_id.into()],
-        )).await.map_err(persistence)?;
-        if exists.is_none() {
-            insert_audit(
-                &transaction,
-                Some(project_id),
-                "email.smtp.test_enqueued",
-                "smtp_configuration",
-                Some(configuration_id),
-                correlation_id,
-            )
-            .await?;
-        }
-        let result = smtp_test_record(&row)?;
-        transaction.commit().await.map_err(persistence)?;
-        Ok(result)
     }
 
     async fn finalize_protected_smtp_test_enqueue(
@@ -1263,7 +815,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
         material: SealedProtectedMaterial,
         now: OffsetDateTime,
     ) -> Result<crate::application::SmtpTestOperationRecord, ApplicationError> {
-        if prepared.material.as_ref().map(|value| value.material_id) != Some(material.material_id) {
+        if prepared.material.material_id != material.material_id {
             return Err(ApplicationError::Integrity);
         }
         let fingerprint = material.request_fingerprint.into_bytes();
@@ -1285,13 +837,13 @@ impl EmailControlPort for PostgresEmailControlRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::InvalidTransition)?;
         if owner
-            .try_get::<Option<Uuid>>("", "recipient_material_id")
+            .try_get::<Uuid>("", "recipient_material_id")
             .map_err(persistence)?
-            != Some(material.material_id)
+            != material.material_id
         {
             return Err(ApplicationError::Integrity);
         }
-        let custody = self.custody()?;
+        let custody = self.custody();
         let reservation = custody
             .materials
             .load_project_reservation_in_transaction(
@@ -1310,8 +862,8 @@ impl EmailControlPort for PostgresEmailControlRepository {
             return Err(ApplicationError::Integrity);
         }
         let state: String = owner.try_get("", "state").map_err(persistence)?;
-        if state == "preparing" {
-            if owner
+        if state == "preparing"
+            && (owner
                 .try_get::<Option<Uuid>>("", "provisioning_token")
                 .map_err(persistence)?
                 != Some(prepared.record.id)
@@ -1319,35 +871,9 @@ impl EmailControlPort for PostgresEmailControlRepository {
                     .try_get::<OffsetDateTime>("", "created_at")
                     .map_err(persistence)?
                     + Duration::minutes(5)
-                    <= now
-            {
-                return Err(ApplicationError::InvalidTransition);
-            }
-            let reference = transaction
-                .query_one_raw(statement(
-                    "SELECT state,operation_id,material_id
-                 FROM smtp_test_recipient_reference_reservations
-                 WHERE recipient_ref=$1 FOR UPDATE",
-                    vec![prepared.record.recipient_ref.clone().into()],
-                ))
-                .await
-                .map_err(persistence)?
-                .ok_or(ApplicationError::Integrity)?;
-            if reference
-                .try_get::<String>("", "state")
-                .map_err(persistence)?
-                != "live"
-                || reference
-                    .try_get::<Uuid>("", "operation_id")
-                    .map_err(persistence)?
-                    != prepared.record.id
-                || reference
-                    .try_get::<Option<Uuid>>("", "material_id")
-                    .map_err(persistence)?
-                    != Some(material.material_id)
-            {
-                return Err(ApplicationError::InvalidTransition);
-            }
+                    <= now)
+        {
+            return Err(ApplicationError::InvalidTransition);
         }
         finalize_pending_material(
             &transaction,
@@ -1531,7 +1057,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
         if request_digest.len() != 32 {
             return Err(ApplicationError::InvalidInput);
         }
-        let custody = self.custody()?;
+        let custody = self.custody();
         let transaction = self.database.begin().await.map_err(persistence)?;
         transaction
             .execute_raw(statement(
@@ -1625,21 +1151,19 @@ impl EmailControlPort for PostgresEmailControlRepository {
                 custody.provider_format_version,
             )
             .await?;
-        let credential_ref = format!("deployment-smtp-generation-{}", command.generation);
         transaction
             .execute_raw(statement(
                 "INSERT INTO deployment_smtp_generations
                  (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
-                  sender_address,credential_ref,safe_fingerprint,explicitly_allowed_private_ips,
+                  sender_address,safe_fingerprint,explicitly_allowed_private_ips,
                   material_owner_id,credential_material_id,created_at,updated_at)
-                 VALUES ($1,'reconciled',1,1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10,$10)",
+                 VALUES ($1,'reconciled',1,1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,$9)",
                 vec![
                     command.generation.into(),
                     command.host.clone().into(),
                     i32::from(command.port).into(),
                     command.tls_mode.as_str().into(),
                     command.sender_address.clone().into(),
-                    credential_ref.clone().into(),
                     serde_json::json!(
                         command
                             .explicitly_allowed_private_ips
@@ -1672,15 +1196,6 @@ impl EmailControlPort for PostgresEmailControlRepository {
             ))
             .await
             .map_err(persistence)?;
-        transaction
-            .execute_raw(statement(
-                "INSERT INTO smtp_credential_reference_reservations
-                 (credential_ref,state,material_id,created_at,updated_at)
-                 VALUES ($1,'live',$2,$3,$3)",
-                vec![credential_ref.into(), material_id.into(), now.into()],
-            ))
-            .await
-            .map_err(persistence)?;
         transaction.commit().await.map_err(persistence)?;
         Ok(PreparedDeploymentSmtpGeneration {
             operation_id,
@@ -1709,7 +1224,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
         if fingerprint.len() != 32 {
             return Err(ApplicationError::Integrity);
         }
-        let custody = self.custody()?;
+        let custody = self.custody();
         let transaction = self.database.begin().await.map_err(persistence)?;
         transaction
             .execute_raw(statement(
@@ -1744,9 +1259,9 @@ impl EmailControlPort for PostgresEmailControlRepository {
                 .as_slice()
                 .ct_eq(prepared.request_digest.as_slice()),
         ) || row
-            .try_get::<Option<Uuid>>("", "credential_material_id")
+            .try_get::<Uuid>("", "credential_material_id")
             .map_err(persistence)?
-            != Some(material.material_id)
+            != material.material_id
         {
             return Err(ApplicationError::IdempotencyConflict);
         }
@@ -2093,7 +1608,9 @@ fn smtp_test_record(
         outcome,
         created_at: row.try_get("", "created_at").map_err(persistence)?,
         completed_at: row.try_get("", "completed_at").map_err(persistence)?,
-        recipient_ref: row.try_get("", "recipient_ref").map_err(persistence)?,
+        recipient_material_id: row
+            .try_get("", "recipient_material_id")
+            .map_err(persistence)?,
     })
 }
 
@@ -2167,15 +1684,11 @@ async fn find_prepared_smtp_operation(
     transaction: &DatabaseTransaction,
     project_id: Uuid,
     prepared: &PrepareSmtpConfiguration,
-) -> Result<Option<PreparedSmtpConfiguration>, ApplicationError> {
+) -> Result<Option<SmtpConfigurationRecord>, ApplicationError> {
     let operation = transaction.query_one_raw(statement(
-        "SELECT operation.request_digest, operation.credential_ref,
-                operation.state AS operation_state,
-                reservation.state AS reservation_state, configuration.*
+        "SELECT operation.request_digest,configuration.*
          FROM project_smtp_secret_operations operation
          JOIN project_smtp_configurations configuration ON configuration.project_id = operation.project_id AND configuration.id = operation.configuration_id
-         LEFT JOIN smtp_credential_reference_reservations reservation
-           ON reservation.credential_ref=operation.credential_ref
          WHERE operation.project_id = $1 AND operation.operation_alias = $2
          FOR UPDATE OF operation,configuration",
         vec![project_id.into(), prepared.operation_alias.clone().into()],
@@ -2186,50 +1699,10 @@ async fn find_prepared_smtp_operation(
     let digest: Vec<u8> = operation
         .try_get("", "request_digest")
         .map_err(persistence)?;
-    let credential_ref: String = operation
-        .try_get("", "credential_ref")
-        .map_err(persistence)?;
-    if digest != prepared.request_digest || credential_ref != prepared.credential_ref {
+    if digest != prepared.request_digest {
         return Err(ApplicationError::IdempotencyConflict);
     }
-    Ok(Some(PreparedSmtpConfiguration {
-        record: smtp_record(&operation)?,
-        operation_alias: prepared.operation_alias.clone(),
-        #[cfg(test)]
-        credential_ref: prepared.credential_ref.clone(),
-        request_digest: prepared.request_digest.clone(),
-        correlation_id: prepared.correlation_id,
-        material: None,
-        external_provisioning_required: matches!(
-            operation
-                .try_get::<String>("", "operation_state")
-                .map_err(persistence)?
-                .as_str(),
-            "prepared" | "provisioning"
-        ) && operation
-            .try_get::<Option<String>>("", "reservation_state")
-            .map_err(persistence)?
-            .as_deref()
-            == Some("live")
-            && operation
-                .try_get::<String>("", "status")
-                .map_err(persistence)?
-                == "pending",
-    }))
-}
-
-async fn lock_smtp_credential_reference(
-    transaction: &DatabaseTransaction,
-    credential_ref: &str,
-) -> Result<(), ApplicationError> {
-    transaction
-        .execute_raw(statement(
-            "SELECT pg_advisory_xact_lock(hashtextextended('owlauth:smtp-credential:' || $1,0))",
-            vec![credential_ref.to_owned().into()],
-        ))
-        .await
-        .map_err(persistence)?;
-    Ok(())
+    smtp_record(&operation).map(Some)
 }
 
 fn parse_ip_allowlist(

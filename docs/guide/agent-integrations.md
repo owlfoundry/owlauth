@@ -8,8 +8,8 @@ OwlAuth separates documentation assistance, remote administration, and future ag
 | ----------------------- | ---------------------------------------------------------------------------------------------- |
 | `owlauth` CLI           | Descriptor-pinned self-hosted Control commands and checksum-verified self-update are available |
 | Codex/Claude plugin     | Repository-distributed integration skill and reference material only                           |
-| Remote Control commands | Typed Project/Application/user/session/provider/key/projection/webhook commands are available  |
-| MCP server/tools        | Self-hosted Control reads plus one preview/commit mutation are available when enabled          |
+| Remote Control commands | Typed Project/Application/user/session/provider/key/webhook commands are available             |
+| MCP server/tools        | Seven self-hosted read-only Control tools are available when explicitly enabled                |
 
 The plugin does not bundle a server, launch a local MCP process, expose Project Auth operations, or create credentials. Treat it as documentation and guardrails for the Beta repository.
 
@@ -63,32 +63,11 @@ Credentials come from a TTY prompt, protected file descriptor, OS credential sto
 
 The self-hosted server provides a bounded standards-conformant Streamable HTTP MCP Control adapter authenticated by the `owl_ctrl_v1_...` operator Bearer key on every request. It has full deployment-operator authority.
 
-The endpoint exposes `mcp` relative to the administrative base URL. It is disabled by default and enabled with `OWLAUTH_CONTROL_MCP_ENABLED=true`; discovery publishes `mcp_url` only while the route is composed. Its current stateless JSON-response catalog identifies `owlauth-server` and exposes eight read-only tools for system capabilities, Project/Application inventory, projection policy, and webhook endpoint/delivery inspection. Its only mutation is a high-impact projection-policy update with separate preview and commit tools and no direct alias. It creates no MCP session and declares no prompts or resources. Tool discovery is not authorization; every invocation reauthenticates the operator key and revalidates current target revisions.
+The endpoint exposes `mcp` relative to the administrative base URL. It is disabled by default and enabled with `OWLAUTH_CONTROL_MCP_ENABLED=true`; discovery publishes `mcp_url` only while the route is composed. Its current stateless JSON-response catalog identifies `owlauth-server` and exposes exactly seven read-only tools for system capabilities, Project/Application inventory, and webhook endpoint/delivery inspection. It has no mutation tool, creates no MCP session, and declares no prompts or resources. Tool discovery is not authorization; every invocation reauthenticates the operator key and revalidates current target revisions.
 
 The endpoint is not a Runtime route or local plugin process. CLI, plugins, installers, and agent packages never bundle, launch, download, supervise, or impersonate an MCP server. The protected MCP host sends the Bearer header; the key never enters prompt/model context, tools, results, URLs, or protocol session IDs.
 
-A tool maps to one bounded Control application command or query with explicit target/revisions, closed input/output, idempotency, timeout/rate/audit policy, and preview/commit confirmation for high-impact actions. MCP does not provide raw SQL, generic HTTP/OpenAPI forwarding, repository access, CLI/shell/filesystem execution, unrestricted bulk mutation, or export of secrets, provider tokens, sessions, operator/API keys, private keys, or user-profile dumps.
-
-### High-impact confirmation
-
-```mermaid
-sequenceDiagram
-    participant Agent as MCP client
-    participant Adapter as Self-hosted HTTP MCP adapter
-    participant Core as Shared Control core
-    participant PG as PostgreSQL
-
-    Agent->>Adapter: Preview exact typed command
-    Adapter->>Core: Authenticate operator key and resolve Project/revisions
-    Core->>PG: Store digest of short-lived bound capability
-    Adapter-->>Agent: Redacted summary + one-use capability
-    Agent->>Adapter: Commit identical command + capability
-    Adapter->>Core: Reauthenticate key and validate payload/revisions
-    Core->>PG: Consume capability + mutate + audit atomically
-    Adapter-->>Agent: Bounded result or stale/replay error
-```
-
-The self-hosted capability binds the fixed deployment-operator actor, Control audience, deployment instance, exact MCP Control endpoint, exact commit tool, normalized command, explicit Project, Project metadata revision, and target revision. PostgreSQL stores only its digest and uses its own clock for the bounded expiry. PostgreSQL—not Redis—enforces one use in the same transaction as the conditional mutation, expansion operation, and audit event.
+Each tool maps to one bounded Control query with explicit targets, closed input/output, and timeout/rate policy. MCP does not provide raw SQL, generic HTTP/OpenAPI forwarding, repository access, CLI/shell/filesystem execution, mutation, unrestricted bulk reads, or export of secrets, provider tokens, sessions, operator/API keys, private keys, or user-profile dumps. Any future mutation requires a separately reviewed server-enforced authorization, idempotency, audit, and confirmation design before it enters the catalog.
 
 ## External control gateways
 

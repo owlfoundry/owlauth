@@ -143,7 +143,7 @@ pub(crate) struct ConnectionGuard {
     pub issuer: String,
     pub subject: String,
     pub client_id: String,
-    pub secret_ref: String,
+    pub secret_material_id: Uuid,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

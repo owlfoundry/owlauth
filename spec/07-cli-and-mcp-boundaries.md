@@ -164,48 +164,13 @@ POST, optional GET streaming, DELETE, and session-header behavior follow the neg
 
 Every tool maps to one bounded application command/query and defines a closed input schema, explicit Project target where applicable, expected revisions, deterministic side effects, idempotency behavior, timeout/rate policy, safe output, audit action, and server-owned impact class that no request parameter can override. Tools are hand-designed and are not generated from OpenAPI or CLI commands.
 
-Every new or otherwise unclassified mutating tool defaults to high impact and therefore requires preview/commit. Only a reviewed read-only tool or bounded, reversible low-impact mutation may be classified lower. High-impact v1 operations include deletion; disabling or revoking a user, session family, provider, Application, Project, credential, or signing key; signing-key activation/rotation; security-policy, redirect/origin, provider, email, or webhook trust changes; identity merge/link/disconnect; and any bulk, irreversible, or externally visible security-sensitive mutation. The owning catalog records this classification, conformance tests prove that each high-impact operation has no direct-commit alias or alternate lower-class path, and safe tool annotations or `tools/list` metadata never replace server-side enforcement.
+V1 exposes no mutating MCP tool. Any future mutation is unclassified until a reviewed specification defines its server-enforced impact class, authorization, idempotency, audit, and—when high impact—preview/commit confirmation path. Tool annotations or `tools/list` metadata never replace server-side enforcement.
 
 Tools MUST NOT provide raw SQL, repository access, generic HTTP/OpenAPI forwarding, arbitrary path/method/body invocation, CLI/shell/filesystem execution, unrestricted bulk mutation, or export of provider secrets/tokens, handoff/session credentials, the operator key, private keys, or user profile dumps.
 
 Prompt text, model output, UI approval, tool discovery, and tool arguments are untrusted input. They cannot establish authority; only successful operator-key authentication admits a self-hosted request.
 
-The initial self-hosted catalog classifies `owlauth_system_get`, Project/Application inventory reads, `owlauth_projection_policy_get`, and webhook endpoint/delivery inspection as read-only. Its only mutation is the high-impact projection-policy expansion pair: `owlauth_projection_policy_update_preview` issues the one-use confirmation capability, and `owlauth_projection_policy_update_commit` is the sole commit path. Preview rejects narrowing and no-change requests, so every successful commit advances the target policy revision and creates the bounded expansion operation. There is no direct mutation alias. Adding another mutating tool requires recording its impact class and confirmation path here before exposure.
-
-## High-impact MCP confirmation
-
-High-impact tools use a preview/commit flow to bind operator intent to current state:
-
-```mermaid
-sequenceDiagram
-    participant Agent as Remote MCP client
-    participant Adapter as HTTP MCP Control adapter
-    participant Core as Shared core
-    participant PG as PostgreSQL
-
-    Agent->>Adapter: Preview typed Project command
-    Adapter->>Adapter: Authenticate deployment operator key
-    Adapter->>Core: Calculate safe summary
-    Core->>PG: Read revisions and store confirmation digest
-    PG-->>Core: Authoritative snapshot + capability record
-    Core-->>Agent: Redacted summary + raw capability
-    Agent->>Adapter: Commit exact command + capability
-    Adapter->>Adapter: Reauthenticate deployment operator key
-    Adapter->>Core: Validate command, Project, and revisions
-    Core->>PG: Consume capability + conditional mutation + audit atomically
-    PG-->>Core: Committed, replayed, expired, or stale/conflict
-    Core-->>Agent: Bounded result
-```
-
-The high-entropy integrity-protected capability binds:
-
-- the fixed deployment-operator actor and MCP/Control audience;
-- the exact tool and normalized command digest;
-- the explicit Project when Project-bound;
-- Project metadata and command-specific target revisions;
-- a short expiry and one-use state.
-
-It is not bound to a server-side user, role, permission grant, transport session, or secondary-authentication session. PostgreSQL stores only its digest and atomically consumes it with the command and deployment-operator audit event. A capability cannot move to another tool, command, Project, revision, deployment, endpoint, or Runtime route. Capability admission is serialized in PostgreSQL, removes expired rows in bounded `SKIP LOCKED` batches, and enforces a hard retained-row ceiling of 4096; once full, preview fails closed until expiry cleanup creates capacity. Thus preview-only traffic cannot create unbounded durable state even if no later maintenance traffic arrives.
+The initial self-hosted catalog contains exactly seven read-only tools: `owlauth_system_get`, Project list/get, Application list/get, webhook endpoint list, and webhook delivery list. There is no projection-policy tool, mutation tool, preview/commit capability, durable confirmation table, or alternate direct-commit alias. Adding a mutation requires implementing and testing its reviewed design before it enters the catalog.
 
 ## Surface and recovery boundaries
 

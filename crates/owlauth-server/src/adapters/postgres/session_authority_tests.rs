@@ -25,9 +25,9 @@ use super::{
     session_authority::PostgresSessionAuthorityRepository,
 };
 use crate::adapters::runtime_security::{
-    ManagedCredentialKeyMaterial, RuntimeKeyMaterial, SoftwareManagedCredentialProtector,
-    SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
-    UnavailableDurableEmailAddressReader,
+    ManagedCredentialKeyMaterial, RuntimeKeyMaterial, SoftwareDurableEmailAddressReader,
+    SoftwareManagedCredentialProtector, SoftwareProjectionVerifiedEmailProtector,
+    SoftwareRuntimeProtector, UnavailableDurableEmailAddressReader,
 };
 use crate::{
     application::{
@@ -38,13 +38,13 @@ use crate::{
         CompleteAuthenticatedIdentity, ConfirmBrowserLogout, ControlLifecyclePort,
         CreateIdentityMutation, CreateIdentityMutationResult, CreateLoginTransaction,
         CreateManagedReauthorization, CreateManagedReauthorizationResult, DenyProviderCallback,
-        DisableProjectUser, ExpectedIdentity, ExpectedUser, FailManagedReauthorization,
-        FailProviderExchange, IdentityMutationBindingsDisposition, IdentityMutationCreateOperation,
-        IdentityMutationPrimarySourceDisposition, IdentityMutationProofAuthoritySelection,
-        IdentityMutationProviderCapabilities, IdentityMutationSessionsDisposition,
-        LoginRevisionSnapshot, LogoutApplicationSession, ManagedAdapterCapabilitySnapshot,
-        ManagedConnectionRepository, ManagedCredentialCapability, ManagedCredentialContext,
-        ManagedCredentialProtector, ManagedInteractionCleanupService,
+        DisableProjectUser, EnableProjectUser, ExpectedIdentity, ExpectedUser,
+        FailManagedReauthorization, FailProviderExchange, IdentityMutationBindingsDisposition,
+        IdentityMutationCreateOperation, IdentityMutationPrimarySourceDisposition,
+        IdentityMutationProofAuthoritySelection, IdentityMutationProviderCapabilities,
+        IdentityMutationSessionsDisposition, LoginRevisionSnapshot, LogoutApplicationSession,
+        ManagedAdapterCapabilitySnapshot, ManagedConnectionRepository, ManagedCredentialCapability,
+        ManagedCredentialContext, ManagedCredentialProtector, ManagedInteractionCleanupService,
         ManagedReauthorizationRepository, ManagedReauthorizationStatus, PrepareBrowserLogout,
         PrepareHandoffExchange, PrepareRefreshRotation, PreparedIdentityMutationConfirmation,
         PreparedIdentityMutationCreate, PreparedIdentityMutationProviderCompletion,
@@ -71,6 +71,21 @@ impl Clock for FixedClock {
     fn now(&self) -> OffsetDateTime {
         self.0
     }
+}
+
+fn test_projection_materializer() -> Arc<PostgresIdentityProjectionMaterializer> {
+    Arc::new(PostgresIdentityProjectionMaterializer::new(
+        Arc::new(UnavailableDurableEmailAddressReader),
+        Arc::new(
+            SoftwareProjectionVerifiedEmailProtector::new(
+                "session-authority-test".to_owned(),
+                1,
+                [103; 32],
+                BTreeMap::new(),
+            )
+            .expect("session projection protector"),
+        ),
+    ))
 }
 
 fn callback_capability_snapshot() -> ManagedCredentialCapability {
@@ -443,12 +458,22 @@ async fn seed_authority(pool: &PgPool, now: OffsetDateTime, namespace: &str) -> 
     .await
     .expect("seed policy");
     sqlx::query(
-        "INSERT INTO provider_configurations
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('03',32),'hex'),decode('01','hex'),
+                     decode(repeat('02',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
             (id, project_id, provider_key, kind, display_name, issuer, client_id,
-             callback_url, secret_ref, status, revision)
-         VALUES ($1, $2, 'oidc-main', 'oidc', 'OIDC', 'https://issuer.example',
-             'client',
-             $3, 'secret/ref/oidc-main', 'active', 1)",
+             callback_url, secret_material_id, status, revision)
+         SELECT $1, $2, 'oidc-main', 'oidc', 'OIDC', 'https://issuer.example',
+                'client', $3, material.id, 'active', 1 FROM material",
     )
     .bind(seeded.provider_id)
     .bind(seeded.project_id)
@@ -482,12 +507,21 @@ async fn seed_authority(pool: &PgPool, now: OffsetDateTime, namespace: &str) -> 
     .await
     .expect("seed signing ring");
     sqlx::query(
-        "INSERT INTO project_signing_keys
-            (id, project_id, ring_id, kid, public_jwk, signer_ref, state, ring_revision,
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,state)
+             VALUES (gen_random_uuid(),'project',$2,'signing_key',$1,1,'signing_key',
+                     'software',1,1,decode(repeat('04',32),'hex'),decode('01','hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO project_signing_keys
+            (id, project_id, ring_id, kid, public_jwk, signer_material_id, state, ring_revision,
              provisioned_at, published_at, activated_at, sign_not_before)
-         VALUES ($1, $2, $3, 'kid_test01',
+         SELECT $1, $2, $3, 'kid_test01',
              '{\"alg\":\"EdDSA\",\"crv\":\"Ed25519\",\"kid\":\"kid_test01\",\"kty\":\"OKP\",\"use\":\"sig\",\"x\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}'::jsonb,
-             'signer/ref/test01', 'active', 1, $4, $4, $4, $4)",
+             material.id, 'active', 1, $4, $4, $4, $4 FROM material",
     )
     .bind(seeded.signing_key_id)
     .bind(seeded.project_id)
@@ -536,8 +570,12 @@ async fn insert_managed_fixture(
     sqlx::query(
         "INSERT INTO linked_identities
            (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,status,
-            identity_revision,display_name,observed_at,created_at,updated_at)
-         VALUES ($1,$2,$3,$4,'https://issuer.example',$5,'active',1,'Managed fixture',$6,$6,$6)",
+            identity_revision,source_profile_digest,display_name,observed_at,created_at,updated_at)
+         SELECT $1,$2,$3,$4,provider.issuer,$5,'active',1,
+                public.owlauth_provider_source_profile_digest('Managed fixture',NULL,NULL),
+                'Managed fixture',$6,$6,$6
+           FROM provider_configurations AS provider
+          WHERE provider.project_id=$2 AND provider.id=$4",
     )
     .bind(identity_id)
     .bind(seeded.project_id)
@@ -570,8 +608,7 @@ async fn insert_managed_fixture(
            (id,project_id,provider_configuration_id,linked_identity_id,user_id,state,revision,
             generation,credential_generation,project_security_revision,provider_revision,
             user_security_revision,identity_revision,managed_profile_revision,adapter_key,
-            adapter_capability_revision,
-            required_scopes,supports_revocation,last_safe_outcome,
+            adapter_capability_revision,required_scopes,supports_revocation,last_safe_outcome,
             next_synchronize_at,next_renewal_at,created_at,updated_at)
          VALUES ($1,$2,$3,$4,$5,'active',1,1,1,1,1,1,1,1,
                  'controlled_oidc_profile_v1',1,
@@ -902,30 +939,55 @@ async fn google_managed_workers_use_named_authority_without_project_egress_snaps
         .replace_nanosecond(0)
         .expect("whole-second test time");
     let seeded = seed_authority(&pool, now, "googlemanaged").await;
-    let mut provider_setup = pool
-        .begin()
-        .await
-        .expect("begin Google provider fixture setup");
-    sqlx::query("SET LOCAL session_replication_role='replica'")
-        .execute(&mut *provider_setup)
-        .await
-        .expect("disable compatibility trigger for preselected Google fixture");
+    let google_provider_id = Uuid::new_v4();
+    let google_provider_key = "google-main".to_owned();
+    let google_callback_url = format!(
+        "https://runtime.example/projects/{}/auth/callback/{google_provider_key}",
+        seeded.project_public_id
+    );
     sqlx::query(
-        "UPDATE provider_configurations
-            SET adapter_kind='google',issuer=$1,managed_profile_enabled=TRUE,
-                onboarding_policy_revision=NULL
-          WHERE project_id=$2 AND id=$3",
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('13',32),'hex'),decode('11','hex'),
+                     decode(repeat('12',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
+            (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
+             secret_material_id,status,revision,managed_profile_enabled)
+         SELECT $1,$2,$3,'google','Google',$4,'client',$5,material.id,'active',1,TRUE
+           FROM material",
     )
-    .bind(crate::domain::GOOGLE_ISSUER)
+    .bind(google_provider_id)
     .bind(seeded.project_id)
-    .bind(seeded.provider_id)
-    .execute(&mut *provider_setup)
+    .bind(&google_provider_key)
+    .bind(crate::domain::GOOGLE_ISSUER)
+    .bind(&google_callback_url)
+    .execute(&pool)
     .await
-    .expect("select Google named-provider authority");
-    provider_setup
-        .commit()
-        .await
-        .expect("commit Google provider fixture setup");
+    .expect("insert Google named-provider authority");
+    sqlx::query(
+        "INSERT INTO application_provider_assignments
+            (project_id,application_id,provider_id,status,security_revision)
+         VALUES ($1,$2,$3,'active',1)",
+    )
+    .bind(seeded.project_id)
+    .bind(seeded.application_id)
+    .bind(google_provider_id)
+    .execute(&pool)
+    .await
+    .expect("assign Google named-provider authority");
+    let seeded = SeededAuthority {
+        provider_id: google_provider_id,
+        provider_key: google_provider_key,
+        callback_url: google_callback_url,
+        ..seeded
+    };
     let protector = SoftwareRuntimeProtector::new(
         "google-managed-test".to_owned(),
         1,
@@ -952,7 +1014,8 @@ async fn google_managed_workers_use_named_authority_without_project_egress_snaps
     let database = Database::connect(&url)
         .await
         .expect("Google managed-worker SeaORM pool");
-    let repository = PostgresManagedConnectionRepository::new(database.clone());
+    let repository =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
 
     let read = repository
         .claim_next_read(Uuid::new_v4(), now, now + Duration::seconds(30))
@@ -1105,10 +1168,31 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         )
         .expect("managed test protector"),
     );
+    let projection_materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
+        Arc::new(
+            SoftwareDurableEmailAddressReader::new(
+                "managed-test-deployment".to_owned(),
+                1,
+                RuntimeKeyMaterial::new([1; 32], [2; 32]),
+                BTreeMap::new(),
+            )
+            .expect("session durable email reader"),
+        ),
+        Arc::new(
+            SoftwareProjectionVerifiedEmailProtector::new(
+                "session-authority-test".to_owned(),
+                1,
+                [103; 32],
+                BTreeMap::new(),
+            )
+            .expect("session projection protector"),
+        ),
+    ));
     let sessions = PostgresSessionAuthorityRepository::with_protectors(
         database.clone(),
         protector.clone(),
         protector.clone(),
+        projection_materializer.clone(),
     );
     let callback_url = seeded.callback_url.clone();
     let login = authentication
@@ -1265,19 +1349,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     .execute(&pool)
     .await
     .expect("select primary verified email");
-    sqlx::query(
-        "UPDATE project_policies SET projection_verified_email_enabled=TRUE WHERE project_id=$1",
-    )
-    .bind(seeded.project_id)
-    .execute(&pool)
-    .await
-    .expect("admit verified email at Project boundary");
-    sqlx::query("UPDATE applications SET projection_verified_email_enabled=TRUE WHERE id=$1")
-        .bind(seeded.application_id)
-        .execute(&pool)
-        .await
-        .expect("admit verified email at Application boundary");
-
     let identity_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM linked_identities
          WHERE project_id = $1 AND issuer = 'https://issuer.example' AND subject = 'subject-1'",
@@ -1420,7 +1491,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     );
     let rewrite_provider_secret = sqlx::query(
         "UPDATE managed_provider_reauthorization_interactions
-            SET secret_material_id=NULL,secret_ref='different/provider/secret'
+            SET secret_material_id=gen_random_uuid()
           WHERE id=$1",
     )
     .bind(interaction_id)
@@ -1706,7 +1777,8 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         Some(33),
     )
     .await;
-    let cancellation_sweeper = PostgresManagedConnectionRepository::new(database.clone());
+    let cancellation_sweeper =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
     assert_eq!(
         cancellation_sweeper
             .terminalize_expired_interactions(256, now + Duration::seconds(21))
@@ -1765,7 +1837,8 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     .expect("managed create result inventory");
     assert!(erased.is_none());
 
-    let managed_repository = PostgresManagedConnectionRepository::new(database.clone());
+    let managed_repository =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
     sqlx::query(
         "UPDATE managed_provider_connections SET next_renewal_at = $1 WHERE project_id = $2 AND id = $3",
     )
@@ -3083,16 +3156,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         .execute(&pool)
         .await
         .expect("advance user revision after prepare");
-    sqlx::query("UPDATE project_policies SET projection_revision = 2 WHERE project_id = $1")
-        .bind(seeded.project_id)
-        .execute(&pool)
-        .await
-        .expect("advance Project projection policy after prepare");
-    sqlx::query("UPDATE applications SET projection_revision = 2 WHERE id = $1")
-        .bind(seeded.application_id)
-        .execute(&pool)
-        .await
-        .expect("advance Application projection policy after prepare");
     sqlx::query("UPDATE project_key_rings SET signing_epoch = 2 WHERE id = $1")
         .bind(seeded.ring_id)
         .execute(&pool)
@@ -3117,8 +3180,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         .await
         .expect("reprepare handoff after owner revisions change");
     assert_eq!(fresh_preparation.user_revision, 2);
-    assert_eq!(fresh_preparation.project_projection_revision, 2);
-    assert_eq!(fresh_preparation.application_projection_revision, 2);
     assert_eq!(fresh_preparation.signing_epoch, 2);
     let expected_projection = fresh_preparation.projection_document.clone();
     let exchange = CommitHandoffExchange {
@@ -3190,9 +3251,9 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     .execute(&pool)
     .await
     .expect("corrupt stored projection before current-user read");
-    let runtime = PostgresRuntimeAuthorityRepository::with_runtime_protector(
+    let runtime = PostgresRuntimeAuthorityRepository::with_projection_materializer(
         database.clone(),
-        protector.clone(),
+        projection_materializer,
     );
     let current = runtime
         .current_session(
@@ -3210,43 +3271,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         .expect("current-user read lazily repairs projection material");
     assert_eq!(current.projection_revision, session.projection_revision);
     assert_eq!(current.projection_document, expected_projection);
-
-    sqlx::query(
-        "UPDATE applications
-            SET projection_verified_email_enabled=FALSE,projection_revision=3 WHERE id=$1",
-    )
-    .bind(seeded.application_id)
-    .execute(&pool)
-    .await
-    .expect("close Application verified-email projection gate");
-    let gated_off = runtime
-        .current_session(
-            AccessTokenSessionLookup {
-                project_id: seeded.project_id,
-                application_public_id: "app_session01".to_owned(),
-                user_public_id: issued.user_public_id.clone(),
-                application_session_id: session.application_session_id,
-                claims_revision: 1,
-                now: exchange_at,
-            },
-            false,
-        )
-        .await
-        .expect("repair projection after one policy gate closes");
-    assert_eq!(
-        gated_off.projection_document["verified_email"],
-        serde_json::Value::Null
-    );
-    assert_eq!(gated_off.projection_revision, 2);
-
-    sqlx::query(
-        "UPDATE applications
-            SET projection_verified_email_enabled=TRUE,projection_revision=4 WHERE id=$1",
-    )
-    .bind(seeded.application_id)
-    .execute(&pool)
-    .await
-    .expect("reopen Application verified-email projection gate");
 
     let (family_expires_at, initial_retain_until): (OffsetDateTime, OffsetDateTime) =
         sqlx::query_as(
@@ -3296,10 +3320,9 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     );
     assert_eq!(
         refresh_preparation.projection_revision,
-        gated_off.projection_revision + 1
+        session.projection_revision + 1
     );
     let expected_projection = refresh_preparation.projection_document.clone();
-    let expected_projection_revision = refresh_preparation.projection_revision;
     let current_after_refresh_repair = runtime
         .current_session(
             AccessTokenSessionLookup {
@@ -3319,54 +3342,11 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         expected_projection
     );
 
-    sqlx::query(
-        "ALTER TABLE application_user_projections
-         DISABLE TRIGGER application_user_projections_source_base_digest_fill",
-    )
-    .execute(&pool)
-    .await
-    .expect("disable compatibility trigger for legacy-null fixture");
-    sqlx::query(
-        "UPDATE application_user_projections
-         SET source_base_profile_digest = NULL
-         WHERE binding_id = $1",
-    )
-    .bind(session.binding_id)
-    .execute(&pool)
-    .await
-    .expect("simulate legacy projection without source digest");
-    sqlx::query(
-        "ALTER TABLE application_user_projections
-         ENABLE TRIGGER application_user_projections_source_base_digest_fill",
-    )
-    .execute(&pool)
-    .await
-    .expect("restore projection compatibility trigger");
-    let source_digest_repair = sessions
-        .prepare_refresh_rotation(PrepareRefreshRotation {
-            project_id: seeded.project_id,
-            application_id: seeded.application_id,
-            presented_token: digest(12),
-            now: refresh_at,
-        })
-        .await
-        .expect("repair source digest during refresh preparation");
-    let RefreshPreparationResult::Ready(source_digest_repair) = source_digest_repair else {
-        panic!("current refresh token must remain eligible during storage repair");
-    };
-    assert_eq!(
-        source_digest_repair.projection_revision,
-        expected_projection_revision
-    );
-    assert_eq!(
-        source_digest_repair.projection_document,
-        expected_projection
-    );
     let refresh_a = RotateRefreshToken {
         project_id: seeded.project_id,
         application_id: seeded.application_id,
         presented_token: digest(12),
-        preparation: *source_digest_repair,
+        preparation: *refresh_preparation,
         successor_generation_id: Uuid::new_v4(),
         successor_token: digest(13),
         now: refresh_at,
@@ -3422,34 +3402,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     assert_eq!(
         successor_retain_until,
         family_expires_at + Duration::seconds(60)
-    );
-
-    sqlx::query(
-        "UPDATE applications
-            SET projection_verified_email_enabled=FALSE,projection_revision=5 WHERE id=$1",
-    )
-    .bind(seeded.application_id)
-    .execute(&pool)
-    .await
-    .expect("close Application verified-email gate before Control disable");
-    let gated_off_again = runtime
-        .current_session(
-            AccessTokenSessionLookup {
-                project_id: seeded.project_id,
-                application_public_id: "app_session01".to_owned(),
-                user_public_id: issued.user_public_id.clone(),
-                application_session_id: session.application_session_id,
-                claims_revision: 1,
-                now: refresh_at,
-            },
-            true,
-        )
-        .await
-        .expect("clear protected projection material through Runtime authority");
-    assert_eq!(gated_off_again.projection_revision, 4);
-    assert_eq!(
-        gated_off_again.projection_document["verified_email"],
-        serde_json::Value::Null
     );
 
     let prepared = sessions
@@ -3831,7 +3783,8 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     );
     assert_eq!(projection_after_replacement, projection_before_replacement);
 
-    let control = PostgresControlLifecycleRepository::new(database.clone());
+    let control =
+        PostgresControlLifecycleRepository::new(database.clone(), test_projection_materializer());
     let disabled = control
         .disable_project_user(DisableProjectUser {
             project_id: seeded.project_id,
@@ -3851,7 +3804,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
     .fetch_one(&pool)
     .await
     .expect("load disabled projection");
-    assert_eq!(disabled_projection, (5, 3, "disabled".to_owned()));
+    assert_eq!(disabled_projection, (3, 3, "disabled".to_owned()));
 
     let audit_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_events
@@ -3895,7 +3848,8 @@ async fn ordinary_login_and_managed_profile_share_canonical_user_identity_lock_o
         .await
         .expect("lock-order SeaORM pool");
     let authentication = PostgresAuthenticationRepository::new(database.clone());
-    let sessions = PostgresSessionAuthorityRepository::new(database.clone());
+    let sessions =
+        PostgresSessionAuthorityRepository::new(database.clone(), test_projection_materializer());
     let first_claim = claim_provider_login(&authentication, &seeded, 71, now).await;
     let issued = sessions
         .complete_authenticated_identity(completion_command(&seeded, &first_claim, 71, now))
@@ -3911,7 +3865,8 @@ async fn ordinary_login_and_managed_profile_share_canonical_user_identity_lock_o
     .expect("lock-order protector");
     let fixture =
         insert_managed_for_existing_identity(&pool, &seeded, issued.user_id, &protector, now).await;
-    let managed = PostgresManagedConnectionRepository::new(database.clone());
+    let managed =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
     let guard_claim = managed
         .claim_for_revocation(
             seeded.project_id,
@@ -4124,7 +4079,8 @@ async fn read_evidence_rolls_back_when_control_revocation_wins_connection_lock()
     let database = Database::connect(&url)
         .await
         .expect("read-evidence SeaORM pool");
-    let repository = PostgresManagedConnectionRepository::new(database.clone());
+    let repository =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
     let guard = repository
         .claim_for_revocation(
             seeded.project_id,
@@ -4256,8 +4212,10 @@ async fn destructive_intent_refuses_login_credential_replacement_until_terminal(
     let sessions = PostgresSessionAuthorityRepository::with_managed_protector(
         database.clone(),
         protector.clone(),
+        test_projection_materializer(),
     );
-    let managed = PostgresManagedConnectionRepository::new(database.clone());
+    let managed =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
 
     let identity_claim = claim_provider_login(&authentication, &seeded, 11, now).await;
     let identity = sessions
@@ -4599,8 +4557,10 @@ async fn ordinary_login_truthfully_supersedes_old_generation_renewals() {
     let sessions = PostgresSessionAuthorityRepository::with_managed_protector(
         database.clone(),
         protector.clone(),
+        test_projection_materializer(),
     );
-    let managed = PostgresManagedConnectionRepository::new(database.clone());
+    let managed =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
 
     let identity_claim = claim_provider_login(&authentication, &seeded, 12, now).await;
     let identity = sessions
@@ -4960,8 +4920,11 @@ async fn stale_managed_callbacks_terminalize_without_touching_current_generation
         )
         .expect("stale-callback protector"),
     );
-    let sessions =
-        PostgresSessionAuthorityRepository::with_managed_protector(database.clone(), protector);
+    let sessions = PostgresSessionAuthorityRepository::with_managed_protector(
+        database.clone(),
+        protector,
+        test_projection_materializer(),
+    );
     let reauthorizations = PostgresManagedReauthorizationRepository::new(database.clone());
 
     let identity_claim = claim_provider_login(&authentication, &seeded, 13, now).await;
@@ -5303,8 +5266,8 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
             .expect("provider profile projection protector"),
         ),
     ));
-    let sessions = PostgresSessionAuthorityRepository::new(database.clone())
-        .with_projection_materializer(projection_materializer);
+    let sessions =
+        PostgresSessionAuthorityRepository::new(database.clone(), projection_materializer);
     let first_claim = claim_provider_login(&authentication, &first_project, 21, now).await;
     let competing_claim = claim_provider_login(&authentication, &first_project, 41, now).await;
     let other_project_claim = claim_provider_login(&authentication, &second_project, 61, now).await;
@@ -5374,12 +5337,23 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
         first_project.project_public_id
     );
     sqlx::query(
-        "INSERT INTO provider_configurations
+        "WITH material AS (
+             INSERT INTO protected_materials
+                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
+                 provider_id,provider_format_version,context_version,context_digest,
+                 opaque_value,safe_fingerprint,state)
+             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
+                     'configuration_secret','software',1,1,
+                     decode(repeat('03',32),'hex'),decode('01','hex'),
+                     decode(repeat('02',32),'hex'),'live')
+             RETURNING id
+         )
+         INSERT INTO provider_configurations
             (id, project_id, provider_key, kind, display_name, issuer, client_id,
-             callback_url, secret_ref, status, revision)
-         VALUES ($1, $2, 'oidc-secondary', 'oidc', 'OIDC',
-             'https://issuer.example', 'client-secondary', $3,
-             'secret/ref/oidc-secondary', 'active', 1)",
+             callback_url, secret_material_id, status, revision)
+         SELECT $1, $2, 'oidc-secondary', 'oidc', 'OIDC',
+                'https://issuer.example', 'client-secondary', $3,
+                material.id, 'active', 1 FROM material",
     )
     .bind(secondary_provider_id)
     .bind(first_project.project_id)
@@ -5432,9 +5406,9 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
     sqlx::query(
         "INSERT INTO application_user_projections
             (id, project_id, binding_id, application_id, user_id, schema_name,
-             projection_revision, source_user_revision, project_policy_revision,
-             application_policy_revision, canonical_digest, source_base_profile_digest, document)
-         VALUES ($1, $2, $3, $4, $5, 'owlauth.user.v1', 1, 1, 1, 1, $6, $6, $7)",
+             projection_revision, source_user_revision, canonical_digest,
+             source_base_profile_digest, document)
+         VALUES ($1, $2, $3, $4, $5, 'owlauth.user.v1', 1, 1, $6, $6, $7)",
     )
     .bind(Uuid::new_v4())
     .bind(first_project.project_id)
@@ -5469,18 +5443,15 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
         .complete_authenticated_identity(profile_change)
         .await
         .expect("complete primary-profile change");
-    let (
-        user_revision,
-        projection_revision,
-        source_user_revision,
-        project_policy_revision,
-        application_policy_revision,
-        document,
-        canonical_digest,
-    ): (i64, i64, i64, i64, i64, serde_json::Value, Vec<u8>) = sqlx::query_as(
+    let (user_revision, projection_revision, source_user_revision, document, canonical_digest): (
+        i64,
+        i64,
+        i64,
+        serde_json::Value,
+        Vec<u8>,
+    ) = sqlx::query_as(
         "SELECT users.user_revision, projections.projection_revision,
-                    projections.source_user_revision, projections.project_policy_revision,
-                    projections.application_policy_revision, projections.document,
+                    projections.source_user_revision, projections.document,
                     projections.canonical_digest
              FROM project_users AS users
              JOIN application_user_projections AS projections
@@ -5495,8 +5466,6 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
     assert_eq!(user_revision, 2);
     assert_eq!(projection_revision, 2);
     assert_eq!(source_user_revision, 2);
-    assert_eq!(project_policy_revision, 1);
-    assert_eq!(application_policy_revision, 1);
     assert_eq!(document["display_name"], "Grace");
     assert_ne!(canonical_digest, vec![1_u8; 32]);
     let profile_event_types: Vec<String> = sqlx::query_scalar(
@@ -5550,81 +5519,6 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
         "Grace"
     );
 
-    let before_digest_repair: (i64, i64, i64, OffsetDateTime, OffsetDateTime) = sqlx::query_as(
-        "SELECT identities.identity_revision, users.user_revision,
-                    projections.projection_revision, users.updated_at, identities.updated_at
-             FROM linked_identities AS identities
-             JOIN project_users AS users
-               ON users.project_id = identities.project_id AND users.id = identities.user_id
-             JOIN application_user_projections AS projections
-               ON projections.project_id = users.project_id AND projections.user_id = users.id
-             WHERE identities.project_id = $1 AND identities.subject = 'shared-subject'",
-    )
-    .bind(first_project.project_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load revisions before digest-only repair");
-    sqlx::query(
-        "ALTER TABLE linked_identities
-         DISABLE TRIGGER linked_identities_source_profile_digest_fill",
-    )
-    .execute(&pool)
-    .await
-    .expect("disable compatibility trigger for legacy-null fixture");
-    sqlx::query(
-        "UPDATE linked_identities SET source_profile_digest = NULL
-         WHERE project_id = $1 AND subject = 'shared-subject'",
-    )
-    .bind(first_project.project_id)
-    .execute(&pool)
-    .await
-    .expect("simulate legacy provider source without digest");
-    sqlx::query(
-        "ALTER TABLE linked_identities
-         ENABLE TRIGGER linked_identities_source_profile_digest_fill",
-    )
-    .execute(&pool)
-    .await
-    .expect("restore provider-source compatibility trigger");
-    sqlx::query("UPDATE project_users SET base_profile_digest = $2 WHERE id = $1")
-        .bind(first.user_id)
-        .bind(vec![6_u8; 32])
-        .execute(&pool)
-        .await
-        .expect("corrupt only user base digest");
-    let repair_claim =
-        claim_provider_login(&authentication, &secondary_registration, 91, now).await;
-    let mut repair_command = completion_command(&secondary_registration, &repair_claim, 91, now);
-    let AuthenticatedIdentityEvidence::Provider(repair_profile) = &mut repair_command.evidence;
-    repair_profile.display_name =
-        Some(ProfileDisplayName::parse("Grace".to_owned()).expect("same display name"));
-    sessions
-        .complete_authenticated_identity(repair_command)
-        .await
-        .expect("provider completion repairs digest-only corruption");
-    let after_digest_repair: (i64, i64, i64, OffsetDateTime, OffsetDateTime) = sqlx::query_as(
-        "SELECT identities.identity_revision, users.user_revision,
-                    projections.projection_revision, users.updated_at, identities.updated_at
-             FROM linked_identities AS identities
-             JOIN project_users AS users
-               ON users.project_id = identities.project_id AND users.id = identities.user_id
-             JOIN application_user_projections AS projections
-               ON projections.project_id = users.project_id AND projections.user_id = users.id
-             WHERE identities.project_id = $1 AND identities.subject = 'shared-subject'",
-    )
-    .bind(first_project.project_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load revisions after digest-only repair");
-    assert_eq!(after_digest_repair, before_digest_repair);
-    let event_count_after_digest_repair: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM application_user_events WHERE binding_id=$1")
-            .bind(binding_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count events after provider digest-only no-op");
-    assert_eq!(event_count_after_digest_repair, 1);
-
     let orphan_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
          FROM project_users AS users
@@ -5663,7 +5557,8 @@ async fn claimed_provider_failures_are_terminal_and_abandoned_claims_are_recover
     let seeded = seed_authority(&pool, now, "recovery01").await;
     let database = Database::connect(&url).await.expect("SeaORM test pool");
     let authentication = PostgresAuthenticationRepository::new(database.clone());
-    let sessions = PostgresSessionAuthorityRepository::new(database.clone());
+    let sessions =
+        PostgresSessionAuthorityRepository::new(database.clone(), test_projection_materializer());
 
     let claimed = claim_provider_login(&authentication, &seeded, 101, now).await;
     let mut invalid = completion_command(&seeded, &claimed, 101, now);
@@ -5798,7 +5693,8 @@ async fn revocation_process_loss_after_dispatch_boundary_never_replays_ciphertex
     let database = Database::connect(&url)
         .await
         .expect("revocation crash SeaORM pool");
-    let repository = PostgresManagedConnectionRepository::new(database.clone());
+    let repository =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
     repository
         .request_revocation(
             seeded.project_id,
@@ -5942,7 +5838,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
     let database = Database::connect(&url)
         .await
         .expect("managed matrix SeaORM pool");
-    let repository = PostgresManagedConnectionRepository::new(database.clone());
+    let repository =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
 
     // Read scheduling is round-robin across Project/provider groups even when the first group
     // retains an older backlog. Two simultaneous workers also claim distinct SKIP LOCKED rows.
@@ -6023,7 +5920,10 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
     let replica_database = Database::connect(&url)
         .await
         .expect("second Runtime replica pool");
-    let replica = PostgresManagedConnectionRepository::new(replica_database.clone());
+    let replica = PostgresManagedConnectionRepository::new(
+        replica_database.clone(),
+        test_projection_materializer(),
+    );
     let concurrent_now = now + Duration::seconds(31);
     let (claim_a, claim_b) = tokio::join!(
         repository.claim_next_read(
@@ -7214,7 +7114,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
     // The successor's profile stage retains both the exact connection lease and the shared
     // Project/provider budget. A second repository/worker can claim neither this due successor
     // nor another due connection for the same provider until the owner completes or expires.
-    let replica_repository = PostgresManagedConnectionRepository::new(database.clone());
+    let replica_repository =
+        PostgresManagedConnectionRepository::new(database.clone(), test_projection_materializer());
     let peer = insert_managed_fixture(&pool, &first, &protector, race_now, 47).await;
     let persisted_profile_lease: (Option<Uuid>, Option<String>, Option<OffsetDateTime>) =
         sqlx::query_as(
@@ -7288,6 +7189,18 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
         Some(race_now + Duration::seconds(41))
     );
     assert_eq!(delayed_profile_state.2, Some(race_now + Duration::hours(6)));
+    let source_digest_is_current: bool = sqlx::query_scalar(
+        "SELECT source_profile_digest =
+                public.owlauth_provider_source_profile_digest(
+                    'Delayed managed profile',NULL,'en-US')
+           FROM linked_identities WHERE project_id=$1 AND id=$2",
+    )
+    .bind(first.project_id)
+    .bind(committed.guard.linked_identity_id)
+    .fetch_one(&pool)
+    .await
+    .expect("verify managed profile source digest");
+    assert!(source_digest_is_current);
     let peer_renewal = replica_repository
         .prepare_next_renewal(
             Uuid::new_v4(),
@@ -7585,7 +7498,10 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
         ))
     );
     let runtime_two_cleanup = ManagedInteractionCleanupService::new(
-        Arc::new(PostgresManagedConnectionRepository::new(database.clone())),
+        Arc::new(PostgresManagedConnectionRepository::new(
+            database.clone(),
+            test_projection_materializer(),
+        )),
         RuntimeProtector::readable_key_versions(&runtime_two),
         RuntimeProtector::readable_key_versions(&runtime_two),
         Arc::new(FixedClock(now + Duration::seconds(31))),
@@ -7638,7 +7554,10 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
     )
     .expect("Runtime version-one ring");
     let runtime_one_cleanup = ManagedInteractionCleanupService::new(
-        Arc::new(PostgresManagedConnectionRepository::new(database.clone())),
+        Arc::new(PostgresManagedConnectionRepository::new(
+            database.clone(),
+            test_projection_materializer(),
+        )),
         RuntimeProtector::readable_key_versions(&runtime_one),
         RuntimeProtector::readable_key_versions(&runtime_one),
         Arc::new(FixedClock(now + Duration::seconds(31))),
@@ -7773,7 +7692,7 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            )
            INSERT INTO managed_provider_reauthorization_interactions
              (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-              provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
+              provider_configuration_id,provider_key,issuer,provider_kind,provider_display_name,subject,client_id,
               secret_material_id,provider_egress_policy_revision,application_id,
               expected_connection_generation,expected_credential_generation,
               expected_connection_revision,project_security_revision,user_security_revision,
@@ -7784,8 +7703,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            SELECT md5('managed-expired-scale-' || series.value::text)::uuid,
                   source.project_id,source.project_public_id,source.connection_id,
                   source.linked_identity_id,source.user_id,source.provider_configuration_id,
-                  source.provider_key,source.issuer,source.provider_kind,source.subject,
-                  source.client_id,source.secret_ref,source.secret_material_id,
+                  source.provider_key,source.issuer,source.provider_kind,source.provider_display_name,source.subject,
+                  source.client_id,source.secret_material_id,
                   source.provider_egress_policy_revision,source.application_id,
                   source.expected_connection_generation,
                   source.expected_credential_generation,source.expected_connection_revision,
@@ -7858,7 +7777,7 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            )
            INSERT INTO managed_provider_reauthorization_interactions
              (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-              provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
+              provider_configuration_id,provider_key,issuer,provider_kind,provider_display_name,subject,client_id,
               secret_material_id,provider_egress_policy_revision,application_id,
               expected_connection_generation,expected_credential_generation,
               expected_connection_revision,project_security_revision,user_security_revision,
@@ -7870,8 +7789,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            SELECT md5('managed-restore-scale-' || series.value::text)::uuid,
                   source.project_id,source.project_public_id,source.connection_id,
                   source.linked_identity_id,source.user_id,source.provider_configuration_id,
-                  source.provider_key,source.issuer,source.provider_kind,source.subject,
-                  source.client_id,source.secret_ref,source.secret_material_id,
+                  source.provider_key,source.issuer,source.provider_kind,source.provider_display_name,source.subject,
+                  source.client_id,source.secret_material_id,
                   source.provider_egress_policy_revision,source.application_id,
                   source.expected_connection_generation,
                   source.expected_credential_generation,source.expected_connection_revision,
@@ -7952,6 +7871,196 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
         .close()
         .await
         .expect("close managed matrix SeaORM pool");
+    pool.close().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the security regression keeps disable, concurrent re-enable, stale credentials, projection, audit, and fresh authentication in one real PostgreSQL journey"
+)]
+async fn reenable_keeps_pre_disable_credentials_dead_and_requires_fresh_authentication() {
+    let Some((_container, url)) = start_postgres().await else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(12)
+        .connect(&url)
+        .await
+        .expect("re-enable PostgreSQL pool");
+    MIGRATOR.run(&pool).await.expect("re-enable migrations");
+    let now = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("whole-second re-enable time");
+    let seeded = seed_authority(&pool, now, "reenable01").await;
+    let database = Database::connect(&url)
+        .await
+        .expect("re-enable SeaORM pool");
+    let authentication = PostgresAuthenticationRepository::new(database.clone());
+    let projection_materializer = test_projection_materializer();
+    let sessions =
+        PostgresSessionAuthorityRepository::new(database.clone(), projection_materializer.clone());
+    let (user_id, old_handoff) =
+        prepared_handoff_for_project_graph_lock_test(&authentication, &sessions, &seeded, 91, now)
+            .await;
+    let old_refresh_token = old_handoff.refresh_token.clone();
+    let old_session = sessions
+        .commit_handoff_exchange(old_handoff)
+        .await
+        .expect("pre-disable session should commit");
+    let user_public_id: String =
+        sqlx::query_scalar("SELECT public_id FROM project_users WHERE id=$1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("pre-disable user public ID");
+    let runtime = PostgresRuntimeAuthorityRepository::with_projection_materializer(
+        database.clone(),
+        projection_materializer,
+    );
+    let old_lookup = |at| AccessTokenSessionLookup {
+        project_id: seeded.project_id,
+        application_public_id: "app_reenable01".to_owned(),
+        user_public_id: user_public_id.clone(),
+        application_session_id: old_session.application_session_id,
+        claims_revision: 1,
+        now: at,
+    };
+    runtime
+        .current_session(old_lookup(now + Duration::seconds(6)), false)
+        .await
+        .expect("pre-disable credential should be live");
+
+    let disabled =
+        PostgresControlLifecycleRepository::new(database.clone(), test_projection_materializer())
+            .disable_project_user(DisableProjectUser {
+                project_id: seeded.project_id,
+                user_id,
+                expected_security_revision: 1,
+                correlation_id: Uuid::new_v4(),
+                now: now + Duration::seconds(7),
+            })
+            .await
+            .expect("disable should commit atomically");
+    assert_eq!(
+        (
+            disabled.status,
+            disabled.user_revision,
+            disabled.security_revision
+        ),
+        (crate::application::ProjectUserStatus::Disabled, 2, 2)
+    );
+    assert_eq!(
+        runtime
+            .current_session(old_lookup(now + Duration::seconds(8)), false)
+            .await,
+        Err(ApplicationError::NotFound)
+    );
+
+    let left =
+        PostgresControlLifecycleRepository::new(database.clone(), test_projection_materializer());
+    let right =
+        PostgresControlLifecycleRepository::new(database.clone(), test_projection_materializer());
+    let enable = EnableProjectUser {
+        project_id: seeded.project_id,
+        user_id,
+        expected_security_revision: 2,
+        correlation_id: Uuid::new_v4(),
+        now: now + Duration::seconds(9),
+    };
+    let (enabled_left, enabled_right) = tokio::join!(
+        left.enable_project_user(enable),
+        right.enable_project_user(EnableProjectUser {
+            correlation_id: Uuid::new_v4(),
+            ..enable
+        })
+    );
+    assert!(matches!(
+        (&enabled_left, &enabled_right),
+        (Ok(_), Err(ApplicationError::RevisionConflict))
+            | (Err(ApplicationError::RevisionConflict), Ok(_))
+    ));
+    let enabled = enabled_left
+        .or(enabled_right)
+        .expect("one enable should win");
+    assert_eq!(
+        (
+            enabled.status,
+            enabled.user_revision,
+            enabled.security_revision
+        ),
+        (crate::application::ProjectUserStatus::Active, 3, 3)
+    );
+
+    assert_eq!(
+        runtime
+            .current_session(old_lookup(now + Duration::seconds(10)), false)
+            .await,
+        Err(ApplicationError::Disabled),
+        "re-enable must not resurrect the pre-disable access session"
+    );
+    assert_eq!(
+        sessions
+            .prepare_refresh_rotation(PrepareRefreshRotation {
+                project_id: seeded.project_id,
+                application_id: seeded.application_id,
+                presented_token: old_refresh_token,
+                now: now + Duration::seconds(10),
+            })
+            .await,
+        Err(ApplicationError::RevisionConflict),
+        "re-enable must not resurrect the pre-disable refresh family"
+    );
+
+    let projection: (i64, i64, String) = sqlx::query_as(
+        "SELECT projection_revision,source_user_revision,document->>'status'
+           FROM application_user_projections WHERE binding_id=$1",
+    )
+    .bind(old_session.binding_id)
+    .fetch_one(&pool)
+    .await
+    .expect("re-enabled projection should exist");
+    assert_eq!(projection, (3, 3, "active".to_owned()));
+    let lifecycle_audits: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_events
+          WHERE project_id=$1 AND target_kind='project_user' AND target_id=$2
+            AND action IN ('project_user.disabled','project_user.enabled')
+          ORDER BY occurred_at,action",
+    )
+    .bind(seeded.project_id)
+    .bind(user_id)
+    .fetch_all(&pool)
+    .await
+    .expect("disable and enable audits should be durable");
+    assert_eq!(lifecycle_audits.len(), 2);
+    assert!(lifecycle_audits.contains(&"project_user.disabled".to_owned()));
+    assert!(lifecycle_audits.contains(&"project_user.enabled".to_owned()));
+
+    let (fresh_user_id, fresh_handoff) = prepared_handoff_for_project_graph_lock_test(
+        &authentication,
+        &sessions,
+        &seeded,
+        111,
+        now + Duration::seconds(11),
+    )
+    .await;
+    assert_eq!(fresh_user_id, user_id);
+    let fresh_session = sessions
+        .commit_handoff_exchange(fresh_handoff)
+        .await
+        .expect("fresh post-enable authentication should establish a session");
+    runtime
+        .current_session(
+            AccessTokenSessionLookup {
+                application_session_id: fresh_session.application_session_id,
+                ..old_lookup(now + Duration::seconds(17))
+            },
+            false,
+        )
+        .await
+        .expect("fresh post-enable credential should be live");
+
+    database.close().await.expect("close re-enable SeaORM pool");
     pool.close().await;
 }
 
@@ -8410,21 +8519,13 @@ async fn project_graph_lock_serializes_merge_against_handoff_and_refresh_writers
         .await
         .expect("lock-order SeaORM pool");
     let authentication = PostgresAuthenticationRepository::new(database.clone());
-    let sessions = PostgresSessionAuthorityRepository::new(database.clone());
-    let mutation_protector = Arc::new(
-        SoftwareRuntimeProtector::new(
-            "lock-order-test".to_owned(),
-            1,
-            RuntimeKeyMaterial::new([91; 32], [92; 32]),
-            BTreeMap::new(),
-        )
-        .expect("lock-order Runtime protector"),
-    );
+    let sessions =
+        PostgresSessionAuthorityRepository::new(database.clone(), test_projection_materializer());
     let mutations = PostgresIdentityMutationRepository::new(
         database.clone(),
         "runtime-1".to_owned(),
         Uuid::nil(),
-        mutation_protector,
+        test_projection_materializer(),
         Vec::new(),
     );
 

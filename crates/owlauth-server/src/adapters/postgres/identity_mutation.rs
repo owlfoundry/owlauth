@@ -131,7 +131,7 @@ struct SlotSeed {
 #[derive(Clone)]
 struct ProviderSnapshot {
     provider_id: Uuid,
-    secret_material_id: Option<Uuid>,
+    secret_material_id: Uuid,
     revision: i64,
     assignment_revision: i64,
     egress_policy_revision: Option<i64>,
@@ -2421,8 +2421,8 @@ async fn snapshot_method(
         } => {
             let row = transaction
                 .query_one_raw(statement(
-                    "SELECT provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer,provider.provider_key,provider.revision,provider.status,
-                            provider.secret_ref,provider.secret_material_id,
+                    "SELECT provider.kind AS provider_kind,provider.issuer,provider.provider_key,provider.revision,provider.status,
+                            provider.secret_material_id,
                             assignment.status AS assignment_status,
                             assignment.security_revision AS assignment_revision,
                             egress.revision AS egress_policy_revision
@@ -2445,14 +2445,11 @@ async fn snapshot_method(
                 .ok_or(ApplicationError::NotFound)?;
             if get::<String>(&row, "status")? != "active"
                 || get::<String>(&row, "assignment_status")? != "active"
-                || (get::<Option<String>>(&row, "secret_ref")?.is_none()
-                    == get::<Option<Uuid>>(&row, "secret_material_id")?.is_none())
             {
                 return Err(ApplicationError::Disabled);
             }
             let provider_kind = super::provider_row::effective_provider_kind(
-                &get::<String>(&row, "provider_legacy_kind")?,
-                get::<Option<String>>(&row, "provider_adapter_kind")?.as_deref(),
+                &get::<String>(&row, "provider_kind")?,
                 &get::<String>(&row, "issuer")?,
             )?;
             let capabilities = provider_kind.capabilities();
@@ -2587,7 +2584,7 @@ async fn insert_slot(
                 provider.map(|value| value.callback_url.clone()).into(),
                 provider.map(|value| value.pkce).into(),
                 provider.map(|value| value.nonce).into(),
-                provider.and_then(|value| value.secret_material_id).into(),
+                provider.map(|value| value.secret_material_id).into(),
                 snapshot
                     .email_policy_revision
                     .map(|_| application_id)
@@ -2659,8 +2656,7 @@ async fn record_from_row(
     );
     let slots = transaction
         .query_all_raw(statement(
-            "SELECT slot.*,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.provider_key,provider.issuer,provider.client_id,
-                    COALESCE(slot.provider_secret_material_id::TEXT, provider.secret_ref) AS secret_ref,
+            "SELECT slot.*,provider.kind AS provider_kind,provider.provider_key,provider.issuer,provider.client_id,
                     egress.mode AS current_egress_mode,
                     egress.exact_origins AS current_egress_exact_origins,
                     egress.revision AS current_egress_policy_revision
@@ -2696,8 +2692,7 @@ fn slot_record(row: &QueryResult) -> Result<IdentityMutationSlotRecord, Applicat
     let provider = if method_kind == IdentityMutationProofMethodKind::Provider {
         let issuer = required::<String>(row, "issuer")?;
         let provider_kind = super::provider_row::effective_provider_kind(
-            &required::<String>(row, "provider_legacy_kind")?,
-            get::<Option<String>>(row, "provider_adapter_kind")?.as_deref(),
+            &required::<String>(row, "provider_kind")?,
             &issuer,
         )?;
         let capabilities = provider_kind.capabilities();
@@ -2743,7 +2738,7 @@ fn slot_record(row: &QueryResult) -> Result<IdentityMutationSlotRecord, Applicat
             provider_key: required(row, "provider_key")?,
             issuer,
             client_id: required(row, "client_id")?,
-            secret_ref: required(row, "secret_ref")?,
+            secret_material_id: required(row, "provider_secret_material_id")?,
             callback_url: required(row, "callback_url")?,
             adapter_key,
             adapter_capability_revision: required(row, "provider_adapter_capability_revision")?,
@@ -3350,9 +3345,8 @@ async fn revalidate_slot_authority(
         "provider" => {
             let row = transaction
                 .query_one_raw(statement(
-                    "SELECT provider.status,provider.revision,provider.secret_ref,
-                            provider.secret_material_id,provider.kind AS provider_legacy_kind,
-                            provider.adapter_kind AS provider_adapter_kind,provider.issuer,
+                    "SELECT provider.status,provider.revision,provider.secret_material_id,
+                            provider.kind AS provider_kind,provider.issuer,
                             assignment.status AS assignment_status,
                             assignment.security_revision AS assignment_revision
                        FROM provider_configurations provider
@@ -3371,8 +3365,7 @@ async fn revalidate_slot_authority(
                 .map_err(persistence)?
                 .ok_or(ApplicationError::RevisionConflict)?;
             let provider_kind = super::provider_row::effective_provider_kind(
-                &get::<String>(&row, "provider_legacy_kind")?,
-                get::<Option<String>>(&row, "provider_adapter_kind")?.as_deref(),
+                &get::<String>(&row, "provider_kind")?,
                 &get::<String>(&row, "issuer")?,
             )?;
             let policy_revision = get::<Option<i64>>(slot, "provider_egress_policy_revision")?;
@@ -3393,10 +3386,8 @@ async fn revalidate_slot_authority(
             if !policy_valid
                 || get::<String>(&row, "status")? != "active"
                 || get::<String>(&row, "assignment_status")? != "active"
-                || (get::<Option<String>>(&row, "secret_ref")?.is_none()
-                    == get::<Option<Uuid>>(&row, "secret_material_id")?.is_none())
-                || get::<Option<Uuid>>(&row, "secret_material_id")?
-                    != get::<Option<Uuid>>(slot, "provider_secret_material_id")?
+                || get::<Uuid>(&row, "secret_material_id")?
+                    != required::<Uuid>(slot, "provider_secret_material_id")?
                 || get::<i64>(&row, "revision")? != required::<i64>(slot, "provider_revision")?
                 || get::<i64>(&row, "assignment_revision")?
                     != required::<i64>(slot, "provider_assignment_security_revision")?
@@ -4356,9 +4347,10 @@ async fn confirm_link(
                 .execute_raw(statement(
                     "INSERT INTO linked_identities
                      (id,project_id,user_id,created_via_provider_configuration_id,issuer,subject,
-                      status,identity_revision,display_name,picture_url,locale,observed_at,
-                      source_kind,source_schema,created_at,updated_at)
-                     VALUES ($1,$2,$3,$4,$5,$6,'active',1,$7,$8,NULL,$9,
+                      status,identity_revision,display_name,picture_url,locale,
+                      source_profile_digest,observed_at,source_kind,source_schema,created_at,updated_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,'active',1,$7,$8,NULL,
+                             public.owlauth_provider_source_profile_digest($7,$8,NULL),$9,
                              'provider','owlauth.provider-profile.v1',$9,$9)",
                     vec![
                         Uuid::new_v4().into(),

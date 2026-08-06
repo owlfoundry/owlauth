@@ -120,10 +120,22 @@ mod tests {
         assert!(advertised.login_readiness);
         assert!(advertised.federated_project_auth);
         assert!(control["paths"]["/v1/projects"].is_object());
+        let signing_key_collection = &control["paths"]["/v1/projects/{project_id}/signing-keys"];
+        assert!(signing_key_collection["get"].is_object());
+        assert!(signing_key_collection.get("post").is_none());
         assert!(
-            control["paths"]["/v1/projects/{project_id}/signing-keys/{key_id}/reconcile"]
-                .is_object()
+            control["paths"]["/v1/projects/{project_id}/signing-keys/rotate"]["post"].is_object()
         );
+        for removed_path in [
+            "/v1/projects/{project_id}/signing-keys/{key_id}/reconcile",
+            "/v1/projects/{project_id}/signing-keys/{key_id}/activate",
+            "/v1/projects/{project_id}/signing-keys/{key_id}/retire",
+        ] {
+            assert!(
+                control["paths"].get(removed_path).is_none(),
+                "removed signing-key path leaked into Control OpenAPI: {removed_path}"
+            );
+        }
         assert!(
             control["paths"]["/v1/projects/{project_id}/providers/{provider_id}/reconcile"]
                 .is_object()

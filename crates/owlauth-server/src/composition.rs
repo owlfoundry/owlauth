@@ -17,26 +17,21 @@ use crate::{
         custody::SoftwareCustodyProvider,
         migrations::{SchemaError, prepare_schema},
         postgres::{
-            DatabasePools, create_pools,
-            custody::{CustodyMode, ProtectedMaterialRepository},
-            custody_import::PostgresCustodyImporter,
+            DatabasePools, create_pools, custody::ProtectedMaterialRepository,
             email::PostgresPasswordlessEmailRepository,
             projection::PostgresProjectionEmailKeyAuthority,
-            provider_egress::PostgresProviderEgressPolicyRepository,
         },
         protected_runtime::PostgresProtectedRuntimeCustody,
         runtime_security::{
             RuntimeKeyMaterial, SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
         },
-        software_store::EncryptedFileStore,
     },
     application::{
         DeploymentSmtpDesiredStatus, DeploymentSmtpGeneration, DeploymentSmtpRegistry,
-        ManagedConnectionService, ProjectionExpansionWorker, ProviderEgressPolicyPort,
-        RuntimeAuthService, SmtpCredentialResolver, SmtpTlsMode, WebhookWorker,
+        ManagedConnectionService, RuntimeAuthService, SmtpCredentialResolver, SmtpTlsMode,
+        WebhookWorker,
     },
     config::{DeploymentSmtpStatus, ListenerConfig, PlaneMode, ServerConfig},
-    domain::{ProviderEgressMode, ProviderEgressPolicy},
     http::{PlaneRouters, build_routers_with_capabilities},
     providers::{ActiveProvider, ProviderRegistrations},
 };
@@ -92,14 +87,10 @@ pub enum ServerError {
     ProviderComposition,
     #[error("PostgreSQL schema preparation failed: {0}")]
     Schema(SchemaFailure),
-    #[error("legacy custody import did not complete")]
-    CustodyImport,
     #[error("PostgreSQL serving pools could not be prepared")]
     DatabasePools,
     #[error("stored material requires an unavailable provider capability")]
     ProviderReadiness,
-    #[error("legacy Custom OIDC policy bridge did not complete")]
-    ProviderPolicyBridge,
     #[error("Runtime process incarnation could not be claimed")]
     RuntimeIncarnation,
     #[error("Client digest readiness could not be claimed")]
@@ -135,113 +126,6 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     run_with_providers(config, providers).await
 }
 
-/// Runs the listenerless one-way legacy-file to `PostgreSQL` custody importer.
-///
-/// The command requires Control-only configuration, binds no business listener, and atomically
-/// switches custody authority only after every authoritative legacy object and snapshot is verified.
-///
-/// # Errors
-///
-/// Returns a bounded schema, pool, configuration, or import failure.
-pub async fn import_legacy_custody(config: ServerConfig) -> Result<usize, ServerError> {
-    if config.mode != PlaneMode::Control {
-        return Err(ServerError::CustodyImport);
-    }
-    prepare_schema(&config.postgres)
-        .await
-        .map_err(|error| ServerError::Schema(error.into()))?;
-    let pools = create_pools(&config)
-        .await
-        .map_err(|_| ServerError::DatabasePools)?;
-    let result = async {
-        let database = pools
-            .control
-            .as_ref()
-            .ok_or(ServerError::CustodyImport)?
-            .clone();
-        let provisioning = config
-            .provisioning
-            .as_ref()
-            .ok_or(ServerError::CustodyImport)?;
-        let legacy_custody = config
-            .legacy_custody_import
-            .as_ref()
-            .ok_or(ServerError::CustodyImport)?;
-        let root = provisioning
-            .software_custody_key
-            .as_ref()
-            .ok_or(ServerError::CustodyImport)?
-            .expose_copy();
-        let provider_id = ProviderId::new("software").map_err(|_| ServerError::CustodyImport)?;
-        let provider = SoftwareCustodyProvider::new(provider_id, root)
-            .map_err(|_| ServerError::CustodyImport)?;
-        let signing_store = EncryptedFileStore::new(
-            legacy_custody.signer_store_root.clone(),
-            legacy_custody.signer_store_key.expose_copy(),
-        )
-        .map_err(|_| ServerError::CustodyImport)?;
-        let secret_store = EncryptedFileStore::new(
-            legacy_custody.configuration_secret_store_root.clone(),
-            legacy_custody.configuration_secret_store_key.expose_copy(),
-        )
-        .map_err(|_| ServerError::CustodyImport)?;
-        let importer = PostgresCustodyImporter::new(
-            database,
-            config
-                .instance_id
-                .as_deref()
-                .ok_or(ServerError::CustodyImport)?,
-            signing_store,
-            secret_store,
-            provider,
-        )
-        .map_err(|_| ServerError::CustodyImport)?;
-        importer
-            .run()
-            .await
-            .map(|report| report.imported)
-            .map_err(|_| ServerError::CustodyImport)
-    }
-    .await;
-    pools.close().await;
-    result
-}
-
-async fn reconcile_provider_policy_bridge(
-    config: &ServerConfig,
-    pools: &DatabasePools,
-) -> Result<(), ServerError> {
-    if !config.mode.has_control() && !config.mode.has_runtime() {
-        return Ok(());
-    }
-    let database = pools
-        .control
-        .clone()
-        .or_else(|| pools.runtime.clone())
-        .ok_or(ServerError::ProviderPolicyBridge)?;
-    let egress_policies = PostgresProviderEgressPolicyRepository::new(database);
-    let bridge_pending = egress_policies
-        .legacy_provider_policy_bridge_pending()
-        .await
-        .map_err(|_| ServerError::ProviderPolicyBridge)?;
-    if !bridge_pending {
-        return Ok(());
-    }
-    if config.provider_allowed_origins.is_empty() {
-        return Err(ServerError::ProviderPolicyBridge);
-    }
-    let policy = ProviderEgressPolicy::new(
-        ProviderEgressMode::ExactOrigins,
-        config.provider_allowed_origins.clone(),
-        config.provider_allow_http_loopback,
-    )
-    .map_err(|_| ServerError::ProviderPolicyBridge)?;
-    egress_policies
-        .bridge_legacy_provider_policy(policy)
-        .await
-        .map_err(|_| ServerError::ProviderPolicyBridge)
-}
-
 /// Runs `OwlAuth` with an explicit immutable set of statically linked provider capabilities.
 ///
 /// Custom composition never falls back to the bundled software provider. The complete capability
@@ -268,10 +152,6 @@ pub async fn run_with_providers(
     let pools = create_pools(&config)
         .await
         .map_err(|_| ServerError::DatabasePools)?;
-    if let Err(error) = reconcile_provider_policy_bridge(&config, &pools).await {
-        pools.close().await;
-        return Err(error);
-    }
     if let Err(error) = validate_provider_readiness(&config, &pools, &providers).await {
         pools.close().await;
         return Err(error);
@@ -309,6 +189,14 @@ pub async fn run_with_providers(
         .client
         .as_ref()
         .and_then(|client| client.readiness.clone());
+    let signing_lifecycle = capabilities
+        .control
+        .as_ref()
+        .and_then(|control| control.provisioning.clone());
+    let signing_observation = capabilities
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.readiness.clone());
     let mut routers = build_routers_with_capabilities(&config, capabilities);
     if let Some(managed) = routers.managed_sync.as_deref() {
         match managed.restore_key_state().await {
@@ -357,6 +245,9 @@ pub async fn run_with_providers(
 
     let client_digest_readiness_maintenance =
         client_digest_readiness.map(spawn_client_digest_readiness_renewal);
+    let signing_lifecycle_maintenance = signing_lifecycle.map(spawn_signing_lifecycle_maintenance);
+    let signing_observation_maintenance =
+        signing_observation.map(spawn_signing_observation_maintenance);
 
     routers.mark_ready();
     if config.mode.has_runtime() {
@@ -386,6 +277,14 @@ pub async fn run_with_providers(
         maintenance.abort();
         let _ = maintenance.await;
     }
+    if let Some(maintenance) = signing_lifecycle_maintenance {
+        maintenance.abort();
+        let _ = maintenance.await;
+    }
+    if let Some(maintenance) = signing_observation_maintenance {
+        maintenance.abort();
+        let _ = maintenance.await;
+    }
     if let Some(maintenance) = email_protection_maintenance {
         maintenance.abort();
         let _ = maintenance.await;
@@ -400,6 +299,40 @@ pub async fn run_with_providers(
     }
     pools.close().await;
     result
+}
+
+fn spawn_signing_lifecycle_maintenance(
+    provisioning: Arc<crate::application::ProvisioningService>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = provisioning.reconcile_signing_key_lifecycle(100).await {
+                tracing::warn!(
+                    event = "signing_key_lifecycle_reconciliation_pending",
+                    error = ?error,
+                    "signing key lifecycle reconciliation failed closed and will retry"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+}
+
+fn spawn_signing_observation_maintenance(
+    readiness: Arc<crate::application::ReadinessService>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = readiness.observe_signing_revisions(100).await {
+                tracing::warn!(
+                    event = "signing_key_revision_observation_pending",
+                    error = ?error,
+                    "Runtime signing revision observation failed closed and will retry"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
 }
 
 fn spawn_client_digest_readiness_renewal(
@@ -506,15 +439,6 @@ pub(crate) async fn validate_provider_readiness(
         .ok_or(ServerError::ProviderReadiness)?;
     let materials = ProtectedMaterialRepository::new(database.clone(), deployment_id)
         .map_err(|_| ServerError::ProviderReadiness)?;
-    if materials
-        .authority()
-        .await
-        .map_err(|_| ServerError::ProviderReadiness)?
-        .mode
-        != CustodyMode::Protected
-    {
-        return Err(ServerError::ProviderReadiness);
-    }
     if !config.mode.has_runtime() {
         return Ok(());
     }
@@ -1001,6 +925,18 @@ async fn reconcile_deployment_smtp(
         }
         return Err(crate::application::ApplicationError::Integrity);
     };
+    let material_row = database
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT credential_material_id FROM deployment_smtp_generations WHERE generation=$1",
+            [configured.generation.into()],
+        ))
+        .await
+        .map_err(|_| crate::application::ApplicationError::Persistence)?
+        .ok_or(crate::application::ApplicationError::NotFound)?;
+    let credential_material_id = material_row
+        .try_get::<Uuid>("", "credential_material_id")
+        .map_err(|_| crate::application::ApplicationError::Integrity)?;
     let generation = DeploymentSmtpGeneration {
         generation: configured.generation,
         desired_status: match configured.status {
@@ -1017,7 +953,7 @@ async fn reconcile_deployment_smtp(
             _ => return Err(crate::application::ApplicationError::Integrity),
         },
         sender_address: configured.sender_address.clone(),
-        credential_ref: format!("deployment-smtp-generation-{}", configured.generation),
+        credential_material_id,
         safe_fingerprint,
         explicitly_allowed_private_ips: configured.explicitly_allowed_private_ips.clone(),
     };
@@ -1036,9 +972,8 @@ async fn reconcile_deployment_smtp(
             .map_err(|_| crate::application::ApplicationError::Persistence)?
             .ok_or(crate::application::ApplicationError::NotFound)?;
         let material_id = row
-            .try_get::<Option<Uuid>>("", "credential_material_id")
-            .map_err(|_| crate::application::ApplicationError::Persistence)?
-            .ok_or(crate::application::ApplicationError::Integrity)?;
+            .try_get::<Uuid>("", "credential_material_id")
+            .map_err(|_| crate::application::ApplicationError::Integrity)?;
         let fingerprint = row
             .try_get::<Option<Vec<u8>>>("", "safe_fingerprint")
             .map_err(|_| crate::application::ApplicationError::Persistence)?
@@ -1056,7 +991,7 @@ async fn reconcile_deployment_smtp(
         )?;
         SmtpCredentialResolver::resolve_checked(
             &custody,
-            &material_id.to_string(),
+            material_id,
             &generation.safe_fingerprint,
         )
         .await?;
@@ -1172,7 +1107,10 @@ async fn reconcile_project_smtp_readiness_batch_before(
     let mut unavailable = 0_u32;
     for candidate in candidates {
         let readable = resolver
-            .resolve_checked(&candidate.credential_ref, &candidate.safe_fingerprint)
+            .resolve_checked(
+                candidate.credential_material_id,
+                &candidate.safe_fingerprint,
+            )
             .await
             .is_ok();
         repository
@@ -1243,7 +1181,6 @@ async fn serve_until_shutdown(
     let selection = runtime_worker_selection(
         routers.runtime_auth.is_some(),
         routers.managed_sync.is_some(),
-        routers.projection_expansion.is_some(),
         routers.webhook_delivery.is_some(),
     );
     let runtime_auth = routers.runtime_auth.clone();
@@ -1259,10 +1196,6 @@ async fn serve_until_shutdown(
             .managed_sync
             .clone()
             .map(|managed| run_managed_workers(managed, shutdown_receiver.clone())),
-        routers
-            .projection_expansion
-            .clone()
-            .map(|worker| run_projection_expansion_worker(worker, shutdown_receiver.clone())),
         routers
             .webhook_delivery
             .clone()
@@ -1339,7 +1272,6 @@ struct RuntimeWorkerSelection {
     mail: bool,
     provider_recovery: bool,
     managed_sync: bool,
-    projection_expansion: bool,
     webhook_delivery: bool,
 }
 
@@ -1350,46 +1282,37 @@ struct RuntimeWorkerSelection {
 const fn runtime_worker_selection(
     runtime_auth_composed: bool,
     managed_sync_composed: bool,
-    projection_expansion_composed: bool,
     webhook_delivery_composed: bool,
 ) -> RuntimeWorkerSelection {
     RuntimeWorkerSelection {
         mail: runtime_auth_composed,
         provider_recovery: FEDERATED_PROJECT_AUTH_AVAILABLE && runtime_auth_composed,
         managed_sync: managed_sync_composed,
-        projection_expansion: projection_expansion_composed,
         webhook_delivery: webhook_delivery_composed,
     }
 }
 
-fn spawn_runtime_worker_tasks<Mail, Recovery, Managed, Projection, Webhook>(
+fn spawn_runtime_worker_tasks<Mail, Recovery, Managed, Webhook>(
     selection: RuntimeWorkerSelection,
     mail: Option<Mail>,
     provider_recovery: Option<Recovery>,
     managed_sync: Option<Managed>,
-    projection_expansion: Option<Projection>,
     webhook_delivery: Option<Webhook>,
 ) -> Vec<tokio::task::JoinHandle<()>>
 where
     Mail: Future<Output = ()> + Send + 'static,
     Recovery: Future<Output = ()> + Send + 'static,
     Managed: Future<Output = ()> + Send + 'static,
-    Projection: Future<Output = ()> + Send + 'static,
     Webhook: Future<Output = ()> + Send + 'static,
 {
     assert_eq!(selection.mail, mail.is_some());
     assert_eq!(selection.provider_recovery, provider_recovery.is_some());
     assert_eq!(selection.managed_sync, managed_sync.is_some());
-    assert_eq!(
-        selection.projection_expansion,
-        projection_expansion.is_some()
-    );
     assert_eq!(selection.webhook_delivery, webhook_delivery.is_some());
     mail.into_iter()
         .map(tokio::spawn)
         .chain(provider_recovery.into_iter().map(tokio::spawn))
         .chain(managed_sync.into_iter().map(tokio::spawn))
-        .chain(projection_expansion.into_iter().map(tokio::spawn))
         .chain(webhook_delivery.into_iter().map(tokio::spawn))
         .collect()
 }
@@ -1519,46 +1442,6 @@ async fn run_managed_workers(
                             event = "managed_provider_sync_failed",
                             "a bounded managed provider synchronization iteration failed"
                         );
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn run_projection_expansion_worker(
-    worker: Arc<ProjectionExpansionWorker>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-            }
-            _ = interval.tick() => {
-                let started = tokio::time::Instant::now();
-                for _ in 0..4 {
-                    match worker.run_once().await {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(error) => {
-                            tracing::warn!(
-                                event = "projection_expansion_worker_failed",
-                                error = ?error,
-                                "a bounded projection expansion batch did not complete"
-                            );
-                            break;
-                        }
-                    }
-                    if started.elapsed() >= Duration::from_secs(1) {
                         break;
                     }
                 }
@@ -1701,32 +1584,29 @@ mod tests {
     fn runtime_worker_ownership_is_independent_across_optional_capabilities() {
         const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
         assert_eq!(
-            runtime_worker_selection(false, false, false, false),
+            runtime_worker_selection(false, false, false),
             RuntimeWorkerSelection {
                 mail: false,
                 provider_recovery: false,
                 managed_sync: false,
-                projection_expansion: false,
                 webhook_delivery: false,
             }
         );
         assert_eq!(
-            runtime_worker_selection(true, false, false, false),
+            runtime_worker_selection(true, false, false),
             RuntimeWorkerSelection {
                 mail: true,
                 provider_recovery: true,
                 managed_sync: false,
-                projection_expansion: false,
                 webhook_delivery: false,
             }
         );
         assert_eq!(
-            runtime_worker_selection(false, true, true, true),
+            runtime_worker_selection(false, true, true),
             RuntimeWorkerSelection {
                 mail: false,
                 provider_recovery: false,
                 managed_sync: true,
-                projection_expansion: true,
                 webhook_delivery: true,
             }
         );
@@ -1762,7 +1642,7 @@ mod tests {
         let managed_dropped = Arc::clone(&dropped);
         let managed_all_started = Arc::clone(&all_started);
         let workers = spawn_runtime_worker_tasks(
-            runtime_worker_selection(true, true, false, false),
+            runtime_worker_selection(true, true, false),
             Some(worker(shutdown_receiver.clone(), Arc::clone(&mail_stopped))),
             Some(worker(
                 shutdown_receiver.clone(),
@@ -1775,7 +1655,6 @@ mod tests {
                 }
                 std::future::pending::<()>().await;
             }),
-            None::<std::future::Ready<()>>,
             None::<std::future::Ready<()>>,
         );
         assert_eq!(workers.len(), 3);
