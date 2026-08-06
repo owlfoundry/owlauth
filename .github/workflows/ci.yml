@@ -594,11 +594,13 @@ jobs:
           archive_sha256="$(python -c 'import json; print(json.load(open("candidate/candidate.json"))["archive"]["sha256"])')"
           descriptor_sha256="$(python -c 'import hashlib; print(hashlib.sha256(open("candidate/candidate.json", "rb").read()).hexdigest())')"
           artifact_name="typescript-sdk-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "artifact-name=$artifact_name" >> "$GITHUB_OUTPUT"
-          echo "archive-file=$archive_file" >> "$GITHUB_OUTPUT"
-          echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
-          echo "descriptor-sha256=$descriptor_sha256" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact-name=$artifact_name"
+            echo "archive-file=$archive_file"
+            echo "archive-sha256=$archive_sha256"
+            echo "descriptor-sha256=$descriptor_sha256"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
       - name: Upload immutable TypeScript candidate
         uses: actions/upload-artifact@v6
         with:
@@ -654,11 +656,13 @@ jobs:
           archive_sha256="$(python -c 'import json; print(json.load(open("candidate/candidate.json"))["archive"]["sha256"])')"
           descriptor_sha256="$(python -c 'import hashlib; print(hashlib.sha256(open("candidate/candidate.json", "rb").read()).hexdigest())')"
           artifact_name="python-sdk-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "artifact-name=$artifact_name" >> "$GITHUB_OUTPUT"
-          echo "archive-file=$archive_file" >> "$GITHUB_OUTPUT"
-          echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
-          echo "descriptor-sha256=$descriptor_sha256" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact-name=$artifact_name"
+            echo "archive-file=$archive_file"
+            echo "archive-sha256=$archive_sha256"
+            echo "descriptor-sha256=$descriptor_sha256"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
       - name: Upload immutable Python candidate
         uses: actions/upload-artifact@v6
         with:
@@ -723,12 +727,14 @@ jobs:
           archive_sha256="$(python -c 'import json; print(json.load(open("candidate/candidate.json"))["archive"]["sha256"])')"
           descriptor_sha256="$(python -c 'import hashlib; print(hashlib.sha256(open("candidate/candidate.json", "rb").read()).hexdigest())')"
           artifact_name="rust-sdk-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "artifact-name=$artifact_name" >> "$GITHUB_OUTPUT"
-          echo "archive-file=$archive_file" >> "$GITHUB_OUTPUT"
-          echo "upload-metadata-file=$upload_metadata_file" >> "$GITHUB_OUTPUT"
-          echo "archive-sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
-          echo "descriptor-sha256=$descriptor_sha256" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact-name=$artifact_name"
+            echo "archive-file=$archive_file"
+            echo "upload-metadata-file=$upload_metadata_file"
+            echo "archive-sha256=$archive_sha256"
+            echo "descriptor-sha256=$descriptor_sha256"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
       - name: Upload immutable Rust candidate
         uses: actions/upload-artifact@v6
         with:

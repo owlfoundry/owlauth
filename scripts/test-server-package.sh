@@ -38,7 +38,11 @@ server_files="$(tar -tzf "$server_archive" | sed 's#^[^/]*/##')"
 grep -qx LICENSE <<< "$server_files"
 grep -qx build.rs <<< "$server_files"
 migration_files="$(grep '^migrations/.*\.sql$' <<< "$server_files")"
-expected_migration_files=$'migrations/20260803000000_initial.sql\nmigrations/20260804000000_key_provider_custody.sql'
+expected_migration_files="$(
+  for migration in crates/owlauth-server/migrations/*.sql; do
+    printf 'migrations/%s\n' "$(basename "$migration")"
+  done
+)"
 [[ "$migration_files" == "$expected_migration_files" ]]
 grep -qx third-party/README.md <<< "$server_files"
 grep -qx third-party/rmcp/LICENSE <<< "$server_files"
