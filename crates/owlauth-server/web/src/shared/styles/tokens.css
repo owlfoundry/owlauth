@@ -141,7 +141,6 @@ code,
 
 @media (forced-colors: active) {
   :root {
-    color-scheme: light dark;
     --owl-canvas: Canvas;
     --owl-sidebar: Canvas;
     --owl-surface: Canvas;
