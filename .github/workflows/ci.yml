@@ -161,11 +161,14 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Verify publishable Rust product packages
         run: |
+          cargo package --manifest-path crates/owlauth-key-provider/Cargo.toml --locked --allow-dirty
+          key_provider_files="$(cargo package --manifest-path crates/owlauth-key-provider/Cargo.toml --locked --allow-dirty --list)"
+          grep -qx LICENSE <<< "$key_provider_files"
           cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty
-          package_files="$(cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty --list)"
-          grep -qx LICENSE <<< "$package_files"
+          types_files="$(cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty --list)"
+          grep -qx LICENSE <<< "$types_files"
           # The SDK candidate is packaged exactly once in rust-candidate. The CLI and
-          # server use the just-packaged unpublished owlauth-types through temporary
+          # server use the just-packaged unpublished dependency crates through temporary
           # local patches and must compile without network access.
           scripts/test-cli-package.sh
           scripts/test-server-package.sh
@@ -518,8 +521,10 @@ jobs:
       - name: Test release tooling and installers
         run: |
           scripts/release/test-verify-release.sh
+          python3 scripts/release/test-verify-shared-crate-version.py
           python3 scripts/release/test-changelog.py
           python3 scripts/release/test-prepare-release.py
+          scripts/release/test-publish-crate.sh
           python3 scripts/test-sdk-artifact.py
           python3 scripts/test-sdk-evidence.py
           python3 scripts/release/test-verify-sdk-candidate.py

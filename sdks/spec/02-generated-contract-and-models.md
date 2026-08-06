@@ -8,12 +8,14 @@ The SDK contract pipeline exports OpenAPI 3.1 documents from the exact `owlauth-
 cargo run --locked --package owlauth-types --bin export-openapi -- \
   runtime <temporary-build-path>/runtime-openapi.json
 cargo run --locked --package owlauth-types --bin export-openapi -- \
+  client <temporary-build-path>/client-openapi.json
+cargo run --locked --package owlauth-types --bin export-openapi -- \
   control <temporary-build-path>/control-openapi.json
 ```
 
 The complete documents are derived from reviewed public DTOs in `crates/owlauth-types`, are generated without compiling `owlauth-server`, and are never committed. `sdks/spec/contract/sdk-surface.json` explicitly selects the Runtime Project Auth operations claimed by the official SDKs. `scripts/sdk-contract.py` recursively selects their wire-relevant operation and component graph, removes non-wire document annotations, writes the reviewed deterministic snapshot `sdks/spec/contract/runtime-project-auth.normalized.json`, and checks it in CI.
 
-The normalized snapshot is a reviewed derivative and drift baseline, not a second server contract. The full Runtime digest is provenance only: an unrelated additive Runtime operation changes provenance but does not silently expand or block the SDK surface. Any selected-surface drift fails CI with an explicit client-review diagnostic until compatibility, all three adapters, shared cases, and documentation are reviewed together. Any claimed Control operation or operator security scheme fails unconditionally.
+The normalized snapshot is a reviewed derivative and drift baseline, not a second server contract. The full Runtime digest is provenance only: an unrelated additive Runtime operation changes provenance but does not silently expand or block the SDK surface. Any selected-surface drift fails CI with an explicit client-review diagnostic until compatibility, all three adapters, shared cases, and documentation are reviewed together. Any claimed Client/Control operation or Project-client/operator security scheme fails unconditionally.
 
 The Beta SDKs retain handwritten narrow wire adapters and protocol-safety layers rather than generated public clients. This is intentional for the bounded eight-operation surface. Contract extraction proves structural authority; shared fixtures, semantic cases, exact-artifact tests, and real-server journeys prove the behavior that OpenAPI cannot express, including PKCE custody, one-use handoff/refresh behavior, context isolation, ambiguity, and redaction.
 
@@ -22,10 +24,11 @@ The Beta SDKs retain handwritten narrow wire adapters and protocol-safety layers
 The source contract distinguishes:
 
 - Runtime Project Auth DTOs and operations intended for public SDKs;
-- Control administrative DTOs intended for a separate privileged client/CLI surface;
+- Client user/projection/introspection DTOs intended for customer-owned generated backend clients;
+- Control administrative DTOs intended for CLI/Console/MCP;
 - health/diagnostic vocabulary that does not imply authentication support.
 
-Default SDK generation consumes Runtime only. It must not expose Control endpoints, management credentials/scopes, server storage models, provider payloads, key references, or internal health detail merely because one server binary contains those surfaces.
+Default SDK generation consumes Runtime only. It must not expose Client/Control endpoints, Project client keys, management credentials/scopes, server storage models, provider payloads, key references, or internal health detail merely because one server binary contains those surfaces. OwlAuth exports the complete Client OpenAPI for users but does not generate or publish an official Client API SDK.
 
 ## Generated-contract and adapter boundary
 
@@ -67,7 +70,7 @@ A Project JWT may be carried as an opaque credential by an SDK. Decoding unverif
 
 ## Drift and compatibility
 
-CI exports both ephemeral plane documents, validates per-plane operation uniqueness and the explicit liveness/readiness overlap, recursively normalizes the selected Runtime graph, and byte-compares it with the tracked snapshot. The check also records the source commit, server/types versions, full Runtime digest, claimed-surface digest, policy digest, and normalizer version as ephemeral provenance. Unexplained selected drift fails with instructions to review and update all clients; full-Runtime-only drift remains visible in provenance.
+CI exports all three ephemeral surface documents, validates operation uniqueness within each document, and compares the selected Runtime SDK graph independently against Client and Control, allowing only the explicitly declared liveness/readiness overlap. Client and Control are not compared for global path or `operationId` uniqueness: they are listener-scoped, non-SDK contracts and may intentionally use the same resource-shaped path or operation name with different authority and response models. The check recursively normalizes the selected Runtime graph and byte-compares it with the tracked snapshot. It also records the source commit, server/types versions, full Runtime digest, claimed-surface digest, policy digest, and normalizer version as ephemeral provenance. Unexplained selected drift fails with instructions to review and update all clients; full-Runtime-only drift remains visible in provenance.
 
 Compatibility review flags at least:
 
@@ -78,7 +81,7 @@ Compatibility review flags at least:
 - authentication/credential placement changes;
 - handoff, refresh, logout, or retry semantic changes;
 - error-code/category changes;
-- Runtime/Control surface leakage.
+- Runtime/Client/Control surface leakage.
 
 The server and each SDK release independently. Each SDK publishes a tested Runtime contract/server compatibility statement. A new OpenAPI operation is not part of the stable SDK API until generated mapping, required handwritten protocol-safety semantics, tests, and documentation ship together.
 
@@ -86,7 +89,7 @@ The server and each SDK release independently. Each SDK publishes a tested Runti
 
 - Two clean normalizations are byte-identical with the same claimed-surface digest.
 - A clean contract job leaves no complete OpenAPI file in the source tree.
-- The policy and normalized default SDK surface contain only the eight reviewed Runtime Project Auth operations and no Control authority.
+- The policy and normalized default SDK surface contain only the reviewed Runtime Project Auth operations and no Client or Control authority.
 - Mutation tests cover selected drift, unclaimed additions, missing/duplicate operations, dangling/external references, plane leakage, and management security leakage.
 - Adapter/model tests cover omission/null, unknown fields/enums, bounds, Project/Application identifiers, exact request framing, and secret redaction.
 - Handwritten protocol code reaches wire models only through the narrow internal adapter boundary.

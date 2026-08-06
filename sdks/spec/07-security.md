@@ -8,7 +8,7 @@ The current packages implement Beta Runtime Project Auth clients, but they are n
 
 ## Public identifiers versus credentials
 
-`project_id`, `application_id`, and a publishable Application key are public configuration. SDKs may include them in reviewed Runtime requests and diagnostics, but must not describe them as secrets, user credentials, or Control authority.
+`project_id`, `application_id`, and a publishable Application key are public configuration. SDKs may include them in reviewed Runtime requests and diagnostics, but must not describe them as secrets, user credentials, or Client/Control authority.
 
 Sensitive values include:
 
@@ -17,9 +17,9 @@ Sensitive values include:
 - Project access and refresh tokens;
 - Runtime/browser session cookies;
 - provider callback values returned through Runtime;
-- management/provider credentials if accidentally supplied by a caller.
+- Project client keys and management/provider credentials if accidentally supplied by a caller.
 
-Provider client secrets and provider access/refresh tokens are not SDK inputs or outputs. If encountered, they are rejected/redacted rather than adopted.
+Project client keys, provider client secrets, and provider access/refresh tokens are not SDK inputs or outputs. If encountered, they are rejected/redacted rather than adopted. Candidate qualification binds Python and Rust package code byte-for-byte to the reviewed checkout and binds every normalized TypeScript `dist` member to the tracked reviewed artifact-surface manifest; sampled secret/path markers remain defense in depth, not the purity authority. Any Client operation—including differently formatted or concatenated paths—therefore changes reviewed code or a reviewed build digest before it can enter a final SDK artifact.
 
 ## Sensitive-value handling
 
@@ -40,7 +40,7 @@ Pending login, PKCE state, user/session credentials, refresh coordination, persi
 
 A public identifier in a response cannot change the active context. Cross-Project or cross-Application mismatch is a protocol/security failure and produces no credential migration or resource-existence disclosure.
 
-The Rust SDK must not depend on `owlauth-server`, its internal modules, migrations, persistence adapters, or privileged Control implementation.
+The Rust SDK must not depend on `owlauth-server`, its internal modules, migrations, persistence adapters, or privileged Client/Control implementation.
 
 ## Browser and native boundaries
 

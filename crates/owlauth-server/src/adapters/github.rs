@@ -315,6 +315,7 @@ mod tests {
                 nonce: "unused-nonce".to_owned(),
                 pkce_challenge: "A".repeat(43),
                 profile: ProviderRequestProfile::Login,
+                egress_policy: None,
             }))
             .unwrap();
         let url = Url::parse(&authorization.url).unwrap();
@@ -342,6 +343,7 @@ mod tests {
             nonce: "unused-nonce".to_owned(),
             pkce_challenge: "A".repeat(43),
             profile: ProviderRequestProfile::ManagedProfile,
+            egress_policy: None,
         }));
         assert_eq!(
             managed,
@@ -358,6 +360,7 @@ mod tests {
                 nonce: "unused-nonce".to_owned(),
                 pkce_challenge: "A".repeat(43),
                 profile: ProviderRequestProfile::Login,
+                egress_policy: None,
             }));
         assert_eq!(
             plaintext_remote,
@@ -426,6 +429,7 @@ mod tests {
                 now: time::OffsetDateTime::now_utc(),
                 allowed_clock_skew_seconds: 60,
                 profile: ProviderRequestProfile::Login,
+                egress_policy: None,
             })
             .await
             .unwrap();

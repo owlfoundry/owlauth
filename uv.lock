@@ -448,7 +448,7 @@ wheels = [
 
 [[package]]
 name = "owlauth-client"
-version = "0.0.1"
+version = "0.0.0.dev0"
 source = { editable = "sdks/python" }
 
 [[package]]

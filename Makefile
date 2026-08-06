@@ -77,9 +77,10 @@ package-check: web-build ## Build once and inspect local registry package candid
 	@scripts/test-server-package.sh
 
 .PHONY: openapi
-openapi: ## Export complete Runtime and Control OpenAPI documents
+openapi: ## Export complete Runtime, Client, and Control OpenAPI documents
 	@mkdir -p target/openapi
 	@cargo run --quiet --locked --package owlauth-types --bin export-openapi -- runtime target/openapi/runtime.json
+	@cargo run --quiet --locked --package owlauth-types --bin export-openapi -- client target/openapi/client.json
 	@cargo run --quiet --locked --package owlauth-types --bin export-openapi -- control target/openapi/control.json
 
 .PHONY: web-contracts
@@ -119,11 +120,10 @@ docs-deploy: ## Deploy documentation to Cloudflare Workers
 	@pnpm --filter @owlauth/docs run deploy
 
 .PHONY: dev
-dev: ## Build web assets, start local infrastructure, and run Runtime plus Control
+dev: ## Build web assets, start local infrastructure, and run all three planes
 	@test -f .env || { echo "Missing .env; run: cp .env.example .env" >&2; exit 1; }
 	@$(MAKE) web-build
 	@$(MAKE) dev-up
-	@mkdir -p .local/owlauth/signers .local/owlauth/configuration-secrets
 	@set -a; . ./.env; set +a; exec cargo run --locked --package owlauth-server
 
 .PHONY: dev-up

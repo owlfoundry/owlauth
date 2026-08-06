@@ -95,6 +95,7 @@ mod tests {
             now: OffsetDateTime::UNIX_EPOCH,
             allowed_clock_skew_seconds: 60,
             profile: ProviderRequestProfile::Login,
+            egress_policy: None,
         }
     }
 

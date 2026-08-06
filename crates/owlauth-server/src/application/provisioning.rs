@@ -1,16 +1,23 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use owlauth_key_provider::{
+    ConfigurationSecretSealer, DestroyOutcome, DestroySigningKeyRequest, InspectSigningKeyRequest,
+    OpaqueEnvelope, OpaqueHandle, OperationId, ProtectionContext, ProviderError,
+    ProviderErrorClass, ProviderFormatVersion, ProviderId, ProvisionSigningKeyRequest,
+    ProvisionedSigningKey, RequestFingerprint, RetryClassification, SealSecretRequest,
+    SecretPlaintext, SigningAlgorithm, SigningKeyProvisioner, SigningPublicKey,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::{
-    ApplicationError, Clock, ConfigurationSecretStore, EntropySource, RequestDigester, SignerStore,
-};
+use super::{ApplicationError, Clock, RequestDigester};
+#[cfg(test)]
+use super::{ConfigurationSecretStore, EntropySource, SignerStore};
 use crate::domain::{
     ApplicationType, DisplayName, MAX_ACCESS_TOKEN_LIFETIME_SECONDS,
     MIN_ACCESS_TOKEN_LIFETIME_SECONDS, OpaqueOwner, ProviderKey, ProviderKind, PublicId,
@@ -18,6 +25,7 @@ use crate::domain::{
 
 const SIGNING_ALGORITHM: &str = "EdDSA";
 const SIGNING_PURPOSE: &str = "application_tokens";
+const SIGNING_PROVIDER_LEASE_SECONDS: i64 = 30;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProjectRecord {
@@ -143,13 +151,39 @@ pub(crate) struct CreateProvider {
     pub managed_profile_enabled: bool,
     pub idempotency_key: String,
     pub expected_project_revision: i64,
+    pub egress_policy_revision: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProvisioningOperationState {
     Prepared,
+    Submitted,
     Stored,
     Completed,
+    CleanupPending,
+    CleanupLeased,
+    CleanupBlocked,
+    Failed,
+    Abandoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SigningProviderLease {
+    pub token: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SigningProviderAction {
+    Provision(SigningProviderLease),
+    Inspect(SigningProviderLease),
+    Cleanup(SigningProviderLease),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SigningProviderCall {
+    Provision,
+    Inspect,
+    Cleanup,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +197,23 @@ pub(crate) struct PreparedSigningKey {
     pub state: ProvisioningOperationState,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedSigningMaterial {
+    pub material_id: Uuid,
+    pub provider_id: ProviderId,
+    pub provider_format_version: ProviderFormatVersion,
+    pub context: ProtectionContext,
+    pub committed_handle: Option<OpaqueHandle>,
+    pub committed_public_key: Option<SigningPublicKey>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ProvisionedProtectedSigningMaterial {
+    pub material_id: Uuid,
+    pub handle: OpaqueHandle,
+    pub public_key: SigningPublicKey,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SigningKeyRecovery {
     pub operation_alias: String,
@@ -170,8 +221,10 @@ pub(crate) struct SigningKeyRecovery {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SigningKeyActivationCandidate {
+    #[cfg(test)]
     pub kid: String,
     pub signer_ref: String,
+    #[cfg(test)]
     pub public_jwk: Value,
 }
 
@@ -185,6 +238,7 @@ pub(crate) struct PrepareProvider {
     pub managed_profile_enabled: bool,
     pub operation_alias: String,
     pub expected_project_revision: i64,
+    pub egress_policy_revision: Option<i64>,
     pub request_digest: Vec<u8>,
 }
 
@@ -196,6 +250,73 @@ pub(crate) struct PreparedProvider {
     pub state: ProvisioningOperationState,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedSecretMaterial {
+    pub material_id: Uuid,
+    pub provider_id: ProviderId,
+    pub provider_format_version: ProviderFormatVersion,
+    pub context: ProtectionContext,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ConfigurationSecretSealers {
+    capabilities: Arc<BTreeMap<ProviderId, Arc<dyn ConfigurationSecretSealer>>>,
+}
+
+impl ConfigurationSecretSealers {
+    pub(crate) fn new(
+        capabilities: BTreeMap<ProviderId, Arc<dyn ConfigurationSecretSealer>>,
+    ) -> Self {
+        Self {
+            capabilities: Arc::new(capabilities),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn single<S>(capability: S) -> Self
+    where
+        S: ConfigurationSecretSealer + 'static,
+    {
+        let provider_id = capability.provider_id();
+        Self::new(BTreeMap::from([(
+            provider_id,
+            Arc::new(capability) as Arc<dyn ConfigurationSecretSealer>,
+        )]))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        material: &PreparedSecretMaterial,
+    ) -> Result<Arc<dyn ConfigurationSecretSealer>, ApplicationError> {
+        let capability = self
+            .capabilities
+            .get(&material.provider_id)
+            .cloned()
+            .ok_or(ApplicationError::Integrity)?;
+        if !capability
+            .supported_format_versions()
+            .contains(material.provider_format_version)
+        {
+            return Err(ApplicationError::Integrity);
+        }
+        Ok(capability)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SealedProtectedMaterial {
+    pub material_id: Uuid,
+    pub provider_id: ProviderId,
+    pub provider_format_version: ProviderFormatVersion,
+    pub envelope: OpaqueEnvelope,
+    pub request_fingerprint: RequestFingerprint,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderRecovery {
     pub operation_alias: String,
@@ -205,6 +326,7 @@ pub(crate) struct ProviderRecovery {
     pub issuer: String,
     pub client_id: String,
     pub managed_profile_enabled: bool,
+    pub egress_policy_revision: Option<i64>,
 }
 
 impl CreateProject {
@@ -246,6 +368,10 @@ impl CreateProvider {
         self.display_name = DisplayName::parse(self.display_name)?.into_inner();
         validate_provider_issuer(&self.issuer, allow_http_loopback)?;
         if !self.kind.issuer_matches(&self.issuer)
+            || (self.kind == ProviderKind::Oidc) != self.egress_policy_revision.is_some()
+            || self
+                .egress_policy_revision
+                .is_some_and(|revision| revision <= 0)
             || (self.managed_profile_enabled && !self.kind.capabilities().managed_profile)
         {
             return Err(ApplicationError::InvalidInput);
@@ -391,6 +517,10 @@ pub(crate) trait ApplicationProvisioningPort: Send + Sync {
     ) -> Result<ApplicationRecord, ApplicationError>;
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "durable provider lifecycle transitions carry exact operation, lease, and outcome fences"
+)]
 #[async_trait]
 pub(crate) trait SigningKeyProvisioningPort: Send + Sync {
     async fn prepare_signing_key(
@@ -406,6 +536,63 @@ pub(crate) trait SigningKeyProvisioningPort: Send + Sync {
         project_id: Uuid,
         key_id: Uuid,
     ) -> Result<SigningKeyRecovery, ApplicationError>;
+    async fn prepared_signing_material(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedSigningKey,
+    ) -> Result<Option<PreparedSigningMaterial>, ApplicationError>;
+    async fn claim_signing_provider_action(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedSigningKey,
+        now: OffsetDateTime,
+        lease_until: OffsetDateTime,
+    ) -> Result<SigningProviderAction, ApplicationError>;
+    async fn record_signing_provider_failure(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedSigningKey,
+        lease: SigningProviderLease,
+        provider_call: SigningProviderCall,
+        error_class: ProviderErrorClass,
+        retry: RetryClassification,
+        error_code: Option<String>,
+        recorded_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError>;
+    async fn record_signing_provider_absence(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedSigningKey,
+        lease: SigningProviderLease,
+        recorded_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError>;
+    async fn queue_signing_provider_cleanup(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedSigningKey,
+        lease: SigningProviderLease,
+        recorded_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError>;
+    async fn complete_signing_provider_cleanup(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedSigningKey,
+        lease: SigningProviderLease,
+        destroyed: bool,
+        correlation_id: Uuid,
+        completed_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError>;
+    async fn record_protected_signing_key_material(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedSigningKey,
+        expected_project_revision: i64,
+        lease: SigningProviderLease,
+        material: ProvisionedProtectedSigningMaterial,
+        public_jwk: Value,
+        recorded_at: OffsetDateTime,
+    ) -> Result<(), ApplicationError>;
+    #[cfg(test)]
     async fn record_signing_key_material(
         &self,
         project_id: Uuid,
@@ -471,6 +658,12 @@ pub(crate) trait ProviderProvisioningPort: Send + Sync {
         project_id: Uuid,
         provider_id: Uuid,
     ) -> Result<ProviderRecovery, ApplicationError>;
+    async fn prepared_provider_material(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedProvider,
+    ) -> Result<Option<PreparedSecretMaterial>, ApplicationError>;
+    #[cfg(test)]
     async fn mark_provider_secret_stored(
         &self,
         project_id: Uuid,
@@ -478,6 +671,16 @@ pub(crate) trait ProviderProvisioningPort: Send + Sync {
         expected_project_revision: i64,
         stored_at: OffsetDateTime,
     ) -> Result<(), ApplicationError>;
+    async fn finalize_protected_provider(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedProvider,
+        expected_project_revision: i64,
+        material: SealedProtectedMaterial,
+        correlation_id: Uuid,
+        finalized_at: OffsetDateTime,
+    ) -> Result<ProviderRecord, ApplicationError>;
+    #[cfg(test)]
     async fn finalize_provider(
         &self,
         project_id: Uuid,
@@ -523,15 +726,47 @@ pub(crate) trait ProviderProvisioningPort: Send + Sync {
 
 #[derive(Clone)]
 pub(crate) struct ProvisioningInfrastructure {
-    signer_store: Arc<dyn SignerStore>,
-    secret_store: Arc<dyn ConfigurationSecretStore>,
+    signing_provisioners: Arc<BTreeMap<ProviderId, Arc<dyn SigningKeyProvisioner>>>,
+    secret_sealers: ConfigurationSecretSealers,
     clock: Arc<dyn Clock>,
-    entropy: Arc<dyn EntropySource>,
     digester: Arc<dyn RequestDigester>,
     allow_http_loopback_provider: bool,
+    #[cfg(test)]
+    signer_store: Option<Arc<dyn SignerStore>>,
+    #[cfg(test)]
+    secret_store: Option<Arc<dyn ConfigurationSecretStore>>,
+    #[cfg(test)]
+    entropy: Option<Arc<dyn EntropySource>>,
 }
 
 impl ProvisioningInfrastructure {
+    pub(crate) fn new_protected<K, D>(
+        clock: K,
+        digester: D,
+        allow_http_loopback_provider: bool,
+        signing_provisioners: BTreeMap<ProviderId, Arc<dyn SigningKeyProvisioner>>,
+        secret_sealers: BTreeMap<ProviderId, Arc<dyn ConfigurationSecretSealer>>,
+    ) -> Self
+    where
+        K: Clock + 'static,
+        D: RequestDigester + 'static,
+    {
+        Self {
+            signing_provisioners: Arc::new(signing_provisioners),
+            secret_sealers: ConfigurationSecretSealers::new(secret_sealers),
+            clock: Arc::new(clock),
+            digester: Arc::new(digester),
+            allow_http_loopback_provider,
+            #[cfg(test)]
+            signer_store: None,
+            #[cfg(test)]
+            secret_store: None,
+            #[cfg(test)]
+            entropy: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new<S, C, K, E, D>(
         signer_store: S,
         secret_store: C,
@@ -548,15 +783,73 @@ impl ProvisioningInfrastructure {
         D: RequestDigester + 'static,
     {
         Self {
-            signer_store: Arc::new(signer_store),
-            secret_store: Arc::new(secret_store),
+            signing_provisioners: Arc::new(BTreeMap::new()),
+            secret_sealers: ConfigurationSecretSealers::default(),
             clock: Arc::new(clock),
-            entropy: Arc::new(entropy),
             digester: Arc::new(digester),
             allow_http_loopback_provider,
+            signer_store: Some(Arc::new(signer_store)),
+            secret_store: Some(Arc::new(secret_store)),
+            entropy: Some(Arc::new(entropy)),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_signing_provisioner<S>(mut self, signing_provisioner: S) -> Self
+    where
+        S: SigningKeyProvisioner + 'static,
+    {
+        let provider_id = signing_provisioner.provider_id();
+        self.signing_provisioners = Arc::new(BTreeMap::from([(
+            provider_id,
+            Arc::new(signing_provisioner) as Arc<dyn SigningKeyProvisioner>,
+        )]));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_secret_sealer<S>(mut self, secret_sealer: S) -> Self
+    where
+        S: ConfigurationSecretSealer + 'static,
+    {
+        self.secret_sealers = ConfigurationSecretSealers::single(secret_sealer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_provider_capabilities(
+        mut self,
+        signing_provisioners: BTreeMap<ProviderId, Arc<dyn SigningKeyProvisioner>>,
+        secret_sealers: BTreeMap<ProviderId, Arc<dyn ConfigurationSecretSealer>>,
+    ) -> Self {
+        self.signing_provisioners = Arc::new(signing_provisioners);
+        self.secret_sealers = ConfigurationSecretSealers::new(secret_sealers);
+        self
+    }
+
+    fn signing_provisioner(
+        &self,
+        provider_id: &ProviderId,
+        format_version: ProviderFormatVersion,
+    ) -> Result<Arc<dyn SigningKeyProvisioner>, ApplicationError> {
+        let provisioner = self
+            .signing_provisioners
+            .get(provider_id)
+            .cloned()
+            .ok_or(ApplicationError::Integrity)?;
+        let capabilities = provisioner.capabilities();
+        if !capabilities.supports_algorithm(SigningAlgorithm::Ed25519)
+            || !capabilities.format_versions().contains(format_version)
+        {
+            return Err(ApplicationError::Integrity);
+        }
+        Ok(provisioner)
+    }
 }
+
+mod project_application;
+mod provider_secret;
+mod signing;
 
 #[derive(Clone)]
 pub(crate) struct ProvisioningService {
@@ -584,488 +877,47 @@ impl ProvisioningService {
             infrastructure,
         }
     }
+}
 
-    pub(crate) async fn create_project(
-        &self,
-        command: CreateProject,
-        correlation_id: Uuid,
-    ) -> Result<ProjectRecord, ApplicationError> {
-        self.projects
-            .create_project(command.normalize()?, correlation_id)
-            .await
+fn normalized_ed25519_jwk(
+    kid: &str,
+    public_key: &SigningPublicKey,
+) -> Result<Value, ApplicationError> {
+    if public_key.algorithm() != SigningAlgorithm::Ed25519 || public_key.as_bytes().len() != 32 {
+        return Err(ApplicationError::Integrity);
     }
-    pub(crate) async fn list_projects(
-        &self,
-        belongs_to: Option<String>,
-    ) -> Result<Vec<ProjectRecord>, ApplicationError> {
-        self.projects
-            .list_projects(normalize_owner(belongs_to)?)
-            .await
-    }
-    pub(crate) async fn get_project(
-        &self,
-        project_id: Uuid,
-    ) -> Result<ProjectRecord, ApplicationError> {
-        self.projects.get_project(project_id).await
-    }
-    pub(crate) async fn get_project_policy(
-        &self,
-        project_id: Uuid,
-    ) -> Result<ProjectPolicyRecord, ApplicationError> {
-        self.projects.get_project_policy(project_id).await
-    }
-    pub(crate) async fn update_project_policy(
-        &self,
-        project_id: Uuid,
-        command: UpdateProjectPolicy,
-        correlation_id: Uuid,
-    ) -> Result<ProjectPolicyRecord, ApplicationError> {
-        if !(MIN_ACCESS_TOKEN_LIFETIME_SECONDS..=MAX_ACCESS_TOKEN_LIFETIME_SECONDS)
-            .contains(&command.access_token_lifetime_seconds)
-        {
-            return Err(ApplicationError::InvalidInput);
+    Ok(json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "alg": SIGNING_ALGORITHM,
+        "use": "sig",
+        "kid": kid,
+        "x": URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
+    }))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err supplies the owned provider error directly"
+)]
+pub(super) fn map_provider_error(error: ProviderError) -> ApplicationError {
+    match error.class() {
+        ProviderErrorClass::InvalidRequest
+        | ProviderErrorClass::UnsupportedAlgorithm
+        | ProviderErrorClass::Integrity => ApplicationError::Integrity,
+        ProviderErrorClass::Conflict => ApplicationError::IdempotencyConflict,
+        ProviderErrorClass::NotFound => ApplicationError::NotFound,
+        ProviderErrorClass::PermissionDenied | ProviderErrorClass::Unavailable => {
+            ApplicationError::ExternalStore
         }
-        self.projects
-            .update_project_policy(project_id, command, correlation_id)
-            .await
-    }
-    pub(crate) async fn update_project(
-        &self,
-        project_id: Uuid,
-        command: UpdateProject,
-        correlation_id: Uuid,
-    ) -> Result<ProjectRecord, ApplicationError> {
-        self.projects
-            .update_project(project_id, command.normalize()?, correlation_id)
-            .await
-    }
-    pub(crate) async fn disable_project(
-        &self,
-        project_id: Uuid,
-        expected_security_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<ProjectRecord, ApplicationError> {
-        self.projects
-            .disable_project(project_id, expected_security_revision, correlation_id)
-            .await
-    }
-    pub(crate) async fn create_application(
-        &self,
-        project_id: Uuid,
-        command: CreateApplication,
-        correlation_id: Uuid,
-    ) -> Result<ApplicationRecord, ApplicationError> {
-        self.applications
-            .create_application(project_id, command.normalize()?, correlation_id)
-            .await
-    }
-    pub(crate) async fn list_applications(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<ApplicationRecord>, ApplicationError> {
-        self.applications.list_applications(project_id).await
-    }
-    pub(crate) async fn get_application(
-        &self,
-        project_id: Uuid,
-        application_id: Uuid,
-    ) -> Result<ApplicationRecord, ApplicationError> {
-        self.applications
-            .get_application(project_id, application_id)
-            .await
-    }
-    pub(crate) async fn update_application(
-        &self,
-        project_id: Uuid,
-        application_id: Uuid,
-        command: UpdateApplication,
-        correlation_id: Uuid,
-    ) -> Result<ApplicationRecord, ApplicationError> {
-        self.applications
-            .update_application(
-                project_id,
-                application_id,
-                command.normalize()?,
-                correlation_id,
-            )
-            .await
-    }
-    pub(crate) async fn replace_application_configuration(
-        &self,
-        project_id: Uuid,
-        application_id: Uuid,
-        command: ReplaceApplicationConfiguration,
-        correlation_id: Uuid,
-    ) -> Result<ApplicationRecord, ApplicationError> {
-        self.applications
-            .replace_application_configuration(project_id, application_id, command, correlation_id)
-            .await
-    }
-    pub(crate) async fn disable_application(
-        &self,
-        project_id: Uuid,
-        application_id: Uuid,
-        expected_security_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<ApplicationRecord, ApplicationError> {
-        self.applications
-            .disable_application(
-                project_id,
-                application_id,
-                expected_security_revision,
-                correlation_id,
-            )
-            .await
-    }
-    pub(crate) async fn provision_signing_key(
-        &self,
-        project_id: Uuid,
-        operation_alias: String,
-        expected_project_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<SigningKeyRecord, ApplicationError> {
-        provision_signing_key_workflow(
-            self.signing_keys.as_ref(),
-            &self.infrastructure,
-            project_id,
-            operation_alias,
-            expected_project_revision,
-            correlation_id,
-        )
-        .await
-    }
-    pub(crate) async fn list_signing_keys(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<SigningKeyRecord>, ApplicationError> {
-        self.signing_keys.list_signing_keys(project_id).await
-    }
-    pub(crate) async fn reconcile_signing_key(
-        &self,
-        project_id: Uuid,
-        key_id: Uuid,
-        expected_project_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<SigningKeyRecord, ApplicationError> {
-        let recovery = self
-            .signing_keys
-            .signing_key_recovery(project_id, key_id)
-            .await?;
-        provision_signing_key_workflow(
-            self.signing_keys.as_ref(),
-            &self.infrastructure,
-            project_id,
-            recovery.operation_alias,
-            expected_project_revision,
-            correlation_id,
-        )
-        .await
-    }
-    pub(crate) async fn activate_signing_key(
-        &self,
-        project_id: Uuid,
-        key_id: Uuid,
-        expected_ring_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<SigningKeyRecord, ApplicationError> {
-        let candidate = self
-            .signing_keys
-            .signing_key_activation_candidate(project_id, key_id)
-            .await?;
-        self.infrastructure
-            .signer_store
-            .verify(candidate.signer_ref, &candidate.kid, &candidate.public_jwk)
-            .await?;
-        self.signing_keys
-            .activate_signing_key_if_ready(
-                project_id,
-                key_id,
-                expected_ring_revision,
-                correlation_id,
-            )
-            .await
-    }
-    pub(crate) async fn retire_signing_key(
-        &self,
-        project_id: Uuid,
-        key_id: Uuid,
-        expected_ring_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<SigningKeyRecord, ApplicationError> {
-        self.signing_keys
-            .retire_signing_key(project_id, key_id, expected_ring_revision, correlation_id)
-            .await
-    }
-    pub(crate) async fn revoke_signing_key(
-        &self,
-        project_id: Uuid,
-        key_id: Uuid,
-        expected_ring_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<SigningKeyRecord, ApplicationError> {
-        self.signing_keys
-            .revoke_signing_key(project_id, key_id, expected_ring_revision, correlation_id)
-            .await
-    }
-    pub(crate) async fn create_provider(
-        &self,
-        project_id: Uuid,
-        command: CreateProvider,
-        correlation_id: Uuid,
-    ) -> Result<ProviderRecord, ApplicationError> {
-        create_provider_workflow(
-            self.providers.as_ref(),
-            &self.infrastructure,
-            project_id,
-            command,
-            correlation_id,
-        )
-        .await
-    }
-    pub(crate) async fn list_providers(
-        &self,
-        project_id: Uuid,
-    ) -> Result<Vec<ProviderRecord>, ApplicationError> {
-        self.providers.list_providers(project_id).await
-    }
-    pub(crate) async fn reconcile_provider(
-        &self,
-        project_id: Uuid,
-        provider_id: Uuid,
-        client_secret: Zeroizing<String>,
-        expected_project_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<ProviderRecord, ApplicationError> {
-        let recovery = self
-            .providers
-            .provider_recovery(project_id, provider_id)
-            .await?;
-        create_provider_workflow(
-            self.providers.as_ref(),
-            &self.infrastructure,
-            project_id,
-            CreateProvider {
-                kind: recovery.kind,
-                provider_key: recovery.provider_key,
-                display_name: recovery.display_name,
-                issuer: recovery.issuer,
-                client_id: recovery.client_id,
-                client_secret,
-                managed_profile_enabled: recovery.managed_profile_enabled,
-                idempotency_key: recovery.operation_alias,
-                expected_project_revision,
-            },
-            correlation_id,
-        )
-        .await
-    }
-    pub(crate) async fn assign_provider(
-        &self,
-        project_id: Uuid,
-        provider_id: Uuid,
-        application_id: Uuid,
-        expected_application_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<ProviderRecord, ApplicationError> {
-        self.providers
-            .assign_provider(
-                project_id,
-                provider_id,
-                application_id,
-                expected_application_revision,
-                correlation_id,
-            )
-            .await
-    }
-    pub(crate) async fn unassign_provider(
-        &self,
-        project_id: Uuid,
-        provider_id: Uuid,
-        application_id: Uuid,
-        expected_application_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<ProviderRecord, ApplicationError> {
-        self.providers
-            .unassign_provider(
-                project_id,
-                provider_id,
-                application_id,
-                expected_application_revision,
-                correlation_id,
-            )
-            .await
-    }
-    pub(crate) async fn disable_provider(
-        &self,
-        project_id: Uuid,
-        provider_id: Uuid,
-        expected_provider_revision: i64,
-        correlation_id: Uuid,
-    ) -> Result<ProviderRecord, ApplicationError> {
-        self.providers
-            .disable_provider(
-                project_id,
-                provider_id,
-                expected_provider_revision,
-                correlation_id,
-            )
-            .await
+        _ => ApplicationError::ExternalStore,
     }
 }
 
-async fn provision_signing_key_workflow(
-    signing_keys: &dyn SigningKeyProvisioningPort,
-    infrastructure: &ProvisioningInfrastructure,
-    project_id: Uuid,
-    operation_alias: String,
-    expected_project_revision: i64,
-    correlation_id: Uuid,
-) -> Result<SigningKeyRecord, ApplicationError> {
-    validate_idempotency_key(&operation_alias)?;
-    let digest = infrastructure.digester.digest_json(&json!({
-        "project_id": project_id,
-        "algorithm": SIGNING_ALGORITHM,
-        "purpose": SIGNING_PURPOSE,
-    }))?;
-    let signer_ref = external_store_alias(
-        infrastructure.digester.as_ref(),
-        "signer",
-        project_id,
-        &operation_alias,
-    );
-    let prepared = signing_keys
-        .prepare_signing_key(
-            project_id,
-            operation_alias,
-            signer_ref,
-            expected_project_revision,
-            digest.clone(),
-        )
-        .await?;
-    if prepared.request_digest != digest {
-        return Err(ApplicationError::IdempotencyConflict);
-    }
-    if prepared.state == ProvisioningOperationState::Completed {
-        return signing_keys
-            .get_signing_key(project_id, prepared.key_id)
-            .await;
-    }
-
-    infrastructure
-        .signer_store
-        .put_if_absent(
-            prepared.signer_ref.clone(),
-            infrastructure.entropy.signing_seed()?,
-        )
-        .await?;
-    let public_jwk = infrastructure
-        .signer_store
-        .public_jwk(prepared.signer_ref.clone(), &prepared.kid)
-        .await?;
-    let now = infrastructure.clock.now();
-    signing_keys
-        .record_signing_key_material(
-            project_id,
-            &prepared,
-            expected_project_revision,
-            public_jwk,
-            now,
-        )
-        .await?;
-    signing_keys
-        .publish_signing_key(
-            project_id,
-            &prepared,
-            expected_project_revision,
-            correlation_id,
-            now,
-        )
-        .await
-}
-
-async fn create_provider_workflow(
-    providers: &dyn ProviderProvisioningPort,
-    infrastructure: &ProvisioningInfrastructure,
-    project_id: Uuid,
-    command: CreateProvider,
-    correlation_id: Uuid,
-) -> Result<ProviderRecord, ApplicationError> {
-    let command = command.normalize(infrastructure.allow_http_loopback_provider)?;
-    let secret_digest = infrastructure
-        .secret_store
-        .request_fingerprint(command.client_secret.as_bytes());
-    let digest = infrastructure.digester.digest_json(&json!({
-        "project_id": project_id,
-        "kind": command.kind.as_str(),
-        "provider_key": &command.provider_key,
-        "display_name": &command.display_name,
-        "issuer": &command.issuer,
-        "client_id": &command.client_id,
-        "managed_profile_enabled": command.managed_profile_enabled,
-        "secret_digest": URL_SAFE_NO_PAD.encode(secret_digest),
-    }))?;
-    let prepared = providers
-        .prepare_provider(
-            project_id,
-            PrepareProvider {
-                kind: command.kind,
-                provider_key: command.provider_key,
-                display_name: command.display_name,
-                issuer: command.issuer,
-                client_id: command.client_id,
-                managed_profile_enabled: command.managed_profile_enabled,
-                operation_alias: command.idempotency_key.clone(),
-                expected_project_revision: command.expected_project_revision,
-                request_digest: digest.clone(),
-            },
-        )
-        .await?;
-    if prepared.request_digest != digest {
-        return Err(ApplicationError::IdempotencyConflict);
-    }
-    if prepared.state == ProvisioningOperationState::Completed {
-        return providers
-            .get_provider(project_id, prepared.provider_id)
-            .await;
-    }
-
-    let secret_ref = external_store_alias(
-        infrastructure.digester.as_ref(),
-        "secret",
-        project_id,
-        &command.idempotency_key,
-    );
-    infrastructure
-        .secret_store
-        .put_if_absent(
-            secret_ref.clone(),
-            Zeroizing::new(command.client_secret.as_bytes().to_vec()),
-        )
-        .await?;
-    infrastructure
-        .secret_store
-        .ensure_readable(secret_ref.clone())
-        .await?;
-    let now = infrastructure.clock.now();
-    providers
-        .mark_provider_secret_stored(
-            project_id,
-            &prepared,
-            command.expected_project_revision,
-            now,
-        )
-        .await?;
-    providers
-        .finalize_provider(
-            project_id,
-            &prepared,
-            command.expected_project_revision,
-            secret_ref,
-            correlation_id,
-            now,
-        )
-        .await
-}
+#[cfg(test)]
+use provider_secret::create_provider_workflow;
+#[cfg(test)]
+use signing::provision_signing_key_workflow;
 
 #[cfg(test)]
 mod tests {
@@ -1271,6 +1123,83 @@ mod tests {
             unimplemented!("not used by provisioning workflow tests")
         }
 
+        async fn prepared_signing_material(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedSigningKey,
+        ) -> Result<Option<PreparedSigningMaterial>, ApplicationError> {
+            Ok(None)
+        }
+
+        async fn claim_signing_provider_action(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedSigningKey,
+            _now: OffsetDateTime,
+            _lease_until: OffsetDateTime,
+        ) -> Result<SigningProviderAction, ApplicationError> {
+            unimplemented!("legacy workflow fixture has no protected provider action")
+        }
+
+        async fn record_signing_provider_failure(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedSigningKey,
+            _lease: SigningProviderLease,
+            _provider_call: SigningProviderCall,
+            _error_class: ProviderErrorClass,
+            _retry: RetryClassification,
+            _error_code: Option<String>,
+            _recorded_at: OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("legacy workflow fixture has no protected provider failure")
+        }
+
+        async fn record_signing_provider_absence(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedSigningKey,
+            _lease: SigningProviderLease,
+            _recorded_at: OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("legacy workflow fixture has no protected provider absence")
+        }
+
+        async fn queue_signing_provider_cleanup(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedSigningKey,
+            _lease: SigningProviderLease,
+            _recorded_at: OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("legacy workflow fixture has no protected cleanup")
+        }
+
+        async fn complete_signing_provider_cleanup(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedSigningKey,
+            _lease: SigningProviderLease,
+            _destroyed: bool,
+            _correlation_id: Uuid,
+            _completed_at: OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("legacy workflow fixture has no protected cleanup")
+        }
+
+        async fn record_protected_signing_key_material(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedSigningKey,
+            _expected_project_revision: i64,
+            _lease: SigningProviderLease,
+            _material: ProvisionedProtectedSigningMaterial,
+            _public_jwk: Value,
+            _recorded_at: OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            unimplemented!("legacy workflow fixture has no protected material")
+        }
+
         async fn record_signing_key_material(
             &self,
             _project_id: Uuid,
@@ -1428,6 +1357,26 @@ mod tests {
             unimplemented!("not used by provisioning workflow tests")
         }
 
+        async fn prepared_provider_material(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedProvider,
+        ) -> Result<Option<PreparedSecretMaterial>, ApplicationError> {
+            Ok(None)
+        }
+
+        async fn finalize_protected_provider(
+            &self,
+            _project_id: Uuid,
+            _prepared: &PreparedProvider,
+            _expected_project_revision: i64,
+            _material: SealedProtectedMaterial,
+            _correlation_id: Uuid,
+            _finalized_at: OffsetDateTime,
+        ) -> Result<ProviderRecord, ApplicationError> {
+            unimplemented!("legacy workflow fixture has no protected material")
+        }
+
         async fn mark_provider_secret_stored(
             &self,
             _project_id: Uuid,
@@ -1561,7 +1510,25 @@ mod tests {
             managed_profile_enabled: false,
             idempotency_key: "provider-operation-12345678".to_owned(),
             expected_project_revision: 1,
+            egress_policy_revision: Some(1),
         }
+    }
+
+    #[test]
+    fn protected_provider_fixture_is_valid() {
+        let command = CreateProvider {
+            kind: ProviderKind::Oidc,
+            provider_key: "custody-workforce".to_owned(),
+            display_name: "Protected OIDC".to_owned(),
+            issuer: "https://accounts.example/".to_owned(),
+            client_id: "protected-client".to_owned(),
+            client_secret: Zeroizing::new("protected-secret".to_owned()),
+            managed_profile_enabled: false,
+            idempotency_key: "provider-custody-12345678".to_owned(),
+            expected_project_revision: 1,
+            egress_policy_revision: Some(1),
+        };
+        command.normalize(false).expect("fixture should normalize");
     }
 
     #[test]
@@ -1569,11 +1536,13 @@ mod tests {
         let mut google = provider_command();
         google.kind = ProviderKind::Google;
         google.issuer = crate::domain::GOOGLE_ISSUER.to_owned();
+        google.egress_policy_revision = None;
         google.managed_profile_enabled = true;
         assert!(google.normalize(false).is_ok());
 
         let mut github = provider_command();
         github.kind = ProviderKind::Github;
+        github.egress_policy_revision = None;
         github.issuer = crate::domain::GITHUB_ISSUER.to_owned();
         assert!(github.normalize(false).is_ok());
 

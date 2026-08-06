@@ -434,10 +434,16 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
     );
   });
   await managedDenialPage.goto(deniedReauthorization.hosted_target);
+  await expect(
+    managedDenialPage.getByRole("heading", {
+      name: "Reauthorize managed connection",
+      exact: true,
+    }),
+    `managed denial Hosted target remained on ${managedDenialPage.url()}`,
+  ).toBeVisible({ timeout: 30_000 });
+  await expect(managedDenialPage.getByRole("button")).toHaveCount(1);
   await armProviderDenial(page.request);
-  await managedDenialPage
-    .getByRole("button", { name: "Continue with controlled-provider" })
-    .click();
+  await managedDenialPage.getByRole("button").click();
   await expect(
     managedDenialPage.getByRole("heading", { name: "Provider authorization was not approved" }),
   ).toBeVisible();
@@ -519,11 +525,17 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
     );
   });
   await rejectedManagedPage.goto(rejectedReauthorization.hosted_target);
+  await expect(
+    rejectedManagedPage.getByRole("heading", {
+      name: "Reauthorize managed connection",
+      exact: true,
+    }),
+    `managed rejection Hosted target remained on ${rejectedManagedPage.url()}`,
+  ).toBeVisible({ timeout: 30_000 });
+  await expect(rejectedManagedPage.getByRole("button")).toHaveCount(1);
   const countsBeforeManagedRejection = await providerRequestCounts(page.request);
   await armProviderCodeRejection(page.request);
-  await rejectedManagedPage
-    .getByRole("button", { name: "Continue with controlled-provider" })
-    .click();
+  await rejectedManagedPage.getByRole("button").click();
   await expect(
     rejectedManagedPage.getByRole("heading", { name: "Reauthorization could not be completed" }),
   ).toBeVisible();
@@ -617,7 +629,7 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   ).toBeVisible();
   await expect(managedPage.getByText("does not sign you in to an Application")).toBeVisible();
   await expect(managedPage.getByRole("button")).toHaveCount(1);
-  await managedPage.getByRole("button", { name: "Continue with controlled-provider" }).click();
+  await managedPage.getByRole("button").click();
   await expect
     .poll(
       async () => {
@@ -791,9 +803,8 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
       exact: true,
     }),
   ).toBeVisible();
-  await disconnectedRecoveryPage
-    .getByRole("button", { name: "Continue with controlled-provider" })
-    .click();
+  await expect(disconnectedRecoveryPage.getByRole("button")).toHaveCount(1);
+  await disconnectedRecoveryPage.getByRole("button").click();
   await expect
     .poll(
       async () => {
@@ -2376,6 +2387,7 @@ async function provision(request: APIRequestContext, suffix: string): Promise<Pr
       display_name: "Controlled Provider",
       expected_project_revision: project.metadata_revision,
       issuer: providerOrigin,
+      kind: "oidc",
       managed_profile_enabled: true,
       provider_key: "controlled-provider",
     },

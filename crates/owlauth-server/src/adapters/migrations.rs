@@ -6,8 +6,12 @@ use tokio::time::timeout;
 
 use crate::config::{MigrationMode, PostgresConfig};
 
+#[cfg(test)]
+#[path = "migration_contention_tests.rs"]
+mod contention_tests;
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-const BINARY_SCHEMA_LEVEL: i64 = 20_260_803_000_000;
+const BINARY_SCHEMA_LEVEL: i64 = 20_260_805_130_000;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SchemaError {
@@ -17,6 +21,10 @@ pub(crate) enum SchemaError {
     Migration,
     #[error("PostgreSQL migration lock deadline elapsed")]
     LockTimeout,
+    #[error("PostgreSQL migration statement deadline elapsed")]
+    StatementTimeout,
+    #[error("PostgreSQL migration process deadline elapsed")]
+    Deadline,
     #[error("PostgreSQL migration history is absent or unreadable")]
     HistoryUnavailable,
     #[error("PostgreSQL migration history contains an unsuccessful migration")]
@@ -43,49 +51,97 @@ async fn connect(url: &str, deadline: Duration) -> Result<PgConnection, SchemaEr
 
 async fn migrate(config: &PostgresConfig) -> Result<(), SchemaError> {
     let mut connection = connect(config.migration_url.expose(), config.connect_timeout).await?;
-    let timeout_value = format!("{}ms", config.migration_lock_timeout.as_millis());
-    sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-        .bind(timeout_value)
-        .execute(&mut connection)
-        .await
-        .map_err(|_| SchemaError::Migration)?;
+    configure_migration_session(&mut connection, config).await?;
 
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    let result = run_migrator(&mut connection, &migrator, config.migration_deadline).await;
+
+    // Closing the dedicated backend is part of migration completion. It releases a cancelled
+    // transaction and SQLx's session advisory migration lock before any serving pool is built.
+    let close_result = close_migration_connection(connection, config.connect_timeout).await;
+    result?;
+    close_result?;
+    verify_url(config.migration_url.expose(), config.connect_timeout).await
+}
+
+async fn close_migration_connection(
+    connection: PgConnection,
+    deadline: Duration,
+) -> Result<(), SchemaError> {
+    timeout(deadline, connection.close())
+        .await
+        .map_err(|_| SchemaError::Connection)?
+        .map_err(|_| SchemaError::Migration)
+}
+
+async fn configure_migration_session(
+    connection: &mut PgConnection,
+    config: &PostgresConfig,
+) -> Result<(), SchemaError> {
     if let Some(role) = &config.migration_owner_role {
         // `set_config` accepts the validated role as a value rather than SQL syntax.
         sqlx::query("SELECT set_config('role', $1, false)")
             .bind(role)
-            .execute(&mut connection)
+            .execute(&mut *connection)
             .await
             .map_err(|_| SchemaError::Migration)?;
     }
+    configure_migration_timeouts(
+        connection,
+        config.migration_lock_timeout,
+        config.migration_statement_timeout,
+    )
+    .await
+}
 
-    let mut migrator = sqlx::migrate!("./migrations");
-    migrator.set_ignore_missing(true);
-    let migration_result =
-        timeout(config.migration_lock_timeout, migrator.run(&mut connection)).await;
-    match migration_result {
-        Ok(Ok(())) => {
-            connection
-                .close()
-                .await
-                .map_err(|_| SchemaError::Migration)?;
-            verify_url(config.migration_url.expose(), config.connect_timeout).await
-        }
-        Ok(Err(error)) if is_database_lock_timeout(&error) => Err(SchemaError::LockTimeout),
-        Ok(Err(_)) => Err(SchemaError::Migration),
-        Err(_) => Err(SchemaError::LockTimeout),
+async fn configure_migration_timeouts(
+    connection: &mut PgConnection,
+    lock_timeout: Duration,
+    statement_timeout: Duration,
+) -> Result<(), SchemaError> {
+    for (setting, value) in [
+        ("lock_timeout", format!("{}ms", lock_timeout.as_millis())),
+        (
+            "statement_timeout",
+            format!("{}ms", statement_timeout.as_millis()),
+        ),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, false)")
+            .bind(setting)
+            .bind(value)
+            .execute(&mut *connection)
+            .await
+            .map_err(|_| SchemaError::Migration)?;
+    }
+    Ok(())
+}
+
+async fn run_migrator(
+    connection: &mut PgConnection,
+    migrator: &sqlx::migrate::Migrator,
+    deadline: Duration,
+) -> Result<(), SchemaError> {
+    match timeout(deadline, migrator.run(connection)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(classify_migration_error(&error)),
+        Err(_) => Err(SchemaError::Deadline),
     }
 }
 
-fn is_database_lock_timeout(error: &sqlx::migrate::MigrateError) -> bool {
-    let database_error = match error {
+fn classify_migration_error(error: &sqlx::migrate::MigrateError) -> SchemaError {
+    let code = match error {
         sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(error))
         | sqlx::migrate::MigrateError::ExecuteMigration(sqlx::Error::Database(error), _) => {
-            Some(error)
+            error.code()
         }
         _ => None,
     };
-    database_error.is_some_and(|error| error.code().as_deref() == Some("55P03"))
+    match code.as_deref() {
+        Some("55P03") => SchemaError::LockTimeout,
+        Some("57014") => SchemaError::StatementTimeout,
+        _ => SchemaError::Migration,
+    }
 }
 
 pub(crate) async fn verify_url(url: &str, deadline: Duration) -> Result<(), SchemaError> {

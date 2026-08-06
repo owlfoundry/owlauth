@@ -57,6 +57,7 @@ docker run --detach \
   --network "$network" \
   --env OWLAUTH_INSTANCE_ID=smoke-deployment \
   --env OWLAUTH_POSTGRES_URL=postgresql://owlauth:owlauth_smoke@postgres:5432/owlauth \
+  --env OWLAUTH_SOFTWARE_CUSTODY_KEY=Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4 \
   --env OWLAUTH_SIGNER_STORE_ROOT=/tmp/owlauth-smoke/signers \
   --env OWLAUTH_SIGNER_STORE_KEY=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE \
   --env OWLAUTH_CONFIGURATION_SECRET_STORE_ROOT=/tmp/owlauth-smoke/secrets \

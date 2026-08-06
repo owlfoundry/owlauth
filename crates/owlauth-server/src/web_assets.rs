@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, fmt::Write as _, sync::LazyLock};
+use std::{fmt::Write as _, sync::LazyLock};
 
 use axum::{
     body::Body,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use rust_embed::Embed;
@@ -30,7 +30,6 @@ struct ServerManifest {
     entry: String,
     scripts: Vec<String>,
     stylesheets: Vec<String>,
-    asset_set_sha256: String,
     files: Vec<AssetFile>,
 }
 
@@ -38,19 +37,6 @@ struct ServerManifest {
 struct AssetFile {
     path: String,
     mime: String,
-    representations: Representations,
-}
-
-#[derive(Deserialize)]
-struct Representations {
-    identity: Representation,
-    gzip: Option<Representation>,
-    brotli: Option<Representation>,
-}
-
-#[derive(Deserialize)]
-struct Representation {
-    path: String,
     bytes: usize,
     sha256: String,
 }
@@ -141,15 +127,10 @@ pub(crate) fn shell_with_context(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    response.headers_mut().insert(
-        header::ETAG,
-        HeaderValue::from_str(&format!("\"assets-{}\"", manifest.asset_set_sha256))
-            .expect("asset-set ETag should be a header value"),
-    );
     response
 }
 
-pub(crate) fn asset(plane: WebPlane, requested_path: &str, headers: &HeaderMap) -> Response {
+pub(crate) fn asset(plane: WebPlane, requested_path: &str) -> Response {
     let manifest = manifest(plane);
     let Some(file) = manifest
         .files
@@ -158,43 +139,17 @@ pub(crate) fn asset(plane: WebPlane, requested_path: &str, headers: &HeaderMap) 
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((encoding, representation)) = select_representation(&file.representations, headers)
-    else {
-        return StatusCode::NOT_ACCEPTABLE.into_response();
-    };
-    let etag = format!("\"sha256-{}\"", representation.sha256);
-    if headers
-        .get_all(header::IF_NONE_MATCH)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .any(|candidate| candidate == etag || candidate == "*")
-    {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        set_asset_headers(&mut response, file, encoding, representation, &etag);
-        return response;
-    }
-
     let bytes = match plane {
-        WebPlane::Runtime => RuntimeAssets::get(&representation.path),
-        WebPlane::Control => ControlAssets::get(&representation.path),
+        WebPlane::Runtime => RuntimeAssets::get(&file.path),
+        WebPlane::Control => ControlAssets::get(&file.path),
     };
     let Some(bytes) = bytes else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    if bytes.data.len() != file.bytes || sha256_hex(&bytes.data) != file.sha256 {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let mut response = Response::new(Body::from(bytes.data.into_owned()));
-    set_asset_headers(&mut response, file, encoding, representation, &etag);
-    response
-}
-
-fn set_asset_headers(
-    response: &mut Response,
-    file: &AssetFile,
-    encoding: Option<&'static str>,
-    representation: &Representation,
-    etag: &str,
-) {
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -202,102 +157,24 @@ fn set_asset_headers(
     );
     headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&representation.bytes.to_string())
+        HeaderValue::from_str(&file.bytes.to_string())
             .expect("asset length should be a header value"),
     );
-    headers.insert(
-        header::ETAG,
-        HeaderValue::from_str(etag).expect("digest ETag should be a header value"),
-    );
-    headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
-    if let Some(encoding) = encoding {
-        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
-    }
+    response
 }
 
-fn select_representation<'a>(
-    representations: &'a Representations,
-    headers: &HeaderMap,
-) -> Option<(Option<&'static str>, &'a Representation)> {
-    let quality = encoding_qualities(headers);
-    let brotli_quality = quality
-        .get("br")
-        .copied()
-        .or_else(|| quality.get("*").copied())
-        .unwrap_or(0);
-    let gzip_quality = quality
-        .get("gzip")
-        .copied()
-        .or_else(|| quality.get("*").copied())
-        .unwrap_or(0);
-    let identity_quality = quality
-        .get("identity")
-        .copied()
-        .or_else(|| quality.get("*").copied())
-        .unwrap_or(1_000);
-
-    if brotli_quality > 0
-        && brotli_quality >= gzip_quality
-        && brotli_quality >= identity_quality
-        && let Some(representation) = &representations.brotli
-    {
-        return Some((Some("br"), representation));
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    if gzip_quality > 0
-        && gzip_quality >= identity_quality
-        && let Some(representation) = &representations.gzip
-    {
-        return Some((Some("gzip"), representation));
-    }
-    (identity_quality > 0).then_some((None, &representations.identity))
-}
-
-fn encoding_qualities(headers: &HeaderMap) -> BTreeMap<String, u16> {
-    let mut qualities = BTreeMap::new();
-    for value in headers
-        .get_all(header::ACCEPT_ENCODING)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-    {
-        for item in value.split(',') {
-            let mut parts = item.trim().split(';');
-            let encoding = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
-            if encoding.is_empty() {
-                continue;
-            }
-            let mut quality = 1_000;
-            for parameter in parts {
-                let Some(value) = parameter.trim().strip_prefix("q=") else {
-                    continue;
-                };
-                quality = parse_quality(value).unwrap_or(0);
-            }
-            qualities.insert(encoding, quality);
-        }
-    }
-    qualities
-}
-
-fn parse_quality(value: &str) -> Option<u16> {
-    if value == "1" {
-        return Some(1_000);
-    }
-    if value == "0" {
-        return Some(0);
-    }
-    let fraction = value.strip_prefix("0.")?;
-    if fraction.is_empty()
-        || fraction.len() > 3
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let number = fraction.parse::<u16>().ok()?;
-    Some(number * 10_u16.pow(u32::try_from(3 - fraction.len()).ok()?))
+    output
 }
 
 fn html_escape(value: &str) -> String {
@@ -313,21 +190,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quality_values_are_bounded() {
-        assert_eq!(parse_quality("1"), Some(1_000));
-        assert_eq!(parse_quality("0.5"), Some(500));
-        assert_eq!(parse_quality("0.125"), Some(125));
-        assert_eq!(parse_quality("1.1"), None);
-        assert_eq!(parse_quality("0.0000"), None);
-    }
-
-    #[test]
     fn embedded_plane_manifests_are_distinct() {
-        assert_ne!(
-            RUNTIME_MANIFEST.asset_set_sha256,
-            CONTROL_MANIFEST.asset_set_sha256
-        );
         assert!(RUNTIME_MANIFEST.entry.contains("runtime-"));
         assert!(CONTROL_MANIFEST.entry.contains("control-"));
+    }
+
+    #[tokio::test]
+    async fn contextual_runtime_meta_is_non_executable_and_attribute_escaped() {
+        let hostile = r#"{\"display_name\":\"\\\"><script>alert(1)</script>&\"}"#;
+        let response = shell_with_context(
+            WebPlane::Runtime,
+            "/runtime/",
+            &[("owlauth-runtime-bootstrap", hostile)],
+        );
+        let document = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .expect("contextual shell should be bounded")
+                .to_vec(),
+        )
+        .expect("shell should be UTF-8");
+        assert!(!document.contains("<script>alert(1)</script>"));
+        assert!(document.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(document.contains("&quot;"));
+        assert!(document.contains("&amp;"));
     }
 }

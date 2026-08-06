@@ -30,8 +30,8 @@ features:
     details: Projects can host OTP and magic-link authentication through Project-selected SMTP, with one-use proofs and no silent email linking.
   - title: Application user synchronization
     details: Applications receive bounded revisioned user projections and optional signed durable webhooks only for users already bound to them.
-  - title: Runtime and Control separation
-    details: Public authentication traffic and privileged administration use isolated listeners and policies over one shared application and domain core.
+  - title: Runtime, Client, and Control separation
+    details: Public authentication, customer-backend APIs, and privileged administration use isolated listeners, credentials, and policies over one shared application and domain core.
   - title: Hosted web surfaces
     details: Runtime provides hosted end-user authentication pages, while Control provides an API-key-driven Management Console in the same server artifact.
   - title: First-party SDK design
@@ -41,7 +41,7 @@ features:
 ---
 
 ::: warning Beta
-OwlAuth is Beta for its delivered self-hosted server, CLI, Hosted Authentication and Management Console, and TypeScript/Python/Rust Project Auth SDK scope. It includes OIDC and passwordless-email login, managed provider profile synchronization, Project session/token lifecycles, revisioned Application projections with signed webhooks, and optional remote Control MCP. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment; operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and downstream OAuth authorization-server behavior are outside the current product.
+OwlAuth is Beta for its delivered self-hosted server, backend-only Client API, CLI, Hosted Authentication and Management Console, and TypeScript/Python/Rust Runtime Project Auth SDK scope. It includes OIDC and passwordless-email login, managed provider profile synchronization, Project session/token lifecycles, revisioned Application projections with signed webhooks, and optional remote Control MCP. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment; operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and downstream OAuth authorization-server behavior are outside the current product.
 :::
 
 ## The product model

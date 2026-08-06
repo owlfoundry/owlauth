@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/owlauth-cli",
+    "crates/owlauth-key-provider",
     "crates/owlauth-server",
     "crates/owlauth-types",
     "sdks/rust",

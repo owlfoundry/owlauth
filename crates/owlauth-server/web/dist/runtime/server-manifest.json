@@ -1,60 +1,26 @@
 {
   "schemaVersion": 1,
   "plane": "runtime",
-  "entry": "assets/runtime-Befu0ga6.js",
+  "entry": "assets/runtime-hIqGdjDb.js",
   "scripts": [
-    "assets/runtime-Befu0ga6.js"
+    "assets/runtime-hIqGdjDb.js"
   ],
   "stylesheets": [
-    "assets/runtime-BOZEcoBO.css"
+    "assets/runtime-Bi4Z_99o.css"
   ],
-  "assetSetSha256": "65226e802953af27d924189b6d96bbcd64c14dfa3c9e9746d864d5852c0bfb8b",
+  "assetSetSha256": "176602a9689987721636f9edea70ab687213f9f1ece4f6b772002e20ee8d4dd1",
   "files": [
     {
-      "path": "assets/runtime-BOZEcoBO.css",
+      "path": "assets/runtime-Bi4Z_99o.css",
       "mime": "text/css; charset=utf-8",
-      "bytes": 3026,
-      "sha256": "4a22ec3d279efb4ccbad41d67c87467118312753f1a0ea270232a4e72e765aa6",
-      "representations": {
-        "identity": {
-          "path": "assets/runtime-BOZEcoBO.css",
-          "bytes": 3026,
-          "sha256": "4a22ec3d279efb4ccbad41d67c87467118312753f1a0ea270232a4e72e765aa6"
-        },
-        "gzip": {
-          "path": "assets/runtime-BOZEcoBO.css.gz",
-          "bytes": 1112,
-          "sha256": "7aeb1f373ca3adaf71a3823b6a55207321a08c070cf5bb3454596c0e2153f858"
-        },
-        "brotli": {
-          "path": "assets/runtime-BOZEcoBO.css.br",
-          "bytes": 935,
-          "sha256": "01ebec04b87e608e3f91fb4dd65dafc0cf40ae6480e0d8ed6c059c93cbe6ad49"
-        }
-      }
+      "bytes": 12762,
+      "sha256": "d23f769b69432a3a270311300d9f610b9affb47070163ae325fc65e540859f78"
     },
     {
-      "path": "assets/runtime-Befu0ga6.js",
+      "path": "assets/runtime-hIqGdjDb.js",
       "mime": "text/javascript; charset=utf-8",
-      "bytes": 236711,
-      "sha256": "4eff0e47e14a54d655b884a06eda9e616e39dd40ce709b569f99256264f6a54e",
-      "representations": {
-        "identity": {
-          "path": "assets/runtime-Befu0ga6.js",
-          "bytes": 236711,
-          "sha256": "4eff0e47e14a54d655b884a06eda9e616e39dd40ce709b569f99256264f6a54e"
-        },
-        "gzip": {
-          "path": "assets/runtime-Befu0ga6.js.gz",
-          "bytes": 73229,
-          "sha256": "10adf24ff82c91f072381e228fdcf24541701e4fc21f582dd3b53eca17023f35"
-        },
-        "brotli": {
-          "path": "assets/runtime-Befu0ga6.js.br",
-          "bytes": 60929,
-          "sha256": "cf3fa69da7139f2d39b3feac8f34a4de49be6c87dca69432cbefac9ae66c66f4"
-        }
-      }
+      "bytes": 243704,
+      "sha256": "5f436f6960da12d32220a7fa2f712af3a088a6054ca2dbf3b2f1b09ae148c4aa"
     }
   ]
 }

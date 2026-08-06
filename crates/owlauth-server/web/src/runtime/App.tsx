@@ -2,20 +2,17 @@ import { useEffect, useRef, useState } from "react";
 
 import type { components } from "../generated/runtime-openapi";
 import { readConfiguredBase } from "../shared/configured-base";
-import { Shell } from "../shared/Shell";
-import styles from "./app.module.css";
 import { createRuntimeClient } from "./client";
+import { RuntimeScreen } from "./flows/RuntimeScreen";
 import {
-  IdentityMutationFlow,
   identityMutationHandleFromPath,
   type IdentityMutationHostedBootstrap,
   validateIdentityMutationBootstrap,
-} from "./IdentityMutationFlow";
+} from "./flows/IdentityMutationFlow";
 import {
   consumeIdentityMutationMagicBootstrap,
-  IdentityMutationMagicFlow,
   type IdentityMutationMagicBootstrap,
-} from "./IdentityMutationMagicFlow";
+} from "./flows/IdentityMutationMagicFlow";
 
 export const hostedNavigation = {
   replace(target: string) {
@@ -24,7 +21,7 @@ export const hostedNavigation = {
 };
 
 type HostedInteraction = components["schemas"]["HostedInteractionResponse"];
-type HostedProvider = components["schemas"]["HostedProvider"];
+export type HostedProvider = components["schemas"]["HostedProvider"];
 type EmailProofMode = components["schemas"]["EmailProofMode"];
 type BrowserLogout = components["schemas"]["BrowserLogoutResponse"];
 interface SafeHostedError {
@@ -34,6 +31,8 @@ interface SafeHostedError {
 interface ManagedReauthorizationBootstrap {
   project_public_id: string;
   provider_key: string;
+  provider_display_name: string;
+  provider_kind: HostedProvider["kind"];
   status: string;
   revision: number;
   csrf?: string;
@@ -55,7 +54,7 @@ interface MagicContext {
   generation: number;
   revision: number;
 }
-type ViewState =
+export type ViewState =
   | { status: "ready-interaction"; handle: string; bootstrap: HostedInteraction }
   | { status: "email-entry"; handle: string; bootstrap: HostedInteraction }
   | {
@@ -129,7 +128,11 @@ function validProofModes(value: unknown, allowEmpty: boolean): value is EmailPro
 function validProvider(value: unknown): value is HostedProvider {
   if (typeof value !== "object" || value === null) return false;
   const provider = value as Record<string, unknown>;
-  return boundedString(provider["key"], 64) && boundedString(provider["display_name"], 128);
+  return (
+    boundedString(provider["key"], 64) &&
+    boundedString(provider["display_name"], 128) &&
+    (provider["kind"] === "oidc" || provider["kind"] === "google" || provider["kind"] === "github")
+  );
 }
 
 function validInteraction(value: unknown): value is HostedInteraction {
@@ -181,6 +184,10 @@ function validManagedReauthorization(value: unknown): value is ManagedReauthoriz
   return (
     boundedString(interaction["project_public_id"], 96) &&
     boundedString(interaction["provider_key"], 64) &&
+    boundedString(interaction["provider_display_name"], 128) &&
+    (interaction["provider_kind"] === "oidc" ||
+      interaction["provider_kind"] === "google" ||
+      interaction["provider_kind"] === "github") &&
     boundedString(interaction["status"], 64) &&
     statuses.has(interaction["status"]) &&
     typeof interaction["revision"] === "number" &&
@@ -314,7 +321,7 @@ export function safeNavigationUrl(
     target.hostname === "127.0.0.1" ||
     target.hostname === "[::1]";
   if (providerNavigation) return target.protocol === "http:" && loopback ? target.href : null;
-  if (target.protocol === "http:") return target.href;
+  if (target.protocol === "http:") return loopback ? target.href : null;
   const scheme = target.protocol.slice(0, -1);
   const forbiddenSchemes = new Set([
     "about",
@@ -481,30 +488,6 @@ function initialView(flow: RuntimeFlow | null): ViewState {
         message: "Return to your Application and start sign-in again.",
       };
   }
-}
-
-function TerminalView({
-  state,
-}: {
-  readonly state: Extract<ViewState, { status: "error" | "complete" | "progress" }>;
-}) {
-  const heading = useRef<HTMLHeadingElement>(null);
-  useEffect(() => {
-    heading.current?.focus();
-  }, []);
-  return (
-    <section aria-labelledby="runtime-result" aria-live="polite">
-      <h2 id="runtime-result" ref={heading} tabIndex={-1} className={styles["focusTarget"]}>
-        {state.title}
-      </h2>
-      <p
-        role={state.status === "error" ? "alert" : "status"}
-        className={state.status === "error" ? styles["error"] : undefined}
-      >
-        {state.message}
-      </p>
-    </section>
-  );
 }
 
 export function RuntimeApp() {
@@ -878,238 +861,29 @@ export function RuntimeApp() {
     }
   }
 
-  const title =
-    state.status === "ready-interaction" ||
-    state.status === "email-entry" ||
-    state.status === "email-proof"
-      ? state.bootstrap.application_display_name
-      : state.status === "ready-magic"
-        ? "Confirm email sign-in"
-        : state.status === "identity-mutation" || state.status === "identity-mutation-magic"
-          ? "Identity verification"
-          : state.status === "ready-managed-reauthorization"
-            ? "Reauthorize managed connection"
-            : state.status === "ready-logout"
-              ? "Sign out"
-              : state.status === "submitting"
-                ? state.title
-                : "Hosted authentication";
-
   return (
-    <Shell eyebrow="OwlAuth Runtime" title={title}>
-      {state.status === "identity-mutation" ? (
-        <IdentityMutationFlow handle={state.handle} bootstrap={state.bootstrap} />
-      ) : state.status === "identity-mutation-magic" ? (
-        <IdentityMutationMagicFlow bootstrap={state.bootstrap} />
-      ) : state.status === "ready-interaction" ? (
-        <section aria-labelledby="runtime-project" aria-busy="false">
-          <h2 id="runtime-project">{state.bootstrap.project_display_name}</h2>
-          <p className={styles["summary"]}>
-            Choose a sign-in method for {state.bootstrap.application_display_name}.
-          </p>
-          {state.bootstrap.presentation_hint === undefined ||
-          state.bootstrap.presentation_hint === null ? null : (
-            <p className={styles["notice"]}>{state.bootstrap.presentation_hint}</p>
-          )}
-          <div className={styles["methods"]} role="group" aria-label="Sign-in methods">
-            {state.bootstrap.email_available ? (
-              <button className={styles["method"]} type="button" onClick={() => void selectEmail()}>
-                Continue with email
-              </button>
-            ) : null}
-            {state.bootstrap.providers.map((provider) => (
-              <button
-                className={styles["method"]}
-                type="button"
-                key={provider.key}
-                onClick={() => void selectProvider(provider)}
-              >
-                Continue with {provider.display_name}
-              </button>
-            ))}
-          </div>
-          {state.bootstrap.session_reuse_available ? (
-            <>
-              <hr className={styles["divider"]} />
-              <section aria-labelledby="reuse-session">
-                <h3 id="reuse-session">Continue with your current Project session</h3>
-                <p>This is a separate confirmation and will not select an identity provider.</p>
-                <button
-                  className={styles["secondary"]}
-                  type="button"
-                  onClick={() => void reuseSession()}
-                >
-                  Continue with current session
-                </button>
-              </section>
-            </>
-          ) : null}
-        </section>
-      ) : state.status === "email-entry" ? (
-        <section aria-labelledby="email-entry-title">
-          <h2 id="email-entry-title">Enter your email address</h2>
-          <p className={styles["summary"]}>
-            We will respond the same way whether or not an account already exists.
-          </p>
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              void sendEmailChallenge();
-            }}
-          >
-            <label htmlFor="email-address">Email address</label>
-            <input
-              id="email-address"
-              name="email"
-              type="email"
-              autoComplete="email"
-              required
-              maxLength={254}
-              value={emailAddress}
-              onChange={(event) => {
-                setEmailAddress(event.target.value);
-              }}
-            />
-            <button className={styles["method"]} type="submit">
-              Send sign-in email
-            </button>
-          </form>
-        </section>
-      ) : state.status === "email-proof" ? (
-        <section aria-labelledby="email-proof-title" aria-live="polite">
-          <h2 id="email-proof-title">Check your email</h2>
-          <p role="status">
-            {state.proofModes.length === 2
-              ? "Use the newest code or open the newest sign-in link. "
-              : state.proofModes.includes("otp")
-                ? "Use the newest code. "
-                : "Open the newest sign-in link. "}
-            This challenge expires at {new Date(state.expiresAt).toLocaleTimeString()}.
-          </p>
-          {otpError === null ? null : (
-            <div role="alert" className={styles["error"]}>
-              <h3>Code invalid or expired</h3>
-              <p>{otpError}</p>
-            </div>
-          )}
-          {state.proofModes.includes("otp") ? (
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                void verifyOtp();
-              }}
-            >
-              <label htmlFor="email-otp">One-time code</label>
-              <input
-                id="email-otp"
-                name="otp"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                pattern="[0-9]{6,10}"
-                minLength={6}
-                maxLength={10}
-                required
-                value={otp}
-                onChange={(event) => {
-                  setOtp(event.target.value.replace(/\D/gu, "").slice(0, 10));
-                }}
-              />
-              <button className={styles["method"]} type="submit">
-                Verify code
-              </button>
-            </form>
-          ) : null}
-          <p>Need another message? Enter the same email address and request a new generation.</p>
-          <label htmlFor="resend-email">Email address</label>
-          <input
-            id="resend-email"
-            type="email"
-            autoComplete="email"
-            maxLength={254}
-            value={emailAddress}
-            onChange={(event) => {
-              setEmailAddress(event.target.value);
-            }}
-          />
-          <button
-            className={styles["secondary"]}
-            type="button"
-            onClick={() => void sendEmailChallenge(true)}
-          >
-            Resend
-          </button>
-        </section>
-      ) : state.status === "ready-magic" ? (
-        <section aria-labelledby="magic-confirm-title">
-          <h2 id="magic-confirm-title">Continue email sign-in</h2>
-          {state.context === null ? (
-            <p role="alert" className={styles["error"]}>
-              This link is invalid or expired. Return to the browser where sign-in started.
-            </p>
-          ) : (
-            <>
-              <p role="status">
-                The link has been removed from browser history. Continue only if you requested this
-                sign-in.
-              </p>
-              <button
-                className={styles["method"]}
-                type="button"
-                onClick={() => void confirmMagic()}
-              >
-                Continue
-              </button>
-            </>
-          )}
-        </section>
-      ) : state.status === "ready-managed-reauthorization" ? (
-        <section aria-labelledby="managed-reauthorization">
-          <h2 id="managed-reauthorization">Confirm provider credential replacement</h2>
-          <p>
-            Continue only with the fixed {state.bootstrap.provider_key} provider. This action
-            replaces one managed credential generation and does not sign you in to an Application.
-          </p>
-          <button
-            className={styles["method"]}
-            type="button"
-            onClick={() => void startManagedReauthorization()}
-          >
-            Continue with {state.bootstrap.provider_key}
-          </button>
-        </section>
-      ) : state.status === "ready-logout" ? (
-        <section aria-labelledby="confirm-sign-out">
-          <h2 id="confirm-sign-out">Sign out of this Project?</h2>
-          <p>This ends the Project browser session and sessions derived from it.</p>
-          <div className={styles["actions"]}>
-            <button className={styles["danger"]} type="button" onClick={() => void confirmLogout()}>
-              Confirm sign out
-            </button>
-            <button
-              className={styles["secondary"]}
-              type="button"
-              onClick={() => {
-                setState({
-                  status: "complete",
-                  title: "Sign-out cancelled",
-                  message: "No changes were made. You can close this page.",
-                });
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </section>
-      ) : state.status === "submitting" ? (
-        <section aria-busy="true">
-          <h2>{state.title}</h2>
-          <p role="status">{state.message}</p>
-        </section>
-      ) : state.status === "error" || state.status === "complete" || state.status === "progress" ? (
-        <TerminalView state={state} />
-      ) : (
-        <p>No authentication interaction is active. Start sign-in from an OwlAuth Application.</p>
-      )}
-    </Shell>
+    <RuntimeScreen
+      state={state}
+      emailAddress={emailAddress}
+      setEmailAddress={setEmailAddress}
+      otp={otp}
+      setOtp={setOtp}
+      otpError={otpError}
+      selectProvider={selectProvider}
+      selectEmail={selectEmail}
+      reuseSession={reuseSession}
+      sendEmailChallenge={sendEmailChallenge}
+      verifyOtp={verifyOtp}
+      confirmMagic={confirmMagic}
+      startManagedReauthorization={startManagedReauthorization}
+      confirmLogout={confirmLogout}
+      cancelLogout={() => {
+        setState({
+          status: "complete",
+          title: "Sign-out cancelled",
+          message: "No changes were made. You can close this page.",
+        });
+      }}
+    />
   );
 }

@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
@@ -22,9 +23,12 @@ use crate::application::{
     IdentityMutationTargetIssuer, IdentityMutationTargetVerifier, ManagedCredentialContext,
     ManagedCredentialProtector, ManagedReauthorizationTargetIssuer,
     ManagedReauthorizationTargetVerifier, OpaquePurpose, ProtectedPurpose, ProtectedValue,
-    ProviderSecretResolver, RuntimeProtector, RuntimeSigner, VersionedDigest,
+    RuntimeProtector, VersionedDigest,
 };
+#[cfg(test)]
+use crate::application::{ProviderSecretResolver, RuntimeSigner};
 
+#[cfg(test)]
 use super::software_store::EncryptedFileStore;
 
 const DIGEST_DOMAIN: &[u8] = b"owlauth-runtime-digest-v1\0";
@@ -271,10 +275,7 @@ pub(crate) struct SplitRuntimeProtector {
 }
 
 impl SplitRuntimeProtector {
-    #[allow(
-        dead_code,
-        reason = "unit and compatibility callers without projection material use the two-ring constructor"
-    )]
+    #[cfg(test)]
     pub(crate) fn new(
         short_term: SoftwareRuntimeProtector,
         email_identity: Option<SoftwareRuntimeProtector>,
@@ -851,6 +852,7 @@ impl SoftwareIdentityMutationTargetVerifier {
 }
 
 impl IdentityMutationTargetVerifier for SoftwareIdentityMutationTargetVerifier {
+    #[cfg(test)]
     fn readable_key_versions(&self) -> BTreeSet<i32> {
         RuntimeProtector::readable_key_versions(&self.0.0)
     }
@@ -1236,17 +1238,20 @@ impl ManagedCredentialProtector for SoftwareRuntimeProtector {
 }
 
 /// A signer capability over an encrypted file store. It cannot read or return signing seeds.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct EncryptedFileRuntimeSigner {
     store: EncryptedFileStore,
 }
 
+#[cfg(test)]
 impl EncryptedFileRuntimeSigner {
     pub(crate) fn new(store: EncryptedFileStore) -> Self {
         Self { store }
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl RuntimeSigner for EncryptedFileRuntimeSigner {
     async fn sign(
@@ -1271,17 +1276,20 @@ impl RuntimeSigner for EncryptedFileRuntimeSigner {
 }
 
 /// A resolver capability over an encrypted file store. References are used exactly as supplied.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct EncryptedFileProviderSecretResolver {
     store: EncryptedFileStore,
 }
 
+#[cfg(test)]
 impl EncryptedFileProviderSecretResolver {
     pub(crate) fn new(store: EncryptedFileStore) -> Self {
         Self { store }
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ProviderSecretResolver for EncryptedFileProviderSecretResolver {
     async fn resolve(&self, secret_ref: &str) -> Result<Zeroizing<String>, ApplicationError> {
@@ -1292,6 +1300,7 @@ impl ProviderSecretResolver for EncryptedFileProviderSecretResolver {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl crate::application::WebhookSecretResolver for EncryptedFileProviderSecretResolver {
     async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
@@ -1311,12 +1320,9 @@ impl crate::application::WebhookSecretResolver for EncryptedFileProviderSecretRe
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl crate::application::SmtpCredentialResolver for EncryptedFileProviderSecretResolver {
-    fn fingerprint(&self, value: &[u8]) -> [u8; 32] {
-        self.store.request_fingerprint(value)
-    }
-
     async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
         let value = self
             .store
@@ -1324,6 +1330,18 @@ impl crate::application::SmtpCredentialResolver for EncryptedFileProviderSecretR
             .await
             .map_err(authoritative_reference_error)?;
         Ok(Zeroizing::new(value.as_bytes().to_vec()))
+    }
+
+    async fn resolve_checked(
+        &self,
+        reference: &str,
+        expected_fingerprint: &[u8; 32],
+    ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        let value = crate::application::SmtpCredentialResolver::resolve(self, reference).await?;
+        if self.store.request_fingerprint(value.as_slice()) != *expected_fingerprint {
+            return Err(ApplicationError::Disabled);
+        }
+        Ok(value)
     }
 
     async fn erase(&self, reference: &str) -> Result<(), ApplicationError> {
@@ -1334,7 +1352,7 @@ impl crate::application::SmtpCredentialResolver for EncryptedFileProviderSecretR
     }
 }
 
-fn verify_ed25519(
+pub(crate) fn verify_ed25519(
     public_jwk: &Value,
     signing_input: &[u8],
     signature: &[u8],
@@ -1383,6 +1401,7 @@ fn validate_public_ed25519_jwk(jwk: &Map<String, Value>) -> Result<(), Applicati
     Ok(())
 }
 
+#[cfg(test)]
 fn authoritative_reference_error(error: ApplicationError) -> ApplicationError {
     if error == ApplicationError::InvalidInput {
         ApplicationError::Integrity

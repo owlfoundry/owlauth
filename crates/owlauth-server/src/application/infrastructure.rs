@@ -1,6 +1,8 @@
+#[cfg(test)]
 use async_trait::async_trait;
 use serde_json::Value;
 use time::OffsetDateTime;
+#[cfg(test)]
 use zeroize::Zeroizing;
 
 use super::ApplicationError;
@@ -9,6 +11,7 @@ pub(crate) trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
 }
 
+#[cfg(test)]
 pub(crate) trait EntropySource: Send + Sync {
     fn signing_seed(&self) -> Result<Zeroizing<[u8; 32]>, ApplicationError>;
 }
@@ -19,6 +22,7 @@ pub(crate) trait RequestDigester: Send + Sync {
     fn digest_bytes(&self, value: &[u8]) -> Vec<u8>;
 }
 
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait SignerStore: Send + Sync {
     async fn put_if_absent(
@@ -42,6 +46,7 @@ pub(crate) trait SignerStore: Send + Sync {
 /// keyed fingerprints are the authority for whether a retry is the same operation. Provisioning
 /// must also share a permanent per-alias ordering fence with Runtime erasure: an erase racing any
 /// stale writer must win durably and leave no material that can be recreated later.
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait ConfigurationSecretProvisioner: Send + Sync {
     fn request_fingerprint(&self, value: &[u8]) -> [u8; 32];
@@ -55,6 +60,7 @@ pub(crate) trait ConfigurationSecretProvisioner: Send + Sync {
 
 /// Read-capable configuration store retained for provider provisioning and Runtime resolution.
 /// Email Control is deliberately typed against `ConfigurationSecretProvisioner` instead.
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait ConfigurationSecretStore: Send + Sync {
     fn request_fingerprint(&self, value: &[u8]) -> [u8; 32];

@@ -2,10 +2,11 @@
 
 This directory contains detailed, canonical technology decision records registered by [`spec/10`](../10-implementation-technology-selections.md).
 
-| ID                                                           | Decision                               | Requirement owner                                          |
-| ------------------------------------------------------------ | -------------------------------------- | ---------------------------------------------------------- |
-| [`TS-001`](ts-001-postgresql-repositories-and-migrations.md) | PostgreSQL repositories and migrations | [`spec/04`](../04-storage-and-migrations.md)               |
-| [`TS-002`](ts-002-hosted-web-and-asset-pipeline.md)          | Hosted web surfaces and asset pipeline | [`spec/09`](../09-hosted-web-surfaces-and-control-auth.md) |
+| ID                                                           | Decision                                         | Requirement owner                                                                                                                                                                                                               |
+| ------------------------------------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`TS-001`](ts-001-postgresql-repositories-and-migrations.md) | PostgreSQL repositories and migrations           | [`spec/04`](../04-storage-and-migrations.md)                                                                                                                                                                                    |
+| [`TS-002`](ts-002-hosted-web-and-asset-pipeline.md)          | Hosted web surfaces and asset pipeline           | [`spec/09`](../09-hosted-web-surfaces-and-control-auth.md)                                                                                                                                                                      |
+| [`TS-003`](ts-003-key-provider-and-postgresql-custody.md)    | Key-provider SPI and PostgreSQL software custody | [`spec/02`](../02-domain-and-crate-boundaries.md), [`spec/04`](../04-storage-and-migrations.md), [`spec/06`](../06-operations-configuration-and-security.md), [`spec/08`](../08-consistency-resilience-and-plane-separation.md) |
 
 The register is the sole authority for decision status and answers which technologies are approved. Each detail record owns the dependency profile, rationale, rejected alternatives, focused validation, and revisit triggers. Concern-specific specs continue to own behavior and security invariants.
 

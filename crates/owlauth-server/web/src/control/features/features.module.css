@@ -1,0 +1,231 @@
+.form {
+  display: grid;
+  gap: 0.85rem;
+  max-width: 48rem;
+  margin-block: 1rem;
+  padding: 1rem;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.form label,
+.inlineForm label {
+  color: var(--owl-text);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.form input,
+.form select,
+.form textarea,
+.inlineForm select,
+.inlineForm input,
+.confirmation input {
+  min-height: 2.5rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--owl-text);
+  background: var(--owl-surface-raised);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+  font: inherit;
+}
+
+.form textarea {
+  min-height: 6rem;
+  resize: vertical;
+}
+
+.form button,
+.actions button,
+.inlineForm button,
+.list button,
+.cards button,
+.identityMutation button {
+  min-height: 2.5rem;
+  padding: 0.5rem 0.875rem;
+  color: var(--owl-text);
+  background: var(--owl-surface-raised);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+.form button:hover,
+.actions button:hover,
+.inlineForm button:hover,
+.list button:hover,
+.cards button:hover,
+.identityMutation button:hover {
+  background: var(--owl-surface-hover);
+}
+
+.form button:disabled,
+.actions button:disabled,
+.inlineForm button:disabled,
+.cards button:disabled,
+.identityMutation button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.form button {
+  justify-self: start;
+}
+
+.workspace {
+  display: grid;
+  gap: 2rem;
+}
+
+.toolbar,
+.sectionHeader,
+.actions,
+.inlineForm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.toolbar p,
+.sectionHeader p {
+  margin: 0;
+}
+
+.detail {
+  display: grid;
+  gap: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--owl-border);
+}
+
+.panel,
+.cards > li {
+  padding: 1rem;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.list,
+.cards {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.list button {
+  width: 100%;
+  text-align: left;
+}
+
+.list button[aria-pressed="true"] {
+  background: var(--owl-accent-soft);
+  box-shadow: inset 3px 0 var(--owl-accent);
+}
+
+.list span {
+  float: right;
+}
+
+.cards > li {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.actions,
+.inlineForm {
+  justify-content: flex-start;
+}
+
+.userGrid,
+.sessionColumns {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(0, 3fr);
+  gap: 1rem;
+}
+
+.sessionColumns {
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+}
+
+.danger,
+.form .danger,
+.cards .danger {
+  color: var(--owl-danger);
+  background: var(--owl-danger-surface);
+  border-color: #81444d;
+}
+
+.identityMutation {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--owl-border);
+}
+
+.authority,
+.confirmation {
+  display: grid;
+  gap: 0.65rem;
+  padding: 1rem;
+  background: var(--owl-surface-raised);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.authority legend {
+  font-weight: 700;
+}
+
+.planReview {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  background: var(--owl-accent-soft);
+  border: 2px solid var(--owl-accent-strong);
+  border-radius: var(--owl-radius-surface);
+}
+
+.planGroup {
+  display: grid;
+  gap: 0.25rem;
+  padding-left: 0.75rem;
+  border-left: 0.2rem solid var(--owl-border-strong);
+}
+
+.planReview p,
+.planGroup p {
+  margin: 0;
+}
+
+.machineValue {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--owl-text-muted);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.8125rem;
+}
+
+code {
+  overflow-wrap: anywhere;
+}
+
+@media (width <= 48rem) {
+  .userGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .toolbar,
+  .sectionHeader {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

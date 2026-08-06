@@ -26,7 +26,10 @@ const CALLBACK_CLOCK_SKEW_SECONDS: i64 = 60;
 const MAX_HANDLE_BYTES: usize = 256;
 const MAX_CALLBACK_CODE_BYTES: usize = 4096;
 const CONTROLLED_OIDC_PROOF_ADAPTER_KEY: &str = "controlled_oidc_profile_v1";
-const CONTROLLED_OIDC_PROOF_ADAPTER_REVISION: i64 = 1;
+const GOOGLE_OIDC_PROOF_ADAPTER_KEY: &str = "google_oidc_profile_v1";
+const OIDC_PROOF_ADAPTER_REVISION: i64 = 1;
+#[cfg(test)]
+const CONTROLLED_OIDC_PROOF_ADAPTER_REVISION: i64 = OIDC_PROOF_ADAPTER_REVISION;
 const CONTROLLED_OIDC_PROOF_SCOPES: &[&str] = &["openid", "profile"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +143,7 @@ impl IdentityMutationCreateOperation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn derived_roles(&self) -> &'static [IdentityMutationSlotRole] {
         match self {
             Self::Link { .. } => &[
@@ -174,9 +178,17 @@ pub(crate) struct IdentityMutationProviderCapability {
 
 impl IdentityMutationProviderCapability {
     pub(crate) fn controlled_oidc() -> Self {
+        Self::oidc(CONTROLLED_OIDC_PROOF_ADAPTER_KEY)
+    }
+
+    fn google_oidc() -> Self {
+        Self::oidc(GOOGLE_OIDC_PROOF_ADAPTER_KEY)
+    }
+
+    fn oidc(adapter_key: &'static str) -> Self {
         Self {
-            adapter_key: CONTROLLED_OIDC_PROOF_ADAPTER_KEY.to_owned(),
-            adapter_revision: CONTROLLED_OIDC_PROOF_ADAPTER_REVISION,
+            adapter_key: adapter_key.to_owned(),
+            adapter_revision: OIDC_PROOF_ADAPTER_REVISION,
             exact_nonrenewable_scopes: CONTROLLED_OIDC_PROOF_SCOPES
                 .iter()
                 .map(ToString::to_string)
@@ -210,8 +222,35 @@ impl IdentityMutationProviderCapability {
         .map_err(ApplicationError::from)
     }
 
+    #[cfg(test)]
     pub(crate) fn exact_nonrenewable_scopes(&self) -> &[String] {
         &self.exact_nonrenewable_scopes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IdentityMutationProviderCapabilities {
+    oidc: IdentityMutationProviderCapability,
+    google: IdentityMutationProviderCapability,
+}
+
+impl IdentityMutationProviderCapabilities {
+    pub(crate) fn reviewed() -> Self {
+        Self {
+            oidc: IdentityMutationProviderCapability::controlled_oidc(),
+            google: IdentityMutationProviderCapability::google_oidc(),
+        }
+    }
+
+    pub(crate) fn for_kind(
+        &self,
+        kind: crate::domain::ProviderKind,
+    ) -> Option<&IdentityMutationProviderCapability> {
+        match kind {
+            crate::domain::ProviderKind::Oidc => Some(&self.oidc),
+            crate::domain::ProviderKind::Google => Some(&self.google),
+            crate::domain::ProviderKind::Github => None,
+        }
     }
 }
 
@@ -242,6 +281,8 @@ pub(crate) struct IdentityMutationProviderSlotAuthority {
     pub provider_configuration_id: Uuid,
     pub provider_kind: crate::domain::ProviderKind,
     pub provider_configuration_revision: i64,
+    pub provider_egress_policy_revision: Option<i64>,
+    pub egress_policy: Option<crate::domain::ProviderEgressPolicy>,
     pub provider_key: String,
     pub issuer: String,
     pub client_id: String,
@@ -326,7 +367,7 @@ pub(crate) struct CreatedIdentityMutation {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PreparedIdentityMutationCreate {
     pub command: CreateIdentityMutation,
-    pub provider_capability: IdentityMutationProviderCapability,
+    pub provider_capabilities: IdentityMutationProviderCapabilities,
     pub runtime_base: String,
     pub intent_id: Uuid,
     pub hosted_handle_digest: VersionedDigest,
@@ -410,12 +451,9 @@ pub(crate) struct IdentityMutationProviderCallback {
 }
 
 pub(crate) enum IdentityMutationCallbackOutcome {
-    Proved {
-        intent: IdentityMutationView,
-        continuation: Zeroizing<String>,
-    },
-    Duplicate(IdentityMutationView),
-    TerminalizedFailure(IdentityMutationView),
+    Proved { continuation: Zeroizing<String> },
+    Duplicate,
+    TerminalizedFailure,
     TerminalizedStaleAuthority,
 }
 
@@ -996,6 +1034,7 @@ pub(crate) trait IdentityMutationTargetIssuer: Send + Sync {
 }
 
 pub(crate) trait IdentityMutationTargetVerifier: Send + Sync {
+    #[cfg(test)]
     fn readable_key_versions(&self) -> BTreeSet<i32>;
     fn digest_handle_at(
         &self,
@@ -1053,7 +1092,7 @@ pub(crate) struct IdentityMutationControlService {
     candidate_verifier: Arc<dyn IdentityMutationCandidateVerifier>,
     clock: Arc<dyn Clock>,
     runtime_base: Url,
-    provider_capability: IdentityMutationProviderCapability,
+    provider_capabilities: IdentityMutationProviderCapabilities,
 }
 
 impl IdentityMutationControlService {
@@ -1083,7 +1122,7 @@ impl IdentityMutationControlService {
         candidate_verifier: Arc<dyn IdentityMutationCandidateVerifier>,
         clock: Arc<dyn Clock>,
         runtime_base: Url,
-        provider_capability: IdentityMutationProviderCapability,
+        provider_capabilities: IdentityMutationProviderCapabilities,
     ) -> Result<Self, ApplicationError> {
         if !matches!(runtime_base.scheme(), "http" | "https") || runtime_base.host_str().is_none() {
             return Err(ApplicationError::InvalidInput);
@@ -1094,7 +1133,7 @@ impl IdentityMutationControlService {
             candidate_verifier,
             clock,
             runtime_base,
-            provider_capability,
+            provider_capabilities,
         })
     }
 
@@ -1118,7 +1157,7 @@ impl IdentityMutationControlService {
             .create(PreparedIdentityMutationCreate {
                 request_digest: create_request_digest(&command),
                 command,
-                provider_capability: self.provider_capability.clone(),
+                provider_capabilities: self.provider_capabilities.clone(),
                 runtime_base: self.runtime_base.to_string(),
                 intent_id,
                 hosted_handle_digest,
@@ -1269,6 +1308,55 @@ impl IdentityMutationControlService {
     }
 }
 
+#[async_trait]
+pub(crate) trait IdentityMutationRuntimePort: Send + Sync {
+    async fn bootstrap(
+        &self,
+        interaction: &str,
+        browser_binding: Option<&str>,
+    ) -> Result<IdentityMutationBootstrap, ApplicationError>;
+
+    async fn establish_magic_transfer_context(
+        &self,
+        challenge_id: Uuid,
+    ) -> Result<IdentityMutationMagicTransferGate, ApplicationError>;
+
+    async fn start_method(
+        &self,
+        command: StartIdentityMutationMethod,
+    ) -> Result<StartedIdentityMutationMethod, ApplicationError>;
+
+    async fn begin_email_challenge(
+        &self,
+        request: BeginIdentityMutationEmailChallenge,
+    ) -> Result<IdentityMutationEmailChallengeAccepted, ApplicationError>;
+
+    async fn verify_email_proof(
+        &self,
+        request: VerifyRawIdentityMutationEmailProof,
+    ) -> Result<IdentityMutationEmailCompletionDecision, ApplicationError>;
+
+    async fn verify_magic_transfer(
+        &self,
+        request: VerifyIdentityMutationMagicTransferProof,
+    ) -> Result<IdentityMutationEmailCompletionDecision, ApplicationError>;
+
+    async fn confirm_ready(
+        &self,
+        command: ConfirmIdentityMutationReady,
+    ) -> Result<IdentityMutationView, ApplicationError>;
+
+    async fn deny_provider_callback(
+        &self,
+        denial: IdentityMutationProviderDenial,
+    ) -> Result<IdentityMutationView, ApplicationError>;
+
+    async fn complete_provider_callback(
+        &self,
+        callback: IdentityMutationProviderCallback,
+    ) -> Result<IdentityMutationCallbackOutcome, ApplicationError>;
+}
+
 pub(crate) struct IdentityMutationRuntimeService {
     repository: Arc<dyn RuntimeIdentityMutationRepository>,
     protector: Arc<dyn RuntimeProtector>,
@@ -1279,7 +1367,74 @@ pub(crate) struct IdentityMutationRuntimeService {
     provider_secrets: Arc<dyn ProviderSecretResolver>,
     clock: Arc<dyn Clock>,
     runtime_base: Url,
-    provider_capability: IdentityMutationProviderCapability,
+    provider_capabilities: IdentityMutationProviderCapabilities,
+}
+
+#[async_trait]
+impl IdentityMutationRuntimePort for IdentityMutationRuntimeService {
+    async fn bootstrap(
+        &self,
+        interaction: &str,
+        browser_binding: Option<&str>,
+    ) -> Result<IdentityMutationBootstrap, ApplicationError> {
+        self.bootstrap(interaction, browser_binding).await
+    }
+
+    async fn establish_magic_transfer_context(
+        &self,
+        challenge_id: Uuid,
+    ) -> Result<IdentityMutationMagicTransferGate, ApplicationError> {
+        self.establish_magic_transfer_context(challenge_id).await
+    }
+
+    async fn start_method(
+        &self,
+        command: StartIdentityMutationMethod,
+    ) -> Result<StartedIdentityMutationMethod, ApplicationError> {
+        self.start_method(command).await
+    }
+
+    async fn begin_email_challenge(
+        &self,
+        request: BeginIdentityMutationEmailChallenge,
+    ) -> Result<IdentityMutationEmailChallengeAccepted, ApplicationError> {
+        self.begin_email_challenge(request).await
+    }
+
+    async fn verify_email_proof(
+        &self,
+        request: VerifyRawIdentityMutationEmailProof,
+    ) -> Result<IdentityMutationEmailCompletionDecision, ApplicationError> {
+        self.verify_email_proof(request).await
+    }
+
+    async fn verify_magic_transfer(
+        &self,
+        request: VerifyIdentityMutationMagicTransferProof,
+    ) -> Result<IdentityMutationEmailCompletionDecision, ApplicationError> {
+        self.verify_magic_transfer(request).await
+    }
+
+    async fn confirm_ready(
+        &self,
+        command: ConfirmIdentityMutationReady,
+    ) -> Result<IdentityMutationView, ApplicationError> {
+        self.confirm_ready(command).await
+    }
+
+    async fn deny_provider_callback(
+        &self,
+        denial: IdentityMutationProviderDenial,
+    ) -> Result<IdentityMutationView, ApplicationError> {
+        self.deny_provider_callback(denial).await
+    }
+
+    async fn complete_provider_callback(
+        &self,
+        callback: IdentityMutationProviderCallback,
+    ) -> Result<IdentityMutationCallbackOutcome, ApplicationError> {
+        self.complete_provider_callback(callback).await
+    }
 }
 
 impl IdentityMutationRuntimeService {
@@ -1303,7 +1458,7 @@ impl IdentityMutationRuntimeService {
         provider_secrets: Arc<dyn ProviderSecretResolver>,
         clock: Arc<dyn Clock>,
         runtime_base: Url,
-        provider_capability: IdentityMutationProviderCapability,
+        provider_capabilities: IdentityMutationProviderCapabilities,
     ) -> Self {
         Self {
             repository,
@@ -1315,7 +1470,7 @@ impl IdentityMutationRuntimeService {
             provider_secrets,
             clock,
             runtime_base,
-            provider_capability,
+            provider_capabilities,
         }
     }
 
@@ -1527,9 +1682,8 @@ impl IdentityMutationRuntimeService {
         let claimed = match claimed {
             ClaimIdentityMutationProvider::Claimed(record) => record,
             ClaimIdentityMutationProvider::Duplicate(record) => {
-                return Ok(IdentityMutationCallbackOutcome::Duplicate(
-                    record.safe_view(),
-                ));
+                drop(record);
+                return Ok(IdentityMutationCallbackOutcome::Duplicate);
             }
             ClaimIdentityMutationProvider::TerminalizedStaleAuthority => {
                 return Ok(IdentityMutationCallbackOutcome::TerminalizedStaleAuthority);
@@ -2119,9 +2273,13 @@ impl IdentityMutationRuntimeService {
     ) -> Result<StartedIdentityMutationMethod, ApplicationError> {
         let slot = current.slot(command.proof_slot_id)?;
         let authority = slot.provider.as_ref().ok_or(ApplicationError::Integrity)?;
-        if authority.adapter_key != self.provider_capability.adapter_key
-            || authority.adapter_capability_revision != self.provider_capability.adapter_revision
-            || authority.exact_scopes != self.provider_capability.exact_nonrenewable_scopes
+        let capability = self
+            .provider_capabilities
+            .for_kind(authority.provider_kind)
+            .filter(|capability| capability.adapter_key == authority.adapter_key)
+            .ok_or(ApplicationError::RevisionConflict)?;
+        if authority.adapter_capability_revision != capability.adapter_revision
+            || authority.exact_scopes != capability.exact_nonrenewable_scopes
             || !authority.oidc_nonce_required
         {
             return Err(ApplicationError::RevisionConflict);
@@ -2170,6 +2328,7 @@ impl IdentityMutationRuntimeService {
                 nonce: nonce.to_string(),
                 pkce_challenge,
                 profile: ProviderRequestProfile::IdentityProof,
+                egress_policy: authority.egress_policy.clone(),
             })
             .await
             .map_err(map_provider_error)?;
@@ -2208,10 +2367,14 @@ impl IdentityMutationRuntimeService {
     ) -> Result<IdentityMutationCallbackOutcome, ApplicationError> {
         let slot = claimed.slot(callback.proof_slot_id)?;
         let authority = slot.provider.as_ref().ok_or(ApplicationError::Integrity)?;
+        let capability = self
+            .provider_capabilities
+            .for_kind(authority.provider_kind)
+            .filter(|capability| capability.adapter_key == authority.adapter_key)
+            .ok_or(ApplicationError::RevisionConflict)?;
         if slot.state != IdentityMutationSlotState::ProviderExchangeInProgress
-            || authority.adapter_key != self.provider_capability.adapter_key
-            || authority.adapter_capability_revision != self.provider_capability.adapter_revision
-            || authority.exact_scopes != self.provider_capability.exact_nonrenewable_scopes
+            || authority.adapter_capability_revision != capability.adapter_revision
+            || authority.exact_scopes != capability.exact_nonrenewable_scopes
         {
             return Err(ApplicationError::RevisionConflict);
         }
@@ -2246,6 +2409,7 @@ impl IdentityMutationRuntimeService {
                 now: self.clock.now(),
                 allowed_clock_skew_seconds: CALLBACK_CLOCK_SKEW_SECONDS,
                 profile: ProviderRequestProfile::IdentityProof,
+                egress_policy: authority.egress_policy.clone(),
             })
             .await
             .map_err(map_provider_error)?;
@@ -2312,10 +2476,8 @@ impl IdentityMutationRuntimeService {
                 now: self.clock.now(),
             })
             .await?;
-        Ok(IdentityMutationCallbackOutcome::Proved {
-            intent: completed.safe_view(),
-            continuation,
-        })
+        let _ = completed;
+        Ok(IdentityMutationCallbackOutcome::Proved { continuation })
     }
 
     #[allow(clippy::type_complexity)]
@@ -2925,9 +3087,10 @@ fn resolve_failed_provider(
 ) -> Result<IdentityMutationCallbackOutcome, ApplicationError> {
     match result? {
         FailIdentityMutationProvider::Terminalized(record)
-        | FailIdentityMutationProvider::TerminalWinner(record) => Ok(
-            IdentityMutationCallbackOutcome::TerminalizedFailure(record.safe_view()),
-        ),
+        | FailIdentityMutationProvider::TerminalWinner(record) => {
+            drop(record);
+            Ok(IdentityMutationCallbackOutcome::TerminalizedFailure)
+        }
     }
 }
 
@@ -3939,7 +4102,7 @@ mod tests {
             Arc::new(TestSecrets),
             Arc::new(TestClock),
             Url::parse("https://runtime.example/").expect("runtime URL"),
-            IdentityMutationProviderCapability::controlled_oidc(),
+            IdentityMutationProviderCapabilities::reviewed(),
         )
     }
 
@@ -4048,6 +4211,23 @@ mod tests {
             snapshot.callback().as_str(),
             "https://runtime.example/runtime/projects/prj_identity_test/auth/callback/oidc-main"
         );
+
+        let capabilities = IdentityMutationProviderCapabilities::reviewed();
+        let google = capabilities
+            .for_kind(crate::domain::ProviderKind::Google)
+            .expect("Google identity proof is reviewed")
+            .snapshot(
+                "https://runtime.example/runtime/",
+                "prj_identity_test",
+                "google",
+            )
+            .unwrap();
+        assert_eq!(google.adapter_key(), GOOGLE_OIDC_PROOF_ADAPTER_KEY);
+        assert!(
+            capabilities
+                .for_kind(crate::domain::ProviderKind::Github)
+                .is_none()
+        );
     }
 
     #[test]
@@ -4098,7 +4278,7 @@ mod tests {
             Arc::new(TestProofMaterial),
             Arc::new(TestClock),
             Url::parse("https://runtime.example/runtime/").unwrap(),
-            IdentityMutationProviderCapability::controlled_oidc(),
+            IdentityMutationProviderCapabilities::reviewed(),
         )
         .unwrap();
         let created = service.create(command()).await.unwrap();
@@ -4261,7 +4441,7 @@ mod tests {
             Arc::new(TestProofMaterial),
             Arc::new(TestClock),
             Url::parse("https://runtime.example/runtime/").unwrap(),
-            IdentityMutationProviderCapability::controlled_oidc(),
+            IdentityMutationProviderCapabilities::reviewed(),
         )
         .unwrap()
     }

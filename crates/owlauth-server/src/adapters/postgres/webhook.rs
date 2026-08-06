@@ -16,9 +16,9 @@ use uuid::Uuid;
 use crate::{
     application::{
         ApplicationError, ApplicationUserEventRecord, ClaimedWebhookDelivery,
-        ClaimedWebhookSecretCleanup, ConfirmWebhookSecretProvisioned, HistoryCursor,
-        PrepareWebhookEndpoint, PrepareWebhookRotation, PreparedWebhookEndpoint,
-        PreparedWebhookSecret, ProjectionVerifiedEmailProtector, ProtectedValue,
+        ClaimedWebhookSecretCleanup, HistoryCursor, PrepareWebhookEndpoint, PrepareWebhookRotation,
+        PreparedSecretMaterial, PreparedWebhookEndpoint, PreparedWebhookSecret,
+        ProjectionVerifiedEmailProtector, ProtectedValue, SealedProtectedMaterial,
         UpdateWebhookEndpoint, WebhookControlPort, WebhookDeliveryRecord,
         WebhookDeliveryRepository, WebhookEndpointRecord, WebhookSecretPreparationState,
         WebhookTransportOutcome, endpoint_status,
@@ -32,11 +32,17 @@ use crate::{
 use super::{
     audit::append_runtime_audit,
     authentication::persistence,
+    custody::{
+        MaterialOwnerKind, MaterialPurpose, ProtectedMaterialRepository, finalize_pending_material,
+    },
     entity::{
         application, application_user_event, application_user_projection, project,
         webhook_delivery, webhook_delivery_attempt, webhook_endpoint, webhook_secret_generation,
     },
 };
+#[cfg(test)]
+use crate::application::ConfirmWebhookSecretProvisioned;
+use owlauth_key_provider::{MaterialKind, ProviderFormatVersion, ProviderId};
 
 const MAX_LIST_ROWS: usize = 101;
 
@@ -44,9 +50,60 @@ const MAX_LIST_ROWS: usize = 101;
 pub(crate) struct PostgresWebhookRepository {
     database: DatabaseConnection,
     projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
+    #[cfg(not(test))]
+    custody: WebhookCustody,
+    #[cfg(test)]
+    custody: Option<WebhookCustody>,
+}
+
+#[derive(Clone)]
+struct WebhookCustody {
+    materials: ProtectedMaterialRepository,
+    active_secret: Option<(ProviderId, ProviderFormatVersion)>,
 }
 
 impl PostgresWebhookRepository {
+    pub(crate) fn new_control_protected(
+        database: DatabaseConnection,
+        projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
+        deployment_id: &str,
+        provider_id: ProviderId,
+        provider_format_version: ProviderFormatVersion,
+    ) -> Result<Self, ApplicationError> {
+        let custody = WebhookCustody {
+            materials: ProtectedMaterialRepository::new(database.clone(), deployment_id)?,
+            active_secret: Some((provider_id, provider_format_version)),
+        };
+        Ok(Self {
+            database,
+            projection_protector,
+            #[cfg(not(test))]
+            custody,
+            #[cfg(test)]
+            custody: Some(custody),
+        })
+    }
+
+    pub(crate) fn new_runtime_protected(
+        database: DatabaseConnection,
+        projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
+        deployment_id: &str,
+    ) -> Result<Self, ApplicationError> {
+        let custody = WebhookCustody {
+            materials: ProtectedMaterialRepository::new(database.clone(), deployment_id)?,
+            active_secret: None,
+        };
+        Ok(Self {
+            database,
+            projection_protector,
+            #[cfg(not(test))]
+            custody,
+            #[cfg(test)]
+            custody: Some(custody),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         database: DatabaseConnection,
         projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
@@ -54,7 +111,76 @@ impl PostgresWebhookRepository {
         Self {
             database,
             projection_protector,
+            custody: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_custody(
+        mut self,
+        deployment_id: &str,
+        provider_id: ProviderId,
+        provider_format_version: ProviderFormatVersion,
+    ) -> Result<Self, ApplicationError> {
+        self.custody = Some(WebhookCustody {
+            materials: ProtectedMaterialRepository::new(self.database.clone(), deployment_id)?,
+            active_secret: Some((provider_id, provider_format_version)),
+        });
+        Ok(self)
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "production custody is mandatory while legacy unit fixtures deliberately omit it"
+    )]
+    fn custody(&self) -> Result<&WebhookCustody, ApplicationError> {
+        #[cfg(not(test))]
+        return Ok(&self.custody);
+        #[cfg(test)]
+        self.custody.as_ref().ok_or(ApplicationError::Integrity)
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "production custody is mandatory while legacy unit fixtures deliberately omit it"
+    )]
+    fn optional_custody(&self) -> Option<&WebhookCustody> {
+        #[cfg(not(test))]
+        return Some(&self.custody);
+        #[cfg(test)]
+        self.custody.as_ref()
+    }
+
+    async fn prepared_secret_material(
+        &self,
+        project_id: Uuid,
+        secret: &webhook_secret_generation::Model,
+    ) -> Result<Option<PreparedSecretMaterial>, ApplicationError> {
+        let Some(material_id) = secret.material_id else {
+            return Ok(None);
+        };
+        let custody = self.custody()?;
+        let reservation = custody
+            .materials
+            .load_project_reservation(
+                project_id,
+                material_id,
+                MaterialPurpose::WebhookSigningSecret,
+            )
+            .await?;
+        if reservation.owner_kind != MaterialOwnerKind::WebhookSecret
+            || reservation.owner_id != secret.endpoint_id
+            || reservation.generation != i64::from(secret.generation)
+            || reservation.material_kind != MaterialKind::ConfigurationSecret
+        {
+            return Err(ApplicationError::Integrity);
+        }
+        Ok(Some(PreparedSecretMaterial {
+            material_id,
+            provider_id: reservation.provider_id,
+            provider_format_version: reservation.provider_format_version,
+            context: reservation.context,
+        }))
     }
 }
 
@@ -196,6 +322,8 @@ pub(super) async fn append_projection_event(
                 lease_expires_at: Set(None),
                 claimed_secret_generation: Set(None),
                 claimed_overlap_generation: Set(None),
+                claimed_secret_material_id: Set(None),
+                claimed_overlap_material_id: Set(None),
                 last_outcome_class: Set(None),
                 last_http_status: Set(None),
                 created_at: Set(occurred_at),
@@ -257,9 +385,12 @@ impl WebhookControlPort for PostgresWebhookRepository {
                 .ok_or(ApplicationError::Integrity)?;
             transaction.commit().await.map_err(persistence)?;
             let preparation_state = secret_preparation_state(&secret, existing.status == "pending");
+            let material = self.prepared_secret_material(project_id, &secret).await?;
             return Ok(PreparedWebhookEndpoint {
                 endpoint: endpoint_record(existing)?,
+                #[cfg(test)]
                 secret_ref: secret.secret_ref,
+                material,
                 preparation_state,
             });
         }
@@ -291,9 +422,12 @@ impl WebhookControlPort for PostgresWebhookRepository {
                 .ok_or(ApplicationError::Integrity)?;
             transaction.commit().await.map_err(persistence)?;
             let preparation_state = secret_preparation_state(&secret, existing.status == "pending");
+            let material = self.prepared_secret_material(project_id, &secret).await?;
             return Ok(PreparedWebhookEndpoint {
                 endpoint: endpoint_record(existing)?,
+                #[cfg(test)]
                 secret_ref: secret.secret_ref,
+                material,
                 preparation_state,
             });
         }
@@ -311,13 +445,17 @@ impl WebhookControlPort for PostgresWebhookRepository {
         }
         let endpoint_id = Uuid::new_v4();
         let public_id = format!("wh_{}", endpoint_id.simple());
+        let material_id = self.optional_custody().map(|_| Uuid::new_v4());
         let secret_ref = format!(
             "webhook_{}_{}_{}_1",
             project_id.simple(),
             application_id.simple(),
             endpoint_id.simple()
         );
-        let safe_fingerprint = URL_SAFE_NO_PAD.encode(&command.request_fingerprint[..16]);
+        let safe_fingerprint = self
+            .optional_custody()
+            .is_none()
+            .then(|| URL_SAFE_NO_PAD.encode(&command.request_fingerprint[..16]));
         let endpoint = webhook_endpoint::ActiveModel {
             id: Set(endpoint_id),
             project_id: Set(project_id),
@@ -345,7 +483,37 @@ impl WebhookControlPort for PostgresWebhookRepository {
         .insert(&transaction)
         .await
         .map_err(persistence)?;
-        reserve_new_secret_reference(&transaction, &secret_ref, now).await?;
+        let material =
+            if let (Some(custody), Some(material_id)) = (self.optional_custody(), material_id) {
+                let (provider_id, provider_format_version) = custody
+                    .active_secret
+                    .as_ref()
+                    .ok_or(ApplicationError::Integrity)?;
+                let reservation = custody
+                    .materials
+                    .reserve_project_in_transaction(
+                        &transaction,
+                        project_id,
+                        material_id,
+                        MaterialOwnerKind::WebhookSecret,
+                        endpoint_id,
+                        1,
+                        MaterialKind::ConfigurationSecret,
+                        MaterialPurpose::WebhookSigningSecret,
+                        provider_id.clone(),
+                        *provider_format_version,
+                    )
+                    .await?;
+                Some(PreparedSecretMaterial {
+                    material_id,
+                    provider_id: reservation.provider_id,
+                    provider_format_version: reservation.provider_format_version,
+                    context: reservation.context,
+                })
+            } else {
+                None
+            };
+        reserve_new_secret_reference(&transaction, &secret_ref, material_id, now).await?;
         webhook_secret_generation::ActiveModel {
             endpoint_id: Set(endpoint_id),
             generation: Set(1),
@@ -353,6 +521,7 @@ impl WebhookControlPort for PostgresWebhookRepository {
             request_fingerprint: Set(command.request_fingerprint),
             secret_ref: Set(secret_ref.clone()),
             safe_fingerprint: Set(safe_fingerprint),
+            material_id: Set(material_id),
             state: Set("pending".to_owned()),
             created_at: Set(now),
             provisioned_at: Set(None),
@@ -375,11 +544,14 @@ impl WebhookControlPort for PostgresWebhookRepository {
         transaction.commit().await.map_err(persistence)?;
         Ok(PreparedWebhookEndpoint {
             endpoint: endpoint_record(endpoint)?,
+            #[cfg(test)]
             secret_ref,
+            material,
             preparation_state: WebhookSecretPreparationState::Pending,
         })
     }
 
+    #[cfg(test)]
     async fn confirm_secret_provisioned(
         &self,
         project_id: Uuid,
@@ -421,6 +593,110 @@ impl WebhookControlPort for PostgresWebhookRepository {
             let mut active = secret.into_active_model();
             active.provisioned_at = Set(Some(now));
             active.update(&transaction).await.map_err(persistence)?;
+            append_runtime_audit(
+                &transaction,
+                project_id,
+                "deployment_operator",
+                "webhook.secret.provision",
+                "webhook_endpoint",
+                Some(endpoint_id),
+                correlation_id,
+            )
+            .await?;
+        }
+        transaction.commit().await.map_err(persistence)?;
+        Ok(())
+    }
+
+    async fn finalize_protected_secret(
+        &self,
+        project_id: Uuid,
+        application_id: Uuid,
+        endpoint_id: Uuid,
+        generation: i32,
+        expected_endpoint_revision: i64,
+        request_fingerprint: &[u8],
+        material: SealedProtectedMaterial,
+        now: OffsetDateTime,
+        correlation_id: Uuid,
+    ) -> Result<(), ApplicationError> {
+        if generation < 1 || request_fingerprint.len() != 32 {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let fingerprint = material.request_fingerprint.into_bytes();
+        if fingerprint.len() != 32 {
+            return Err(ApplicationError::Integrity);
+        }
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        let endpoint =
+            lock_active_endpoint(&transaction, project_id, application_id, endpoint_id).await?;
+        if endpoint.revision != expected_endpoint_revision {
+            return Err(ApplicationError::RevisionConflict);
+        }
+        let secret = webhook_secret_generation::Entity::find_by_id((endpoint_id, generation))
+            .lock_exclusive()
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        if secret.material_id != Some(material.material_id)
+            || !bool::from(
+                secret
+                    .request_fingerprint
+                    .as_slice()
+                    .ct_eq(request_fingerprint),
+            )
+            || !matches!(
+                secret.state.as_str(),
+                "pending" | "active" | "overlap" | "retired" | "compromised"
+            )
+        {
+            return Err(ApplicationError::InvalidTransition);
+        }
+        let terminal = matches!(secret.state.as_str(), "retired" | "compromised");
+        let custody = self.custody()?;
+        let reservation = custody
+            .materials
+            .load_project_reservation_in_transaction(
+                &transaction,
+                project_id,
+                material.material_id,
+                MaterialPurpose::WebhookSigningSecret,
+            )
+            .await?;
+        if reservation.owner_kind != MaterialOwnerKind::WebhookSecret
+            || reservation.owner_id != endpoint_id
+            || reservation.generation != i64::from(generation)
+            || reservation.material_kind != MaterialKind::ConfigurationSecret
+            || reservation.provider_id != material.provider_id
+            || reservation.provider_format_version != material.provider_format_version
+        {
+            return Err(ApplicationError::Integrity);
+        }
+        if !terminal {
+            ensure_live_secret_reference(&transaction, &secret.secret_ref).await?;
+        }
+        let was_provisioned = secret.provisioned_at.is_some();
+        finalize_pending_material(
+            &transaction,
+            material.material_id,
+            Some(project_id),
+            material.envelope.into_zeroizing().to_vec(),
+            Some(fingerprint.clone()),
+            now,
+        )
+        .await?;
+        if terminal {
+            transaction.commit().await.map_err(persistence)?;
+            return Ok(());
+        }
+        let mut active = secret.into_active_model();
+        active.safe_fingerprint = Set(Some(URL_SAFE_NO_PAD.encode(&fingerprint[..16])));
+        if !was_provisioned {
+            active.provisioned_at = Set(Some(now));
+        }
+        active.update(&transaction).await.map_err(persistence)?;
+        if !was_provisioned {
             append_runtime_audit(
                 &transaction,
                 project_id,
@@ -736,10 +1012,13 @@ impl WebhookControlPort for PostgresWebhookRepository {
             transaction.commit().await.map_err(persistence)?;
             let preparation_state = secret_preparation_state(&existing, true);
             let already_active = existing.activated_at.is_some();
+            let material = self.prepared_secret_material(project_id, &existing).await?;
             return Ok(PreparedWebhookSecret {
                 endpoint: endpoint_record(endpoint)?,
                 generation: existing.generation,
+                #[cfg(test)]
                 secret_ref: existing.secret_ref,
+                material,
                 preparation_state,
                 already_active,
             });
@@ -763,10 +1042,13 @@ impl WebhookControlPort for PostgresWebhookRepository {
             ) {
                 transaction.commit().await.map_err(persistence)?;
                 let preparation_state = secret_preparation_state(&pending, true);
+                let material = self.prepared_secret_material(project_id, &pending).await?;
                 return Ok(PreparedWebhookSecret {
                     endpoint: endpoint_record(endpoint)?,
                     generation: pending.generation,
+                    #[cfg(test)]
                     secret_ref: pending.secret_ref,
+                    material,
                     preparation_state,
                     already_active: false,
                 });
@@ -794,6 +1076,7 @@ impl WebhookControlPort for PostgresWebhookRepository {
             .await
             .map_err(persistence)?
             .map_or(1, |value| value.generation + 1);
+        let material_id = self.optional_custody().map(|_| Uuid::new_v4());
         let secret_ref = format!(
             "webhook_{}_{}_{}_{}",
             project_id.simple(),
@@ -801,14 +1084,48 @@ impl WebhookControlPort for PostgresWebhookRepository {
             endpoint_id.simple(),
             generation
         );
-        reserve_new_secret_reference(&transaction, &secret_ref, now).await?;
+        let material =
+            if let (Some(custody), Some(material_id)) = (self.optional_custody(), material_id) {
+                let (provider_id, provider_format_version) = custody
+                    .active_secret
+                    .as_ref()
+                    .ok_or(ApplicationError::Integrity)?;
+                let reservation = custody
+                    .materials
+                    .reserve_project_in_transaction(
+                        &transaction,
+                        project_id,
+                        material_id,
+                        MaterialOwnerKind::WebhookSecret,
+                        endpoint_id,
+                        i64::from(generation),
+                        MaterialKind::ConfigurationSecret,
+                        MaterialPurpose::WebhookSigningSecret,
+                        provider_id.clone(),
+                        *provider_format_version,
+                    )
+                    .await?;
+                Some(PreparedSecretMaterial {
+                    material_id,
+                    provider_id: reservation.provider_id,
+                    provider_format_version: reservation.provider_format_version,
+                    context: reservation.context,
+                })
+            } else {
+                None
+            };
+        reserve_new_secret_reference(&transaction, &secret_ref, material_id, now).await?;
         webhook_secret_generation::ActiveModel {
             endpoint_id: Set(endpoint_id),
             generation: Set(generation),
             idempotency_key: Set(command.idempotency_key),
             request_fingerprint: Set(command.request_fingerprint.clone()),
             secret_ref: Set(secret_ref.clone()),
-            safe_fingerprint: Set(URL_SAFE_NO_PAD.encode(&command.request_fingerprint[..16])),
+            safe_fingerprint: Set(self
+                .optional_custody()
+                .is_none()
+                .then(|| URL_SAFE_NO_PAD.encode(&command.request_fingerprint[..16]))),
+            material_id: Set(material_id),
             state: Set("pending".to_owned()),
             created_at: Set(now),
             provisioned_at: Set(None),
@@ -832,7 +1149,9 @@ impl WebhookControlPort for PostgresWebhookRepository {
         Ok(PreparedWebhookSecret {
             endpoint: endpoint_record(endpoint)?,
             generation,
+            #[cfg(test)]
             secret_ref,
+            material,
             preparation_state: WebhookSecretPreparationState::Pending,
             already_active: false,
         })
@@ -1128,6 +1447,8 @@ impl WebhookControlPort for PostgresWebhookRepository {
             lease_expires_at: Set(None),
             claimed_secret_generation: Set(None),
             claimed_overlap_generation: Set(None),
+            claimed_secret_material_id: Set(None),
+            claimed_overlap_material_id: Set(None),
             last_outcome_class: Set(None),
             last_http_status: Set(None),
             created_at: Set(now),
@@ -1311,7 +1632,7 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT cleanup.id,cleanup.secret_ref,
+                "SELECT cleanup.id,cleanup.secret_ref,cleanup.material_id,
                         reservation.state AS reservation_state,reservation.cleanup_id
                    FROM webhook_secret_cleanup_operations cleanup
                    JOIN webhook_secret_generations secret
@@ -1319,6 +1640,7 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
                     AND secret.generation=cleanup.generation
                    JOIN webhook_secret_reference_reservations reservation
                      ON reservation.secret_ref=cleanup.secret_ref
+                    AND reservation.material_id IS NOT DISTINCT FROM cleanup.material_id
                   WHERE cleanup.not_before <= transaction_timestamp()
                     AND (cleanup.state='pending'
                          OR (cleanup.state='leased' AND cleanup.lease_expires_at <= transaction_timestamp()))
@@ -1350,6 +1672,7 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
         };
         let id: Uuid = row.try_get("", "id").map_err(persistence)?;
         let secret_ref: String = row.try_get("", "secret_ref").map_err(persistence)?;
+        let material_id: Option<Uuid> = row.try_get("", "material_id").map_err(persistence)?;
         lock_webhook_secret_reference(&transaction, &secret_ref).await?;
         let reservation_state: String =
             row.try_get("", "reservation_state").map_err(persistence)?;
@@ -1412,7 +1735,9 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
             .ok_or(ApplicationError::RevisionConflict)?;
         let cleanup = ClaimedWebhookSecretCleanup {
             id,
-            secret_ref,
+            secret_ref: material_id.map_or_else(|| secret_ref.clone(), |id| id.to_string()),
+            legacy_secret_ref: Some(secret_ref),
+            material_id,
             lease_owner: worker_id.to_owned(),
             lease_incarnation: worker_incarnation,
             lease_generation: leased
@@ -1428,8 +1753,12 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
         cleanup: &ClaimedWebhookSecretCleanup,
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
+        let secret_ref = cleanup
+            .legacy_secret_ref
+            .as_deref()
+            .ok_or(ApplicationError::Integrity)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        lock_webhook_secret_reference(&transaction, &cleanup.secret_ref).await?;
+        lock_webhook_secret_reference(&transaction, secret_ref).await?;
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1438,31 +1767,41 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
                         lease_expires_at=NULL,updated_at=$6,erased_at=$6
                   WHERE id=$1 AND secret_ref=$2 AND state='leased'
                     AND lease_owner=$3 AND lease_incarnation=$4 AND lease_generation=$5
+                    AND material_id IS NOT DISTINCT FROM $7
                     AND lease_expires_at > transaction_timestamp()
                   RETURNING endpoint_id",
                 [
                     cleanup.id.into(),
-                    cleanup.secret_ref.clone().into(),
+                    secret_ref.to_owned().into(),
                     cleanup.lease_owner.clone().into(),
                     cleanup.lease_incarnation.into(),
                     cleanup.lease_generation.into(),
                     now.into(),
+                    cleanup.material_id.into(),
                 ],
             ))
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::RevisionConflict)?;
         let endpoint_id: Uuid = row.try_get("", "endpoint_id").map_err(persistence)?;
+        if let Some(material_id) = cleanup.material_id {
+            self.custody()?
+                .materials
+                .erase_by_id_in_transaction(&transaction, material_id, now)
+                .await?;
+        }
         let reserved = transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "UPDATE webhook_secret_reference_reservations
                     SET state='erased',cleanup_id=NULL,updated_at=$3,erased_at=$3
-                  WHERE secret_ref=$1 AND state='reserved' AND cleanup_id=$2",
+                  WHERE secret_ref=$1 AND state='reserved' AND cleanup_id=$2
+                    AND material_id IS NOT DISTINCT FROM $4",
                 [
-                    cleanup.secret_ref.clone().into(),
+                    secret_ref.to_owned().into(),
                     cleanup.id.into(),
                     now.into(),
+                    cleanup.material_id.into(),
                 ],
             ))
             .await
@@ -1572,6 +1911,18 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
                      claimed_overlap_generation=CASE
                          WHEN e.overlap_expires_at > db_clock.now
                          THEN e.overlap_secret_generation ELSE NULL END,
+                     claimed_secret_material_id=(
+                         SELECT secret.material_id
+                           FROM webhook_secret_generations secret
+                          WHERE secret.endpoint_id=e.id
+                            AND secret.generation=e.current_secret_generation),
+                     claimed_overlap_material_id=CASE
+                         WHEN e.overlap_expires_at > db_clock.now THEN (
+                             SELECT secret.material_id
+                               FROM webhook_secret_generations secret
+                              WHERE secret.endpoint_id=e.id
+                                AND secret.generation=e.overlap_secret_generation)
+                         ELSE NULL END,
                      updated_at=db_clock.now
                  FROM advanced,db_clock,webhook_endpoints e,applications a,projects p,
                       application_user_events event
@@ -1622,13 +1973,15 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
                 .map_err(persistence)?
                 .ok_or(ApplicationError::Integrity)?;
         let overlap_secret_ref = if let Some(generation) = overlap_generation {
+            let overlap = webhook_secret_generation::Entity::find_by_id((endpoint_id, generation))
+                .one(&transaction)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
             Some(
-                webhook_secret_generation::Entity::find_by_id((endpoint_id, generation))
-                    .one(&transaction)
-                    .await
-                    .map_err(persistence)?
-                    .ok_or(ApplicationError::Integrity)?
-                    .secret_ref,
+                overlap
+                    .material_id
+                    .map_or(overlap.secret_ref, |material_id| material_id.to_string()),
             )
         } else {
             None
@@ -1642,7 +1995,9 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
             event_id: event.event_id,
             endpoint_url,
             raw_body,
-            primary_secret_ref: primary.secret_ref,
+            primary_secret_ref: primary
+                .material_id
+                .map_or(primary.secret_ref, |material_id| material_id.to_string()),
             overlap_secret_ref,
             attempt_number,
         }))
@@ -1727,6 +2082,8 @@ impl WebhookDeliveryRepository for PostgresWebhookRepository {
         active.lease_expires_at = Set(None);
         active.claimed_secret_generation = Set(None);
         active.claimed_overlap_generation = Set(None);
+        active.claimed_secret_material_id = Set(None);
+        active.claimed_overlap_material_id = Set(None);
         active.last_outcome_class = Set(Some(outcome.outcome.as_str().to_owned()));
         active.last_http_status = Set(outcome.http_status.map(i32::from));
         active.updated_at = Set(now);
@@ -2080,6 +2437,8 @@ async fn recover_one_expired_delivery(
     active.lease_expires_at = Set(None);
     active.claimed_secret_generation = Set(None);
     active.claimed_overlap_generation = Set(None);
+    active.claimed_secret_material_id = Set(None);
+    active.claimed_overlap_material_id = Set(None);
     active.next_attempt_at = Set(active.next_attempt_at.take().unwrap_or(now).min(now));
     active.last_outcome_class = Set(Some("ambiguous".to_owned()));
     active.last_http_status = Set(None);
@@ -2143,6 +2502,7 @@ fn event_raw_body(
 async fn reserve_new_secret_reference<C: ConnectionTrait>(
     connection: &C,
     secret_ref: &str,
+    material_id: Option<Uuid>,
     now: OffsetDateTime,
 ) -> Result<(), ApplicationError> {
     lock_webhook_secret_reference(connection, secret_ref).await?;
@@ -2150,9 +2510,9 @@ async fn reserve_new_secret_reference<C: ConnectionTrait>(
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO webhook_secret_reference_reservations
-                 (secret_ref,state,created_at,updated_at)
-             VALUES ($1,'live',$2,$2) ON CONFLICT (secret_ref) DO NOTHING",
-            [secret_ref.to_owned().into(), now.into()],
+                 (secret_ref,state,material_id,created_at,updated_at)
+             VALUES ($1,'live',$2,$3,$3) ON CONFLICT (secret_ref) DO NOTHING",
+            [secret_ref.to_owned().into(), material_id.into(), now.into()],
         ))
         .await
         .map_err(persistence)?;
@@ -2193,18 +2553,27 @@ async fn enqueue_secret_cleanup<C: ConnectionTrait>(
     now: OffsetDateTime,
     not_before: OffsetDateTime,
 ) -> Result<(), ApplicationError> {
+    let material_id = webhook_secret_generation::Entity::find_by_id((endpoint_id, generation))
+        .one(connection)
+        .await
+        .map_err(persistence)?
+        .ok_or(ApplicationError::Integrity)?
+        .material_id;
     connection
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO webhook_secret_cleanup_operations
-                 (id,endpoint_id,generation,secret_ref,state,not_before,created_at,updated_at)
-             VALUES ($1,$2,$3,$4,'pending',$6,$5,$5)
+                 (id,endpoint_id,generation,secret_ref,material_id,state,not_before,created_at,updated_at)
+             VALUES ($1,$2,$3,$4,$5,'pending',
+                     CASE WHEN $7 <= $6 THEN transaction_timestamp() ELSE $7 END,
+                     transaction_timestamp(),transaction_timestamp())
              ON CONFLICT (endpoint_id,generation) DO NOTHING",
             [
                 Uuid::new_v4().into(),
                 endpoint_id.into(),
                 generation.into(),
                 secret_ref.to_owned().into(),
+                material_id.into(),
                 now.into(),
                 not_before.into(),
             ],

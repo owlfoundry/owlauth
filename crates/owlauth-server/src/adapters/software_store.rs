@@ -1,30 +1,35 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{fs, path::PathBuf, sync::Arc};
+#[cfg(test)]
+use std::{fs::OpenOptions, io::Write, path::Path};
 
+#[cfg(test)]
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
-use ed25519_dalek::{Signer as _, SigningKey};
+#[cfg(test)]
+use ed25519_dalek::Signer as _;
+#[cfg(test)]
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+#[cfg(test)]
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::application::{
-    ApplicationError, ConfigurationSecretProvisioner, ConfigurationSecretStore, SignerStore,
-};
+use crate::application::ApplicationError;
+#[cfg(test)]
+use crate::application::{ConfigurationSecretProvisioner, ConfigurationSecretStore, SignerStore};
 
 const FORMAT_VERSION: u8 = 1;
+#[cfg(test)]
 const SIGNING_ALGORITHM: &str = "EdDSA";
 
 #[derive(Clone)]
@@ -43,6 +48,7 @@ impl std::fmt::Debug for EncryptedFileStore {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StoreWrite {
     Created,
@@ -70,11 +76,13 @@ struct Envelope {
 
 /// Control-plane wrapper that exposes only encrypted create-if-absent operations. It has no read,
 /// decrypt, signing, or Runtime credential-resolution API even though it shares the on-disk format.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct WriteOnlyEncryptedFileProvisioner {
     inner: EncryptedFileStore,
 }
 
+#[cfg(test)]
 impl WriteOnlyEncryptedFileProvisioner {
     pub(crate) fn new(root: PathBuf, key: [u8; 32]) -> Result<Self, StoreError> {
         Ok(Self {
@@ -102,6 +110,7 @@ impl EncryptedFileStore {
         digest.finalize().into()
     }
 
+    #[cfg(test)]
     pub(crate) async fn put_if_absent(
         &self,
         alias: String,
@@ -113,6 +122,7 @@ impl EncryptedFileStore {
             .map_err(|_| StoreError::Unavailable)?
     }
 
+    #[cfg(test)]
     async fn put_secret_if_absent(
         &self,
         alias: String,
@@ -136,6 +146,7 @@ impl EncryptedFileStore {
     /// Permanently tombstone an alias before removing its material. Provisioning checks the same
     /// durable marker before and after its atomic create, so a writer that started before cleanup
     /// either loses to the marker or has its just-created material removed.
+    #[cfg(test)]
     pub(crate) async fn erase(&self, alias: String) -> Result<(), StoreError> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -170,6 +181,25 @@ impl EncryptedFileStore {
             .map_err(|_| StoreError::Unavailable)?
     }
 
+    pub(crate) async fn read_for_custody_import(
+        &self,
+        alias: &str,
+    ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        self.read(alias.to_owned()).await.map_err(store_error)
+    }
+
+    pub(crate) async fn read_optional_for_custody_import(
+        &self,
+        alias: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, ApplicationError> {
+        match self.read(alias.to_owned()).await {
+            Ok(value) => Ok(Some(value)),
+            Err(StoreError::NotFound) => Ok(None),
+            Err(error) => Err(store_error(error)),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) async fn sign_ed25519(
         &self,
         alias: &str,
@@ -185,6 +215,7 @@ impl EncryptedFileStore {
         Ok(signing_key.sign(signing_input).to_bytes().to_vec())
     }
 
+    #[cfg(test)]
     pub(super) async fn read_utf8_secret(
         &self,
         alias: &str,
@@ -194,6 +225,7 @@ impl EncryptedFileStore {
         Ok(Zeroizing::new(secret.to_owned()))
     }
 
+    #[cfg(test)]
     fn put_if_absent_blocking(
         &self,
         alias: &str,
@@ -275,6 +307,7 @@ impl EncryptedFileStore {
         result
     }
 
+    #[cfg(test)]
     async fn provision_if_not_erased(
         &self,
         alias: String,
@@ -335,6 +368,7 @@ impl EncryptedFileStore {
             .join(format!(".erased-{}.tombstone", alias_path_digest(alias)?)))
     }
 
+    #[cfg(test)]
     fn lock_alias(&self, alias: &str) -> Result<fs::File, StoreError> {
         let path = self
             .root
@@ -351,6 +385,7 @@ impl EncryptedFileStore {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl SignerStore for EncryptedFileStore {
     async fn put_if_absent(
@@ -423,6 +458,7 @@ impl SignerStore for EncryptedFileStore {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ConfigurationSecretProvisioner for WriteOnlyEncryptedFileProvisioner {
     fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
@@ -441,6 +477,7 @@ impl ConfigurationSecretProvisioner for WriteOnlyEncryptedFileProvisioner {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ConfigurationSecretProvisioner for EncryptedFileStore {
     fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
@@ -461,6 +498,7 @@ impl ConfigurationSecretProvisioner for EncryptedFileStore {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ConfigurationSecretStore for EncryptedFileStore {
     fn request_fingerprint(&self, value: &[u8]) -> [u8; 32] {
@@ -517,6 +555,7 @@ fn validate_alias(alias: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn sync_directory(path: &Path) -> Result<(), StoreError> {
     OpenOptions::new()
         .read(true)

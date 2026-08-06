@@ -8,7 +8,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let plane = arguments
         .next()
-        .ok_or("usage: owlauth-export-openapi <runtime|control> [output-file]")?
+        .ok_or("usage: owlauth-export-openapi <runtime|client|control> [output-file]")?
         .parse::<OpenApiPlane>()?;
     let output = arguments.next();
     if arguments.next().is_some() {

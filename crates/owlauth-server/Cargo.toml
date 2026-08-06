@@ -1,6 +1,6 @@
 [package]
 name = "owlauth-server"
-version = "0.0.2"
+version = "0.0.0-dev"
 edition.workspace = true
 description = "Self-hostable Project Auth and identity server"
 license.workspace = true
@@ -18,8 +18,10 @@ ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 getrandom = "0.3.4"
 hmac = "0.12.1"
+hkdf = "0.12.4"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
-owlauth-types = { version = "=0.0.2", path = "../owlauth-types" }
+owlauth-key-provider = { version = "=0.0.0-dev", path = "../owlauth-key-provider" }
+owlauth-types = { version = "=0.0.0-dev", path = "../owlauth-types" }
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "rustls", "stream"] }
 redis = { version = "0.32.7", default-features = false, features = ["connection-manager", "script", "tokio-rustls-comp"] }
 rmcp = { version = "3.1.0", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
@@ -37,7 +39,7 @@ thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
 tower = { version = "0.5.3", features = ["limit", "util"] }
-tower-http = { version = "0.6.8", features = ["catch-panic", "limit", "request-id", "timeout", "trace"] }
+tower-http = { version = "0.6.8", features = ["catch-panic", "compression-br", "compression-gzip", "limit", "request-id", "timeout", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 url = { version = "2.5.8", features = ["serde"] }

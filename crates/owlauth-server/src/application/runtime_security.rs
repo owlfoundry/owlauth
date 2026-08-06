@@ -259,6 +259,7 @@ pub(crate) struct ProviderAuthorizationRequest {
     pub nonce: String,
     pub pkce_challenge: String,
     pub profile: ProviderRequestProfile,
+    pub egress_policy: Option<crate::domain::ProviderEgressPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,6 +280,7 @@ pub(crate) struct ProviderCallbackRequest {
     pub now: OffsetDateTime,
     pub allowed_clock_skew_seconds: i64,
     pub profile: ProviderRequestProfile,
+    pub egress_policy: Option<crate::domain::ProviderEgressPolicy>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -352,6 +354,7 @@ pub(crate) struct LoginStartContext {
 pub(crate) struct HostedProviderMethod {
     pub key: String,
     pub display_name: String,
+    pub kind: crate::domain::ProviderKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -388,6 +391,7 @@ pub(crate) struct ProviderRuntimeContext {
     pub secret_ref: String,
     pub managed_profile_enabled: bool,
     pub managed_profile_revision: i64,
+    pub egress_policy: Option<crate::domain::ProviderEgressPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

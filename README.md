@@ -41,12 +41,13 @@ sequenceDiagram
 
 The handoff ticket is short-lived, one-use, and bound to the Project, Application, exact redirect, browser transaction, and PKCE challenge. Project access tokens are short-lived signed JWTs. Refresh tokens are opaque, stateful, one-use credentials with strict family rotation and replay revocation.
 
-The target server exposes two isolated transport planes over one shared application/domain core:
+The server exposes three isolated transport planes over one shared application/domain core:
 
 - **Runtime / Protocol Plane:** hosted provider/email login, public Project configuration, handoff exchange, revisioned user/session operations, token refresh, logout, Project JWKS, and bounded delivery workers.
+- **Client Plane:** backend-only Project user directory, exact lookup, Application projection reads, and online token introspection under one Project client key; no browser surface or Client SDK.
 - **Control Plane:** Project, Application, provider/managed-connection, SMTP/email policy, user/identity, Application webhook, session, policy, key, and audit administration under the single deployment operator key.
 
-The two planes use distinct listeners and authentication policies even when one `owlauth-server` process composes both.
+The three planes use distinct listeners, credentials, and policies even when one `owlauth-server` process composes all of them.
 
 ## Repository layout
 
@@ -75,7 +76,7 @@ Start with:
 - [Server architecture specifications](spec/README.md)
 - [Technology selection register](spec/10-implementation-technology-selections.md)
 - [Identity connection, passwordless email, and user-sync specification](spec/11-identity-connections-passwordless-email-and-user-sync.md)
-- [Bottom-up server and hosted-web implementation plan](spec/implementation-plan.md)
+- [Product UI and interaction design specification](spec/12-product-ui-and-interaction-design.md)
 - [Detailed technology decisions](spec/technology/README.md)
 - [SDK specifications](sdks/spec/README.md)
 - [Building a SaaS around OwlAuth](docs/guide/building-saas.md)
@@ -96,20 +97,20 @@ make build
 make package-check
 ```
 
-Start a complete local Runtime and Control process with disposable development configuration:
+Start a complete local Runtime, Client, and Control process with disposable development configuration:
 
 ```bash
 cp .env.example .env
 make dev
 ```
 
-Runtime is served at `http://127.0.0.1:8080/`, and the Control Console is served at
+Runtime is served at `http://127.0.0.1:8080/`, Client at `http://127.0.0.1:8082/`, and the Control Console at
 `http://127.0.0.1:8081/console/`. The development Control key is the
 `OWLAUTH_CONTROL_API_KEY` value in `.env`. Stop the foreground server with `Ctrl-C`, then run
 `make dev-down` when the PostgreSQL and Redis containers are no longer needed.
 
-Use `make openapi` to export both contracts and `make web-e2e` to run the isolated real-browser
-gate. The browser gate starts its own PostgreSQL, OwlAuth Runtime and Control listeners, a
+Use `make openapi` to export all three plane contracts and `make web-e2e` to run the isolated real-browser
+gate. The browser gate starts its own PostgreSQL, OwlAuth Runtime, Client, and Control listeners, a
 controlled standards-compatible OIDC provider, and real Application actors. Container-backed Rust
 integration tests skip locally when Docker is unavailable; CI requires Docker execution:
 
@@ -145,17 +146,17 @@ owlauth update
 
 ## Packages and releases
 
-The server, CLI, and each SDK follow independent SemVer. `owlauth-types` follows the server version.
+The server, CLI, and each SDK follow independent SemVer. Server and CLI tags share the crates.io version namespace of their exact `owlauth-types` dependency, so those two tag families form one strictly increasing crate version sequence.
 
-| Component      | Package                           | Release tag             |
-| -------------- | --------------------------------- | ----------------------- |
-| Server         | `owlauth-server`, `owlauth-types` | `server-v{version}`     |
-| CLI            | `owlauth-cli`                     | `cli-v{version}`        |
-| TypeScript SDK | `@owlauth/client`                 | `typescript-v{version}` |
-| Python SDK     | `owlauth-client`                  | `python-v{version}`     |
-| Rust SDK       | `owlauth-client`                  | `rust-v{version}`       |
+| Component      | Package                                                   | Release tag             |
+| -------------- | --------------------------------------------------------- | ----------------------- |
+| Server         | `owlauth-key-provider`, `owlauth-types`, `owlauth-server` | `server-v{version}`     |
+| CLI            | `owlauth-types`, `owlauth-cli`                            | `cli-v{version}`        |
+| TypeScript SDK | `@owlauth/client`                                         | `typescript-v{version}` |
+| Python SDK     | `owlauth-client`                                          | `python-v{version}`     |
+| Rust SDK       | `owlauth-client`                                          | `rust-v{version}`       |
 
-A release tag points at the current `main` commit. Release workflows derive the version from the tag and materialize it only in isolated workflow workspaces, so releases do not require version-bump commits.
+Committed package manifests use non-publishable development sentinels (`0.0.0-dev`, or `0.0.0.dev0` for Python). A release tag points at the current `main` commit and is the sole release-version authority. Release workflows materialize it only in isolated workflow workspaces, so releases do not require version-bump commits.
 
 Server images are published at `ghcr.io/owlfoundry/owlauth`: `main` updates `dev`, a server release publishes its version and updates `latest`, and `build/server/{tag}` publishes the isolated smoke-tested tag `build-{tag}`.
 

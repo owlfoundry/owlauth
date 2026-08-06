@@ -4,7 +4,7 @@
 
 The official SDKs make OwlAuth Runtime Project Auth safer and idiomatic in TypeScript, Python, and Rust. They help an Application use its public Project/Application configuration, initiate login through an upstream provider, complete a PKCE-bound handoff, call explicit Project credential operations, read the current Project user, and log out. The core packages expose protocol APIs and enforce protocol safety; they do not own platform navigation, credential persistence, or framework session state.
 
-They are not OAuth authorization servers, identity providers, policy engines, administrative clients, or substitutes for backend business authorization. OAuth/OIDC details belong between OwlAuth and the configured upstream provider. Downstream Applications use the Project Auth API rather than registering OAuth grants or receiving provider tokens from OwlAuth.
+They are not OAuth authorization servers, identity providers, policy engines, administrative clients, Project Client API wrappers, user-directory SDKs, or substitutes for backend business authorization. OAuth/OIDC details belong between OwlAuth and the configured upstream provider. Downstream Applications use the Project Auth API rather than registering OAuth grants or receiving provider tokens from OwlAuth.
 
 The current TypeScript, Python, and Rust packages are Beta Runtime Project Auth clients. They implement contract-aligned transport, public configuration and JWKS retrieval, caller-held PKCE pending state, callback validation and one-use handoff exchange, credential refresh, current-user queries, and logout, with real-server coverage. The requirements below describe their current safety contract and acceptance gates unless explicitly marked as future work.
 
@@ -24,7 +24,7 @@ The current TypeScript, Python, and Rust packages are Beta Runtime Project Auth 
 | Refresh token               | opaque one-use rotating credential for one Application session family       | PostgreSQL-authoritative strict rotation                             |
 | Current Project user        | bounded Project-local user/session view                                     | Runtime evaluates token and current state                            |
 
-Public Project/Application identifiers are not secrets and never authenticate Control operations. Provider client secrets, provider tokens, management credentials, storage rows, and private signing keys never enter an SDK configuration or response.
+Public Project/Application identifiers are not secrets and never authenticate Client or Control operations. Project client keys, provider client secrets, provider tokens, management credentials, storage rows, and private signing keys never enter an SDK configuration or response.
 
 ## Actors and responsibilities
 
@@ -51,7 +51,7 @@ A production SDK has four explicit layers:
 
 The core SDKs return navigation targets, pending-login state, credential pairs, and cleanup requirements as explicit values. They do not navigate a user agent, mutate browser history, choose persistent storage, install request interceptors, or maintain framework session state. Browser, native, server-session, and framework convenience layers may be supplied by an Application or another library without changing the Runtime protocol.
 
-Generated Control operations are not part of the default SDK. Administrative access belongs to a distinct Control client surface and the `owlauth` CLI. A Runtime SDK cannot gain Control authority merely because DTO definitions share a Rust package.
+Generated Client and Control operations are not part of an SDK. Customer backends consume the independent Client OpenAPI through user-owned generated code, while administrative access belongs to the `owlauth` CLI/Console/MCP Control surfaces. A Runtime SDK cannot gain Client or Control authority merely because DTO definitions share a Rust package.
 
 Applications may use documented low-level Runtime operations, but the default path must preserve safe ordering, redaction, Project/Application binding, and one-use semantics.
 
@@ -90,7 +90,8 @@ The TypeScript implementation does not import Node-only runtime modules into its
 
 - Public API review distinguishes stable handwritten symbols from generated/internal code.
 - Client state cannot cross a configured Project/Application boundary.
-- Public IDs and publishable keys are never presented as secrets or Control credentials.
+- Public IDs and publishable keys are never presented as secrets or Client/Control credentials.
+- Project client keys and Client OpenAPI operations are absent from every package API and artifact.
 - Equivalent conformance cases produce equivalent semantic outcomes in all languages.
 - Rust dependency checks prove no edge to `owlauth-server`.
 - The published TypeScript core has one `@owlauth/client` artifact and passes its declared Node.js and browser runtime matrices before browser support is claimed.

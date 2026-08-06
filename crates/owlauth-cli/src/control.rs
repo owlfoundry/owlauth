@@ -1,17 +1,24 @@
+use std::io::Write as _;
+
 use clap::{Args, Subcommand, ValueEnum};
 use owlauth_types::{
     control::{
-        ActivateWebhookSecretRotationRequest, Application, ApplicationList, ApplicationSession,
-        ApplicationType, ApplicationUserEvent, ApplicationUserEventList, ApplicationUserEventType,
-        BrowserSession, CreateApplicationRequest, CreateProjectRequest, CreateProviderRequest,
-        CreateSigningKeyRequest, CreateWebhookEndpointRequest, ExpectedSecurityRevision,
-        ExpectedSessionRevision, ExpectedWebhookEndpointRevision, KeyTransitionRequest,
-        PrepareWebhookSecretRotationRequest, PreparedWebhookSecretRotation, Project, ProjectList,
-        ProjectPolicy, ProjectUser, ProjectUserIdentityList, ProjectUserList, ProjectUserSessions,
-        ProjectUserStatus, ProjectionPolicy, Provider, ProviderAssignmentRequest, ProviderList,
-        ProviderRevisionRequest, ReplayWebhookDeliveryRequest, SigningKey, SigningKeyList,
-        UpdateProjectPolicyRequest, UpdateProjectionPolicyRequest, UpdateWebhookEndpointRequest,
-        WebhookDelivery, WebhookDeliveryList, WebhookEndpoint, WebhookEndpointList,
+        AcknowledgeProjectClientKeyDeliveryRequest, ActivateWebhookSecretRotationRequest,
+        Application, ApplicationList, ApplicationSession, ApplicationType, ApplicationUserEvent,
+        ApplicationUserEventList, ApplicationUserEventType, BrowserSession,
+        CreateApplicationRequest, CreateProjectClientKeyRequest, CreateProjectClientKeyResponse,
+        CreateProjectRequest, CreateProviderRequest, CreateSigningKeyRequest,
+        CreateWebhookEndpointRequest, ExpectedSecurityRevision, ExpectedSessionRevision,
+        ExpectedWebhookEndpointRevision, KeyTransitionRequest, OidcPreflightRequest,
+        OidcPreflightResult, PrepareWebhookSecretRotationRequest, PreparedWebhookSecretRotation,
+        Project, ProjectClientKey, ProjectClientKeyList, ProjectList, ProjectPolicy, ProjectUser,
+        ProjectUserIdentityList, ProjectUserList, ProjectUserSessions, ProjectUserStatus,
+        ProjectionPolicy, Provider, ProviderAssignmentRequest, ProviderEgressMode,
+        ProviderEgressPolicy, ProviderList, ProviderRevisionRequest, ReplayWebhookDeliveryRequest,
+        RevokeProjectClientKeyRequest, SigningKey, SigningKeyList, UpdateProjectPolicyRequest,
+        UpdateProjectionPolicyRequest, UpdateProviderEgressPolicyRequest,
+        UpdateWebhookEndpointRequest, WebhookDelivery, WebhookDeliveryList, WebhookEndpoint,
+        WebhookEndpointList,
     },
     runtime::ProviderKind,
 };
@@ -240,6 +247,48 @@ impl From<ApplicationTypeArg> for ApplicationType {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct ClientKeyArgs {
+    #[command(subcommand)]
+    command: ClientKeyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ClientKeyCommand {
+    /// List secret-free Project client-key metadata.
+    List { project_id: String },
+    /// Create a Project client key and reveal its credential exactly once.
+    Create {
+        project_id: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Confirm that a revealed credential is durably stored outside `OwlAuth`.
+    Acknowledge {
+        project_id: String,
+        key_id: String,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Immediately and irreversibly revoke one Project client key.
+    Revoke {
+        project_id: String,
+        key_id: String,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        expected_revision: i64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct ApplicationArgs {
     #[command(subcommand)]
     command: ApplicationCommand,
@@ -300,6 +349,21 @@ enum ProviderKindArg {
     Github,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProviderEgressModeArg {
+    AllowAll,
+    ExactOrigins,
+}
+
+impl From<ProviderEgressModeArg> for ProviderEgressMode {
+    fn from(value: ProviderEgressModeArg) -> Self {
+        match value {
+            ProviderEgressModeArg::AllowAll => Self::AllowAll,
+            ProviderEgressModeArg::ExactOrigins => Self::ExactOrigins,
+        }
+    }
+}
+
 impl From<ProviderKindArg> for ProviderKind {
     fn from(value: ProviderKindArg) -> Self {
         match value {
@@ -318,6 +382,23 @@ pub(crate) struct ProviderArgs {
 
 #[derive(Debug, Subcommand)]
 enum ProviderCommand {
+    EgressGet {
+        project_id: String,
+    },
+    EgressSet {
+        project_id: String,
+        #[arg(long, value_enum)]
+        mode: ProviderEgressModeArg,
+        #[arg(long, value_delimiter = ',')]
+        exact_origin: Vec<String>,
+        #[arg(long)]
+        expected_revision: i64,
+    },
+    Preflight {
+        project_id: String,
+        #[arg(long)]
+        issuer: String,
+    },
     List {
         project_id: String,
     },
@@ -330,7 +411,7 @@ enum ProviderCommand {
         #[arg(long)]
         display_name: String,
         #[arg(long)]
-        issuer: String,
+        issuer: Option<String>,
         #[arg(long)]
         client_id: String,
         /// Environment variable containing the write-only provider client secret.
@@ -637,6 +718,113 @@ pub(crate) fn run_project(profile: Option<&str>, args: ProjectArgs) -> Result<()
     }
 }
 
+pub(crate) fn run_client_key(
+    profile: Option<&str>,
+    args: ClientKeyArgs,
+) -> Result<(), RemoteError> {
+    match args.command {
+        ClientKeyCommand::List { project_id } => {
+            resource(&project_id)?;
+            let value: ProjectClientKeyList = authenticated_server(profile)?
+                .get(&format!("projects/{project_id}/client-keys"))?;
+            print_json(&value)
+        }
+        ClientKeyCommand::Create {
+            project_id,
+            label,
+            idempotency_key,
+        } => {
+            resource(&project_id)?;
+            idem(&idempotency_key)?;
+            let mut value: CreateProjectClientKeyResponse = authenticated_server(profile)?.send(
+                Method::POST,
+                &format!("projects/{project_id}/client-keys"),
+                &CreateProjectClientKeyRequest { label },
+                Some(&idempotency_key),
+            )?;
+            // Stream directly to stdout so no additional heap String retains the one-time secret.
+            // Zeroize the deserialized response on both successful and failed output.
+            let result = print_one_time_client_key(&value);
+            value.credential.zeroize();
+            result
+        }
+        ClientKeyCommand::Acknowledge {
+            project_id,
+            key_id,
+            expected_revision,
+            idempotency_key,
+            yes,
+        } => {
+            resources(&[&project_id, &key_id])?;
+            idem(&idempotency_key)?;
+            let target = format!("projects/{project_id}/client-keys/{key_id}/acknowledge");
+            let stored = require_confirmation(
+                yes,
+                profile,
+                "project-client-key.acknowledge-delivery",
+                &target,
+                &serde_json::json!({
+                    "effect": "assert that the one-time credential is durably stored outside OwlAuth and unblock replacement creation",
+                    "expected_revision": expected_revision,
+                    "confirm_stored": true,
+                }),
+            )?;
+            let value: ProjectClientKey = authenticated_server_snapshot(stored)?.send(
+                Method::POST,
+                &target,
+                &AcknowledgeProjectClientKeyDeliveryRequest {
+                    expected_revision,
+                    confirm_stored: true,
+                },
+                Some(&idempotency_key),
+            )?;
+            print_json(&value)
+        }
+        ClientKeyCommand::Revoke {
+            project_id,
+            key_id,
+            expected_revision,
+            idempotency_key,
+            yes,
+        } => {
+            resources(&[&project_id, &key_id])?;
+            idem(&idempotency_key)?;
+            let target = format!("projects/{project_id}/client-keys/{key_id}/revoke");
+            let stored = require_confirmation(
+                yes,
+                profile,
+                "project-client-key.revoke",
+                &target,
+                &serde_json::json!({
+                    "effect": "immediately and irreversibly revoke the Project client key",
+                    "expected_revision": expected_revision,
+                    "confirm": true,
+                }),
+            )?;
+            let value: ProjectClientKey = authenticated_server_snapshot(stored)?.send(
+                Method::POST,
+                &target,
+                &RevokeProjectClientKeyRequest {
+                    expected_revision,
+                    confirm: true,
+                },
+                Some(&idempotency_key),
+            )?;
+            print_json(&value)
+        }
+    }
+}
+
+fn print_one_time_client_key(value: &CreateProjectClientKeyResponse) -> Result<(), RemoteError> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, value).map_err(|_| RemoteError::ProfileStorage)?;
+    output
+        .write_all(b"\n")
+        .and_then(|()| output.flush())
+        .map_err(|_| RemoteError::ProfileStorage)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "typed user lifecycle dispatch keeps confirmation and exact session targets visible"
@@ -927,6 +1115,41 @@ fn run_application_user_event(
 )]
 pub(crate) fn run_provider(profile: Option<&str>, args: ProviderArgs) -> Result<(), RemoteError> {
     match args.command {
+        ProviderCommand::EgressGet { project_id } => {
+            resource(&project_id)?;
+            let value: ProviderEgressPolicy = authenticated_server(profile)?
+                .get(&format!("projects/{project_id}/provider-egress-policy"))?;
+            print_json(&value)
+        }
+        ProviderCommand::EgressSet {
+            project_id,
+            mode,
+            exact_origin,
+            expected_revision,
+        } => {
+            resource(&project_id)?;
+            let value: ProviderEgressPolicy = authenticated_server(profile)?.send(
+                Method::PUT,
+                &format!("projects/{project_id}/provider-egress-policy"),
+                &UpdateProviderEgressPolicyRequest {
+                    mode: mode.into(),
+                    exact_origins: exact_origin,
+                    expected_revision,
+                },
+                None,
+            )?;
+            print_json(&value)
+        }
+        ProviderCommand::Preflight { project_id, issuer } => {
+            resource(&project_id)?;
+            let value: OidcPreflightResult = authenticated_server(profile)?.send(
+                Method::POST,
+                &format!("projects/{project_id}/providers/oidc/preflight"),
+                &OidcPreflightRequest { issuer },
+                None,
+            )?;
+            print_json(&value)
+        }
         ProviderCommand::List { project_id } => {
             resource(&project_id)?;
             let value: ProviderList =
@@ -947,9 +1170,13 @@ pub(crate) fn run_provider(profile: Option<&str>, args: ProviderArgs) -> Result<
         } => {
             resource(&project_id)?;
             idem(&idempotency_key)?;
+            let kind: ProviderKind = kind.into();
+            if matches!(kind, ProviderKind::Oidc) != issuer.is_some() {
+                return Err(RemoteError::InvalidProviderVariant);
+            }
             let client = authenticated_server(profile)?;
             let mut request = CreateProviderRequest {
-                kind: Some(kind.into()),
+                kind,
                 provider_key,
                 display_name,
                 issuer,
@@ -1759,6 +1986,7 @@ mod tests {
             format!("projects/{PROJECT}/applications"),
             format!("projects/{PROJECT}/applications/{APPLICATION}"),
             format!("projects/{PROJECT}/providers"),
+            format!("projects/{PROJECT}/provider-egress-policy"),
             format!("projects/{PROJECT}/signing-keys"),
             format!("projects/{PROJECT}/projection-policy"),
             format!("projects/{PROJECT}/applications/{APPLICATION}/projection-policy"),
@@ -1780,6 +2008,15 @@ mod tests {
         assert_get::<ProviderList>(
             &format!("projects/{PROJECT}/providers"),
             json!({"items":[]}),
+        );
+        assert_get::<ProviderEgressPolicy>(
+            &format!("projects/{PROJECT}/provider-egress-policy"),
+            json!({
+                "project_id": PROJECT,
+                "mode": "allow_all",
+                "exact_origins": [],
+                "revision": 1
+            }),
         );
         assert_get::<SigningKeyList>(
             &format!("projects/{PROJECT}/signing-keys"),
@@ -1805,6 +2042,39 @@ mod tests {
         assert_get::<ProjectUserSessions>(
             &format!("projects/{PROJECT}/users/{USER}/sessions"),
             json!({"application_sessions":[],"browser_sessions":[]}),
+        );
+        assert_get::<ProjectClientKeyList>(
+            &format!("projects/{PROJECT}/client-keys"),
+            json!({"items":[],"active_unacknowledged_key":null}),
+        );
+        assert_send(
+            Method::POST,
+            &format!("projects/{PROJECT}/client-keys"),
+            &CreateProjectClientKeyRequest {
+                label: "customer-backend".to_owned(),
+            },
+            Some("client_key_create_1"),
+            json!({"label":"customer-backend"}),
+        );
+        assert_send(
+            Method::POST,
+            &format!("projects/{PROJECT}/client-keys/{KEY}/acknowledge"),
+            &AcknowledgeProjectClientKeyDeliveryRequest {
+                expected_revision: 1,
+                confirm_stored: true,
+            },
+            Some("client_key_acknowledge_1"),
+            json!({"expected_revision":1,"confirm_stored":true}),
+        );
+        assert_send(
+            Method::POST,
+            &format!("projects/{PROJECT}/client-keys/{KEY}/revoke"),
+            &RevokeProjectClientKeyRequest {
+                expected_revision: 2,
+                confirm: true,
+            },
+            Some("client_key_revoke_1"),
+            json!({"expected_revision":2,"confirm":true}),
         );
 
         let project = CreateProjectRequest {
@@ -1859,11 +2129,36 @@ mod tests {
             json!({"expected_security_revision":4}),
         );
 
+        assert_send(
+            Method::PUT,
+            &format!("projects/{PROJECT}/provider-egress-policy"),
+            &UpdateProviderEgressPolicyRequest {
+                mode: ProviderEgressMode::ExactOrigins,
+                exact_origins: vec!["https://identity.example".to_owned()],
+                expected_revision: 1,
+            },
+            None,
+            json!({
+                "mode":"exact_origins",
+                "exact_origins":["https://identity.example"],
+                "expected_revision":1
+            }),
+        );
+        assert_send(
+            Method::POST,
+            &format!("projects/{PROJECT}/providers/oidc/preflight"),
+            &OidcPreflightRequest {
+                issuer: "https://identity.example".to_owned(),
+            },
+            None,
+            json!({"issuer":"https://identity.example"}),
+        );
+
         let provider = CreateProviderRequest {
-            kind: Some(ProviderKind::Google),
+            kind: ProviderKind::Google,
             provider_key: "google".to_owned(),
             display_name: "Google".to_owned(),
-            issuer: "https://accounts.google.com".to_owned(),
+            issuer: None,
             client_id: "client".to_owned(),
             client_secret: "write-only-test-secret".to_owned(),
             managed_profile_enabled: true,
@@ -1878,11 +2173,37 @@ mod tests {
                 "kind":"google",
                 "provider_key":"google",
                 "display_name":"Google",
-                "issuer":"https://accounts.google.com",
+                "issuer":null,
                 "client_id":"client",
                 "client_secret":"write-only-test-secret",
                 "managed_profile_enabled":true,
                 "expected_project_revision":5
+            }),
+        );
+        let custom_oidc = CreateProviderRequest {
+            kind: ProviderKind::Oidc,
+            provider_key: "workforce".to_owned(),
+            display_name: "Workforce".to_owned(),
+            issuer: Some("https://identity.example".to_owned()),
+            client_id: "client".to_owned(),
+            client_secret: "write-only-test-secret".to_owned(),
+            managed_profile_enabled: false,
+            expected_project_revision: 6,
+        };
+        assert_send(
+            Method::POST,
+            &format!("projects/{PROJECT}/providers"),
+            &custom_oidc,
+            Some("provider_create_2"),
+            json!({
+                "kind":"oidc",
+                "provider_key":"workforce",
+                "display_name":"Workforce",
+                "issuer":"https://identity.example",
+                "client_id":"client",
+                "client_secret":"write-only-test-secret",
+                "managed_profile_enabled":false,
+                "expected_project_revision":6
             }),
         );
         let assignment = ProviderAssignmentRequest {

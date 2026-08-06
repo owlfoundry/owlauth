@@ -1,9 +1,12 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+#[cfg(test)]
 use zeroize::Zeroizing;
 
-use crate::application::{ApplicationError, Clock, EntropySource, RequestDigester};
+#[cfg(test)]
+use crate::application::EntropySource;
+use crate::application::{ApplicationError, Clock, RequestDigester};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SystemClock;
@@ -14,9 +17,11 @@ impl Clock for SystemClock {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SystemEntropy;
 
+#[cfg(test)]
 impl EntropySource for SystemEntropy {
     fn signing_seed(&self) -> Result<Zeroizing<[u8; 32]>, ApplicationError> {
         let mut seed = Zeroizing::new([0_u8; 32]);

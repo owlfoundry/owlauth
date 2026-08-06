@@ -41,7 +41,7 @@ use crate::{
         DisableProjectUser, ExpectedIdentity, ExpectedUser, FailManagedReauthorization,
         FailProviderExchange, IdentityMutationBindingsDisposition, IdentityMutationCreateOperation,
         IdentityMutationPrimarySourceDisposition, IdentityMutationProofAuthoritySelection,
-        IdentityMutationProviderCapability, IdentityMutationSessionsDisposition,
+        IdentityMutationProviderCapabilities, IdentityMutationSessionsDisposition,
         LoginRevisionSnapshot, LogoutApplicationSession, ManagedAdapterCapabilitySnapshot,
         ManagedConnectionRepository, ManagedCredentialCapability, ManagedCredentialContext,
         ManagedCredentialProtector, ManagedInteractionCleanupService,
@@ -709,6 +709,7 @@ async fn prepare_provider_login(
                 display_name: "OIDC".to_owned(),
                 issuer: "https://issuer.example".to_owned(),
                 provider_revision: 1,
+                provider_egress_policy_revision: Some(1),
                 assignment_security_revision: 1,
             }],
             admitted_email: None,
@@ -885,6 +886,192 @@ async fn provider_callback_unreadable_nonce_or_pkce_is_non_mutating_in_postgres(
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
+    reason = "one real PostgreSQL journey proves the complete Google managed credential lifecycle"
+)]
+async fn google_managed_workers_use_named_authority_without_project_egress_snapshot() {
+    let Some((_container, url)) = start_postgres().await else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&url)
+        .await
+        .expect("Google managed-worker PostgreSQL pool");
+    MIGRATOR.run(&pool).await.expect("session migrations");
+    let now = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("whole-second test time");
+    let seeded = seed_authority(&pool, now, "googlemanaged").await;
+    let mut provider_setup = pool
+        .begin()
+        .await
+        .expect("begin Google provider fixture setup");
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *provider_setup)
+        .await
+        .expect("disable compatibility trigger for preselected Google fixture");
+    sqlx::query(
+        "UPDATE provider_configurations
+            SET adapter_kind='google',issuer=$1,managed_profile_enabled=TRUE,
+                onboarding_policy_revision=NULL
+          WHERE project_id=$2 AND id=$3",
+    )
+    .bind(crate::domain::GOOGLE_ISSUER)
+    .bind(seeded.project_id)
+    .bind(seeded.provider_id)
+    .execute(&mut *provider_setup)
+    .await
+    .expect("select Google named-provider authority");
+    provider_setup
+        .commit()
+        .await
+        .expect("commit Google provider fixture setup");
+    let protector = SoftwareRuntimeProtector::new(
+        "google-managed-test".to_owned(),
+        1,
+        RuntimeKeyMaterial::new([71; 32], [72; 32]),
+        BTreeMap::new(),
+    )
+    .expect("Google managed credential protector");
+    let fixture = insert_managed_fixture(&pool, &seeded, &protector, now, 71).await;
+    sqlx::query(
+        "UPDATE managed_provider_connections
+            SET adapter_key='google_oidc_profile_v1',required_scopes=ARRAY['openid','profile']
+          WHERE project_id=$1 AND id=$2",
+    )
+    .bind(seeded.project_id)
+    .bind(fixture.connection_id)
+    .execute(&pool)
+    .await
+    .expect("snapshot Google managed capability");
+    sqlx::query("DELETE FROM project_provider_egress_policies WHERE project_id=$1")
+        .bind(seeded.project_id)
+        .execute(&pool)
+        .await
+        .expect("named Google worker must not require Custom OIDC policy inventory");
+    let database = Database::connect(&url)
+        .await
+        .expect("Google managed-worker SeaORM pool");
+    let repository = PostgresManagedConnectionRepository::new(database.clone());
+
+    let read = repository
+        .claim_next_read(Uuid::new_v4(), now, now + Duration::seconds(30))
+        .await
+        .expect("claim Google profile read")
+        .expect("Google profile read should be due");
+    assert_eq!(
+        read.guard.provider_kind,
+        crate::domain::ProviderKind::Google
+    );
+    assert!(read.guard.provider_egress_policy_revision.is_none());
+    assert!(read.guard.egress_policy.is_none());
+    assert!(
+        repository
+            .finish_read_failure(
+                &read,
+                "test_release",
+                now + Duration::hours(1),
+                now + Duration::seconds(1),
+            )
+            .await
+            .expect("release Google profile claim")
+    );
+
+    sqlx::query("UPDATE managed_provider_connections SET next_renewal_at=$1 WHERE id=$2")
+        .bind(now)
+        .bind(fixture.connection_id)
+        .execute(&pool)
+        .await
+        .expect("make Google renewal due");
+    let renewal = repository
+        .prepare_next_renewal(
+            Uuid::new_v4(),
+            now + Duration::seconds(2),
+            now + Duration::seconds(32),
+            true,
+        )
+        .await
+        .expect("prepare Google renewal")
+        .expect("Google renewal should be due");
+    assert_eq!(
+        renewal.claim.guard.provider_kind,
+        crate::domain::ProviderKind::Google
+    );
+    assert!(
+        renewal
+            .claim
+            .guard
+            .provider_egress_policy_revision
+            .is_none()
+    );
+    assert!(
+        repository
+            .mark_renewal_submitted(&renewal, now + Duration::seconds(3))
+            .await
+            .expect("mark Google renewal submitted")
+    );
+    let successor_context = ManagedCredentialContext {
+        project_id: seeded.project_id,
+        provider_configuration_id: seeded.provider_id,
+        linked_identity_id: renewal.claim.guard.linked_identity_id,
+        connection_id: fixture.connection_id,
+        connection_generation: renewal.claim.guard.connection_generation + 1,
+        credential_generation: renewal.claim.guard.credential_generation + 1,
+    };
+    let successor = protector
+        .protect_credential(&successor_context, b"google-renewal-successor")
+        .expect("protect Google successor");
+    let successor = repository
+        .commit_renewal_successor(&renewal, successor, now + Duration::seconds(4))
+        .await
+        .expect("commit Google successor")
+        .expect("Google successor should win");
+    assert!(
+        repository
+            .finish_successor_without_profile(&successor, now + Duration::seconds(5))
+            .await
+            .expect("finish Google successor")
+    );
+
+    repository
+        .request_revocation(
+            seeded.project_id,
+            fixture.user_id,
+            fixture.connection_id,
+            successor.connection_revision,
+            successor.connection_generation,
+            Uuid::new_v4(),
+            now + Duration::seconds(6),
+        )
+        .await
+        .expect("request Google revocation");
+    let revocation = repository
+        .claim_next_revocation(
+            Uuid::new_v4(),
+            now + Duration::seconds(7),
+            now + Duration::seconds(37),
+        )
+        .await
+        .expect("claim Google revocation")
+        .expect("Google revocation should be due");
+    assert_eq!(
+        revocation.guard.provider_kind,
+        crate::domain::ProviderKind::Google
+    );
+    assert!(revocation.guard.provider_egress_policy_revision.is_none());
+    assert!(
+        repository
+            .release_revocation_claim(&revocation, now + Duration::seconds(8))
+            .await
+            .expect("release Google revocation claim")
+    );
+    database.close().await.expect("close Google SeaORM pool");
+    pool.close().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
     reason = "the integration test proves one complete identity-to-logout authority journey"
 )]
 async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
@@ -950,6 +1137,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
                 display_name: "OIDC".to_owned(),
                 issuer: "https://issuer.example".to_owned(),
                 provider_revision: 1,
+                provider_egress_policy_revision: Some(1),
                 assignment_security_revision: 1,
             }],
             admitted_email: None,
@@ -1193,6 +1381,55 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         panic!("first managed reauthorization create must own the result")
     };
     assert_eq!(created.linked_identity_id, linked_identity_id);
+    assert_eq!(created.provider_display_name, "OIDC");
+    let rewrite_provider_display = sqlx::query(
+        "UPDATE managed_provider_reauthorization_interactions
+            SET provider_display_name='different provider'
+          WHERE id=$1",
+    )
+    .bind(interaction_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        rewrite_provider_display.is_err(),
+        "managed reauthorization freezes its insertion-time provider display"
+    );
+    let rewrite_provider_kind = sqlx::query(
+        "UPDATE managed_provider_reauthorization_interactions
+            SET provider_kind='google'
+          WHERE id=$1",
+    )
+    .bind(interaction_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        rewrite_provider_kind.is_err(),
+        "managed reauthorization freezes its insertion-time provider kind"
+    );
+    let rewrite_provider_egress = sqlx::query(
+        "UPDATE managed_provider_reauthorization_interactions
+            SET provider_egress_policy_revision=provider_egress_policy_revision+1
+          WHERE id=$1",
+    )
+    .bind(interaction_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        rewrite_provider_egress.is_err(),
+        "managed reauthorization freezes its insertion-time provider egress authority"
+    );
+    let rewrite_provider_secret = sqlx::query(
+        "UPDATE managed_provider_reauthorization_interactions
+            SET secret_material_id=NULL,secret_ref='different/provider/secret'
+          WHERE id=$1",
+    )
+    .bind(interaction_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        rewrite_provider_secret.is_err(),
+        "managed reauthorization freezes its insertion-time provider secret authority"
+    );
     assert_eq!(created.adapter_key, "controlled_oidc_profile_v1");
     assert_eq!(created.adapter_capability_revision, 1);
     assert_eq!(
@@ -1616,6 +1853,56 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         submitted.operation_state,
         crate::application::RenewalOperationState::Submitted
     );
+    sqlx::query("UPDATE managed_provider_renewal_operations SET lease_expires_at=$1 WHERE id=$2")
+        .bind(now + Duration::seconds(4))
+        .bind(prepared.operation_id)
+        .execute(&pool)
+        .await
+        .expect("expire submitted operation lease before policy drift recovery");
+    sqlx::query(
+        "UPDATE managed_provider_connections SET lease_expires_at=$1 WHERE project_id=$2 AND id=$3",
+    )
+    .bind(now + Duration::seconds(4))
+    .bind(seeded.project_id)
+    .bind(managed_connection.0)
+    .execute(&pool)
+    .await
+    .expect("expire submitted connection lease before policy drift recovery");
+    sqlx::query(
+        "UPDATE project_provider_egress_policies SET revision=revision+1 WHERE project_id=$1",
+    )
+    .bind(seeded.project_id)
+    .execute(&pool)
+    .await
+    .expect("advance Custom OIDC egress authority after dispatch");
+    let stale_submitted = managed_repository
+        .prepare_next_renewal(
+            Uuid::new_v4(),
+            now + Duration::seconds(5),
+            now + Duration::seconds(35),
+            true,
+        )
+        .await
+        .expect("stale submitted renewal must remain recoverable for terminalization")
+        .expect("stale submitted operation remains durable");
+    assert_eq!(stale_submitted.operation_id, prepared.operation_id);
+    assert_eq!(
+        stale_submitted.operation_state,
+        crate::application::RenewalOperationState::Submitted
+    );
+    assert!(!stale_submitted.authority_valid);
+    assert!(stale_submitted.claim.guard.egress_policy.is_none());
+    assert_eq!(
+        stale_submitted.claim.guard.provider_egress_policy_revision,
+        Some(1)
+    );
+    sqlx::query(
+        "UPDATE project_provider_egress_policies SET revision=revision-1 WHERE project_id=$1",
+    )
+    .bind(seeded.project_id)
+    .execute(&pool)
+    .await
+    .expect("restore shared fixture egress authority");
     sqlx::query("DELETE FROM managed_provider_renewal_operations WHERE id = $1")
         .bind(prepared.operation_id)
         .execute(&pool)
@@ -2714,6 +3001,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
                 display_name: "OIDC".to_owned(),
                 issuer: "https://issuer.example".to_owned(),
                 provider_revision: 1,
+                provider_egress_policy_revision: Some(1),
                 assignment_security_revision: 1,
             }],
             admitted_email: None,
@@ -3345,6 +3633,7 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
                     display_name: "OIDC".to_owned(),
                     issuer: "https://issuer.example".to_owned(),
                     provider_revision: 1,
+                    provider_egress_policy_revision: Some(1),
                     assignment_security_revision: 1,
                 }],
                 admitted_email: None,
@@ -7485,7 +7774,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            INSERT INTO managed_provider_reauthorization_interactions
              (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
               provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
-              application_id,expected_connection_generation,expected_credential_generation,
+              secret_material_id,provider_egress_policy_revision,application_id,
+              expected_connection_generation,expected_credential_generation,
               expected_connection_revision,project_security_revision,user_security_revision,
               identity_revision,provider_revision,managed_profile_revision,application_revision,
               assignment_security_revision,callback_url,adapter_key,adapter_capability_revision,
@@ -7495,7 +7785,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
                   source.project_id,source.project_public_id,source.connection_id,
                   source.linked_identity_id,source.user_id,source.provider_configuration_id,
                   source.provider_key,source.issuer,source.provider_kind,source.subject,
-                  source.client_id,source.secret_ref,source.application_id,
+                  source.client_id,source.secret_ref,source.secret_material_id,
+                  source.provider_egress_policy_revision,source.application_id,
                   source.expected_connection_generation,
                   source.expected_credential_generation,source.expected_connection_revision,
                   source.project_security_revision,source.user_security_revision,
@@ -7568,7 +7859,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
            INSERT INTO managed_provider_reauthorization_interactions
              (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
               provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
-              application_id,expected_connection_generation,expected_credential_generation,
+              secret_material_id,provider_egress_policy_revision,application_id,
+              expected_connection_generation,expected_credential_generation,
               expected_connection_revision,project_security_revision,user_security_revision,
               identity_revision,provider_revision,managed_profile_revision,application_revision,
               assignment_security_revision,callback_url,adapter_key,adapter_capability_revision,
@@ -7579,7 +7871,8 @@ async fn managed_worker_queues_are_fair_durable_and_destructive_in_postgres() {
                   source.project_id,source.project_public_id,source.connection_id,
                   source.linked_identity_id,source.user_id,source.provider_configuration_id,
                   source.provider_key,source.issuer,source.provider_kind,source.subject,
-                  source.client_id,source.secret_ref,source.application_id,
+                  source.client_id,source.secret_ref,source.secret_material_id,
+                  source.provider_egress_policy_revision,source.application_id,
                   source.expected_connection_generation,
                   source.expected_credential_generation,source.expected_connection_revision,
                   source.project_security_revision,source.user_security_revision,
@@ -7850,7 +8143,7 @@ fn prepared_merge_for_lock_test(
             idempotency_key: idempotency_key.to_owned(),
             correlation_id: Uuid::new_v4(),
         },
-        provider_capability: IdentityMutationProviderCapability::controlled_oidc(),
+        provider_capabilities: IdentityMutationProviderCapabilities::reviewed(),
         runtime_base: "https://runtime.example/".to_owned(),
         intent_id,
         hosted_handle_digest: digest(handle_seed),

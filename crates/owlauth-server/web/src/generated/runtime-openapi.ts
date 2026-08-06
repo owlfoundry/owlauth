@@ -593,6 +593,7 @@ export interface components {
         HostedProvider: {
             display_name: string;
             key: string;
+            kind: components["schemas"]["ProviderKind"];
         };
         /** @enum {string} */
         IdentityKind: "provider" | "email";

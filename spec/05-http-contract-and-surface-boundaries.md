@@ -1,4 +1,4 @@
-# 05 — Runtime and Control HTTP contracts
+# 05 — Runtime, Client, and Control HTTP contracts
 
 ## Contract authority
 
@@ -7,10 +7,11 @@ Reviewed Rust definitions in `crates/owlauth-types` are the source of stable HTT
 The package separates contracts by surface:
 
 - `runtime` contains Project Auth, session, current-user, and public key/configuration DTOs;
+- `client` contains Project-key-authenticated customer-backend user/projection/introspection DTOs;
 - `control` contains administrative DTOs and problem details;
 - `health` contains minimal listener-specific health vocabulary.
 
-Runtime and Control operations are never combined merely because one process serves both listeners. Generated OpenAPI is a derived view and cannot grant an operation exposure or authorization.
+Runtime, Client, and Control operations are never combined merely because one process serves all listeners. Generated OpenAPI is a derived view and cannot grant an operation exposure or authorization.
 
 ## Listener and router isolation
 
@@ -23,26 +24,33 @@ flowchart TB
         RC[Public Project config and JWKS]
     end
 
+    subgraph ClientListener[Client listener: client.auth.example.com]
+        BM[Project client-key authentication]
+        BR[Read-only Project user and introspection router]
+    end
+
     subgraph ControlListener[Control listener: admin.auth.example.com or private bind]
         WC[Embedded Web Console]
         CM[Deployment operator API-key authentication]
         CR[Control API router]
-        CO[Control OpenAPI]
     end
 
     HU --> RM
     RM --> RR
     RM --> RC
+    BM --> BR
     WC --> CM
     CM --> CR
-    CM --> CO
     RR --> APP[Shared application services]
+    BR --> APP
     CR --> APP
 ```
 
-Listeners have distinct bind addresses, trusted-proxy settings, TLS policy, routers, middleware, authentication, CORS, rate limits, request bounds, connection budgets, metrics dimensions, and readiness. Routing by `Host` on one untrusted socket is not equivalent. Distinct Runtime and Control external origins are recommended to isolate the browser-held operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root base paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary as defined by spec 09. Internal listener isolation remains unchanged.
+OpenAPI documents are build/release artifacts from `owlauth-types`, not routes on any listener. Each server release attaches exact-version Runtime, Client, and Control JSON documents generated from the same qualified source.
 
-In `--plane=all`, a request accepted by one listener cannot dispatch to the other plane's router through path, host, forwarding header, content type, or method manipulation.
+The three listeners have distinct bind addresses, trusted-proxy settings, TLS policy, routers, middleware, authentication, CORS, rate limits, request bounds, connection budgets, metrics dimensions, and readiness. Routing by `Host` on one untrusted socket is not equivalent. Distinct Runtime and Control external origins are recommended to isolate the browser-held operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root base paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary as defined by spec 09. Internal listener isolation remains unchanged.
+
+In `--plane=all`, a request accepted by one listener cannot dispatch to either other surface's router through path, host, forwarding header, content type, or method manipulation.
 
 ## Management Console surface
 
@@ -60,7 +68,7 @@ For `identity_mutation`, the UI renders only the intent's server-derived roles a
 
 For `managed_reauthorization`, the UI renders one fixed provider action for the exact frozen existing user/identity/connection and captured active Application assignment. Its callback requires the adapter's exact managed scopes and may only generation-fence and replace that connection's encrypted renewable credential, restore `active`, complete the interaction, and audit. Only after that successor transaction commits may an optional bounded profile result be obtained and committed through the separate current-generation profile-sync transaction with its user/projection/event guards. It creates no user, identity, browser/Application session, handoff, receipt, or ownership mutation. Hosted UI assets and pages never expose the Control endpoint/key, receipt capability, or mount Control routes.
 
-The complete two-surface route partition, distinct/shared external URL models, key/browser storage behavior, CSP, caching, redirect safety, and packaging requirements are owned by [spec 09](09-hosted-web-surfaces-and-control-auth.md).
+The Runtime/Control browser route partition, distinct/shared external URL models, key/browser storage behavior, CSP, caching, redirect safety, and packaging requirements are owned by [spec 09](09-hosted-web-surfaces-and-control-auth.md). The JSON-only Client surface and Project client-key boundary are owned by [spec 13](13-client-api-and-project-client-keys.md).
 
 ## Runtime Project Auth surface
 
@@ -108,7 +116,7 @@ Public configuration may include:
 - safe Runtime URLs and SDK feature flags;
 - allowed authentication methods that contain no secret; the server still snapshots and revalidates assignment when starting/selecting a method.
 
-It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal IDs, KMS references, Redis/PostgreSQL topology, or policy internals. Runtime authentication middleware does not recognize `OWLAUTH_CONTROL_API_KEY`; presenting that value to any Runtime route never grants access.
+It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal/protected-material IDs, key-provider handles/envelopes, Redis/PostgreSQL topology, or policy internals. Runtime authentication middleware recognizes neither `OWLAUTH_CONTROL_API_KEY` nor Project client keys; presenting either value to a Runtime route never grants access.
 
 ### Runtime parsing and errors
 
@@ -131,6 +139,12 @@ CORS is deny-by-default and Application-specific. Runtime compares the exact req
 
 Publishable keys and public IDs can identify rate/quotas but do not authorize user data. Current-user and refresh responses require actual session credentials.
 
+## Customer-backend Client surface
+
+Client resources are rooted at `/v1/projects/{project_public_id}/` on the independent Client listener. They require exactly one active Project client key whose authoritative Project matches the route. V1 exposes only bounded user listing/exact lookup, materialized Application projection lookup, and Project access-token introspection. It has no browser CORS, cookies, HTML, redirect, Control mutation, or Runtime login/session endpoint.
+
+Client uses an independent `project_client_key` bearer security scheme and complete OpenAPI document. Authentication denial, generous configurable abuse limits, PostgreSQL-authoritative permission and read checks, response minimization, and exact routes are defined by spec 13. V1 does not cache Client directory/email/projection/introspection responses. OwlAuth publishes no Client API SDK; existing language SDK surface normalization must prove that no Client operation or security scheme enters their Runtime contract.
+
 ## Control service discovery
 
 The Control listener exposes credential-free origin-root `GET /.well-known/owlauth` for CLI endpoint discovery before any key is released. The CLI profile stores the administrative service origin; the descriptor returns the canonical Control base path. In a shared Runtime/Control origin, the trusted reverse proxy reserves this exact root route for Control discovery while all other plane routes remain under their disjoint bases; no catch-all or redirect is allowed. It returns the shared versioned descriptor shape owned by root spec 07 with product `owlauth-server`, stable non-secret deployment instance ID, canonical external Control API base, supported public Control API versions, credential class `operator-api-key`, and the canonical remote MCP URL only when MCP is enabled. This root spec owns those self-hosted values and route behavior; it does not redefine the common CLI profile schema.
@@ -143,12 +157,14 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 
 | Resource family                                           | Representative operations                                                                                                                                                                                                                                                                                                                                                          |
 | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/projects`                                               | create/read/update/disable; read/write/filter exact `belongs_to`                                                                                                                                                                                                                                                                                                                   |
+| `/projects`                                               | create/read/update/disable; read/write/filter exact `belongs_to`; list/create/revoke Project client keys with one-time create reveal                                                                                                                                                                                                                                               |
 | `/projects/{project}/applications`                        | register/disable app; origins, redirects, publishable keys                                                                                                                                                                                                                                                                                                                         |
-| `/projects/{project}/providers`                           | configure/disable provider client registrations, resource-keyed reconcile of interrupted secret provisioning with write-only secret re-entry, assign Applications, rotate secret reference and managed-sync policy                                                                                                                                                                 |
+| `/projects/{project}/providers`                           | configure/disable provider client registrations, preflight custom OIDC, resource-keyed reconcile of interrupted secret provisioning with write-only secret re-entry, and assign Applications                                                                                                                                                                                       |
+| `/projects/{project}/provider-egress-policy`              | read or revision-CAS the Project's custom-provider origin policy; default allow-all mode or recommended exact-origin mode                                                                                                                                                                                                                                                          |
 | `/projects/{project}/users`                               | query/disable users; inspect revision/source provenance, exact primary source, identities, bindings, and managed-connection metadata; inspect/sync/revoke/disconnect connections; idempotently create/read/cancel exact managed-reauthorization interactions, returning the opaque Hosted target only from create or identical create-result replay through expiry                 |
 | `/projects/{project}/identity-mutation-intents`           | idempotently create a short-lived revisioned explicit link/unlink/merge intent whose mandatory proof roles are server-derived and receive its opaque Hosted target; read only bounded intent/slot status; cancel, or confirm an explicitly Hosted-confirmed `ready` intent by ID/expected revision so receipts, mutation, candidate cleanup, completion, and audit commit together |
-| `/projects/{project}/email-auth`                          | configure assigned OTP/magic-link policy, sign-up/linking bounds, Project SMTP generations, and explicit deployment-default opt-in; test, activate, disable/mark-compromised, and inspect safe Project delivery eligibility                                                                                                                                                        |
+| `/projects/{project}/email-method`                        | read and configure OTP/magic-link policy and sign-up/linking bounds; list the bounded sparse Application assignment state and revision history, while assignment writes remain CAS-fenced by the owning Application security revision                                                                                                                                              |
+| `/projects/{project}/smtp-configurations`                 | create write-only Project SMTP generations with explicit deployment-default opt-in; test, activate, disable/mark-compromised, and inspect safe Project delivery eligibility                                                                                                                                                                                                        |
 | `/system/smtp-default-generations`                        | reconcile the process-configured deployment-default generation/fingerprint and activate/disable/mark-compromised its deployment-scoped eligibility metadata                                                                                                                                                                                                                        |
 | `/projects/{project}/applications/{application}/webhooks` | configure exact endpoints/event filters, rotate write-only secret, inspect safe health/deliveries, and replay immutable events                                                                                                                                                                                                                                                     |
 | `/projects/{project}/sessions`                            | list and revoke Project/Application sessions                                                                                                                                                                                                                                                                                                                                       |
@@ -159,6 +175,64 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 | Control health                                            | safe probe response under the configured probe policy                                                                                                                                                                                                                                                                                                                              |
 
 The webhook resource returns only safe endpoint/secret-version/delivery metadata. Secret input is write-only, and replay names an existing immutable event plus its existing endpoint; Control has no arbitrary event-send route. Webhook payload/signature headers are an Application integration contract but endpoint configuration/replay remain Control operations. The exact `v1` HMAC grammar and duplicate/out-of-order receiver fixtures are generated and versioned with public contracts.
+
+### Provider onboarding contract
+
+Provider creation names one required closed adapter kind: `oidc`, `google`, or `github`. A custom
+OIDC registration is `kind = oidc`; there is no `custom` kind, executable adapter name, module,
+script, or issuer-selected fallback. The request always supplies the Project-owned provider key,
+bounded display name, client ID, write-only client secret, managed-profile decision, and current
+Project metadata revision. Its issuer field is variant-specific:
+
+- `oidc` requires one canonical issuer and rejects the reserved Google and GitHub issuer roots;
+- `google` omits issuer and every endpoint/scope/authorization override; the server derives the
+  exact `https://accounts.google.com` profile;
+- `github` likewise omits issuer and low-level overrides; the server derives the exact reviewed
+  GitHub profile, which remains login-only.
+
+Named-adapter input that supplies an issuer, endpoint, scope, consent parameter, capability, or
+other low-level override is rejected rather than ignored. Provider reads return the canonical
+server-derived issuer, closed kind, safe capabilities, fixed scopes, and bounded presentation
+metadata, but never secret presence, references, discovery documents, upstream tokens, or vendor
+payloads.
+
+Every Project owns one revisioned custom-provider egress policy. `GET/PUT /v1/projects/{project_id}/provider-egress-policy` reads or compare-and-swaps it. The default
+`allow_all` mode stores no origin list and admits any canonical HTTPS issuer and discovered endpoint
+origin, including operator-managed private-network destinations. The recommended `exact_origins`
+mode contains 1–1024 unique canonical origins; discovery and every endpoint must match one. An update
+supplies the observed policy revision, commits a safe audit event, and takes effect for preflight,
+create, public method availability, login, proof, managed synchronization, and reauthorization
+without rewriting provider rows. Runtime exposes none of this policy. Development IP-literal
+loopback HTTP additionally requires the process development opt-in and, in `exact_origins` mode, a
+matching Project origin.
+
+Authenticated Project-qualified `POST /v1/projects/{project_id}/providers/oidc/preflight` accepts only a proposed canonical custom OIDC
+issuer. It performs one bounded non-persistent discovery validation under the Project's current
+egress-policy revision and returns only a normalized safe summary: the canonical issuer, sorted
+admitted endpoint origins, observed policy revision/mode, fixed login scopes, whether OwlAuth's exact
+managed-profile profile is currently supported, and that profile's fixed scopes and capability
+flags. It never accepts a client secret, changes policy, persists provider state, returns endpoint
+paths, DNS answers, headers, raw metadata, response bodies, or vendor errors. A malformed or
+policy-denied issuer and locally rejected metadata/profile return
+`422 provider_preflight_rejected`; discovery transport failure, malformed remote metadata, or an
+unavailable provider return `503 provider_preflight_unavailable`. Invalid HTTP request shape remains
+an ordinary bounded input error. No diagnostic exposes remote detail.
+
+A successful preflight is advisory and carries no authorization token, digest, lease, or later
+commit authority. Custom OIDC create repeats canonicalization, discovery, capability, and current
+Project origin-policy validation before any PostgreSQL provider operation or configuration-secret
+write. A policy or metadata change between preflight and create therefore fails create without
+partial provisioning. Runtime does not pin or trust the create-time document: every authorization,
+exchange, managed-profile, and reauthorization dispatch reads the current Project policy and repeats
+strict discovery and endpoint-origin validation. Later metadata or policy drift can only make the
+affected method unavailable; it cannot silently widen scopes, algorithms, or capabilities, and an
+exact-origin policy cannot be bypassed. Reconciliation of an already prepared provider resumes only
+its frozen original request and secret fingerprint after current-policy revalidation; it is not a
+bypass.
+
+Preflight is rate/concurrency/deadline bounded independently from provider callback exchanges. Its
+audit/telemetry records only Project, operation, safe outcome class, correlation, and bounded
+latency—never issuer, endpoint, DNS, remote body, client registration, or secret material.
 
 A provisioning resource that remains pending after an ambiguous response or process restart is
 visible in its ordinary bounded list. Its Project-qualified resource ID addresses the existing
@@ -215,7 +289,7 @@ This contract supports external indexing but does not promise tenant isolation. 
 
 Control uses stable problem details containing safe code/type, status, correlation ID, optional bounded field violations, and revision/conflict metadata. Authentication and hidden-resource failures avoid Project enumeration.
 
-PostgreSQL, Redis, KMS, secret-store, and provider errors map to dependency classes without vendor detail. An authentication denial does not disclose the protected resource or its `belongs_to` value.
+PostgreSQL, Redis, key-provider, protected-material, and upstream-provider errors map to bounded dependency/integrity classes without vendor detail, material IDs, handles, envelopes, fingerprints, or plaintext. An authentication denial does not disclose the protected resource or its `belongs_to` value.
 
 ## Contract mapping
 

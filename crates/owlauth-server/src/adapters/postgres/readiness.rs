@@ -332,7 +332,7 @@ impl PostgresReadinessAdapter {
             providers: providers
                 .into_iter()
                 .map(|provider| {
-                    let kind = super::effective_provider_kind(
+                    let kind = super::provider_row::effective_provider_kind(
                         &provider.kind,
                         provider.adapter_kind.as_deref(),
                         &provider.issuer,

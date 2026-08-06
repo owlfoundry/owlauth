@@ -299,18 +299,22 @@ test("Block D public journey delivers immutable events and dispatches through Co
     await page.goto(`${controlBase}console/`);
     await page.getByLabel("Operator API key").fill(operatorKey);
     await page.getByRole("button", { name: "Unlock console" }).click();
-    await page.getByRole("button", { name: new RegExp(`Block D ${suffix}`, "u") }).click();
+    await page.getByRole("link", { name: new RegExp(`Block D ${suffix}`, "u") }).click();
+    await page.getByRole("link", { name: "Applications", exact: true }).click();
     await page
-      .getByRole("button", { name: new RegExp(`Block D Application ${suffix}`, "u") })
+      .getByRole("link", { name: new RegExp(`Block D Application ${suffix}`, "u") })
       .click();
-    await expect(page.getByRole("heading", { name: "Application user sync" })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: new RegExp(`Block D Application ${suffix}`, "u") }),
+    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Immutable user events" })).toBeVisible();
     await expect(
       page.locator("code").filter({ hasText: "user.projection.created" }).first(),
     ).toBeVisible();
     await expect(
       page.locator("code").filter({ hasText: "user.projection.updated" }).first(),
     ).toBeVisible();
-    await expect(page.getByText(/state delivered/u).first()).toBeVisible();
+    await expect(page.getByText(/Status: delivered/u).first()).toBeVisible();
     expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
     expect(page.url()).not.toContain(operatorKey);
   } finally {
@@ -328,13 +332,20 @@ test("Application sync Console is keyboard and accessibility safe", async ({
   await page.goto(`${controlBase}console/`);
   await page.getByLabel("Operator API key").fill(operatorKey);
   await page.getByRole("button", { name: "Unlock console" }).press("Enter");
-  await page.getByRole("button", { name: new RegExp(`Block D ${suffix}`, "u") }).press("Enter");
+  await page.getByRole("link", { name: new RegExp(`Block D ${suffix}`, "u") }).press("Enter");
+  await page.getByRole("link", { name: "Applications", exact: true }).press("Enter");
   await page
-    .getByRole("button", { name: new RegExp(`Block D Application ${suffix}`, "u") })
+    .getByRole("link", { name: new RegExp(`Block D Application ${suffix}`, "u") })
     .press("Enter");
-  await expect(page.getByRole("heading", { name: "Application user sync" })).toBeVisible();
-  await page.getByLabel("HTTPS URL").focus();
-  await expect(page.getByLabel("HTTPS URL")).toBeFocused();
+  await expect(
+    page.getByRole("heading", { name: new RegExp(`Block D Application ${suffix}`, "u") }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Create webhook endpoint" }).focus();
+  await page.getByRole("button", { name: "Create webhook endpoint" }).press("Enter");
+  const dialog = page.getByRole("dialog", { name: "Create webhook endpoint" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("HTTPS URL").focus();
+  await expect(dialog.getByLabel("HTTPS URL")).toBeFocused();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
   expect(authority.application.id).not.toBe("");
 });
@@ -406,6 +417,7 @@ async function provision(
       display_name: "Controlled Provider",
       expected_project_revision: project.metadata_revision,
       issuer: providerOrigin,
+      kind: "oidc",
       managed_profile_enabled: true,
       provider_key: "controlled-provider",
     },

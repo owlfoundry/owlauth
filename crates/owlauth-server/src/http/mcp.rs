@@ -1000,6 +1000,9 @@ fn application_error_result(error: ApplicationError) -> CallToolResult {
         ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
+        | ApplicationError::ClientVerifierUnavailable
+        | ApplicationError::ProviderPreflightRejected
+        | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
             "temporarily_unavailable",
             "The Control capability is temporarily unavailable.",

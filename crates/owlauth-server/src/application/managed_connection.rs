@@ -129,6 +129,8 @@ pub(crate) struct ConnectionGuard {
     pub credential_generation: i64,
     pub project_security_revision: i64,
     pub provider_revision: i64,
+    pub provider_egress_policy_revision: Option<i64>,
+    pub egress_policy: Option<crate::domain::ProviderEgressPolicy>,
     pub managed_profile_revision: i64,
     pub provider_kind: ProviderKind,
     pub adapter_key: String,

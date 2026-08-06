@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use url::{Host, Url};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const STORE_SCHEMA_VERSION: u32 = 1;
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
@@ -190,6 +190,8 @@ pub enum RemoteError {
     InvalidIdempotencyKey,
     #[error("history limit must be between 1 and 100")]
     InvalidHistoryLimit,
+    #[error("Custom OIDC requires --issuer; named provider presets forbid --issuer")]
+    InvalidProviderVariant,
     #[error("this operation requires explicit --yes confirmation")]
     OperationConfirmationRequired,
     #[error("profile storage is unavailable or invalid")]
@@ -639,7 +641,9 @@ fn decode_api_response<T: DeserializeOwned>(response: Response) -> Result<T, Rem
     {
         return Err(RemoteError::ApiResponseTooLarge);
     }
-    let mut bytes = Vec::new();
+    // Control responses can contain one-time credentials. Keep the raw response buffer under
+    // zeroizing ownership even though most decoded response models are secret-free.
+    let mut bytes = Zeroizing::new(Vec::new());
     response
         .take(MAX_API_RESPONSE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -647,7 +651,7 @@ fn decode_api_response<T: DeserializeOwned>(response: Response) -> Result<T, Rem
     if bytes.len() as u64 > MAX_API_RESPONSE_BYTES {
         return Err(RemoteError::ApiResponseTooLarge);
     }
-    if status_code == 200 {
+    if status.is_success() {
         return serde_json::from_slice(&bytes).map_err(|_| RemoteError::InvalidApiResponse);
     }
     let problem: owlauth_types::control::ProblemDetails =

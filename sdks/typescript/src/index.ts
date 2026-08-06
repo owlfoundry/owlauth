@@ -1,4 +1,4 @@
-export const VERSION = "0.0.1";
+export const VERSION = "0.0.0-dev";
 
 export { Client, type BeginLoginOptions, type ClientOptions, type CryptoProvider } from "./client.js";
 export {

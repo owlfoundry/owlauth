@@ -12,6 +12,8 @@ use crate::application::{
     PreparedManagedReauthorizationCreate, ProtectedValue, VersionedDigest,
 };
 
+use crate::domain::{ProviderEgressPolicy, ProviderKind};
+
 use super::{audit::append_runtime_audit, authentication::persistence};
 
 const CREATE_OPERATION_KIND: &str = "managed_reauthorization.create";
@@ -163,12 +165,17 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             .ok_or(ApplicationError::NotFound)?;
         let authority = transaction
             .query_one_raw(statement(
-                r"SELECT provider.id AS provider_id, provider.kind AS provider_legacy_kind, provider.adapter_kind AS provider_adapter_kind, provider.provider_key, provider.issuer,
-                          provider.client_id, provider.secret_ref, provider.callback_url,
+                r"SELECT provider.id AS provider_id, provider.kind AS provider_legacy_kind, provider.adapter_kind AS provider_adapter_kind, provider.provider_key, provider.display_name AS provider_display_name, provider.issuer,
+                          provider.client_id, provider.secret_ref, provider.secret_material_id,
+                          provider.callback_url,
                           provider.revision AS provider_revision,
                           provider.managed_profile_revision, application.revision AS application_revision,
-                          assignment.security_revision AS assignment_security_revision
+                          assignment.security_revision AS assignment_security_revision,
+                          CASE WHEN provider.adapter_kind='oidc' THEN egress.revision ELSE NULL END
+                            AS egress_policy_revision
                      FROM managed_provider_connections AS connection
+                     LEFT JOIN project_provider_egress_policies AS egress
+                       ON egress.project_id=connection.project_id
                      JOIN provider_configurations AS provider
                        ON provider.project_id=connection.project_id
                       AND provider.id=connection.provider_configuration_id
@@ -247,16 +254,19 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::RevisionConflict)?;
-        let provider_kind = super::effective_provider_kind(
+        let provider_kind = super::provider_row::effective_provider_kind(
             &get::<String>(&authority, "provider_legacy_kind")?,
             get::<Option<String>>(&authority, "provider_adapter_kind")?.as_deref(),
             &get::<String>(&authority, "issuer")?,
         )?;
-        if !provider_kind.capabilities().managed_profile
-            || !provider_kind.issuer_matches(&get::<String>(&authority, "issuer")?)
-        {
+        if !provider_kind.capabilities().managed_profile {
             return Err(ApplicationError::Integrity);
         }
+        let egress_policy_revision = if provider_kind == ProviderKind::Oidc {
+            Some(get::<i64>(&authority, "egress_policy_revision")?)
+        } else {
+            None
+        };
         if get::<Uuid>(&authority, "provider_id")?
             != get::<Uuid>(&connection, "provider_configuration_id")?
             || get::<Uuid>(&identity, "id")? != get::<Uuid>(&connection, "linked_identity_id")?
@@ -269,17 +279,18 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
                 r"INSERT INTO managed_provider_reauthorization_interactions
                   (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
                    provider_configuration_id,provider_key,issuer,subject,client_id,secret_ref,
-                   application_id,expected_connection_generation,expected_credential_generation,
+                   secret_material_id,application_id,expected_connection_generation,
+                   expected_credential_generation,
                    expected_connection_revision,project_security_revision,user_security_revision,
                    identity_revision,provider_revision,managed_profile_revision,application_revision,
                    assignment_security_revision,callback_url,adapter_key,adapter_capability_revision,
                    supports_revocation,required_scopes,provider_pkce_required,oidc_nonce_required,
                    interaction_digest,interaction_digest_key_version,revision,status,expires_at,created_at,
-                   provider_kind)
+                   provider_kind,provider_egress_policy_revision,provider_display_name)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-                         $19,$20,$21,$22,$23,$24,$25,$26,$27,
-                         ARRAY(SELECT jsonb_array_elements_text($28::jsonb)),$29,$30,$31,$32,1,
-                         'awaiting_browser_binding',$33,$34,$35)",
+                         $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,
+                         ARRAY(SELECT jsonb_array_elements_text($29::jsonb)),$30,$31,$32,$33,1,
+                         'awaiting_browser_binding',$34,$35,$36,$37,$38)",
                 vec![
                     prepared.interaction_id.into(),
                     prepared.command.project_id.into(),
@@ -292,9 +303,8 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
                     get::<String>(&authority, "issuer")?.into(),
                     get::<String>(&identity, "subject")?.into(),
                     get::<String>(&authority, "client_id")?.into(),
-                    get::<Option<String>>(&authority, "secret_ref")?
-                        .ok_or(ApplicationError::Integrity)?
-                        .into(),
+                    get::<Option<String>>(&authority, "secret_ref")?.into(),
+                    get::<Option<Uuid>>(&authority, "secret_material_id")?.into(),
                     prepared.command.application_id.into(),
                     prepared.command.expected_connection_generation.into(),
                     prepared.command.expected_credential_generation.into(),
@@ -318,6 +328,8 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
                     prepared.expires_at.into(),
                     prepared.now.into(),
                     provider_kind.as_str().into(),
+                    egress_policy_revision.into(),
+                    get::<String>(&authority, "provider_display_name")?.into(),
                 ],
             ))
             .await
@@ -1026,6 +1038,8 @@ impl ManagedReauthorizationRepository for PostgresManagedReauthorizationReposito
             credential_generation: claimed.expected_credential_generation + 1,
             project_security_revision: claimed.project_security_revision,
             provider_revision: claimed.provider_revision,
+            provider_egress_policy_revision: claimed.provider_egress_policy_revision,
+            egress_policy: claimed.egress_policy.clone(),
             managed_profile_revision: claimed.managed_profile_revision,
             provider_kind: claimed.provider_kind,
             adapter_key: claimed.adapter_key.clone(),
@@ -1139,6 +1153,20 @@ async fn lock_and_classify_current_authority<C: ConnectionTrait>(
         ],
     )
     .await?;
+    if record.provider_kind == ProviderKind::Oidc {
+        let expected_revision = record
+            .provider_egress_policy_revision
+            .ok_or(ApplicationError::Integrity)?;
+        current &= locked_validity(
+            connection,
+            r"SELECT (revision=$2) AS valid
+                 FROM project_provider_egress_policies WHERE project_id=$1 FOR SHARE",
+            vec![record.project_id.into(), expected_revision.into()],
+        )
+        .await?;
+    } else if record.provider_egress_policy_revision.is_some() {
+        return Err(ApplicationError::Integrity);
+    }
     current &= locked_validity(
         connection,
         r"SELECT (status='active' AND revision=$3 AND managed_profile_enabled
@@ -1309,9 +1337,10 @@ async fn read_record_by_id<C: ConnectionTrait>(
     let row = connection
         .query_one_raw(statement(
             r"SELECT id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
-                      provider_configuration_id,provider_key,
-                      COALESCE(provider_kind, CASE issuer WHEN 'https://accounts.google.com' THEN 'google' ELSE 'oidc' END) AS provider_kind,
-                      issuer,subject,client_id,secret_ref,
+                      provider_configuration_id,provider_key,provider_display_name,
+                      provider_kind,
+                      issuer,subject,client_id,
+                      COALESCE(secret_material_id::TEXT,secret_ref) AS secret_ref,
                       application_id,expected_connection_generation,expected_credential_generation,
                       expected_connection_revision,project_security_revision,user_security_revision,
                       identity_revision,provider_revision,managed_profile_revision,application_revision,
@@ -1320,8 +1349,14 @@ async fn read_record_by_id<C: ConnectionTrait>(
                       to_json(required_scopes) AS required_scopes,
                       provider_pkce_required,oidc_nonce_required,revision,status,csrf_key_version,
                       oidc_nonce_digest,oidc_nonce_key_version,provider_pkce_ciphertext,
-                      provider_pkce_key_version,expires_at
-                 FROM managed_provider_reauthorization_interactions WHERE id=$1",
+                      provider_pkce_key_version,expires_at,provider_egress_policy_revision,
+                      (SELECT mode FROM project_provider_egress_policies
+                        WHERE project_id=interaction.project_id) AS current_egress_mode,
+                      (SELECT exact_origins FROM project_provider_egress_policies
+                        WHERE project_id=interaction.project_id) AS current_egress_exact_origins,
+                      (SELECT revision FROM project_provider_egress_policies
+                        WHERE project_id=interaction.project_id) AS current_egress_policy_revision
+                 FROM managed_provider_reauthorization_interactions AS interaction WHERE id=$1",
             vec![interaction_id.into()],
         ))
         .await
@@ -1373,6 +1408,24 @@ fn record_from_row(
     if !provider_kind.capabilities().managed_profile || !provider_kind.issuer_matches(&issuer) {
         return Err(ApplicationError::Integrity);
     }
+    let status = ManagedReauthorizationStatus::parse(&get::<String>(row, "status")?)?;
+    let provider_egress_policy_revision =
+        get::<Option<i64>>(row, "provider_egress_policy_revision")?;
+    let egress_policy = if provider_kind == ProviderKind::Oidc {
+        match provider_egress_policy_revision {
+            Some(revision) if revision == get::<i64>(row, "current_egress_policy_revision")? => {
+                Some(provider_egress_policy_from_row(row)?)
+            }
+            Some(_) | None if status.terminal() => None,
+            Some(_) => None,
+            None => return Err(ApplicationError::Integrity),
+        }
+    } else {
+        if provider_egress_policy_revision.is_some() {
+            return Err(ApplicationError::Integrity);
+        }
+        None
+    };
     Ok(ManagedReauthorizationRecord {
         id: get(row, "id")?,
         project_id: get(row, "project_id")?,
@@ -1382,6 +1435,7 @@ fn record_from_row(
         user_id: get(row, "user_id")?,
         provider_configuration_id: get(row, "provider_configuration_id")?,
         provider_key: get(row, "provider_key")?,
+        provider_display_name: get(row, "provider_display_name")?,
         application_id: get(row, "application_id")?,
         expected_connection_generation: get(row, "expected_connection_generation")?,
         expected_credential_generation: get(row, "expected_credential_generation")?,
@@ -1391,6 +1445,8 @@ fn record_from_row(
         user_security_revision: get(row, "user_security_revision")?,
         identity_revision: get(row, "identity_revision")?,
         provider_revision: get(row, "provider_revision")?,
+        provider_egress_policy_revision,
+        egress_policy,
         managed_profile_revision: get(row, "managed_profile_revision")?,
         application_revision: get(row, "application_revision")?,
         assignment_security_revision: get(row, "assignment_security_revision")?,
@@ -1406,12 +1462,21 @@ fn record_from_row(
         provider_pkce_required: get(row, "provider_pkce_required")?,
         oidc_nonce_required: get(row, "oidc_nonce_required")?,
         revision: get(row, "revision")?,
-        status: ManagedReauthorizationStatus::parse(&get::<String>(row, "status")?)?,
+        status,
         csrf_key_version: get(row, "csrf_key_version")?,
         oidc_nonce: nonce,
         provider_pkce: pkce,
         expires_at: get(row, "expires_at")?,
     })
+}
+
+fn provider_egress_policy_from_row(
+    row: &sea_orm::QueryResult,
+) -> Result<ProviderEgressPolicy, ApplicationError> {
+    super::provider_row::decode_provider_egress_policy(
+        &get::<String>(row, "current_egress_mode")?,
+        get(row, "current_egress_exact_origins")?,
+    )
 }
 
 async fn expire_by_digest<C: ConnectionTrait>(

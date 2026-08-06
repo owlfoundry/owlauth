@@ -1,0 +1,224 @@
+.pageHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.pageHeader h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 650;
+  line-height: 2rem;
+}
+
+.pageHeader p {
+  max-width: 50rem;
+  margin: 0.35rem 0 0;
+  color: var(--owl-text-muted);
+}
+
+.pageActions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.breadcrumbs {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.breadcrumbs ol {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--owl-text-muted);
+  font-size: 0.8125rem;
+}
+
+.breadcrumbs li,
+.breadcrumbs a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.breadcrumbs li:not(:last-child)::after {
+  margin-left: 0.45rem;
+  color: var(--owl-text-subtle);
+  content: "/";
+}
+
+.breadcrumbs a {
+  color: inherit;
+}
+
+.tableRegion {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.table th,
+.table td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--owl-border);
+  vertical-align: top;
+}
+
+.table th {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  color: var(--owl-text-muted);
+  background: var(--owl-surface-raised);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.table td {
+  color: var(--owl-text);
+  background: var(--owl-surface);
+}
+
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.table tbody tr:hover td {
+  background: var(--owl-surface-hover);
+}
+
+.empty {
+  display: grid;
+  justify-items: start;
+  gap: 0.6rem;
+  padding: 2rem;
+  background: var(--owl-surface);
+  border: 1px dashed var(--owl-border-strong);
+  border-radius: var(--owl-radius-surface);
+}
+
+.empty h1,
+.empty h2,
+.empty h3,
+.empty p {
+  margin: 0;
+}
+
+.empty p {
+  max-width: 40rem;
+  color: var(--owl-text-muted);
+}
+
+.descriptionList {
+  display: grid;
+  grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr);
+  margin: 0;
+  border-top: 1px solid var(--owl-border);
+}
+
+.descriptionList dt,
+.descriptionList dd {
+  min-width: 0;
+  margin: 0;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--owl-border);
+}
+
+.descriptionList dt {
+  padding-right: 1rem;
+  color: var(--owl-text-muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.descriptionList dd {
+  overflow-wrap: anywhere;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 1.5rem;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--owl-border);
+}
+
+.tab {
+  display: inline-flex;
+  min-height: 2.75rem;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  color: var(--owl-text-muted);
+  border-bottom: 2px solid transparent;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.tab[aria-current="page"] {
+  color: var(--owl-text);
+  border-bottom-color: var(--owl-accent);
+}
+
+.section {
+  margin-block: 1.5rem;
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.sectionHeader h2,
+.sectionHeader h3,
+.sectionHeader p {
+  margin: 0;
+}
+
+.sectionHeader p {
+  color: var(--owl-text-muted);
+}
+
+@media (width <= 48rem) {
+  .pageHeader,
+  .sectionHeader {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pageActions > * {
+    flex: 1 1 auto;
+  }
+
+  .descriptionList {
+    grid-template-columns: 1fr;
+  }
+
+  .descriptionList dt {
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
+
+  .descriptionList dd {
+    padding-top: 0.25rem;
+  }
+}

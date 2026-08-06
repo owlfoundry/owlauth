@@ -70,7 +70,7 @@ The gateway MUST:
 - map only allowlisted external operations to fixed Control commands;
 - prevent generic Control forwarding, arbitrary Project selection, key export, and policy bypass.
 
-OwlAuth provides indexed metadata, revision conditions, Project isolation, and domain validation. It does not provide server-enforced tenant isolation for callers sharing the operator key. Organization membership, customer API keys, tenant RBAC, plans, billing, and hosted multi-tenant orchestration are outside the OwlAuth product.
+OwlAuth provides indexed metadata, revision conditions, Project isolation, and domain validation. It does not provide server-enforced tenant isolation for callers sharing the operator key. Organization membership, arbitrary customer business API keys, tenant RBAC, plans, billing, and hosted multi-tenant orchestration are outside the OwlAuth product. The fixed read-only Project client keys from spec 13 are a separate admitted Client credential class, not tenant-management or business API keys.
 
 ## One CLI, endpoint-discovered deployment
 
@@ -124,6 +124,7 @@ The self-hosted adapter:
 - requires a validated/pinned self-hosted descriptor, exact Control endpoint, and TLS verification;
 - treats every invocation as the fixed deployment operator;
 - sends explicit Project/target identifiers and expected revisions for destructive commands;
+- emits a Project client credential only from the original successful create response and exposes a separate revision-fenced, idempotent `client-key acknowledge` command that requires explicit confirmation after automation has durably stored it;
 - uses deployment-operator-scoped idempotency for eligible retries;
 - shows the selected profile/endpoint and a safe summary before destructive commands;
 - treats deliberate non-interactive confirmation as intent UX, not extra authority;

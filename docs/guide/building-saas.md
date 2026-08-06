@@ -36,7 +36,7 @@ flowchart LR
 
 The SaaS service is the tenant policy-enforcement point. It calls only published OwlAuth Control APIs; it must not import `owlauth-server`, share its repositories, or read or write an OwlAuth database directly.
 
-A managed cell is one OwlAuth administrative trust domain. It includes an `owlauth-server` deployment, PostgreSQL, optional Redis, signer and configuration-secret stores, Runtime ingress, private Control ingress, and one deployment operator key. A cell can hold Projects for several organizations only when your trusted SaaS service is the sole operator.
+A managed cell is one OwlAuth administrative trust domain. It includes an `owlauth-server` deployment, PostgreSQL, optional Redis, a separately preserved software custody root or custom-provider authority, public Runtime ingress, backend-only Client ingress, private Control ingress, and one deployment operator key. A cell can hold Projects for several organizations only when your trusted SaaS service is the sole operator.
 
 ## Keep identities separate
 
@@ -139,9 +139,9 @@ Derive a globally unique Control idempotency key from the durable SaaS operation
 
 Useful managed-resource states include `provisioning`, `active`, `updating`, `suspending`, `disabled`, `provisioning_failed`, and `reconciliation_required`. Protect those transitions with your own monotonic revision independently of OwlAuth's metadata revision.
 
-## Keep Runtime off the management critical path
+## Keep Runtime and Client off the management critical path
 
-Customer applications and end users should use the assigned OwlAuth Runtime directly. A healthy login, provider callback, handoff, refresh, or current-user request should not synchronously depend on:
+Customer applications and end users should use the assigned OwlAuth Runtime directly. Customer backends should use the assigned Client listener with a Project client key for user-directory reads, exact lookup, Application projection reads, and online token introspection. A healthy Runtime or Client request should not synchronously depend on:
 
 - your SaaS API or console;
 - platform identity;
@@ -160,10 +160,11 @@ Use different credentials and secret namespaces for each trust domain:
 | Platform identity credential    | SaaS API                          | authenticated management subject only                   |
 | Customer API key                | SaaS API                          | SaaS principal plus a scope ceiling                     |
 | Cell operator API key           | one managed cell Control listener | full deployment Control authority                       |
+| Project client key              | one managed cell Client listener  | one Project's backend directory/introspection authority |
 | Application publishable key     | managed Runtime                   | public Application identification and abuse attribution |
 | Project access or refresh token | managed Runtime/customer backend  | Project user and Application session context            |
 
-A customer API key must never be forwarded to OwlAuth, and a cell operator key must never appear in customer responses, browsers, tenant records, logs, traces, metrics, support bundles, or agent context. Use one operator key per cell to limit blast radius, and keep Control ingress private even though network position does not replace Bearer authentication.
+A customer API key must never be forwarded to OwlAuth. A cell operator key must never appear in customer responses, browsers, tenant records, logs, traces, metrics, support bundles, or agent context. Project client keys are one-time Control reveals that must be acknowledged only after durable external secret-manager storage; they belong exclusively in customer backend custody and never in browsers, Runtime SDK configuration, URLs, or frontend bundles. Use one operator key per cell to limit blast radius, and keep Control ingress private even though network position does not replace Bearer authentication.
 
 If you issue customer API keys, store only a versioned digest and safe lookup metadata after one-time secret display. Effective permission should be the intersection of the key's immutable scope ceiling and the principal's current permissions. Revoking membership or disabling the principal must therefore remove authority immediately.
 
@@ -171,15 +172,16 @@ If you issue customer API keys, store only a versioned digest and safe lookup me
 
 A cell is the unit of administrative trust, capacity, backup, recovery, and incident blast radius. Keep Platform Identity and managed customer cells separate in production, including PostgreSQL authority, operator keys, signer namespaces, secret stores, and recovery paths.
 
-| Failure                                | Management behavior                                            | Customer Runtime behavior                            |
-| -------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
-| SaaS database unavailable              | fail tenant management closed                                  | continue from cell authority                         |
-| SaaS API unavailable                   | console and automation unavailable                             | continue                                             |
-| Platform identity unavailable          | new administrator login affected                               | continue                                             |
-| Cell Control unavailable               | affected commands fail or reconcile                            | continue if Runtime and its dependencies are healthy |
-| Cell Runtime or PostgreSQL unavailable | affected cell unavailable                                      | affected cell unavailable                            |
-| Operator-key mismatch                  | Control calls fail until rotation/reconciliation               | Runtime credentials remain independent               |
-| Payment provider unavailable           | preserve bounded last-confirmed commercial state and reconcile | continue                                             |
+| Failure                                | Management behavior                                            | Customer Runtime behavior                                     |
+| -------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------- |
+| SaaS database unavailable              | fail tenant management closed                                  | continue from cell authority                                  |
+| SaaS API unavailable                   | console and automation unavailable                             | continue                                                      |
+| Platform identity unavailable          | new administrator login affected                               | continue                                                      |
+| Cell Control unavailable               | affected commands fail or reconcile                            | Runtime and Client continue if their dependencies are healthy |
+| Cell Client unavailable                | backend directory/introspection requests fail                  | browser Runtime authentication continues                      |
+| Cell Runtime or PostgreSQL unavailable | affected cell unavailable                                      | affected cell unavailable                                     |
+| Operator-key mismatch                  | Control calls fail until rotation/reconciliation               | Runtime and Client credentials remain independent             |
+| Payment provider unavailable           | preserve bounded last-confirmed commercial state and reconcile | continue                                                      |
 
 Bound work per cell with deadlines, concurrency limits, circuit breakers, and queues so one unhealthy cell cannot exhaust fleet control capacity. Persist actor attribution and operation intent before workers perform an external effect. Revalidate organization, managed-resource, entitlement, and OwlAuth revisions immediately before that effect.
 
@@ -227,7 +229,7 @@ Before serving multiple organizations, verify at least:
 - operator keys are redacted and unique per cell;
 - failed and ambiguous provisioning is reconciled without duplicate resources;
 - platform identity and managed customer cells are operationally isolated;
-- Runtime remains independent from SaaS, Control, and billing outages;
+- Runtime and Client remain independent from SaaS, Control, and billing outages;
 - restore-time ownership drift blocks mutation until reconciliation.
 
 OwlAuth's own test suite provides evidence for the specifically exercised Project-isolation and server invariants. It does not certify a deployment or prove the tenant isolation, billing correctness, fleet orchestration, or cross-system recovery of the SaaS layer you build around it.

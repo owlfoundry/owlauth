@@ -16,6 +16,7 @@
     "get_readiness"
   ],
   "forbiddenSecuritySchemes": [
-    "operator_api_key"
+    "operator_api_key",
+    "project_client_key"
   ]
 }

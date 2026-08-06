@@ -1,0 +1,122 @@
+.summary {
+  margin: 0;
+  color: var(--owl-text-muted);
+}
+
+.methods {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.method,
+.secondary,
+.danger {
+  min-height: 2.75rem;
+  padding: 0.65rem 0.875rem;
+  color: var(--owl-text);
+  background: var(--owl-surface-raised);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+.method {
+  background: var(--owl-accent-strong);
+  border-color: var(--owl-accent-strong);
+}
+
+.secondary {
+  background: var(--owl-surface-raised);
+}
+
+.danger {
+  color: var(--owl-danger);
+  background: var(--owl-danger-surface);
+  border-color: #81444d;
+}
+
+.method:hover,
+.secondary:hover,
+.danger:hover {
+  background: var(--owl-surface-hover);
+  border-color: var(--owl-focus);
+}
+
+.method:disabled,
+.secondary:disabled,
+.danger:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.divider {
+  margin: 1.5rem 0;
+  border: 0;
+  border-top: 1px solid var(--owl-border);
+}
+
+.notice,
+.error {
+  padding: 0.75rem;
+  background: var(--owl-info-surface);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+}
+
+.error {
+  color: var(--owl-danger);
+  background: var(--owl-danger-surface);
+  border-color: #81444d;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.proofSlots {
+  display: grid;
+  gap: 1rem;
+  margin: 1rem 0;
+  padding: 0;
+  list-style-position: inside;
+}
+
+.proofSlots > li {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  background: var(--owl-surface-raised);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.proofSlots form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.proofSlots input {
+  min-height: 2.5rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--owl-text);
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+  font: inherit;
+}
+
+.focusTarget:focus {
+  outline: none;
+}
+
+@media (width <= 30rem) {
+  .actions {
+    display: grid;
+  }
+}

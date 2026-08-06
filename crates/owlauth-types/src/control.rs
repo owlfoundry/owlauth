@@ -97,6 +97,11 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::get_project_policy,
         crate::control_resources::update_project_policy,
         crate::control_resources::disable_project,
+        crate::control_resources::list_project_client_keys,
+        crate::control_resources::get_project_client_key,
+        crate::control_resources::create_project_client_key,
+        crate::control_resources::acknowledge_project_client_key_delivery,
+        crate::control_resources::revoke_project_client_key,
         crate::control_resources::list_applications,
         crate::control_resources::create_application,
         crate::control_resources::get_application,
@@ -125,6 +130,9 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::activate_signing_key,
         crate::control_resources::retire_signing_key,
         crate::control_resources::revoke_signing_key,
+        crate::control_resources::get_provider_egress_policy,
+        crate::control_resources::update_provider_egress_policy,
+        crate::control_resources::preflight_oidc_provider,
         crate::control_resources::list_providers,
         crate::control_resources::create_provider,
         crate::control_resources::reconcile_provider,
@@ -133,6 +141,7 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::unassign_provider,
         crate::control_resources::get_email_method_policy,
         crate::control_resources::update_email_method_policy,
+        crate::control_resources::list_email_assignments,
         crate::control_resources::assign_email_method,
         crate::control_resources::list_deployment_smtp_generations,
         crate::control_resources::disable_deployment_smtp_generation,
@@ -214,12 +223,24 @@ pub fn get_system() -> SystemCapabilities {
         ReplayWebhookDeliveryRequest,
         SigningKey,
         SigningKeyList,
+        ProjectClientKeyStatus,
+        ProjectClientKey,
+        ProjectClientKeyList,
+        CreateProjectClientKeyRequest,
+        CreateProjectClientKeyResponse,
+        AcknowledgeProjectClientKeyDeliveryRequest,
+        RevokeProjectClientKeyRequest,
         CreateSigningKeyRequest,
         ReconcileSigningKeyRequest,
         KeyTransitionRequest,
         Provider,
         ProviderManagedProfileCapability,
         ProviderList,
+        ProviderEgressMode,
+        ProviderEgressPolicy,
+        UpdateProviderEgressPolicyRequest,
+        OidcPreflightRequest,
+        OidcPreflightResult,
         CreateProviderRequest,
         ReconcileProviderRequest,
         ProviderRevisionRequest,
@@ -229,10 +250,13 @@ pub fn get_system() -> SystemCapabilities {
         EmailMethodPolicy,
         UpdateEmailMethodPolicyRequest,
         EmailAssignmentRequest,
+        EmailAssignment,
+        EmailAssignmentList,
         SmtpConfiguration,
         SmtpConfigurationList,
         DeploymentSmtpGeneration,
         DeploymentSmtpGenerationList,
+        ReconcileDeploymentSmtpRequest,
         CreateSmtpConfigurationRequest,
         SmtpRevisionRequest,
         TestSmtpConfigurationRequest,
@@ -344,6 +368,25 @@ mod identity_inventory_tests {
                 ["/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints"]
                 .is_null()
         );
+    }
+
+    #[test]
+    fn email_assignment_read_model_is_bounded_and_control_only() {
+        let document = serde_json::to_value(openapi()).expect("serialize Control OpenAPI");
+        let path = "/v1/projects/{project_id}/email-method/assignments";
+        assert!(document["paths"][path]["get"].is_object());
+        assert_eq!(
+            document["components"]["schemas"]["EmailAssignmentList"]["properties"]["items"]["maxItems"],
+            100
+        );
+        assert_eq!(
+            document["components"]["schemas"]["EmailAssignment"]["properties"]["security_revision"]
+                ["minimum"],
+            1
+        );
+        let runtime =
+            serde_json::to_value(crate::runtime::openapi()).expect("serialize Runtime OpenAPI");
+        assert!(runtime["paths"].get(path).is_none());
     }
 
     #[test]

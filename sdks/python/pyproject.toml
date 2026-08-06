@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "owlauth-client"
-version = "0.0.1"
+version = "0.0.0.dev0"
 description = "Python Project Auth client for OwlAuth"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -47,6 +47,41 @@ use crate::application::{
 const POSTGRES_PORT: u16 = 5432;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+async fn seed_legacy_deployment_smtp(pool: &PgPool, generation: &DeploymentSmtpGeneration) {
+    let tls_mode = match generation.tls_mode {
+        SmtpTlsMode::ImplicitTls => "implicit_tls",
+        SmtpTlsMode::StartTlsRequired => "starttls_required",
+        SmtpTlsMode::DevelopmentLoopbackPlaintext => {
+            panic!("legacy deployment fixture is TLS-only")
+        }
+    };
+    sqlx::query(
+        "INSERT INTO deployment_smtp_generations
+         (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
+          sender_address,credential_ref,safe_fingerprint,explicitly_allowed_private_ips,
+          material_owner_id)
+         VALUES ($1,'reconciled',1,1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(generation.generation)
+    .bind(&generation.host)
+    .bind(i32::from(generation.port))
+    .bind(tls_mode)
+    .bind(&generation.sender_address)
+    .bind(&generation.credential_ref)
+    .bind(generation.safe_fingerprint.to_vec())
+    .bind(serde_json::json!(
+        generation
+            .explicitly_allowed_private_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    ))
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .expect("seed legacy deployment SMTP generation");
+}
+
 #[derive(Default)]
 struct CountingSmtpProvisioner {
     writes: AtomicUsize,
@@ -774,7 +809,10 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .prepare_smtp_test(project_id, smtp_test.clone(), now)
         .await
         .expect("enqueue durable SMTP test");
-    assert_eq!(prepared.state, crate::application::SmtpTestState::Preparing);
+    assert_eq!(
+        prepared.record.state,
+        crate::application::SmtpTestState::Preparing
+    );
     let test_barrier = Arc::new(BarrierSmtpProvisioner::new());
     let paused_repository = PostgresEmailControlRepository::new(database.clone());
     let paused_barrier = test_barrier.clone();
@@ -825,7 +863,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .prepare_smtp_test(project_id, smtp_test.clone(), now)
         .await
         .expect("idempotent pending replay");
-    assert_eq!(replay.id, operation_id);
+    assert_eq!(replay.record.id, operation_id);
     let claimed = email
         .claim_smtp_test("runtime-a", now, now + Duration::seconds(30))
         .await
@@ -912,7 +950,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .await
         .expect("prepare abandoned test");
     assert_eq!(
-        abandoned.state,
+        abandoned.record.state,
         crate::application::SmtpTestState::Preparing
     );
     let abandoned = email_control
@@ -1099,6 +1137,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         safe_fingerprint: [77; 32],
         explicitly_allowed_private_ips: Vec::new(),
     };
+    seed_legacy_deployment_smtp(&pool, &deployment).await;
     email
         .reconcile_deployment_smtp(&deployment, now)
         .await
@@ -1964,11 +2003,11 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     sqlx::query(
         "INSERT INTO deployment_smtp_generations
          (generation,status,revision,security_eligibility_revision,host,port,tls_mode,sender_address,
-          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,created_at,updated_at)
+          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,material_owner_id,created_at,updated_at)
          VALUES (1,'active',1,1,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'deployment_ref',$1,'[]'::jsonb,$2,$2),
+                 'deployment_ref',$1,'[]'::jsonb,md5('email-test-deployment-1')::uuid,$2,$2),
                 (2,'reconciled',1,1,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'deployment_ref_2',$1,'[]'::jsonb,$2,$2)",
+                 'deployment_ref_2',$1,'[]'::jsonb,md5('email-test-deployment-2')::uuid,$2,$2)",
     )
     .bind(vec![8_u8; 32])
     .bind(now)
@@ -2971,11 +3010,11 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     sqlx::query(
         "INSERT INTO deployment_smtp_generations
          (generation,status,revision,security_eligibility_revision,host,port,tls_mode,sender_address,
-          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,created_at,updated_at)
+          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,material_owner_id,created_at,updated_at)
          VALUES (20,'disabled',2,2,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'terminal_shared_ref',$1,'[]'::jsonb,$2,$2),
+                 'terminal_shared_ref',$1,'[]'::jsonb,md5('email-test-deployment-20')::uuid,$2,$2),
                 (21,'compromised',2,2,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'terminal_shared_ref',$1,'[]'::jsonb,$2,$2)",
+                 'terminal_shared_ref',$1,'[]'::jsonb,md5('email-test-deployment-21')::uuid,$2,$2)",
     )
     .bind(vec![10_u8; 32])
     .bind(cleanup_now)
@@ -3048,9 +3087,9 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     sqlx::query(
         "INSERT INTO deployment_smtp_generations
          (generation,status,revision,security_eligibility_revision,host,port,tls_mode,sender_address,
-          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,created_at,updated_at)
+          credential_ref,safe_fingerprint,explicitly_allowed_private_ips,material_owner_id,created_at,updated_at)
          VALUES (30,'compromised',2,2,'smtp.example.com',465,'implicit_tls','deployment@example.com',
-                 'crash_recovery_ref',$1,'[]'::jsonb,$2,$2)",
+                 'crash_recovery_ref',$1,'[]'::jsonb,md5('email-test-deployment-30')::uuid,$2,$2)",
     )
     .bind(vec![11_u8; 32])
     .bind(cleanup_now)
@@ -3197,9 +3236,9 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         "INSERT INTO deployment_smtp_generations
          (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
           sender_address,credential_ref,safe_fingerprint,explicitly_allowed_private_ips,
-          created_at,updated_at)
+          material_owner_id,created_at,updated_at)
          VALUES (40,'compromised',2,2,'race.smtp.example',465,'implicit_tls',
-                 'race@example.com',$1,$2,'[]'::jsonb,$3,$3)",
+                 'race@example.com',$1,$2,'[]'::jsonb,md5('email-test-deployment-40')::uuid,$3,$3)",
     )
     .bind(race_ref)
     .bind(vec![40_u8; 32])
@@ -3238,7 +3277,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
                     operation_alias: "reserved-project-race-1".to_owned(),
                     credential_ref: race_ref.to_owned(),
                     request_digest: vec![51; 32],
-                    safe_fingerprint: [51; 32],
+                    safe_fingerprint: Some([51; 32]),
                     expected_project_security_revision: current_project_revision,
                     correlation_id: Uuid::new_v4(),
                 },
@@ -3329,7 +3368,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
                 operation_alias: "barrier-provision-serialization-1".to_owned(),
                 credential_ref: barrier_ref.clone(),
                 request_digest: vec![60; 32],
-                safe_fingerprint: [60; 32],
+                safe_fingerprint: Some([60; 32]),
                 expected_project_security_revision: barrier_revision,
                 correlation_id: Uuid::new_v4(),
             },
@@ -3424,7 +3463,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
                 operation_alias: "delayed-provision-after-erase-1".to_owned(),
                 credential_ref: delayed_ref.clone(),
                 request_digest: vec![61; 32],
-                safe_fingerprint: [61; 32],
+                safe_fingerprint: Some([61; 32]),
                 expected_project_security_revision: delayed_revision,
                 correlation_id: Uuid::new_v4(),
             },
@@ -3847,6 +3886,7 @@ async fn project_smtp_restore_readiness_is_project_scoped_and_restart_safe_in_po
         safe_fingerprint: [91; 32],
         explicitly_allowed_private_ips: Vec::new(),
     };
+    seed_legacy_deployment_smtp(&pool, &deployment).await;
     repository
         .reconcile_deployment_smtp(&deployment, now)
         .await
@@ -3855,7 +3895,6 @@ async fn project_smtp_restore_readiness_is_project_scoped_and_restart_safe_in_po
     let restored = crate::composition::reconcile_project_smtp_readiness_restore(
         &repository,
         &resolver,
-        &store,
         now + Duration::seconds(1),
     )
     .await
@@ -3908,7 +3947,6 @@ async fn project_smtp_restore_readiness_is_project_scoped_and_restart_safe_in_po
     crate::composition::reconcile_project_smtp_readiness_restore(
         &restarted,
         &resolver,
-        &store,
         now + Duration::seconds(2),
     )
     .await
@@ -4540,7 +4578,7 @@ async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postg
                     operation_alias: "bounded-live-generation-33".to_owned(),
                     credential_ref: "bounded-live-generation-33".to_owned(),
                     request_digest: vec![33; 32],
-                    safe_fingerprint: [33; 32],
+                    safe_fingerprint: Some([33; 32]),
                     expected_project_security_revision: project_revision,
                     correlation_id: Uuid::new_v4(),
                 },

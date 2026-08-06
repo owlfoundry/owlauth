@@ -1,7 +1,7 @@
 mod mcp;
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -9,104 +9,75 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
 use axum::{
     Extension, Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query, Request, State},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, FromRequest, OriginalUri, Path, Query, Request, State,
+    },
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post, put},
 };
 use owlauth_types::{
-    FEDERATED_PROJECT_AUTH_AVAILABLE, HealthResponse,
+    FEDERATED_PROJECT_AUTH_AVAILABLE, HealthResponse, client as client_types,
     control::{self as control_types, ServiceDescriptor, SystemCapabilities},
     runtime as runtime_types,
 };
+#[cfg(test)]
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::Semaphore;
 use tower::limit::ConcurrencyLimitLayer;
-use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer};
+use tower_http::{
+    catch_panic::CatchPanicLayer, compression::CompressionLayer, timeout::TimeoutLayer,
+};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    adapters::{
-        github::GithubOAuthProviderClient,
-        oidc::{RestrictedOidcManagedProfileAdapter, RestrictedOidcProviderClient},
-        postgres::{
-            DatabasePools,
-            authentication::PostgresAuthenticationRepository,
-            control_lifecycle::PostgresControlLifecycleRepository,
-            email::PostgresPasswordlessEmailRepository,
-            email_control::PostgresEmailControlRepository,
-            identity_mutation::{
-                PostgresControlIdentityMutationRepository,
-                PostgresRuntimeIdentityMutationRepository,
-            },
-            managed_connection::PostgresManagedConnectionRepository,
-            managed_reauthorization::PostgresManagedReauthorizationRepository,
-            projection::PostgresIdentityProjectionMaterializer,
-            projection_expansion::PostgresProjectionExpansionRepository,
-            provider_callback::PostgresProviderCallbackOwnerResolver,
-            provisioning::PostgresProvisioningAdapter,
-            readiness::PostgresReadinessAdapter,
-            runtime_authority::PostgresRuntimeAuthorityRepository,
-            session_authority::PostgresSessionAuthorityRepository,
-            webhook::PostgresWebhookRepository,
-        },
-        provider_registry::ProviderClientRegistry,
-        redis_admission::RedisAdmissionCounter,
-        runtime_security::{
-            EncryptedFileProviderSecretResolver, EncryptedFileRuntimeSigner,
-            ManagedCredentialKeyMaterial, RuntimeKeyMaterial, SoftwareDurableEmailAddressReader,
-            SoftwareIdentityMutationCandidateVerifier,
-            SoftwareIdentityMutationDurableEmailProtector,
-            SoftwareIdentityMutationProofMaterialProtector, SoftwareIdentityMutationTargetIssuer,
-            SoftwareIdentityMutationTargetVerifier, SoftwareManagedCredentialProtector,
-            SoftwareManagedReauthorizationTargetIssuer,
-            SoftwareManagedReauthorizationTargetVerifier, SoftwareProjectionVerifiedEmailProtector,
-            SoftwareRuntimeProtector, SplitRuntimeProtector, UnavailableDurableEmailAddressReader,
-        },
-        smtp::{ForbiddenSmtpDestinations, SafeSmtpTransport},
-        software_store::{EncryptedFileStore, WriteOnlyEncryptedFileProvisioner},
-        system::{Sha256RequestDigester, SystemClock, SystemEntropy},
-        webhook_http::SafeWebhookTransport,
-    },
     application::{
         self, AdmissionDecision, AdmissionDimension, AdmissionDimensionKind, AdmissionEndpoint,
         AdmissionService, ApplicationError, BeginEmailChallenge, BeginLogin, Clock,
         ConfirmProjectBrowserLogout, ConfirmSessionReuse, ControlLifecycleService,
         CreateApplication, CreateManagedReauthorization, CreateProject, CreateProvider,
-        CreateSmtpConfiguration, DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE,
-        DurableEmailAddressReader, EmailControlService, ExchangeHandoff,
-        IdentityMutationControlService, IdentityMutationProviderCapability,
-        IdentityMutationRuntimeService, MailWorker, ManagedConnectionMetadata,
-        ManagedConnectionRepository, ManagedConnectionService, ManagedInteractionCleanupService,
-        ManagedReauthorizationCallback, ManagedReauthorizationCallbackOutcome,
-        ManagedReauthorizationControlService, ManagedReauthorizationDenial,
-        ManagedReauthorizationRuntimeService, ManagedReauthorizationTargetVerifier,
-        McpConfirmationContext, McpConfirmationService, ProjectionExpansionWorker,
-        ProjectionPolicyService, ProjectionVerifiedEmailProtector, ProviderCallback,
+        CreateSmtpConfiguration, EmailControlService, ExchangeHandoff,
+        IdentityMutationControlService, IdentityMutationRuntimePort, ManagedConnectionMetadata,
+        ManagedConnectionRepository, ManagedConnectionService, ManagedReauthorizationCallback,
+        ManagedReauthorizationCallbackOutcome, ManagedReauthorizationControlService,
+        ManagedReauthorizationDenial, ManagedReauthorizationRuntimeService, McpConfirmationService,
+        ProjectionExpansionWorker, ProjectionPolicyService, ProviderCallback,
         ProviderCallbackDenial, ProviderCallbackOwner, ProviderCallbackOwnerResolver,
-        ProvisioningInfrastructure, ProvisioningService, ReadinessService, RefreshSession,
-        ReplaceApplicationConfiguration, RuntimeAuthService, RuntimeProtector, SelectEmail,
-        SelectProvider, SubmitEmailProof, UpdateApplication, UpdateProject, UpdateProjectPolicy,
-        WebhookControlService, WebhookWorker,
+        ProviderOnboardingService, ProvisioningService, ReadinessService, RefreshSession,
+        ReplaceApplicationConfiguration, RuntimeAuthService, SelectEmail, SelectProvider,
+        SubmitEmailProof, UpdateApplication, UpdateProject, UpdateProjectPolicy,
+        UpdateProviderEgressPolicy, WebhookControlService, WebhookWorker,
     },
-    config::{ListenerConfig, OperatorApiKey, ServerConfig},
-    domain::ApplicationType,
+    config::{DeploymentSmtpConfig, ListenerConfig, OperatorApiKey, ServerConfig},
+    domain::{ApplicationType, ProviderEgressMode},
     web_assets::{self, WebPlane},
+};
+
+#[cfg(test)]
+use crate::application::IdentityMutationRuntimeService;
+#[cfg(test)]
+use crate::{
+    adapters::postgres::DatabasePools,
+    composition::{
+        build_managed_reauthorization_service, build_managed_reauthorization_target_issuer,
+        build_managed_reauthorization_target_verifier,
+    },
 };
 
 #[derive(Clone, Copy, Debug)]
 enum HttpPlane {
     Runtime,
+    Client,
     Control,
 }
 
@@ -114,6 +85,7 @@ impl HttpPlane {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Runtime => "runtime",
+            Self::Client => "client",
             Self::Control => "control",
         }
     }
@@ -123,122 +95,6 @@ impl HttpPlane {
 struct ProbeState {
     ready: Arc<AtomicBool>,
     base_path: Arc<str>,
-}
-
-#[async_trait]
-trait IdentityMutationRuntimeAuthority: Send + Sync {
-    async fn bootstrap(
-        &self,
-        interaction: &str,
-        browser_binding: Option<&str>,
-    ) -> Result<application::IdentityMutationBootstrap, ApplicationError>;
-
-    async fn establish_magic_transfer_context(
-        &self,
-        challenge_id: Uuid,
-    ) -> Result<application::IdentityMutationMagicTransferGate, ApplicationError>;
-
-    async fn start_method(
-        &self,
-        command: application::StartIdentityMutationMethod,
-    ) -> Result<application::StartedIdentityMutationMethod, ApplicationError>;
-
-    async fn begin_email_challenge(
-        &self,
-        request: application::BeginIdentityMutationEmailChallenge,
-    ) -> Result<application::IdentityMutationEmailChallengeAccepted, ApplicationError>;
-
-    async fn verify_email_proof(
-        &self,
-        request: application::VerifyRawIdentityMutationEmailProof,
-    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError>;
-
-    async fn verify_magic_transfer(
-        &self,
-        request: application::VerifyIdentityMutationMagicTransferProof,
-    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError>;
-
-    async fn confirm_ready(
-        &self,
-        command: application::ConfirmIdentityMutationReady,
-    ) -> Result<application::IdentityMutationView, ApplicationError>;
-
-    async fn deny_provider_callback(
-        &self,
-        denial: application::IdentityMutationProviderDenial,
-    ) -> Result<application::IdentityMutationView, ApplicationError>;
-
-    async fn complete_provider_callback(
-        &self,
-        callback: application::IdentityMutationProviderCallback,
-    ) -> Result<application::IdentityMutationCallbackOutcome, ApplicationError>;
-}
-
-#[async_trait]
-impl IdentityMutationRuntimeAuthority for IdentityMutationRuntimeService {
-    async fn bootstrap(
-        &self,
-        interaction: &str,
-        browser_binding: Option<&str>,
-    ) -> Result<application::IdentityMutationBootstrap, ApplicationError> {
-        self.bootstrap(interaction, browser_binding).await
-    }
-
-    async fn establish_magic_transfer_context(
-        &self,
-        challenge_id: Uuid,
-    ) -> Result<application::IdentityMutationMagicTransferGate, ApplicationError> {
-        self.establish_magic_transfer_context(challenge_id).await
-    }
-
-    async fn start_method(
-        &self,
-        command: application::StartIdentityMutationMethod,
-    ) -> Result<application::StartedIdentityMutationMethod, ApplicationError> {
-        self.start_method(command).await
-    }
-
-    async fn begin_email_challenge(
-        &self,
-        request: application::BeginIdentityMutationEmailChallenge,
-    ) -> Result<application::IdentityMutationEmailChallengeAccepted, ApplicationError> {
-        self.begin_email_challenge(request).await
-    }
-
-    async fn verify_email_proof(
-        &self,
-        request: application::VerifyRawIdentityMutationEmailProof,
-    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError> {
-        self.verify_email_proof(request).await
-    }
-
-    async fn verify_magic_transfer(
-        &self,
-        request: application::VerifyIdentityMutationMagicTransferProof,
-    ) -> Result<application::IdentityMutationEmailCompletionDecision, ApplicationError> {
-        self.verify_magic_transfer(request).await
-    }
-
-    async fn confirm_ready(
-        &self,
-        command: application::ConfirmIdentityMutationReady,
-    ) -> Result<application::IdentityMutationView, ApplicationError> {
-        self.confirm_ready(command).await
-    }
-
-    async fn deny_provider_callback(
-        &self,
-        denial: application::IdentityMutationProviderDenial,
-    ) -> Result<application::IdentityMutationView, ApplicationError> {
-        self.deny_provider_callback(denial).await
-    }
-
-    async fn complete_provider_callback(
-        &self,
-        callback: application::IdentityMutationProviderCallback,
-    ) -> Result<application::IdentityMutationCallbackOutcome, ApplicationError> {
-        self.complete_provider_callback(callback).await
-    }
 }
 
 #[derive(Clone)]
@@ -252,43 +108,51 @@ struct RuntimeState {
     managed_reauthorization: Option<Arc<ManagedReauthorizationRuntimeService>>,
     cookie_path: Arc<str>,
     external_origin: Arc<str>,
-    identity_mutations: Option<Arc<dyn IdentityMutationRuntimeAuthority>>,
+    identity_mutations: Option<Arc<dyn IdentityMutationRuntimePort>>,
+}
+
+#[derive(Clone)]
+struct ClientState {
+    probe: ProbeState,
+    admission: Arc<AdmissionService>,
+    api: Option<Arc<application::ClientApiService>>,
+    readiness: Option<Arc<application::ClientDigestReadinessService>>,
 }
 
 #[derive(Clone)]
 struct ControlState {
     probe: ProbeState,
+    clock: Arc<dyn Clock>,
     operator_key: Arc<OperatorApiKey>,
     descriptor: Arc<ServiceDescriptor>,
     provisioning: Option<Arc<ProvisioningService>>,
     lifecycle: Option<Arc<ControlLifecycleService>>,
     email_control: Option<Arc<EmailControlService>>,
-    managed_connections: Option<Arc<PostgresManagedConnectionRepository>>,
+    deployment_smtp: Option<Arc<DeploymentSmtpConfig>>,
+    managed_connections: Option<Arc<dyn ManagedConnectionRepository>>,
     managed_reauthorization: Option<Arc<ManagedReauthorizationControlService>>,
     identity_mutations: Option<Arc<IdentityMutationControlService>>,
     projection_policy: Option<Arc<ProjectionPolicyService>>,
     mcp_confirmation: Option<Arc<McpConfirmationService>>,
     webhooks: Option<Arc<WebhookControlService>>,
+    provider_onboarding: Option<Arc<ProviderOnboardingService>>,
+    client_keys: Option<Arc<application::ClientKeyLifecycleService>>,
 }
 
 pub(crate) struct PlaneRouters {
     pub runtime: Option<Router>,
+    pub client: Option<Router>,
     pub control: Option<Router>,
     pub runtime_auth: Option<Arc<RuntimeAuthService>>,
     pub managed_sync: Option<Arc<ManagedConnectionService>>,
     pub projection_expansion: Option<Arc<ProjectionExpansionWorker>>,
     pub webhook_delivery: Option<Arc<WebhookWorker>>,
-    #[allow(
-        dead_code,
-        reason = "test and worker composition inspection uses this named service"
-    )]
+    #[cfg(test)]
     pub(crate) runtime_identity_mutations: Option<Arc<IdentityMutationRuntimeService>>,
-    #[allow(
-        dead_code,
-        reason = "test and worker composition inspection uses this named service"
-    )]
+    #[cfg(test)]
     pub(crate) control_identity_mutations: Option<Arc<IdentityMutationControlService>>,
     runtime_ready: Arc<AtomicBool>,
+    client_ready: Arc<AtomicBool>,
     control_ready: Arc<AtomicBool>,
 }
 
@@ -297,6 +161,9 @@ impl PlaneRouters {
         if self.runtime.is_some() {
             self.runtime_ready.store(true, Ordering::Release);
         }
+        if self.client.is_some() {
+            self.client_ready.store(true, Ordering::Release);
+        }
         if self.control.is_some() {
             self.control_ready.store(true, Ordering::Release);
         }
@@ -304,1103 +171,202 @@ impl PlaneRouters {
 
     pub fn mark_unready(&self) {
         self.runtime_ready.store(false, Ordering::Release);
+        self.client_ready.store(false, Ordering::Release);
         self.control_ready.store(false, Ordering::Release);
     }
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "composition keeps plane-specific dependencies and worker capabilities visible"
-)]
 pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>) -> PlaneRouters {
     build_routers_with_runtime_incarnation(config, pools, Uuid::nil())
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "composition keeps plane-specific dependencies and worker capabilities visible"
-)]
+#[cfg(test)]
 pub(crate) fn build_routers_with_runtime_incarnation(
     config: &ServerConfig,
     pools: Option<&DatabasePools>,
     runtime_incarnation: Uuid,
 ) -> PlaneRouters {
-    let runtime_ready = Arc::new(AtomicBool::new(false));
-    let control_ready = Arc::new(AtomicBool::new(false));
-    let provider_clients = config
-        .mode
-        .has_runtime()
-        .then(|| build_provider_clients(config));
-    let runtime_identity_mutations = config
-        .mode
-        .has_runtime()
-        .then(|| {
-            pools
-                .and_then(|pools| pools.runtime.clone())
-                .map(|database| {
-                    build_identity_mutation_runtime_service(
-                        database,
-                        config,
-                        runtime_incarnation,
-                        provider_clients
-                            .as_ref()
-                            .expect("Runtime provider clients are composed once"),
-                    )
-                })
-        })
-        .flatten();
-    let control_identity_mutations = config
-        .mode
-        .has_control()
-        .then(|| {
-            pools
-                .and_then(|pools| pools.control.clone())
-                .map(|database| build_identity_mutation_control_service(database, config))
-        })
-        .flatten();
-    let runtime_components = (config.mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE)
-        .then(|| {
-            pools
-                .and_then(|pools| pools.runtime.clone())
-                .map(|database| {
-                    build_runtime_auth_service(
-                        database,
-                        config,
-                        runtime_incarnation,
-                        provider_clients
-                            .as_ref()
-                            .expect("Runtime provider clients are composed once"),
-                    )
-                })
-        })
-        .flatten();
-    let runtime_auth = runtime_components
-        .as_ref()
-        .map(|(auth, _, _)| Arc::clone(auth));
-    let managed_sync = runtime_components
-        .as_ref()
-        .map(|(_, sync, _)| Arc::clone(sync));
-    let runtime_reauthorization = runtime_components
-        .as_ref()
-        .map(|(_, _, reauthorization)| Arc::clone(reauthorization));
-    let projection_expansion = config
-        .mode
-        .has_runtime()
-        .then(|| {
-            pools
-                .and_then(|pools| pools.runtime.clone())
-                .map(|database| {
-                    build_projection_expansion_worker(database, config, runtime_incarnation)
-                })
-        })
-        .flatten();
-    let webhook_delivery = config
-        .mode
-        .has_runtime()
-        .then(|| {
-            pools
-                .and_then(|pools| pools.runtime.clone())
-                .map(|database| build_webhook_worker(database, config, runtime_incarnation))
-        })
-        .flatten();
+    let providers = crate::composition::bundled_software_providers(config)
+        .expect("validated bundled provider configuration");
+    let capabilities = crate::composition::build_http_capabilities(
+        config,
+        pools,
+        runtime_incarnation,
+        runtime_incarnation,
+        &providers,
+    );
+    build_routers_with_capabilities(config, capabilities)
+}
 
-    let runtime = config.mode.has_runtime().then(|| {
-        let readiness = pools
-            .and_then(|pools| pools.runtime.clone())
-            .map(|database| {
-                Arc::new(ReadinessService::new(Arc::new(
-                    PostgresReadinessAdapter::new(
-                        database,
-                        config.runtime_process_id.clone(),
-                        runtime_incarnation,
-                        config.required_runtime_process_ids.clone(),
-                        config.publication_lease_ttl,
-                    ),
-                )))
-            });
-        runtime_router(
-            &config.runtime,
-            RuntimeState {
-                probe: ProbeState {
-                    ready: Arc::clone(&runtime_ready),
-                    base_path: Arc::from(config.runtime.external_base.path()),
-                },
-                readiness,
-                admission: build_runtime_admission(config),
-                verified_origins: Arc::new(VerifiedApplicationOrigins::default()),
-                auth: runtime_auth.clone(),
-                callback_owners: pools
-                    .and_then(|pools| pools.runtime.clone())
-                    .map(|database| {
-                        Arc::new(PostgresProviderCallbackOwnerResolver::new(database))
-                            as Arc<dyn ProviderCallbackOwnerResolver>
-                    }),
-                managed_reauthorization: runtime_reauthorization,
-                cookie_path: Arc::from(config.runtime.external_base.path()),
-                external_origin: Arc::from(
-                    config.runtime.external_base.origin().ascii_serialization(),
-                ),
-                identity_mutations: runtime_identity_mutations
-                    .clone()
-                    .map(|service| service as Arc<dyn IdentityMutationRuntimeAuthority>),
-            },
-            config,
-        )
-    });
-    let control = config.mode.has_control().then(|| {
-        control_router(
-            &config.control,
-            ControlState {
-                probe: ProbeState {
-                    ready: Arc::clone(&control_ready),
-                    base_path: Arc::from(config.control.external_base.path()),
-                },
-                operator_key: Arc::new(
-                    config
-                        .control_api_key
-                        .clone()
-                        .expect("validated Control configuration has an operator key"),
-                ),
-                descriptor: Arc::new(ServiceDescriptor {
-                    schema_version: "1".to_owned(),
-                    product: "owlauth-server".to_owned(),
-                    instance_id: config
-                        .instance_id
-                        .clone()
-                        .expect("validated Control configuration has an instance ID"),
-                    api_base_url: config
-                        .control
-                        .external_base
-                        .join("v1/")
-                        .expect("validated base accepts a relative API path")
-                        .to_string(),
-                    api_versions: vec!["v1".to_owned()],
-                    credential_class: "operator-api-key".to_owned(),
-                    mcp_url: config.control_mcp.enabled.then(|| {
-                        config
-                            .control
-                            .external_base
-                            .join("mcp")
-                            .expect("validated Control base accepts the MCP path")
-                            .to_string()
-                    }),
-                }),
-                provisioning: pools
-                    .and_then(|pools| pools.control.clone())
-                    .map(|database| build_provisioning_service(database, config)),
-                lifecycle: pools
-                    .and_then(|pools| pools.control.clone())
-                    .map(|database| {
-                        Arc::new(ControlLifecycleService::new(
-                            Arc::new(
-                                PostgresControlLifecycleRepository::new_with_projection_materializer(
-                                    database,
-                                    build_identity_projection_materializer(config),
-                                ),
-                            ),
-                            Arc::new(SystemClock),
-                        ))
-                    }),
-                email_control: pools
-                    .and_then(|pools| pools.control.clone())
-                    .map(|database| build_email_control_service(database, config)),
-                managed_connections: pools
-                    .and_then(|pools| pools.control.clone())
-                    .map(|database| {
-                        Arc::new(
-                            PostgresManagedConnectionRepository::new_with_projection_materializer(
-                                database,
-                                build_identity_projection_materializer(config),
-                            ),
-                        )
-                    }),
-                managed_reauthorization: pools
-                    .and_then(|pools| pools.control.clone())
-                    .map(|database| build_managed_reauthorization_service(database, config)),
-                identity_mutations: control_identity_mutations.clone(),
-                projection_policy: pools
-                    .and_then(|pools| pools.control.clone())
-                    .map(|database| build_projection_policy_service(database, config)),
-                mcp_confirmation: config
-                    .control_mcp
-                    .enabled
-                    .then(|| {
-                        pools
-                            .and_then(|pools| pools.control.clone())
-                            .map(|database| build_mcp_confirmation_service(database, config))
-                    })
-                    .flatten(),
-                webhooks: pools
-                    .and_then(|pools| pools.control.clone())
-                    .map(|database| build_webhook_control_service(database, config)),
-            },
-            config,
-        )
-    });
+pub(crate) fn build_routers_with_capabilities(
+    config: &ServerConfig,
+    capabilities: crate::composition::HttpCapabilities,
+) -> PlaneRouters {
+    let runtime_ready = Arc::new(AtomicBool::new(false));
+    let client_ready = Arc::new(AtomicBool::new(false));
+    let control_ready = Arc::new(AtomicBool::new(false));
+
+    let runtime_auth = capabilities
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.auth.clone());
+    let managed_sync = capabilities
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.managed_sync.clone());
+    let projection_expansion = capabilities
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.projection_expansion.clone());
+    let webhook_delivery = capabilities
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.webhook_delivery.clone());
+    #[cfg(test)]
+    let runtime_identity_mutations = capabilities
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.identity_mutations.clone());
+    #[cfg(test)]
+    let control_identity_mutations = capabilities
+        .control
+        .as_ref()
+        .and_then(|control| control.identity_mutations.clone());
+
+    let runtime = capabilities
+        .runtime
+        .map(|capabilities| build_runtime_plane(config, capabilities, Arc::clone(&runtime_ready)));
+    let client = capabilities
+        .client
+        .map(|capabilities| build_client_plane(config, capabilities, Arc::clone(&client_ready)));
+    let control = capabilities
+        .control
+        .map(|capabilities| build_control_plane(config, capabilities, Arc::clone(&control_ready)));
 
     PlaneRouters {
         runtime,
+        client,
         control,
         runtime_auth,
         managed_sync,
         projection_expansion,
         webhook_delivery,
+        #[cfg(test)]
         runtime_identity_mutations,
+        #[cfg(test)]
         control_identity_mutations,
         runtime_ready,
+        client_ready,
         control_ready,
     }
 }
 
-fn build_provisioning_service(
-    database: DatabaseConnection,
+fn build_runtime_plane(
     config: &ServerConfig,
-) -> Arc<ProvisioningService> {
-    let provisioning = config
-        .provisioning
-        .as_ref()
-        .expect("validated Control configuration has provisioning stores");
-    let signer_store = EncryptedFileStore::new(
-        provisioning.signer_store_root.clone(),
-        provisioning.signer_store_key.expose_copy(),
+    capabilities: crate::composition::RuntimeHttpCapabilities,
+    ready: Arc<AtomicBool>,
+) -> Router {
+    runtime_router(
+        &config.runtime,
+        RuntimeState {
+            probe: ProbeState {
+                ready,
+                base_path: Arc::from(config.runtime.external_base.path()),
+            },
+            readiness: capabilities.readiness,
+            admission: capabilities.admission,
+            verified_origins: Arc::new(VerifiedApplicationOrigins::default()),
+            auth: capabilities.auth,
+            callback_owners: capabilities.callback_owners,
+            managed_reauthorization: capabilities.managed_reauthorization,
+            cookie_path: Arc::from(config.runtime.external_base.path()),
+            external_origin: Arc::from(config.runtime.external_base.origin().ascii_serialization()),
+            identity_mutations: capabilities
+                .identity_mutations
+                .map(|service| service as Arc<dyn IdentityMutationRuntimePort>),
+        },
+        config,
     )
-    .expect("validated signer store configuration");
-    let secret_store = EncryptedFileStore::new(
-        provisioning.configuration_secret_store_root.clone(),
-        provisioning.configuration_secret_store_key.expose_copy(),
-    )
-    .expect("validated secret store configuration");
-    Arc::new(ProvisioningService::new(
-        Arc::new(PostgresProvisioningAdapter::new(
-            database,
-            config.runtime.external_base.clone(),
-            config.required_runtime_process_ids.clone(),
-            config.key_propagation_delay,
-            config.signing_verification_retention,
-        )),
-        ProvisioningInfrastructure::new(
-            signer_store,
-            secret_store,
-            SystemClock,
-            SystemEntropy,
-            Sha256RequestDigester,
-            config.provider_allow_http_loopback,
-        ),
-    ))
 }
 
-fn build_email_control_service(
-    database: DatabaseConnection,
+fn build_client_plane(
     config: &ServerConfig,
-) -> Arc<EmailControlService> {
-    let provisioning = config
-        .provisioning
-        .as_ref()
-        .expect("validated Control configuration has provisioning stores");
-    let secret_store = WriteOnlyEncryptedFileProvisioner::new(
-        provisioning.configuration_secret_store_root.clone(),
-        provisioning.configuration_secret_store_key.expose_copy(),
+    capabilities: crate::composition::ClientHttpCapabilities,
+    ready: Arc<AtomicBool>,
+) -> Router {
+    client_router(
+        &config.client,
+        ClientState {
+            probe: ProbeState {
+                ready,
+                base_path: Arc::from(config.client.external_base.path()),
+            },
+            admission: capabilities.admission,
+            api: capabilities.api,
+            readiness: capabilities.readiness,
+        },
+        config,
     )
-    .expect("validated write-only secret provisioner configuration");
-    Arc::new(EmailControlService::new(
-        Arc::new(PostgresEmailControlRepository::new_with_runtime_roster(
-            database,
-            config.required_runtime_process_ids.clone(),
-        )),
-        Arc::new(secret_store),
-        Arc::new(SystemClock),
-        Arc::new(Sha256RequestDigester),
-    ))
 }
 
-fn build_projection_policy_service(
-    database: DatabaseConnection,
+fn build_control_plane(
     config: &ServerConfig,
-) -> Arc<ProjectionPolicyService> {
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        source_reader,
-        projection_protector,
-    ));
-    Arc::new(ProjectionPolicyService::new(
-        Arc::new(PostgresProjectionExpansionRepository::new(
-            database,
-            materializer,
-        )),
-        Arc::new(SystemClock),
-    ))
-}
-
-fn build_mcp_confirmation_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-) -> Arc<McpConfirmationService> {
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        source_reader,
-        projection_protector,
-    ));
-    Arc::new(
-        McpConfirmationService::new(
-            Arc::new(PostgresProjectionExpansionRepository::new(
-                database,
-                materializer,
-            )),
-            McpConfirmationContext {
+    capabilities: crate::composition::ControlHttpCapabilities,
+    ready: Arc<AtomicBool>,
+) -> Router {
+    control_router(
+        &config.control,
+        ControlState {
+            probe: ProbeState {
+                ready,
+                base_path: Arc::from(config.control.external_base.path()),
+            },
+            clock: capabilities.clock,
+            operator_key: Arc::new(
+                config
+                    .control_api_key
+                    .clone()
+                    .expect("validated Control configuration has an operator key"),
+            ),
+            descriptor: Arc::new(ServiceDescriptor {
+                schema_version: "1".to_owned(),
+                product: "owlauth-server".to_owned(),
                 instance_id: config
                     .instance_id
                     .clone()
                     .expect("validated Control configuration has an instance ID"),
-                control_endpoint: config
+                api_base_url: config
                     .control
                     .external_base
-                    .join("mcp")
-                    .expect("validated Control base accepts the MCP path")
+                    .join("v1/")
+                    .expect("validated base accepts a relative API path")
                     .to_string(),
-            },
-        )
-        .expect("validated Control identity forms an MCP confirmation context"),
-    )
-}
-
-fn build_webhook_control_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-) -> Arc<WebhookControlService> {
-    let provisioning = config
-        .provisioning
-        .as_ref()
-        .expect("validated Control configuration has provisioning stores");
-    let secrets = WriteOnlyEncryptedFileProvisioner::new(
-        provisioning.configuration_secret_store_root.clone(),
-        provisioning.configuration_secret_store_key.expose_copy(),
-    )
-    .expect("validated write-only webhook secret provisioner configuration");
-    let (_, projection_protector) = build_projection_materializer_capabilities(config);
-    Arc::new(WebhookControlService::new(
-        Arc::new(PostgresWebhookRepository::new(
-            database,
-            projection_protector,
-        )),
-        Arc::new(secrets),
-        Arc::new(SafeWebhookTransport::new(
-            [config.runtime.bind, config.control.bind],
-            config.webhook_allowed_private_ips.clone(),
-            config.webhook_extra_root_cert_der.as_deref(),
-        )),
-        Arc::new(SystemClock),
-    ))
-}
-
-fn build_projection_expansion_worker(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-    runtime_incarnation: Uuid,
-) -> Arc<ProjectionExpansionWorker> {
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    let materializer = Arc::new(PostgresIdentityProjectionMaterializer::new(
-        source_reader,
-        projection_protector,
-    ));
-    Arc::new(
-        ProjectionExpansionWorker::new(
-            Arc::new(PostgresProjectionExpansionRepository::new(
-                database,
-                materializer,
-            )),
-            Arc::new(SystemClock),
-            config.runtime_process_id.clone(),
-            runtime_incarnation,
-            config.publication_lease_ttl,
-            DEFAULT_PROJECTION_EXPANSION_BATCH_SIZE,
-        )
-        .expect("validated projection expansion worker configuration"),
-    )
-}
-
-fn build_webhook_worker(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-    runtime_incarnation: Uuid,
-) -> Arc<WebhookWorker> {
-    let provisioning = config
-        .provisioning
-        .as_ref()
-        .expect("validated Runtime configuration has provisioning stores");
-    let secret_store = EncryptedFileStore::new(
-        provisioning.configuration_secret_store_root.clone(),
-        provisioning.configuration_secret_store_key.expose_copy(),
-    )
-    .expect("validated readable webhook secret store configuration");
-    let (_, projection_protector) = build_projection_materializer_capabilities(config);
-    Arc::new(
-        WebhookWorker::new(
-            Arc::new(PostgresWebhookRepository::new(
-                database,
-                projection_protector,
-            )),
-            Arc::new(EncryptedFileProviderSecretResolver::new(secret_store)),
-            Arc::new(SafeWebhookTransport::new(
-                [config.runtime.bind, config.control.bind],
-                config.webhook_allowed_private_ips.clone(),
-                config.webhook_extra_root_cert_der.as_deref(),
-            )),
-            Arc::new(SystemClock),
-            config.runtime_process_id.clone(),
-            runtime_incarnation,
-            config.publication_lease_ttl,
-        )
-        .expect("validated webhook delivery worker configuration"),
-    )
-}
-
-fn forbidden_smtp_listener_destinations(config: &ServerConfig) -> ForbiddenSmtpDestinations {
-    let mut forbidden = ForbiddenSmtpDestinations::default();
-    for bind in [config.runtime.bind, config.control.bind] {
-        forbidden.insert_listener_bind(bind);
-    }
-    forbidden
-}
-
-fn build_runtime_admission(config: &ServerConfig) -> Arc<AdmissionService> {
-    let admission = config
-        .admission
-        .as_ref()
-        .expect("validated Runtime configuration has admission settings");
-    let distributed = admission.redis_url.as_ref().map(|url| {
-        Arc::new(
-            RedisAdmissionCounter::new(url.expose(), admission.redis_timeout)
-                .expect("validated Redis admission URL"),
-        ) as Arc<dyn application::DistributedAdmissionCounter>
-    });
-    Arc::new(AdmissionService::new(
-        admission.namespace.clone(),
-        admission.digest_key.expose_copy(),
-        admission.maximum_processes.get(),
-        distributed,
-    ))
-}
-
-fn build_identity_projection_materializer(
-    config: &ServerConfig,
-) -> Arc<PostgresIdentityProjectionMaterializer> {
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    Arc::new(PostgresIdentityProjectionMaterializer::new(
-        source_reader,
-        projection_protector,
-    ))
-}
-
-fn build_projection_materializer_capabilities(
-    config: &ServerConfig,
-) -> (
-    Arc<dyn DurableEmailAddressReader>,
-    Arc<dyn ProjectionVerifiedEmailProtector>,
-) {
-    let deployment = config
-        .instance_id
-        .clone()
-        .expect("validated configuration has an instance ID");
-    let build_material =
-        |active: &crate::config::RuntimeKeyConfig,
-         retained: &BTreeMap<i32, crate::config::RuntimeKeyConfig>| {
-            let active = RuntimeKeyMaterial::new(
-                active.digest_key.expose_copy(),
-                active.protection_key.expose_copy(),
-            );
-            let retained = retained
-                .iter()
-                .map(|(version, keys)| {
-                    (
-                        *version,
-                        RuntimeKeyMaterial::new(
-                            keys.digest_key.expose_copy(),
-                            keys.protection_key.expose_copy(),
-                        ),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            (active, retained)
-        };
-    let source_reader: Arc<dyn DurableEmailAddressReader> =
-        match config.email_identity_protection.as_ref() {
-            Some(email) => {
-                let (active, retained) = build_material(&email.active, &email.retained);
-                Arc::new(
-                    SoftwareDurableEmailAddressReader::new(
-                        deployment.clone(),
-                        email.active_version,
-                        active,
-                        retained,
-                    )
-                    .expect("validated durable email identity protection configuration"),
-                )
-            }
-            None => Arc::new(UnavailableDurableEmailAddressReader),
-        };
-    let projection = &config.projection_email_protection;
-    let (active, retained) = build_material(&projection.active, &projection.retained);
-    let projection_protector = Arc::new(
-        SoftwareProjectionVerifiedEmailProtector::new(
-            deployment,
-            projection.active_version,
-            active,
-            retained,
-        )
-        .expect("validated projection verified-email protection configuration"),
-    );
-    (source_reader, projection_protector)
-}
-
-fn protection_material(
-    protection: &crate::config::RuntimeProtectionConfig,
-) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
-    let active = RuntimeKeyMaterial::new(
-        protection.active.digest_key.expose_copy(),
-        protection.active.protection_key.expose_copy(),
-    );
-    let retained = protection
-        .retained
-        .iter()
-        .map(|(version, keys)| {
-            (
-                *version,
-                RuntimeKeyMaterial::new(
-                    keys.digest_key.expose_copy(),
-                    keys.protection_key.expose_copy(),
-                ),
-            )
-        })
-        .collect();
-    (protection.active_version, active, retained)
-}
-
-fn identity_mutation_target_material(
-    config: &ServerConfig,
-) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
-    // The reviewed short-lived target material is shared only as raw roots. Identity target
-    // facades apply their own cryptographic deployment domain and expose disjoint capabilities.
-    protection_material(&config.managed_reauthorization_target_protection)
-}
-
-fn identity_mutation_evidence_material(
-    config: &ServerConfig,
-) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
-    protection_material(&config.identity_mutation_evidence_protection)
-}
-
-fn build_identity_runtime_protector(config: &ServerConfig) -> Arc<SplitRuntimeProtector> {
-    let deployment = config
-        .instance_id
-        .as_deref()
-        .expect("validated instance ID");
-    let build = |protection: &crate::config::RuntimeProtectionConfig| {
-        let (version, active, retained) = protection_material(protection);
-        SoftwareRuntimeProtector::new(deployment.to_owned(), version, active, retained)
-            .expect("validated protection ring")
-    };
-    let runtime = config
-        .runtime_protection
-        .as_ref()
-        .expect("Runtime-only identity service requires generic Runtime protection");
-    let email = config.email_identity_protection.as_ref().map(|protection| {
-        let runtime_shape = crate::config::RuntimeProtectionConfig {
-            active_version: protection.active_version,
-            active: protection.active.clone(),
-            retained: protection.retained.clone(),
-        };
-        build(&runtime_shape)
-    });
-    let projection = &config.projection_email_protection;
-    let projection_shape = crate::config::RuntimeProtectionConfig {
-        active_version: projection.active_version,
-        active: projection.active.clone(),
-        retained: projection.retained.clone(),
-    };
-    Arc::new(SplitRuntimeProtector::new_with_projection_email(
-        build(runtime),
-        email,
-        build(&projection_shape),
-    ))
-}
-
-fn build_identity_mutation_control_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-) -> Arc<IdentityMutationControlService> {
-    let deployment = config
-        .instance_id
-        .as_deref()
-        .expect("validated instance ID");
-    let (target_version, target_active, target_retained) =
-        identity_mutation_target_material(config);
-    let target = Arc::new(
-        SoftwareIdentityMutationTargetIssuer::new(
-            deployment,
-            target_version,
-            target_active,
-            target_retained,
-        )
-        .expect("validated identity mutation target issuer"),
-    );
-    let (evidence_version, evidence_active, evidence_retained) =
-        identity_mutation_evidence_material(config);
-    let evidence = Arc::new(
-        SoftwareIdentityMutationCandidateVerifier::new(
-            deployment,
-            evidence_version,
-            evidence_active,
-            evidence_retained,
-        )
-        .expect("validated identity mutation evidence verifier"),
-    );
-    let (source_reader, projection_protector) = build_projection_materializer_capabilities(config);
-    let repository = Arc::new(PostgresControlIdentityMutationRepository::new(
-        database,
-        Arc::new(PostgresIdentityProjectionMaterializer::new(
-            source_reader,
-            projection_protector,
-        )),
-        config.required_runtime_process_ids.clone(),
-    ));
-    Arc::new(
-        IdentityMutationControlService::new(
-            repository,
-            target,
-            evidence,
-            Arc::new(SystemClock),
-            config.runtime.external_base.clone(),
-            IdentityMutationProviderCapability::controlled_oidc(),
-        )
-        .expect("validated identity mutation Control service"),
-    )
-}
-
-const PROVIDER_CALLBACK_CONCURRENCY_LIMIT: usize = 16;
-const GOOGLE_PROVIDER_ORIGINS: [&str; 4] = [
-    "https://accounts.google.com",
-    "https://oauth2.googleapis.com",
-    "https://www.googleapis.com",
-    "https://openidconnect.googleapis.com",
-];
-
-struct ComposedProviderClients {
-    oidc: RestrictedOidcProviderClient,
-    google: RestrictedOidcProviderClient,
-    registry: Arc<ProviderClientRegistry>,
-}
-
-fn build_provider_clients(config: &ServerConfig) -> ComposedProviderClients {
-    let callback_budget = Arc::new(Semaphore::new(PROVIDER_CALLBACK_CONCURRENCY_LIMIT));
-    let oidc = RestrictedOidcProviderClient::new_with_budget(
-        config.provider_allowed_origins.clone(),
-        config.provider_allow_http_loopback,
-        callback_budget.clone(),
-    )
-    .expect("validated generic OIDC endpoint policy");
-    let google = RestrictedOidcProviderClient::new_with_budget_and_callback_policy(
-        GOOGLE_PROVIDER_ORIGINS,
-        false,
-        config.provider_allow_http_loopback,
-        callback_budget.clone(),
-    )
-    .expect("fixed Google endpoint policy");
-    let registry = Arc::new(ProviderClientRegistry::new(
-        oidc.clone(),
-        google.clone(),
-        GithubOAuthProviderClient::new_with_budget_and_callback_policy(
-            callback_budget,
-            config.provider_allow_http_loopback,
-        )
-        .expect("fixed GitHub provider transport"),
-    ));
-    ComposedProviderClients {
-        oidc,
-        google,
-        registry,
-    }
-}
-
-fn build_identity_mutation_runtime_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-    runtime_incarnation: Uuid,
-    provider_clients: &ComposedProviderClients,
-) -> Arc<IdentityMutationRuntimeService> {
-    let deployment = config
-        .instance_id
-        .as_deref()
-        .expect("validated instance ID");
-    let protector = build_identity_runtime_protector(config);
-    let (target_version, target_active, target_retained) =
-        identity_mutation_target_material(config);
-    let target = Arc::new(
-        SoftwareIdentityMutationTargetVerifier::new(
-            deployment,
-            target_version,
-            target_active,
-            target_retained,
-        )
-        .expect("validated identity mutation target verifier"),
-    );
-    let (evidence_version, evidence_active, evidence_retained) =
-        identity_mutation_evidence_material(config);
-    let evidence = Arc::new(
-        SoftwareIdentityMutationProofMaterialProtector::new(
-            deployment,
-            evidence_version,
-            evidence_active,
-            evidence_retained,
-        )
-        .expect("validated identity mutation evidence producer"),
-    );
-    let stores = config
-        .provisioning
-        .as_ref()
-        .expect("validated Runtime provider secret store");
-    let secret_store = EncryptedFileStore::new(
-        stores.configuration_secret_store_root.clone(),
-        stores.configuration_secret_store_key.expose_copy(),
-    )
-    .expect("validated provider secret store");
-    let provider = provider_clients.registry.clone();
-    Arc::new(IdentityMutationRuntimeService::new(
-        Arc::new(PostgresRuntimeIdentityMutationRepository::new(
-            database,
-            config.runtime_process_id.clone(),
-            runtime_incarnation,
-            config.required_runtime_process_ids.clone(),
-        )),
-        protector.clone(),
-        target,
-        evidence,
-        Arc::new(SoftwareIdentityMutationDurableEmailProtector::new(
-            protector.clone(),
-        )),
-        provider,
-        Arc::new(EncryptedFileProviderSecretResolver::new(secret_store)),
-        Arc::new(SystemClock),
-        config.runtime.external_base.clone(),
-        IdentityMutationProviderCapability::controlled_oidc(),
-    ))
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "Runtime composition keeps one process incarnation and physically distinct short-term, email identity, projection email, managed target, and managed credential custody visible"
-)]
-fn build_runtime_auth_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-    runtime_incarnation: Uuid,
-    provider_clients: &ComposedProviderClients,
-) -> (
-    Arc<RuntimeAuthService>,
-    Arc<ManagedConnectionService>,
-    Arc<ManagedReauthorizationRuntimeService>,
-) {
-    let stores = config
-        .provisioning
-        .as_ref()
-        .expect("validated Runtime configuration has signer and provider-secret stores");
-    let protection = config
-        .runtime_protection
-        .as_ref()
-        .expect("validated Runtime configuration has protection keys");
-    let signer_store = EncryptedFileStore::new(
-        stores.signer_store_root.clone(),
-        stores.signer_store_key.expose_copy(),
-    )
-    .expect("validated signer store configuration");
-    let secret_store = EncryptedFileStore::new(
-        stores.configuration_secret_store_root.clone(),
-        stores.configuration_secret_store_key.expose_copy(),
-    )
-    .expect("validated provider-secret store configuration");
-    let deployment_context = config
-        .instance_id
-        .clone()
-        .expect("validated Runtime configuration has an instance ID");
-    let build_ring =
-        |active_version: i32,
-         active: &crate::config::RuntimeKeyConfig,
-         retained: &BTreeMap<i32, crate::config::RuntimeKeyConfig>| {
-            let active = RuntimeKeyMaterial::new(
-                active.digest_key.expose_copy(),
-                active.protection_key.expose_copy(),
-            );
-            let retained = retained
-                .iter()
-                .map(|(version, keys)| {
-                    (
-                        *version,
-                        RuntimeKeyMaterial::new(
-                            keys.digest_key.expose_copy(),
-                            keys.protection_key.expose_copy(),
-                        ),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            SoftwareRuntimeProtector::new(
-                deployment_context.clone(),
-                active_version,
-                active,
-                retained,
-            )
-            .expect("validated Runtime protection configuration")
-        };
-    let projection_email = &config.projection_email_protection;
-    let protector = SplitRuntimeProtector::new_with_projection_email(
-        build_ring(
-            protection.active_version,
-            &protection.active,
-            &protection.retained,
-        ),
-        config
-            .email_identity_protection
-            .as_ref()
-            .map(|email_identity| {
-                build_ring(
-                    email_identity.active_version,
-                    &email_identity.active,
-                    &email_identity.retained,
-                )
-            }),
-        build_ring(
-            projection_email.active_version,
-            &projection_email.active,
-            &projection_email.retained,
-        ),
-    );
-    let interaction_readable_key_versions = protector.readable_key_versions();
-    let protector = Arc::new(protector);
-
-    let managed_protection = config
-        .managed_credential_protection
-        .as_ref()
-        .expect("validated Runtime managed credential key ring");
-    let managed_retained = managed_protection
-        .retained
-        .iter()
-        .map(|(version, key)| {
-            (
-                *version,
-                ManagedCredentialKeyMaterial::new(key.expose_copy()),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let managed_protector = Arc::new(
-        SoftwareManagedCredentialProtector::new(
-            deployment_context,
-            managed_protection.active_version,
-            ManagedCredentialKeyMaterial::new(managed_protection.active_key.expose_copy()),
-            managed_retained,
-        )
-        .expect("validated managed credential protection configuration"),
-    );
-
-    let provider = provider_clients.registry.as_ref().clone();
-    let secret_resolver = Arc::new(EncryptedFileProviderSecretResolver::new(secret_store));
-    let email = Arc::new(
-        PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-            database.clone(),
-            config.runtime_process_id.clone(),
-            runtime_incarnation,
-            config.required_runtime_process_ids.clone(),
-            time::Duration::seconds(
-                i64::try_from(
+                api_versions: vec!["v1".to_owned()],
+                credential_class: "operator-api-key".to_owned(),
+                mcp_url: config.control_mcp.enabled.then(|| {
                     config
-                        .publication_lease_ttl
-                        .as_secs()
-                        .max(5)
-                        .saturating_mul(2),
-                )
-                .expect("validated Runtime publication lease duration"),
-            ),
-        ),
-    );
-    let mail_worker = Arc::new(
-        MailWorker::new(
-            email.clone(),
-            Arc::new(SafeSmtpTransport::with_egress_policy(
-                forbidden_smtp_listener_destinations(config),
-                config.smtp_extra_root_cert_der.as_deref(),
-                config
-                    .deployment_smtp
-                    .as_ref()
-                    .map_or(&[], |smtp| smtp.explicitly_allowed_private_ips.as_slice()),
-            )),
-            secret_resolver.clone(),
-            protector.clone(),
-            config.runtime_process_id.clone(),
-        )
-        .expect("validated mail worker configuration"),
-    );
-
-    let managed_reauthorization_target_verifier =
-        build_managed_reauthorization_target_verifier(config);
-    let target_readable_key_versions =
-        managed_reauthorization_target_verifier.readable_key_versions();
-    let managed_adapter = Arc::new(RestrictedOidcManagedProfileAdapter::new(
-        provider_clients.oidc.clone(),
-        provider_clients.google.clone(),
-        secret_resolver.clone(),
-    ));
-    let projection_materializer = build_identity_projection_materializer(config);
-    let managed_repository = Arc::new(
-        PostgresManagedConnectionRepository::new_with_projection_materializer(
-            database.clone(),
-            projection_materializer.clone(),
-        ),
-    );
-    let interaction_cleanup = Arc::new(
-        ManagedInteractionCleanupService::new(
-            managed_repository.clone(),
-            interaction_readable_key_versions,
-            target_readable_key_versions,
-            Arc::new(SystemClock),
-        )
-        .expect("validated Runtime short-term readable key inventory"),
-    );
-    let managed_sync = Arc::new(
-        ManagedConnectionService::new(
-            managed_repository.clone(),
-            managed_protector.clone(),
-            interaction_cleanup,
-            managed_adapter,
-            Arc::new(SystemClock),
-        )
-        .expect("validated managed provider adapter capability"),
-    );
-    let managed_reauthorization = Arc::new(
-        ManagedReauthorizationRuntimeService::new(
-            Arc::new(PostgresManagedReauthorizationRepository::new(
-                database.clone(),
-            )),
-            managed_repository,
-            protector.clone(),
-            managed_reauthorization_target_verifier,
-            managed_protector.clone(),
-            Arc::new(provider.clone()),
-            secret_resolver.clone(),
-            Arc::new(SystemClock),
-            crate::adapters::oidc::managed_profile_capabilities(),
-        )
-        .expect("validated managed reauthorization capability"),
-    );
-    let auth = Arc::new(RuntimeAuthService::new(
-        Arc::new(PostgresAuthenticationRepository::new_with_runtime_identity(
-            database.clone(),
-            config.runtime_process_id.clone(),
-            runtime_incarnation,
-        )),
-        Arc::new(
-            PostgresSessionAuthorityRepository::new_with_runtime_identity_and_managed_protector(
-                database.clone(),
-                config.runtime_process_id.clone(),
-                runtime_incarnation,
-                managed_protector,
-                protector.clone(),
-                projection_materializer,
-            ),
-        ),
-        Arc::new(
-            PostgresRuntimeAuthorityRepository::new_with_runtime_identity_and_protector(
-                database,
-                config.runtime_process_id.clone(),
-                runtime_incarnation,
-                config.required_runtime_process_ids.clone(),
-                protector.clone(),
-            ),
-        ),
-        email,
-        mail_worker,
-        protector,
-        Arc::new(EncryptedFileRuntimeSigner::new(signer_store)),
-        secret_resolver,
-        Arc::new(provider),
-        crate::adapters::oidc::managed_profile_capabilities(),
-        Arc::new(SystemClock),
-        config.runtime.external_base.clone(),
-    ));
-    (auth, managed_sync, managed_reauthorization)
-}
-
-fn managed_reauthorization_target_material(
-    config: &ServerConfig,
-) -> (i32, RuntimeKeyMaterial, BTreeMap<i32, RuntimeKeyMaterial>) {
-    let protection = &config.managed_reauthorization_target_protection;
-    let active = RuntimeKeyMaterial::new(
-        protection.active.digest_key.expose_copy(),
-        protection.active.protection_key.expose_copy(),
-    );
-    let retained = protection
-        .retained
-        .iter()
-        .map(|(version, keys)| {
-            (
-                *version,
-                RuntimeKeyMaterial::new(
-                    keys.digest_key.expose_copy(),
-                    keys.protection_key.expose_copy(),
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    (protection.active_version, active, retained)
-}
-
-fn build_managed_reauthorization_target_verifier(
-    config: &ServerConfig,
-) -> Arc<SoftwareManagedReauthorizationTargetVerifier> {
-    let (active_version, active, retained) = managed_reauthorization_target_material(config);
-    Arc::new(
-        SoftwareManagedReauthorizationTargetVerifier::new(
-            config
-                .instance_id
-                .as_deref()
-                .expect("validated instance ID"),
-            active_version,
-            active,
-            retained,
-        )
-        .expect("validated managed reauthorization target verifier configuration"),
-    )
-}
-
-fn build_managed_reauthorization_target_issuer(
-    config: &ServerConfig,
-) -> Arc<SoftwareManagedReauthorizationTargetIssuer> {
-    let (active_version, active, retained) = managed_reauthorization_target_material(config);
-    Arc::new(
-        SoftwareManagedReauthorizationTargetIssuer::new(
-            config
-                .instance_id
-                .as_deref()
-                .expect("validated instance ID"),
-            active_version,
-            active,
-            retained,
-        )
-        .expect("validated managed reauthorization target issuer configuration"),
-    )
-}
-
-fn build_managed_reauthorization_service(
-    database: DatabaseConnection,
-    config: &ServerConfig,
-) -> Arc<ManagedReauthorizationControlService> {
-    let target_issuer = build_managed_reauthorization_target_issuer(config);
-    Arc::new(
-        ManagedReauthorizationControlService::new(
-            Arc::new(PostgresManagedReauthorizationRepository::new(database)),
-            target_issuer,
-            Arc::new(SystemClock),
-            config.runtime.external_base.clone(),
-            crate::adapters::oidc::managed_profile_capabilities(),
-        )
-        .expect("validated managed reauthorization capability"),
+                        .control
+                        .external_base
+                        .join("mcp")
+                        .expect("validated Control base accepts the MCP path")
+                        .to_string()
+                }),
+            }),
+            provisioning: capabilities.provisioning,
+            lifecycle: capabilities.lifecycle,
+            email_control: capabilities.email_control,
+            deployment_smtp: config.deployment_smtp.clone().map(Arc::new),
+            managed_connections: capabilities.managed_connections,
+            managed_reauthorization: capabilities.managed_reauthorization,
+            identity_mutations: capabilities.identity_mutations,
+            projection_policy: capabilities.projection_policy,
+            mcp_confirmation: capabilities.mcp_confirmation,
+            webhooks: capabilities.webhooks,
+            provider_onboarding: capabilities.provider_onboarding,
+            client_keys: capabilities.client_keys,
+        },
+        config,
     )
 }
 
@@ -1408,7 +374,10 @@ fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &Serve
     let public = Router::new()
         .route("/", get(runtime_root))
         .route("/auth/", get(runtime_shell))
-        .route("/auth/assets/{*path}", get(runtime_asset))
+        .route(
+            "/auth/assets/{*path}",
+            get(runtime_asset).layer(CompressionLayer::new().br(true).gzip(true)),
+        )
         .route("/health", get(liveness))
         .route("/ready", get(runtime_readiness))
         .route(
@@ -1429,6 +398,47 @@ fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &Serve
         listener,
         router.with_state(state),
         HttpPlane::Runtime,
+        config.request_timeout,
+        config.max_request_bytes,
+        256,
+    )
+}
+
+fn client_router(listener: &ListenerConfig, state: ClientState, config: &ServerConfig) -> Router {
+    let protected = Router::new()
+        .route(
+            "/projects/{project_id}/users",
+            get(client_list_project_users),
+        )
+        .route(
+            "/projects/{project_id}/users/lookup",
+            post(client_lookup_project_user),
+        )
+        .route(
+            "/projects/{project_id}/users/{user_id}",
+            get(client_get_project_user),
+        )
+        .route(
+            "/projects/{project_id}/applications/{application_id}/users/{user_id}",
+            get(client_get_application_user_projection),
+        )
+        .route(
+            "/projects/{project_id}/tokens/introspect",
+            post(client_introspect_project_token),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_client_key,
+        ));
+    let router = Router::new()
+        .route("/health", get(liveness))
+        .route("/ready", get(client_readiness))
+        .nest("/v1", protected)
+        .with_state(state);
+    mount_and_bound(
+        listener,
+        router,
+        HttpPlane::Client,
         config.request_timeout,
         config.max_request_bytes,
         256,
@@ -1658,6 +668,14 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             post(revoke_signing_key),
         )
         .route(
+            "/projects/{project_id}/provider-egress-policy",
+            get(get_provider_egress_policy).put(update_provider_egress_policy),
+        )
+        .route(
+            "/projects/{project_id}/providers/oidc/preflight",
+            post(preflight_oidc_provider),
+        )
+        .route(
             "/projects/{project_id}/providers",
             get(list_providers).post(create_provider),
         )
@@ -1678,6 +696,10 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             get(get_email_method_policy).put(update_email_method_policy),
         )
         .route(
+            "/projects/{project_id}/email-method/assignments",
+            get(list_email_assignments),
+        )
+        .route(
             "/projects/{project_id}/applications/{application_id}/email-method",
             put(assign_email_method),
         )
@@ -1687,7 +709,7 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         )
         .route(
             "/system/smtp-default-generations",
-            get(list_deployment_smtp_generations),
+            get(list_deployment_smtp_generations).post(reconcile_deployment_smtp_generation),
         )
         .route(
             "/system/smtp-default-generations/{generation}/disable",
@@ -1740,8 +762,12 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         ));
     let mut application = Router::new()
         .route("/", get(control_root))
+        .route("/console", get(control_shell))
         .route("/console/", get(control_shell))
-        .route("/console/assets/{*path}", get(control_asset))
+        .route(
+            "/console/assets/{*path}",
+            get(control_asset).layer(CompressionLayer::new().br(true).gzip(true)),
+        )
         .route("/console/{*path}", get(control_shell))
         .route("/health", get(liveness))
         .route("/ready", get(control_readiness))
@@ -1779,6 +805,22 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
 
 fn control_lifecycle_router() -> Router<ControlState> {
     Router::new()
+        .route(
+            "/projects/{project_id}/client-keys",
+            get(list_project_client_keys).post(create_project_client_key),
+        )
+        .route(
+            "/projects/{project_id}/client-keys/{key_id}",
+            get(get_project_client_key),
+        )
+        .route(
+            "/projects/{project_id}/client-keys/{key_id}/acknowledge",
+            post(acknowledge_project_client_key_delivery),
+        )
+        .route(
+            "/projects/{project_id}/client-keys/{key_id}/revoke",
+            post(revoke_project_client_key),
+        )
         .route("/projects/{project_id}/users", get(list_project_users))
         .route(
             "/projects/{project_id}/users/{user_id}",
@@ -2081,8 +1123,8 @@ fn scoped_email_admission_dimension<'a>(
     }
 }
 
-async fn runtime_asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
-    web_assets::asset(WebPlane::Runtime, &format!("assets/{path}"), &headers)
+async fn runtime_asset(Path(path): Path<String>) -> Response {
+    web_assets::asset(WebPlane::Runtime, &format!("assets/{path}"))
 }
 
 async fn runtime_preflight(
@@ -2984,6 +2026,8 @@ const fn identity_mutation_status_str(
 struct ManagedReauthorizationHostedBootstrap {
     project_public_id: String,
     provider_key: String,
+    provider_display_name: String,
+    provider_kind: String,
     status: String,
     revision: i64,
     csrf: String,
@@ -3050,6 +2094,8 @@ async fn managed_reauthorization_shell(
     let body = ManagedReauthorizationHostedBootstrap {
         project_public_id: bootstrap.interaction.project_public_id,
         provider_key: bootstrap.interaction.provider_key,
+        provider_display_name: bootstrap.interaction.provider_display_name,
+        provider_kind: bootstrap.interaction.provider_kind.as_str().to_owned(),
         status: bootstrap.interaction.status.as_str().to_owned(),
         revision: bootstrap.interaction.revision,
         csrf: bootstrap.csrf.to_string(),
@@ -3870,8 +2916,8 @@ async fn provider_callback(
                     application::IdentityMutationCallbackOutcome::Proved {
                         continuation, ..
                     } => Some(continuation.to_string()),
-                    application::IdentityMutationCallbackOutcome::Duplicate(_)
-                    | application::IdentityMutationCallbackOutcome::TerminalizedFailure(_)
+                    application::IdentityMutationCallbackOutcome::Duplicate
+                    | application::IdentityMutationCallbackOutcome::TerminalizedFailure
                     | application::IdentityMutationCallbackOutcome::TerminalizedStaleAuthority => {
                         None
                     }
@@ -4058,6 +3104,8 @@ async fn provider_callback(
                 let payload = serde_json::json!({
                     "project_public_id": interaction.project_public_id,
                     "provider_key": interaction.provider_key,
+                    "provider_display_name": interaction.provider_display_name,
+                    "provider_kind": interaction.provider_kind.as_str(),
                     "status": interaction.status.as_str(),
                     "revision": interaction.revision,
                     "expires_at": timestamp(interaction.expires_at),
@@ -4635,8 +3683,8 @@ async fn control_shell(State(state): State<ControlState>) -> Response {
     web_assets::shell(WebPlane::Control, &state.probe.base_path)
 }
 
-async fn control_asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
-    web_assets::asset(WebPlane::Control, &format!("assets/{path}"), &headers)
+async fn control_asset(Path(path): Path<String>) -> Response {
+    web_assets::asset(WebPlane::Control, &format!("assets/{path}"))
 }
 
 async fn liveness() -> Json<HealthResponse> {
@@ -4645,6 +3693,20 @@ async fn liveness() -> Json<HealthResponse> {
 
 async fn runtime_readiness(State(state): State<RuntimeState>) -> Response {
     readiness_response(state.probe.ready.load(Ordering::Acquire))
+}
+
+async fn client_readiness(State(state): State<ClientState>) -> Response {
+    if !state.probe.ready.load(Ordering::Acquire) {
+        return readiness_response(false);
+    }
+    let ready = match state.readiness.as_deref() {
+        Some(readiness) => readiness
+            .readiness()
+            .await
+            .is_ok_and(|snapshot| snapshot.is_ready()),
+        None => true,
+    };
+    readiness_response(ready)
 }
 
 async fn control_readiness(State(state): State<ControlState>) -> Response {
@@ -4663,6 +3725,212 @@ fn readiness_response(ready: bool) -> Response {
         HealthResponse::unavailable()
     };
     (status, Json(body)).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientUserListQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn client_list_project_users(
+    State(state): State<ClientState>,
+    Extension(request_id): Extension<String>,
+    Extension(principal): Extension<application::ClientPrincipal>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    let Ok(Query(query)) = Query::<ClientUserListQuery>::try_from_uri(&uri) else {
+        return client_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let result = client_api(&state)
+        .map(|service| service.list_users(&principal, query.cursor.as_deref(), query.limit));
+    let result = match result {
+        Ok(future) => future.await.and_then(client_user_list),
+        Err(error) => Err(error),
+    };
+    client_json(result, &request_id)
+}
+
+async fn client_get_project_user(
+    State(state): State<ClientState>,
+    Extension(request_id): Extension<String>,
+    Extension(principal): Extension<application::ClientPrincipal>,
+    Path((_project_id, user_id)): Path<(String, String)>,
+) -> Response {
+    let result = match client_api(&state) {
+        Ok(service) => service.user(&principal, &user_id).await.map(client_user),
+        Err(error) => Err(error),
+    };
+    client_json(result, &request_id)
+}
+
+async fn client_lookup_project_user(
+    State(state): State<ClientState>,
+    Extension(request_id): Extension<String>,
+    Extension(principal): Extension<application::ClientPrincipal>,
+    ClientJson(request): ClientJson<client_types::LookupClientUserRequest>,
+) -> Response {
+    let result = match client_api(&state) {
+        Ok(service) => service
+            .lookup_user_by_email(&principal, &request.email)
+            .await
+            .map(|user| client_types::LookupClientUserResponse {
+                user: user.map(client_user),
+            }),
+        Err(error) => Err(error),
+    };
+    client_json(result, &request_id)
+}
+
+async fn client_get_application_user_projection(
+    State(state): State<ClientState>,
+    Extension(request_id): Extension<String>,
+    Extension(principal): Extension<application::ClientPrincipal>,
+    Path((_project_id, application_id, user_id)): Path<(String, String, String)>,
+) -> Response {
+    let result = match client_api(&state) {
+        Ok(service) => service
+            .application_projection(&principal, &application_id, &user_id)
+            .await
+            .and_then(client_application_projection),
+        Err(error) => Err(error),
+    };
+    client_json(result, &request_id)
+}
+
+async fn client_introspect_project_token(
+    State(state): State<ClientState>,
+    Extension(request_id): Extension<String>,
+    Extension(principal): Extension<application::ClientPrincipal>,
+    ClientJson(request): ClientJson<client_types::IntrospectProjectTokenRequest>,
+) -> Response {
+    let result = match client_api(&state) {
+        Ok(service) => service
+            .introspect(
+                &principal,
+                &request.token,
+                request.expected_application_id.as_deref(),
+            )
+            .await
+            .and_then(client_token_introspection),
+        Err(error) => Err(error),
+    };
+    client_json(result, &request_id)
+}
+
+fn client_api(state: &ClientState) -> Result<&application::ClientApiService, ApplicationError> {
+    state.api.as_deref().ok_or(ApplicationError::Persistence)
+}
+
+fn client_user(user: application::ClientUser) -> client_types::ClientUser {
+    client_types::ClientUser {
+        user_id: user.user_public_id,
+        project_id: user.project_public_id,
+        status: match user.status {
+            application::ClientUserStatus::Active => client_types::ClientUserStatus::Active,
+            application::ClientUserStatus::Disabled => client_types::ClientUserStatus::Disabled,
+            application::ClientUserStatus::Merged => client_types::ClientUserStatus::Merged,
+        },
+        display_name: user.display_name,
+        picture_url: user.picture_url,
+        verified_email: user.primary_verified_email,
+        user_revision: user.user_revision,
+        created_at: timestamp(user.created_at),
+        updated_at: timestamp(user.updated_at),
+    }
+}
+
+fn client_user_list(
+    page: application::ClientUserPage,
+) -> Result<client_types::ClientUserList, ApplicationError> {
+    if page.users.len() > application::MAX_CLIENT_USER_PAGE_LIMIT {
+        return Err(ApplicationError::Integrity);
+    }
+    Ok(client_types::ClientUserList {
+        items: page.users.into_iter().map(client_user).collect(),
+        next_cursor: page.next_cursor,
+    })
+}
+
+fn client_application_projection(
+    projection: application::ClientApplicationProjection,
+) -> Result<client_types::ClientApplicationUserProjection, ApplicationError> {
+    // The document's updated_at is the projected Project-user timestamp. The projection row's
+    // updated_at is storage/materialization metadata and may legitimately be later after first
+    // materialization or repair, so it must not redefine or invalidate the public document field.
+    client_projection_document(
+        projection.project_public_id,
+        projection.application_public_id,
+        projection.user_public_id,
+        projection.projection_revision,
+        projection.document,
+    )
+}
+
+fn client_projection_document(
+    project_public_id: String,
+    application_public_id: String,
+    user_public_id: String,
+    projection_revision: i64,
+    document: serde_json::Value,
+) -> Result<client_types::ClientApplicationUserProjection, ApplicationError> {
+    let document = user_projection(document)?;
+    if document.user_id != user_public_id || document.projection_revision != projection_revision {
+        return Err(ApplicationError::Integrity);
+    }
+    Ok(client_types::ClientApplicationUserProjection {
+        project_id: project_public_id,
+        application_id: application_public_id,
+        user_id: user_public_id,
+        projection_schema: document.projection_schema,
+        user_revision: document.user_revision,
+        projection_revision: document.projection_revision,
+        display_name: document.display_name,
+        picture_url: document.picture_url,
+        locale: document.locale,
+        verified_email: document.verified_email,
+        status: document.status,
+        created_at: document.created_at,
+        updated_at: document.updated_at,
+    })
+}
+
+fn client_token_introspection(
+    result: application::ClientTokenIntrospection,
+) -> Result<client_types::ProjectTokenIntrospectionResponse, ApplicationError> {
+    match result {
+        application::ClientTokenIntrospection::Inactive => {
+            Ok(client_types::ProjectTokenIntrospectionResponse::Inactive(
+                client_types::InactiveProjectToken { active: false },
+            ))
+        }
+        application::ClientTokenIntrospection::Active(active) => {
+            let projection = client_projection_document(
+                active.project_public_id.clone(),
+                active.application_public_id.clone(),
+                active.user_public_id.clone(),
+                active.projection_revision,
+                active.projection_document,
+            )?;
+            Ok(client_types::ProjectTokenIntrospectionResponse::Active(
+                client_types::ActiveProjectToken {
+                    active: true,
+                    project_id: active.project_public_id,
+                    application_id: active.application_public_id,
+                    user_id: active.user_public_id,
+                    session_id: active.application_session_id.to_string(),
+                    token_type: active.token_type,
+                    issued_at: timestamp(active.issued_at),
+                    expires_at: timestamp(active.expires_at),
+                    user_revision: active.user_revision,
+                    session_revision: active.session_revision,
+                    application_revision: active.application_revision,
+                    projection,
+                },
+            ))
+        }
+    }
 }
 
 async fn service_descriptor(State(state): State<ControlState>) -> Json<ServiceDescriptor> {
@@ -4722,6 +3990,35 @@ where
     }
 }
 
+struct ClientJson<T>(T);
+
+impl<S, T> FromRequest<S> for ClientJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = request
+            .extensions()
+            .get::<String>()
+            .cloned()
+            .unwrap_or_else(|| "unavailable".to_owned());
+        Json::<T>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(|_| {
+                client_error_response(
+                    StatusCode::BAD_REQUEST,
+                    client_types::ClientErrorCode::InvalidRequest,
+                    "The Client request body must be bounded JSON matching the operation schema.",
+                    &request_id,
+                )
+            })
+    }
+}
+
 struct ControlJson<T>(T);
 
 impl<S, T> FromRequest<S> for ControlJson<T>
@@ -4752,6 +4049,94 @@ where
     }
 }
 
+async fn require_client_key(
+    State(state): State<ClientState>,
+    Extension(client): Extension<ClientAddress>,
+    Path(parameters): Path<HashMap<String, String>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<String>()
+        .cloned()
+        .unwrap_or_else(|| "unavailable".to_owned());
+    if let AdmissionDecision::Rejected {
+        retry_after_seconds,
+        ..
+    } = state.admission.admit_client_pre_authority(&client.0).await
+    {
+        return client_rate_limited_response(retry_after_seconds, &request_id);
+    }
+    let Some(project_public_id) = parameters.get("project_id") else {
+        return client_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    let Some(credential) = client_bearer_credential(request.headers()) else {
+        return client_credential_denial(&state, &client, &request_id).await;
+    };
+    let service = match client_api(&state) {
+        Ok(service) => service,
+        Err(error) => return client_problem(error, &request_id),
+    };
+    let principal = service.authenticate(project_public_id, credential).await;
+    match principal {
+        Ok(principal) => {
+            let project_id = principal.project_id.to_string();
+            let key_id = principal.key_id.to_string();
+            if let AdmissionDecision::Rejected {
+                retry_after_seconds,
+                ..
+            } = state
+                .admission
+                .admit_client_authoritative(&client.0, &project_id, &key_id)
+                .await
+            {
+                return client_rate_limited_response(retry_after_seconds, &request_id);
+            }
+            service.observe_client_key_usage(&principal);
+            request.headers_mut().remove(header::AUTHORIZATION);
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(
+            ApplicationError::Integrity
+            | ApplicationError::Persistence
+            | ApplicationError::ExternalStore,
+        ) => client_problem(ApplicationError::Persistence, &request_id),
+        Err(_) => client_credential_denial(&state, &client, &request_id).await,
+    }
+}
+
+async fn client_credential_denial(
+    state: &ClientState,
+    client: &ClientAddress,
+    request_id: &str,
+) -> Response {
+    match state
+        .admission
+        .admit_client_credential_failure(&client.0)
+        .await
+    {
+        AdmissionDecision::Allowed => unauthorized_client(request_id),
+        AdmissionDecision::Rejected {
+            retry_after_seconds,
+            ..
+        } => client_rate_limited_response(retry_after_seconds, request_id),
+    }
+}
+
+fn client_bearer_credential(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?;
+    let credential = value.strip_prefix("Bearer ")?;
+    (!credential.is_empty() && !credential.bytes().any(|byte| byte.is_ascii_whitespace()))
+        .then_some(credential)
+}
+
 async fn require_operator(
     State(state): State<ControlState>,
     request: Request,
@@ -4777,6 +4162,15 @@ async fn require_operator(
 fn provisioning(state: &ControlState) -> Result<&ProvisioningService, ApplicationError> {
     state
         .provisioning
+        .as_deref()
+        .ok_or(ApplicationError::Persistence)
+}
+
+fn provider_onboarding(
+    state: &ControlState,
+) -> Result<&ProviderOnboardingService, ApplicationError> {
+    state
+        .provider_onboarding
         .as_deref()
         .ok_or(ApplicationError::Persistence)
 }
@@ -4871,7 +4265,7 @@ async fn managed_provider_connection_action(
     ) {
         return application_problem(error, request_id);
     }
-    let now = SystemClock.now();
+    let now = state.clock.now();
     let result = match action {
         ManagedControlAction::Synchronize => {
             repository
@@ -5182,6 +4576,15 @@ fn control_lifecycle(state: &ControlState) -> Result<&ControlLifecycleService, A
         .ok_or(ApplicationError::Persistence)
 }
 
+fn client_key_lifecycle(
+    state: &ControlState,
+) -> Result<&application::ClientKeyLifecycleService, ApplicationError> {
+    state
+        .client_keys
+        .as_deref()
+        .ok_or(ApplicationError::Persistence)
+}
+
 fn email_control(state: &ControlState) -> Result<&EmailControlService, ApplicationError> {
     state
         .email_control
@@ -5436,6 +4839,34 @@ async fn update_email_method_policy(
     control_json(result, &request_id)
 }
 
+async fn list_email_assignments(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service.list_assignments(project_id).await.map(|items| {
+            control_types::EmailAssignmentList {
+                items: items
+                    .into_iter()
+                    .map(|assignment| control_types::EmailAssignment {
+                        project_id: assignment.project_id.to_string(),
+                        application_id: assignment.application_id.to_string(),
+                        enabled: assignment.enabled,
+                        security_revision: assignment.security_revision,
+                    })
+                    .collect(),
+            }
+        }),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
 async fn assign_email_method(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -5487,6 +4918,52 @@ async fn list_smtp_configurations(
             }),
             Err(error) => Err(error),
         };
+    control_json(result, &request_id)
+}
+
+async fn reconcile_deployment_smtp_generation(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::ReconcileDeploymentSmtpRequest>,
+) -> Response {
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let Some(configured) = state.deployment_smtp.as_deref() else {
+        return control_json::<control_types::DeploymentSmtpGeneration>(
+            Err(ApplicationError::InvalidTransition),
+            &request_id,
+        );
+    };
+    let tls_mode = match configured.tls_mode.as_str() {
+        "implicit_tls" => application::SmtpControlTlsMode::ImplicitTls,
+        "starttls_required" => application::SmtpControlTlsMode::StarttlsRequired,
+        _ => {
+            return control_json::<control_types::DeploymentSmtpGeneration>(
+                Err(ApplicationError::Integrity),
+                &request_id,
+            );
+        }
+    };
+    let result = match email_control(&state) {
+        Ok(service) => service
+            .reconcile_deployment_smtp(application::ReconcileDeploymentSmtpGeneration {
+                generation: configured.generation,
+                host: configured.host.clone(),
+                port: configured.port,
+                tls_mode,
+                sender_address: configured.sender_address.clone(),
+                expected_safe_fingerprint: configured.safe_fingerprint,
+                explicitly_allowed_private_ips: configured.explicitly_allowed_private_ips.clone(),
+                credential: zeroize::Zeroizing::new(body.credential),
+                idempotency_key,
+                correlation_id: request_uuid(&request_id),
+            })
+            .await
+            .map(control_deployment_smtp),
+        Err(error) => Err(error),
+    };
     control_json(result, &request_id)
 }
 
@@ -5859,7 +5336,9 @@ fn control_smtp(record: application::SmtpConfigurationRecord) -> control_types::
         sender_name: record.sender_name,
         reply_to: record.reply_to,
         retained_until: record.retained_until.map(timestamp),
-        safe_fingerprint: URL_SAFE_NO_PAD.encode(record.safe_fingerprint),
+        safe_fingerprint: record
+            .safe_fingerprint
+            .map(|fingerprint| URL_SAFE_NO_PAD.encode(fingerprint)),
     }
 }
 
@@ -6304,6 +5783,196 @@ fn control_identity_mutation_view(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListProjectClientKeysQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_project_client_keys(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    query: Result<Query<ListProjectClientKeysQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let Ok(Query(query)) = query else {
+        return application_problem(ApplicationError::InvalidInput, &request_id);
+    };
+    match client_key_lifecycle(&state) {
+        Ok(service) => match service
+            .list_project_client_keys(project_id, query.cursor.as_deref(), query.limit)
+            .await
+        {
+            Ok((keys, next_cursor, active_unacknowledged_key)) => {
+                Json(control_types::ProjectClientKeyList {
+                    items: keys.into_iter().map(control_project_client_key).collect(),
+                    next_cursor,
+                    active_unacknowledged_key: active_unacknowledged_key
+                        .map(control_project_client_key),
+                })
+                .into_response()
+            }
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn get_project_client_key(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, key_id)): Path<(String, String)>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let key_id = match resource_uuid(&key_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match client_key_lifecycle(&state) {
+        Ok(service) => match service.get_project_client_key(project_id, key_id).await {
+            Ok(key) => Json(control_project_client_key(key)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn create_project_client_key(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::CreateProjectClientKeyRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    let result = match client_key_lifecycle(&state) {
+        Ok(service) => {
+            service
+                .create_project_client_key(application::CreateProjectClientKey {
+                    project_id,
+                    label: body.label,
+                    idempotency_key,
+                    correlation_id: request_uuid(&request_id),
+                })
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(application::CreateProjectClientKeyResult::Created {
+            metadata,
+            credential,
+        }) => (
+            StatusCode::CREATED,
+            Json(control_types::CreateProjectClientKeyResponse {
+                key: control_project_client_key(metadata),
+                credential: credential.expose().to_owned(),
+            }),
+        )
+            .into_response(),
+        Ok(application::CreateProjectClientKeyResult::ReplayWithoutSecret { metadata }) => {
+            let detail = format!(
+                "This idempotent create already completed for public key ID {}; its one-time credential cannot be shown again. Revoke that key and create another.",
+                metadata.public_key_id
+            );
+            control_problem(
+                StatusCode::CONFLICT,
+                "secret_unavailable",
+                "Credential unavailable",
+                &detail,
+                &request_id,
+            )
+        }
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn acknowledge_project_client_key_delivery(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, key_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::AcknowledgeProjectClientKeyDeliveryRequest>,
+) -> Response {
+    if !body.confirm_stored {
+        return application_problem(ApplicationError::InvalidInput, &request_id);
+    }
+    let (project_id, key_id) = match resource_pair(&project_id, &key_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    match client_key_lifecycle(&state) {
+        Ok(service) => match service
+            .acknowledge_project_client_key_delivery(
+                application::AcknowledgeProjectClientKeyDelivery {
+                    project_id,
+                    key_id,
+                    expected_revision: body.expected_revision,
+                    idempotency_key,
+                    correlation_id: request_uuid(&request_id),
+                },
+            )
+            .await
+        {
+            Ok(key) => Json(control_project_client_key(key)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn revoke_project_client_key(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, key_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::RevokeProjectClientKeyRequest>,
+) -> Response {
+    if !body.confirm {
+        return application_problem(ApplicationError::InvalidInput, &request_id);
+    }
+    let (project_id, key_id) = match resource_pair(&project_id, &key_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    match client_key_lifecycle(&state) {
+        Ok(service) => match service
+            .revoke_project_client_key(application::RevokeProjectClientKey {
+                project_id,
+                key_id,
+                expected_revision: body.expected_revision,
+                idempotency_key,
+                correlation_id: request_uuid(&request_id),
+            })
+            .await
+        {
+            Ok(key) => Json(control_project_client_key(key)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
 async fn list_project_users(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -6511,6 +6180,32 @@ async fn revoke_browser_session(
             Err(error) => application_problem(error, &request_id),
         },
         Err(error) => application_problem(error, &request_id),
+    }
+}
+
+fn control_project_client_key(
+    key: application::ProjectClientKeyRecord,
+) -> control_types::ProjectClientKey {
+    control_types::ProjectClientKey {
+        id: key.id.to_string(),
+        project_id: key.project_id.to_string(),
+        public_key_id: key.public_key_id,
+        label: key.label,
+        status: match key.status {
+            application::ProjectClientKeyStatus::Active => {
+                control_types::ProjectClientKeyStatus::Active
+            }
+            application::ProjectClientKeyStatus::Revoked => {
+                control_types::ProjectClientKeyStatus::Revoked
+            }
+        },
+        digest_key_version: key.digest_key_version,
+        display_prefix: key.display_prefix,
+        revision: key.revision,
+        created_at: timestamp(key.created_at),
+        credential_acknowledged_at: key.credential_acknowledged_at.map(timestamp),
+        last_used_at: key.last_used_at.map(timestamp),
+        revoked_at: key.revoked_at.map(timestamp),
     }
 }
 
@@ -7613,6 +7308,112 @@ async fn signing_key_transition(
     }
 }
 
+fn control_provider_egress_mode(mode: ProviderEgressMode) -> control_types::ProviderEgressMode {
+    match mode {
+        ProviderEgressMode::AllowAll => control_types::ProviderEgressMode::AllowAll,
+        ProviderEgressMode::ExactOrigins => control_types::ProviderEgressMode::ExactOrigins,
+    }
+}
+
+fn domain_provider_egress_mode(mode: control_types::ProviderEgressMode) -> ProviderEgressMode {
+    match mode {
+        control_types::ProviderEgressMode::AllowAll => ProviderEgressMode::AllowAll,
+        control_types::ProviderEgressMode::ExactOrigins => ProviderEgressMode::ExactOrigins,
+    }
+}
+
+fn control_provider_egress_policy(
+    policy: application::ProviderEgressPolicyRecord,
+) -> control_types::ProviderEgressPolicy {
+    control_types::ProviderEgressPolicy {
+        project_id: policy.project_id.to_string(),
+        mode: control_provider_egress_mode(policy.mode),
+        exact_origins: policy.exact_origins,
+        revision: policy.revision,
+    }
+}
+
+async fn get_provider_egress_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match provider_onboarding(&state) {
+        Ok(service) => match service.get_policy(project_id).await {
+            Ok(policy) => Json(control_provider_egress_policy(policy)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn update_provider_egress_policy(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::UpdateProviderEgressPolicyRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match provider_onboarding(&state) {
+        Ok(service) => match service
+            .update_policy(
+                project_id,
+                UpdateProviderEgressPolicy {
+                    mode: domain_provider_egress_mode(body.mode),
+                    exact_origins: body.exact_origins,
+                    expected_revision: body.expected_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(policy) => Json(control_provider_egress_policy(policy)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn preflight_oidc_provider(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::OidcPreflightRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match provider_onboarding(&state) {
+        Ok(service) => match service
+            .preflight(project_id, body.issuer, request_uuid(&request_id))
+            .await
+        {
+            Ok((summary, policy)) => Json(control_types::OidcPreflightResult {
+                canonical_issuer: summary.canonical_issuer,
+                admitted_endpoint_origins: summary.admitted_endpoint_origins,
+                exact_scopes: summary.exact_scopes,
+                authorization_code_supported: summary.authorization_code_supported,
+                pkce_s256_supported: summary.pkce_s256_supported,
+                rs256_id_tokens_supported: summary.rs256_id_tokens_supported,
+                managed_profile_supported: summary.managed_profile_supported,
+                policy_mode: control_provider_egress_mode(policy.mode),
+                policy_revision: policy.revision,
+            })
+            .into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
 async fn list_providers(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -7652,7 +7453,29 @@ async fn create_provider(
     let Ok(idempotency_key) = idempotency_key(&headers) else {
         return invalid_idempotency(&request_id);
     };
-    let provider_kind = control_provider_kind(body.kind, &body.issuer);
+    let (provider_kind, issuer) = match control_provider_create_variant(body.kind, body.issuer) {
+        Ok(provider) => provider,
+        Err(error) => return application_problem(error, &request_id),
+    };
+    let egress_policy_revision = if provider_kind == crate::domain::ProviderKind::Oidc {
+        match provider_onboarding(&state) {
+            Ok(service) => match service
+                .preflight_for_create(
+                    project_id,
+                    issuer.clone(),
+                    body.managed_profile_enabled,
+                    request_uuid(&request_id),
+                )
+                .await
+            {
+                Ok(policy) => Some(policy.revision),
+                Err(error) => return application_problem(error, &request_id),
+            },
+            Err(error) => return application_problem(error, &request_id),
+        }
+    } else {
+        None
+    };
     match provisioning(&state) {
         Ok(service) => match service
             .create_provider(
@@ -7661,12 +7484,13 @@ async fn create_provider(
                     kind: provider_kind,
                     provider_key: body.provider_key,
                     display_name: body.display_name,
-                    issuer: body.issuer,
+                    issuer,
                     client_id: body.client_id,
                     client_secret: zeroize::Zeroizing::new(body.client_secret),
                     managed_profile_enabled: body.managed_profile_enabled,
                     idempotency_key,
                     expected_project_revision: body.expected_project_revision,
+                    egress_policy_revision,
                 },
                 request_uuid(&request_id),
             )
@@ -7952,19 +7776,23 @@ async fn project_jwks(
     }
 }
 
-fn control_provider_kind(
-    kind: Option<runtime_types::ProviderKind>,
-    issuer: &str,
-) -> crate::domain::ProviderKind {
-    match kind {
-        Some(runtime_types::ProviderKind::Oidc) => crate::domain::ProviderKind::Oidc,
-        Some(runtime_types::ProviderKind::Google) => crate::domain::ProviderKind::Google,
-        Some(runtime_types::ProviderKind::Github) => crate::domain::ProviderKind::Github,
-        None => match issuer {
-            crate::domain::GOOGLE_ISSUER => crate::domain::ProviderKind::Google,
-            crate::domain::GITHUB_ISSUER => crate::domain::ProviderKind::Github,
-            _ => crate::domain::ProviderKind::Oidc,
-        },
+fn control_provider_create_variant(
+    kind: runtime_types::ProviderKind,
+    issuer: Option<String>,
+) -> Result<(crate::domain::ProviderKind, String), ApplicationError> {
+    match (kind, issuer) {
+        (runtime_types::ProviderKind::Oidc, Some(issuer)) => {
+            Ok((crate::domain::ProviderKind::Oidc, issuer))
+        }
+        (runtime_types::ProviderKind::Google, None) => Ok((
+            crate::domain::ProviderKind::Google,
+            crate::domain::GOOGLE_ISSUER.to_owned(),
+        )),
+        (runtime_types::ProviderKind::Github, None) => Ok((
+            crate::domain::ProviderKind::Github,
+            crate::domain::GITHUB_ISSUER.to_owned(),
+        )),
+        _ => Err(ApplicationError::InvalidInput),
     }
 }
 
@@ -8114,6 +7942,11 @@ fn hosted_interaction_response(
             .map(|provider| runtime_types::HostedProvider {
                 key: provider.key.clone(),
                 display_name: provider.display_name.clone(),
+                kind: match provider.kind {
+                    crate::domain::ProviderKind::Oidc => runtime_types::ProviderKind::Oidc,
+                    crate::domain::ProviderKind::Google => runtime_types::ProviderKind::Google,
+                    crate::domain::ProviderKind::Github => runtime_types::ProviderKind::Github,
+                },
             })
             .collect(),
         email_available: bootstrap.interaction.email_available,
@@ -8732,11 +8565,29 @@ fn application_problem(error: ApplicationError, request_id: &str) -> Response {
             "Publication pending",
             "Runtime has not observed this key revision for the propagation interval.",
         ),
+        ApplicationError::ClientVerifierUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "client_verifier_unavailable",
+            "Client verifier fleet unavailable",
+            "The required Client verifier fleet is not ready for this credential version.",
+        ),
         ApplicationError::InvalidTransition => (
             StatusCode::CONFLICT,
             "invalid_transition",
             "Invalid state transition",
             "The requested lifecycle transition is not allowed.",
+        ),
+        ApplicationError::ProviderPreflightRejected => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "provider_preflight_rejected",
+            "Provider preflight rejected",
+            "The issuer or discovered provider metadata does not satisfy the OwlAuth OIDC profile or current Project egress policy.",
+        ),
+        ApplicationError::ProviderPreflightUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_preflight_unavailable",
+            "Provider preflight unavailable",
+            "The provider discovery endpoint could not be reached or safely validated.",
         ),
         ApplicationError::Integrity => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -8775,6 +8626,95 @@ fn control_problem(
         .into_response()
 }
 
+fn client_json<T>(result: Result<T, ApplicationError>, request_id: &str) -> Response
+where
+    T: Serialize,
+{
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => client_problem(error, request_id),
+    }
+}
+
+fn client_problem(error: ApplicationError, request_id: &str) -> Response {
+    let (status, code, message) = match error {
+        ApplicationError::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            client_types::ClientErrorCode::InvalidRequest,
+            "The Client request is invalid.",
+        ),
+        ApplicationError::NotFound | ApplicationError::Disabled => (
+            StatusCode::NOT_FOUND,
+            client_types::ClientErrorCode::NotFound,
+            "The requested Client resource was not found or is no longer available.",
+        ),
+        ApplicationError::RevisionConflict
+        | ApplicationError::InvalidTransition
+        | ApplicationError::IdempotencyConflict
+        | ApplicationError::OperationInProgress
+        | ApplicationError::PublicationPending => (
+            StatusCode::CONFLICT,
+            client_types::ClientErrorCode::Conflict,
+            "The Client request is no longer valid in the current state.",
+        ),
+        ApplicationError::Integrity
+        | ApplicationError::Persistence
+        | ApplicationError::ClientVerifierUnavailable
+        | ApplicationError::ProviderPreflightRejected
+        | ApplicationError::ProviderPreflightUnavailable
+        | ApplicationError::ExternalStore => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            client_types::ClientErrorCode::TemporarilyUnavailable,
+            "The Client authority is temporarily unavailable.",
+        ),
+    };
+    client_error_response(status, code, message, request_id)
+}
+
+fn client_rate_limited_response(retry_after_seconds: u64, request_id: &str) -> Response {
+    let retry_after_seconds = retry_after_seconds.clamp(1, 60);
+    let mut response = client_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        client_types::ClientErrorCode::RateLimited,
+        "The Client request rate limit was exceeded.",
+        request_id,
+    );
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn unauthorized_client(request_id: &str) -> Response {
+    let mut response = client_error_response(
+        StatusCode::UNAUTHORIZED,
+        client_types::ClientErrorCode::InvalidCredential,
+        "A single valid Project client Bearer credential is required.",
+        request_id,
+    );
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+fn client_error_response(
+    status: StatusCode,
+    code: client_types::ClientErrorCode,
+    message: &str,
+    request_id: &str,
+) -> Response {
+    (
+        status,
+        Json(client_types::ClientError {
+            code,
+            message: message.to_owned(),
+            request_id: request_id.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
     let (status, code, message) = match error {
         ApplicationError::NotFound | ApplicationError::Disabled => (
@@ -8798,6 +8738,9 @@ fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
         ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
+        | ApplicationError::ClientVerifierUnavailable
+        | ApplicationError::ProviderPreflightRejected
+        | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
             StatusCode::SERVICE_UNAVAILABLE,
             "authority_unavailable",
@@ -9030,7 +8973,7 @@ pub(crate) mod tests {
     }
 
     #[async_trait]
-    impl IdentityMutationRuntimeAuthority for TestIdentityMutationAuthority {
+    impl IdentityMutationRuntimePort for TestIdentityMutationAuthority {
         async fn bootstrap(
             &self,
             _interaction: &str,
@@ -9197,7 +9140,6 @@ pub(crate) mod tests {
             match self.callback_behavior {
                 CallbackBehavior::Proved => {
                     Ok(application::IdentityMutationCallbackOutcome::Proved {
-                        intent: test_identity_view(8, crate::domain::IdentityMutationStatus::Ready),
                         continuation: zeroize::Zeroizing::new(test_identity_interaction()),
                     })
                 }
@@ -9263,7 +9205,7 @@ pub(crate) mod tests {
     }
 
     fn test_identity_runtime_state(
-        authority: Arc<dyn IdentityMutationRuntimeAuthority>,
+        authority: Arc<dyn IdentityMutationRuntimePort>,
         callback_owners: Option<Arc<dyn ProviderCallbackOwnerResolver>>,
     ) -> RuntimeState {
         RuntimeState {
@@ -9705,26 +9647,66 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn omitted_control_provider_kind_infers_only_exact_named_issuers() {
+    fn control_provider_create_variants_derive_only_named_issuers() {
         assert_eq!(
-            control_provider_kind(None, crate::domain::GOOGLE_ISSUER),
-            crate::domain::ProviderKind::Google
+            control_provider_create_variant(runtime_types::ProviderKind::Google, None),
+            Ok((
+                crate::domain::ProviderKind::Google,
+                crate::domain::GOOGLE_ISSUER.to_owned(),
+            ))
         );
         assert_eq!(
-            control_provider_kind(None, crate::domain::GITHUB_ISSUER),
-            crate::domain::ProviderKind::Github
-        );
-        assert_eq!(
-            control_provider_kind(None, "https://issuer.example"),
-            crate::domain::ProviderKind::Oidc
-        );
-        assert_eq!(
-            control_provider_kind(
-                Some(runtime_types::ProviderKind::Oidc),
-                crate::domain::GOOGLE_ISSUER,
+            control_provider_create_variant(
+                runtime_types::ProviderKind::Oidc,
+                Some("https://issuer.example".to_owned()),
             ),
-            crate::domain::ProviderKind::Oidc
+            Ok((
+                crate::domain::ProviderKind::Oidc,
+                "https://issuer.example".to_owned(),
+            ))
         );
+        assert_eq!(
+            control_provider_create_variant(
+                runtime_types::ProviderKind::Google,
+                Some(crate::domain::GOOGLE_ISSUER.to_owned()),
+            ),
+            Err(ApplicationError::InvalidInput)
+        );
+        assert_eq!(
+            control_provider_create_variant(runtime_types::ProviderKind::Oidc, None),
+            Err(ApplicationError::InvalidInput)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_preflight_problem_codes_are_stable_and_safely_bounded() {
+        for (error, status, code) in [
+            (
+                ApplicationError::ProviderPreflightRejected,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "provider_preflight_rejected",
+            ),
+            (
+                ApplicationError::ProviderPreflightUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider_preflight_unavailable",
+            ),
+        ] {
+            let response = application_problem(error, "request-safe-id");
+            assert_eq!(response.status(), status);
+            let body: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), 16_384)
+                    .await
+                    .expect("problem response should be bounded"),
+            )
+            .expect("problem response should be JSON");
+            assert_eq!(body["code"], code);
+            assert_eq!(body["request_id"], "request-safe-id");
+            assert_eq!(body["status"], status.as_u16());
+            let serialized = body.to_string();
+            assert!(!serialized.contains("issuer.example"));
+            assert!(!serialized.contains("upstream"));
+        }
     }
 
     #[test]
@@ -10004,10 +9986,31 @@ pub(crate) mod tests {
             ("OWLAUTH_CONTROL_API_KEY".to_owned(), key),
             ("OWLAUTH_INSTANCE_ID".to_owned(), instance_id.to_owned()),
             (
+                "OWLAUTH_CLIENT_PROCESS_ID".to_owned(),
+                "client-1".to_owned(),
+            ),
+            (
+                "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS".to_owned(),
+                "client-1".to_owned(),
+            ),
+            (
+                "OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "OWLAUTH_CLIENT_KEY_DIGEST_KEY".to_owned(),
+                "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo".to_owned(),
+            ),
+            (
+                "OWLAUTH_SOFTWARE_CUSTODY_KEY".to_owned(),
+                "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4".to_owned(),
+            ),
+            (
                 "OWLAUTH_MODE".to_owned(),
                 match mode {
                     PlaneMode::All => "all",
                     PlaneMode::Runtime => "runtime",
+                    PlaneMode::Client => "client",
                     PlaneMode::Control => "control",
                 }
                 .to_owned(),
@@ -10134,6 +10137,7 @@ pub(crate) mod tests {
         // database sentinel. Touching either downstream path would fail instead of yielding 429.
         let pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
+            client: None,
             control: None,
         };
         let mut routers = build_routers(&config, Some(&pools));
@@ -10309,6 +10313,7 @@ pub(crate) mod tests {
         assert!(control_config.email_identity_protection.is_some());
         let control_pools = DatabasePools {
             runtime: None,
+            client: None,
             control: Some(DatabaseConnection::default()),
         };
         let control = build_routers(&control_config, Some(&control_pools));
@@ -10321,6 +10326,7 @@ pub(crate) mod tests {
         assert!(runtime_config.control_api_key.is_none());
         let runtime_pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
+            client: None,
             control: None,
         };
         let runtime = build_routers(&runtime_config, Some(&runtime_pools));
@@ -10330,6 +10336,7 @@ pub(crate) mod tests {
         let all_config = test_config(PlaneMode::All);
         let all_pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
+            client: None,
             control: Some(DatabaseConnection::default()),
         };
         let all = build_routers(&all_config, Some(&all_pools));
@@ -10344,6 +10351,7 @@ pub(crate) mod tests {
         assert!(config.provisioning.is_some());
         let pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
+            client: None,
             control: None,
         };
         let mut routers = build_routers(&config, Some(&pools));
@@ -10956,6 +10964,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end asset test must compare both planes, encodings, HEAD semantics, and cross-plane isolation"
+    )]
     async fn embedded_assets_are_plane_local_and_representation_correct() {
         let config = test_config(PlaneMode::All);
         let mut routers = build_routers(&config, None);
@@ -10997,24 +11009,38 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(compressed.status(), StatusCode::OK);
         assert_eq!(compressed.headers()[header::CONTENT_ENCODING], "br");
-        assert_eq!(compressed.headers()[header::VARY], "Accept-Encoding");
+        assert_eq!(compressed.headers()[header::VARY], "accept-encoding");
         assert_eq!(
             compressed.headers()[header::CACHE_CONTROL],
             "public, max-age=31536000, immutable"
         );
-        let etag = compressed.headers()[header::ETAG].clone();
-        let not_modified = runtime
+        assert!(!compressed.headers().contains_key(header::ETAG));
+        let identity = runtime
             .clone()
             .oneshot(
                 Request::get(&runtime_asset_path)
-                    .header(header::ACCEPT_ENCODING, "br")
-                    .header(header::IF_NONE_MATCH, etag)
+                    .header(header::ACCEPT_ENCODING, "identity")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(identity.status(), StatusCode::OK);
+        assert!(!identity.headers().contains_key(header::CONTENT_ENCODING));
+        assert_eq!(identity.headers()[header::VARY], "accept-encoding");
+        let head = runtime
+            .clone()
+            .oneshot(
+                Request::head(&runtime_asset_path)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()[header::CONTENT_ENCODING], "gzip");
+        assert!(to_bytes(head.into_body(), 1).await.unwrap().is_empty());
 
         let runtime_filename = runtime_asset_path
             .rsplit('/')
@@ -11031,7 +11057,19 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(cross_plane.status(), StatusCode::NOT_FOUND);
 
+        let slashless_control_shell = control
+            .clone()
+            .oneshot(
+                Request::get("/control/console")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(slashless_control_shell.status(), StatusCode::OK);
+
         let control_shell = control
+            .clone()
             .oneshot(
                 Request::get("/control/console/settings")
                     .body(Body::empty())
@@ -11048,9 +11086,81 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(control_document.contains("name=\"owlauth-control-base\" content=\"/control/\""));
-        assert!(
-            attribute(&control_document, "src").starts_with("/control/console/assets/control-")
+        let control_asset_path = attribute(&control_document, "src");
+        assert!(control_asset_path.starts_with("/control/console/assets/control-"));
+
+        let control_compressed = control
+            .clone()
+            .oneshot(
+                Request::get(&control_asset_path)
+                    .header(header::ACCEPT_ENCODING, "gzip;q=0.8, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_compressed.status(), StatusCode::OK);
+        assert_eq!(control_compressed.headers()[header::CONTENT_ENCODING], "br");
+        assert_eq!(
+            control_compressed.headers()[header::VARY],
+            "accept-encoding"
         );
+        assert_eq!(
+            control_compressed.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(!control_compressed.headers().contains_key(header::ETAG));
+
+        let control_identity = control
+            .clone()
+            .oneshot(
+                Request::get(&control_asset_path)
+                    .header(header::ACCEPT_ENCODING, "identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_identity.status(), StatusCode::OK);
+        assert!(
+            !control_identity
+                .headers()
+                .contains_key(header::CONTENT_ENCODING)
+        );
+        assert_eq!(control_identity.headers()[header::VARY], "accept-encoding");
+
+        let control_head = control
+            .clone()
+            .oneshot(
+                Request::head(&control_asset_path)
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_head.status(), StatusCode::OK);
+        assert_eq!(control_head.headers()[header::CONTENT_ENCODING], "gzip");
+        assert!(
+            to_bytes(control_head.into_body(), 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let control_filename = control_asset_path
+            .rsplit('/')
+            .next()
+            .expect("asset path should have a filename");
+        let reverse_cross_plane = runtime
+            .oneshot(
+                Request::get(format!("/runtime/auth/assets/{control_filename}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reverse_cross_plane.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -11125,6 +11235,552 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(cross_site_rejected.status(), StatusCode::FORBIDDEN);
+    }
+
+    const CLIENT_TEST_PROJECT: &str = "project-a";
+    const CLIENT_TEST_PUBLIC_KEY_ID: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
+    #[test]
+    fn client_projection_preserves_materialized_user_and_projection_revisions() {
+        let converted = client_projection_document(
+            "project-a".to_owned(),
+            "application-a".to_owned(),
+            "user-a".to_owned(),
+            13,
+            serde_json::json!({
+                "user_id": "user-a",
+                "user_revision": 7,
+                "projection_schema": "owlauth.user.v1",
+                "projection_revision": 13,
+                "display_name": null,
+                "picture_url": null,
+                "locale": null,
+                "verified_email": null,
+                "status": "active",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:01Z"
+            }),
+        )
+        .expect("valid materialized projection");
+        assert_eq!(converted.user_revision, 7);
+        assert_eq!(converted.projection_revision, 13);
+    }
+
+    struct TestClientRepository {
+        authority_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl application::ClientApiRepository for TestClientRepository {
+        async fn client_key_authority(
+            &self,
+            public_key_id: &str,
+        ) -> Result<application::ClientKeyAuthority, ApplicationError> {
+            self.authority_calls.fetch_add(1, Ordering::SeqCst);
+            if public_key_id != CLIENT_TEST_PUBLIC_KEY_ID {
+                return Err(ApplicationError::NotFound);
+            }
+            Ok(application::ClientKeyAuthority {
+                key_id: Uuid::from_u128(0xc11e_0002),
+                project_id: Uuid::from_u128(0xc11e_0001),
+                project_public_id: CLIENT_TEST_PROJECT.to_owned(),
+                public_key_id: CLIENT_TEST_PUBLIC_KEY_ID.to_owned(),
+                digest_key_version: 1,
+                credential_digest: [7; 32],
+            })
+        }
+
+        async fn confirm_active(
+            &self,
+            project_id: Uuid,
+            key_id: Uuid,
+        ) -> Result<(), ApplicationError> {
+            assert_eq!(project_id, Uuid::from_u128(0xc11e_0001));
+            assert_eq!(key_id, Uuid::from_u128(0xc11e_0002));
+            Ok(())
+        }
+
+        async fn record_usage_if_older(
+            &self,
+            project_id: Uuid,
+            key_id: Uuid,
+            _usage_bucket: OffsetDateTime,
+        ) -> Result<(), ApplicationError> {
+            assert_eq!(project_id, Uuid::from_u128(0xc11e_0001));
+            assert_eq!(key_id, Uuid::from_u128(0xc11e_0002));
+            Ok(())
+        }
+
+        async fn list_users(
+            &self,
+            project_id: Uuid,
+            project_public_id: &str,
+            after: Option<application::ClientUserCursor>,
+            limit_plus_one: usize,
+        ) -> Result<Vec<(application::ClientUserCursor, application::ClientUser)>, ApplicationError>
+        {
+            assert_eq!(project_id, Uuid::from_u128(0xc11e_0001));
+            assert_eq!(project_public_id, CLIENT_TEST_PROJECT);
+            assert!(after.is_none());
+            assert_eq!(limit_plus_one, 51);
+            Ok(Vec::new())
+        }
+
+        async fn user_by_public_id(
+            &self,
+            _project_id: Uuid,
+            _project_public_id: &str,
+            _user_public_id: &str,
+        ) -> Result<application::ClientUser, ApplicationError> {
+            Err(ApplicationError::NotFound)
+        }
+
+        async fn user_by_email_digests(
+            &self,
+            _project_id: Uuid,
+            _project_public_id: &str,
+            _candidates: &[application::VersionedDigest],
+        ) -> Result<Option<application::ClientUser>, ApplicationError> {
+            Ok(None)
+        }
+
+        async fn application_projection(
+            &self,
+            _project_id: Uuid,
+            _project_public_id: &str,
+            _application_public_id: &str,
+            _user_public_id: &str,
+        ) -> Result<application::ClientApplicationProjection, ApplicationError> {
+            Err(ApplicationError::NotFound)
+        }
+
+        async fn verification_key(
+            &self,
+            _project_id: Uuid,
+            _kid: &str,
+            _now: OffsetDateTime,
+        ) -> Result<application::ClientVerificationKey, ApplicationError> {
+            Err(ApplicationError::NotFound)
+        }
+
+        async fn introspect_session(
+            &self,
+            _lookup: application::ClientTokenSessionLookup,
+        ) -> Result<application::ActiveClientToken, ApplicationError> {
+            Err(ApplicationError::Disabled)
+        }
+    }
+
+    struct TestClientKeyVerifier;
+
+    impl application::ClientKeyVerifier for TestClientKeyVerifier {
+        fn readable_versions(&self) -> std::collections::BTreeSet<i32> {
+            std::collections::BTreeSet::from([1])
+        }
+
+        fn digest_candidate(
+            &self,
+            project_id: Uuid,
+            key_id: Uuid,
+            public_key_id: &str,
+            secret: &[u8; application::CLIENT_KEY_SECRET_BYTES],
+            digest_key_version: i32,
+        ) -> Result<[u8; 32], ApplicationError> {
+            let expected = project_id == Uuid::from_u128(0xc11e_0001)
+                && key_id == Uuid::from_u128(0xc11e_0002)
+                && public_key_id == CLIENT_TEST_PUBLIC_KEY_ID
+                && digest_key_version == 1
+                && secret == &[0; application::CLIENT_KEY_SECRET_BYTES];
+            Ok(if expected { [7; 32] } else { [8; 32] })
+        }
+    }
+
+    struct TestClientEmailDigester;
+
+    impl application::ClientEmailLookupDigester for TestClientEmailDigester {
+        fn digest_candidates(
+            &self,
+            _project_id: Uuid,
+            _canonical_email: &str,
+        ) -> Result<Vec<application::VersionedDigest>, ApplicationError> {
+            Ok(vec![application::VersionedDigest {
+                value: [1; 32],
+                key_version: 1,
+            }])
+        }
+    }
+
+    struct TestClientTokenVerifier;
+
+    impl application::ClientTokenSignatureVerifier for TestClientTokenVerifier {
+        fn verify(
+            &self,
+            _public_jwk: &serde_json::Value,
+            _signing_input: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), ApplicationError> {
+            Ok(())
+        }
+    }
+
+    struct TestClientClock;
+
+    impl application::Clock for TestClientClock {
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("test timestamp")
+        }
+    }
+
+    fn canonical_test_client_credential() -> String {
+        format!(
+            "owl_client_v1.{CLIENT_TEST_PUBLIC_KEY_ID}.{}",
+            "A".repeat(43)
+        )
+    }
+
+    fn isolated_test_client_router_with_authority_calls() -> (Router, Arc<AtomicUsize>) {
+        let config = test_config(PlaneMode::Client);
+        let authority_calls = Arc::new(AtomicUsize::new(0));
+        let api = Arc::new(application::ClientApiService::new(
+            Arc::new(TestClientRepository {
+                authority_calls: Arc::clone(&authority_calls),
+            }),
+            Arc::new(TestClientKeyVerifier),
+            Arc::new(TestClientEmailDigester),
+            Arc::new(TestClientTokenVerifier),
+            Arc::new(TestClientClock),
+        ));
+        let mut routers = build_routers_with_capabilities(
+            &config,
+            crate::composition::HttpCapabilities {
+                runtime: None,
+                client: Some(crate::composition::ClientHttpCapabilities {
+                    admission: Arc::new(AdmissionService::new(
+                        format!("client-http-{}", Uuid::new_v4()),
+                        [83; 32],
+                        1,
+                        None,
+                    )),
+                    api: Some(api),
+                    readiness: None,
+                }),
+                control: None,
+            },
+        );
+        routers.mark_ready();
+        (
+            routers.client.take().expect("Client router"),
+            authority_calls,
+        )
+    }
+
+    fn isolated_test_client_router() -> Router {
+        isolated_test_client_router_with_authority_calls().0
+    }
+
+    async fn assert_client_error(
+        response: Response,
+        expected_status: StatusCode,
+        expected_code: client_types::ClientErrorCode,
+    ) {
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let error: client_types::ClientError = serde_json::from_slice(
+            &to_bytes(response.into_body(), 4096)
+                .await
+                .expect("bounded Client error body"),
+        )
+        .expect("Client JSON error envelope");
+        assert_eq!(error.code, expected_code);
+        assert!(!error.request_id.is_empty());
+    }
+
+    fn assert_no_browser_authority_headers(response: &Response) {
+        for name in [
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            header::SET_COOKIE,
+            header::LOCATION,
+        ] {
+            assert!(
+                !response.headers().contains_key(&name),
+                "Client response unexpectedly contains {name}"
+            );
+        }
+        assert!(!response.status().is_redirection());
+    }
+
+    #[tokio::test]
+    async fn client_authentication_failures_collapse_to_one_bearer_error() {
+        let router = isolated_test_client_router();
+        let path = "/v1/projects/project-a/users";
+        let valid = canonical_test_client_credential();
+        let requests = [
+            Request::get(path).body(Body::empty()).unwrap(),
+            Request::get(path)
+                .header(header::AUTHORIZATION, format!("Bearer {valid}"))
+                .header(header::AUTHORIZATION, format!("Bearer {valid}"))
+                .body(Body::empty())
+                .unwrap(),
+            Request::get(path)
+                .header(header::AUTHORIZATION, "Bearer owl_client_v1.not-canonical")
+                .body(Body::empty())
+                .unwrap(),
+            Request::get(path)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer owl_ctrl_v1_{}", "A".repeat(43)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        ];
+        for request in requests {
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+            assert_no_browser_authority_headers(&response);
+            assert_client_error(
+                response,
+                StatusCode::UNAUTHORIZED,
+                client_types::ClientErrorCode::InvalidCredential,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn client_pre_authority_admission_stops_unknown_credentials_before_authority() {
+        let router = isolated_test_client_router();
+        let path = "/v1/projects/project-a/users";
+        for _ in 0..120 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(header::AUTHORIZATION, "Bearer malformed")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = router
+            .oneshot(
+                Request::get(path)
+                    .header(header::AUTHORIZATION, "Bearer malformed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = response.headers()[header::RETRY_AFTER]
+            .to_str()
+            .expect("integer Retry-After")
+            .parse::<u64>()
+            .expect("numeric Retry-After");
+        assert!((1..=60).contains(&retry_after));
+        assert_no_browser_authority_headers(&response);
+        assert_client_error(
+            response,
+            StatusCode::TOO_MANY_REQUESTS,
+            client_types::ClientErrorCode::RateLimited,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn failure_block_stops_canonical_unknown_credentials_before_another_repository_lookup() {
+        let (router, authority_calls) = isolated_test_client_router_with_authority_calls();
+        let unknown = format!(
+            "Bearer owl_client_v1.{}.{}",
+            URL_SAFE_NO_PAD.encode([1_u8; application::CLIENT_KEY_PUBLIC_ID_BYTES]),
+            "A".repeat(43)
+        );
+        let request = || {
+            Request::get("/v1/projects/project-a/users")
+                .header(header::AUTHORIZATION, &unknown)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        for request_number in 1..=120 {
+            let response = router.clone().oneshot(request()).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "unknown canonical request {request_number}"
+            );
+        }
+        assert_eq!(authority_calls.load(Ordering::SeqCst), 120);
+
+        let threshold_response = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(threshold_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(authority_calls.load(Ordering::SeqCst), 121);
+
+        let preblocked_response = router.oneshot(request()).await.unwrap();
+        assert_eq!(preblocked_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            authority_calls.load(Ordering::SeqCst),
+            121,
+            "an active source block must reject before another authority lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_client_traffic_does_not_consume_the_strict_failure_budget() {
+        let router = isolated_test_client_router();
+        let authorization = format!("Bearer {}", canonical_test_client_credential());
+        for request_number in 1..=130 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get("/v1/projects/project-a/users")
+                        .header(header::AUTHORIZATION, &authorization)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "valid request {request_number} was incorrectly charged to failure admission"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_client_key_is_project_bound_and_reads_the_directory() {
+        let router = isolated_test_client_router();
+        let authorization = format!("Bearer {}", canonical_test_client_credential());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/v1/projects/project-a/users")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::ORIGIN, "https://browser.example")
+                    .header(header::ACCEPT, "text/html,application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            HeaderValue::from_static("application/json")
+        );
+        assert_no_browser_authority_headers(&response);
+        let page: client_types::ClientUserList = serde_json::from_slice(
+            &to_bytes(response.into_body(), 4096)
+                .await
+                .expect("bounded list body"),
+        )
+        .expect("Client list JSON");
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_cursor, None);
+
+        let wrong_project = router
+            .oneshot(
+                Request::get("/v1/projects/project-b/users")
+                    .header(header::AUTHORIZATION, authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_project.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        assert_client_error(
+            wrong_project,
+            StatusCode::UNAUTHORIZED,
+            client_types::ClientErrorCode::InvalidCredential,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_client_parse_failures_use_the_client_json_envelope() {
+        let router = isolated_test_client_router();
+        let authorization = format!("Bearer {}", canonical_test_client_credential());
+        let malformed_query = router
+            .clone()
+            .oneshot(
+                Request::get("/v1/projects/project-a/users?limit=not-a-number")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_client_error(
+            malformed_query,
+            StatusCode::BAD_REQUEST,
+            client_types::ClientErrorCode::InvalidRequest,
+        )
+        .await;
+
+        let malformed_body = router
+            .oneshot(
+                Request::post("/v1/projects/project-a/users/lookup")
+                    .header(header::AUTHORIZATION, authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_client_error(
+            malformed_body,
+            StatusCode::BAD_REQUEST,
+            client_types::ClientErrorCode::InvalidRequest,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn client_router_exposes_only_json_client_and_probe_routes() {
+        let router = isolated_test_client_router();
+        for path in [
+            "/",
+            "/auth/",
+            "/console",
+            "/mcp",
+            "/v1/projects/project-a/auth/config",
+            "/v1/projects/project-a/client-keys",
+            "/.well-known/owlauth",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_no_browser_authority_headers(&response);
+        }
+        let preflight = router
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/projects/project-a/users")
+                    .header(header::ORIGIN, "https://browser.example")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        assert_no_browser_authority_headers(&preflight);
+        assert_client_error(
+            preflight,
+            StatusCode::UNAUTHORIZED,
+            client_types::ClientErrorCode::InvalidCredential,
+        )
+        .await;
     }
 
     #[tokio::test]

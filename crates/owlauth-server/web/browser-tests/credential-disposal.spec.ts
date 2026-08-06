@@ -13,7 +13,7 @@ test("operator credentials are discarded on lock, reload, denial, and page close
 
   await page.goto(`${controlBase}console/`);
   await unlock(page, operatorKey);
-  await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
   await assertCredentialFreeBrowserState(page, [operatorKey, rejectedKey]);
 
   await page.getByRole("button", { name: "Lock console" }).click();
@@ -21,19 +21,54 @@ test("operator credentials are discarded on lock, reload, denial, and page close
   await assertCredentialFreeBrowserState(page, [operatorKey, rejectedKey]);
 
   await unlock(page, operatorKey);
-  await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
   await page.reload();
   await expect(page.getByRole("button", { name: "Unlock console" })).toBeVisible();
   await expect(page.getByLabel("Operator API key")).toHaveValue("");
   await assertCredentialFreeBrowserState(page, [operatorKey, rejectedKey]);
 
   await unlock(page, rejectedKey);
-  await expect(page.getByRole("alert")).toHaveText("Authentication failed.");
+  await expect(page.getByRole("alert")).toContainText("The API key could not be verified.");
   await expect(page.getByLabel("Operator API key")).toHaveValue("");
   await assertCredentialFreeBrowserState(page, [operatorKey, rejectedKey]);
 
   await unlock(page, operatorKey);
-  await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const lifecycle = window as Window & {
+      __owlauthRestoreEvidence?: { body: string; persisted: boolean }[];
+    };
+    const evidence: { body: string; persisted: boolean }[] = [];
+    lifecycle.__owlauthRestoreEvidence = evidence;
+    window.addEventListener(
+      "pageshow",
+      (event) => {
+        evidence.push({
+          body: document.body.textContent,
+          persisted: event.persisted,
+        });
+      },
+      { capture: true },
+    );
+  });
+  await page.goto("about:blank");
+  await page.goBack();
+  await expect(page.getByRole("button", { name: "Unlock console" })).toBeVisible();
+  const restoreEvidence = await page.evaluate(
+    () =>
+      (
+        window as Window & {
+          __owlauthRestoreEvidence?: { body: string; persisted: boolean }[];
+        }
+      ).__owlauthRestoreEvidence ?? [],
+  );
+  for (const restored of restoreEvidence.filter(({ persisted }) => persisted)) {
+    expect(restored.body).not.toContain("Projects");
+  }
+  await assertCredentialFreeBrowserState(page, [operatorKey, rejectedKey]);
+
+  await unlock(page, operatorKey);
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
   await page.close();
 
   const reopened = await context.newPage();
@@ -43,6 +78,82 @@ test("operator credentials are discarded on lock, reload, denial, and page close
   await assertCredentialFreeBrowserState(reopened, [operatorKey, rejectedKey]);
   expect(consoleMessages.join("\n")).not.toContain(operatorKey);
   expect(consoleMessages.join("\n")).not.toContain(rejectedKey);
+});
+
+test("client-key reveal is one-time, non-dismissible, and revisioned in a real browser", async ({
+  page,
+  browserName,
+}) => {
+  const suffix = `${browserName}-${Date.now().toString(36)}`;
+  const projectName = `Client key Project ${suffix}`;
+  const keyLabel = `backend <img> ${suffix}`;
+
+  await page.goto(`${controlBase}console/`);
+  await unlock(page, operatorKey);
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Create Project" }).first().click();
+  await page.getByLabel("Display name").fill(projectName);
+  await page.getByRole("dialog").getByRole("button", { name: "Create Project" }).click();
+  await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
+
+  await page.getByRole("link", { name: "Client API keys" }).click();
+  await expect(page.getByRole("heading", { name: "Client API keys" })).toBeVisible();
+  await page.getByRole("button", { name: "Create client key" }).first().click();
+  const create = page.getByRole("dialog", { name: "Create client key" });
+  await create.getByLabel("Key label").fill(keyLabel);
+  await create.getByRole("button", { name: "Create client key" }).click();
+
+  const reveal = page.getByRole("dialog", { name: "Store this client key now" });
+  await expect(reveal).toBeVisible();
+  await expect(reveal.getByRole("button", { name: "Close dialog" })).toHaveCount(0);
+  const credential = await reveal.getByTestId("one-time-client-credential").innerText();
+  expect(credential).toMatch(/^owl_client_v1\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/u);
+  await page.keyboard.press("Escape");
+  await expect(reveal).toBeVisible();
+  await reveal.getByLabel(/I stored this credential/u).check();
+  await reveal.getByRole("button", { name: "I saved this key" }).click();
+  await expect(reveal).toBeHidden();
+  await expect(page.getByText(credential, { exact: true })).toHaveCount(0);
+  await expect(page.locator("img")).toHaveCount(0);
+  const acknowledgedRow = page.getByRole("row", { name: new RegExp(keyLabel, "u") });
+  await expect(acknowledgedRow).toContainText("Storage confirmed");
+
+  // Lose a second original reveal through reload. The safe server inventory, not browser storage,
+  // must reconstruct the gate and permit revocation while preventing another create.
+  const unresolvedLabel = `reload unresolved ${suffix}`;
+  await page.getByRole("button", { name: "Create client key" }).first().click();
+  const unresolvedCreate = page.getByRole("dialog", { name: "Create client key" });
+  await unresolvedCreate.getByLabel("Key label").fill(unresolvedLabel);
+  await unresolvedCreate.getByRole("button", { name: "Create client key" }).click();
+  const unresolvedReveal = page.getByRole("dialog", { name: "Store this client key now" });
+  const lostCredential = await unresolvedReveal
+    .getByTestId("one-time-client-credential")
+    .innerText();
+  await page.reload();
+  await unlock(page, operatorKey);
+  await expect(page.getByRole("heading", { name: "Client API keys" })).toBeVisible();
+  const unresolvedRow = page.getByRole("row", { name: new RegExp(unresolvedLabel, "u") });
+  await expect(unresolvedRow).toContainText("Storage unconfirmed — creation blocked");
+  await expect(page.getByRole("button", { name: "Create client key" }).first()).toBeDisabled();
+  await unresolvedRow.getByRole("button", { name: "Revoke" }).click();
+  const unresolvedRevoke = page.getByRole("dialog", { name: "Revoke client key" });
+  await unresolvedRevoke.getByRole("button", { name: "Revoke client key" }).click();
+  await expect(unresolvedRow).toContainText("Status: revoked");
+
+  await acknowledgedRow.getByRole("button", { name: "Revoke" }).click();
+  const revoke = page.getByRole("dialog", { name: "Revoke client key" });
+  await expect(revoke).toContainText(keyLabel);
+  await revoke.getByRole("button", { name: "Revoke client key" }).click();
+  await expect(page.getByRole("row", { name: new RegExp(keyLabel, "u") })).toContainText(
+    "Status: revoked",
+  );
+  await expect(page.getByText(credential, { exact: true })).toHaveCount(0);
+  await assertCredentialFreeBrowserState(page, [
+    operatorKey,
+    rejectedKey,
+    credential,
+    lostCredential,
+  ]);
 });
 
 async function unlock(page: Page, key: string): Promise<void> {

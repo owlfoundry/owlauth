@@ -41,6 +41,7 @@ pub(crate) struct AdmittedProviderMethod {
     pub display_name: String,
     pub issuer: String,
     pub provider_revision: i64,
+    pub provider_egress_policy_revision: Option<i64>,
     pub assignment_security_revision: i64,
 }
 

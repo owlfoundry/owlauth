@@ -8,19 +8,19 @@ OAuth/OIDC is used only between OwlAuth and a Project's configured upstream prov
 
 ## Public identifiers and credentials
 
-| Value                       | Form                                                | Purpose                                                 | Security role                                                     |
-| --------------------------- | --------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------- |
-| `project_id`                | public stable identifier                            | select isolated Project auth namespace                  | not a secret or authorization credential                          |
-| `application_id`            | public stable identifier                            | identify web/mobile/native/server Application           | not a secret or Control credential                                |
-| Publishable application key | public revocable identifier                         | SDK initialization, quotas, and abuse attribution       | never grants administrative or user authority                     |
-| Login transaction handle    | high-entropy opaque browser value                   | bind provider redirect and browser interaction          | digest in PostgreSQL; short-lived and one-use where transitioned  |
-| Upstream provider state     | high-entropy opaque value                           | bind provider callback to Project login transaction     | digest in PostgreSQL; exact provider/Project binding              |
-| Handoff ticket              | high-entropy opaque value                           | transfer authenticated result to an Application         | digest in PostgreSQL; one-use and PKCE-bound                      |
-| Project browser session     | opaque hardened cookie                              | reuse authentication among Applications in one Project  | digest in PostgreSQL; Project/user/browser bound                  |
-| Project access token        | short-lived signed JWT                              | authenticate Project user to that Project's backend     | Project issuer/audience; Application and session context          |
-| Refresh token               | high-entropy opaque value                           | rotate one Application session family                   | digest in PostgreSQL; Project/Application/user bound              |
-| Provider secret             | secret-store reference                              | authenticate OwlAuth to GitHub/Google/upstream provider | Project provider adapter only; never browser-visible              |
-| Deployment operator API key | single secret loaded from `OWLAUTH_CONTROL_API_KEY` | administer the entire deployment through Control        | Control-listener only and categorically never accepted by Runtime |
+| Value                       | Form                                                          | Purpose                                                 | Security role                                                     |
+| --------------------------- | ------------------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------- |
+| `project_id`                | public stable identifier                                      | select isolated Project auth namespace                  | not a secret or authorization credential                          |
+| `application_id`            | public stable identifier                                      | identify web/mobile/native/server Application           | not a secret or Control credential                                |
+| Publishable application key | public revocable identifier                                   | SDK initialization, quotas, and abuse attribution       | never grants administrative or user authority                     |
+| Login transaction handle    | high-entropy opaque browser value                             | bind provider redirect and browser interaction          | digest in PostgreSQL; short-lived and one-use where transitioned  |
+| Upstream provider state     | high-entropy opaque value                                     | bind provider callback to Project login transaction     | digest in PostgreSQL; exact provider/Project binding              |
+| Handoff ticket              | high-entropy opaque value                                     | transfer authenticated result to an Application         | digest in PostgreSQL; one-use and PKCE-bound                      |
+| Project browser session     | opaque hardened cookie                                        | reuse authentication among Applications in one Project  | digest in PostgreSQL; Project/user/browser bound                  |
+| Project access token        | short-lived signed JWT                                        | authenticate Project user to that Project's backend     | Project issuer/audience; Application and session context          |
+| Refresh token               | high-entropy opaque value                                     | rotate one Application session family                   | digest in PostgreSQL; Project/Application/user bound              |
+| Provider secret             | stable protected-material ID to an opaque PostgreSQL envelope | authenticate OwlAuth to GitHub/Google/upstream provider | exact Project provider adapter/opener only; never browser-visible |
+| Deployment operator API key | single secret loaded from `OWLAUTH_CONTROL_API_KEY`           | administer the entire deployment through Control        | Control-listener only and categorically never accepted by Runtime |
 
 A Project access token is an OwlAuth application-session credential, not an OAuth access token. Its use as an HTTP Bearer token does not make Runtime an OAuth authorization server.
 
@@ -262,7 +262,7 @@ Application logout and Project browser logout use different credential and DTO c
 - Application disablement invalidates only that Application's Runtime credentials and pending handoffs.
 - Revocation responses do not reveal whether an unrelated Project, user, session, or token exists.
 
-Already issued self-contained Project access tokens remain cryptographically valid until short expiry unless the application backend uses a separately defined online status check. New handoff, refresh, and current-user operations observe authoritative status immediately after PostgreSQL commit.
+Already issued self-contained Project access tokens remain cryptographically valid until short expiry under local verification. A customer backend that requires current revocation/session authority uses the Project-client-key-authenticated Client introspection operation defined by spec 13. New handoff, refresh, current-user, and introspection operations observe authoritative status immediately after PostgreSQL commit.
 
 ## Browser, native, and request safety
 
@@ -276,4 +276,4 @@ Request bodies, headers, parameter counts, and string lengths have endpoint-spec
 
 Random values come from the operating-system CSPRNG. Raw tickets, refresh tokens, cookies, and provider credentials cross the smallest possible interface and are stored only as digests or encrypted provider-specific material where recovery is necessary.
 
-Logs, traces, metrics, errors, audit events, OpenAPI examples, and agent context never contain provider tokens, provider codes, handoff tickets, Project access tokens, refresh tokens, PKCE verifiers, cookies, provider secrets, the deployment operator API key, private keys, full callback URLs, or complete user profiles. Audit events record Project, Application, stable user/target references where authorized, action, outcome, reason class, and correlation without recoverable credentials.
+Logs, traces, metrics, errors, audit events, OpenAPI examples, and agent context never contain provider tokens, provider codes, handoff tickets, Project access tokens, refresh tokens, PKCE verifiers, cookies, provider secrets, Project client keys, the deployment operator API key, private keys, full callback URLs, or complete user profiles. Audit events record Project, Application, stable user/target references where authorized, action, outcome, reason class, and correlation without recoverable credentials.

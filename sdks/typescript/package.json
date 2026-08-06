@@ -1,6 +1,6 @@
 {
   "name": "@owlauth/client",
-  "version": "0.0.1",
+  "version": "0.0.0-dev",
   "description": "TypeScript Project Auth client for OwlAuth",
   "license": "BSD-3-Clause",
   "author": "OwlFoundry",

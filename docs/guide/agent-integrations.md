@@ -17,10 +17,10 @@ The plugin does not bundle a server, launch a local MCP process, expose Project 
 
 The shared source under [`plugins/owlauth`](https://github.com/owlfoundry/owlauth/tree/main/plugins/owlauth) is packaged for Codex and Claude. Its integration skill should help an agent:
 
-- recognize the implemented Beta Runtime, Control, and SDK boundaries and avoid inventing deferred routes or commands;
+- recognize the implemented Beta Runtime, backend Client, Control, and Runtime SDK boundaries and avoid inventing deferred routes or commands;
 - select the TypeScript, Python, or Rust SDK and preserve its explicit Application-owned navigation, storage, and refresh-coordination boundary;
 - distinguish downstream Project Auth from upstream OAuth/OIDC federation;
-- understand that Project/Application IDs and publishable keys are public identifiers, not Control credentials;
+- understand that Project/Application IDs and publishable keys are public identifiers, Project client keys are backend-only Client credentials, and neither is a Control credential;
 - inspect generated OpenAPI as an ephemeral contract view;
 - require the component's candidate-bound final evidence manifest before describing an SDK operation as release-qualified; exported methods, package versions, workspace tests, generated OpenAPI, and fixtures alone are insufficient, and current manifests prove one exact Runtime/source coordinate rather than a range;
 - direct security reports to the private disclosure path.
@@ -41,7 +41,7 @@ owlauth --profile local webhook delivery list PROJECT_ID APPLICATION_ID --limit 
 owlauth update --dry-run
 ```
 
-The CLI must not access PostgreSQL/Redis, load server modules, run migrations, or host Runtime/Control listeners. Audit export remains deferred.
+The CLI must not access PostgreSQL/Redis, load server modules, run migrations, or host Runtime/Client/Control listeners. Audit export remains deferred.
 
 ## Remote CLI trust model
 

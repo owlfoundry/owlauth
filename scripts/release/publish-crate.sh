@@ -2,8 +2,9 @@
 set -euo pipefail
 
 manifest="${1:-}"
-if [[ -z "$manifest" || ! -f "$manifest" ]]; then
-  printf 'usage: %s <Cargo.toml>\n' "$0" >&2
+expected_version="${2:-}"
+if [[ -z "$manifest" || ! -f "$manifest" || -z "$expected_version" ]]; then
+  printf 'usage: %s <Cargo.toml> <expected-release-version>\n' "$0" >&2
   exit 2
 fi
 
@@ -28,6 +29,15 @@ read -r package version < <(
   printf 'failed to read package name and version from %s\n' "$manifest" >&2
   exit 1
 }
+if [[ "$version" == "0.0.0-dev" ]]; then
+  printf 'refusing to publish development sentinel for %s\n' "$package" >&2
+  exit 1
+fi
+if [[ "$version" != "$expected_version" ]]; then
+  printf 'manifest version %s for %s differs from expected release version %s\n' \
+    "$version" "$package" "$expected_version" >&2
+  exit 1
+fi
 
 cargo package --locked --allow-dirty --manifest-path "$manifest"
 archive="target/package/${package}-${version}.crate"

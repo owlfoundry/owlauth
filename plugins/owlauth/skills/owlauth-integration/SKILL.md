@@ -1,11 +1,11 @@
 ---
 name: owlauth-integration
-description: Integrate applications and developer tooling with OwlAuth Project Auth, select the TypeScript, Python, or Rust client, inspect generated Runtime contracts, and reason about the endpoint-discovered self-hosted CLI and remote HTTP MCP capabilities. Use for OwlAuth setup, Project/Application integration, upstream provider login, SDK usage, migration, troubleshooting, or agent integration requests.
+description: Integrate applications and developer tooling with OwlAuth Project Auth, select the TypeScript, Python, or Rust client, inspect generated Runtime or backend Client contracts, and reason about the endpoint-discovered self-hosted CLI and remote HTTP MCP capabilities. Use for OwlAuth setup, Project/Application integration, upstream provider login, SDK usage, migration, troubleshooting, or agent integration requests.
 ---
 
 # OwlAuth integration
 
-Treat OwlAuth as Beta until published documentation says otherwise. The delivered self-hosted server includes PostgreSQL authority, isolated Runtime/Control planes, Hosted Authentication and Management Console surfaces, GitHub/Google/strict custom OIDC and passwordless-email login, managed provider profile synchronization, Project session/token lifecycles, revisioned projections and signed webhooks, and optional remote Control MCP. The TypeScript, Python, and Rust SDKs implement the public Runtime protocol while leaving navigation, persistence, refresh coordination, framework sessions, and backend JWT verification to the Application. The `owlauth` CLI provides endpoint discovery, typed self-hosted administration, system inspection, and checksum-verified self-update. Preserve pre-1.0 and exact-coordinate evidence limits; do not invent deferred interfaces, CLI commands, MCP tools, compatibility ranges, deployment certification, or production support.
+Treat OwlAuth as Beta until published documentation says otherwise. The delivered self-hosted server includes PostgreSQL authority, isolated Runtime/Client/Control planes, Hosted Authentication and Management Console surfaces, GitHub/Google/strict custom OIDC and passwordless-email login, managed provider profile synchronization, Project session/token lifecycles, revisioned projections and signed webhooks, and optional remote Control MCP. The TypeScript, Python, and Rust SDKs implement only the public Runtime protocol while leaving navigation, persistence, refresh coordination, framework sessions, and backend JWT verification to the Application. Customer backends use the separate OpenAPI-only Project-key Client API. The `owlauth` CLI provides endpoint discovery, typed self-hosted administration, system inspection, and checksum-verified self-update. Preserve pre-1.0 and exact-coordinate evidence limits; do not invent deferred interfaces, CLI commands, MCP tools, compatibility ranges, deployment certification, or production support.
 
 ## Product model
 
@@ -15,7 +15,7 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
 
 ## Workflow
 
-1. Determine whether the request concerns Runtime Application integration, Control administration, an SDK, an agent plugin, or a proposed interface.
+1. Determine whether the request concerns Runtime Application integration, backend Client API integration, Control administration, a Runtime SDK, an agent plugin, or a proposed interface.
 
 2. Establish whether the user is asking about implemented behavior or explicitly deferred architecture. State unavailable capabilities precisely.
 
@@ -35,7 +35,7 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
 
 5. Validate integrations against `sdks/spec/`, its fixtures, conformance cases, and current package README. Preserve Project/Application binding, exact redirects/origins, PKCE handoff, serialized refresh rotation, backend token verification, redaction, and stable errors.
 
-6. Keep Runtime SDK operations separate from privileged Control operations. Do not imply that the core SDK owns browser navigation, history cleanup, persistence, refresh single-flight, backend sessions, or business authorization.
+6. Keep Runtime SDK operations separate from backend-only Client operations and privileged Control operations. Do not imply that the core SDK owns browser navigation, history cleanup, persistence, refresh single-flight, backend sessions, or business authorization.
 
 ## Boundaries
 

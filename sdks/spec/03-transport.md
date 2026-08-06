@@ -2,7 +2,7 @@
 
 ## Current status
 
-All three Beta official SDKs implement the Runtime Project Auth network operations described here through their platform-appropriate injectable transports. The TypeScript package uses one Web-standard core in Node.js and supported browsers. The normative matrices below are the Block E convergence target; an existing Beta implementation is not conformant evidence until its source, shared corpus, exact artifact, and real-server lanes all pass them.
+All three Beta official SDKs implement the Runtime Project Auth network operations described here through their platform-appropriate injectable transports. The TypeScript package uses one Web-standard core in Node.js and supported browsers. The matrices below are normative; an existing Beta implementation is not conformant evidence until its source, shared corpus, exact artifact, and real-server lanes all pass them.
 
 ## TypeScript runtime portability
 
@@ -30,9 +30,9 @@ Every public operation defines:
 - maximum response assumptions;
 - stable semantic error mapping.
 
-`project_id`, `application_id`, and a publishable key may appear where the public Runtime contract specifies. They remain identifiers, not secrets. Project access tokens use reviewed authorization-header placement. Refresh tokens, handoff tickets, PKCE verifiers, browser cookies, and management credentials never appear in URLs. The only front-channel value returned to an Application redirect is the protocol-defined short-lived handoff result plus bounded Application state.
+`project_id`, `application_id`, and a publishable key may appear where the public Runtime contract specifies. They remain identifiers, not secrets. Project access tokens use reviewed authorization-header placement. A Project client key is a separate customer-backend credential and never enters SDK configuration, headers, request models, transport hooks, or examples. Refresh tokens, handoff tickets, PKCE verifiers, browser cookies, and management credentials never appear in URLs. The only front-channel value returned to an Application redirect is the protocol-defined short-lived handoff result plus bounded Application state.
 
-Transport does not send provider credentials or provider tokens: OwlAuth Runtime owns upstream-provider interaction.
+Transport does not send Project client keys, provider credentials, or provider tokens: OwlAuth Client and Runtime own their separate caller boundaries.
 
 ## Claimed operation matrix
 

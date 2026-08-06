@@ -18,12 +18,18 @@ pub(crate) enum ApplicationError {
     OperationInProgress,
     #[error("publication has not propagated to Runtime")]
     PublicationPending,
+    #[error("required Client verifier fleet is not ready")]
+    ClientVerifierUnavailable,
     #[error("state transition is not allowed")]
     InvalidTransition,
     #[error("authoritative state failed an integrity check")]
     Integrity,
     #[error("authoritative persistence is unavailable")]
     Persistence,
+    #[error("OIDC preflight rejected the issuer or discovered metadata")]
+    ProviderPreflightRejected,
+    #[error("OIDC preflight could not reach or validate the provider")]
+    ProviderPreflightUnavailable,
     #[error("external secret or signer store is unavailable")]
     ExternalStore,
 }

@@ -1,0 +1,171 @@
+.page {
+  margin-top: 1.5rem;
+}
+
+.form {
+  display: grid;
+  gap: 1rem;
+  max-width: 48rem;
+}
+
+.formActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
+}
+
+.summaryCard {
+  padding: 1rem;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.summaryCard h2,
+.summaryCard h3,
+.summaryCard p {
+  margin: 0;
+}
+
+.summaryCard p {
+  margin-top: 0.5rem;
+  color: var(--owl-text-muted);
+}
+
+.resourceLink {
+  color: var(--owl-text);
+  font-weight: 600;
+}
+
+.muted {
+  color: var(--owl-text-muted);
+}
+
+.machineValue {
+  display: block;
+  max-width: 38rem;
+  overflow-wrap: anywhere;
+  color: var(--owl-text-muted);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.8125rem;
+}
+
+.credential {
+  display: block;
+  max-width: 100%;
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  overflow-x: auto;
+  color: var(--owl-text);
+  background: var(--owl-canvas);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.detailSurface {
+  padding: 1.25rem;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.dangerZone {
+  margin-top: 3rem;
+  padding: 1.25rem;
+  background: color-mix(in srgb, var(--owl-danger-surface) 55%, var(--owl-surface));
+  border: 1px solid #81444d;
+  border-radius: var(--owl-radius-surface);
+}
+
+.dangerZone h2,
+.dangerZone p {
+  margin-top: 0;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(16rem, 20rem) minmax(0, 1fr);
+  gap: 1.5rem;
+}
+
+.selectionList {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.selectionList a,
+.selectionList button {
+  width: 100%;
+  min-height: 2.75rem;
+  display: block;
+  padding: 0.65rem 0.75rem;
+  color: var(--owl-text);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--owl-border);
+  text-align: left;
+  text-decoration: none;
+}
+
+.selectionList li:last-child a,
+.selectionList li:last-child button {
+  border-bottom: 0;
+}
+
+.selectionList a:hover,
+.selectionList button:hover {
+  background: var(--owl-surface-hover);
+}
+
+.selectionList [aria-current="page"],
+.selectionList [aria-pressed="true"] {
+  background: var(--owl-accent-soft);
+}
+
+.inlineFields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+@media (width <= 54rem) {
+  .split,
+  .inlineFields {
+    grid-template-columns: 1fr;
+  }
+}

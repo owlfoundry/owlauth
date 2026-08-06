@@ -14,8 +14,8 @@ cp .env.example .env
 make dev
 ```
 
-`make dev` rebuilds the embedded web assets, starts this infrastructure, creates ignored local
-software-store directories, and runs the combined Runtime and Control process in the foreground.
+`make dev` rebuilds the embedded web assets, starts this infrastructure, and runs the combined
+Runtime, Client, and Control process in the foreground using PostgreSQL-resident protected material.
 Application configuration lives in the ignored root `.env`; the committed root `.env.example`
 contains public disposable development values only.
 

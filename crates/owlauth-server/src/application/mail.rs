@@ -6,13 +6,13 @@ use std::{
 
 use async_trait::async_trait;
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::ApplicationError;
 
 pub(crate) const MAX_DNS_ANSWERS: usize = 16;
 pub(crate) const MAX_CNAME_DEPTH: usize = 8;
-pub(crate) const MAX_SMTP_RESPONSE_LINE: usize = 1_000;
 pub(crate) const MAX_MAIL_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_MAIL_ATTEMPTS: i16 = 8;
 pub(crate) const SHORT_TERM_DATA_RETENTION: Duration = Duration::minutes(10);
@@ -192,6 +192,7 @@ pub(crate) struct ClaimedSmtpSecretCleanup {
     pub project_id: uuid::Uuid,
     pub idempotency_key: String,
     pub recipient_ref: String,
+    pub lifecycle_ref: String,
     pub lease_owner: String,
 }
 
@@ -199,6 +200,7 @@ pub(crate) struct ClaimedSmtpSecretCleanup {
 pub(crate) struct ClaimedSmtpCredentialCleanup {
     pub id: uuid::Uuid,
     pub credential_ref: String,
+    pub lifecycle_ref: String,
     pub lease_owner: String,
 }
 
@@ -366,9 +368,16 @@ pub(crate) trait MailOutboxRepository: Send + Sync {
 
 #[async_trait]
 pub(crate) trait SmtpCredentialResolver: Send + Sync {
-    fn fingerprint(&self, value: &[u8]) -> [u8; 32];
-
     async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError>;
+
+    async fn resolve_checked(
+        &self,
+        reference: &str,
+        _expected_fingerprint: &[u8; 32],
+    ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        self.resolve(reference).await
+    }
+
     async fn erase(&self, reference: &str) -> Result<(), ApplicationError>;
 }
 
@@ -534,7 +543,9 @@ impl MailWorker {
         else {
             return Ok(false);
         };
-        self.credentials.erase(&cleanup.recipient_ref).await?;
+        if Uuid::parse_str(&cleanup.recipient_ref).is_err() {
+            self.credentials.erase(&cleanup.recipient_ref).await?;
+        }
         self.repository
             .finish_smtp_secret_cleanup(&cleanup, now)
             .await?;
@@ -552,7 +563,9 @@ impl MailWorker {
         else {
             return Ok(false);
         };
-        self.credentials.erase(&cleanup.credential_ref).await?;
+        if Uuid::parse_str(&cleanup.credential_ref).is_err() {
+            self.credentials.erase(&cleanup.credential_ref).await?;
+        }
         self.repository
             .finish_smtp_credential_cleanup(&cleanup, now)
             .await?;
@@ -594,10 +607,10 @@ impl MailWorker {
                 }
                 let recipient = String::from_utf8(recipient.to_vec())
                     .map_err(|_| ApplicationError::InvalidInput)?;
-                let credential = self.credentials.resolve(&job.credential_ref).await?;
-                if self.credentials.fingerprint(credential.as_slice()) != job.safe_fingerprint {
-                    return Err(ApplicationError::Disabled);
-                }
+                let credential = self
+                    .credentials
+                    .resolve_checked(&job.credential_ref, &job.safe_fingerprint)
+                    .await?;
                 let submission = MailSubmission {
                     endpoint: job.endpoint.clone(),
                     message_id: job.message_id.clone(),
@@ -669,10 +682,10 @@ impl MailWorker {
             if tokio::time::Instant::now() >= dispatch_deadline {
                 return Err(ApplicationError::ExternalStore);
             }
-            let credential = self.credentials.resolve(&job.credential_ref).await?;
-            if self.credentials.fingerprint(credential.as_slice()) != job.safe_fingerprint {
-                return Err(ApplicationError::Disabled);
-            }
+            let credential = self
+                .credentials
+                .resolve_checked(&job.credential_ref, &job.safe_fingerprint)
+                .await?;
             let submission = MailSubmission {
                 endpoint: job.endpoint.clone(),
                 message_id: job.message_id.clone(),
@@ -1262,10 +1275,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for SuccessfulCredentials {
-        fn fingerprint(&self, _value: &[u8]) -> [u8; 32] {
-            [7; 32]
-        }
-
         async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             Ok(Zeroizing::new(b"local-secret".to_vec()))
         }
@@ -1367,10 +1376,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for UnusedCredentials {
-        fn fingerprint(&self, _value: &[u8]) -> [u8; 32] {
-            unreachable!("claim returned no mail")
-        }
-
         async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             unreachable!("claim returned no mail")
         }
@@ -1384,10 +1389,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for SlowCredentials {
-        fn fingerprint(&self, _value: &[u8]) -> [u8; 32] {
-            [7; 32]
-        }
-
         async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             tokio::time::sleep(StdDuration::from_secs(1)).await;
             Ok(Zeroizing::new(b"local-secret".to_vec()))
@@ -1402,10 +1403,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for CountingCredentials {
-        fn fingerprint(&self, _value: &[u8]) -> [u8; 32] {
-            [7; 32]
-        }
-
         async fn resolve(&self, reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if reference == "smtp-test-recipient" {
@@ -1424,10 +1421,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for BoundaryCredentials {
-        fn fingerprint(&self, _value: &[u8]) -> [u8; 32] {
-            [7; 32]
-        }
-
         async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if call == 0 {
@@ -1449,12 +1442,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SmtpCredentialResolver for MismatchedCredentials {
-        fn fingerprint(&self, _value: &[u8]) -> [u8; 32] {
-            [1; 32]
-        }
-
         async fn resolve(&self, _reference: &str) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
             Ok(Zeroizing::new(b"local-secret".to_vec()))
+        }
+
+        async fn resolve_checked(
+            &self,
+            _reference: &str,
+            _expected_fingerprint: &[u8; 32],
+        ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+            Err(ApplicationError::Disabled)
         }
 
         async fn erase(&self, _reference: &str) -> Result<(), ApplicationError> {

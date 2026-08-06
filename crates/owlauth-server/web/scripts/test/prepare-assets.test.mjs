@@ -31,21 +31,20 @@ async function fixture({
   return root;
 }
 
-test("normalizes a closed plane manifest and creates deterministic representations", async () => {
+test("normalizes a closed plane manifest without owning compression representations", async () => {
   const first = await fixture();
   const second = await fixture();
   try {
     const firstManifest = await preparePlane("runtime", first);
     const secondManifest = await preparePlane("runtime", second);
     assert.deepEqual(firstManifest, secondManifest);
-    for (const suffix of ["", ".gz", ".br"]) {
-      assert.deepEqual(
-        await readFile(path.join(first, `assets/runtime-abcdefgh.js${suffix}`)),
-        await readFile(path.join(second, `assets/runtime-abcdefgh.js${suffix}`)),
-      );
-    }
+    assert.deepEqual(
+      await readFile(path.join(first, "assets/runtime-abcdefgh.js")),
+      await readFile(path.join(second, "assets/runtime-abcdefgh.js")),
+    );
     assert.equal(firstManifest.schemaVersion, 1);
     assert.equal(firstManifest.files[0].mime, "text/javascript; charset=utf-8");
+    assert.equal("representations" in firstManifest.files[0], false);
   } finally {
     await Promise.all([
       rm(first, { recursive: true, force: true }),

@@ -1687,7 +1687,8 @@ async fn identity_lifecycle_schema_rejects_stale_proofs_live_evidence_and_merge_
         "INSERT INTO managed_provider_reauthorization_interactions
             (id,project_id,project_public_id,connection_id,linked_identity_id,user_id,
              provider_configuration_id,provider_key,issuer,provider_kind,subject,client_id,secret_ref,
-             application_id,expected_connection_generation,expected_credential_generation,
+             provider_egress_policy_revision,application_id,expected_connection_generation,
+             expected_credential_generation,
              expected_connection_revision,project_security_revision,user_security_revision,
              identity_revision,provider_revision,managed_profile_revision,application_revision,
              assignment_security_revision,callback_url,adapter_key,
@@ -1695,7 +1696,8 @@ async fn identity_lifecycle_schema_rejects_stale_proofs_live_evidence_and_merge_
              provider_pkce_required,oidc_nonce_required,revision,status,expires_at,created_at)
          VALUES ($1,$2,(SELECT public_id FROM projects WHERE id=$2),$3,$4,$5,$6,
                  'oidc-main',
-                 'https://issuer.example','oidc','subject-winner01','client','secret/ref/test',$7,
+                 'https://issuer.example','oidc','subject-winner01','client','secret/ref/test',
+                 (SELECT revision FROM project_provider_egress_policies WHERE project_id=$2),$7,
                  1,1,1,1,1,1,1,1,1,1,'https://runtime.example/callback','oidc',1,true,
                  ARRAY['openid','profile']::text[],false,true,1,'awaiting_browser_binding',
                  transaction_timestamp()+INTERVAL '10 minutes',transaction_timestamp())",

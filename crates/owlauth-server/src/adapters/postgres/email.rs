@@ -113,25 +113,13 @@ pub(crate) struct ProjectSmtpReadinessCandidate {
 }
 
 impl PostgresPasswordlessEmailRepository {
+    #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
         Self::new_with_runtime_identity(
             database,
             "runtime-1".to_owned(),
             Uuid::nil(),
             vec!["runtime-1".to_owned()],
-            time::Duration::minutes(5),
-        )
-    }
-
-    pub(crate) fn new_with_runtime_roster(
-        database: DatabaseConnection,
-        required_runtime_process_ids: Vec<String>,
-    ) -> Self {
-        Self::new_with_runtime_identity(
-            database,
-            "runtime-reader".to_owned(),
-            Uuid::nil(),
-            required_runtime_process_ids,
             time::Duration::minutes(5),
         )
     }
@@ -273,6 +261,10 @@ impl PostgresPasswordlessEmailRepository {
     /// Returns a bounded inventory of exact active or still-retained Project SMTP references.
     /// Rows with no observation are preferred, then the oldest observation, so repeated batches
     /// converge without making unrelated Runtime capabilities globally unready.
+    /// Returns a bounded inventory of exact active or still-retained Project SMTP references.
+    /// Rows with no observation are preferred, then the oldest observation, so repeated batches
+    /// converge without making unrelated Runtime capabilities globally unready.
+    #[cfg(test)]
     pub(crate) async fn project_smtp_readiness_candidates(
         &self,
         now: OffsetDateTime,
@@ -343,7 +335,8 @@ impl PostgresPasswordlessEmailRepository {
         self.lock_local_runtime_incarnation(&transaction).await?;
         let rows = transaction
             .query_all_raw(statement(
-                "SELECT smtp.project_id,smtp.id,smtp.generation,smtp.credential_ref,
+                "SELECT smtp.project_id,smtp.id,smtp.generation,
+                        COALESCE(smtp.credential_material_id::TEXT,smtp.credential_ref) AS credential_ref,
                         smtp.safe_fingerprint
                  FROM project_smtp_configurations smtp
                  LEFT JOIN project_smtp_runtime_readiness readiness
@@ -402,7 +395,8 @@ impl PostgresPasswordlessEmailRepository {
              SELECT smtp.project_id,smtp.id,smtp.generation,$6,$7,$8,$9,$10
              FROM project_smtp_configurations smtp
              WHERE smtp.project_id=$1 AND smtp.id=$2 AND smtp.generation=$3
-               AND smtp.credential_ref=$4 AND smtp.safe_fingerprint=$5
+               AND COALESCE(smtp.credential_material_id::TEXT,smtp.credential_ref)=$4
+               AND smtp.safe_fingerprint=$5
                AND EXISTS (
                  SELECT 1 FROM runtime_process_incarnations current
                  WHERE current.process_id=$6 AND current.process_incarnation=$7)
@@ -2083,20 +2077,9 @@ impl crate::application::DeploymentSmtpRegistry for PostgresPasswordlessEmailRep
             ))
             .await
             .map_err(persistence)?;
-        if let Some(existing) = existing {
-            if deployment_smtp_is_unchanged(&existing, generation, tls_mode)? {
-                return transaction.commit().await.map_err(persistence);
-            }
-        } else {
-            transaction.execute_raw(statement(
-                "INSERT INTO deployment_smtp_generations
-                 (generation,status,revision,security_eligibility_revision,host,port,tls_mode,sender_address,
-                  credential_ref,safe_fingerprint,explicitly_allowed_private_ips,created_at,updated_at)
-                 VALUES ($1,'reconciled',1,1,$2,$3,$4,$5,$6,$7,$8,$9,$9)",
-                vec![generation.generation.into(), generation.host.clone().into(), i32::from(generation.port).into(),
-                    tls_mode.into(), generation.sender_address.clone().into(), generation.credential_ref.clone().into(),
-                    generation.safe_fingerprint.to_vec().into(), ip_allowlist_json(&generation.explicitly_allowed_private_ips).into(), now.into()],
-            )).await.map_err(persistence)?;
+        let existing = existing.ok_or(ApplicationError::NotFound)?;
+        if deployment_smtp_is_unchanged(&existing, generation, tls_mode)? {
+            return transaction.commit().await.map_err(persistence);
         }
         let action = match generation.desired_status {
             crate::application::DeploymentSmtpDesiredStatus::Reconciled => {
@@ -2506,6 +2489,8 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         let row = transaction
             .query_one_raw(statement(
                 "SELECT test.*,smtp.safe_fingerprint,
+                        COALESCE(test.recipient_material_id::TEXT,test.recipient_ref) AS resolved_recipient_ref,
+                        COALESCE(test.credential_material_id::TEXT,test.credential_ref) AS resolved_credential_ref,
                         '[]'::jsonb AS explicitly_allowed_private_ips
              FROM project_smtp_test_operations test
              JOIN project_smtp_configurations smtp
@@ -2563,7 +2548,9 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                 .map_err(persistence)?,
             idempotency_key: key,
             message_id: row.try_get("", "message_id").map_err(persistence)?,
-            recipient_ref: row.try_get("", "recipient_ref").map_err(persistence)?,
+            recipient_ref: row
+                .try_get("", "resolved_recipient_ref")
+                .map_err(persistence)?,
             endpoint: crate::application::SmtpEndpoint {
                 hostname: row.try_get("", "host").map_err(persistence)?,
                 port: u16::try_from(row.try_get::<i32>("", "port").map_err(persistence)?)
@@ -2576,7 +2563,9 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                 development_plaintext_enabled: false,
             },
             envelope_from: row.try_get("", "sender_address").map_err(persistence)?,
-            credential_ref: row.try_get("", "credential_ref").map_err(persistence)?,
+            credential_ref: row
+                .try_get("", "resolved_credential_ref")
+                .map_err(persistence)?,
             safe_fingerprint: row
                 .try_get::<Vec<u8>>("", "safe_fingerprint")
                 .map_err(persistence)?
@@ -2645,7 +2634,8 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                      FROM project_smtp_configurations smtp
                      WHERE smtp.project_id=$1 AND smtp.id=$2 AND smtp.generation=$3
                        AND smtp.revision=$4 AND smtp.security_eligibility_revision=$5
-                       AND smtp.credential_ref=$6 AND smtp.safe_fingerprint=$7
+                       AND COALESCE(smtp.credential_material_id::TEXT,smtp.credential_ref)=$6
+                       AND smtp.safe_fingerprint=$7
                        AND (smtp.status IN ('pending','active') OR
                             (smtp.status='retained' AND smtp.retained_until>$10))
                        AND EXISTS (
@@ -2722,7 +2712,8 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         self.lock_local_runtime_incarnation(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
-                "SELECT project_id,id,idempotency_key,recipient_ref FROM project_smtp_test_operations
+                "SELECT project_id,id,idempotency_key,recipient_ref,recipient_material_id
+                 FROM project_smtp_test_operations
              WHERE state IN ('delivered','failed','ambiguous') AND recipient_erased_at IS NULL
                AND (cleanup_lease_owner IS NULL OR cleanup_lease_expires_at <= $1)
              ORDER BY completed_at LIMIT 1",
@@ -2818,10 +2809,18 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         if updated.rows_affected() != 1 {
             return Err(ApplicationError::RevisionConflict);
         }
+        let erasure_ref = row
+            .try_get::<Option<Uuid>>("", "recipient_material_id")
+            .map_err(persistence)?
+            .map_or_else(
+                || recipient_ref.clone(),
+                |material_id| material_id.to_string(),
+            );
         let cleanup = crate::application::ClaimedSmtpSecretCleanup {
             project_id,
             idempotency_key: key,
-            recipient_ref,
+            recipient_ref: erasure_ref,
+            lifecycle_ref: recipient_ref,
             lease_owner: worker.to_owned(),
         };
         transaction.commit().await.map_err(persistence)?;
@@ -2837,7 +2836,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         self.lock_local_runtime_incarnation(&transaction).await?;
         let owner = transaction
             .query_one_raw(statement(
-                "SELECT id,recipient_ref FROM project_smtp_test_operations
+                "SELECT id,recipient_ref,recipient_material_id FROM project_smtp_test_operations
                  WHERE project_id=$1 AND idempotency_key=$2 AND cleanup_lease_owner=$3
                    AND recipient_erased_at IS NULL FOR UPDATE",
                 vec![
@@ -2851,8 +2850,54 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
             .ok_or(ApplicationError::RevisionConflict)?;
         let operation_id: Uuid = owner.try_get("", "id").map_err(persistence)?;
         let recipient_ref: String = owner.try_get("", "recipient_ref").map_err(persistence)?;
-        if recipient_ref != cleanup.recipient_ref {
+        let erasure_ref = owner
+            .try_get::<Option<Uuid>>("", "recipient_material_id")
+            .map_err(persistence)?
+            .map_or_else(
+                || recipient_ref.clone(),
+                |material_id| material_id.to_string(),
+            );
+        if recipient_ref != cleanup.lifecycle_ref || erasure_ref != cleanup.recipient_ref {
             return Err(ApplicationError::Integrity);
+        }
+        if let Some(material_id) = owner
+            .try_get::<Option<Uuid>>("", "recipient_material_id")
+            .map_err(persistence)?
+        {
+            super::custody::lock_material_inventory(&transaction).await?;
+            let material = transaction
+                .query_one_raw(statement(
+                    "SELECT state,owner_kind FROM protected_materials WHERE id=$1 FOR UPDATE",
+                    vec![material_id.into()],
+                ))
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
+            if material
+                .try_get::<String>("", "owner_kind")
+                .map_err(persistence)?
+                != "smtp_test_recipient"
+            {
+                return Err(ApplicationError::Integrity);
+            }
+            if material
+                .try_get::<String>("", "state")
+                .map_err(persistence)?
+                != "erased"
+            {
+                let erased = transaction
+                    .execute_raw(statement(
+                        "UPDATE protected_materials
+                            SET opaque_value=NULL,state='erased',erased_at=$2,updated_at=$2
+                          WHERE id=$1 AND state IN ('pending','live')",
+                        vec![material_id.into(), now.into()],
+                    ))
+                    .await
+                    .map_err(persistence)?;
+                if erased.rows_affected() != 1 {
+                    return Err(ApplicationError::RevisionConflict);
+                }
+            }
         }
         lock_smtp_credential_reference(&transaction, &recipient_ref).await?;
         let tombstoned = transaction
@@ -2899,7 +2944,8 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         let retired_projects = transaction
             .query_all_raw(statement(
                 "WITH bounded AS (
-                   SELECT smtp.project_id,smtp.id,smtp.generation,smtp.credential_ref
+                   SELECT smtp.project_id,smtp.id,smtp.generation,smtp.credential_ref,
+                          smtp.credential_material_id
                    FROM project_smtp_configurations smtp
                    WHERE ((smtp.status='retained' AND smtp.retained_until <= $1)
                           OR smtp.status IN ('disabled','compromised'))
@@ -2934,7 +2980,8 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                  SET status='retired',retained_until=NULL,revision=revision+1,
                      security_eligibility_revision=security_eligibility_revision+1,updated_at=$1
                  FROM bounded WHERE smtp.project_id=bounded.project_id AND smtp.id=bounded.id
-                 RETURNING smtp.project_id,smtp.id,smtp.generation,smtp.credential_ref",
+                 RETURNING smtp.project_id,smtp.id,smtp.generation,smtp.credential_ref,
+                           smtp.credential_material_id",
                 vec![now.into()],
             ))
             .await
@@ -2946,14 +2993,17 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
             transaction
                 .execute_raw(statement(
                     "INSERT INTO smtp_credential_cleanup_operations
-                     (id,scope,project_id,generation,credential_ref,state,created_at)
-                     VALUES ($1,'project',$2,$3,$4,'pending',$5)
+                     (id,scope,project_id,generation,credential_ref,material_id,state,created_at)
+                     VALUES ($1,'project',$2,$3,$4,$5,'pending',$6)
                      ON CONFLICT (scope,project_id,generation) DO NOTHING",
                     vec![
                         Uuid::new_v4().into(),
                         project_id.into(),
                         generation.into(),
                         row.try_get::<String>("", "credential_ref")
+                            .map_err(persistence)?
+                            .into(),
+                        row.try_get::<Option<Uuid>>("", "credential_material_id")
                             .map_err(persistence)?
                             .into(),
                         now.into(),
@@ -3000,7 +3050,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                  SET status='retired',retained_until=NULL,revision=revision+1,
                      security_eligibility_revision=security_eligibility_revision+1,updated_at=$1
                  FROM bounded WHERE smtp.generation=bounded.generation
-                 RETURNING smtp.generation,smtp.credential_ref",
+                 RETURNING smtp.generation,smtp.credential_ref,smtp.credential_material_id",
                 vec![now.into()],
             ))
             .await
@@ -3010,13 +3060,16 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
             transaction
                 .execute_raw(statement(
                     "INSERT INTO smtp_credential_cleanup_operations
-                     (id,scope,project_id,generation,credential_ref,state,created_at)
-                     VALUES ($1,'deployment_default',NULL,$2,$3,'pending',$4)
+                     (id,scope,project_id,generation,credential_ref,material_id,state,created_at)
+                     VALUES ($1,'deployment_default',NULL,$2,$3,$4,'pending',$5)
                      ON CONFLICT (scope,project_id,generation) DO NOTHING",
                     vec![
                         Uuid::new_v4().into(),
                         generation.into(),
                         row.try_get::<String>("", "credential_ref")
+                            .map_err(persistence)?
+                            .into(),
+                        row.try_get::<Option<Uuid>>("", "credential_material_id")
                             .map_err(persistence)?
                             .into(),
                         now.into(),
@@ -3039,7 +3092,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         self.lock_local_runtime_incarnation(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
-                "SELECT cleanup.id,cleanup.credential_ref
+                "SELECT cleanup.id,cleanup.credential_ref,cleanup.material_id
                  FROM smtp_credential_cleanup_operations cleanup
                  LEFT JOIN smtp_credential_reference_reservations reservation
                    ON reservation.credential_ref=cleanup.credential_ref
@@ -3139,9 +3192,17 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         if updated.rows_affected() != 1 {
             return Err(ApplicationError::RevisionConflict);
         }
+        let erasure_ref = row
+            .try_get::<Option<Uuid>>("", "material_id")
+            .map_err(persistence)?
+            .map_or_else(
+                || credential_ref.clone(),
+                |material_id| material_id.to_string(),
+            );
         let cleanup = crate::application::ClaimedSmtpCredentialCleanup {
             id,
-            credential_ref,
+            credential_ref: erasure_ref,
+            lifecycle_ref: credential_ref,
             lease_owner: worker.to_owned(),
         };
         transaction.commit().await.map_err(persistence)?;
@@ -3155,13 +3216,13 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
         self.lock_local_runtime_incarnation(&transaction).await?;
-        lock_smtp_credential_reference(&transaction, &cleanup.credential_ref).await?;
+        lock_smtp_credential_reference(&transaction, &cleanup.lifecycle_ref).await?;
         let row = transaction
             .query_one_raw(statement(
                 "UPDATE smtp_credential_cleanup_operations
                  SET state='erased',lease_owner=NULL,lease_expires_at=NULL,erased_at=$3
                  WHERE id=$1 AND state='leased' AND lease_owner=$2
-                 RETURNING scope,project_id,generation",
+                 RETURNING scope,project_id,generation,material_id",
                 vec![
                     cleanup.id.into(),
                     cleanup.lease_owner.clone().into(),
@@ -3174,13 +3235,44 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         let scope: String = row.try_get("", "scope").map_err(persistence)?;
         let project_id: Option<Uuid> = row.try_get("", "project_id").map_err(persistence)?;
         let generation: i32 = row.try_get("", "generation").map_err(persistence)?;
+        let material_id: Option<Uuid> = row.try_get("", "material_id").map_err(persistence)?;
+        if let Some(material_id) = material_id {
+            super::custody::lock_material_inventory(&transaction).await?;
+            let material = transaction
+                .query_one_raw(statement(
+                    "SELECT state,owner_kind FROM protected_materials WHERE id=$1 FOR UPDATE",
+                    vec![material_id.into()],
+                ))
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
+            let owner_kind: String = material.try_get("", "owner_kind").map_err(persistence)?;
+            if !matches!(owner_kind.as_str(), "project_smtp" | "deployment_smtp") {
+                return Err(ApplicationError::Integrity);
+            }
+            let state: String = material.try_get("", "state").map_err(persistence)?;
+            if state != "erased" {
+                let erased = transaction
+                    .execute_raw(statement(
+                        "UPDATE protected_materials
+                            SET opaque_value=NULL,state='erased',erased_at=$2,updated_at=$2
+                          WHERE id=$1 AND state IN ('pending','live')",
+                        vec![material_id.into(), now.into()],
+                    ))
+                    .await
+                    .map_err(persistence)?;
+                if erased.rows_affected() != 1 {
+                    return Err(ApplicationError::RevisionConflict);
+                }
+            }
+        }
         let reserved = transaction
             .execute_raw(statement(
                 "UPDATE smtp_credential_reference_reservations
              SET state='erased',cleanup_id=NULL,erased_at=$3,updated_at=$3
              WHERE credential_ref=$1 AND state='reserved' AND cleanup_id=$2",
                 vec![
-                    cleanup.credential_ref.clone().into(),
+                    cleanup.lifecycle_ref.clone().into(),
                     cleanup.id.into(),
                     now.into(),
                 ],
@@ -3498,15 +3590,6 @@ async fn load_email_protection_inventory(
         };
     }
     Ok(inventory)
-}
-
-fn ip_allowlist_json(values: &[std::net::IpAddr]) -> serde_json::Value {
-    serde_json::Value::Array(
-        values
-            .iter()
-            .map(|value| serde_json::Value::String(value.to_string()))
-            .collect(),
-    )
 }
 
 fn parse_tls_mode(value: &str) -> Result<crate::application::SmtpTlsMode, ApplicationError> {
@@ -4127,7 +4210,9 @@ async fn claim_due_login_mail(
         transaction
                 .query_one_raw(statement(
                     "SELECT smtp.host,smtp.port,smtp.tls_mode,smtp.sender_address,
-                            smtp.sender_name,smtp.reply_to,smtp.credential_ref,smtp.safe_fingerprint,
+                            smtp.sender_name,smtp.reply_to,
+                            COALESCE(smtp.credential_material_id::TEXT,smtp.credential_ref) AS credential_ref,
+                            smtp.safe_fingerprint,
                             '[]'::jsonb AS allowed_private_ips,smtp.status,smtp.retained_until,
                             smtp.security_eligibility_revision
                      FROM project_smtp_configurations smtp
@@ -4171,7 +4256,8 @@ async fn claim_due_login_mail(
         transaction
                 .query_one_raw(statement(
                     "SELECT smtp.host,smtp.port,smtp.tls_mode,smtp.sender_address,
-                            NULL::TEXT AS sender_name,NULL::TEXT AS reply_to,smtp.credential_ref,
+                            NULL::TEXT AS sender_name,NULL::TEXT AS reply_to,
+                            COALESCE(smtp.credential_material_id::TEXT,smtp.credential_ref) AS credential_ref,
                             smtp.safe_fingerprint,smtp.explicitly_allowed_private_ips AS allowed_private_ips,
                             smtp.status,smtp.retained_until,smtp.security_eligibility_revision
                      FROM deployment_smtp_generations smtp WHERE smtp.generation=$1
@@ -4729,7 +4815,9 @@ async fn claim_due_identity_mutation_mail(
         transaction
             .query_one_raw(statement(
                 "SELECT smtp.host,smtp.port,smtp.tls_mode,smtp.sender_address,smtp.sender_name,
-                        smtp.reply_to,smtp.credential_ref,smtp.safe_fingerprint,
+                        smtp.reply_to,
+                        COALESCE(smtp.credential_material_id::TEXT,smtp.credential_ref) AS credential_ref,
+                        smtp.safe_fingerprint,
                         '[]'::jsonb AS allowed_private_ips,smtp.status,smtp.retained_until,
                         smtp.security_eligibility_revision
                    FROM project_smtp_configurations smtp WHERE smtp.project_id=$1 AND smtp.id=$2
@@ -4768,7 +4856,8 @@ async fn claim_due_identity_mutation_mail(
         transaction
             .query_one_raw(statement(
                 "SELECT smtp.host,smtp.port,smtp.tls_mode,smtp.sender_address,
-                        NULL::TEXT AS sender_name,NULL::TEXT AS reply_to,smtp.credential_ref,
+                        NULL::TEXT AS sender_name,NULL::TEXT AS reply_to,
+                        COALESCE(smtp.credential_material_id::TEXT,smtp.credential_ref) AS credential_ref,
                         smtp.safe_fingerprint,smtp.explicitly_allowed_private_ips AS allowed_private_ips,
                         smtp.status,smtp.retained_until,smtp.security_eligibility_revision
                    FROM deployment_smtp_generations smtp WHERE smtp.generation=$1 FOR SHARE OF smtp",

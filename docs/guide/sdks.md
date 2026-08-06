@@ -29,7 +29,7 @@ An SDK initializes from public Project/Application configuration:
 
 These values select and attribute an integration. They are not secrets, user credentials, Project access tokens, or Control authority.
 
-Default SDKs target the **Runtime Project Auth contract only**. Administrative Control operations require a deliberately isolated client module or the remote CLI. The Rust SDK gets no privileged path to `owlauth-server`, PostgreSQL, domain entities, or key providers.
+Default SDKs target the **Runtime Project Auth contract only**. They reject Client and Control operation/security imports. Administrative Control operations use the remote CLI or another deliberately isolated operator client. Customer backends call the separate Client API from generated code or direct HTTP; OwlAuth does not publish an official Client SDK. The Rust SDK gets no privileged path to `owlauth-server`, PostgreSQL, domain entities, or key providers.
 
 ```mermaid
 flowchart LR
@@ -40,6 +40,25 @@ flowchart LR
     CLI --> Control[Control listener]
     Control --> Core
 ```
+
+## Customer backend Client OpenAPI
+
+Every server release attaches three independent exact-version documents:
+
+- `owlauth-runtime-openapi.json` for browser/native Project Auth SDKs;
+- `owlauth-client-openapi.json` for customer backend user reads and online token introspection;
+- `owlauth-control-openapi.json` for deployment administration.
+
+Generate a customer-owned Client API library with any OpenAPI 3.1-compatible tool, or call the five JSON endpoints directly. Supply a Project client key only from a trusted backend as one `Authorization: Bearer` credential. Never place that key in browser/native code, Hosted assets, URLs, cookies, or Runtime SDK configuration.
+
+For a source checkout, export the same document deterministically:
+
+```bash
+cargo run --locked -p owlauth-types --bin export-openapi -- \
+  client owlauth-client-openapi.json
+```
+
+The Client document is a wire contract, not an OwlAuth authorization/business SDK: customer code still owns organizations, billing, business permissions, repositories, caching policy, and framework integration.
 
 ## Sign-in lifecycle
 
@@ -77,7 +96,7 @@ An application backend—not a TypeScript client running in the browser—verifi
 
 ## Generated and handwritten layers
 
-Reviewed Rust definitions in `crates/owlauth-types` produce separate Runtime and Control OpenAPI descriptions in the target architecture. The OpenAPI artifact is generated ephemerally from the exact source revision and is not committed.
+Reviewed Rust definitions in `crates/owlauth-types` produce separate Runtime, Client, and Control OpenAPI descriptions. Documents are generated ephemerally from the exact source revision and are not committed; exact-version copies are attached to server releases.
 
 Generated code may own wire models, serialization, endpoint declarations, and low-level operations. Handwritten core SDK code owns transport policy, PKCE custody, callback validation, safe one-use request semantics, Project/Application isolation, redaction, and idiomatic errors. Application or separate integration code owns navigation, history mutation, persistence, refresh coordination, and framework state.
 
@@ -118,7 +137,7 @@ One archive is built per component and bound to a canonical candidate descriptor
 | Python     | Python 3.11, 3.12, 3.13, and 3.14                    | Chromium job         | The wheel uses its normal HTTP transport; a bounded raw helper drives Hosted/provider navigation               |
 | Rust       | Stable Rust                                          | Chromium job         | An external Cargo consumer uses the extracted `.crate`; a bounded raw helper drives Hosted/provider navigation |
 
-The real-server suite starts one OwlAuth Runtime/Control process topology with isolated PostgreSQL and key/configuration stores. Browser-direct product custody, backend product custody, TypeScript, Python, and Rust receive distinct Project/Application assignments and mutable credentials while sharing that server coordinate. Firefox runs the TypeScript assignment; Chromium runs all three SDK assignments. Backend-custody product evidence does not imply that every core SDK owns backend state.
+The real-server suite starts one OwlAuth Runtime/Client/Control process topology with isolated PostgreSQL and key/configuration stores. Browser-direct product custody, backend product custody, TypeScript, Python, and Rust receive distinct Project/Application assignments and mutable credentials while sharing that server coordinate. Firefox runs the TypeScript assignment; Chromium runs all three SDK assignments. Backend-custody product evidence does not imply that every core SDK owns backend state.
 
 After all package and same-server fragments pass, CI creates `typescript-final-evidence.json`, `python-final-evidence.json`, and `rust-final-evidence.json`. Each manifest binds the candidate descriptor, exact archive, matrices, per-operation coverage, assignments, and same-server commit. Release workflows verify the component manifest against the tag/run candidate, attach it to the GitHub Release, and publish the already-qualified archive without rebuilding it. Non-PR runs attest candidate archives/descriptors and final manifests.
 

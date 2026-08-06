@@ -25,7 +25,8 @@ cargo package \
   --locked --allow-dirty --no-verify
 cargo package \
   --manifest-path crates/owlauth-cli/Cargo.toml \
-  --locked --allow-dirty --no-verify
+  --locked --allow-dirty --no-verify \
+  --config 'patch.crates-io.owlauth-types.path="crates/owlauth-types"'
 
 cli_files="$(tar -tzf "$cli_archive" | sed 's#^[^/]*/##')"
 grep -qx LICENSE <<< "$cli_files"

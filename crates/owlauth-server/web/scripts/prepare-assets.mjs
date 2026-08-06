@@ -1,12 +1,7 @@
-import { constants as bufferConstants } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
-
-import { gzipSync } from "fflate";
-
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLANES = ["runtime", "control"];
 const MIME = new Map([
@@ -69,37 +64,6 @@ async function listFiles(directory, prefix = "") {
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
-}
-
-function compressionVariants(bytes) {
-  const gzip = Buffer.from(gzipSync(bytes, { level: 9, mtime: 0 }));
-  const brotli = brotliCompressSync(bytes, {
-    params: {
-      [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
-      [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
-      [zlibConstants.BROTLI_PARAM_SIZE_HINT]: Math.min(bytes.length, bufferConstants.MAX_LENGTH),
-    },
-  });
-  invariant(
-    gzip.equals(Buffer.from(gzipSync(bytes, { level: 9, mtime: 0 }))),
-    "gzip output is not deterministic",
-  );
-  invariant(
-    brotli.equals(
-      brotliCompressSync(bytes, {
-        params: {
-          [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
-          [zlibConstants.BROTLI_PARAM_QUALITY]: 11,
-          [zlibConstants.BROTLI_PARAM_SIZE_HINT]: Math.min(
-            bytes.length,
-            bufferConstants.MAX_LENGTH,
-          ),
-        },
-      }),
-    ),
-    "Brotli output is not deterministic",
-  );
-  return { gzip, brotli };
 }
 
 function collectClosure(manifest, plane) {
@@ -224,11 +188,7 @@ export async function preparePlane(plane, root = path.join(packageRoot, "dist", 
 
   const before = await listFiles(root);
   const authored = before.filter(
-    (file) =>
-      file !== ".vite/manifest.json" &&
-      file !== "server-manifest.json" &&
-      !file.endsWith(".gz") &&
-      !file.endsWith(".br"),
+    (file) => file !== ".vite/manifest.json" && file !== "server-manifest.json",
   );
   invariant(new Set(authored).size === authored.length, `${plane} output contains duplicate paths`);
   invariant(
@@ -242,25 +202,11 @@ export async function preparePlane(plane, root = path.join(packageRoot, "dist", 
     const absolute = path.join(root, ...relative.split("/"));
     const bytes = await readFile(absolute);
     const mime = validateFileContent(relative, bytes);
-    const identity = { path: relative, bytes: bytes.length, sha256: sha256(bytes) };
-    const representations = { identity };
-    if (TEXT_EXTENSIONS.has(path.posix.extname(relative))) {
-      const { gzip, brotli } = compressionVariants(bytes);
-      await writeFile(`${absolute}.gz`, gzip);
-      await writeFile(`${absolute}.br`, brotli);
-      representations.gzip = { path: `${relative}.gz`, bytes: gzip.length, sha256: sha256(gzip) };
-      representations.brotli = {
-        path: `${relative}.br`,
-        bytes: brotli.length,
-        sha256: sha256(brotli),
-      };
-    }
     normalizedFiles.push({
       path: relative,
       mime,
       bytes: bytes.length,
-      sha256: identity.sha256,
-      representations,
+      sha256: sha256(bytes),
     });
   }
 
@@ -282,11 +228,7 @@ export async function preparePlane(plane, root = path.join(packageRoot, "dist", 
   );
 
   const expected = new Set([".vite/manifest.json", "server-manifest.json"]);
-  for (const file of normalizedFiles) {
-    expected.add(file.path);
-    for (const representation of Object.values(file.representations))
-      expected.add(representation.path);
-  }
+  for (const file of normalizedFiles) expected.add(file.path);
   const after = await listFiles(root);
   invariant(
     after.length === expected.size && after.every((file) => expected.has(file)),

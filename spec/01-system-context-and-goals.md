@@ -6,7 +6,7 @@ OwlAuth is a self-hostable authentication and identity service for applications.
 
 OwlAuth authenticates through configured upstream identity providers or first-party passwordless email, maps proven identities to Project-scoped users, and returns a revisioned Project user projection plus OwlAuth session credentials to the initiating Application. It may manage a provider connection solely for bounded profile synchronization and may notify an already bound Application through signed user-projection webhooks. Applications and their backends do not integrate with OwlAuth as general OAuth clients; they use the Project Auth API and SDK and never receive upstream provider credentials.
 
-OwlAuth owns authentication, identity linking, Project sessions, and Project token claims. An application backend still owns business authorization such as organization membership, document access, billing roles, and domain-specific permissions.
+OwlAuth owns authentication, identity linking, Project sessions, and Project token claims. A customer backend may use a Project client key on the separate Client API to read its Project user directory and authoritatively introspect an OwlAuth access token. It still owns business authorization such as organization membership, document access, billing roles, and domain-specific permissions, and it owns any generated OpenAPI client or SaaS/BFF framework integration.
 
 ## Core concepts
 
@@ -15,7 +15,7 @@ OwlAuth owns authentication, identity linking, Project sessions, and Project tok
 | Deployment                  | one OwlAuth installation and administrative trust domain                                | one operator policy, one PostgreSQL authority                                           |
 | Project                     | isolated authentication namespace for one product or related application family         | owns users, identities, provider configuration, sessions, tokens, and keys              |
 | Application                 | one web/mobile/native/server integration inside a Project                               | owns public app identifier, type, allowed origins, and post-login redirects             |
-| Provider configuration      | a Project's GitHub/Google/OIDC client registration assigned to one or more Applications | owns provider client ID, callback identity, and secret-store reference                  |
+| Provider configuration      | a Project's GitHub/Google/OIDC client registration assigned to one or more Applications | owns provider client ID, callback identity, and protected-secret material ID            |
 | Project user                | stable local identity inside exactly one Project                                        | not reused or discoverable across Projects                                              |
 | Linked identity             | verified upstream issuer/subject attached to a Project user                             | unique within the Project                                                               |
 | Project browser session     | user/browser authentication state reusable by Applications in the same Project          | never authenticates another Project                                                     |
@@ -25,24 +25,25 @@ OwlAuth owns authentication, identity linking, Project sessions, and Project tok
 | Managed provider connection | optional renewable provider credential and sync lifecycle for one linked identity       | server-only, least-scope profile synchronization; never an Application token vault      |
 | Email identity/challenge    | first-party verified email plus OTP or magic-link proof                                 | Project-bound, one-use, enumeration-safe, and tied to the Application login transaction |
 | User projection/webhook     | revisioned Application-visible user view and asynchronous change notification           | emitted only after an Application-user binding; bounded and credential-free             |
+| Project client key          | server-generated confidential credential for one Project's read-only Client API         | hash-only, independently revocable, never accepted by Runtime or Control                |
 | `belongs_to`                | nullable opaque Project metadata supplied by an external control system                 | index/correlation only; no built-in tenant authorization semantics                      |
 
 Project identifiers are globally unique within the deployment. User identifiers may use globally unique UUIDs operationally, but their semantic identity is `(project_id, user_id)`. The same provider account can map to independent users in different Projects.
 
 ## Actors and adjacent systems
 
-| Actor or system            | Relationship to OwlAuth                                                             | Trust position                                                                                              |
-| -------------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| End user                   | authenticates through an Application and upstream provider                          | browser, redirects, and supplied data are untrusted                                                         |
-| Application                | starts login, exchanges a handoff ticket, stores/uses session results               | public app identifiers are not secrets; redirect and origin registration is authoritative                   |
-| Application backend        | verifies Project tokens and applies business authorization                          | separate authorization boundary                                                                             |
-| Upstream identity provider | authenticates the end user and returns stable issuer/subject claims                 | remote security dependency with provider-specific validation                                                |
-| Deployment operator        | creates Projects/Applications/providers and manages users, keys, and policy         | trusted holder of the deployment-wide Control API key; all Control actions audit as the deployment operator |
-| External control gateway   | optionally proxies Control for another product's organization/RBAC layer            | separate policy-enforcement point; must validate `belongs_to` and object access                             |
-| PostgreSQL                 | stores authoritative Project, identity, login, session, token, key, and audit state | privileged durability and consistency boundary                                                              |
-| Redis                      | provides non-authoritative caching, rate coordination, and invalidation hints       | disposable support dependency; values may be stale or absent                                                |
-| Signer/key store or KMS    | protects private keys and performs Project-scoped signing/data protection           | privileged cryptographic boundary                                                                           |
-| SDK, CLI, or MCP caller    | adapts Runtime or Control interfaces                                                | untrusted input; never an authorization authority                                                           |
+| Actor or system            | Relationship to OwlAuth                                                                                                                        | Trust position                                                                                              |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| End user                   | authenticates through an Application and upstream provider                                                                                     | browser, redirects, and supplied data are untrusted                                                         |
+| Application                | starts login, exchanges a handoff ticket, stores/uses session results                                                                          | public app identifiers are not secrets; redirect and origin registration is authoritative                   |
+| Application backend        | calls Client with its Project client key, verifies/introspects Project tokens, and applies business authorization                              | trusted customer server for one Project; never deployment Control authority                                 |
+| Upstream identity provider | authenticates the end user and returns stable issuer/subject claims                                                                            | remote security dependency with provider-specific validation                                                |
+| Deployment operator        | creates Projects/Applications/providers and manages users, keys, and policy                                                                    | trusted holder of the deployment-wide Control API key; all Control actions audit as the deployment operator |
+| External control gateway   | optionally proxies Control for another product's organization/RBAC layer                                                                       | separate policy-enforcement point; must validate `belongs_to` and object access                             |
+| PostgreSQL                 | stores authoritative Project, identity, login, session, token, key, and audit state                                                            | privileged durability and consistency boundary                                                              |
+| Redis                      | provides non-authoritative caching, rate coordination, and invalidation hints                                                                  | disposable support dependency; values may be stale or absent                                                |
+| Key-provider capability    | provisions/signs Project keys or seals/opens configuration secrets; bundled mode uses PostgreSQL envelopes, custom mode may use remote custody | privileged role-specific cryptographic boundary                                                             |
+| SDK, CLI, or MCP caller    | adapts Runtime or Control interfaces                                                                                                           | untrusted input; never an authorization authority                                                           |
 
 ## Project and Application isolation
 
@@ -71,12 +72,13 @@ Project boundaries apply to every Runtime operation. The selected Project is res
 
 ## Logical plane architecture
 
-OwlAuth is a modular monolith with two transport planes over one shared core.
+OwlAuth is a modular monolith with three transport planes over one shared core. The exact Client credential, API, OpenAPI, caching, and isolation rules are owned by [spec 13](13-client-api-and-project-client-keys.md).
 
 ```mermaid
 flowchart LR
     EndUsers[Applications and end users] --> Hosted[Hosted Authentication UI]
     Hosted --> RL[Runtime listener]
+    Backends[Customer backends] --> BL[Client listener]
     Operators[Operator or external control gateway] --> Console[Management Console or Control client]
     Console --> CL[Control listener]
 
@@ -84,18 +86,22 @@ flowchart LR
         subgraph Runtime[Runtime / Protocol Plane]
             RL --> RH[Hosted UI and Project Auth HTTP adapters]
         end
+        subgraph Client[Client Plane]
+            BL --> BA[Project client-key HTTP adapters]
+        end
         subgraph Control[Control Plane]
             CL --> CA[Management Console, Control HTTP, and MCP adapters]
         end
         RH --> AS[Shared application services]
+        BA --> AS
         CA --> AS
         AS --> D[Project-scoped domain model]
         AS --> P[Ports]
     end
 
-    P --> PG[(PostgreSQL)]
+    P --> PG[(PostgreSQL authority + protected material)]
     P --> Redis[(Redis)]
-    P --> KMS[Signer / key store]
+    P --> KP[Role-specific key-provider capabilities]
     P --> IdP[GitHub / Google / upstream OIDC]
 ```
 
@@ -116,13 +122,24 @@ Runtime serves latency-sensitive public Project authentication traffic:
 
 Runtime is not a general OAuth authorization server. OAuth/OIDC protocol handling exists only inside upstream provider adapters. Runtime's downstream contract is the OwlAuth Project Auth API.
 
+## Client Plane
+
+Client serves JSON-only customer-backend traffic authenticated by an independently rotatable key for exactly one Project:
+
+- bounded Project user listing and exact lookup;
+- exact materialized Application user projection lookup;
+- authoritative online Project access-token introspection;
+- a separate complete Client OpenAPI for customer-generated clients.
+
+Client uses a distinct listener with no browser CORS, cookies, HTML, redirects, operator routes, or Runtime session operations. It cannot mutate users or Project configuration. OwlAuth publishes no official Client API SDK; existing language SDKs remain Runtime Project Auth clients.
+
 ## Control Plane
 
 Control serves its embedded Management Console and authenticated administrative operations:
 
 - credential-free Console shell plus API-key-authenticated Console requests;
 - an optional remote Streamable HTTP MCP adapter authenticated by the same operator API key;
-- Project lifecycle and optional `belongs_to` metadata;
+- Project lifecycle, optional `belongs_to` metadata, and Project client-key creation/list/revocation;
 - Applications, publishable configuration, allowed origins, and post-login redirects;
 - per-Project provider client IDs and secret references;
 - Project user lookup, disablement, merge, and linked-identity removal;
@@ -130,7 +147,7 @@ Control serves its embedded Management Console and authenticated administrative 
 - Project signing-key lifecycle commands and state inspection;
 - Project-scoped and deployment-scoped audit queries and safe health metadata.
 
-Control uses a distinct listener, narrower network exposure, and exactly one deployment-level operator API key loaded from process configuration. A valid key grants the entire deployment's Control authority; OwlAuth has no server-side Control principals, permission sets, credential-management endpoints, or Control sessions of any kind. Public Application identifiers, publishable keys, Runtime access/refresh tokens, and upstream provider credentials are never Control credentials. Conversely, the operator API key is never accepted by Runtime. Control REST, Console, and HTTP MCP routes cannot be mounted into the Runtime router.
+Control uses a distinct listener, narrower network exposure, and exactly one deployment-level operator API key loaded from process configuration. A valid key grants the entire deployment's Control authority; OwlAuth has no server-side Control principals, permission sets, credential-management endpoints, or Control sessions of any kind. Public Application identifiers, publishable keys, Runtime access/refresh tokens, and upstream provider credentials are never Control credentials. Conversely, the operator API key is never accepted by Runtime. Control REST, Console, and HTTP MCP routes cannot be mounted into the Runtime or Client router. Project client keys are never accepted by Control or Runtime, and the operator key is never accepted by Client.
 
 ## Standalone deployment
 
@@ -140,14 +157,17 @@ flowchart LR
     App --> Hosted[OwlAuth hosted authentication]
     Hosted --> Runtime[OwlAuth Runtime]
     Runtime --> Provider[GitHub / Google]
-    Runtime --> PG[(PostgreSQL)]
+    Runtime --> PG[(PostgreSQL + protected material)]
     Runtime --> Redis[(Redis)]
-    Runtime --> KMS[Project signer / key store]
+    Runtime --> RKP[Runtime signer / secret opener]
+
+    Backend[Customer backend] --> Client[OwlAuth Client]
+    Client --> PG
 
     Operator[Single operator] --> Console[OwlAuth Management Console]
     Console --> Control[OwlAuth Control]
     Control --> PG
-    Control --> KMS
+    Control --> CKP[Control key provisioner / secret sealer]
 ```
 
 In standalone operation, one operator manages every Project. `belongs_to` is null unless the operator uses it as private metadata. OwlAuth does not model organizations, memberships, invitations, or tenant roles.
@@ -174,32 +194,34 @@ The external gateway authenticates its administrators, resolves organization mem
 
 ## Deployment shape
 
-One repository and one Rust server package produce one `owlauth-server` binary and one container artifact with three composition modes:
+One repository and one Rust domain/application server package produce the official `owlauth-server` binary and container artifact with four composition modes. The separate narrow `owlauth-key-provider` SPI contains no alternate server policy; the official artifact links only the bundled local software-custody implementation, while an independent provider crate may be statically composed into a custom binary:
 
 ```text
 owlauth-server serve --plane=all
 owlauth-server serve --plane=runtime
+owlauth-server serve --plane=client
 owlauth-server serve --plane=control
 ```
 
-`all` composes both planes in one process but binds distinct Runtime and Control listeners. `runtime` and `control` compose only selected adapters and capabilities. Every mode uses the same domain modules, Project rules, schema, and configuration model.
+`all` composes all three planes in one process but binds distinct Runtime, Client, and Control listeners. `runtime`, `client`, and `control` compose only their selected adapters and capabilities. Every mode uses the same domain modules, Project rules, schema, and configuration model.
 
-A typical topology assigns `auth.example.com` to Runtime and `admin.auth.example.com` or a private address to Control. Hostname separation does not replace listener isolation or administrative authentication.
+A typical topology assigns `auth.example.com` to Runtime, `client.auth.example.com` or a private service address to Client, and `admin.auth.example.com` or a private address to Control. Hostname separation does not replace listener isolation or the corresponding Project-client/operator authentication.
 
 ## Trust boundaries
 
 01. **Project boundary:** every Project-owned resource and credential is resolved and mutated with an authoritative `project_id`; no unqualified lookup can cross Projects.
 02. **Public Runtime boundary:** every request is hostile until parsed, bounded, and Project/Application validated.
-03. **Administrative boundary:** the Control listener verifies the configured deployment operator API key before resolving a target Project or mutation; the key is independent of every Runtime Application and user identity.
-04. **Browser redirect boundary:** login state, provider callback values, redirect targets, cookies, and handoff values are attacker-controlled inputs.
-05. **Shared-core boundary:** only application services initiate domain state transitions; adapters and rows are not authority.
-06. **Persistence boundary:** PostgreSQL constraints and transactions protect durable invariants; stored rows are validated when mapped into domain types.
-07. **Cache boundary:** Redis values may be missing, delayed, duplicated, or stale and never establish a security fact.
-08. **Cryptographic boundary:** private-key operations occur behind Project-aware signer/data-protector interfaces; only public keys and opaque references cross it.
-09. **External-provider boundary:** remote calls use exact configured endpoints, TLS, timeouts, response bounds, state binding, and issuer/subject validation.
-10. **External-gateway boundary:** `belongs_to` is evidence for the gateway's policy decision, not proof that OwlAuth performed tenant authorization.
-11. **Agent boundary:** MCP is a remote HTTP adapter owned by the serving product; protocol self-description, prompt text, tool arguments, transport sessions, and UI approval cannot authorize side effects or expose credentials. No plugin/CLI launches a local MCP server.
+03. **Customer-backend boundary:** the JSON-only Client listener verifies one active Project client key before resolving bounded same-Project reads or introspection; this key is independent of the deployment operator key and every Runtime Application/end-user credential.
+04. **Administrative boundary:** the Control listener verifies the configured deployment operator API key before resolving a target Project or mutation; the key is independent of every Runtime Application and user identity.
+05. **Browser redirect boundary:** login state, provider callback values, redirect targets, cookies, and handoff values are attacker-controlled inputs.
+06. **Shared-core boundary:** only application services initiate domain state transitions; adapters and rows are not authority.
+07. **Persistence boundary:** PostgreSQL constraints and transactions protect durable invariants; stored rows are validated when mapped into domain types.
+08. **Cache boundary:** Redis values may be missing, delayed, duplicated, or stale and never establish a security fact.
+09. **Cryptographic boundary:** plaintext private-key and provider/SMTP/webhook secret operations occur behind role-specific key-provider capabilities. PostgreSQL carries public keys and bounded purpose/context-bound software ciphertext or opaque custom-provider handles/envelopes; the bundled software custody root remains deployment-injected and outside PostgreSQL.
+10. **External-provider boundary:** remote calls use exact configured endpoints, TLS, timeouts, response bounds, state binding, and issuer/subject validation.
+11. **External-gateway boundary:** `belongs_to` is evidence for the gateway's policy decision, not proof that OwlAuth performed tenant authorization.
+12. **Agent boundary:** MCP is a remote HTTP adapter owned by the serving product; protocol self-description, prompt text, tool arguments, transport sessions, and UI approval cannot authorize side effects or expose credentials. No plugin/CLI launches a local MCP server.
 
 ## Design scope
 
-OwlAuth provides upstream social/OIDC federation, managed identity-profile connections, first-party passwordless email OTP/magic-link authentication, Project-scoped users and identities, Applications, sessions, revisioned user projections, signed Application webhooks, token verification, provider/SMTP configuration, user administration, and audit. Provider-token brokering, password authentication, SAML, SCIM, bulk directory synchronization, LDAP synchronization, organization membership, tenant RBAC, customer API keys, billing, hosted multi-tenant orchestration, and general business RBAC/ABAC are outside the OwlAuth product. The detailed identity expansion is owned by [spec 11](11-identity-connections-passwordless-email-and-user-sync.md).
+OwlAuth provides upstream social/OIDC federation, managed identity-profile connections, first-party passwordless email OTP/magic-link authentication, Project-scoped users and identities, Applications, sessions, revisioned user projections, signed Application webhooks, token verification/introspection, Project client keys for the bounded Client API, provider/SMTP configuration, user administration, and audit. Provider-token brokering, password authentication, SAML, SCIM, bulk directory synchronization, LDAP synchronization, organization membership, tenant RBAC, arbitrary customer business API keys, billing, hosted multi-tenant orchestration, and general business RBAC/ABAC are outside the OwlAuth product. The detailed identity expansion is owned by [spec 11](11-identity-connections-passwordless-email-and-user-sync.md), and the Project Client API/key boundary by [spec 13](13-client-api-and-project-client-keys.md).

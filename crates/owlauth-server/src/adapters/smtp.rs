@@ -98,6 +98,7 @@ pub(crate) struct SafeSmtpTransport {
 }
 
 impl SafeSmtpTransport {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         let roots = webpki_roots::TLS_SERVER_ROOTS
             .iter()
@@ -359,6 +360,7 @@ impl SafeSmtpTransport {
             .await
     }
 
+    #[cfg(test)]
     async fn submit_with_timeout(
         &self,
         submission: MailSubmission,

@@ -58,6 +58,8 @@ Patch changes correct behavior without intentionally changing the documented pub
 
 ## Release inputs and gates
 
+Committed SDK manifests identify unreleased development builds rather than impersonating the latest registry release: TypeScript and Rust use `0.0.0-dev`, and Python uses the PEP 440 sentinel `0.0.0.dev0`. Untagged CI may qualify artifacts bearing only those sentinels, but publication rejects them. A component release tag is the sole authority that materializes a publishable version in its isolated workflow checkout.
+
 An SDK release branch/tag points at the current `main` commit under repository release policy. Tag, package metadata, and runtime-reported version agree. Release validation occurs before registry publication and includes:
 
 - pinned/locked supported tools and dependencies;

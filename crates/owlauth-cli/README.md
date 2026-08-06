@@ -44,8 +44,9 @@ The self-hosted client supports typed commands for:
 
 - Project list/get/create/disable, token/session policy get/set, and Project-user list/get/identity/session inspection, disable, and exact session revoke;
 - Application list/get/create/disable and cursor-bounded immutable user-event history;
-- provider list/create/disable/assign/unassign for the closed `oidc`, `google`, and `github` kinds;
+- provider Project-egress get/set, Custom OIDC preflight, and list/create/disable/assign/unassign for the closed `oidc`, `google`, and `github` kinds;
 - signing-key list/create/activate/retire/revoke;
+- Project client-key list/create/acknowledge/revoke, with the credential emitted only by the original successful create;
 - Project- or Application-scoped projection-policy get/set;
 - webhook endpoint list/get/create/subscription update/test/activate/disable, write-only secret rotation prepare/activate, cursor-bounded delivery inspection, and explicit replay.
 
@@ -62,9 +63,15 @@ owlauth --profile local application list \
   11111111-1111-4111-8111-111111111111
 owlauth --profile local signing-key list \
   11111111-1111-4111-8111-111111111111
+owlauth --profile local client-key acknowledge \
+  11111111-1111-4111-8111-111111111111 \
+  22222222-2222-4222-8222-222222222222 \
+  --expected-revision 1 \
+  --idempotency-key client_key_acknowledge_20260805 \
+  --yes
 ```
 
-All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` and `--verified-email-enabled` require an explicit `true` or `false` value.
+All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. `client-key create` leaves replacement creation blocked until the emitted credential is durably stored and the exact returned key revision is passed to `client-key acknowledge`, or the key is revoked. Acknowledgement is an explicit assertion about external secret-manager storage; successful stdout delivery alone does not make that assertion. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` and `--verified-email-enabled` require an explicit `true` or `false` value.
 
 Provider client secrets and webhook signing secrets, including candidate rotation generations, are accepted only through named environment-variable references:
 
@@ -75,14 +82,13 @@ owlauth --profile local provider create \
   --kind github \
   --provider-key github \
   --display-name GitHub \
-  --issuer https://github.com \
   --client-id example-client \
   --client-secret-env PROVIDER_CLIENT_SECRET \
   --expected-project-revision 1 \
   --idempotency-key provider_create_20260803
 ```
 
-Raw secrets are never accepted as ordinary command arguments. Owned operator and resource-secret buffers are explicitly zeroized after use; the synchronous HTTP serializer may still create bounded transient transport-body copies that are dropped normally. A write-only resource secret must use a different environment reference and value from the active operator credential, preventing accidental operator-key submission to provider or webhook storage. Replace placeholders with real canonical values.
+Named presets derive their fixed issuer and reject `--issuer`; Custom OIDC requires it. Before creating Custom OIDC, inspect or replace the Project policy with `provider egress-get` / `provider egress-set`, then run `provider preflight --issuer https://identity.example`. Raw secrets are never accepted as ordinary command arguments. Owned operator and resource-secret buffers are explicitly zeroized after use; the synchronous HTTP serializer may still create bounded transient transport-body copies that are dropped normally. A write-only resource secret must use a different environment reference and value from the active operator credential, preventing accidental operator-key submission to provider or webhook storage. Replace placeholders with real canonical values.
 
 The CLI intentionally omits generic HTTP/OpenAPI forwarding, Runtime and worker routes, raw database or key-store access, provider/key reconcile recovery, identity-mutation proof workflows, and operations absent from the reviewed public Control contract. Webhook replay is an explicit high-impact command: after an ambiguous transport outcome, inspect the paginated delivery history before deciding whether another replay is warranted.
 

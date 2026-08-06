@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use owlauth_key_provider::{ProviderFormatVersion, ProviderId};
 use sea_orm::{Database, EntityTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -35,6 +36,8 @@ use super::{
 };
 use crate::{
     adapters::{
+        custody::SoftwareCustodyProvider,
+        protected_runtime::PostgresProtectedRuntimeCustody,
         runtime_security::{
             RuntimeKeyMaterial, SoftwareProjectionVerifiedEmailProtector,
             UnavailableDurableEmailAddressReader,
@@ -42,12 +45,14 @@ use crate::{
         system::SystemClock,
     },
     application::{
-        ApplicationError, ConfigurationSecretProvisioner, ConfirmedProjectionPolicyUpdate,
-        ControlLifecyclePort, CreateWebhookEndpoint, DisableProjectUser, McpConfirmationContext,
-        McpConfirmationService, PrepareWebhookSecretRotation, ProjectUserStatus,
+        ApplicationError, ApplicationProvisioningPort, ConfigurationSecretProvisioner,
+        ConfirmedProjectionPolicyUpdate, ControlLifecyclePort, CreateWebhookEndpoint,
+        DisableProjectUser, McpConfirmationContext, McpConfirmationService,
+        PrepareWebhookSecretRotation, ProjectProvisioningPort, ProjectUserStatus,
         ProjectionExpansionWorker, ProjectionPolicyPort, ProjectionPolicyService,
         UpdateProjectionPolicy, WebhookControlService, WebhookDeliveryRepository,
-        WebhookEndpointValidator, WebhookSecretPreparationState, WebhookTransportOutcome,
+        WebhookEndpointValidator, WebhookSecretPreparationState, WebhookSecretResolver,
+        WebhookTransportOutcome,
     },
     domain::{ApplicationUserEventType, WebhookDeliveryOutcome},
 };
@@ -1885,6 +1890,269 @@ async fn application_sync_lifecycle_is_atomic_fenced_and_resumable() {
             .await
             .expect("read disabled Project expansion operation");
     assert_eq!(disabled_project_operation_state, "pending");
+
+    database.close().await.expect("close SeaORM database");
+    pool.close().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real PostgreSQL journey proves protected webhook sealing, exact delivery snapshots, replay conflict, and atomic erasure"
+)]
+async fn protected_webhook_material_is_stable_openable_and_atomically_erased() {
+    let Some((_container, pool, database)) = fixture().await else {
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    let application_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let binding_id = Uuid::new_v4();
+    let projection_id = Uuid::new_v4();
+    seed_projection(
+        &pool,
+        &database,
+        project_id,
+        application_id,
+        user_id,
+        binding_id,
+        projection_id,
+    )
+    .await;
+
+    let provider_id = ProviderId::new("software").expect("software provider ID");
+    let provider_format_version = ProviderFormatVersion::new(1).expect("provider format");
+    let custody = SoftwareCustodyProvider::new(provider_id.clone(), [73; 32])
+        .expect("software custody provider");
+    let repository = Arc::new(
+        PostgresWebhookRepository::new(database.clone(), projection_protector())
+            .with_custody(
+                "application-sync-protected-webhook",
+                provider_id.clone(),
+                provider_format_version,
+            )
+            .expect("compose protected webhook repository"),
+    );
+    let service = WebhookControlService::new(
+        repository.clone(),
+        Arc::new(TestSecretProvisioner::default()),
+        Arc::new(TestEndpointValidator),
+        Arc::new(SystemClock),
+    )
+    .with_secret_sealer(custody.clone());
+    let create = |secret_byte| CreateWebhookEndpoint {
+        url: "https://receiver.example.test/owlauth".to_owned(),
+        subscribed_event_types: vec!["user.projection.updated".to_owned()],
+        secret: Zeroizing::new(vec![secret_byte; 32]),
+        idempotency_key: "protected-webhook-create".to_owned(),
+    };
+    let endpoint = service
+        .create_endpoint(project_id, application_id, create(91), Uuid::new_v4())
+        .await
+        .expect("create protected webhook endpoint");
+    let (material_id, alias, safe_fingerprint, first_envelope, material_state): (
+        Uuid,
+        String,
+        Option<String>,
+        Vec<u8>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT secret.material_id,secret.secret_ref,secret.safe_fingerprint,
+                material.opaque_value,material.state
+           FROM webhook_secret_generations secret
+           JOIN protected_materials material ON material.id=secret.material_id
+          WHERE secret.endpoint_id=$1 AND secret.generation=1",
+    )
+    .bind(endpoint.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read protected webhook material");
+    assert_eq!(material_state, "live");
+    assert!(safe_fingerprint.is_some());
+    assert!(
+        Uuid::parse_str(&alias).is_err(),
+        "legacy alias remains non-authoritative"
+    );
+    assert!(
+        !first_envelope.windows(32).any(|window| window == [91; 32]),
+        "PostgreSQL stores only the opaque envelope"
+    );
+
+    service
+        .create_endpoint(project_id, application_id, create(91), Uuid::new_v4())
+        .await
+        .expect("replay protected endpoint with identical secret");
+    let replay_envelope: Vec<u8> =
+        sqlx::query_scalar("SELECT opaque_value FROM protected_materials WHERE id=$1")
+            .bind(material_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read replayed protected envelope");
+    assert_eq!(
+        replay_envelope, first_envelope,
+        "randomized retry envelopes never replace the committed authority"
+    );
+    assert_eq!(
+        service
+            .create_endpoint(project_id, application_id, create(92), Uuid::new_v4(),)
+            .await,
+        Err(ApplicationError::IdempotencyConflict),
+        "the context-bound keyed fingerprint rejects a different secret on replay"
+    );
+
+    let protected_runtime = PostgresProtectedRuntimeCustody::new(
+        database.clone(),
+        "application-sync-protected-webhook",
+        provider_id,
+        custody.clone(),
+        custody,
+    )
+    .expect("compose protected Runtime custody");
+    let opened = WebhookSecretResolver::resolve(&protected_runtime, &material_id.to_string())
+        .await
+        .expect("open exact protected webhook generation");
+    assert_eq!(opened.as_slice(), [91; 32]);
+
+    let endpoint = service
+        .test_endpoint(
+            project_id,
+            application_id,
+            endpoint.id,
+            endpoint.revision,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("test protected endpoint");
+    let endpoint = service
+        .activate_endpoint(
+            project_id,
+            application_id,
+            endpoint.id,
+            endpoint.revision,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("activate protected endpoint");
+    let projection = application_user_projection::Entity::find_by_id(projection_id)
+        .one(&database)
+        .await
+        .expect("read projection")
+        .expect("projection exists");
+    let transaction = database
+        .begin()
+        .await
+        .expect("begin protected webhook event");
+    append_projection_event(
+        &transaction,
+        "prj_sync01",
+        "app_sync01",
+        binding_id,
+        &projection,
+        &projection.document,
+        ApplicationUserEventType::Updated,
+    )
+    .await
+    .expect("append protected webhook event");
+    transaction
+        .commit()
+        .await
+        .expect("commit protected webhook event");
+    let claim = repository
+        .claim_one(
+            "protected-webhook-runtime",
+            Uuid::new_v4(),
+            OffsetDateTime::now_utc() + time::Duration::seconds(1),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("claim protected webhook delivery")
+        .expect("protected delivery exists");
+    assert_eq!(claim.primary_secret_ref, material_id.to_string());
+    let claimed_material: Option<Uuid> =
+        sqlx::query_scalar("SELECT claimed_secret_material_id FROM webhook_deliveries WHERE id=$1")
+            .bind(claim.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read exact delivery material snapshot");
+    assert_eq!(claimed_material, Some(material_id));
+    repository
+        .finish(
+            &claim,
+            OffsetDateTime::now_utc().unix_timestamp(),
+            WebhookTransportOutcome {
+                outcome: WebhookDeliveryOutcome::Accepted,
+                http_status: Some(204),
+                duration_millis: 1,
+            },
+            None,
+            OffsetDateTime::now_utc(),
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("finish protected webhook delivery");
+
+    service
+        .disable_endpoint(
+            project_id,
+            application_id,
+            endpoint.id,
+            endpoint.revision,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("disable protected endpoint");
+    let cleanup = repository
+        .claim_secret_cleanup(
+            "protected-webhook-cleanup",
+            Uuid::new_v4(),
+            OffsetDateTime::now_utc(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("claim protected webhook cleanup")
+        .expect("protected cleanup exists");
+    assert_eq!(cleanup.material_id, Some(material_id));
+    assert_eq!(cleanup.secret_ref, material_id.to_string());
+    assert_eq!(cleanup.legacy_secret_ref.as_deref(), Some(alias.as_str()));
+    repository
+        .finish_secret_cleanup(&cleanup, OffsetDateTime::now_utc())
+        .await
+        .expect("atomically erase protected webhook material");
+    let erased: (String, Option<Vec<u8>>, String) = sqlx::query_as(
+        "SELECT material.state,material.opaque_value,cleanup.state
+           FROM protected_materials material
+           JOIN webhook_secret_cleanup_operations cleanup ON cleanup.material_id=material.id
+          WHERE material.id=$1",
+    )
+    .bind(material_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read protected webhook erasure tombstone");
+    assert_eq!(erased, ("erased".to_owned(), None, "erased".to_owned()));
+    let retained_fingerprint: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT safe_fingerprint FROM protected_materials WHERE id=$1")
+            .bind(material_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read protected webhook fingerprint tombstone");
+    assert_eq!(retained_fingerprint.as_deref().map(<[u8]>::len), Some(32));
+    assert!(
+        WebhookSecretResolver::resolve(&protected_runtime, &material_id.to_string())
+            .await
+            .is_err(),
+        "an erased generation cannot be reopened"
+    );
+    service
+        .create_endpoint(project_id, application_id, create(91), Uuid::new_v4())
+        .await
+        .expect("terminal replay accepts only the original protected secret");
+    assert_eq!(
+        service
+            .create_endpoint(project_id, application_id, create(92), Uuid::new_v4())
+            .await,
+        Err(ApplicationError::IdempotencyConflict),
+        "terminal replay compares the retained keyed fingerprint"
+    );
 
     database.close().await.expect("close SeaORM database");
     pool.close().await;

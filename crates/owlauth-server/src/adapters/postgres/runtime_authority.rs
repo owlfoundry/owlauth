@@ -25,12 +25,9 @@ fn validated_login_provider_kind(
     issuer: &str,
     managed_profile_enabled: bool,
 ) -> Result<ProviderKind, ApplicationError> {
-    let kind = super::effective_provider_kind(legacy_kind, adapter_kind, issuer)?;
+    let kind = super::provider_row::effective_provider_kind(legacy_kind, adapter_kind, issuer)?;
     let capabilities = kind.capabilities();
-    if !capabilities.login
-        || !kind.issuer_matches(issuer)
-        || (managed_profile_enabled && !capabilities.managed_profile)
-    {
+    if !capabilities.login || (managed_profile_enabled && !capabilities.managed_profile) {
         return Err(ApplicationError::Integrity);
     }
     Ok(kind)
@@ -43,8 +40,8 @@ use super::{
         application_publishable_key, application_redirect, application_session,
         application_user_binding, application_user_projection, login_transaction,
         login_transaction_method, project, project_browser_logout_interaction,
-        project_browser_session, project_key_ring, project_policy, project_signing_key,
-        project_user, provider_configuration, refresh_family,
+        project_browser_session, project_key_ring, project_policy, project_provider_egress_policy,
+        project_signing_key, project_user, provider_configuration, refresh_family,
     },
     runtime_incarnation::RuntimeIncarnationFence,
 };
@@ -199,6 +196,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             return Err(ApplicationError::Integrity);
         }
         let mut admitted_providers = Vec::with_capacity(assignments.len());
+        let mut custom_policy_revision = None;
         for assignment in assignments {
             let provider = provider_configuration::Entity::find_by_id(assignment.provider_id)
                 .filter(provider_configuration::Column::ProjectId.eq(project.id))
@@ -214,9 +212,25 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                 &provider.issuer,
                 provider.managed_profile_enabled,
             )?;
-            if provider.secret_ref.is_none() {
+            if provider.secret_ref.is_none() && provider.secret_material_id.is_none() {
                 return Err(ApplicationError::Integrity);
             }
+            let provider_egress_policy_revision = if kind == ProviderKind::Oidc {
+                if custom_policy_revision.is_none() {
+                    custom_policy_revision = Some(
+                        project_provider_egress_policy::Entity::find_by_id(project.id)
+                            .lock_shared()
+                            .one(&transaction)
+                            .await
+                            .map_err(persistence)?
+                            .ok_or(ApplicationError::Integrity)?
+                            .revision,
+                    );
+                }
+                custom_policy_revision
+            } else {
+                None
+            };
             admitted_providers.push(AdmittedProviderMethod {
                 kind,
                 method_key: provider.provider_key,
@@ -224,6 +238,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                 display_name: provider.display_name,
                 issuer: provider.issuer,
                 provider_revision: provider.revision,
+                provider_egress_policy_revision,
                 assignment_security_revision: assignment.security_revision,
             });
         }
@@ -446,11 +461,20 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             providers: methods
                 .into_iter()
                 .filter(|method| method.method_kind == "provider")
-                .map(|method| HostedProviderMethod {
-                    key: method.method_key,
-                    display_name: method.display_name,
+                .map(|method| {
+                    let kind = match method.provider_kind.as_deref() {
+                        Some("oidc") => crate::domain::ProviderKind::Oidc,
+                        Some("google") => crate::domain::ProviderKind::Google,
+                        Some("github") => crate::domain::ProviderKind::Github,
+                        _ => return Err(ApplicationError::Integrity),
+                    };
+                    Ok(HostedProviderMethod {
+                        key: method.method_key,
+                        display_name: method.display_name,
+                        kind,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, ApplicationError>>()?,
             email_available,
             email_otp_enabled,
             email_magic_link_enabled,
@@ -524,6 +548,32 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             &provider.issuer,
             provider.managed_profile_enabled,
         )?;
+        if method.provider_kind.as_deref() != Some(provider_kind.as_str()) {
+            return Err(ApplicationError::Integrity);
+        }
+        let egress_policy = if provider_kind == ProviderKind::Oidc {
+            let expected_revision = method
+                .provider_egress_policy_revision
+                .ok_or(ApplicationError::Integrity)?;
+            let policy = project_provider_egress_policy::Entity::find_by_id(project_id)
+                .lock_shared()
+                .one(&transaction)
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
+            if policy.revision != expected_revision {
+                return Err(ApplicationError::RevisionConflict);
+            }
+            Some(super::provider_row::decode_provider_egress_policy(
+                &policy.mode,
+                policy.exact_origins,
+            )?)
+        } else {
+            if method.provider_egress_policy_revision.is_some() {
+                return Err(ApplicationError::Integrity);
+            }
+            None
+        };
         let result = ProviderRuntimeContext {
             project_id,
             provider_kind,
@@ -533,9 +583,14 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             issuer: provider.issuer,
             client_id: provider.client_id,
             callback_url: provider.callback_url,
-            secret_ref: provider.secret_ref.ok_or(ApplicationError::Integrity)?,
+            secret_ref: provider
+                .secret_material_id
+                .map(|material_id| material_id.to_string())
+                .or(provider.secret_ref)
+                .ok_or(ApplicationError::Integrity)?,
             managed_profile_enabled: provider.managed_profile_enabled,
             managed_profile_revision: provider.managed_profile_revision,
+            egress_policy,
         };
         transaction.commit().await.map_err(persistence)?;
         Ok(result)

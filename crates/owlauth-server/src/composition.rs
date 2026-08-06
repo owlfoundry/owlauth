@@ -1,42 +1,109 @@
+mod http_capabilities;
+
 use std::collections::BTreeMap;
 use std::{future::Future, sync::Arc, time::Duration};
 
+use owlauth_key_provider::{ProviderFormatVersion, ProviderId};
+
 use axum::Router;
 use owlauth_types::FEDERATED_PROJECT_AUTH_AVAILABLE;
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use thiserror::Error;
 use tokio::{net::TcpListener, sync::watch, task::JoinSet, time::timeout};
 use uuid::Uuid;
 
 use crate::{
     adapters::{
-        migrations::prepare_schema,
+        custody::SoftwareCustodyProvider,
+        migrations::{SchemaError, prepare_schema},
         postgres::{
-            DatabasePools, create_pools, email::PostgresPasswordlessEmailRepository,
+            DatabasePools, create_pools,
+            custody::{CustodyMode, ProtectedMaterialRepository},
+            custody_import::PostgresCustodyImporter,
+            email::PostgresPasswordlessEmailRepository,
             projection::PostgresProjectionEmailKeyAuthority,
+            provider_egress::PostgresProviderEgressPolicyRepository,
         },
+        protected_runtime::PostgresProtectedRuntimeCustody,
         runtime_security::{
-            EncryptedFileProviderSecretResolver, RuntimeKeyMaterial,
-            SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
+            RuntimeKeyMaterial, SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
         },
         software_store::EncryptedFileStore,
     },
     application::{
-        ConfigurationSecretStore, DeploymentSmtpDesiredStatus, DeploymentSmtpGeneration,
-        DeploymentSmtpRegistry, ManagedConnectionService, ProjectionExpansionWorker,
+        DeploymentSmtpDesiredStatus, DeploymentSmtpGeneration, DeploymentSmtpRegistry,
+        ManagedConnectionService, ProjectionExpansionWorker, ProviderEgressPolicyPort,
         RuntimeAuthService, SmtpCredentialResolver, SmtpTlsMode, WebhookWorker,
     },
     config::{DeploymentSmtpStatus, PlaneMode, ServerConfig},
-    http::{PlaneRouters, build_routers_with_runtime_incarnation},
+    domain::{ProviderEgressMode, ProviderEgressPolicy},
+    http::{PlaneRouters, build_routers_with_capabilities},
+    providers::{ActiveProvider, ProviderRegistrations},
+};
+
+pub(crate) use http_capabilities::{
+    ClientHttpCapabilities, ControlHttpCapabilities, HttpCapabilities, RuntimeHttpCapabilities,
+    build_http_capabilities,
+};
+#[cfg(test)]
+pub(crate) use http_capabilities::{
+    build_managed_reauthorization_service, build_managed_reauthorization_target_issuer,
+    build_managed_reauthorization_target_verifier,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SchemaFailure {
+    #[error("connection")]
+    Connection,
+    #[error("migration execution")]
+    Migration,
+    #[error("lock timeout")]
+    LockTimeout,
+    #[error("statement timeout")]
+    StatementTimeout,
+    #[error("whole-run deadline")]
+    Deadline,
+    #[error("history unavailable")]
+    HistoryUnavailable,
+    #[error("dirty history")]
+    DirtyHistory,
+    #[error("incompatible history")]
+    IncompatibleHistory,
+}
+
+impl From<SchemaError> for SchemaFailure {
+    fn from(error: SchemaError) -> Self {
+        match error {
+            SchemaError::Connection => Self::Connection,
+            SchemaError::Migration => Self::Migration,
+            SchemaError::LockTimeout => Self::LockTimeout,
+            SchemaError::StatementTimeout => Self::StatementTimeout,
+            SchemaError::Deadline => Self::Deadline,
+            SchemaError::HistoryUnavailable => Self::HistoryUnavailable,
+            SchemaError::DirtyHistory => Self::DirtyHistory,
+            SchemaError::IncompatibleHistory => Self::IncompatibleHistory,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ServerError {
-    #[error("PostgreSQL schema preparation failed")]
-    Schema,
+    #[error("provider capabilities could not be composed safely")]
+    ProviderComposition,
+    #[error("PostgreSQL schema preparation failed: {0}")]
+    Schema(SchemaFailure),
+    #[error("legacy custody import did not complete")]
+    CustodyImport,
     #[error("PostgreSQL serving pools could not be prepared")]
     DatabasePools,
+    #[error("stored material requires an unavailable provider capability")]
+    ProviderReadiness,
+    #[error("legacy Custom OIDC policy bridge did not complete")]
+    ProviderPolicyBridge,
     #[error("Runtime process incarnation could not be claimed")]
     RuntimeIncarnation,
+    #[error("Client digest readiness could not be claimed")]
+    ClientDigestReadiness,
     #[error("email protection inventory could not be reconciled")]
     EmailProtection,
     #[error("projection verified-email key authority could not be reconciled")]
@@ -58,21 +125,161 @@ pub enum ServerError {
 /// Runs the selected production-shaped composition root through bounded shutdown.
 ///
 /// Schema preparation and all selected pool checks complete before any listener binds.
-/// In `all` mode both sockets bind before either begins serving.
+/// In `all` mode all three sockets bind before any begins serving.
 ///
 /// # Errors
 ///
 /// Returns a bounded startup, serving, or shutdown failure without dependency details.
 pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
+    let providers = bundled_software_providers(&config)?;
+    run_with_providers(config, providers).await
+}
+
+/// Runs the listenerless one-way legacy-file to `PostgreSQL` custody importer.
+///
+/// The command requires Control-only configuration, binds no business listener, and atomically
+/// switches custody authority only after every authoritative legacy object and snapshot is verified.
+///
+/// # Errors
+///
+/// Returns a bounded schema, pool, configuration, or import failure.
+pub async fn import_legacy_custody(config: ServerConfig) -> Result<usize, ServerError> {
+    if config.mode != PlaneMode::Control {
+        return Err(ServerError::CustodyImport);
+    }
     prepare_schema(&config.postgres)
         .await
-        .map_err(|_| ServerError::Schema)?;
+        .map_err(|error| ServerError::Schema(error.into()))?;
     let pools = create_pools(&config)
         .await
         .map_err(|_| ServerError::DatabasePools)?;
+    let result = async {
+        let database = pools
+            .control
+            .as_ref()
+            .ok_or(ServerError::CustodyImport)?
+            .clone();
+        let provisioning = config
+            .provisioning
+            .as_ref()
+            .ok_or(ServerError::CustodyImport)?;
+        let legacy_custody = config
+            .legacy_custody_import
+            .as_ref()
+            .ok_or(ServerError::CustodyImport)?;
+        let root = provisioning
+            .software_custody_key
+            .as_ref()
+            .ok_or(ServerError::CustodyImport)?
+            .expose_copy();
+        let provider_id = ProviderId::new("software").map_err(|_| ServerError::CustodyImport)?;
+        let provider = SoftwareCustodyProvider::new(provider_id, root)
+            .map_err(|_| ServerError::CustodyImport)?;
+        let signing_store = EncryptedFileStore::new(
+            legacy_custody.signer_store_root.clone(),
+            legacy_custody.signer_store_key.expose_copy(),
+        )
+        .map_err(|_| ServerError::CustodyImport)?;
+        let secret_store = EncryptedFileStore::new(
+            legacy_custody.configuration_secret_store_root.clone(),
+            legacy_custody.configuration_secret_store_key.expose_copy(),
+        )
+        .map_err(|_| ServerError::CustodyImport)?;
+        let importer = PostgresCustodyImporter::new(
+            database,
+            config
+                .instance_id
+                .as_deref()
+                .ok_or(ServerError::CustodyImport)?,
+            signing_store,
+            secret_store,
+            provider,
+        )
+        .map_err(|_| ServerError::CustodyImport)?;
+        importer
+            .run()
+            .await
+            .map(|report| report.imported)
+            .map_err(|_| ServerError::CustodyImport)
+    }
+    .await;
+    pools.close().await;
+    result
+}
+
+async fn reconcile_provider_policy_bridge(
+    config: &ServerConfig,
+    pools: &DatabasePools,
+) -> Result<(), ServerError> {
+    if !config.mode.has_control() && !config.mode.has_runtime() {
+        return Ok(());
+    }
+    let database = pools
+        .control
+        .clone()
+        .or_else(|| pools.runtime.clone())
+        .ok_or(ServerError::ProviderPolicyBridge)?;
+    let egress_policies = PostgresProviderEgressPolicyRepository::new(database);
+    let bridge_pending = egress_policies
+        .legacy_provider_policy_bridge_pending()
+        .await
+        .map_err(|_| ServerError::ProviderPolicyBridge)?;
+    if !bridge_pending {
+        return Ok(());
+    }
+    if config.provider_allowed_origins.is_empty() {
+        return Err(ServerError::ProviderPolicyBridge);
+    }
+    let policy = ProviderEgressPolicy::new(
+        ProviderEgressMode::ExactOrigins,
+        config.provider_allowed_origins.clone(),
+        config.provider_allow_http_loopback,
+    )
+    .map_err(|_| ServerError::ProviderPolicyBridge)?;
+    egress_policies
+        .bridge_legacy_provider_policy(policy)
+        .await
+        .map_err(|_| ServerError::ProviderPolicyBridge)
+}
+
+/// Runs `OwlAuth` with an explicit immutable set of statically linked provider capabilities.
+///
+/// Custom composition never falls back to the bundled software provider. The complete capability
+/// set is validated for the selected process plane before schema or serving-pool work begins.
+///
+/// # Errors
+///
+/// Returns a provider-composition or bounded startup, serving, or shutdown failure.
+#[allow(
+    clippy::too_many_lines,
+    reason = "top-level startup keeps each fail-closed reconciliation and shutdown boundary visible"
+)]
+pub async fn run_with_providers(
+    config: ServerConfig,
+    providers: ProviderRegistrations,
+) -> Result<(), ServerError> {
+    providers
+        .validate_for_mode(config.mode)
+        .map_err(|_| ServerError::ProviderComposition)?;
+    let providers = Arc::new(providers);
+    prepare_schema(&config.postgres)
+        .await
+        .map_err(|error| ServerError::Schema(error.into()))?;
+    let pools = create_pools(&config)
+        .await
+        .map_err(|_| ServerError::DatabasePools)?;
+    if let Err(error) = reconcile_provider_policy_bridge(&config, &pools).await {
+        pools.close().await;
+        return Err(error);
+    }
+    if let Err(error) = validate_provider_readiness(&config, &pools, &providers).await {
+        pools.close().await;
+        return Err(error);
+    }
     // One startup incarnation is claimed once, then shared by reconciliation and every Runtime
     // serving/claim path. No delayed startup phase may reclaim the stable process identity.
     let runtime_incarnation = Uuid::new_v4();
+    let client_incarnation = Uuid::new_v4();
     claim_runtime_incarnation(&config, &pools, runtime_incarnation)
         .await
         .map_err(|_| ServerError::RuntimeIncarnation)?;
@@ -84,15 +291,25 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         reconcile_projection_email_protection(&config, &pools, runtime_incarnation)
             .await
             .map_err(|_| ServerError::ProjectionEmailProtection)?;
-    reconcile_deployment_smtp(&config, &pools, runtime_incarnation)
+    reconcile_deployment_smtp(&config, &pools, runtime_incarnation, &providers)
         .await
         .map_err(|_| ServerError::DeploymentSmtp)?;
     let project_smtp_readiness =
-        reconcile_project_smtp_readiness(&config, &pools, runtime_incarnation)
+        reconcile_project_smtp_readiness(&config, &pools, runtime_incarnation, &providers)
             .await
             .map_err(|_| ServerError::ProjectSmtpReadiness)?;
-    let mut routers =
-        build_routers_with_runtime_incarnation(&config, Some(&pools), runtime_incarnation);
+    let capabilities = build_http_capabilities(
+        &config,
+        Some(&pools),
+        runtime_incarnation,
+        client_incarnation,
+        providers.as_ref(),
+    );
+    let client_digest_readiness = capabilities
+        .client
+        .as_ref()
+        .and_then(|client| client.readiness.clone());
+    let mut routers = build_routers_with_capabilities(&config, capabilities);
     if let Some(managed) = routers.managed_sync.as_deref() {
         match managed.restore_key_state().await {
             Ok(true) => {}
@@ -107,8 +324,22 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         }
     }
 
+    if let Some(readiness) = client_digest_readiness.as_deref()
+        && readiness.claim().await.is_err()
+    {
+        pools.close().await;
+        return Err(ServerError::ClientDigestReadiness);
+    }
+
     let runtime_listener = match bind_selected(config.mode.has_runtime(), config.runtime.bind).await
     {
+        Ok(listener) => listener,
+        Err(error) => {
+            pools.close().await;
+            return Err(error);
+        }
+    };
+    let client_listener = match bind_selected(config.mode.has_client(), config.client.bind).await {
         Ok(listener) => listener,
         Err(error) => {
             pools.close().await;
@@ -124,6 +355,9 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
         }
     };
 
+    let client_digest_readiness_maintenance =
+        client_digest_readiness.map(spawn_client_digest_readiness_renewal);
+
     routers.mark_ready();
     tracing::info!(
         event = "server_ready",
@@ -134,10 +368,15 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     let result = serve_until_shutdown(
         &mut routers,
         runtime_listener,
+        client_listener,
         control_listener,
         config.shutdown_timeout,
     )
     .await;
+    if let Some(maintenance) = client_digest_readiness_maintenance {
+        maintenance.abort();
+        let _ = maintenance.await;
+    }
     if let Some(maintenance) = email_protection_maintenance {
         maintenance.abort();
         let _ = maintenance.await;
@@ -152,6 +391,185 @@ pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
     }
     pools.close().await;
     result
+}
+
+fn spawn_client_digest_readiness_renewal(
+    readiness: Arc<crate::application::ClientDigestReadinessService>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = readiness.renewal_interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            match readiness.renew().await {
+                Ok(()) => {}
+                Err(crate::application::ApplicationError::Persistence) => {
+                    // The service marks the local observation unhealthy before returning. Keep
+                    // retrying the same exact incarnation so a transient database outage can
+                    // recover without ever claiming readiness during the failed interval.
+                    tracing::error!(
+                        event = "client_digest_readiness_renewal_failed",
+                        "Client digest readiness renewal failed closed; retrying"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        event = "client_digest_readiness_renewal_stopped",
+                        error = %error,
+                        "Client digest readiness renewal stopped after a terminal failure"
+                    );
+                    return;
+                }
+            }
+        }
+    })
+}
+
+pub(crate) fn bundled_software_providers(
+    config: &ServerConfig,
+) -> Result<ProviderRegistrations, ServerError> {
+    // Client verification owns no signing or secret-custody role. A Client-only binary must not
+    // require Control/Runtime provisioning keys merely to construct an intentionally empty
+    // provider registry.
+    if !config.mode.has_control() && !config.mode.has_runtime() {
+        return Ok(ProviderRegistrations::new());
+    }
+    let provisioning = config
+        .provisioning
+        .as_ref()
+        .ok_or(ServerError::ProviderComposition)?;
+    let provider_id = ProviderId::new("software").map_err(|_| ServerError::ProviderComposition)?;
+    let format_version =
+        ProviderFormatVersion::new(1).map_err(|_| ServerError::ProviderComposition)?;
+    let software = Arc::new(
+        SoftwareCustodyProvider::new(
+            provider_id.clone(),
+            provisioning
+                .software_custody_key
+                .as_ref()
+                .ok_or(ServerError::ProviderComposition)?
+                .expose_copy(),
+        )
+        .map_err(|_| ServerError::ProviderComposition)?,
+    );
+    let mut providers = ProviderRegistrations::new();
+    if config.mode.has_control() {
+        providers
+            .register_signing_provisioner(provider_id.clone(), software.clone())
+            .and_then(|providers| {
+                providers.register_secret_sealer(provider_id.clone(), software.clone())
+            })
+            .map_err(|_| ServerError::ProviderComposition)?;
+        providers
+            .select_active_signing_provider(ActiveProvider::new(
+                provider_id.clone(),
+                format_version,
+            ))
+            .select_active_secret_provider(ActiveProvider::new(
+                provider_id.clone(),
+                format_version,
+            ));
+    }
+    if config.mode.has_runtime() {
+        providers
+            .register_runtime_signer(provider_id.clone(), software.clone())
+            .and_then(|providers| providers.register_secret_opener(provider_id, software.clone()))
+            .map_err(|_| ServerError::ProviderComposition)?;
+    }
+    Ok(providers)
+}
+
+pub(crate) async fn validate_provider_readiness(
+    config: &ServerConfig,
+    pools: &DatabasePools,
+    providers: &ProviderRegistrations,
+) -> Result<(), ServerError> {
+    if !config.mode.has_control() && !config.mode.has_runtime() {
+        return Ok(());
+    }
+    let database = pools
+        .runtime
+        .as_ref()
+        .or(pools.control.as_ref())
+        .ok_or(ServerError::ProviderReadiness)?;
+    let deployment_id = config
+        .instance_id
+        .as_deref()
+        .ok_or(ServerError::ProviderReadiness)?;
+    let materials = ProtectedMaterialRepository::new(database.clone(), deployment_id)
+        .map_err(|_| ServerError::ProviderReadiness)?;
+    if materials
+        .authority()
+        .await
+        .map_err(|_| ServerError::ProviderReadiness)?
+        .mode
+        != CustodyMode::Protected
+    {
+        return Err(ServerError::ProviderReadiness);
+    }
+    if !config.mode.has_runtime() {
+        return Ok(());
+    }
+    let custody = PostgresProtectedRuntimeCustody::from_registrations(
+        database.clone(),
+        deployment_id,
+        providers,
+    )
+    .map_err(|_| ServerError::ProviderReadiness)?;
+    for _ in 0..3 {
+        let inventory_revision = materials
+            .material_inventory_revision()
+            .await
+            .map_err(|_| ServerError::ProviderReadiness)?;
+        let scan_result =
+            authenticate_runtime_provider_inventory(&materials, providers, &custody).await;
+        let current_revision = materials
+            .material_inventory_revision()
+            .await
+            .map_err(|_| ServerError::ProviderReadiness)?;
+        if current_revision != inventory_revision {
+            continue;
+        }
+        scan_result?;
+        return Ok(());
+    }
+    Err(ServerError::ProviderReadiness)
+}
+
+async fn authenticate_runtime_provider_inventory(
+    materials: &ProtectedMaterialRepository,
+    providers: &ProviderRegistrations,
+    custody: &PostgresProtectedRuntimeCustody,
+) -> Result<(), ServerError> {
+    let required = materials
+        .required_runtime_capabilities()
+        .await
+        .map_err(|_| ServerError::ProviderReadiness)?;
+    if required.iter().any(|capability| {
+        !providers.supports_runtime_material(
+            &capability.provider_id,
+            capability.provider_format_version,
+            capability.material_kind,
+        )
+    }) {
+        return Err(ServerError::ProviderReadiness);
+    }
+    let mut after = None;
+    loop {
+        let candidates = materials
+            .runtime_readiness_page(after, 128)
+            .await
+            .map_err(|_| ServerError::ProviderReadiness)?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        for candidate in candidates {
+            after = Some(candidate.material.reservation.id);
+            custody
+                .authenticate_readiness_candidate(candidate)
+                .await
+                .map_err(|_| ServerError::ProviderReadiness)?;
+        }
+    }
 }
 
 fn email_protection_failure_class(error: crate::application::ApplicationError) -> &'static str {
@@ -491,10 +909,18 @@ async fn reconcile_projection_email_protection(
     })))
 }
 
+fn allows_unsealed_deployment_smtp_bootstrap(
+    mode: PlaneMode,
+    status: DeploymentSmtpStatus,
+) -> bool {
+    mode == PlaneMode::All && status == DeploymentSmtpStatus::Reconciled
+}
+
 async fn reconcile_deployment_smtp(
     config: &ServerConfig,
     pools: &DatabasePools,
     runtime_incarnation: Uuid,
+    providers: &ProviderRegistrations,
 ) -> Result<(), crate::application::ApplicationError> {
     if !config.mode.has_runtime() {
         return Ok(());
@@ -513,6 +939,16 @@ async fn reconcile_deployment_smtp(
     let Some(configured) = config.deployment_smtp.as_ref() else {
         return registry.assert_no_active_deployment_smtp().await;
     };
+    let Some(safe_fingerprint) = configured.safe_fingerprint else {
+        if allows_unsealed_deployment_smtp_bootstrap(config.mode, configured.status) {
+            // Combined topology may bind Control once with non-active metadata so the ordinary
+            // authenticated API can seal the first credential generation. Runtime-only processes
+            // never own that bootstrap capability, and an already-active database generation
+            // still fails closed here.
+            return registry.assert_no_active_deployment_smtp().await;
+        }
+        return Err(crate::application::ApplicationError::Integrity);
+    };
     let generation = DeploymentSmtpGeneration {
         generation: configured.generation,
         desired_status: match configured.status {
@@ -529,33 +965,49 @@ async fn reconcile_deployment_smtp(
             _ => return Err(crate::application::ApplicationError::Integrity),
         },
         sender_address: configured.sender_address.clone(),
-        credential_ref: configured.credential_ref.clone(),
-        safe_fingerprint: configured.safe_fingerprint,
+        credential_ref: format!("deployment-smtp-generation-{}", configured.generation),
+        safe_fingerprint,
         explicitly_allowed_private_ips: configured.explicitly_allowed_private_ips.clone(),
     };
-    if config.mode.has_runtime()
-        && matches!(
-            configured.status,
-            DeploymentSmtpStatus::Reconciled | DeploymentSmtpStatus::Active
-        )
-    {
-        let provisioning = config
-            .provisioning
-            .as_ref()
+    if matches!(
+        generation.desired_status,
+        DeploymentSmtpDesiredStatus::Reconciled | DeploymentSmtpDesiredStatus::Active
+    ) {
+        let row = database
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT credential_material_id,safe_fingerprint
+                   FROM deployment_smtp_generations WHERE generation=$1",
+                [generation.generation.into()],
+            ))
+            .await
+            .map_err(|_| crate::application::ApplicationError::Persistence)?
+            .ok_or(crate::application::ApplicationError::NotFound)?;
+        let material_id = row
+            .try_get::<Option<Uuid>>("", "credential_material_id")
+            .map_err(|_| crate::application::ApplicationError::Persistence)?
             .ok_or(crate::application::ApplicationError::Integrity)?;
-        let store = EncryptedFileStore::new(
-            provisioning.configuration_secret_store_root.clone(),
-            provisioning.configuration_secret_store_key.expose_copy(),
-        )
-        .map_err(|_| crate::application::ApplicationError::ExternalStore)?;
-        store
-            .ensure_readable(configured.credential_ref.clone())
-            .await?;
-        let resolver = EncryptedFileProviderSecretResolver::new(store.clone());
-        let credential = resolver.resolve(&configured.credential_ref).await?;
-        if store.request_fingerprint(credential.as_slice()) != configured.safe_fingerprint {
+        let fingerprint = row
+            .try_get::<Option<Vec<u8>>>("", "safe_fingerprint")
+            .map_err(|_| crate::application::ApplicationError::Persistence)?
+            .ok_or(crate::application::ApplicationError::Integrity)?;
+        if fingerprint.as_slice() != generation.safe_fingerprint {
             return Err(crate::application::ApplicationError::Integrity);
         }
+        let custody = PostgresProtectedRuntimeCustody::from_registrations(
+            database.clone(),
+            config
+                .instance_id
+                .as_deref()
+                .ok_or(crate::application::ApplicationError::Integrity)?,
+            providers,
+        )?;
+        SmtpCredentialResolver::resolve_checked(
+            &custody,
+            &material_id.to_string(),
+            &generation.safe_fingerprint,
+        )
+        .await?;
     }
     registry
         .reconcile_deployment_smtp(&generation, time::OffsetDateTime::now_utc())
@@ -566,6 +1018,7 @@ async fn reconcile_project_smtp_readiness(
     config: &ServerConfig,
     pools: &DatabasePools,
     runtime_incarnation: Uuid,
+    providers: &ProviderRegistrations,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, crate::application::ApplicationError> {
     if !config.mode.has_runtime() {
         return Ok(None);
@@ -574,16 +1027,15 @@ async fn reconcile_project_smtp_readiness(
         .runtime
         .as_ref()
         .ok_or(crate::application::ApplicationError::Persistence)?;
-    let provisioning = config
-        .provisioning
-        .as_ref()
-        .ok_or(crate::application::ApplicationError::Integrity)?;
-    let store = EncryptedFileStore::new(
-        provisioning.configuration_secret_store_root.clone(),
-        provisioning.configuration_secret_store_key.expose_copy(),
-    )
-    .map_err(|_| crate::application::ApplicationError::ExternalStore)?;
-    let resolver = EncryptedFileProviderSecretResolver::new(store.clone());
+    let resolver: Arc<dyn SmtpCredentialResolver> =
+        Arc::new(PostgresProtectedRuntimeCustody::from_registrations(
+            database.clone(),
+            config
+                .instance_id
+                .as_deref()
+                .ok_or(crate::application::ApplicationError::Integrity)?,
+            providers,
+        )?);
     let repository = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
         database.clone(),
         config.runtime_process_id.clone(),
@@ -593,8 +1045,7 @@ async fn reconcile_project_smtp_readiness(
     );
     reconcile_project_smtp_readiness_restore(
         &repository,
-        &resolver,
-        &store,
+        resolver.as_ref(),
         time::OffsetDateTime::now_utc(),
     )
     .await?;
@@ -603,8 +1054,7 @@ async fn reconcile_project_smtp_readiness(
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(error) = reconcile_project_smtp_readiness_batch(
                 &repository,
-                &resolver,
-                &store,
+                resolver.as_ref(),
                 time::OffsetDateTime::now_utc(),
             )
             .await
@@ -621,8 +1071,7 @@ async fn reconcile_project_smtp_readiness(
 
 pub(crate) async fn reconcile_project_smtp_readiness_restore(
     repository: &PostgresPasswordlessEmailRepository,
-    resolver: &EncryptedFileProviderSecretResolver,
-    store: &EncryptedFileStore,
+    resolver: &dyn SmtpCredentialResolver,
     restore_epoch: time::OffsetDateTime,
 ) -> Result<usize, crate::application::ApplicationError> {
     // Stale ready observations are removed from authority before page one. Process loss at any
@@ -636,7 +1085,6 @@ pub(crate) async fn reconcile_project_smtp_readiness_restore(
         let observed = reconcile_project_smtp_readiness_batch_before(
             repository,
             resolver,
-            store,
             restore_epoch,
             restore_epoch,
         )
@@ -650,19 +1098,17 @@ pub(crate) async fn reconcile_project_smtp_readiness_restore(
 
 pub(crate) async fn reconcile_project_smtp_readiness_batch(
     repository: &PostgresPasswordlessEmailRepository,
-    resolver: &EncryptedFileProviderSecretResolver,
-    store: &EncryptedFileStore,
+    resolver: &dyn SmtpCredentialResolver,
     now: time::OffsetDateTime,
 ) -> Result<(), crate::application::ApplicationError> {
-    reconcile_project_smtp_readiness_batch_before(repository, resolver, store, now, now)
+    reconcile_project_smtp_readiness_batch_before(repository, resolver, now, now)
         .await
         .map(|_| ())
 }
 
 async fn reconcile_project_smtp_readiness_batch_before(
     repository: &PostgresPasswordlessEmailRepository,
-    resolver: &EncryptedFileProviderSecretResolver,
-    store: &EncryptedFileStore,
+    resolver: &dyn SmtpCredentialResolver,
     now: time::OffsetDateTime,
     restore_epoch: time::OffsetDateTime,
 ) -> Result<usize, crate::application::ApplicationError> {
@@ -673,12 +1119,10 @@ async fn reconcile_project_smtp_readiness_batch_before(
     let mut ready = 0_u32;
     let mut unavailable = 0_u32;
     for candidate in candidates {
-        let readable = match resolver.resolve(&candidate.credential_ref).await {
-            Ok(credential) => {
-                store.request_fingerprint(credential.as_slice()) == candidate.safe_fingerprint
-            }
-            Err(_) => false,
-        };
+        let readable = resolver
+            .resolve_checked(&candidate.credential_ref, &candidate.safe_fingerprint)
+            .await
+            .is_ok();
         repository
             .record_project_smtp_readiness(&candidate, readable, now)
             .await?;
@@ -713,6 +1157,7 @@ async fn bind_selected(
 async fn serve_until_shutdown(
     routers: &mut PlaneRouters,
     runtime_listener: Option<TcpListener>,
+    client_listener: Option<TcpListener>,
     control_listener: Option<TcpListener>,
     shutdown_timeout: Duration,
 ) -> Result<(), ServerError> {
@@ -750,6 +1195,12 @@ async fn serve_until_shutdown(
         &mut servers,
         runtime_listener,
         routers.runtime.take(),
+        shutdown_receiver.clone(),
+    );
+    spawn_selected(
+        &mut servers,
+        client_listener,
+        routers.client.take(),
         shutdown_receiver.clone(),
     );
     spawn_selected(
@@ -1130,6 +1581,30 @@ mod tests {
     impl Drop for DropSignal {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn only_control_capable_reconciled_smtp_can_bootstrap_without_a_fingerprint() {
+        assert!(allows_unsealed_deployment_smtp_bootstrap(
+            PlaneMode::All,
+            DeploymentSmtpStatus::Reconciled
+        ));
+        for mode in [PlaneMode::Runtime, PlaneMode::Control] {
+            assert!(!allows_unsealed_deployment_smtp_bootstrap(
+                mode,
+                DeploymentSmtpStatus::Reconciled
+            ));
+        }
+        for status in [
+            DeploymentSmtpStatus::Active,
+            DeploymentSmtpStatus::Disabled,
+            DeploymentSmtpStatus::Compromised,
+        ] {
+            assert!(!allows_unsealed_deployment_smtp_bootstrap(
+                PlaneMode::All,
+                status
+            ));
         }
     }
 

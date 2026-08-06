@@ -174,10 +174,23 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: test -n "$CARGO_REGISTRY_TOKEN"
-      - name: Publish owlauth-cli crate
+      - name: Publish CLI crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: scripts/release/publish-crate.sh crates/owlauth-cli/Cargo.toml
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          scripts/release/publish-crate.sh \
+            crates/owlauth-types/Cargo.toml "$VERSION"
+          for attempt in {1..12}; do
+            if scripts/release/publish-crate.sh \
+              crates/owlauth-cli/Cargo.toml "$VERSION"; then
+              exit 0
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              exit 1
+            fi
+            sleep 10
+          done
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

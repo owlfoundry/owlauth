@@ -19,7 +19,8 @@ use super::{
     audit::append_runtime_audit,
     entity::{
         application, application_provider_assignment, application_redirect, login_transaction,
-        login_transaction_method, project, project_policy, provider_configuration,
+        login_transaction_method, project, project_policy, project_provider_egress_policy,
+        provider_configuration,
     },
     runtime_incarnation::RuntimeIncarnationFence,
 };
@@ -153,7 +154,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
                 .await
                 .map_err(persistence)?
                 .ok_or(ApplicationError::RevisionConflict)?;
-            let provider_kind = super::effective_provider_kind(
+            let provider_kind = super::provider_row::effective_provider_kind(
                 &provider.kind,
                 provider.adapter_kind.as_deref(),
                 &provider.issuer,
@@ -297,6 +298,10 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
                         provider_configuration_id: Set(Some(method.provider_id)),
                         display_name: Set(method.display_name),
                         provider_revision: Set(Some(method.provider_revision)),
+                        provider_kind: Set(Some(method.kind.as_str().to_owned())),
+                        provider_egress_policy_revision: Set(
+                            method.provider_egress_policy_revision,
+                        ),
                         assignment_security_revision: Set(Some(
                             method.assignment_security_revision,
                         )),
@@ -915,6 +920,34 @@ pub(super) async fn revalidate_login_owners(
     if provider.status != "active" || Some(provider.revision) != method.provider_revision {
         return Err(ApplicationError::RevisionConflict);
     }
+    let provider_kind = super::provider_row::effective_provider_kind(
+        &provider.kind,
+        provider.adapter_kind.as_deref(),
+        &provider.issuer,
+    )?;
+    let snapshot_kind = method
+        .provider_kind
+        .as_deref()
+        .ok_or(ApplicationError::Integrity)
+        .and_then(|kind| {
+            crate::domain::ProviderKind::parse(kind).map_err(|_| ApplicationError::Integrity)
+        })?;
+    if snapshot_kind != provider_kind {
+        return Err(ApplicationError::RevisionConflict);
+    }
+    if provider_kind == crate::domain::ProviderKind::Oidc {
+        let policy = project_provider_egress_policy::Entity::find_by_id(login.project_id)
+            .lock_shared()
+            .one(transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        if method.provider_egress_policy_revision != Some(policy.revision) {
+            return Err(ApplicationError::RevisionConflict);
+        }
+    } else if method.provider_egress_policy_revision.is_some() {
+        return Err(ApplicationError::Integrity);
+    }
     let assignment = application_provider_assignment::Entity::find_by_id((
         login.project_id,
         login.application_id,
@@ -1265,6 +1298,7 @@ mod tests {
                     display_name: "OIDC".to_owned(),
                     issuer: "https://issuer.example".to_owned(),
                     provider_revision: 1,
+                    provider_egress_policy_revision: Some(1),
                     assignment_security_revision: 1,
                 }],
                 admitted_email: None,
@@ -1428,6 +1462,7 @@ mod tests {
                         display_name: "OIDC".to_owned(),
                         issuer: "https://issuer.example".to_owned(),
                         provider_revision: 1,
+                        provider_egress_policy_revision: Some(1),
                         assignment_security_revision: 1,
                     }],
                     admitted_email: None,
@@ -1520,6 +1555,7 @@ mod tests {
                         display_name: "OIDC".to_owned(),
                         issuer: "https://issuer.example".to_owned(),
                         provider_revision: 1,
+                        provider_egress_policy_revision: Some(1),
                         assignment_security_revision: 1,
                     }],
                     admitted_email: None,

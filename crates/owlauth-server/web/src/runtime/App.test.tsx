@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import { RuntimeApp, hostedNavigation, safeNavigationUrl } from "./App";
 
@@ -31,8 +31,8 @@ function interactionBootstrap(overrides: Record<string, unknown> = {}) {
     email_proof_modes: [],
     presentation_hint: "Use your company account",
     providers: [
-      { key: "workforce", display_name: "Workforce SSO" },
-      { key: "partners", display_name: "Partner login" },
+      { key: "workforce", display_name: "Workforce SSO", kind: "oidc" },
+      { key: "partners", display_name: "Partner login", kind: "google" },
     ],
     csrf: "csrf-sensitive-value",
     expires_at: future,
@@ -70,7 +70,7 @@ describe("Runtime Hosted Authentication", () => {
     );
     render(<RuntimeApp />);
     expect(screen.getByRole("heading", { name: "Hosted authentication" })).toBeVisible();
-    expect(screen.getByText(/No authentication interaction is active/u)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "No sign-in is active" })).toBeVisible();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
@@ -81,7 +81,7 @@ describe("Runtime Hosted Authentication", () => {
     render(<RuntimeApp />);
 
     expect(screen.getByRole("heading", { name: "Customer portal" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Production" })).toBeVisible();
+    expect(screen.getByText("Production")).toBeVisible();
     expect(screen.getByRole("group", { name: "Sign-in methods" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Continue with Workforce SSO" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Continue with Partner login" })).toBeVisible();
@@ -92,6 +92,32 @@ describe("Runtime Hosted Authentication", () => {
     expect(document.body.textContent).not.toContain("csrf-sensitive-value");
     expect(window.localStorage).toHaveLength(0);
     expect(window.sessionStorage).toHaveLength(0);
+  });
+
+  it("uses the canonical email-first order and preserves the server provider order", () => {
+    window.history.replaceState({}, "", "/runtime/auth/interactions/ordered_interaction");
+    installFlow(
+      "interaction",
+      interactionBootstrap({
+        email_available: true,
+        email_proof_modes: ["otp"],
+        providers: [
+          { key: "partners", display_name: "Partner login", kind: "google" },
+          { key: "workforce", display_name: "Workforce SSO", kind: "oidc" },
+        ],
+      }),
+    );
+
+    render(<RuntimeApp />);
+
+    const methodNames = within(screen.getByRole("group", { name: "Sign-in methods" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent);
+    expect(methodNames).toEqual([
+      "Continue with email",
+      "Continue with Partner login",
+      "Continue with Workforce SSO",
+    ]);
   });
 
   it("does not offer session reuse when the authoritative presentation says it is unavailable", () => {
@@ -212,7 +238,7 @@ describe("Runtime Hosted Authentication", () => {
     render(<RuntimeApp />);
     expect(window.location.hash).toBe("");
     expect(screen.getByRole("heading", { name: "Continue email sign-in" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Continue" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Continue sign-in" })).toBeVisible();
     expect(document.body.textContent).not.toContain("abcdefghijklmnopqrstuv");
     expect(document.head.querySelector('meta[name="owlauth-magic-csrf"]')).toBeNull();
   });
@@ -247,7 +273,7 @@ describe("Runtime Hosted Authentication", () => {
     const replace = vi.spyOn(hostedNavigation, "replace").mockImplementation(() => undefined);
 
     render(<RuntimeApp />);
-    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue sign-in" }));
 
     await waitFor(() => {
       expect(replace).toHaveBeenCalledWith(target);
@@ -312,7 +338,9 @@ describe("Runtime Hosted Authentication", () => {
     );
     installFlow("managed_reauthorization", {
       project_public_id: "prj_public",
-      provider_key: "workforce",
+      provider_key: "workforce-main",
+      provider_display_name: "Workforce SSO <img>",
+      provider_kind: "oidc",
       status: "awaiting_provider_start",
       revision: 2,
       csrf: "managed-csrf-sensitive-value",
@@ -332,10 +360,11 @@ describe("Runtime Hosted Authentication", () => {
     vi.stubGlobal("fetch", fetchMock);
     render(<RuntimeApp />);
 
-    expect(screen.getByText(/fixed workforce provider/u)).toBeVisible();
+    expect(screen.getByText(/Continue only with Workforce SSO <img>/u)).toBeVisible();
     expect(screen.getByText(/does not sign you in/u)).toBeVisible();
-    expect(screen.queryByText(/Partner login/u)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Continue with workforce" }));
+    expect(screen.queryByText(/workforce-main/u)).not.toBeInTheDocument();
+    expect(document.querySelector("img")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Continue with Workforce SSO <img>" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/new managed reauthorization/u);
     expect(document.body.textContent).not.toContain("managed-csrf-sensitive-value");
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -349,7 +378,9 @@ describe("Runtime Hosted Authentication", () => {
     );
     installFlow("managed_reauthorization", {
       project_public_id: "prj_public",
-      provider_key: "workforce",
+      provider_key: "workforce-main",
+      provider_display_name: "Workforce SSO",
+      provider_kind: "oidc",
       status: "awaiting_provider_start",
       revision: 2,
       csrf: "expired-managed-csrf",
@@ -449,9 +480,10 @@ describe("Runtime navigation validation", () => {
     expect(safeNavigationUrl("http://localhost:9000/authorize", true)).toBe(
       "http://localhost:9000/authorize",
     );
-    expect(safeNavigationUrl("http://application.test/callback", false)).toBe(
-      "http://application.test/callback",
+    expect(safeNavigationUrl("http://localhost:9000/callback", false)).toBe(
+      "http://localhost:9000/callback",
     );
+    expect(safeNavigationUrl("http://application.test/callback", false)).toBeNull();
     expect(safeNavigationUrl("com.example.app:/callback?handoff=one", false, "native")).toBe(
       "com.example.app:/callback?handoff=one",
     );

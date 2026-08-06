@@ -340,6 +340,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/client-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_project_client_keys"];
+        put?: never;
+        post: operations["create_project_client_key"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/client-keys/{key_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_project_client_key"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/client-keys/{key_id}/acknowledge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["acknowledge_project_client_key_delivery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/client-keys/{key_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["revoke_project_client_key"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/disable": {
         parameters: {
             query?: never;
@@ -365,6 +429,22 @@ export interface paths {
         };
         get: operations["get_email_method_policy"];
         put: operations["update_email_method_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/email-method/assignments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_email_assignments"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -468,6 +548,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/provider-egress-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_provider_egress_policy"];
+        put: operations["update_provider_egress_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/providers": {
         parameters: {
             query?: never;
@@ -526,6 +622,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["reconcile_provider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/providers/oidc/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["preflight_oidc_provider"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1000,6 +1112,12 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AcknowledgeProjectClientKeyDeliveryRequest: {
+            /** @description Explicit assertion that the one-time credential is stored outside `OwlAuth`. */
+            confirm_stored: boolean;
+            /** Format: int64 */
+            expected_revision: number;
+        };
         ActivateWebhookSecretRotationRequest: {
             /** Format: int64 */
             expected_revision: number;
@@ -1163,6 +1281,14 @@ export interface components {
             /** @description Present only on create or identical idempotency replay through expiry. */
             hosted_target?: string | null;
         };
+        CreateProjectClientKeyRequest: {
+            label: string;
+        };
+        /** @description Original successful create response. The credential is never durable and is redacted in Debug. */
+        CreateProjectClientKeyResponse: {
+            readonly credential: string;
+            key: components["schemas"]["ProjectClientKey"];
+        };
         CreateProjectRequest: {
             belongs_to?: string | null;
             display_name: string;
@@ -1173,8 +1299,10 @@ export interface components {
             display_name: string;
             /** Format: int64 */
             expected_project_revision: number;
-            issuer: string;
-            kind?: null | components["schemas"]["ProviderKind"];
+            /** @description Required for Custom OIDC and forbidden for named profiles. */
+            issuer?: string | null;
+            /** @description Closed server-owned adapter profile. */
+            kind: components["schemas"]["ProviderKind"];
             /** @description Enables only adapter-declared fixed least scopes; callers cannot supply scopes. */
             managed_profile_enabled?: boolean;
             provider_key: string;
@@ -1219,6 +1347,16 @@ export interface components {
         };
         DeploymentSmtpGenerationList: {
             items: components["schemas"]["DeploymentSmtpGeneration"][];
+        };
+        EmailAssignment: {
+            application_id: string;
+            enabled: boolean;
+            project_id: string;
+            /** Format: int64 */
+            security_revision: number;
+        };
+        EmailAssignmentList: {
+            items: components["schemas"]["EmailAssignment"][];
         };
         EmailAssignmentRequest: {
             enabled: boolean;
@@ -1413,6 +1551,21 @@ export interface components {
         };
         /** @enum {string} */
         MergeSessionsDisposition: "loser_revoked";
+        OidcPreflightRequest: {
+            issuer: string;
+        };
+        OidcPreflightResult: {
+            admitted_endpoint_origins: string[];
+            authorization_code_supported: boolean;
+            canonical_issuer: string;
+            exact_scopes: string[];
+            managed_profile_supported: boolean;
+            pkce_s256_supported: boolean;
+            policy_mode: components["schemas"]["ProviderEgressMode"];
+            /** Format: int64 */
+            policy_revision: number;
+            rs256_id_tokens_supported: boolean;
+        };
         PreparedWebhookSecretRotation: {
             already_active: boolean;
             endpoint: components["schemas"]["WebhookEndpoint"];
@@ -1445,6 +1598,31 @@ export interface components {
             security_revision: number;
             status: components["schemas"]["ProjectStatus"];
         };
+        /** @description Safe Control inventory metadata. No credential digest or secret component is exposed. */
+        ProjectClientKey: {
+            created_at: string;
+            /** @description Set only after an operator explicitly confirms durable secret-manager storage. */
+            credential_acknowledged_at: string | null;
+            /** Format: int32 */
+            digest_key_version: number;
+            display_prefix: string;
+            id: string;
+            label: string;
+            last_used_at?: string | null;
+            project_id: string;
+            public_key_id: string;
+            /** Format: int64 */
+            revision: number;
+            revoked_at?: string | null;
+            status: components["schemas"]["ProjectClientKeyStatus"];
+        };
+        ProjectClientKeyList: {
+            active_unacknowledged_key: null | components["schemas"]["ProjectClientKey"];
+            items: components["schemas"]["ProjectClientKey"][];
+            next_cursor?: string | null;
+        };
+        /** @enum {string} */
+        ProjectClientKeyStatus: "active" | "revoked";
         ProjectionPolicy: {
             application_id?: string | null;
             expansion_operation_id?: string | null;
@@ -1545,6 +1723,15 @@ export interface components {
             expected_application_revision: number;
         };
         /** @enum {string} */
+        ProviderEgressMode: "allow_all" | "exact_origins";
+        ProviderEgressPolicy: {
+            exact_origins: string[];
+            mode: components["schemas"]["ProviderEgressMode"];
+            project_id: string;
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @enum {string} */
         ProviderKind: "oidc" | "google" | "github";
         ProviderList: {
             items: components["schemas"]["Provider"][];
@@ -1572,6 +1759,9 @@ export interface components {
             use: components["schemas"]["JwkUse"];
             x: string;
         };
+        ReconcileDeploymentSmtpRequest: {
+            credential: string;
+        };
         ReconcileProviderRequest: {
             client_secret: string;
             /** Format: int64 */
@@ -1591,6 +1781,12 @@ export interface components {
         };
         ReplayWebhookDeliveryRequest: {
             confirm: boolean;
+        };
+        RevokeProjectClientKeyRequest: {
+            /** @description Explicit acknowledgement that revocation is immediate and irreversible. */
+            confirm: boolean;
+            /** Format: int64 */
+            expected_revision: number;
         };
         /** @description Side-effect-free origin-root descriptor used before credential selection. */
         ServiceDescriptor: {
@@ -1642,7 +1838,7 @@ export interface components {
             retained_until?: string | null;
             /** Format: int64 */
             revision: number;
-            safe_fingerprint: string;
+            safe_fingerprint?: string | null;
             /** Format: int64 */
             security_eligibility_revision: number;
             sender_address: string;
@@ -1755,6 +1951,12 @@ export interface components {
             display_name: string;
             /** Format: int64 */
             expected_metadata_revision: number;
+        };
+        UpdateProviderEgressPolicyRequest: {
+            exact_origins: string[];
+            /** Format: int64 */
+            expected_revision: number;
+            mode: components["schemas"]["ProviderEgressMode"];
         };
         UpdateWebhookEndpointRequest: {
             /** Format: int64 */
@@ -3902,6 +4104,410 @@ export interface operations {
             };
         };
     };
+    list_project_client_keys: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Safe Project client-key metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectClientKeyList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    create_project_client_key: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectClientKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description Created Project client key with one-time credential reveal */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateProjectClientKeyResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Unacknowledged delivery, key limit, idempotency conflict, or secret unavailable on replay */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required Client verifier fleet is not ready */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_project_client_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                key_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Safe metadata for one Project client key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectClientKey"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    acknowledge_project_client_key_delivery: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                key_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgeProjectClientKeyDeliveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Project client-key delivery acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectClientKey"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    revoke_project_client_key: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                key_id: string;
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RevokeProjectClientKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description Revoked Project client key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectClientKey"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     disable_project: {
         parameters: {
             query?: never;
@@ -4080,6 +4686,82 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EmailMethodPolicy"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    list_email_assignments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Application email assignments */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmailAssignmentList"];
                 };
             };
             /** @description Invalid request */
@@ -4771,6 +5453,162 @@ export interface operations {
             };
         };
     };
+    get_provider_egress_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project Custom OIDC egress policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderEgressPolicy"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    update_provider_egress_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProviderEgressPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated Project Custom OIDC egress policy */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderEgressPolicy"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
     list_providers: {
         parameters: {
             query?: never;
@@ -5197,6 +6035,86 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Provider"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, or idempotency conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    preflight_oidc_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OidcPreflightRequest"];
+            };
+        };
+        responses: {
+            /** @description Advisory Custom OIDC discovery preflight */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcPreflightResult"];
                 };
             };
             /** @description Invalid request */

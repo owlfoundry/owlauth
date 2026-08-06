@@ -94,8 +94,8 @@ pub(crate) use projection::{
     ProjectionRevision, USER_PROJECTION_SCHEMA_V1, UserProjection, UserProjectionSource,
 };
 pub(crate) use provider::{
-    GITHUB_ISSUER, GOOGLE_ISSUER, ManagedProfileCapabilities, ProviderKey, ProviderKind,
-    ProviderStatus,
+    GITHUB_ISSUER, GOOGLE_ISSUER, ManagedProfileCapabilities, ProviderEgressMode,
+    ProviderEgressPolicy, ProviderKey, ProviderKind, ProviderOrigin, ProviderStatus,
 };
 #[allow(
     unused_imports,

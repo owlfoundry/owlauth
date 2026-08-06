@@ -115,6 +115,7 @@ fn callback_request(issuer: &str) -> ProviderCallbackRequest {
         now: OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
         allowed_clock_skew_seconds: 60,
         profile: ProviderRequestProfile::Login,
+        egress_policy: None,
     }
 }
 
@@ -166,6 +167,7 @@ fn captured_google_discovery_uses_offline_parameters_without_offline_scope() {
             nonce: "nonce-123".to_owned(),
             pkce_challenge: "c".repeat(43),
             profile: ProviderRequestProfile::ManagedProfile,
+            egress_policy: None,
         },
     )
     .expect("Google managed authorization URL");
@@ -347,6 +349,13 @@ fn production_policy_rejects_plain_http_and_non_origin_allowlist_entries() {
 }
 
 #[derive(Clone, Copy)]
+enum DiscoveryBehavior {
+    Valid,
+    IssuerMismatch,
+    UnsupportedCodeFlow,
+}
+
+#[derive(Clone, Copy)]
 enum TokenBehavior {
     Success,
     Reject,
@@ -362,7 +371,9 @@ struct ProviderState {
     origin: String,
     token: String,
     token_behavior: TokenBehavior,
+    discovery_behavior: DiscoveryBehavior,
     token_scope: Option<String>,
+    discovery_calls: AtomicUsize,
     token_calls: AtomicUsize,
     jwks_calls: AtomicUsize,
     rotate_jwks: bool,
@@ -385,6 +396,7 @@ impl Drop for TestProvider {
 }
 
 async fn discovery(State(state): State<Arc<ProviderState>>) -> Response<Body> {
+    state.discovery_calls.fetch_add(1, Ordering::SeqCst);
     let mut document = json!({
         "issuer": state.origin,
         "authorization_endpoint": format!("{}/authorize", state.origin),
@@ -399,6 +411,15 @@ async fn discovery(State(state): State<Arc<ProviderState>>) -> Response<Body> {
         "scopes_supported": ["offline_access", "openid", "profile"],
         "code_challenge_methods_supported": ["S256"]
     });
+    match state.discovery_behavior {
+        DiscoveryBehavior::Valid => {}
+        DiscoveryBehavior::IssuerMismatch => {
+            document["issuer"] = json!("https://mismatched.example");
+        }
+        DiscoveryBehavior::UnsupportedCodeFlow => {
+            document["response_types_supported"] = json!(["token"]);
+        }
+    }
     if matches!(state.token_behavior, TokenBehavior::NoRevocation) {
         document
             .as_object_mut()
@@ -586,13 +607,25 @@ async fn start_provider_with_scope(
     rotate_jwks: bool,
     token_scope: Option<&str>,
 ) -> TestProvider {
+    start_provider_with_discovery(behavior, rotate_jwks, token_scope, DiscoveryBehavior::Valid)
+        .await
+}
+
+async fn start_provider_with_discovery(
+    behavior: TokenBehavior,
+    rotate_jwks: bool,
+    token_scope: Option<&str>,
+    discovery_behavior: DiscoveryBehavior,
+) -> TestProvider {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let state = Arc::new(ProviderState {
         token: sign(&claims(&origin), TEST_KID),
         origin: origin.clone(),
         token_behavior: behavior,
+        discovery_behavior,
         token_scope: token_scope.map(str::to_owned),
+        discovery_calls: AtomicUsize::new(0),
         token_calls: AtomicUsize::new(0),
         jwks_calls: AtomicUsize::new(0),
         rotate_jwks,
@@ -616,6 +649,107 @@ async fn start_provider_with_scope(
         state,
         task,
     }
+}
+
+#[tokio::test]
+async fn custom_oidc_preflight_budget_fails_before_dispatch_and_recovers() {
+    let provider = start_provider(TokenBehavior::Success, false).await;
+    let budget = Arc::new(tokio::sync::Semaphore::new(1));
+    let client = RestrictedOidcProviderClient::new_with_budget(
+        [&provider.origin],
+        true,
+        Arc::clone(&budget),
+    )
+    .expect("loopback test client");
+    let held_permit = Arc::clone(&budget)
+        .acquire_owned()
+        .await
+        .expect("test budget remains open");
+    let policy = ProviderEgressPolicy::new(ProviderEgressMode::AllowAll, Vec::new(), true)
+        .expect("development allow-all policy should be valid");
+
+    assert_eq!(
+        client.preflight(&provider.origin, &policy).await,
+        Err(ProviderExchangeError::UnavailableBeforeDispatch)
+    );
+    assert_eq!(provider.state.discovery_calls.load(Ordering::SeqCst), 0);
+
+    drop(held_permit);
+    client
+        .preflight(&provider.origin, &policy)
+        .await
+        .expect("released budget should admit preflight");
+    assert_eq!(provider.state.discovery_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn custom_oidc_preflight_classifies_received_invalid_metadata_as_rejected() {
+    let policy = ProviderEgressPolicy::new(ProviderEgressMode::AllowAll, Vec::new(), true)
+        .expect("development allow-all policy should be valid");
+    for behavior in [
+        DiscoveryBehavior::IssuerMismatch,
+        DiscoveryBehavior::UnsupportedCodeFlow,
+    ] {
+        let provider =
+            start_provider_with_discovery(TokenBehavior::Success, false, None, behavior).await;
+        let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+        assert_eq!(
+            client.preflight(&provider.origin, &policy).await,
+            Err(ProviderExchangeError::Rejected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_oidc_preflight_honors_allow_all_exact_and_safe_error_classes() {
+    let provider = start_provider(TokenBehavior::Success, false).await;
+    let client = RestrictedOidcProviderClient::for_loopback_tests(&provider.origin);
+    let allow_all = ProviderEgressPolicy::new(ProviderEgressMode::AllowAll, Vec::new(), true)
+        .expect("development allow-all policy should be valid");
+    let summary = client
+        .preflight(&provider.origin, &allow_all)
+        .await
+        .expect("allow-all preflight should admit valid discovery");
+    assert_eq!(summary.canonical_issuer, provider.origin);
+    assert_eq!(summary.admitted_endpoint_origins.len(), 1);
+    assert_eq!(
+        summary.admitted_endpoint_origins.first(),
+        Some(&provider.origin)
+    );
+    assert_eq!(
+        summary.exact_scopes,
+        ["offline_access", "openid", "profile"]
+    );
+    assert!(summary.authorization_code_supported);
+    assert!(summary.pkce_s256_supported);
+    assert!(summary.rs256_id_tokens_supported);
+    assert!(summary.managed_profile_supported);
+
+    let exact = ProviderEgressPolicy::new(
+        ProviderEgressMode::ExactOrigins,
+        vec![provider.origin.clone()],
+        true,
+    )
+    .expect("exact loopback policy should be valid in development");
+    client
+        .preflight(&provider.origin, &exact)
+        .await
+        .expect("exact-origin preflight should admit every discovered endpoint");
+
+    let denied = ProviderEgressPolicy::new(
+        ProviderEgressMode::ExactOrigins,
+        vec!["http://127.0.0.1:1".to_owned()],
+        true,
+    )
+    .expect("different exact loopback origin should be valid policy input");
+    assert_eq!(
+        client.preflight(&provider.origin, &denied).await,
+        Err(ProviderExchangeError::Rejected)
+    );
+    assert_eq!(
+        client.preflight("not-an-issuer", &allow_all).await,
+        Err(ProviderExchangeError::Rejected)
+    );
 }
 
 #[tokio::test]
@@ -789,6 +923,15 @@ fn managed_guard(origin: &str) -> ConnectionGuard {
         credential_generation: 1,
         project_security_revision: 1,
         provider_revision: 1,
+        provider_egress_policy_revision: Some(1),
+        egress_policy: Some(
+            crate::domain::ProviderEgressPolicy::new(
+                crate::domain::ProviderEgressMode::AllowAll,
+                Vec::new(),
+                true,
+            )
+            .expect("allow-all policy"),
+        ),
         managed_profile_revision: 1,
         provider_kind: crate::domain::ProviderKind::Oidc,
         adapter_key: "controlled_oidc_profile_v1".to_owned(),
@@ -1080,6 +1223,7 @@ async fn authorization_request_has_only_the_fixed_oidc_profile() {
             nonce: "nonce-123".to_owned(),
             pkce_challenge: "c".repeat(43),
             profile: ProviderRequestProfile::Login,
+            egress_policy: None,
         })
         .await
         .unwrap();
@@ -1140,6 +1284,7 @@ async fn redirects_oversized_documents_and_endpoint_mismatch_fail_before_dispatc
                 nonce: "nonce".to_owned(),
                 pkce_challenge: "c".repeat(43),
                 profile: ProviderRequestProfile::Login,
+                egress_policy: None,
             })
             .await
             .unwrap_err();

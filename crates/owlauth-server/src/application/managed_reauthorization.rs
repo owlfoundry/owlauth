@@ -81,6 +81,7 @@ pub(crate) struct ManagedReauthorizationRecord {
     pub user_id: Uuid,
     pub provider_configuration_id: Uuid,
     pub provider_key: String,
+    pub provider_display_name: String,
     pub application_id: Uuid,
     pub expected_connection_generation: i64,
     pub expected_credential_generation: i64,
@@ -90,6 +91,8 @@ pub(crate) struct ManagedReauthorizationRecord {
     pub user_security_revision: i64,
     pub identity_revision: i64,
     pub provider_revision: i64,
+    pub provider_egress_policy_revision: Option<i64>,
+    pub egress_policy: Option<crate::domain::ProviderEgressPolicy>,
     pub managed_profile_revision: i64,
     pub application_revision: i64,
     pub assignment_security_revision: i64,
@@ -120,6 +123,8 @@ pub(crate) struct ManagedReauthorizationView {
     pub user_id: Uuid,
     pub connection_id: Uuid,
     pub provider_key: String,
+    pub provider_display_name: String,
+    pub provider_kind: crate::domain::ProviderKind,
     pub application_id: Uuid,
     pub status: ManagedReauthorizationStatus,
     pub revision: i64,
@@ -135,6 +140,8 @@ impl From<&ManagedReauthorizationRecord> for ManagedReauthorizationView {
             user_id: value.user_id,
             connection_id: value.connection_id,
             provider_key: value.provider_key.clone(),
+            provider_display_name: value.provider_display_name.clone(),
+            provider_kind: value.provider_kind,
             application_id: value.application_id,
             status: value.status,
             revision: value.revision,
@@ -672,6 +679,10 @@ impl ManagedReauthorizationRuntimeService {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the start protocol keeps every pre-dispatch authority and protected-material fence visible"
+    )]
     pub(crate) async fn start(
         &self,
         command: StartManagedReauthorization,
@@ -702,6 +713,8 @@ impl ManagedReauthorizationRuntimeService {
         if current.project_public_id != command.project_public_id
             || current.status != ManagedReauthorizationStatus::AwaitingProviderStart
             || current.revision != command.expected_revision
+            || (current.provider_kind == crate::domain::ProviderKind::Oidc
+                && current.egress_policy.is_none())
         {
             return Err(ApplicationError::RevisionConflict);
         }
@@ -757,6 +770,7 @@ impl ManagedReauthorizationRuntimeService {
                 nonce: nonce.to_string(),
                 pkce_challenge: challenge,
                 profile: ProviderRequestProfile::ManagedProfile,
+                egress_policy: current.egress_policy.clone(),
             })
             .await
             .map_err(|_| ApplicationError::ExternalStore)?;
@@ -912,7 +926,10 @@ impl ManagedReauthorizationRuntimeService {
             .for_kind(claimed.provider_kind)
             .ok_or(ApplicationError::RevisionConflict)?;
         let capability = ManagedAdapterCapabilitySnapshot::from_capability(capability)?;
-        if !capability.matches_record(claimed) {
+        if !capability.matches_record(claimed)
+            || (claimed.provider_kind == crate::domain::ProviderKind::Oidc
+                && claimed.egress_policy.is_none())
+        {
             return Err(ApplicationError::RevisionConflict);
         }
         let secret = self
@@ -958,6 +975,7 @@ impl ManagedReauthorizationRuntimeService {
                 now: self.clock.now(),
                 allowed_clock_skew_seconds: CALLBACK_CLOCK_SKEW_SECONDS,
                 profile: ProviderRequestProfile::ManagedProfile,
+                egress_policy: claimed.egress_policy.clone(),
             })
             .await
             .map_err(|_| ApplicationError::ExternalStore)?;
@@ -1206,6 +1224,7 @@ mod tests {
             user_id: Uuid::new_v4(),
             provider_configuration_id: Uuid::new_v4(),
             provider_key: "oidc-main".to_owned(),
+            provider_display_name: "Workforce SSO".to_owned(),
             application_id: Uuid::new_v4(),
             expected_connection_generation: 1,
             expected_credential_generation: 1,
@@ -1215,6 +1234,8 @@ mod tests {
             user_security_revision: 1,
             identity_revision: 1,
             provider_revision: 1,
+            provider_egress_policy_revision: None,
+            egress_policy: None,
             managed_profile_revision: 1,
             application_revision: 1,
             assignment_security_revision: 1,

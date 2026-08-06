@@ -29,6 +29,7 @@ release_tag_prefix() {
 main() {
   local component="${1:-}"
   local tag_prefix tag version remote release_commit main_commit tag_commit remote_tag_commit
+  local conflicting_tag conflicting_remote_ref shared_remote_refs
 
   tag_prefix="$(release_tag_prefix "$component")"
   if [[ -n "${GITHUB_REF_TYPE:-}" && "$GITHUB_REF_TYPE" != "tag" ]]; then
@@ -45,6 +46,10 @@ main() {
   version="${tag#"$tag_prefix"}"
   if ! is_semver "$version"; then
     printf 'tag does not end in a valid SemVer version: %s\n' "$version" >&2
+    return 1
+  fi
+  if [[ "$version" == "0.0.0-dev" ]]; then
+    printf 'release tag uses the reserved development sentinel: %s\n' "$version" >&2
     return 1
   fi
 
@@ -88,6 +93,41 @@ main() {
     printf 'remote release tag %s must resolve to %s, got %s\n' \
       "$tag" "$release_commit" "${remote_tag_commit:-<missing>}" >&2
     return 1
+  fi
+
+  # Server and CLI releases both materialize the public owlauth-types crate, so
+  # their otherwise-independent tags form one strictly increasing sequence.
+  conflicting_tag=""
+  case "$component" in
+    server) conflicting_tag="cli-v$version" ;;
+    cli) conflicting_tag="server-v$version" ;;
+  esac
+  if [[ -n "$conflicting_tag" ]]; then
+    if ! conflicting_remote_ref="$(
+      git ls-remote --tags "$remote" \
+        "refs/tags/$conflicting_tag" "refs/tags/$conflicting_tag^{}"
+    )"; then
+      printf 'failed to query shared owlauth-types version tag %s from remote %s\n' \
+        "$conflicting_tag" "$remote" >&2
+      return 1
+    fi
+    if [[ -n "$conflicting_remote_ref" ]]; then
+      printf 'release version %s is already reserved by %s for shared owlauth-types publication\n' \
+        "$version" "$conflicting_tag" >&2
+      return 1
+    fi
+    if ! shared_remote_refs="$(
+      git ls-remote --tags "$remote" 'refs/tags/server-v*' 'refs/tags/cli-v*'
+    )"; then
+      printf 'failed to query shared owlauth-types release sequence from remote %s\n' \
+        "$remote" >&2
+      return 1
+    fi
+    if ! printf '%s\n' "$shared_remote_refs" | \
+      python3 scripts/release/verify-shared-crate-version.py \
+        --version "$version" --current-tag "$tag"; then
+      return 1
+    fi
   fi
 
   printf 'verified %s release tag %s at %s\n' "$component" "$tag" "$release_commit" >&2

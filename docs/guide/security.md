@@ -86,9 +86,9 @@ SQLx 0.9 embeds ordered migrations, uses its PostgreSQL history/checksum validat
 
 ## Backup and recovery
 
-Treat PostgreSQL, the signer store, the configuration-secret store, deployment identity and URLs, the operator credential, wrapping keys, and every current or retained protection ring as one recovery set. Use PostgreSQL physical backup plus WAL archiving, or the equivalent managed-service point-in-time recovery facility, and continuously test restoration against a matched copy of external key and secret material. A database-only backup is insufficient; Redis is non-authoritative and is not restored as identity state.
+Treat PostgreSQL, the separately preserved software custody root or custom-provider authority, deployment identity and URLs, the operator credential, and every current or retained protection ring as one recovery set. Use PostgreSQL physical backup plus WAL archiving, or the equivalent managed-service point-in-time recovery facility, and continuously test restoration against the matched custody authority. A database-only backup is insufficient; Redis is non-authoritative and is not restored as identity state.
 
-Keep all traffic blocked while restoring. Restore external stores first, then PostgreSQL to the selected point, then the exact process configuration. Start isolated processes with `OWLAUTH_MIGRATION_MODE=verify`, require `/ready`, and treat a missing referenced signer, external secret, or long-term key as a recovery failure rather than generating a replacement. Start the remaining split-plane processes in `verify` mode, confirm durable outbox and lease recovery, and only then reopen traffic. Run any schema upgrade later as a separate reviewed operation. Backup scheduling and restore orchestration remain deployment responsibilities; the detailed checklist is in the [`owlauth-server` operator README](https://github.com/owlfoundry/owlauth/blob/main/crates/owlauth-server/README.md#backup-point-in-time-recovery-and-verify-restart).
+Keep all traffic blocked while restoring. Restore the custody/provider authority first, then PostgreSQL to the selected point, then the exact process configuration. Start an isolated Runtime with `OWLAUTH_MIGRATION_MODE=verify`, require `/ready`, and treat any live envelope that cannot open, signing handle that cannot sign and verify against its committed JWK, or missing long-term key as a recovery failure rather than generating a replacement. Start the remaining split-plane processes in `verify` mode, confirm durable outbox and lease recovery, and only then reopen traffic. Run any schema upgrade later as a separate reviewed operation. Backup scheduling and restore orchestration remain deployment responsibilities; the detailed checklist is in the [`owlauth-server` operator README](https://github.com/owlfoundry/owlauth/blob/main/crates/owlauth-server/README.md#backup-point-in-time-recovery-and-verify-restart).
 
 ## Keys and secrets
 
@@ -96,30 +96,32 @@ Private signing and data-protection material remains behind Project-aware provid
 
 A target key is published in Project JWKS before activation. Runtime publication leases in PostgreSQL prove that ready instances loaded the revision; Redis invalidation is not proof. Rotation keeps old public material through token and cache retention. Emergency revocation stops signing immediately after authoritative observation, while offline verifiers remain bounded by their JWKS cache behavior.
 
+Remote signing-key effects use durable operation identities, database-time leases, provider inspection, and explicit cleanup. A non-retryable or unsupported cleanup remains fail-closed as blocked rather than discarding the handle or asserting destruction. After correcting or replacing the exact retained historical provider implementation, an operator may explicitly reconcile the affected key to requeue cleanup; counters and the last provider-safe diagnostic remain durable. Never force the PostgreSQL row to an erased state or remove historical provider authority without provider-confirmed absence or destruction.
+
 Secrets enter through protected environment/file descriptors, files, or secret managers—not ordinary CLI arguments, public configuration, health responses, panic messages, OpenAPI examples, or agent context.
 
 ## Browser and request safety
 
-Runtime serves the Hosted Authentication UI; Control serves the Management Console. They may use distinct origins or trusted disjoint non-root base paths on one origin while retaining separate internal listeners and credentials. In the shared-origin form, Runtime cookies are path-contained so browsers do not send them to Control. Shared origin deliberately shares one browser/XSS trust boundary; distinct origins provide stronger isolation.
+Runtime serves the Hosted Authentication UI; Control serves the Management Console. Client is backend-only and serves no HTML, assets, redirects, cookies, or CORS grants. Runtime and Control may use distinct origins or trusted disjoint non-root base paths on one origin while all three planes retain separate internal listeners and credentials. In the shared-origin form, Runtime cookies are path-contained so browsers do not send them to Control. Shared origin deliberately shares one browser/XSS trust boundary; distinct origins provide stronger isolation.
 
 - Cookies use `Secure`, `HttpOnly`, host-only/narrow scope where possible, and reviewed `SameSite` behavior.
 - Browser state changes use CSRF protection tied to the interaction/session.
 - Both surfaces use restrictive CSP, framing, referrer, and cache policy, no third-party executable assets, and no service workers. Their React/Vite output is built and embedded separately per plane; Rust emits only external same-origin scripts/styles from validated manifests, and neither a generic SPA fallback nor one plane's asset tree can serve the other.
 - Hosted authentication returns only to the exact stored Application redirect with a short-lived one-use PKCE-bound handoff; interaction handles and tickets are removed from browser history and redacted from referrers/logs before third-party navigation.
-- The Management Console keeps the operator key only in active page memory, sends it only as a Bearer header under the configured Control base URL, and clears it on reload, close, lock, or authentication failure.
+- The Management Console keeps the operator key only in active page memory, sends it only as a Bearer header under the configured Control base URL, and clears it on reload, close, lock, or authentication failure. Project client keys are one-time Control reveals for external secret-manager custody and are sent only by customer backends to the Client listener.
 - CORS is deny-by-default and exact Application-origin based; redirect navigation is not CORS authorization.
 - Bodies, headers, URIs, parameter counts, arrays, strings, decompression, concurrency, and deadlines are bounded.
 - Duplicate singleton parameters, ambiguous encoding, unsupported media, and conflicting credentials fail consistently.
 
 ## Observability and data disclosure
 
-Logs, traces, metrics, errors, audit events, generated examples, and agent context must never contain provider codes/tokens or renewable credentials, email addresses/OTP/magic tokens, SMTP credentials/message bodies, webhook secrets/bodies, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, the operator API key, private keys, full callback URLs, or complete profiles.
+Logs, traces, metrics, errors, audit events, generated examples, and agent context must never contain provider codes/tokens or renewable credentials, email addresses/OTP/magic tokens, SMTP credentials/message bodies, webhook secrets/bodies, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, the operator API key, Project client-key credentials, private keys, full callback URLs, or complete profiles.
 
 Redaction happens before serialization/export. Metrics use bounded-cardinality labels; `belongs_to`, provider subjects, arbitrary URLs, and user profiles are not labels. External errors carry stable safe codes and correlation IDs without revealing cross-Project existence or vendor internals.
 
 ## Operational posture
 
-Runtime and Control use TLS directly or through declared trusted proxies, separate internal listeners, routers, budgets, PostgreSQL pools/quotas, readiness, and rate policy. Control should bind privately; network placement supplements rather than replaces authentication.
+Runtime, Client, and Control use TLS directly or through declared trusted proxies, separate internal listeners, routers, budgets, PostgreSQL pools/quotas, readiness, and rate policy. Client should be reachable only by intended customer backends, and Control should bind privately; network placement supplements rather than replaces authentication.
 
 No business listener becomes ready before typed configuration, PostgreSQL/schema compatibility, and plane-critical key/data-protection capabilities are valid. Redis failure follows endpoint-specific bounded fallback or fail-closed behavior and never weakens an invariant.
 

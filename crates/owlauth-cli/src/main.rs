@@ -31,6 +31,8 @@ enum Command {
     System,
     /// Manage self-hosted Projects and Project policy.
     Project(control::ProjectArgs),
+    /// Manage Project-scoped customer-backend client keys.
+    ClientKey(control::ClientKeyArgs),
     /// Manage self-hosted Applications.
     Application(control::ApplicationArgs),
     /// Manage self-hosted upstream providers.
@@ -116,6 +118,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         },
         Some(Command::System) => remote::system(cli.profile.as_deref())?,
         Some(Command::Project(args)) => control::run_project(cli.profile.as_deref(), args)?,
+        Some(Command::ClientKey(args)) => {
+            control::run_client_key(cli.profile.as_deref(), args)?;
+        }
         Some(Command::Application(args)) => {
             control::run_application(cli.profile.as_deref(), args)?;
         }
@@ -149,6 +154,89 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_key_commands_require_complete_lifecycle_arguments() {
+        const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
+        const KEY: &str = "22222222-2222-4222-8222-222222222222";
+        assert!(Cli::try_parse_from(["owlauth", "client-key", "list", PROJECT]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "owlauth",
+                "client-key",
+                "create",
+                PROJECT,
+                "--label",
+                "customer-backend",
+                "--idempotency-key",
+                "client_key_create_1",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "owlauth",
+                "client-key",
+                "acknowledge",
+                PROJECT,
+                KEY,
+                "--expected-revision",
+                "1",
+                "--idempotency-key",
+                "client_key_acknowledge_1",
+                "--yes",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "owlauth",
+                "client-key",
+                "revoke",
+                PROJECT,
+                KEY,
+                "--expected-revision",
+                "1",
+                "--idempotency-key",
+                "client_key_revoke_1",
+                "--yes",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "owlauth",
+                "client-key",
+                "revoke",
+                PROJECT,
+                KEY,
+                "--expected-revision",
+                "0",
+                "--idempotency-key",
+                "client_key_revoke_1",
+                "--yes",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_key_acknowledgement_refuses_before_profile_or_credential_access() {
+        let cli = Cli::try_parse_from([
+            "owlauth",
+            "client-key",
+            "acknowledge",
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "--expected-revision",
+            "1",
+            "--idempotency-key",
+            "client_key_acknowledge_1",
+        ])
+        .expect("valid command shape");
+        let error = run(cli).expect_err("missing confirmation must fail first");
+        assert!(error.to_string().contains("explicit --yes confirmation"));
+    }
 
     #[test]
     fn rebind_requires_an_explicit_new_credential_reference() {
@@ -301,6 +389,76 @@ mod tests {
         for arguments in commands {
             let error = run(Cli::try_parse_from(arguments).unwrap()).unwrap_err();
             assert!(error.to_string().contains("explicit --yes confirmation"));
+        }
+    }
+
+    #[test]
+    fn provider_onboarding_commands_parse_closed_variants_and_reject_before_credentials() {
+        const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
+        for arguments in [
+            vec!["owlauth", "provider", "egress-get", PROJECT],
+            vec![
+                "owlauth",
+                "provider",
+                "egress-set",
+                PROJECT,
+                "--mode",
+                "exact-origins",
+                "--exact-origin",
+                "https://identity.example",
+                "--expected-revision",
+                "1",
+            ],
+            vec![
+                "owlauth",
+                "provider",
+                "preflight",
+                PROJECT,
+                "--issuer",
+                "https://identity.example",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+
+        let provider = |kind: &'static str, issuer: Option<&'static str>| {
+            let mut arguments = vec![
+                "owlauth",
+                "provider",
+                "create",
+                PROJECT,
+                "--kind",
+                kind,
+                "--provider-key",
+                kind,
+                "--display-name",
+                "Provider",
+                "--client-id",
+                "client",
+                "--client-secret-env",
+                "OWLAUTH_TEST_PROVIDER_SECRET",
+                "--expected-project-revision",
+                "1",
+                "--idempotency-key",
+                "provider_create_1",
+            ];
+            if let Some(issuer) = issuer {
+                arguments.extend(["--issuer", issuer]);
+            }
+            Cli::try_parse_from(arguments).expect("provider command should parse")
+        };
+
+        let _google_without_issuer = provider("google", None);
+        for invalid in [
+            provider("google", Some("https://accounts.google.com")),
+            provider("oidc", None),
+        ] {
+            let error = run(invalid).unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "Custom OIDC requires --issuer; named provider presets forbid --issuer"
+                )
+            );
         }
     }
 

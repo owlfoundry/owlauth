@@ -16,13 +16,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{document}");
         return Ok(());
     }
-    if !arguments.is_empty() {
-        return Err("owlauth-server accepts no command arguments while serving".into());
+    let custody_import = arguments.as_slice() == ["custody-import"];
+    if !arguments.is_empty() && !custody_import {
+        return Err("usage: owlauth-server [custody-import | --openapi <runtime|control>]".into());
     }
 
     // Configuration validates and loads the operator key before telemetry starts. Errors
     // are bounded and secret wrappers never implement revealing formatting.
-    let config = ServerConfig::from_env()?;
+    let config = if custody_import {
+        ServerConfig::from_env_for_custody_import()?
+    } else {
+        ServerConfig::from_env()?
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -31,6 +36,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_current_span(false)
         .with_span_list(false)
         .try_init()?;
-    owlauth_server::run(config).await?;
+    if custody_import {
+        let imported = owlauth_server::import_legacy_custody(config).await?;
+        tracing::info!(
+            event = "custody_import_completed",
+            imported,
+            "legacy custody import completed without binding business listeners"
+        );
+    } else {
+        Box::pin(owlauth_server::run(config)).await?;
+    }
     Ok(())
 }

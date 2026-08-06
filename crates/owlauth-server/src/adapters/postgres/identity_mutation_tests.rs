@@ -46,7 +46,7 @@ use crate::{
         IdentityMutationEmailCandidate, IdentityMutationEmailProofKey,
         IdentityMutationEmailProofMaterial, IdentityMutationPrimarySourceDisposition,
         IdentityMutationProofAuthoritySelection, IdentityMutationProviderCandidate,
-        IdentityMutationProviderCapability, IdentityMutationProviderRegistrationEvidence,
+        IdentityMutationProviderCapabilities, IdentityMutationProviderRegistrationEvidence,
         IdentityMutationRecord, IdentityMutationSessionsDisposition, LoginRevisionSnapshot,
         MailChallengeOwner, MailOutboxRepository, MailTransportOutcome,
         PasswordlessEmailRepository, PreparedIdentityMutationCandidate,
@@ -273,11 +273,12 @@ async fn fixture() -> Option<Fixture> {
     sqlx::query(
         "INSERT INTO deployment_smtp_generations
          (generation,status,revision,security_eligibility_revision,host,port,tls_mode,
-          sender_address,credential_ref,safe_fingerprint)
+          sender_address,credential_ref,safe_fingerprint,material_owner_id)
          VALUES (1,'active',1,1,'smtp.example',465,'implicit_tls',
-                 'sender@example.test','secret/smtp',$1)",
+                 'sender@example.test','secret/smtp',$1,$2)",
     )
     .bind(vec![17_u8; 32])
+    .bind(Uuid::new_v4())
     .execute(&sqlx)
     .await
     .expect("seed deployment SMTP");
@@ -457,7 +458,7 @@ fn prepared_unlink(
             idempotency_key: idempotency_key.to_owned(),
             correlation_id: Uuid::new_v4(),
         },
-        provider_capability: IdentityMutationProviderCapability::controlled_oidc(),
+        provider_capabilities: IdentityMutationProviderCapabilities::reviewed(),
         runtime_base: "https://runtime.example/".to_owned(),
         intent_id,
         hosted_handle_digest: digest(handle_byte),
@@ -517,7 +518,7 @@ fn prepared_merge(
             idempotency_key: "final-merge".to_owned(),
             correlation_id: Uuid::new_v4(),
         },
-        provider_capability: IdentityMutationProviderCapability::controlled_oidc(),
+        provider_capabilities: IdentityMutationProviderCapabilities::reviewed(),
         runtime_base: "https://runtime.example/".to_owned(),
         intent_id,
         hosted_handle_digest: digest(71),
@@ -560,7 +561,7 @@ fn prepared_email(
             idempotency_key: idempotency_key.to_owned(),
             correlation_id: Uuid::new_v4(),
         },
-        provider_capability: IdentityMutationProviderCapability::controlled_oidc(),
+        provider_capabilities: IdentityMutationProviderCapabilities::reviewed(),
         runtime_base: "https://runtime.example/".to_owned(),
         intent_id,
         hosted_handle_digest: digest(21),
@@ -601,7 +602,7 @@ fn prepared(
             idempotency_key: idempotency_key.to_owned(),
             correlation_id: Uuid::new_v4(),
         },
-        provider_capability: IdentityMutationProviderCapability::controlled_oidc(),
+        provider_capabilities: IdentityMutationProviderCapabilities::reviewed(),
         runtime_base: "https://runtime.example/".to_owned(),
         intent_id,
         hosted_handle_digest: digest(1),
@@ -941,6 +942,166 @@ async fn committed_login_email_challenge(
         .await
         .expect("commit healthy login email");
     (login_id, challenge_id, outbox_id)
+}
+
+#[tokio::test]
+async fn google_identity_proof_is_named_authority_and_ignores_custom_oidc_policy_revision() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let mut provider_setup = fixture
+        .sqlx
+        .begin()
+        .await
+        .expect("begin Google identity-proof fixture setup");
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *provider_setup)
+        .await
+        .expect("disable compatibility trigger for preselected Google fixture");
+    sqlx::query(
+        "UPDATE provider_configurations
+            SET adapter_kind='google',issuer=$1,onboarding_policy_revision=NULL
+          WHERE project_id=$2 AND id=$3",
+    )
+    .bind(crate::domain::GOOGLE_ISSUER)
+    .bind(fixture.project_id)
+    .bind(fixture.provider_id)
+    .execute(&mut *provider_setup)
+    .await
+    .expect("select Google identity-proof authority");
+    provider_setup
+        .commit()
+        .await
+        .expect("commit Google identity-proof fixture setup");
+    sqlx::query("UPDATE linked_identities SET issuer=$1 WHERE project_id=$2 AND id=$3")
+        .bind(crate::domain::GOOGLE_ISSUER)
+        .bind(fixture.project_id)
+        .bind(fixture.identity_id)
+        .execute(&fixture.sqlx)
+        .await
+        .expect("align seeded Google identity namespace");
+    let subject: String = sqlx::query_scalar("SELECT subject FROM linked_identities WHERE id=$1")
+        .bind(fixture.identity_id)
+        .fetch_one(&fixture.sqlx)
+        .await
+        .expect("read seeded Google subject");
+    let intent_id = Uuid::new_v4();
+    let handle = 81;
+    let created = fixture
+        .repository
+        .create(prepared_unlink(
+            &fixture,
+            fixture.identity_id,
+            "google-proof-authority",
+            intent_id,
+            handle,
+        ))
+        .await
+        .expect("create Google identity mutation");
+    let CreateIdentityMutationResult::Created(created) = created else {
+        panic!("Google identity mutation must be created");
+    };
+    let slot_id = created.slots[0].id;
+    let snapshot: (String, Option<i64>) = sqlx::query_as(
+        "SELECT provider_adapter_key,provider_egress_policy_revision
+           FROM identity_mutation_proof_slots WHERE intent_id=$1 AND id=$2",
+    )
+    .bind(intent_id)
+    .bind(slot_id)
+    .fetch_one(&fixture.sqlx)
+    .await
+    .expect("read Google proof snapshot");
+    assert_eq!(snapshot, ("google_oidc_profile_v1".to_owned(), None));
+
+    let bound = fixture
+        .repository
+        .bind_browser(
+            &digest(handle),
+            &digest(82),
+            &digest(83),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("bind Google proof browser");
+    fixture
+        .repository
+        .start_provider(
+            intent_id,
+            slot_id,
+            &digest(handle),
+            &digest(82),
+            &digest(83),
+            bound.revision,
+            digest(84),
+            digest(85),
+            Some(protected(86, 17)),
+            protected(87, 41),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("start Google identity proof");
+    sqlx::query("DELETE FROM project_provider_egress_policies WHERE project_id=$1")
+        .bind(fixture.project_id)
+        .execute(&fixture.sqlx)
+        .await
+        .expect("remove unrelated Custom OIDC policy inventory");
+    let project_public_id: String =
+        sqlx::query_scalar("SELECT public_id FROM projects WHERE id=$1")
+            .bind(fixture.project_id)
+            .fetch_one(&fixture.sqlx)
+            .await
+            .expect("read Project public ID");
+    let claimed = fixture
+        .repository
+        .claim_provider_callback(
+            intent_id,
+            slot_id,
+            &project_public_id,
+            "main",
+            &digest(84),
+            &digest(82),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("claim Google callback after unrelated policy change");
+    let ClaimIdentityMutationProvider::Claimed(claimed) = claimed else {
+        panic!("Google callback must have one authoritative claim");
+    };
+    let claimed_authority = claimed
+        .slots
+        .iter()
+        .find(|slot| slot.id == slot_id)
+        .expect("claimed Google slot")
+        .provider
+        .as_ref()
+        .expect("claimed Google authority");
+    assert_eq!(
+        claimed_authority.provider_kind,
+        crate::domain::ProviderKind::Google
+    );
+    assert!(claimed_authority.provider_egress_policy_revision.is_none());
+    let completed = fixture
+        .repository
+        .complete_provider_callback(PreparedIdentityMutationProviderCompletion {
+            claimed,
+            proof_slot_id: slot_id,
+            observation: ProviderProofObservation {
+                issuer: crate::domain::GOOGLE_ISSUER.to_owned(),
+                subject,
+                display_name: None,
+                picture_url: None,
+            },
+            candidate_evidence: None,
+            receipt_id: Uuid::new_v4(),
+            receipt_digest: digest(88),
+            now: OffsetDateTime::UNIX_EPOCH,
+        })
+        .await
+        .expect("commit guarded Google proof evidence");
+    assert_eq!(
+        completed.slots[0].state,
+        crate::domain::IdentityMutationSlotState::Proved
+    );
 }
 
 #[tokio::test]
@@ -2280,6 +2441,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     let runtime_config = identity_mutation_composition_config(PlaneMode::Runtime);
     let runtime_pools = DatabasePools {
         runtime: Some(fixture.database.clone()),
+        client: None,
         control: None,
     };
     let runtime_only = build_routers_with_runtime_incarnation(
@@ -2321,6 +2483,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     );
     let control_pools = DatabasePools {
         runtime: None,
+        client: None,
         control: Some(fixture.database.clone()),
     };
     let split_control =
@@ -2343,6 +2506,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     let all_config = identity_mutation_composition_config(PlaneMode::All);
     let all_pools = DatabasePools {
         runtime: Some(fixture.database.clone()),
+        client: None,
         control: Some(fixture.database.clone()),
     };
     let all =

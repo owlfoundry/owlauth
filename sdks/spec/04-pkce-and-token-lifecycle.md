@@ -2,7 +2,7 @@
 
 ## Current status
 
-Public configuration retrieval, generic Hosted Project login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout exist in the Beta official SDKs. The normative rules below are the Block E convergence target and do not claim that every current implementation already conforms. The packages remain explicit protocol cores rather than persistence, navigation, framework-session, or backend-token-verification libraries, and they must not be presented as production-supported until their independently versioned source, corpus, exact-artifact, real-server, and release criteria are met.
+Public configuration retrieval, generic Hosted Project login initiation, PKCE, handoff exchange, Project credential operations, current-user lookup, and logout exist in the Beta official SDKs. The rules below are normative, while conformance still requires independently versioned source, corpus, exact-artifact, real-server, and release evidence. The packages remain explicit protocol cores rather than persistence, navigation, framework-session, or backend-token-verification libraries and must not be presented as production-supported.
 
 ## Lifecycle overview
 

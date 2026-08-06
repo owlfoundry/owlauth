@@ -4,31 +4,39 @@
 from __future__ import annotations
 
 import importlib.util
-import subprocess
+import io
+import json
 import sys
 import tempfile
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent.parent
 HELPERS_PATH = REPOSITORY_ROOT / "scripts/test-sdk-artifact.py"
-SPEC = importlib.util.spec_from_file_location("sdk_artifact_test_helpers", HELPERS_PATH)
-assert SPEC is not None and SPEC.loader is not None
-helpers = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(helpers)
+HELPERS_SPEC = importlib.util.spec_from_file_location("sdk_artifact_test_helpers", HELPERS_PATH)
+assert HELPERS_SPEC is not None and HELPERS_SPEC.loader is not None
+helpers = importlib.util.module_from_spec(HELPERS_SPEC)
+HELPERS_SPEC.loader.exec_module(helpers)
 
-VERIFIER = REPOSITORY_ROOT / "scripts/release/verify-sdk-candidate.py"
-TAG = f"typescript-v{helpers.VERSION}"
+VERIFIER_PATH = REPOSITORY_ROOT / "scripts/release/verify-sdk-candidate.py"
+VERIFIER_SPEC = importlib.util.spec_from_file_location("verify_sdk_candidate", VERIFIER_PATH)
+assert VERIFIER_SPEC is not None and VERIFIER_SPEC.loader is not None
+verifier = importlib.util.module_from_spec(VERIFIER_SPEC)
+VERIFIER_SPEC.loader.exec_module(verifier)
+
+RELEASE_VERSION = "1.2.3"
+TAG = f"typescript-v{RELEASE_VERSION}"
 
 
-def invoke(archive: Path, descriptor: Path, *overrides: str) -> subprocess.CompletedProcess[str]:
+def invoke(archive: Path, descriptor: Path, *overrides: str) -> SimpleNamespace:
     arguments = [
-        sys.executable,
-        str(VERIFIER),
+        str(VERIFIER_PATH),
         "--component",
         "typescript",
         "--version",
-        helpers.VERSION,
+        RELEASE_VERSION,
         "--source-commit",
         helpers.COMMIT,
         "--workflow-run-id",
@@ -45,15 +53,35 @@ def invoke(archive: Path, descriptor: Path, *overrides: str) -> subprocess.Compl
         str(archive),
     ]
     arguments.extend(overrides)
-    return subprocess.run(arguments, capture_output=True, text=True, check=False)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with patch.object(sys, "argv", arguments), redirect_stdout(stdout), redirect_stderr(stderr):
+        returncode = verifier.main()
+    return SimpleNamespace(
+        returncode=returncode,
+        stdout=stdout.getvalue(),
+        stderr=stderr.getvalue(),
+    )
 
 
 def candidate(root: Path) -> tuple[Path, Path]:
-    archive = root / f"owlauth-client-{helpers.VERSION}.tgz"
+    surface = root / "typescript-artifact-surface.json"
+    helpers.typescript_surface_manifest(surface, version=RELEASE_VERSION)
+    helpers.sdk_artifact.TYPESCRIPT_ARTIFACT_SURFACE_PATH = surface
+
+    manifest = root / "package.json"
+    manifest_document = json.loads(
+        (helpers.REPOSITORY_ROOT / "sdks/typescript/package.json").read_text(encoding="utf-8")
+    )
+    manifest_document["version"] = RELEASE_VERSION
+    manifest.write_text(json.dumps(manifest_document, indent=2) + "\n", encoding="utf-8")
+    helpers.sdk_artifact.MANIFEST_PATHS["typescript"] = manifest
+
+    archive = root / f"owlauth-client-{RELEASE_VERSION}.tgz"
     provenance = root / "contract.json"
     descriptor = root / "candidate.json"
     helpers.contract(provenance)
-    helpers.typescript_archive(archive)
+    helpers.typescript_archive(archive, version=RELEASE_VERSION)
     options = SimpleNamespace(
         component="typescript",
         archive=archive,

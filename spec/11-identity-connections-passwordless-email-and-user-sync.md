@@ -89,14 +89,57 @@ A provider adapter declares whether it supports renewable profile access, which 
 
 The v1 named-adapter registry is closed. Generic `oidc` managed access requests exactly `offline_access openid profile`. Google managed access requests exactly `openid profile` and obtains renewable access through Google's authorization parameters `access_type=offline` and `prompt=consent`; `offline_access` is neither advertised nor requested for Google. GitHub requests exactly `read:user`, uses the immutable nonzero numeric REST user ID as subject, and remains login-only. Each kind has a distinct immutable capability key and exact scope snapshot. All adapters validate the OwlAuth Runtime callback with one deployment policy—HTTPS, plus explicitly enabled exact IP-literal loopback HTTP—independently of their upstream endpoint-origin policy.
 
-In v1, each renewable credential is versioned, purpose-bound AEAD ciphertext in PostgreSQL. The authenticated context binds deployment, Project, provider configuration, linked identity, connection generation, credential generation, and field purpose. This keeps credential replacement inside one authoritative PostgreSQL transition and avoids an external-secret-store/database dual write. Provider client secrets, SMTP credentials, and webhook secrets remain opaque secret-store references because their lifecycle is configuration-owned rather than a rotating per-user protocol result.
+### Provider registration and onboarding
+
+Adapter behavior and operator onboarding are distinct concepts. The only executable adapter kinds remain
+`oidc`, `google`, and `github`. A custom OIDC connection—equivalent in product role to a custom OIDC
+connection in products such as Supabase—is a Project-owned registration of the strict `oidc`
+adapter, not a caller-defined adapter kind. It accepts one canonical non-reserved issuer, client ID,
+write-only client secret, bounded key/display name, managed-profile choice, and Application
+assignments. It never accepts custom code, arbitrary OAuth mode, endpoint override, scope, claim
+mapping, token forwarding, or downstream provider API authority.
+
+Google is a server-authoritative preset over the named `google` adapter. The operator supplies only
+Project-owned presentation/key and client-registration values. OwlAuth derives the exact issuer,
+fixed endpoint-origin set, callback, scopes, PKCE/nonce requirements, managed-profile capability,
+and managed-consent parameters. GitHub follows the same derived named-profile rule while retaining
+its login-only capability. Supplying a named-provider issuer or another low-level override is an
+invalid request; values are never silently ignored.
+
+Each Project owns custom OIDC egress policy. The default `allow_all` mode enables direct connection
+to any canonical HTTPS provider origin, including destinations in networks managed by the
+self-hosting operator. The recommended `exact_origins` mode narrows discovery and every endpoint to
+a bounded canonical origin set. This is Project authority, not process-global origin configuration,
+and it never changes the fixed Google/GitHub named profiles. OwlAuth does not impose an additional
+DNS/IP destination-classification layer. IP-literal loopback HTTP is development-only and requires
+the process development opt-in plus a matching origin when exact mode is selected.
+
+Custom OIDC preflight validates only whether the proposed issuer's current discovery metadata can
+satisfy OwlAuth's fixed protocol profiles under the current Project policy revision. It proves
+neither provider ownership nor future availability and creates no durable registration or trust
+token. Creation repeats the same discovery, endpoint-origin, capability, and policy validation before
+any provider row or client-secret write. A custom OIDC provider may be created with managed profile
+enabled only when that repeated discovery advertises UserInfo plus `offline_access` and the common
+strict requirements. Runtime later reads current Project policy and repeats discovery and endpoint
+admission for every login, proof, renewal, reauthorization, or profile operation;
+metadata or policy drift makes the affected operation unavailable and cannot widen its scope or
+destination set. A provider that remains valid for login but loses managed-profile facts cannot
+silently downgrade a managed request into ordinary login or retain an unsupported renewable
+credential.
+
+Provider display name and closed kind may enter public configuration and the snapshotted Hosted
+method roster. Issuer, client ID, discovery metadata, endpoint origins, capability diagnostics,
+client secret, and provider tokens do not enter Hosted pages, Application projections, handoffs, or
+SDK credentials. Hosted presentation uses only bounded text and local kind-selected assets.
+
+In v1, each renewable credential is versioned, purpose-bound AEAD ciphertext in PostgreSQL under its dedicated managed-credential ring. The authenticated context binds deployment, Project, provider configuration, linked identity, connection generation, credential generation, and field purpose. Provider client secrets, SMTP credentials, and webhook secrets also use PostgreSQL-resident opaque envelopes, but through the separate key-provider SPI and protected-material lifecycle owned by specs 02, 04, and 06. Neither path is an external generic-secret-store/database dual write, and neither exposes plaintext through configuration or DTOs.
 
 A renewable credential:
 
 - is decrypted only inside the provider-profile synchronization adapter for that exact connection generation;
 - is replaced only by a generation-fenced commit, and every replacement advances the credential/connection generation even when the provider returns an equivalent token value;
 - makes the predecessor locally inaccessible after the replacement commit;
-- never enters Runtime/Control DTOs, user projections, webhook payloads, redirects, logs, audit safe context, Redis, or an Application process;
+- never enters Runtime/Client/Control DTOs, user projections, webhook payloads, redirects, logs, audit safe context, Redis, or an Application process;
 - is not usable to request caller-selected scopes or provider resources.
 
 An adapter separately declares whether its read-only profile fetch is safely retryable and whether renewable-credential rotation supports an idempotent replay mechanism. Rotation is never assumed idempotent. A durable renewal operation records the expected/successor generation and attempt identity. Before the external call, OwlAuth commits it as `submitted`; a crash while merely `prepared` permits a new claim, while any crash/lease loss after `submitted` is conservatively ambiguous even if the remote request may not have left the process. If the response is lost or OwlAuth cannot prove whether the provider consumed/rotated the credential, it must not present the old credential again unless that adapter can replay the exact attempt idempotently. Otherwise a guarded commit advances the generation, destroys access to the old credential, and sets `reauth_required`. A received successor credential is protected and committed before any optional read-only profile fetch; failure of that fetch cannot discard or roll back the safer successor. The successor commit retains the exact connection lease and the Project/provider outbound budget through that post-successor stage. Success, classified failure, and the no-profile path validate and release the same owner; another worker may reclaim only after the retained lease expires. Durable renewal-operation terminalization may complete before this profile-stage lease is released and does not release that scheduling/budget authority by itself.
@@ -231,7 +274,7 @@ The email proof never directly returns an access or refresh token. It produces t
 
 ### SMTP configuration and durable delivery
 
-A Project may select exactly one active SMTP configuration generation. It contains bounded host/port/TLS mode, safe sender/reply metadata, template/locale configuration, revision/generation, and an opaque credential secret reference. Passwords or API credentials are write-only Control input and are committed through the Project-scoped secret-store adapter; PostgreSQL, DTOs, Console state after submission, audit, and logs retain only the opaque reference and safe version metadata. Production SMTP permits implicit TLS or mandatory STARTTLS with hostname and certificate validation and no downgrade. Plaintext SMTP is available only behind explicit development configuration for loopback destinations and is never a default or Project-selectable production mode.
+A Project may select exactly one active SMTP configuration generation. It contains bounded host/port/TLS mode, safe sender/reply metadata, template/locale configuration, revision/generation, and a stable protected-material ID. Passwords or API credentials are write-only Control input and pass through the configuration-secret sealer under exact Project/configuration/generation context. PostgreSQL atomically stores the resulting bounded opaque envelope/material record with the owning generation; DTOs, Console state after submission, audit, and logs expose neither envelope, fingerprint, ID, nor plaintext. Production SMTP permits implicit TLS or mandatory STARTTLS with hostname and certificate validation and no downgrade. Plaintext SMTP is available only behind explicit development configuration for loopback destinations and is never a default or Project-selectable production mode.
 
 Configuration precedence is explicit:
 
@@ -241,11 +284,11 @@ Configuration precedence is explicit:
 
 There is no implicit cross-Project fallback or borrowing of another Project's sender, templates, credentials, rate budget, or delivery health. The Console offers a test-delivery command whose recipient and result are bounded/audited; successful test delivery does not activate a configuration without the explicit lifecycle command.
 
-At enqueue, both challenge and mail outbox immutably snapshot `smtp_selection_kind` (`project` or `deployment_default`), nullable Project SMTP configuration ID, and exact SMTP generation plus security-eligibility revision. Project SMTP configuration generations and deployment-default generations have authoritative PostgreSQL status/revision metadata; the latter contains only a safe fingerprint that must match the process-configured handle, never secret bytes. A worker resolves only that pinned generation; replacing configuration never retargets pending mail.
+At enqueue, both challenge and mail outbox immutably snapshot `smtp_selection_kind` (`project` or `deployment_default`), nullable Project SMTP configuration ID, and exact SMTP generation plus security-eligibility revision. Project SMTP configuration generations and deployment-default generations have authoritative PostgreSQL status/revision metadata and each references its exact protected-material row. A worker opens only that pinned non-erased generation under the same context; replacing configuration never retargets pending mail.
 
-Runtime startup and bounded reconciliation inventory every active or unexpired-retained Project SMTP generation against the Runtime credential resolver and exact safe fingerprint. An unreadable/missing reference marks only that exact Project generation unavailable: that Project's email method is not advertised or admitted, and no new durable challenge/outbox work may select it, while unrelated Projects and non-email Runtime capabilities remain ready. The unavailable state survives restart and becomes eligible again only after a successful exact reconciliation. Operational output exposes bounded counts/state classes, never opaque references, fingerprints, recipient data, or secret material.
+Runtime startup and bounded reconciliation inventory every active or unexpired-retained Project/default SMTP generation against its exact material ID, provider/format/context metadata, opener capability, and safe fingerprint. A missing, erased, unknown-version, context-invalid, or undecryptable material row marks only that exact generation unavailable: that Project's email method is not advertised or admitted, and no new durable challenge/outbox work may select it, while unrelated Projects and non-email Runtime capabilities remain ready. The unavailable state survives restart and becomes eligible again only after a successful exact reconciliation. Operational output exposes bounded counts/state classes, never opaque references, fingerprints, recipient data, or secret material.
 
-Every opaque SMTP credential reference has one durable lifecycle record shared by Project preparation/reconciliation, deployment-default reconciliation, and cleanup. All paths serialize on the reference. A committed live registration prevents a cleanup reservation while any active or unexpired pinned use remains; a committed cleanup reservation prevents every new Project or deployment live registration before external erasure. Successful erasure leaves a terminal tombstone, and exact historical idempotency replay returns the retained/retired operation result without provisioning, duplicate audit, or secret resurrection. Leases make reservation/erasure crash-recoverable; an external pre-erase recheck alone is not authority.
+Every SMTP credential material ID has one durable PostgreSQL lifecycle record shared by Project/default creation, generation selection, and cleanup. All paths serialize on that row. A committed live generation prevents crypto-erasure while any active or unexpired pinned use remains; a committed cleanup transition prevents every new live attachment. Successful guarded crypto-erasure clears the envelope and leaves a terminal tombstone, and exact historical idempotency replay returns the retained/retired operation result without resealing, duplicate audit, or secret resurrection. PostgreSQL state—not a filesystem delete, external pre-erase check, or ciphertext equality—is authority.
 
 Planned rotation selects a new generation while retaining an old generation's eligibility revision only through the maximum usefulness of its associated challenges. Disabling or marking either kind of generation compromised atomically advances its PostgreSQL status/revision. Every subsequent mail claim and proof-completion transaction revalidates the pinned generation and revision, so it fails closed immediately after that commit; bounded cleanup then terminalizes/cancels pending jobs and challenges. One SMTP attempt already in flight may complete physically, but the delivered proof cannot authenticate after the eligibility revision changed.
 
@@ -284,7 +327,7 @@ A user may have at most 64 Application bindings within one Project. Binding crea
 
 Applications in one Project share a user directory for authentication, but an Application does not automatically receive every user in that Project. The first successful handoff exchange for `(project_id, application_id, user_id)` creates an Application-user binding and the initial materialized projection in the handoff transaction. Only an existing active binding can receive later projection webhooks. Deploying webhook support or creating an endpoint later does not invent a retroactive `user.projection.created` event for an existing binding; the Application already received that snapshot in its handoff. A later real projection change emits `updated` or `disabled` as applicable. Disabling an Application stops delivery; removing a webhook endpoint does not delete the binding or user.
 
-There is no Runtime list-all-users or change-feed endpoint. Control can search users for administration under the deployment operator key, but that capability is never added to Runtime SDKs.
+There is no Runtime list-all-users or change-feed endpoint. Control can search users for administration under the deployment operator key, but that capability is never added to Runtime SDKs. The separate Project-client-key-authenticated Client API may list the bounded Project base user read model and may retrieve one existing materialized Application projection exactly as defined by spec 13. It does not create a binding, re-project unbound users, expose provider payloads, or gain webhook replay/change-feed authority.
 
 ## Signed Application webhooks
 
@@ -340,7 +383,7 @@ OwlAuth-Webhook-Signature: v1=<unpadded-base64url(HMAC-SHA-256(secret, timestamp
 
 The exact canonical byte grammar, comma/whitespace rules, maximum signature count, and shared conformance fixtures live with the public Control/Application integration contract. The attempt timestamp is regenerated and re-signed for retry/replay while `event_id`, event occurrence time, payload, `user_revision`, and `projection_revision` remain immutable. Receivers verify the exact raw body, supported signature version, bounded clock window, signed header event ID, and at least one active/overlap signature. The `OwlAuth-Webhook-Id` value must exactly equal the body `event_id`; mismatch is rejected before deduplication. Receivers durably deduplicate `event_id` and ignore a projection revision older than the stored revision for that Application user. Delivery is at least once and ordering is not guaranteed across endpoints or attempts.
 
-Endpoint secret material is generated by OwlAuth or accepted as write-only input, shown at most once when policy permits, and stored behind a Project/Application-scoped secret reference. Rotation is staged: create/show a pending new version, let the receiver install it, explicitly activate it, emit both old/new `v1` signatures for a bounded overlap, then retire the old version. A failed/abandoned preparation never changes signing. Disabling an endpoint stops new claims while preserving event/delivery history for bounded inspection.
+Endpoint secret material is generated by OwlAuth or accepted as write-only input, shown at most once when policy permits, sealed under exact Project/Application/endpoint/generation context, and stored in a PostgreSQL protected-material envelope referenced by stable material ID. Rotation is staged: create/show a pending new version, let the receiver install it, explicitly activate it, emit both old/new `v1` signatures for a bounded overlap, then retire the old version. A failed/abandoned preparation never changes signing. Disabling an endpoint stops new claims while preserving event/delivery history for bounded inspection.
 
 Control may inspect safe delivery status and replay an existing immutable event to the same eligible endpoint. Replay creates a new attempt/delivery record; it cannot edit payload, change target Application/user, substitute a URL, or regenerate current user data under an old event ID. Arbitrary event injection is forbidden.
 
@@ -362,7 +405,7 @@ The ordinary Control API and Console support:
 - user source/profile provenance, `user_revision`, email/provider identities, explicit link/unlink/merge with fresh-proof requirements, and Application bindings;
 - webhook endpoint create/test/activate/rotate-secret/disable, event subscription, delivery health, immutable event inspection, and authorized replay.
 
-A Control key can administer these resources deployment-wide but cannot retrieve stored provider/SMTP/webhook secrets. Commands use expected revisions, idempotency where an external secret or delivery side effect could duplicate, explicit confirmation for disconnect/unlink/merge/revoke, and same-transaction audit where required.
+A Control key can administer these resources deployment-wide but cannot retrieve stored provider/SMTP/webhook secrets. Commands use expected revisions, idempotency for randomized secret-material creation and where a delivery side effect could duplicate, explicit confirmation for disconnect/unlink/merge/revoke, and same-transaction material/owner/audit commit where required.
 
 ### Hosted Authentication UI
 
@@ -396,13 +439,13 @@ For ordinary login, method keys, branding, email address, challenge kind, and ne
 ## Security, consistency, and failure rules
 
 1. PostgreSQL remains authority for connection generation/state, email challenge one-use state, identity uniqueness, user revision, Application visibility, event immutability, and outbox/delivery state. Redis may coordinate rate limits or cache safe presentation only.
-2. Provider, secret-store, SMTP, and webhook calls never occur while a business PostgreSQL transaction is held. External results commit only under captured revision/generation guards.
+2. Upstream-provider, key-provider, SMTP, and webhook calls never occur while a business PostgreSQL transaction is held. A self-contained sealed envelope commits atomically with its protected-material row and owner generation; remote/external results commit only under captured revision/generation guards.
 3. Mail and webhook delivery are asynchronous correctness-preserving side effects. Their outage can make email login or synchronization delivery unavailable/degraded but cannot authorize, link, consume, or mutate identity from stale state. Email proof completion conditionally revalidates its pinned SMTP generation/revision, so a committed compromise wins over later proof use even if mail was already delivered.
 4. Worker leases are recoverable scheduling aids. Lease loss may duplicate read-only profile fetch or delivery work but is not permission to repeat a non-idempotent renewable-credential rotation. It cannot duplicate challenge consumption, credential-generation activation, event identity, or user revision.
 5. Every secret/ciphertext uses purpose and Project/Application/identity context. Runtime uses two independently configured and independently retained rings: the short-term ring protects transactions, challenges, sessions, and outbox data, while the `OWLAUTH_EMAIL_IDENTITY_*` ring alone protects durable email lookup digests and PII. No active or retained root may be reused across these rings, and purpose separation does not substitute for retained-set separation. Short-term key loss terminalizes affected work. Missing long-term email identity material makes only email advertisement, admission, challenge/proof, and mail claims unready until exact-incarnation bounded reconciliation succeeds; provider and session capabilities remain available. Control never receives either Runtime decryption capability. Long-term email PII and active managed credentials require proven re-encryption/rewrap before an old protector key retires.
 6. Raw email, OTP, magic token, provider credentials/payloads, SMTP body, webhook secret/body, and full user projections are denied from ordinary logs, metrics, traces, error reports, audit safe context, and agent output.
 7. Current-user/handoff/refresh projection reads observe authoritative user/Application policy and revision. A disabled user cannot be made active by stale provider sync or webhook state.
-8. Backup/restore includes email canonicalization/digest key versions and aliases, long-term email PII protector versions, managed-credential ciphertext and AEAD keys, retained mail challenge/outbox plus identity-mutation candidate-evidence protector versions, SMTP/webhook secret references and overlap generations, projection expansions/events/deliveries, and required signer/schema state. Missing short-term keys terminalize the affected transactions/jobs; missing long-term PII/active-credential keys keep the affected capability unready and require recovery or explicit destructive reauthorization. Restored workers resume only from committed generation/cursor/outbox state.
+8. Backup/restore includes email canonicalization/digest key versions and aliases, long-term email PII protector versions, managed-credential ciphertext and AEAD keys, retained mail challenge/outbox plus identity-mutation candidate-evidence protector versions, SMTP/webhook protected-material envelopes and overlap generations, the separately preserved bundled software custody root or required custom-provider authority, projection expansions/events/deliveries, and required signer/schema state. Missing short-term keys terminalize the affected transactions/jobs; missing long-term PII/active-credential keys keep the affected capability unready and require recovery or explicit destructive reauthorization. Restored workers resume only from committed generation/cursor/outbox state.
 
 ## Acceptance criteria
 
@@ -410,7 +453,7 @@ This concern is implemented only when all of the following hold:
 
 01. provider adapters explicitly declare managed-sync capability and least scopes; login-only adapters retain no renewable credential;
 02. active/reauth-required/revoked/disconnected transitions, credential rotation, stale-result rejection, disconnect erasure, and provider failure classification pass concurrency and recovery tests;
-03. provider tokens cannot appear in any Runtime/Control DTO, Application projection/webhook, redirect, Redis value, log, audit safe context, or browser asset/configuration;
+03. provider tokens cannot appear in any Runtime/Client/Control DTO, Application projection/webhook, redirect, Redis value, log, audit safe context, or browser asset/configuration;
 04. ordinary-login email OTP and magic-link starts are enumeration-safe and bind the exact Project/Application/redirect/PKCE transaction; identity-mutation email proof instead binds the exact intent/slot and captured Application email-policy authority without creating a handoff; a mutation magic GET creates only a separate challenge-scoped, purpose-separated transfer cookie and CSRF gate without reading or consuming fragment proof, while the explicit same-origin POST resolves the stored owner and consumes the newest proof/context once; newest-generation, expiry, attempt, one-use, copied-context, fresh-user-agent, concurrent verification, and restart behavior are tested for both typed interaction classes;
 05. no matching provider/email profile silently links users; prospective link evidence creates/attaches the identity only in final Control confirmation, an already owned candidate requires merge, explicit linking proves every required slot recently, and merge preserves Project/issuer/subject/email-alias uniqueness; every explicit replacement primary source freezes its typed identity ID and positive expected identity revision into idempotency and final confirmation authority;
 06. Project SMTP, explicit deployment fallback, write-only secrets, test/activate transitions, production TLS/no-downgrade policy, immutable challenge/outbox generation+revision pinning, disable/compromise versus proof-completion races, in-flight delivery followed by proof denial, durable outbox, duplicate delivery, retry cutoff, and redaction have integration tests;

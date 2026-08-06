@@ -28,23 +28,6 @@ struct AssetFile {
     mime: String,
     bytes: usize,
     sha256: String,
-    representations: Representations,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Representations {
-    identity: Representation,
-    gzip: Option<Representation>,
-    brotli: Option<Representation>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Representation {
-    path: String,
-    bytes: usize,
-    sha256: String,
 }
 
 fn main() {
@@ -87,26 +70,7 @@ fn validate_plane(root: &Path, expected_plane: &str) -> Result<(), Box<dyn Error
         {
             return Err(format!("invalid {expected_plane} asset entry").into());
         }
-        if file.representations.identity.path != file.path
-            || file.representations.identity.bytes != file.bytes
-            || file.representations.identity.sha256 != file.sha256
-        {
-            return Err(format!("inconsistent {expected_plane} identity metadata").into());
-        }
-
-        verify_representation(root, &file.representations.identity, &mut allowed)?;
-        if let Some(representation) = &file.representations.gzip {
-            if representation.path != format!("{}.gz", file.path) {
-                return Err(format!("invalid {expected_plane} gzip path").into());
-            }
-            verify_representation(root, representation, &mut allowed)?;
-        }
-        if let Some(representation) = &file.representations.brotli {
-            if representation.path != format!("{}.br", file.path) {
-                return Err(format!("invalid {expected_plane} Brotli path").into());
-            }
-            verify_representation(root, representation, &mut allowed)?;
-        }
+        verify_asset(root, file, &mut allowed)?;
 
         set_digest.update(file.path.as_bytes());
         set_digest.update(b"\0");
@@ -137,22 +101,20 @@ fn validate_plane(root: &Path, expected_plane: &str) -> Result<(), Box<dyn Error
     Ok(())
 }
 
-fn verify_representation(
+fn verify_asset(
     root: &Path,
-    representation: &Representation,
+    asset: &AssetFile,
     allowed: &mut BTreeSet<String>,
 ) -> Result<(), Box<dyn Error>> {
-    validate_relative_path(&representation.path)?;
-    if !allowed.insert(representation.path.clone()) {
-        return Err("duplicate asset representation".into());
+    if !allowed.insert(asset.path.clone()) {
+        return Err("duplicate asset path".into());
     }
-    let path = root.join(&representation.path);
+    let path = root.join(&asset.path);
     println!("cargo:rerun-if-changed={}", path.display());
     let bytes = fs::read(path)?;
     let digest = Sha256::digest(&bytes);
-    if bytes.len() != representation.bytes || hexadecimal(digest.as_ref()) != representation.sha256
-    {
-        return Err("asset representation digest mismatch".into());
+    if bytes.len() != asset.bytes || hexadecimal(digest.as_ref()) != asset.sha256 {
+        return Err("asset digest mismatch".into());
     }
     Ok(())
 }

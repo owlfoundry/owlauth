@@ -263,65 +263,80 @@ def normalized_surface(
     runtime: Mapping[str, Any],
     control: Mapping[str, Any],
     policy: SurfacePolicy,
+    *,
+    client: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_operations = document_operations(runtime, "Runtime")
     control_operations = document_operations(control, "Control")
-
-    operation_id_overlap = set(runtime_operations) & set(control_operations)
-    unexpected_overlap = operation_id_overlap - policy.allowed_shared_operation_ids
-    missing_allowed_overlap = policy.allowed_shared_operation_ids - operation_id_overlap
-    if unexpected_overlap:
-        raise ContractError(
-            "Runtime and Control unexpectedly share operation IDs: "
-            f"{sorted(unexpected_overlap)}"
-        )
-    if missing_allowed_overlap:
-        raise ContractError(
-            "declared shared operation IDs are no longer shared: "
-            f"{sorted(missing_allowed_overlap)}"
-        )
+    non_runtime_planes: list[tuple[str, dict[str, Operation]]] = [
+        ("Control", control_operations)
+    ]
+    if client is not None:
+        non_runtime_planes.append(("Client", document_operations(client, "Client")))
 
     runtime_identities = {
         (operation.method, operation.path): operation for operation in runtime_operations.values()
     }
-    control_identities = {
-        (operation.method, operation.path): operation for operation in control_operations.values()
-    }
-    for identity in sorted(set(runtime_identities) & set(control_identities)):
-        runtime_operation = runtime_identities[identity]
-        control_operation = control_identities[identity]
-        if (
-            runtime_operation.operation_id != control_operation.operation_id
-            or runtime_operation.operation_id not in policy.allowed_shared_operation_ids
-        ):
+    for plane_name, plane_operations in non_runtime_planes:
+        operation_id_overlap = set(runtime_operations) & set(plane_operations)
+        unexpected_overlap = operation_id_overlap - policy.allowed_shared_operation_ids
+        missing_allowed_overlap = policy.allowed_shared_operation_ids - operation_id_overlap
+        if unexpected_overlap:
             raise ContractError(
-                "Runtime and Control unexpectedly share HTTP operation "
-                f"{identity[0]} {identity[1]} as "
-                f"{runtime_operation.operation_id!r}/{control_operation.operation_id!r}"
+                f"Runtime and {plane_name} unexpectedly share operation IDs: "
+                f"{sorted(unexpected_overlap)}"
             )
-        if strip_annotations(runtime_operation.value) != strip_annotations(control_operation.value):
+        if missing_allowed_overlap:
             raise ContractError(
-                "shared Runtime and Control operation contracts differ: "
-                f"{runtime_operation.operation_id}"
+                f"declared Runtime/{plane_name} shared operation IDs are no longer shared: "
+                f"{sorted(missing_allowed_overlap)}"
             )
-    for operation_id in policy.allowed_shared_operation_ids:
-        runtime_operation = runtime_operations[operation_id]
-        control_operation = control_operations[operation_id]
-        if (runtime_operation.method, runtime_operation.path) != (
-            control_operation.method,
-            control_operation.path,
-        ):
-            raise ContractError(
-                f"shared operation {operation_id!r} has different method/path identities"
-            )
+
+        plane_identities = {
+            (operation.method, operation.path): operation
+            for operation in plane_operations.values()
+        }
+        for identity in sorted(set(runtime_identities) & set(plane_identities)):
+            runtime_operation = runtime_identities[identity]
+            plane_operation = plane_identities[identity]
+            if (
+                runtime_operation.operation_id != plane_operation.operation_id
+                or runtime_operation.operation_id not in policy.allowed_shared_operation_ids
+            ):
+                raise ContractError(
+                    f"Runtime and {plane_name} unexpectedly share HTTP operation "
+                    f"{identity[0]} {identity[1]} as "
+                    f"{runtime_operation.operation_id!r}/{plane_operation.operation_id!r}"
+                )
+            if strip_annotations(runtime_operation.value) != strip_annotations(
+                plane_operation.value
+            ):
+                raise ContractError(
+                    f"shared Runtime and {plane_name} operation contracts differ: "
+                    f"{runtime_operation.operation_id}"
+                )
+        for operation_id in policy.allowed_shared_operation_ids:
+            runtime_operation = runtime_operations[operation_id]
+            plane_operation = plane_operations[operation_id]
+            if (runtime_operation.method, runtime_operation.path) != (
+                plane_operation.method,
+                plane_operation.path,
+            ):
+                raise ContractError(
+                    f"shared Runtime/{plane_name} operation {operation_id!r} "
+                    "has different method/path identities"
+                )
 
     claimed = set(policy.runtime_operations)
     missing = claimed - set(runtime_operations)
-    control_leakage = claimed & set(control_operations)
     if missing:
         raise ContractError(f"claimed Runtime operations are missing: {sorted(missing)}")
-    if control_leakage:
-        raise ContractError(f"claimed Runtime operations leak into Control: {sorted(control_leakage)}")
+    for plane_name, plane_operations in non_runtime_planes:
+        leakage = claimed & set(plane_operations)
+        if leakage:
+            raise ContractError(
+                f"claimed Runtime operations leak into {plane_name}: {sorted(leakage)}"
+            )
 
     selected: dict[str, Any] = {}
     reference_queue: list[str] = []
@@ -394,11 +409,13 @@ def normalized_surface(
     }
 
 
-def export_documents(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def export_documents(
+    root: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="owlauth-sdk-contract-") as temporary_directory:
         temporary = Path(temporary_directory)
         documents: list[dict[str, Any]] = []
-        for plane in ("runtime", "control"):
+        for plane in ("runtime", "client", "control"):
             output = temporary / f"{plane}.json"
             command = [
                 "cargo",
@@ -421,7 +438,7 @@ def export_documents(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             if not isinstance(value, dict):
                 raise ContractError(f"exported {plane} OpenAPI must be an object")
             documents.append(value)
-        return documents[0], documents[1]
+        return documents[0], documents[1], documents[2]
 
 
 def source_commit(root: Path) -> str:
@@ -506,26 +523,40 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
     parser.add_argument("--provenance", type=Path)
     parser.add_argument("--runtime-openapi", type=Path)
+    parser.add_argument("--client-openapi", type=Path)
     parser.add_argument("--control-openapi", type=Path)
     return parser.parse_args(arguments)
 
 
 def run(arguments: list[str]) -> None:
     options = parse_arguments(arguments)
-    if (options.runtime_openapi is None) != (options.control_openapi is None):
-        raise ContractError("--runtime-openapi and --control-openapi must be provided together")
+    provided_openapi = [
+        options.runtime_openapi,
+        options.client_openapi,
+        options.control_openapi,
+    ]
+    if any(path is not None for path in provided_openapi) and not all(
+        path is not None for path in provided_openapi
+    ):
+        raise ContractError(
+            "--runtime-openapi, --client-openapi, and --control-openapi must be provided together"
+        )
     policy_path = options.policy.resolve()
     snapshot_path = options.snapshot.resolve()
     policy = load_policy(policy_path)
     if options.runtime_openapi is None:
-        runtime, control = export_documents(REPOSITORY_ROOT)
+        runtime, client, control = export_documents(REPOSITORY_ROOT)
     else:
         runtime_value = load_json(options.runtime_openapi)
+        client_value = load_json(options.client_openapi)
         control_value = load_json(options.control_openapi)
-        if not isinstance(runtime_value, dict) or not isinstance(control_value, dict):
+        if not all(
+            isinstance(value, dict)
+            for value in (runtime_value, client_value, control_value)
+        ):
             raise ContractError("OpenAPI inputs must be JSON objects")
-        runtime, control = runtime_value, control_value
-    normalized = normalized_surface(runtime, control, policy)
+        runtime, client, control = runtime_value, client_value, control_value
+    normalized = normalized_surface(runtime, control, policy, client=client)
     rendered = canonical_json(normalized, pretty=True)
     if options.action == "update":
         write_bytes(snapshot_path, rendered)

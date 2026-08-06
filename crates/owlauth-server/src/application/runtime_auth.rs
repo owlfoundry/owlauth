@@ -909,6 +909,7 @@ impl RuntimeAuthService {
                 } else {
                     ProviderRequestProfile::Login
                 },
+                egress_policy: provider.egress_policy.clone(),
             })
             .await
             .map_err(provider_error)?;
@@ -1049,6 +1050,7 @@ impl RuntimeAuthService {
                 } else {
                     ProviderRequestProfile::Login
                 },
+                egress_policy: provider.egress_policy,
             })
             .await
             .map_err(provider_error)?;
@@ -1505,6 +1507,7 @@ impl RuntimeAuthService {
             authenticated_at,
             preparation.access_token_lifetime_seconds,
             &preparation.signing_kid,
+            &preparation.signing_public_jwk,
             &preparation.signer_ref,
         )
         .await
@@ -1524,6 +1527,7 @@ impl RuntimeAuthService {
             preparation.authenticated_at,
             preparation.access_token_lifetime_seconds,
             &preparation.signing_kid,
+            &preparation.signing_public_jwk,
             &preparation.signer_ref,
         )
         .await
@@ -1541,6 +1545,7 @@ impl RuntimeAuthService {
         authenticated_at: OffsetDateTime,
         lifetime_seconds: i64,
         kid: &str,
+        public_jwk: &serde_json::Value,
         signer_ref: &str,
     ) -> Result<String, ApplicationError> {
         let now = self.clock.now();
@@ -1568,7 +1573,7 @@ impl RuntimeAuthService {
             .encode(serde_json::to_vec(&claims).map_err(|_| ApplicationError::Integrity)?);
         let input = format!("{header}.{payload}");
         let signature = self.signer.sign(signer_ref, input.as_bytes()).await?;
-        Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature)))
+        finish_signed_token(self.signer.as_ref(), public_jwk, &input, signature)
     }
 
     async fn authenticate_access_token(
@@ -2096,6 +2101,19 @@ fn parse_credential_version(value: &str) -> Result<i32, ApplicationError> {
     Ok(version)
 }
 
+fn finish_signed_token(
+    signer: &dyn RuntimeSigner,
+    public_jwk: &Value,
+    signing_input: &str,
+    signature: Vec<u8>,
+) -> Result<String, ApplicationError> {
+    signer.verify(public_jwk, signing_input.as_bytes(), &signature)?;
+    Ok(format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature)
+    ))
+}
+
 fn validate_credential_secret(value: &str) -> Result<(), ApplicationError> {
     if value.len() < 24
         || !value
@@ -2233,6 +2251,28 @@ mod tests {
         RuntimeKeyMaterial, SoftwareRuntimeProtector, SplitRuntimeProtector,
     };
 
+    struct RejectingGeneratedSignature;
+
+    #[async_trait::async_trait]
+    impl RuntimeSigner for RejectingGeneratedSignature {
+        async fn sign(
+            &self,
+            _signer_ref: &str,
+            _signing_input: &[u8],
+        ) -> Result<Vec<u8>, ApplicationError> {
+            Ok(vec![7; 64])
+        }
+
+        fn verify(
+            &self,
+            _public_jwk: &Value,
+            _signing_input: &[u8],
+            _signature: &[u8],
+        ) -> Result<(), ApplicationError> {
+            Err(ApplicationError::Integrity)
+        }
+    }
+
     fn split_email_protector() -> SplitRuntimeProtector {
         let material = |seed| RuntimeKeyMaterial::new([seed; 32], [seed + 32; 32]);
         let short_term = SoftwareRuntimeProtector::new(
@@ -2250,6 +2290,19 @@ mod tests {
         )
         .expect("durable email identity protector");
         SplitRuntimeProtector::new(short_term, Some(durable))
+    }
+
+    #[test]
+    fn generated_signature_must_verify_before_a_compact_jwt_is_returned() {
+        assert_eq!(
+            finish_signed_token(
+                &RejectingGeneratedSignature,
+                &serde_json::json!({ "kty": "OKP" }),
+                "header.payload",
+                vec![7; 64],
+            ),
+            Err(ApplicationError::Integrity)
+        );
     }
 
     #[test]

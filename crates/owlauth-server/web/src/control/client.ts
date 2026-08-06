@@ -12,8 +12,14 @@ export type ApplicationUserEvent = components["schemas"]["ApplicationUserEvent"]
 export type WebhookDelivery = components["schemas"]["WebhookDelivery"];
 export type ApplicationUserEventType = components["schemas"]["ApplicationUserEventType"];
 export type SigningKey = components["schemas"]["SigningKey"];
+export type ProjectClientKey = components["schemas"]["ProjectClientKey"];
+export type CreateProjectClientKeyResponse =
+  components["schemas"]["CreateProjectClientKeyResponse"];
 export type Provider = components["schemas"]["Provider"];
+export type ProviderEgressPolicy = components["schemas"]["ProviderEgressPolicy"];
+export type OidcPreflightResult = components["schemas"]["OidcPreflightResult"];
 export type EmailMethodPolicy = components["schemas"]["EmailMethodPolicy"];
+export type EmailAssignment = components["schemas"]["EmailAssignment"];
 export type SmtpConfiguration = components["schemas"]["SmtpConfiguration"];
 export type ProjectUser = components["schemas"]["ProjectUser"];
 export type ProjectUserSessions = components["schemas"]["ProjectUserSessions"];
@@ -71,10 +77,7 @@ export class IdempotencyAttempt {
 
   settle(error?: unknown): void {
     this.inFlight = false;
-    if (
-      error === undefined ||
-      (error instanceof ControlRequestError && error.status >= 400 && error.status < 500)
-    ) {
+    if (error === undefined || !isAmbiguousIdempotencyFailure(error)) {
       this.key = null;
     }
   }
@@ -87,6 +90,15 @@ export class IdempotencyAttempt {
   get retainsKey(): boolean {
     return this.key !== null;
   }
+}
+
+export function isAmbiguousIdempotencyFailure(error: unknown): boolean {
+  if (!(error instanceof ControlRequestError)) return true;
+  return (
+    error.status === 408 ||
+    error.status >= 500 ||
+    (error.status === 409 && error.code === "operation_in_progress")
+  );
 }
 
 export function requireData<T>(data: T | undefined, error: unknown, response: Response): T {

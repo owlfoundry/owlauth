@@ -1,0 +1,17 @@
+[package]
+name = "owlauth-key-provider"
+version = "0.0.0-dev"
+edition.workspace = true
+description = "Provider-neutral signing and configuration-secret custody SPI for OwlAuth"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["authentication", "cryptography", "kms", "signing"]
+categories = ["authentication", "cryptography"]
+
+[dependencies]
+async-trait = "0.1.91"
+zeroize = "1.8.2"
+
+[lints]
+workspace = true

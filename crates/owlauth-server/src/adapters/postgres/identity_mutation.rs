@@ -44,7 +44,7 @@ use crate::{
     },
     domain::{
         IdentityKind, IdentityMutationKind, IdentityMutationSlotRole, IdentityMutationSlotState,
-        IdentityMutationStatus,
+        IdentityMutationStatus, ProviderEgressPolicy, ProviderKind,
     },
 };
 
@@ -131,8 +131,10 @@ struct SlotSeed {
 #[derive(Clone)]
 struct ProviderSnapshot {
     provider_id: Uuid,
+    secret_material_id: Option<Uuid>,
     revision: i64,
     assignment_revision: i64,
+    egress_policy_revision: Option<i64>,
     adapter_key: String,
     adapter_revision: i64,
     scopes: Vec<String>,
@@ -2420,12 +2422,16 @@ async fn snapshot_method(
             let row = transaction
                 .query_one_raw(statement(
                     "SELECT provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.issuer,provider.provider_key,provider.revision,provider.status,
-                            provider.secret_ref,assignment.status AS assignment_status,
-                            assignment.security_revision AS assignment_revision
+                            provider.secret_ref,provider.secret_material_id,
+                            assignment.status AS assignment_status,
+                            assignment.security_revision AS assignment_revision,
+                            egress.revision AS egress_policy_revision
                        FROM provider_configurations provider
                        JOIN application_provider_assignments assignment
                          ON assignment.project_id=provider.project_id
                         AND assignment.provider_id=provider.id AND assignment.application_id=$3
+                       LEFT JOIN project_provider_egress_policies egress
+                         ON egress.project_id=provider.project_id
                       WHERE provider.project_id=$1 AND provider.id=$2
                       FOR SHARE OF provider,assignment",
                     vec![
@@ -2439,26 +2445,29 @@ async fn snapshot_method(
                 .ok_or(ApplicationError::NotFound)?;
             if get::<String>(&row, "status")? != "active"
                 || get::<String>(&row, "assignment_status")? != "active"
-                || get::<Option<String>>(&row, "secret_ref")?.is_none()
+                || (get::<Option<String>>(&row, "secret_ref")?.is_none()
+                    == get::<Option<Uuid>>(&row, "secret_material_id")?.is_none())
             {
                 return Err(ApplicationError::Disabled);
             }
-            let provider_kind = super::effective_provider_kind(
+            let provider_kind = super::provider_row::effective_provider_kind(
                 &get::<String>(&row, "provider_legacy_kind")?,
                 get::<Option<String>>(&row, "provider_adapter_kind")?.as_deref(),
                 &get::<String>(&row, "issuer")?,
             )?;
             let capabilities = provider_kind.capabilities();
-            if !capabilities.identity_proof
-                || !provider_kind.issuer_matches(&get::<String>(&row, "issuer")?)
-            {
+            if !capabilities.identity_proof {
                 return Err(ApplicationError::InvalidInput);
             }
-            let capability = prepared.provider_capability.snapshot(
-                &prepared.runtime_base,
-                project_public_id,
-                &get::<String>(&row, "provider_key")?,
-            )?;
+            let capability = prepared
+                .provider_capabilities
+                .for_kind(provider_kind)
+                .ok_or(ApplicationError::InvalidInput)?
+                .snapshot(
+                    &prepared.runtime_base,
+                    project_public_id,
+                    &get::<String>(&row, "provider_key")?,
+                )?;
             if capability.adapter_key() != capabilities.adapter_key {
                 return Err(ApplicationError::Integrity);
             }
@@ -2466,8 +2475,14 @@ async fn snapshot_method(
                 application_revision,
                 provider: Some(ProviderSnapshot {
                     provider_id: provider_configuration_id,
+                    secret_material_id: get(&row, "secret_material_id")?,
                     revision: get(&row, "revision")?,
                     assignment_revision: get(&row, "assignment_revision")?,
+                    egress_policy_revision: if provider_kind == ProviderKind::Oidc {
+                        Some(required(&row, "egress_policy_revision")?)
+                    } else {
+                        None
+                    },
                     adapter_key: capability.adapter_key().to_owned(),
                     adapter_revision: capability.adapter_capability_revision(),
                     scopes: capability.exact_non_renewable_proof_scopes().to_vec(),
@@ -2539,12 +2554,12 @@ async fn insert_slot(
               existing_email_identity_id,expected_identity_revision,application_id,
               application_security_revision,method_kind,provider_adapter_key,
               provider_adapter_capability_revision,provider_configuration_id,provider_revision,
-              provider_assignment_security_revision,provider_scopes,callback_url,
-              provider_pkce_required,oidc_nonce_required,email_assignment_application_id,
-              email_policy_revision,email_security_revision,email_assignment_security_revision,
-              state,slot_revision,created_at,updated_at)
+              provider_egress_policy_revision,provider_assignment_security_revision,provider_scopes,callback_url,
+              provider_pkce_required,oidc_nonce_required,provider_secret_material_id,
+              email_assignment_application_id,email_policy_revision,email_security_revision,
+              email_assignment_security_revision,state,slot_revision,created_at,updated_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                     $21,$22,$23,$24,$25,$26,$27,$28,$29,'pending',1,$30,$30)",
+                     $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,'pending',1,$32,$32)",
             vec![
                 slot.id.into(),
                 project_id.into(),
@@ -2566,11 +2581,13 @@ async fn insert_slot(
                 provider.map(|value| value.adapter_revision).into(),
                 provider.map(|value| value.provider_id).into(),
                 provider.map(|value| value.revision).into(),
+                provider.and_then(|value| value.egress_policy_revision).into(),
                 provider.map(|value| value.assignment_revision).into(),
                 provider.map(|value| value.scopes.clone()).into(),
                 provider.map(|value| value.callback_url.clone()).into(),
                 provider.map(|value| value.pkce).into(),
                 provider.map(|value| value.nonce).into(),
+                provider.and_then(|value| value.secret_material_id).into(),
                 snapshot
                     .email_policy_revision
                     .map(|_| application_id)
@@ -2643,10 +2660,14 @@ async fn record_from_row(
     let slots = transaction
         .query_all_raw(statement(
             "SELECT slot.*,provider.kind AS provider_legacy_kind,provider.adapter_kind AS provider_adapter_kind,provider.provider_key,provider.issuer,provider.client_id,
-                    provider.secret_ref
+                    COALESCE(slot.provider_secret_material_id::TEXT, provider.secret_ref) AS secret_ref,
+                    egress.mode AS current_egress_mode,
+                    egress.exact_origins AS current_egress_exact_origins,
+                    egress.revision AS current_egress_policy_revision
                FROM identity_mutation_proof_slots slot
                LEFT JOIN provider_configurations provider
                  ON provider.project_id=slot.project_id AND provider.id=slot.provider_configuration_id
+               LEFT JOIN project_provider_egress_policies egress ON egress.project_id=slot.project_id
               WHERE slot.intent_id=$1 ORDER BY slot.slot_ordinal",
             vec![intent_id.into()],
         ))
@@ -2671,9 +2692,10 @@ async fn record_from_row(
 
 fn slot_record(row: &QueryResult) -> Result<IdentityMutationSlotRecord, ApplicationError> {
     let method_kind = parse_method(&get::<String>(row, "method_kind")?)?;
+    let slot_state = parse_slot_state(&get::<String>(row, "state")?)?;
     let provider = if method_kind == IdentityMutationProofMethodKind::Provider {
         let issuer = required::<String>(row, "issuer")?;
-        let provider_kind = super::effective_provider_kind(
+        let provider_kind = super::provider_row::effective_provider_kind(
             &required::<String>(row, "provider_legacy_kind")?,
             get::<Option<String>>(row, "provider_adapter_kind")?.as_deref(),
             &issuer,
@@ -2686,10 +2708,38 @@ fn slot_record(row: &QueryResult) -> Result<IdentityMutationSlotRecord, Applicat
         {
             return Err(ApplicationError::Integrity);
         }
+        let provider_egress_policy_revision =
+            get::<Option<i64>>(row, "provider_egress_policy_revision")?;
+        let egress_policy = if provider_kind == ProviderKind::Oidc {
+            match provider_egress_policy_revision {
+                Some(revision)
+                    if revision == required::<i64>(row, "current_egress_policy_revision")? =>
+                {
+                    Some(provider_egress_policy_from_row(row)?)
+                }
+                None if matches!(
+                    slot_state,
+                    IdentityMutationSlotState::ProviderExchangeFailed
+                        | IdentityMutationSlotState::Proved
+                        | IdentityMutationSlotState::Expired
+                ) =>
+                {
+                    None
+                }
+                _ => return Err(ApplicationError::RevisionConflict),
+            }
+        } else {
+            if provider_egress_policy_revision.is_some() {
+                return Err(ApplicationError::Integrity);
+            }
+            None
+        };
         Some(IdentityMutationProviderSlotAuthority {
             provider_configuration_id: required(row, "provider_configuration_id")?,
             provider_kind,
             provider_configuration_revision: required(row, "provider_revision")?,
+            provider_egress_policy_revision,
+            egress_policy,
             provider_key: required(row, "provider_key")?,
             issuer,
             client_id: required(row, "client_id")?,
@@ -2721,7 +2771,7 @@ fn slot_record(row: &QueryResult) -> Result<IdentityMutationSlotRecord, Applicat
         role: parse_role(&get::<String>(row, "slot_role")?)?,
         identity_kind: parse_identity_kind(&get::<String>(row, "identity_kind")?)?,
         method_kind,
-        state: parse_slot_state(&get::<String>(row, "state")?)?,
+        state: slot_state,
         revision: get(row, "slot_revision")?,
         existing_identity_id: get::<Option<Uuid>>(row, "existing_provider_identity_id")?.or(get::<
             Option<Uuid>,
@@ -2731,6 +2781,15 @@ fn slot_record(row: &QueryResult) -> Result<IdentityMutationSlotRecord, Applicat
         )?),
         provider,
     })
+}
+
+fn provider_egress_policy_from_row(
+    row: &QueryResult,
+) -> Result<ProviderEgressPolicy, ApplicationError> {
+    super::provider_row::decode_provider_egress_policy(
+        &required::<String>(row, "current_egress_mode")?,
+        required(row, "current_egress_exact_origins")?,
+    )
 }
 
 async fn lock_intent(
@@ -3292,6 +3351,8 @@ async fn revalidate_slot_authority(
             let row = transaction
                 .query_one_raw(statement(
                     "SELECT provider.status,provider.revision,provider.secret_ref,
+                            provider.secret_material_id,provider.kind AS provider_legacy_kind,
+                            provider.adapter_kind AS provider_adapter_kind,provider.issuer,
                             assignment.status AS assignment_status,
                             assignment.security_revision AS assignment_revision
                        FROM provider_configurations provider
@@ -3309,9 +3370,33 @@ async fn revalidate_slot_authority(
                 .await
                 .map_err(persistence)?
                 .ok_or(ApplicationError::RevisionConflict)?;
-            if get::<String>(&row, "status")? != "active"
+            let provider_kind = super::provider_row::effective_provider_kind(
+                &get::<String>(&row, "provider_legacy_kind")?,
+                get::<Option<String>>(&row, "provider_adapter_kind")?.as_deref(),
+                &get::<String>(&row, "issuer")?,
+            )?;
+            let policy_revision = get::<Option<i64>>(slot, "provider_egress_policy_revision")?;
+            let policy_valid = if provider_kind == ProviderKind::Oidc {
+                let current = transaction
+                    .query_one_raw(statement(
+                        "SELECT revision FROM project_provider_egress_policies
+                          WHERE project_id=$1 FOR SHARE",
+                        vec![project_id.into()],
+                    ))
+                    .await
+                    .map_err(persistence)?
+                    .ok_or(ApplicationError::RevisionConflict)?;
+                policy_revision == Some(get(&current, "revision")?)
+            } else {
+                policy_revision.is_none()
+            };
+            if !policy_valid
+                || get::<String>(&row, "status")? != "active"
                 || get::<String>(&row, "assignment_status")? != "active"
-                || get::<Option<String>>(&row, "secret_ref")?.is_none()
+                || (get::<Option<String>>(&row, "secret_ref")?.is_none()
+                    == get::<Option<Uuid>>(&row, "secret_material_id")?.is_none())
+                || get::<Option<Uuid>>(&row, "secret_material_id")?
+                    != get::<Option<Uuid>>(slot, "provider_secret_material_id")?
                 || get::<i64>(&row, "revision")? != required::<i64>(slot, "provider_revision")?
                 || get::<i64>(&row, "assignment_revision")?
                     != required::<i64>(slot, "provider_assignment_security_revision")?
@@ -5519,23 +5604,6 @@ async fn append_mutation_outcome_audit(
         .await
         .map_err(persistence)?;
     Ok(())
-}
-
-async fn intent_touches_email_material(
-    transaction: &DatabaseTransaction,
-    intent_id: Uuid,
-) -> Result<bool, ApplicationError> {
-    Ok(transaction
-        .query_one_raw(statement(
-            "SELECT 1 FROM identity_mutation_intents intent
-              WHERE intent.id=$1 AND (intent.primary_source_disposition='email'
-                OR EXISTS (SELECT 1 FROM identity_mutation_proof_slots slot
-                  WHERE slot.intent_id=intent.id AND slot.method_kind='email'))",
-            vec![intent_id.into()],
-        ))
-        .await
-        .map_err(persistence)?
-        .is_some())
 }
 
 async fn lock_prepared_candidate_namespace(

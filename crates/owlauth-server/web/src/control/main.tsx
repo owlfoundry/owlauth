@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router";
 
 import { readConfiguredBase } from "../shared/configured-base";
+import "../shared/styles/tokens.css";
 import { ControlApp } from "./App";
 
 const root = document.getElementById("owlauth-root");

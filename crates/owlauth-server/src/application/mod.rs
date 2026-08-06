@@ -1,42 +1,27 @@
 mod admission;
-#[allow(
-    dead_code,
-    reason = "the HTTP-free authentication repository slice precedes Runtime composition"
-)]
 mod authentication;
+mod client_api;
+mod client_key;
+mod client_readiness;
 mod control_lifecycle;
 mod email_control;
 mod error;
-#[allow(
-    dead_code,
-    reason = "identity mutation ports precede PostgreSQL and HTTP composition"
-)]
 mod identity_mutation;
 mod infrastructure;
-#[allow(
-    dead_code,
-    reason = "mail worker and SMTP adapter are composed in Runtime-capable modes"
-)]
 mod mail;
 mod managed_connection;
 mod managed_reauthorization;
 mod mcp_confirmation;
-#[allow(
-    dead_code,
-    reason = "passwordless email ports are consumed by Runtime and PostgreSQL"
-)]
 mod passwordless_email;
 mod projection_expansion;
 mod provider_callback;
+mod provider_onboarding;
 mod provisioning;
 mod readiness;
 mod runtime_auth;
 mod runtime_security;
-#[allow(
-    dead_code,
-    reason = "the HTTP-free session authority precedes Runtime composition"
-)]
 mod session_authority;
+#[cfg(test)]
 mod unit_of_work;
 mod webhook;
 
@@ -53,6 +38,26 @@ pub(crate) use authentication::{
     LoginRevisionSnapshot, LoginTransactionRecord, ProtectedValue, SelectProviderMethod,
     VersionedDigest,
 };
+pub(crate) use client_api::{
+    ActiveClientToken, ClientApiRepository, ClientApiService, ClientApplicationProjection,
+    ClientEmailLookupDigester, ClientKeyAuthority, ClientPrincipal, ClientTokenIntrospection,
+    ClientTokenSessionLookup, ClientTokenSignatureVerifier, ClientUser, ClientUserCursor,
+    ClientUserPage, ClientUserStatus, ClientVerificationKey, MAX_CLIENT_USER_PAGE_LIMIT,
+};
+pub(crate) use client_key::{
+    AcknowledgeProjectClientKeyDelivery, CLIENT_KEY_CREDENTIAL_PREFIX, CLIENT_KEY_PUBLIC_ID_BYTES,
+    CLIENT_KEY_SECRET_BYTES, ClientKeyCreateAttemptError, ClientKeyIssuer, ClientKeyLifecyclePort,
+    ClientKeyLifecycleService, ClientKeyVerifier, CreateProjectClientKey,
+    CreateProjectClientKeyResult, IssuedClientCredential, MAX_ACTIVE_CLIENT_KEYS_PER_PROJECT,
+    OneTimeClientCredential, ParsedClientCredential, PreparedProjectClientKey,
+    ProjectClientKeyCursor, ProjectClientKeyRecord, ProjectClientKeyStatus, RevokeProjectClientKey,
+    StoredProjectClientKeyCreate, client_key_display_prefix,
+};
+pub(crate) use client_readiness::{
+    ClientDigestReadinessClaim, ClientDigestReadinessPort, ClientDigestReadinessService,
+    ClientDigestReadinessSnapshot, ClientDigestReadinessState, MAX_REQUIRED_CLIENT_PROCESSES,
+    valid_client_process_id,
+};
 pub(crate) use control_lifecycle::{
     ApplicationSessionRecord, BrowserSessionRecord, ControlLifecyclePort, ControlLifecycleService,
     DisableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind, ProjectUserIdentityRecord,
@@ -60,10 +65,11 @@ pub(crate) use control_lifecycle::{
     RevokeApplicationSession, RevokeBrowserSession,
 };
 pub(crate) use email_control::{
-    CreateSmtpConfiguration, DeploymentSmtpGenerationRecord, EmailControlPort, EmailControlService,
-    EmailPolicyRecord, PrepareSmtpConfiguration, PrepareSmtpTest, PreparedSmtpConfiguration,
-    SmtpConfigurationRecord, SmtpControlStatus, SmtpControlTlsMode, SmtpTestOperationRecord,
-    SmtpTestState, UpdateEmailPolicy,
+    CreateSmtpConfiguration, DeploymentSmtpGenerationRecord, EmailAssignmentRecord,
+    EmailControlPort, EmailControlService, EmailPolicyRecord, PrepareSmtpConfiguration,
+    PrepareSmtpTest, PreparedDeploymentSmtpGeneration, PreparedSmtpConfiguration, PreparedSmtpTest,
+    ReconcileDeploymentSmtpGeneration, SmtpConfigurationRecord, SmtpControlStatus,
+    SmtpControlTlsMode, SmtpTestOperationRecord, SmtpTestState, UpdateEmailPolicy,
 };
 pub(crate) use error::ApplicationError;
 #[allow(
@@ -91,12 +97,13 @@ pub(crate) use identity_mutation::{
     IdentityMutationMagicTransferOwner, IdentityMutationPrimarySourceDisposition,
     IdentityMutationProofAuthoritySelection, IdentityMutationProofMaterialProtector,
     IdentityMutationProofMethodKind, IdentityMutationProviderCallback,
-    IdentityMutationProviderCandidate, IdentityMutationProviderCapability,
-    IdentityMutationProviderDenial, IdentityMutationProviderDigestVersions,
-    IdentityMutationProviderRegistrationEvidence, IdentityMutationProviderSlotAuthority,
-    IdentityMutationRecord, IdentityMutationRuntimeService, IdentityMutationSafeSlot,
-    IdentityMutationSessionsDisposition, IdentityMutationSlotRecord, IdentityMutationTargetIssuer,
-    IdentityMutationTargetVerifier, IdentityMutationView, PrepareIdentityMutationEmailGeneration,
+    IdentityMutationProviderCandidate, IdentityMutationProviderCapabilities,
+    IdentityMutationProviderCapability, IdentityMutationProviderDenial,
+    IdentityMutationProviderDigestVersions, IdentityMutationProviderRegistrationEvidence,
+    IdentityMutationProviderSlotAuthority, IdentityMutationRecord, IdentityMutationRuntimePort,
+    IdentityMutationRuntimeService, IdentityMutationSafeSlot, IdentityMutationSessionsDisposition,
+    IdentityMutationSlotRecord, IdentityMutationTargetIssuer, IdentityMutationTargetVerifier,
+    IdentityMutationView, PrepareIdentityMutationEmailGeneration,
     PreparedIdentityMutationCandidate, PreparedIdentityMutationConfirmation,
     PreparedIdentityMutationCreate, PreparedIdentityMutationProviderCompletion,
     ProviderProofObservation, ResolveIdentityMutationMagicTransferContext,
@@ -105,9 +112,10 @@ pub(crate) use identity_mutation::{
     VerifiedIdentityMutationEmailChallenge, VerifyIdentityMutationEmailProof,
     VerifyIdentityMutationMagicTransferProof, VerifyRawIdentityMutationEmailProof,
 };
+pub(crate) use infrastructure::{Clock, RequestDigester};
+#[cfg(test)]
 pub(crate) use infrastructure::{
-    Clock, ConfigurationSecretProvisioner, ConfigurationSecretStore, EntropySource,
-    RequestDigester, SignerStore,
+    ConfigurationSecretProvisioner, ConfigurationSecretStore, EntropySource, SignerStore,
 };
 #[allow(
     unused_imports,
@@ -161,14 +169,21 @@ pub(crate) use projection_expansion::{
     ProjectionPolicyService, UpdateProjectionPolicy,
 };
 pub(crate) use provider_callback::{ProviderCallbackOwner, ProviderCallbackOwnerResolver};
+pub(crate) use provider_onboarding::{
+    OidcPreflightPort, OidcPreflightSummary, ProviderEgressPolicyPort, ProviderEgressPolicyRecord,
+    ProviderOnboardingService, UpdateProviderEgressPolicy,
+};
 pub(crate) use provisioning::{
-    ApplicationConfiguration, ApplicationProvisioningPort, ApplicationRecord, CreateApplication,
-    CreateProject, CreateProvider, PrepareProvider, PreparedProvider, PreparedSigningKey,
+    ApplicationConfiguration, ApplicationProvisioningPort, ApplicationRecord,
+    ConfigurationSecretSealers, CreateApplication, CreateProject, CreateProvider, PrepareProvider,
+    PreparedProvider, PreparedSecretMaterial, PreparedSigningKey, PreparedSigningMaterial,
     ProjectPolicyRecord, ProjectProvisioningPort, ProjectRecord, ProviderProvisioningPort,
-    ProviderRecord, ProviderRecovery, ProvisioningInfrastructure, ProvisioningOperationState,
-    ProvisioningService, ReplaceApplicationConfiguration, SigningKeyActivationCandidate,
-    SigningKeyProvisioningPort, SigningKeyRecord, SigningKeyRecovery, UpdateApplication,
-    UpdateProject, UpdateProjectPolicy,
+    ProviderRecord, ProviderRecovery, ProvisionedProtectedSigningMaterial,
+    ProvisioningInfrastructure, ProvisioningOperationState, ProvisioningService,
+    ReplaceApplicationConfiguration, SealedProtectedMaterial, SigningKeyActivationCandidate,
+    SigningKeyProvisioningPort, SigningKeyRecord, SigningKeyRecovery, SigningProviderAction,
+    SigningProviderCall, SigningProviderLease, UpdateApplication, UpdateProject,
+    UpdateProjectPolicy,
 };
 pub(crate) use readiness::{
     JwksDocument, PublicApplicationConfig, PublicProvider, ReadinessPort, ReadinessService,
@@ -201,13 +216,16 @@ pub(crate) use session_authority::{
     RefreshRotationResult, RotateRefreshToken, SessionAuthorityRepository,
     VerifiedProviderIdentity,
 };
+#[cfg(test)]
 pub(crate) use unit_of_work::{CompleteIdempotency, NewProject, ProjectUnitOfWork};
+#[cfg(test)]
+pub(crate) use webhook::ConfirmWebhookSecretProvisioned;
 pub(crate) use webhook::{
     ApplicationUserEventRecord, ClaimedWebhookDelivery, ClaimedWebhookSecretCleanup,
-    ConfirmWebhookSecretProvisioned, CreateWebhookEndpoint, HistoryCursor, PrepareWebhookEndpoint,
-    PrepareWebhookRotation, PrepareWebhookSecretRotation, PreparedWebhookEndpoint,
-    PreparedWebhookSecret, UpdateWebhookEndpoint, WebhookControlPort, WebhookControlService,
-    WebhookDeliveryRecord, WebhookDeliveryRepository, WebhookEndpointRecord,
-    WebhookEndpointValidator, WebhookSecretPreparationState, WebhookSecretResolver,
-    WebhookTransport, WebhookTransportOutcome, WebhookWorker, endpoint_status, event_type,
+    CreateWebhookEndpoint, HistoryCursor, PrepareWebhookEndpoint, PrepareWebhookRotation,
+    PrepareWebhookSecretRotation, PreparedWebhookEndpoint, PreparedWebhookSecret,
+    UpdateWebhookEndpoint, WebhookControlPort, WebhookControlService, WebhookDeliveryRecord,
+    WebhookDeliveryRepository, WebhookEndpointRecord, WebhookEndpointValidator,
+    WebhookSecretPreparationState, WebhookSecretResolver, WebhookTransport,
+    WebhookTransportOutcome, WebhookWorker, endpoint_status, event_type,
 };

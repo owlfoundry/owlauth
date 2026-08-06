@@ -1,60 +1,26 @@
 {
   "schemaVersion": 1,
   "plane": "control",
-  "entry": "assets/control-1KYTIPem.js",
+  "entry": "assets/control-Dlvc9hHj.js",
   "scripts": [
-    "assets/control-1KYTIPem.js"
+    "assets/control-Dlvc9hHj.js"
   ],
   "stylesheets": [
-    "assets/control-BFfvGatZ.css"
+    "assets/control-CdjjqwA3.css"
   ],
-  "assetSetSha256": "46acb166138672a2fbb82ce6977bfcc5566f512d73c3004af1968a58b0b1e9dd",
+  "assetSetSha256": "ddcf9cf8b8e75c948253b366983e60feda383b7f461ce9a7eb9abc671c012932",
   "files": [
     {
-      "path": "assets/control-1KYTIPem.js",
-      "mime": "text/javascript; charset=utf-8",
-      "bytes": 319675,
-      "sha256": "9fb0e41b5f1b99fa6fdb335a308f8417fd1b4fa4ab96295590445e49ef7b79b5",
-      "representations": {
-        "identity": {
-          "path": "assets/control-1KYTIPem.js",
-          "bytes": 319675,
-          "sha256": "9fb0e41b5f1b99fa6fdb335a308f8417fd1b4fa4ab96295590445e49ef7b79b5"
-        },
-        "gzip": {
-          "path": "assets/control-1KYTIPem.js.gz",
-          "bytes": 96654,
-          "sha256": "d0a57ed390782a5f6a066e6dac7f3e36c03f488d2d758fd719ac10929723a2d3"
-        },
-        "brotli": {
-          "path": "assets/control-1KYTIPem.js.br",
-          "bytes": 80226,
-          "sha256": "f2eba843f97a6e15ad90d5f924591d7b197245094ee9fae2dba61a7b509899be"
-        }
-      }
+      "path": "assets/control-CdjjqwA3.css",
+      "mime": "text/css; charset=utf-8",
+      "bytes": 21396,
+      "sha256": "7e17d923170214f89c576829b41cdd86a96767ec1de5023a59a13b68132fbac7"
     },
     {
-      "path": "assets/control-BFfvGatZ.css",
-      "mime": "text/css; charset=utf-8",
-      "bytes": 3649,
-      "sha256": "c24fd297434f20c941fa48452832929e8df13841b98efa6da45f26513675a5da",
-      "representations": {
-        "identity": {
-          "path": "assets/control-BFfvGatZ.css",
-          "bytes": 3649,
-          "sha256": "c24fd297434f20c941fa48452832929e8df13841b98efa6da45f26513675a5da"
-        },
-        "gzip": {
-          "path": "assets/control-BFfvGatZ.css.gz",
-          "bytes": 1299,
-          "sha256": "d2277e75effae3152760ceb2d54efb9878611135a3f5be0d795bd46e00bae7e6"
-        },
-        "brotli": {
-          "path": "assets/control-BFfvGatZ.css.br",
-          "bytes": 1084,
-          "sha256": "0eff78ba53b398319f7cc9028e1ab498c5ad200f9f4c997d8ad2b4fdccb03457"
-        }
-      }
+      "path": "assets/control-Dlvc9hHj.js",
+      "mime": "text/javascript; charset=utf-8",
+      "bytes": 392656,
+      "sha256": "ea44093eaf025bb6a9204247b09b905ed07f760eb925bc84e5af45871afff26e"
     }
   ]
 }

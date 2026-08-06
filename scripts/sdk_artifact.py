@@ -21,6 +21,9 @@ from typing import Any
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 CORPUS_PATH = REPOSITORY_ROOT / "sdks/spec/conformance/cases.json"
+TYPESCRIPT_ARTIFACT_SURFACE_PATH = (
+    REPOSITORY_ROOT / "sdks/spec/contract/typescript-artifact-surface.json"
+)
 BUILD_CONFIGURATIONS = {
     "typescript": "typescript-npm-pack-v1",
     "python": "python-hatch-wheel-v1",
@@ -41,6 +44,15 @@ FORBIDDEN_CONTENT = (
     b"control_api_key",
     b"operator_api_key",
     b"x-owlauth-operator-key",
+    b"project_client_key",
+    b"projectclientkey",
+    b"owl_client_v1.",
+    b"client-openapi.json",
+    b"/v1/projects/{project_id}/tokens/introspect",
+    b"/v1/projects/{project_id}/users/lookup",
+    b"introspect_project_token",
+    b"lookup_project_user",
+    b"get_application_user_projection",
     b"/control/",
     b"/Users/",
     b"/home/runner/work/",
@@ -52,6 +64,13 @@ SEMVER = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+STABLE_SEMVER = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
+PYTHON_DEVELOPMENT_VERSION = "0.0.0.dev0"
+DEVELOPMENT_VERSIONS = {
+    "typescript": "0.0.0-dev",
+    "python": PYTHON_DEVELOPMENT_VERSION,
+    "rust": "0.0.0-dev",
+}
 MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 256
 MAX_EXPANDED_BYTES = 32 * 1024 * 1024
@@ -60,6 +79,28 @@ MAX_MEMBER_BYTES = 2 * 1024 * 1024
 
 class ArtifactError(RuntimeError):
     """Raised when a candidate archive or descriptor is invalid."""
+
+
+def validate_candidate_version(component: str, version: str, tag: object) -> None:
+    if component == "python":
+        if not STABLE_SEMVER.fullmatch(version) and version != PYTHON_DEVELOPMENT_VERSION:
+            raise ArtifactError("Python candidate version is invalid")
+    elif not SEMVER.fullmatch(version):
+        raise ArtifactError("candidate version is invalid SemVer")
+
+    development_version = DEVELOPMENT_VERSIONS[component]
+    if tag is None:
+        if version != development_version:
+            raise ArtifactError("untagged candidate must use its exact development sentinel")
+        return
+    if not isinstance(tag, str):
+        raise ArtifactError("candidate release tag must be a string or null")
+    if version == development_version:
+        raise ArtifactError("development sentinel cannot be authorized by a release tag")
+    if tag != f"{component}-v{version}":
+        raise ArtifactError("candidate release tag differs from its component and version")
+    if component == "python" and not STABLE_SEMVER.fullmatch(version):
+        raise ArtifactError("tagged Python candidates must use stable SemVer")
 
 
 @dataclass(frozen=True)
@@ -141,6 +182,59 @@ def scan_content(path: str, content: bytes) -> None:
         if candidate:
             raise ArtifactError(
                 f"archive member contains forbidden build or credential data: {path}"
+            )
+
+
+def require_reviewed_source_files(
+    files: Mapping[str, bytes],
+    *,
+    archive_prefix: str,
+    source_directory: Path,
+    names: Iterable[str],
+    label: str,
+) -> None:
+    for name in names:
+        archive_name = f"{archive_prefix}{name}"
+        source_path = source_directory / name
+        try:
+            reviewed = source_path.read_bytes()
+        except OSError as error:
+            raise ArtifactError(
+                f"cannot read reviewed {label} source {source_path}: {error}"
+            ) from error
+        if files.get(archive_name) != reviewed:
+            raise ArtifactError(
+                f"{label} archive code differs from the exact reviewed checkout: {archive_name}"
+            )
+
+
+def require_reviewed_typescript_surface(files: Mapping[str, bytes], version: str) -> None:
+    manifest = exact_object(
+        load_json(TYPESCRIPT_ARTIFACT_SURFACE_PATH),
+        {"schemaVersion", "normalization", "files"},
+        label="TypeScript artifact surface manifest",
+    )
+    if manifest["schemaVersion"] != 1:
+        raise ArtifactError("TypeScript artifact surface schema version is unsupported")
+    expected = manifest["files"]
+    if not isinstance(expected, dict) or not all(
+        isinstance(name, str) and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+        for name, digest in expected.items()
+    ):
+        raise ArtifactError("TypeScript artifact surface manifest is invalid")
+    actual_names = {PurePosixPath(name).name for name in files if name.startswith("package/dist/")}
+    if set(expected) != actual_names:
+        raise ArtifactError("TypeScript reviewed artifact surface file set differs")
+    version_bytes = version.encode()
+    for name, expected_digest in expected.items():
+        content = files[f"package/dist/{name}"]
+        if name in {"index.js", "index.d.ts"}:
+            if version_bytes not in content:
+                raise ArtifactError(f"TypeScript {name} does not contain the exact package version")
+            content = content.replace(version_bytes, b"<VERSION>")
+        if sha256_bytes(content) != expected_digest:
+            raise ArtifactError(
+                f"TypeScript archive code differs from the reviewed artifact surface: {name}"
             )
 
 
@@ -286,6 +380,7 @@ def inspect_typescript(path: Path) -> ArchiveIdentity:
         raise ArtifactError("TypeScript package must expose exactly one root entry point")
     if b"VERSION" not in files["package/dist/index.js"]:
         raise ArtifactError("TypeScript package does not expose its runtime version")
+    require_reviewed_typescript_surface(files, version)
     return ArchiveIdentity("typescript", package["name"], version, tuple(sorted(files)))
 
 
@@ -332,10 +427,27 @@ def inspect_python(path: Path) -> ArchiveIdentity:
     ):
         raise ArtifactError("Python wheel README metadata differs from the checked-out source")
     version = require_string(metadata["Version"], label="wheel version", maximum=128)
-    if not SEMVER.fullmatch(version):
-        raise ArtifactError("Python wheel version is not stable SemVer")
+    if not STABLE_SEMVER.fullmatch(version) and version != PYTHON_DEVELOPMENT_VERSION:
+        raise ArtifactError(
+            "Python wheel version is neither stable SemVer nor the development sentinel"
+        )
     if f'__version__ = "{version}"'.encode() not in files["owlauth/__init__.py"]:
         raise ArtifactError("Python runtime version differs from wheel metadata")
+    require_reviewed_source_files(
+        files,
+        archive_prefix="owlauth/",
+        source_directory=REPOSITORY_ROOT / "sdks/python/src/owlauth",
+        names=(
+            "__init__.py",
+            "client.py",
+            "conformance.py",
+            "errors.py",
+            "models.py",
+            "py.typed",
+            "transport.py",
+        ),
+        label="Python SDK",
+    )
     return ArchiveIdentity("python", metadata["Name"], version, tuple(sorted(files)))
 
 
@@ -397,6 +509,13 @@ def inspect_rust(path: Path) -> ArchiveIdentity:
         raise ArtifactError("crate dirty marker is invalid")
     if b"pub const VERSION" not in relative["src/lib.rs"]:
         raise ArtifactError("Rust crate does not expose its runtime version")
+    require_reviewed_source_files(
+        relative,
+        archive_prefix="src/",
+        source_directory=REPOSITORY_ROOT / "sdks/rust/src",
+        names=("client.rs", "error.rs", "lib.rs", "models.rs", "transport.rs"),
+        label="Rust SDK",
+    )
     return ArchiveIdentity(
         "rust",
         package["name"],
@@ -902,13 +1021,10 @@ def validate_descriptor(value: object) -> Mapping[str, Any]:
         raise ArtifactError("candidate descriptor has an unsupported component")
     commit = require_string(coordinate["sourceCommit"], label="candidate source commit", maximum=40)
     version = require_string(coordinate["version"], label="candidate version", maximum=128)
-    if not re.fullmatch(r"[0-9a-f]{40}", commit) or not SEMVER.fullmatch(version):
-        raise ArtifactError("candidate source commit or version is invalid")
-    if component == "python" and not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
-        raise ArtifactError("Python candidate version must be stable SemVer")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ArtifactError("candidate source commit is invalid")
     tag = coordinate["tag"]
-    if tag is not None and tag != f"{component}-v{version}":
-        raise ArtifactError("candidate release tag differs from its component and version")
+    validate_candidate_version(component, version, tag)
     if coordinate["buildConfiguration"] != BUILD_CONFIGURATIONS[component]:
         raise ArtifactError("candidate build configuration is invalid")
     require_string(coordinate["workflowRunId"], label="workflow run ID", maximum=128)

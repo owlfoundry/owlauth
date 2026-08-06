@@ -165,6 +165,7 @@ pub struct HostedProvider {
     pub key: String,
     #[schema(max_length = 128)]
     pub display_name: String,
+    pub kind: ProviderKind,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]

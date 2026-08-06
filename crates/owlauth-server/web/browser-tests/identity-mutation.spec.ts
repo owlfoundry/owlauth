@@ -468,13 +468,13 @@ test("identity Runtime and Console flows are keyboard and accessibility safe", a
     await consolePage.getByRole("button", { name: "Unlock console" }).press("Enter");
     await expect(consolePage.getByRole("heading", { name: "Projects" })).toBeVisible();
     await consolePage
-      .getByRole("button", { name: new RegExp(`Identity ${suffix}`, "u") })
+      .getByRole("link", { name: new RegExp(`Identity ${suffix}`, "u") })
       .press("Enter");
-    await consolePage.getByRole("button", { name: "Load Project users" }).press("Enter");
+    await consolePage.getByRole("link", { name: "Users", exact: true }).press("Enter");
     await consolePage.getByRole("button", { name: new RegExp(user.public_id, "u") }).press("Enter");
     await expect(
       consolePage.getByRole("heading", { name: "Identity link, unlink, and merge" }),
-    ).toBeVisible();
+    ).toBeVisible({ timeout: 15_000 });
     expect((await new AxeBuilder({ page: consolePage }).analyze()).violations).toEqual([]);
     await consolePage.getByLabel("Operation").focus();
     await consolePage.getByLabel("Operation").selectOption("unlink");
@@ -569,6 +569,7 @@ async function provision(request: APIRequestContext, suffix: string): Promise<Au
       display_name: "Controlled Provider",
       expected_project_revision: project.metadata_revision,
       issuer: providerOrigin,
+      kind: "oidc",
       managed_profile_enabled: true,
       provider_key: "controlled-provider",
     },

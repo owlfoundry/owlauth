@@ -96,7 +96,7 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
   // GET must not reconstruct it from the URL or cookie.
   await page.waitForTimeout(31_000);
   await page.getByRole("textbox", { name: "Email address", exact: true }).fill(email);
-  await page.getByRole("button", { name: "Resend" }).click();
+  await page.getByRole("button", { name: "Send a new message" }).click();
   const second = await waitForMail(page.request, 2);
   const secondOtp = otp(second.at(-1) ?? "");
   expect(secondOtp).not.toBe(firstOtp);
@@ -108,7 +108,7 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
 
   await page.getByLabel("One-time code").fill(firstOtp);
   await page.getByRole("button", { name: "Verify code" }).click();
-  await expect(page.getByRole("heading", { name: "Code invalid or expired" })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("Code invalid or expired.");
   await page.getByLabel("One-time code").fill(secondOtp);
   await page.getByRole("button", { name: "Verify code" }).click();
   await page.waitForURL((url) => url.origin === applicationOrigin, { timeout: 30_000 });
@@ -134,9 +134,11 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
   await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible({
     timeout: 10_000,
   });
-  await expect(page.getByRole("button", { name: "Resend" })).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole("button", { name: "Send a new message" })).toBeVisible({
+    timeout: 10_000,
+  });
   await page.getByRole("textbox", { name: "Email address", exact: true }).fill(email);
-  await page.getByRole("button", { name: "Resend" }).click({ timeout: 10_000 });
+  await page.getByRole("button", { name: "Send a new message" }).click({ timeout: 10_000 });
   const secondMagicMessage = (await waitForMail(page.request, 2)).at(-1) ?? "";
   const secondLink = magicLink(secondMagicMessage);
   const firstMagicProof = magicProof(firstLink);
@@ -161,15 +163,18 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
     await scanner.dispose();
   }
 
-  // Each navigation establishes the transfer cookie for that exact challenge immediately before
-  // its explicit POST. The first proof is the superseded sibling; the second is canonical newest.
+  // Gate 0 admits transfer context only for the canonical newest proof. A superseded link and a
+  // fresh navigation after completion disclose only the same generic return-to-origin state.
   await page.goto(firstLink);
   await expect(page).not.toHaveURL(/proof=/u, { timeout: 10_000 });
   await expect(page.locator("body")).not.toContainText(firstMagicProof, { timeout: 10_000 });
-  await expect(page.getByRole("alert")).toContainText("invalid or expired", {
+  await expect(page.getByRole("heading", { name: "This link cannot be used" })).toBeVisible({
     timeout: 10_000,
   });
-  await expect(page.getByRole("button", { name: "Continue", exact: true })).toHaveCount(0, {
+  await expect(page.getByRole("alert")).toContainText(
+    "Return to the browser where sign-in started.",
+  );
+  await expect(page.getByRole("button", { name: "Continue sign-in", exact: true })).toHaveCount(0, {
     timeout: 10_000,
   });
 
@@ -179,13 +184,18 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
   await expect(page.getByRole("heading", { name: "Continue email sign-in" })).toBeVisible({
     timeout: 10_000,
   });
-  await page.getByRole("button", { name: "Continue", exact: true }).click({ timeout: 10_000 });
+  await page
+    .getByRole("button", { name: "Continue sign-in", exact: true })
+    .click({ timeout: 10_000 });
   await page.waitForURL((url) => url.origin === applicationOrigin, { timeout: 10_000 });
 
   await page.goto(secondLink);
-  await expect(page.getByRole("alert")).toContainText("invalid or expired", {
+  await expect(page.getByRole("heading", { name: "This link cannot be used" })).toBeVisible({
     timeout: 10_000,
   });
+  await expect(page.getByRole("alert")).toContainText(
+    "Return to the browser where sign-in started.",
+  );
 });
 
 test("OTP-only and magic-only policies expose and accept only admitted proofs", async ({
@@ -316,7 +326,9 @@ test("native magic-only completion returns trusted custom-scheme navigation once
   await replayPage.goto(link);
   await expect(replayPage).not.toHaveURL(/proof=/u, { timeout: 10_000 });
   await expect(replayPage.getByRole("heading", { name: "Continue email sign-in" })).toBeVisible();
-  await expect(replayPage.getByRole("button", { name: "Continue", exact: true })).toBeVisible();
+  await expect(
+    replayPage.getByRole("button", { name: "Continue sign-in", exact: true }),
+  ).toBeVisible();
 
   interface CompletionBody {
     completed: boolean;
@@ -358,7 +370,7 @@ test("native magic-only completion returns trusted custom-scheme navigation once
   await page.goto(link);
   await expect(page).not.toHaveURL(/proof=/u, { timeout: 10_000 });
   await expect(page.getByRole("heading", { name: "Continue email sign-in" })).toBeVisible();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page.getByRole("button", { name: "Continue sign-in", exact: true }).click();
   await backendObserved;
   await page.unroute("**/auth/email/magic/confirm");
   expect(backendStatus, JSON.stringify(backendBody)).toBe(200);
@@ -372,7 +384,7 @@ test("native magic-only completion returns trusted custom-scheme navigation once
   const replayPending = replayPage.waitForResponse((response) =>
     response.url().endsWith("/auth/email/magic/confirm"),
   );
-  await replayPage.getByRole("button", { name: "Continue", exact: true }).click();
+  await replayPage.getByRole("button", { name: "Continue sign-in", exact: true }).click();
   const replay = await replayPending;
   expect(replay.status(), await replay.text()).toBe(200);
   expect(await replay.json()).toEqual({
@@ -504,7 +516,7 @@ test("scoped address suppression is API and Hosted-state indistinguishable", asy
   // result; neither response discloses which address-lane requests were suppressed.
   await page.getByLabel("One-time code").fill("000000");
   await page.getByRole("button", { name: "Verify code" }).click();
-  await expect(page.getByRole("heading", { name: "Code invalid or expired" })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("Code invalid or expired.");
 
   // All 128 admitted jobs are now physically accounted for, while both suppressed generations
   // are absent. Clearing only after that exact drain makes the following Firefox project

@@ -75,9 +75,27 @@ describe("IdempotencyAttempt", () => {
     expect(afterConflict).not.toBe(first);
   });
 
-  it("retains retry identity for retryable server responses and clears on abandon", () => {
+  it("retains retry identity for ambiguous timeout, in-progress, and server responses", () => {
     const attempt = new IdempotencyAttempt();
     const first = attempt.begin();
+    attempt.settle(new ControlRequestError(undefined, 408));
+    expect(attempt.begin()).toBe(first);
+
+    attempt.settle(
+      new ControlRequestError(
+        {
+          code: "operation_in_progress",
+          detail: "The durable operation has not completed yet.",
+          request_id: "request-1",
+          status: 409,
+          title: "Operation in progress",
+          type: "about:blank",
+        },
+        409,
+      ),
+    );
+    expect(attempt.begin()).toBe(first);
+
     attempt.settle(new ControlRequestError(undefined, 503));
     expect(attempt.begin()).toBe(first);
     attempt.abandon();

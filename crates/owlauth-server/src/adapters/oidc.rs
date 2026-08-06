@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,14 +19,15 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::application::{
-    BoundedManagedProfile, ConnectionGuard, ManagedProfileAdapter, ProviderAuthorization,
-    ProviderAuthorizationRequest, ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity,
-    ProviderReadError, ProviderRenewalResult, ProviderRequestProfile, ProviderRevocationResult,
+    BoundedManagedProfile, ConnectionGuard, ManagedProfileAdapter, OidcPreflightPort,
+    OidcPreflightSummary, ProviderAuthorization, ProviderAuthorizationRequest,
+    ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity, ProviderReadError,
+    ProviderRenewalResult, ProviderRequestProfile, ProviderRevocationResult,
     ProviderSecretResolver, RenewableProviderCredential, RenewedCredential, UpstreamProviderClient,
 };
 use crate::domain::{
     BoundedProviderProfile, ManagedProfileCapability, ProfileDisplayName, ProfileLocale,
-    ProfilePictureUrl, RenewalReplay,
+    ProfilePictureUrl, ProviderEgressMode, ProviderEgressPolicy, ProviderOrigin, RenewalReplay,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -85,6 +86,23 @@ impl RestrictedOidcProviderClient {
         )
     }
 
+    pub(crate) fn new_allow_all_with_budget(
+        allow_http_loopback: bool,
+        exchange_budget: Arc<Semaphore>,
+    ) -> Result<Self, ProviderExchangeError> {
+        Self::build_with_policy(
+            EndpointPolicy {
+                allowed_origins: HashSet::new(),
+                allow_all: true,
+                allow_http_loopback,
+            },
+            allow_http_loopback,
+            REQUEST_TIMEOUT,
+            exchange_budget,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_budget<I, S>(
         allowed_endpoint_origins: I,
         allow_http_loopback: bool,
@@ -134,6 +152,20 @@ impl RestrictedOidcProviderClient {
     {
         let endpoint_policy =
             EndpointPolicy::new(allowed_endpoint_origins, allow_http_loopback_endpoints)?;
+        Self::build_with_policy(
+            endpoint_policy,
+            callback_allow_http_loopback,
+            request_timeout,
+            exchange_budget,
+        )
+    }
+
+    fn build_with_policy(
+        endpoint_policy: EndpointPolicy,
+        callback_allow_http_loopback: bool,
+        request_timeout: Duration,
+        exchange_budget: Arc<Semaphore>,
+    ) -> Result<Self, ProviderExchangeError> {
         let http = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(request_timeout)
@@ -173,29 +205,54 @@ impl RestrictedOidcProviderClient {
     async fn discover(
         &self,
         issuer: &str,
+        policy: &EndpointPolicy,
         network_error: ProviderExchangeError,
+        metadata_error: ProviderExchangeError,
     ) -> Result<DiscoveryDocument, ProviderExchangeError> {
-        let issuer_url = self.endpoint_policy.validate_issuer(issuer)?;
+        let issuer_url = policy.validate_issuer(issuer)?;
         let discovery_url = discovery_url(&issuer_url);
-        self.endpoint_policy.validate_endpoint(&discovery_url)?;
+        policy.validate_endpoint(&discovery_url)?;
         let response = self
             .fetch_bounded(discovery_url, DISCOVERY_BODY_LIMIT)
             .await;
         let (status, content_type, body) = response.map_err(|()| network_error)?;
-        if !status.is_success() || !is_json_content_type(content_type.as_deref()) {
+        if !status.is_success() {
             return Err(network_error);
         }
-        let value = parse_unique_json(&body).map_err(|()| network_error)?;
+        if !is_json_content_type(content_type.as_deref()) {
+            return Err(metadata_error);
+        }
+        let value = parse_unique_json(&body).map_err(|()| metadata_error)?;
         if !object_has_at_most(&value, 32) {
-            return Err(network_error);
+            return Err(metadata_error);
         }
         let document: DiscoveryDocument =
-            serde_json::from_value(value).map_err(|_| network_error)?;
+            serde_json::from_value(value).map_err(|_| metadata_error)?;
         if document.issuer != issuer {
-            return Err(network_error);
+            return Err(metadata_error);
         }
-        document.validate(&self.endpoint_policy)?;
+        document.validate(policy).map_err(|_| metadata_error)?;
         Ok(document)
+    }
+
+    fn operation_endpoint_policy(
+        &self,
+        kind: crate::domain::ProviderKind,
+        policy: Option<&ProviderEgressPolicy>,
+    ) -> Result<EndpointPolicy, ProviderExchangeError> {
+        match (kind, policy) {
+            (crate::domain::ProviderKind::Oidc, Some(policy)) => {
+                EndpointPolicy::from_provider_policy(
+                    policy,
+                    self.endpoint_policy.allow_http_loopback,
+                )
+            }
+            (crate::domain::ProviderKind::Oidc, None) if !self.endpoint_policy.allow_all => {
+                Ok((*self.endpoint_policy).clone())
+            }
+            (crate::domain::ProviderKind::Google, None) => Ok((*self.endpoint_policy).clone()),
+            _ => Err(ProviderExchangeError::UnavailableBeforeDispatch),
+        }
     }
 
     async fn fetch_bounded(
@@ -406,13 +463,84 @@ impl RestrictedOidcProviderClient {
 }
 
 #[async_trait]
+impl OidcPreflightPort for RestrictedOidcProviderClient {
+    async fn preflight(
+        &self,
+        issuer: &str,
+        policy: &ProviderEgressPolicy,
+    ) -> Result<OidcPreflightSummary, ProviderExchangeError> {
+        // Control preflight has its own deliberately small process-local budget. It must fail fast
+        // rather than queue operator requests behind slow or unavailable discovery endpoints.
+        let _permit = self
+            .exchange_budget
+            .try_acquire()
+            .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?;
+        if !crate::domain::ProviderKind::Oidc.issuer_matches(issuer) {
+            return Err(ProviderExchangeError::Rejected);
+        }
+        let endpoint_policy =
+            EndpointPolicy::from_provider_policy(policy, self.endpoint_policy.allow_http_loopback)
+                .map_err(|_| ProviderExchangeError::Rejected)?;
+        endpoint_policy
+            .validate_issuer(issuer)
+            .map_err(|_| ProviderExchangeError::Rejected)?;
+        let document = self
+            .discover(
+                issuer,
+                &endpoint_policy,
+                ProviderExchangeError::UnavailableBeforeDispatch,
+                ProviderExchangeError::Rejected,
+            )
+            .await?;
+        let mut origins = BTreeSet::new();
+        for endpoint in [
+            Some(&document.authorization_endpoint),
+            Some(&document.token_endpoint),
+            Some(&document.jwks_uri),
+            document.userinfo_endpoint.as_ref(),
+            document.revocation_endpoint.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            origins.insert(
+                ProviderOrigin::from_url(endpoint, self.endpoint_policy.allow_http_loopback)
+                    .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?
+                    .into_inner(),
+            );
+        }
+        origins.insert(
+            ProviderOrigin::from_url(
+                &endpoint_policy.validate_issuer(issuer)?,
+                self.endpoint_policy.allow_http_loopback,
+            )
+            .map_err(|_| ProviderExchangeError::UnavailableBeforeDispatch)?
+            .into_inner(),
+        );
+        let managed_profile_supported =
+            managed_discovery_supported(crate::domain::ProviderKind::Oidc, &document);
+        Ok(OidcPreflightSummary {
+            canonical_issuer: document.issuer,
+            admitted_endpoint_origins: origins.into_iter().collect(),
+            exact_scopes: managed_profile_scopes(crate::domain::ProviderKind::Oidc),
+            authorization_code_supported: true,
+            pkce_s256_supported: true,
+            rs256_id_tokens_supported: true,
+            managed_profile_supported,
+        })
+    }
+}
+
+#[async_trait]
 impl UpstreamProviderClient for RestrictedOidcProviderClient {
     fn issuer_allowed(&self, kind: crate::domain::ProviderKind, issuer: &str) -> bool {
-        matches!(
-            kind,
-            crate::domain::ProviderKind::Oidc | crate::domain::ProviderKind::Google
-        ) && kind.issuer_matches(issuer)
-            && self.endpoint_policy.validate_issuer(issuer).is_ok()
+        match kind {
+            crate::domain::ProviderKind::Oidc => kind.issuer_matches(issuer),
+            crate::domain::ProviderKind::Google => {
+                kind.issuer_matches(issuer) && self.endpoint_policy.validate_issuer(issuer).is_ok()
+            }
+            crate::domain::ProviderKind::Github => false,
+        }
     }
 
     async fn authorization_url(
@@ -422,14 +550,18 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
         if !self.issuer_allowed(request.kind, &request.issuer) {
             return Err(ProviderExchangeError::UnavailableBeforeDispatch);
         }
+        let endpoint_policy =
+            self.operation_endpoint_policy(request.kind, request.egress_policy.as_ref())?;
         validate_authorization_request(
             &request,
-            &self.endpoint_policy,
+            &endpoint_policy,
             self.callback_allow_http_loopback,
         )?;
         let discovery = self
             .discover(
                 &request.issuer,
+                &endpoint_policy,
+                ProviderExchangeError::UnavailableBeforeDispatch,
                 ProviderExchangeError::UnavailableBeforeDispatch,
             )
             .await?;
@@ -455,9 +587,11 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
         if !self.issuer_allowed(request.kind, &request.issuer) {
             return Err(ProviderExchangeError::UnavailableBeforeDispatch);
         }
+        let endpoint_policy =
+            self.operation_endpoint_policy(request.kind, request.egress_policy.as_ref())?;
         validate_callback_request(
             &request,
-            &self.endpoint_policy,
+            &endpoint_policy,
             self.callback_allow_http_loopback,
         )?;
         // Provider exchange capacity is deliberately process-local and fail-fast. Waiting for a
@@ -469,6 +603,8 @@ impl UpstreamProviderClient for RestrictedOidcProviderClient {
         let discovery = self
             .discover(
                 &request.issuer,
+                &endpoint_policy,
+                ProviderExchangeError::UnavailableBeforeDispatch,
                 ProviderExchangeError::UnavailableBeforeDispatch,
             )
             .await?;
@@ -633,9 +769,14 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         let client = self
             .client(guard)
             .map_err(|()| ProviderReadError::Transient)?;
+        let endpoint_policy = client
+            .operation_endpoint_policy(guard.provider_kind, guard.egress_policy.as_ref())
+            .map_err(|_| ProviderReadError::Transient)?;
         let discovery = client
             .discover(
                 &guard.issuer,
+                &endpoint_policy,
+                ProviderExchangeError::UnavailableBeforeDispatch,
                 ProviderExchangeError::UnavailableBeforeDispatch,
             )
             .await
@@ -693,9 +834,16 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         let Ok(client) = self.client(guard) else {
             return ProviderRenewalResult::TransientBeforeDispatch;
         };
+        let Ok(endpoint_policy) =
+            client.operation_endpoint_policy(guard.provider_kind, guard.egress_policy.as_ref())
+        else {
+            return ProviderRenewalResult::TransientBeforeDispatch;
+        };
         let Ok(discovery) = client
             .discover(
                 &guard.issuer,
+                &endpoint_policy,
+                ProviderExchangeError::UnavailableBeforeDispatch,
                 ProviderExchangeError::UnavailableBeforeDispatch,
             )
             .await
@@ -790,9 +938,16 @@ impl ManagedProfileAdapter for RestrictedOidcManagedProfileAdapter {
         let Ok(client) = self.client(guard) else {
             return ProviderRevocationResult::Ambiguous;
         };
+        let Ok(endpoint_policy) =
+            client.operation_endpoint_policy(guard.provider_kind, guard.egress_policy.as_ref())
+        else {
+            return ProviderRevocationResult::Ambiguous;
+        };
         let Ok(discovery) = client
             .discover(
                 &guard.issuer,
+                &endpoint_policy,
+                ProviderExchangeError::UnavailableBeforeDispatch,
                 ProviderExchangeError::UnavailableBeforeDispatch,
             )
             .await
@@ -895,9 +1050,10 @@ impl Origin {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct EndpointPolicy {
     allowed_origins: HashSet<Origin>,
+    allow_all: bool,
     allow_http_loopback: bool,
 }
 
@@ -928,8 +1084,26 @@ impl EndpointPolicy {
         }
         Ok(Self {
             allowed_origins,
+            allow_all: false,
             allow_http_loopback,
         })
+    }
+
+    fn from_provider_policy(
+        policy: &ProviderEgressPolicy,
+        allow_http_loopback: bool,
+    ) -> Result<Self, ProviderExchangeError> {
+        if policy.mode() == ProviderEgressMode::AllowAll {
+            return Ok(Self {
+                allowed_origins: HashSet::new(),
+                allow_all: true,
+                allow_http_loopback,
+            });
+        }
+        Self::new(
+            policy.exact_origins().map(ProviderOrigin::as_str),
+            allow_http_loopback,
+        )
     }
 
     fn secure_scheme(url: &Url, allow_http_loopback: bool) -> bool {
@@ -967,7 +1141,7 @@ impl EndpointPolicy {
             || url.username() != ""
             || url.password().is_some()
             || !Self::secure_scheme(url, self.allow_http_loopback)
-            || !self.allowed_origins.contains(&Origin::from_url(url)?)
+            || (!self.allow_all && !self.allowed_origins.contains(&Origin::from_url(url)?))
         {
             return Err(ProviderExchangeError::UnavailableBeforeDispatch);
         }

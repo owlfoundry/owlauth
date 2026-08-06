@@ -11,6 +11,7 @@ use sha2::Sha256;
 
 const SCHEMA_VERSION: &str = "v1";
 const LOCAL_CAPACITY: usize = 8_192;
+const CLIENT_FAILURE_BLOCK_CAPACITY: usize = 8_192;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -47,11 +48,14 @@ pub(crate) enum AdmissionEndpoint {
     BrowserLogoutPrepare,
     BrowserLogoutRead,
     BrowserLogoutConfirm,
+    ClientPreAuthority,
+    ClientCredentialFailure,
+    ClientAuthoritative,
 }
 
 impl AdmissionEndpoint {
     #[cfg(test)]
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 30] = [
         Self::PublicConfig,
         Self::ProjectJwks,
         Self::LoginStart,
@@ -79,6 +83,9 @@ impl AdmissionEndpoint {
         Self::BrowserLogoutPrepare,
         Self::BrowserLogoutRead,
         Self::BrowserLogoutConfirm,
+        Self::ClientPreAuthority,
+        Self::ClientCredentialFailure,
+        Self::ClientAuthoritative,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -110,11 +117,16 @@ impl AdmissionEndpoint {
             Self::BrowserLogoutPrepare => "browser_logout_prepare",
             Self::BrowserLogoutRead => "browser_logout_read",
             Self::BrowserLogoutConfirm => "browser_logout_confirm",
+            Self::ClientPreAuthority => "client_pre_authority",
+            Self::ClientCredentialFailure => "client_credential_failure",
+            Self::ClientAuthoritative => "client_authoritative",
         }
     }
 
     const fn policy(self) -> AdmissionPolicy {
         let limit = match self {
+            Self::ClientPreAuthority => 60_000,
+            Self::ClientAuthoritative => 6_000,
             Self::PublicConfig | Self::ProjectJwks | Self::CurrentUser => 600,
             Self::HostedInteraction | Self::HostedIdentityMutation => 300,
             Self::Refresh => 240,
@@ -122,7 +134,7 @@ impl AdmissionEndpoint {
             | Self::EmailChallenge
             | Self::EmailResend
             | Self::IdentityMutationEmailChallenge => 256,
-            Self::LoginStart | Self::BrowserLogoutPrepare => 120,
+            Self::LoginStart | Self::BrowserLogoutPrepare | Self::ClientCredentialFailure => 120,
             Self::ProviderCallback | Self::HandoffExchange | Self::ApplicationLogout => 96,
             Self::ManagedReauthorizationStart
             | Self::IdentityMutationMethod
@@ -403,6 +415,7 @@ pub(crate) struct AdmissionService {
     distributed: Option<Arc<dyn DistributedAdmissionCounter>>,
     local: Mutex<LocalCounters>,
     backend_state: Mutex<BackendState>,
+    client_failure_blocks: Mutex<HashMap<String, u64>>,
     monotonic: Arc<dyn MonotonicClock>,
 }
 
@@ -439,6 +452,7 @@ impl AdmissionService {
             distributed,
             local: Mutex::new(LocalCounters::new(LOCAL_CAPACITY)),
             backend_state: Mutex::new(BackendState::default()),
+            client_failure_blocks: Mutex::new(HashMap::new()),
             monotonic,
         }
     }
@@ -474,6 +488,102 @@ impl AdmissionService {
     /// limited to dimensions available without `PostgreSQL`: the transport client and the opaque
     /// interaction credential. Its purpose-separated keys cannot consume or replenish the later
     /// owner-scoped quota.
+    /// Strict source-only guard before any Client credential parsing or `PostgreSQL` lookup.
+    pub(crate) async fn admit_client_pre_authority(
+        &self,
+        client_address: &str,
+    ) -> AdmissionDecision {
+        let now = self.monotonic.elapsed_millis();
+        let block_key = self.digest("client_failure_source", client_address);
+        if let Ok(mut blocks) = self.client_failure_blocks.lock() {
+            match blocks.get(&block_key).copied() {
+                Some(expires_at) if expires_at > now => {
+                    return AdmissionDecision::Rejected {
+                        retry_after_seconds: retry_seconds(expires_at.saturating_sub(now)),
+                        reason: AdmissionRejectionReason::Quota,
+                        suppression_eligible: false,
+                    };
+                }
+                Some(_) => {
+                    blocks.remove(&block_key);
+                }
+                None => {}
+            }
+        }
+        self.admit_stage(
+            AdmissionEndpoint::ClientPreAuthority,
+            Some(client_address),
+            &[],
+            "pre_authority",
+        )
+        .await
+    }
+
+    /// Strict failure-only source guard. Valid credentials never consume this budget.
+    pub(crate) async fn admit_client_credential_failure(
+        &self,
+        client_address: &str,
+    ) -> AdmissionDecision {
+        let decision = self
+            .admit_stage(
+                AdmissionEndpoint::ClientCredentialFailure,
+                Some(client_address),
+                &[],
+                "credential_failure",
+            )
+            .await;
+        if let AdmissionDecision::Rejected {
+            retry_after_seconds,
+            ..
+        } = decision
+        {
+            let now = self.monotonic.elapsed_millis();
+            let block_key = self.digest("client_failure_source", client_address);
+            if let Ok(mut blocks) = self.client_failure_blocks.lock() {
+                if blocks.len() >= CLIENT_FAILURE_BLOCK_CAPACITY && !blocks.contains_key(&block_key)
+                {
+                    blocks.retain(|_, expires_at| *expires_at > now);
+                }
+                if blocks.len() < CLIENT_FAILURE_BLOCK_CAPACITY || blocks.contains_key(&block_key) {
+                    blocks.insert(
+                        block_key,
+                        now.saturating_add(retry_after_seconds.saturating_mul(1_000)),
+                    );
+                }
+            }
+        }
+        decision
+    }
+
+    /// Generous owner-scoped guard after `PostgreSQL`-backed Client authentication. UUID values are
+    /// private authoritative identifiers; no raw credential enters an admission key.
+    pub(crate) async fn admit_client_authoritative(
+        &self,
+        client_address: &str,
+        project_id: &str,
+        key_id: &str,
+    ) -> AdmissionDecision {
+        let dimensions = [
+            AdmissionDimension {
+                kind: AdmissionDimensionKind::Project,
+                value: project_id,
+                email_scope: None,
+            },
+            AdmissionDimension {
+                kind: AdmissionDimensionKind::Credential,
+                value: key_id,
+                email_scope: None,
+            },
+        ];
+        self.admit_stage(
+            AdmissionEndpoint::ClientAuthoritative,
+            Some(client_address),
+            &dimensions,
+            "authoritative",
+        )
+        .await
+    }
+
     pub(crate) async fn admit_email_pre_authority(
         &self,
         endpoint: AdmissionEndpoint,
@@ -888,6 +998,9 @@ mod tests {
                 "browser_logout_prepare",
                 "browser_logout_read",
                 "browser_logout_confirm",
+                "client_pre_authority",
+                "client_credential_failure",
+                "client_authoritative",
             ]
         );
         assert_eq!(

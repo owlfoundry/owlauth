@@ -1,0 +1,148 @@
+.canvas {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem 1rem;
+  background:
+    radial-gradient(circle at 50% 15%, rgb(21 61 53 / 42%), transparent 32rem), var(--owl-canvas);
+}
+
+.card {
+  width: min(100%, 30rem);
+  padding: clamp(1.25rem, 5vw, 2rem);
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+  box-shadow: var(--owl-shadow-raised);
+}
+
+.wide {
+  width: min(100%, 42rem);
+}
+
+.header {
+  margin-bottom: 1.5rem;
+  text-align: center;
+}
+
+.context {
+  margin: 0 0 0.4rem;
+  color: var(--owl-text-muted);
+  font-size: 0.875rem;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 1.75rem;
+  font-weight: 650;
+  line-height: 2.25rem;
+}
+
+.description {
+  margin: 0.65rem auto 0;
+  color: var(--owl-text-muted);
+}
+
+.content {
+  display: grid;
+  gap: 1rem;
+}
+
+.card button {
+  min-height: 2.75rem;
+}
+
+.attribution {
+  margin: 1.5rem 0 0;
+  color: var(--owl-text-subtle);
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+.method {
+  width: 100%;
+  min-height: 2.75rem;
+  display: grid;
+  grid-template-columns: 1.5rem 1fr;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.65rem 0.875rem;
+  color: var(--owl-text);
+  background: var(--owl-surface-raised);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+  cursor: pointer;
+  font-weight: 600;
+  text-align: left;
+}
+
+.method:hover:not(:disabled) {
+  background: var(--owl-surface-hover);
+}
+
+.method:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.providerIcon {
+  width: 1.5rem;
+  height: 1.5rem;
+  display: grid;
+  place-items: center;
+  color: var(--owl-text-muted);
+}
+
+.divider {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--owl-text-subtle);
+  font-size: 0.8125rem;
+}
+
+.divider::before,
+.divider::after {
+  height: 1px;
+  background: var(--owl-border);
+  content: "";
+}
+
+.terminal {
+  display: grid;
+  justify-items: center;
+  gap: 0.75rem;
+  text-align: center;
+}
+
+.terminal h2,
+.terminal p {
+  margin: 0;
+}
+
+.terminal p {
+  color: var(--owl-text-muted);
+}
+
+@media (width <= 32rem) {
+  .canvas {
+    min-height: 100dvh;
+    align-items: stretch;
+    padding: 0.75rem;
+  }
+
+  .card,
+  .wide {
+    width: 100%;
+    min-height: calc(100dvh - 1.5rem);
+    border-radius: 0.65rem;
+  }
+}
+
+@media (forced-colors: active) {
+  .card,
+  .method {
+    border-color: CanvasText;
+  }
+}

@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Stable public HTTP contracts for `OwlAuth`'s isolated Runtime and Control planes.
+//! Stable public HTTP contracts for `OwlAuth`'s isolated Runtime, Client, and Control planes.
 
+pub mod client;
 pub mod control;
 mod control_resources;
 pub mod export;
@@ -17,16 +18,23 @@ pub const FEDERATED_PROJECT_AUTH_AVAILABLE: bool = true;
 mod tests {
     use serde_json::Value;
 
-    use crate::{control, export, runtime};
+    use crate::{client, control, export, runtime};
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one contract test keeps complete cross-plane path and component isolation visible"
+    )]
     fn generated_documents_are_plane_pure_and_versioned() {
         let runtime =
             serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI should serialize");
+        let client =
+            serde_json::to_value(client::openapi()).expect("Client OpenAPI should serialize");
         let control =
             serde_json::to_value(control::openapi()).expect("Control OpenAPI should serialize");
 
         assert_eq!(runtime["info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(client["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(control["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(runtime["paths"]["/health"].is_object());
         assert!(runtime["paths"]["/ready"].is_object());
@@ -60,6 +68,46 @@ mod tests {
                 .get("CreateProviderRequest")
                 .is_none()
         );
+        assert!(
+            runtime["components"]["schemas"]
+                .get("IntrospectProjectTokenRequest")
+                .is_none()
+        );
+
+        for path in [
+            "/health",
+            "/ready",
+            "/v1/projects/{project_id}/users",
+            "/v1/projects/{project_id}/users/lookup",
+            "/v1/projects/{project_id}/users/{user_id}",
+            "/v1/projects/{project_id}/applications/{application_id}/users/{user_id}",
+            "/v1/projects/{project_id}/tokens/introspect",
+        ] {
+            assert!(
+                client["paths"][path].is_object(),
+                "missing Client path: {path}"
+            );
+        }
+        assert!(client["components"]["securitySchemes"]["project_client_key"].is_object());
+        assert!(client["paths"].get("/v1/system").is_none());
+        assert!(
+            client["paths"]
+                .get("/v1/projects/{project_public_id}/auth/config")
+                .is_none()
+        );
+        for forbidden_schema in [
+            "CreateProviderRequest",
+            "PublicApplicationConfig",
+            "RefreshSessionRequest",
+            "ProjectClientKey",
+        ] {
+            assert!(
+                client["components"]["schemas"]
+                    .get(forbidden_schema)
+                    .is_none(),
+                "Client OpenAPI leaked {forbidden_schema}"
+            );
+        }
 
         assert!(control["paths"]["/v1/system"].is_object());
         let capabilities = &control["components"]["schemas"]["SystemCapabilities"];
@@ -99,7 +147,7 @@ mod tests {
         assert!(
             control["components"]["schemas"]["CreateProviderRequest"]["required"]
                 .as_array()
-                .is_some_and(|required| !required.iter().any(|field| field == "kind"))
+                .is_some_and(|required| required.iter().any(|field| field == "kind"))
         );
         assert_eq!(
             control["components"]["schemas"]["ReconcileProviderRequest"]["properties"]["client_secret"]
@@ -182,6 +230,102 @@ mod tests {
     }
 
     #[test]
+    fn every_client_rate_limit_response_requires_integer_retry_after_seconds() {
+        let client: Value = serde_json::from_str(
+            &export::to_pretty_json(export::OpenApiPlane::Client)
+                .expect("Client OpenAPI should serialize"),
+        )
+        .expect("exported Client OpenAPI should be JSON");
+        let operations = [
+            ("/v1/projects/{project_id}/users", "get"),
+            ("/v1/projects/{project_id}/users/lookup", "post"),
+            ("/v1/projects/{project_id}/users/{user_id}", "get"),
+            (
+                "/v1/projects/{project_id}/applications/{application_id}/users/{user_id}",
+                "get",
+            ),
+            ("/v1/projects/{project_id}/tokens/introspect", "post"),
+        ];
+        for (path, method) in operations {
+            let retry_after =
+                &client["paths"][path][method]["responses"]["429"]["headers"]["Retry-After"];
+            assert_eq!(retry_after["schema"]["type"], "integer");
+            assert_eq!(retry_after["required"], true);
+            assert!(
+                retry_after["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("Required")
+                        && description.contains("whole seconds"))
+            );
+        }
+    }
+
+    #[test]
+    fn client_auth_projection_and_introspection_contract_is_exact() {
+        let client: Value = serde_json::from_str(
+            &export::to_pretty_json(export::OpenApiPlane::Client)
+                .expect("Client OpenAPI should serialize"),
+        )
+        .expect("exported Client OpenAPI should be JSON");
+        let operations = [
+            ("/v1/projects/{project_id}/users", "get"),
+            ("/v1/projects/{project_id}/users/lookup", "post"),
+            ("/v1/projects/{project_id}/users/{user_id}", "get"),
+            (
+                "/v1/projects/{project_id}/applications/{application_id}/users/{user_id}",
+                "get",
+            ),
+            ("/v1/projects/{project_id}/tokens/introspect", "post"),
+        ];
+        for (path, method) in operations {
+            let challenge =
+                &client["paths"][path][method]["responses"]["401"]["headers"]["WWW-Authenticate"];
+            assert_eq!(challenge["required"], true, "{method} {path}");
+            assert_eq!(challenge["schema"]["type"], "string", "{method} {path}");
+        }
+
+        let schemas = &client["components"]["schemas"];
+        assert_eq!(
+            schemas["InactiveProjectToken"]["properties"]["active"]["const"],
+            false
+        );
+        assert_eq!(
+            schemas["ActiveProjectToken"]["properties"]["active"]["const"],
+            true
+        );
+        assert!(
+            schemas["ClientApplicationUserProjection"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "user_revision"))
+        );
+        assert_eq!(
+            schemas["ClientApplicationUserProjection"]["properties"]["user_revision"]["minimum"],
+            1
+        );
+        assert!(
+            schemas["ClientUserList"]["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|field| field == "next_cursor"))
+        );
+        assert_eq!(
+            schemas["ClientUserList"]["properties"]["next_cursor"]["maxLength"],
+            64
+        );
+
+        let parameters = client["paths"]["/v1/projects/{project_id}/users"]["get"]["parameters"]
+            .as_array()
+            .expect("Client list parameters");
+        let parameter = |name: &str| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .unwrap_or_else(|| panic!("missing Client parameter {name}"))
+        };
+        assert_eq!(parameter("project_id")["schema"]["maxLength"], 96);
+        assert_eq!(parameter("cursor")["schema"]["maxLength"], 64);
+    }
+
+    #[test]
     fn public_contracts_are_bounded_and_reject_private_jwk_members() {
         let runtime =
             serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI should serialize");
@@ -218,7 +362,11 @@ mod tests {
 
     #[test]
     fn separate_exports_are_deterministic() {
-        for plane in [export::OpenApiPlane::Runtime, export::OpenApiPlane::Control] {
+        for plane in [
+            export::OpenApiPlane::Runtime,
+            export::OpenApiPlane::Client,
+            export::OpenApiPlane::Control,
+        ] {
             let first = export::to_pretty_json(plane).expect("OpenAPI should serialize");
             let second = export::to_pretty_json(plane).expect("OpenAPI should serialize");
             assert_eq!(first, second);

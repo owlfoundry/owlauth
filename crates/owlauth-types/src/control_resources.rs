@@ -1,8 +1,24 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 pub use crate::runtime::{IdentityKind, IdentityMutationMethodKind};
 use crate::runtime::{ProviderKind, PublicJwk, SigningAlgorithm};
+
+fn deserialize_required_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
+fn deserialize_required_nullable_project_client_key<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProjectClientKey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<ProjectClientKey>::deserialize(deserializer)
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -389,6 +405,117 @@ pub struct SigningKeyList {
     pub items: Vec<SigningKey>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectClientKeyStatus {
+    Active,
+    Revoked,
+}
+
+/// Safe Control inventory metadata. No credential digest or secret component is exposed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectClientKey {
+    #[schema(max_length = 36)]
+    pub id: String,
+    #[schema(max_length = 36)]
+    pub project_id: String,
+    #[schema(min_length = 22, max_length = 22, pattern = "^[A-Za-z0-9_-]{22}$")]
+    pub public_key_id: String,
+    #[schema(min_length = 1, max_length = 64)]
+    pub label: String,
+    pub status: ProjectClientKeyStatus,
+    #[schema(minimum = 1)]
+    pub digest_key_version: i32,
+    #[schema(
+        min_length = 36,
+        max_length = 36,
+        pattern = "^owl_client_v1\\.[A-Za-z0-9_-]{22}$"
+    )]
+    pub display_prefix: String,
+    #[schema(minimum = 1)]
+    pub revision: i64,
+    #[schema(max_length = 64)]
+    pub created_at: String,
+    /// Set only after an operator explicitly confirms durable secret-manager storage.
+    #[serde(deserialize_with = "deserialize_required_nullable_string")]
+    #[schema(max_length = 64, required = true)]
+    pub credential_acknowledged_at: Option<String>,
+    #[schema(max_length = 64)]
+    pub last_used_at: Option<String>,
+    #[schema(max_length = 64)]
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectClientKeyList {
+    #[schema(max_items = 100)]
+    pub items: Vec<ProjectClientKey>,
+    #[serde(default)]
+    #[schema(max_length = 64)]
+    pub next_cursor: Option<String>,
+    /// Bounded, secret-free creation gate authority independent of paginated history size.
+    #[serde(deserialize_with = "deserialize_required_nullable_project_client_key")]
+    #[schema(required = true)]
+    pub active_unacknowledged_key: Option<ProjectClientKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateProjectClientKeyRequest {
+    #[schema(min_length = 1, max_length = 64)]
+    pub label: String,
+}
+
+/// Original successful create response. The credential is never durable and is redacted in Debug.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateProjectClientKeyResponse {
+    pub key: ProjectClientKey,
+    #[schema(
+        min_length = 80,
+        max_length = 80,
+        pattern = "^owl_client_v1\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$",
+        read_only
+    )]
+    pub credential: String,
+}
+
+impl std::fmt::Debug for CreateProjectClientKeyResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreateProjectClientKeyResponse")
+            .field("key", &self.key)
+            .field("credential", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for CreateProjectClientKeyResponse {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.credential);
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AcknowledgeProjectClientKeyDeliveryRequest {
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+    /// Explicit assertion that the one-time credential is stored outside `OwlAuth`.
+    pub confirm_stored: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeProjectClientKeyRequest {
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+    /// Explicit acknowledgement that revocation is immediate and irreversible.
+    pub confirm: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct CreateSigningKeyRequest {
     #[schema(minimum = 1)]
@@ -446,18 +573,69 @@ pub struct ProviderList {
     pub items: Vec<Provider>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderEgressMode {
+    AllowAll,
+    ExactOrigins,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ProviderEgressPolicy {
+    pub project_id: String,
+    pub mode: ProviderEgressMode,
+    #[schema(max_items = 1024)]
+    pub exact_origins: Vec<String>,
+    #[schema(minimum = 1)]
+    pub revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct UpdateProviderEgressPolicyRequest {
+    pub mode: ProviderEgressMode,
+    #[schema(max_items = 1024)]
+    pub exact_origins: Vec<String>,
+    #[schema(minimum = 1)]
+    pub expected_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct OidcPreflightRequest {
+    #[schema(min_length = 8, max_length = 2048)]
+    pub issuer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the public diagnostic reports four independent reviewed OIDC capabilities"
+)]
+pub struct OidcPreflightResult {
+    pub canonical_issuer: String,
+    #[schema(max_items = 8)]
+    pub admitted_endpoint_origins: Vec<String>,
+    #[schema(max_items = 8)]
+    pub exact_scopes: Vec<String>,
+    pub authorization_code_supported: bool,
+    pub pkce_s256_supported: bool,
+    pub rs256_id_tokens_supported: bool,
+    pub managed_profile_supported: bool,
+    pub policy_mode: ProviderEgressMode,
+    #[schema(minimum = 1)]
+    pub policy_revision: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct CreateProviderRequest {
-    /// Closed adapter kind. Omission is accepted only for compatibility and inferred from the
-    /// exact issuer root by the server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<ProviderKind>,
+    /// Closed server-owned adapter profile.
+    pub kind: ProviderKind,
     #[schema(min_length = 1, max_length = 64)]
     pub provider_key: String,
     #[schema(min_length = 1, max_length = 128)]
     pub display_name: String,
+    /// Required for Custom OIDC and forbidden for named profiles.
     #[schema(min_length = 8, max_length = 2048)]
-    pub issuer: String,
+    pub issuer: Option<String>,
     #[schema(min_length = 1, max_length = 512)]
     pub client_id: String,
     #[schema(write_only, min_length = 1, max_length = 4096)]
@@ -574,6 +752,21 @@ pub struct EmailAssignmentRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct EmailAssignment {
+    pub project_id: String,
+    pub application_id: String,
+    pub enabled: bool,
+    #[schema(minimum = 1)]
+    pub security_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct EmailAssignmentList {
+    #[schema(max_items = 100)]
+    pub items: Vec<EmailAssignment>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct SmtpConfiguration {
     pub id: String,
     pub project_id: String,
@@ -594,7 +787,7 @@ pub struct SmtpConfiguration {
     #[schema(max_length = 64)]
     pub retained_until: Option<String>,
     #[schema(max_length = 64)]
-    pub safe_fingerprint: String,
+    pub safe_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -627,6 +820,13 @@ pub struct DeploymentSmtpGenerationList {
 pub struct SmtpConfigurationList {
     #[schema(max_items = 32)]
     pub items: Vec<SmtpConfiguration>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileDeploymentSmtpRequest {
+    #[schema(write_only, min_length = 2, max_length = 4096)]
+    pub credential: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -1237,6 +1437,75 @@ control_path!(
     params(("project_id" = String, Path))
 );
 control_path!(
+    list_project_client_keys,
+    get,
+    "/v1/projects/{project_id}/client-keys",
+    ProjectClientKeyList,
+    "Safe Project client-key metadata",
+    params(
+        ("project_id" = String, Path),
+        ("cursor" = Option<String>, Query),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 100)
+    )
+);
+control_path!(
+    get_project_client_key,
+    get,
+    "/v1/projects/{project_id}/client-keys/{key_id}",
+    ProjectClientKey,
+    "Safe metadata for one Project client key",
+    params(("project_id" = String, Path), ("key_id" = String, Path))
+);
+
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/client-keys",
+    request_body = CreateProjectClientKeyRequest,
+    responses(
+        (status = 201, description = "Created Project client key with one-time credential reveal", body = CreateProjectClientKeyResponse),
+        (status = 400, description = "Invalid request", body = ProblemDetails),
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails),
+        (status = 404, description = "Resource not found", body = ProblemDetails),
+        (status = 409, description = "Unacknowledged delivery, key limit, idempotency conflict, or secret unavailable on replay", body = ProblemDetails),
+        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails),
+        (status = 503, description = "Required Client verifier fleet is not ready", body = ProblemDetails)
+    ),
+    params(
+        ("project_id" = String, Path),
+        ("Idempotency-Key" = String, Header)
+    ),
+    security(("operator_api_key" = []))
+)]
+#[doc(hidden)]
+pub fn create_project_client_key() {}
+
+control_path!(
+    acknowledge_project_client_key_delivery,
+    post,
+    "/v1/projects/{project_id}/client-keys/{key_id}/acknowledge",
+    ProjectClientKey,
+    "Project client-key delivery acknowledged",
+    body = AcknowledgeProjectClientKeyDeliveryRequest,
+    params(
+        ("project_id" = String, Path),
+        ("key_id" = String, Path),
+        ("Idempotency-Key" = String, Header)
+    )
+);
+control_path!(
+    revoke_project_client_key,
+    post,
+    "/v1/projects/{project_id}/client-keys/{key_id}/revoke",
+    ProjectClientKey,
+    "Revoked Project client key",
+    body = RevokeProjectClientKeyRequest,
+    params(
+        ("project_id" = String, Path),
+        ("key_id" = String, Path),
+        ("Idempotency-Key" = String, Header)
+    )
+);
+control_path!(
     list_applications,
     get,
     "/v1/projects/{project_id}/applications",
@@ -1556,6 +1825,32 @@ control_path!(
     params(("project_id" = String, Path), ("key_id" = String, Path))
 );
 control_path!(
+    get_provider_egress_policy,
+    get,
+    "/v1/projects/{project_id}/provider-egress-policy",
+    ProviderEgressPolicy,
+    "Project Custom OIDC egress policy",
+    params(("project_id" = String, Path))
+);
+control_path!(
+    update_provider_egress_policy,
+    put,
+    "/v1/projects/{project_id}/provider-egress-policy",
+    ProviderEgressPolicy,
+    "Updated Project Custom OIDC egress policy",
+    body = UpdateProviderEgressPolicyRequest,
+    params(("project_id" = String, Path))
+);
+control_path!(
+    preflight_oidc_provider,
+    post,
+    "/v1/projects/{project_id}/providers/oidc/preflight",
+    OidcPreflightResult,
+    "Advisory Custom OIDC discovery preflight",
+    body = OidcPreflightRequest,
+    params(("project_id" = String, Path))
+);
+control_path!(
     list_providers,
     get,
     "/v1/projects/{project_id}/providers",
@@ -1644,6 +1939,14 @@ control_path!(
     params(("project_id" = String, Path))
 );
 control_path!(
+    list_email_assignments,
+    get,
+    "/v1/projects/{project_id}/email-method/assignments",
+    EmailAssignmentList,
+    "Application email assignments",
+    params(("project_id" = String, Path))
+);
+control_path!(
     assign_email_method,
     put,
     "/v1/projects/{project_id}/applications/{application_id}/email-method",
@@ -1661,6 +1964,15 @@ control_path!(
     "/v1/system/smtp-default-generations",
     DeploymentSmtpGenerationList,
     "Deployment SMTP generations"
+);
+control_path!(
+    reconcile_deployment_smtp_generation,
+    post,
+    "/v1/system/smtp-default-generations",
+    DeploymentSmtpGeneration,
+    "Reconciled deployment SMTP generation",
+    body = ReconcileDeploymentSmtpRequest,
+    params(("Idempotency-Key" = String, Header))
 );
 control_path!(
     disable_deployment_smtp_generation,
@@ -2084,3 +2396,91 @@ control_path!(
     body = ConfirmIdentityMutationIntentRequest,
     params(("project_id" = String, Path), ("intent_id" = String, Path))
 );
+
+#[cfg(test)]
+mod project_client_key_contract_tests {
+    use super::*;
+
+    fn metadata() -> ProjectClientKey {
+        ProjectClientKey {
+            id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            project_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            public_key_id: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            label: "production backend".to_owned(),
+            status: ProjectClientKeyStatus::Active,
+            digest_key_version: 1,
+            display_prefix: "owl_client_v1.AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            revision: 1,
+            created_at: "2026-08-05T00:00:00Z".to_owned(),
+            credential_acknowledged_at: None,
+            last_used_at: None,
+            revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn one_time_credential_is_redacted_from_debug() {
+        let response = CreateProjectClientKeyResponse {
+            key: metadata(),
+            credential: format!("owl_client_v1.AAAAAAAAAAAAAAAAAAAAAA.{}", "B".repeat(43)),
+        };
+        let debug = format!("{response:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&"B".repeat(43)));
+    }
+
+    #[test]
+    fn acknowledgement_status_is_explicit_and_required_in_inventory() {
+        let mut encoded = serde_json::to_value(metadata()).expect("client-key metadata");
+        encoded
+            .as_object_mut()
+            .expect("client-key metadata object")
+            .remove("credential_acknowledged_at");
+        assert!(serde_json::from_value::<ProjectClientKey>(encoded).is_err());
+
+        assert!(
+            serde_json::from_value::<ProjectClientKeyList>(serde_json::json!({
+                "items": [],
+                "next_cursor": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProjectClientKeyList>(serde_json::json!({
+                "items": [],
+                "next_cursor": null,
+                "active_unacknowledged_key": null
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn lifecycle_commands_reject_unknown_authority_fields() {
+        assert!(
+            serde_json::from_value::<CreateProjectClientKeyRequest>(serde_json::json!({
+                "label": "backend",
+                "scopes": ["users:read"]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RevokeProjectClientKeyRequest>(serde_json::json!({
+                "expected_revision": 1,
+                "confirm": true,
+                "enable": false
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AcknowledgeProjectClientKeyDeliveryRequest>(
+                serde_json::json!({
+                    "expected_revision": 1,
+                    "confirm_stored": true,
+                    "credential": "must-never-be-accepted"
+                })
+            )
+            .is_err()
+        );
+    }
+}

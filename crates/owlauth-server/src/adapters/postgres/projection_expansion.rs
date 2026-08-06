@@ -923,6 +923,9 @@ fn application_error_class(error: ApplicationError) -> &'static str {
         | ApplicationError::IdempotencyConflict
         | ApplicationError::OperationInProgress => "invalid_state",
         ApplicationError::PublicationPending => "publication_pending",
+        ApplicationError::ClientVerifierUnavailable => "client_verifier_unavailable",
+        ApplicationError::ProviderPreflightRejected => "provider_preflight_rejected",
+        ApplicationError::ProviderPreflightUnavailable => "provider_preflight_unavailable",
         ApplicationError::ExternalStore => "external_store",
     }
 }

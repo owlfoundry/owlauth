@@ -83,24 +83,6 @@ impl PostgresSessionAuthorityRepository {
         }
     }
 
-    pub(crate) fn new_with_runtime_identity(
-        database: DatabaseConnection,
-        runtime_process_id: String,
-        runtime_incarnation: uuid::Uuid,
-        projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-    ) -> Self {
-        Self {
-            database,
-            runtime_incarnation: RuntimeIncarnationFence::new(
-                runtime_process_id,
-                runtime_incarnation,
-            ),
-            managed_protector: None,
-            runtime_protector: None,
-            projection_materializer: Some(projection_materializer),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn with_projection_materializer(
         mut self,
@@ -1031,6 +1013,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             signing_ring_id: signing.ring_id,
             signing_key_id: signing.key_id,
             signing_kid: signing.kid,
+            signing_public_jwk: signing.public_jwk,
             signer_ref: signing.signer_ref,
             signing_epoch: signing.epoch,
             access_token_lifetime_seconds: access_token_lifetime(&policy)?,
@@ -1706,6 +1689,7 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             signing_ring_id: signing.ring_id,
             signing_key_id: signing.key_id,
             signing_kid: signing.kid,
+            signing_public_jwk: signing.public_jwk,
             signer_ref: signing.signer_ref,
             signing_epoch: signing.epoch,
             access_token_lifetime_seconds: access_token_lifetime(&policy)?,
@@ -2738,6 +2722,7 @@ struct SigningSnapshot {
     key_id: uuid::Uuid,
     issuer: String,
     kid: String,
+    public_jwk: Value,
     signer_ref: String,
     epoch: i64,
 }
@@ -2775,7 +2760,11 @@ async fn active_signing_snapshot(
         key_id: key.id,
         issuer: ring.issuer,
         kid: key.kid,
-        signer_ref: key.signer_ref,
+        public_jwk: key.public_jwk,
+        signer_ref: key
+            .signer_material_id
+            .map(|material_id| material_id.to_string())
+            .unwrap_or(key.signer_ref),
         epoch: ring.signing_epoch,
     })
 }
