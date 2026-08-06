@@ -13,17 +13,17 @@ interface UnsavedChangesGuardProps {
 export function UnsavedChangesGuard({ dirty, submitting, onDiscard }: UnsavedChangesGuardProps) {
   const blocker = useBlocker(
     ({ currentLocation, nextLocation }) =>
-      dirty &&
+      (dirty || submitting) &&
       `${currentLocation.pathname}${currentLocation.search}${currentLocation.hash}` !==
         `${nextLocation.pathname}${nextLocation.search}${nextLocation.hash}`,
   );
 
   useEffect(() => {
-    if (blocker.state === "blocked" && !dirty) blocker.reset();
-  }, [blocker, dirty]);
+    if (blocker.state === "blocked" && !dirty && !submitting) blocker.reset();
+  }, [blocker, dirty, submitting]);
 
   useEffect(() => {
-    if (!dirty) return;
+    if (!dirty && !submitting) return;
     const preventUnload = (event: BeforeUnloadEvent) => {
       event.preventDefault();
     };
@@ -31,7 +31,7 @@ export function UnsavedChangesGuard({ dirty, submitting, onDiscard }: UnsavedCha
     return () => {
       window.removeEventListener("beforeunload", preventUnload);
     };
-  }, [dirty]);
+  }, [dirty, submitting]);
 
   const blocked = blocker.state === "blocked";
   return (

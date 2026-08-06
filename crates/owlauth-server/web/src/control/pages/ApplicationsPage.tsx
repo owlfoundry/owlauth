@@ -22,6 +22,7 @@ export function ApplicationsPage() {
   const [createName, setCreateName] = useState("");
   const [createType, setCreateType] = useState<"web" | "native">("web");
   const [createError, setCreateError] = useState<string | null>(null);
+  const [createdApplicationId, setCreatedApplicationId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const attempt = useRef(new IdempotencyAttempt());
   const navigate = useNavigate();
@@ -60,6 +61,17 @@ export function ApplicationsPage() {
     };
   }, [handleError, refresh]);
 
+  useEffect(() => {
+    if (createdApplicationId === null || project === null) return;
+    const timer = window.setTimeout(() => {
+      setCreatedApplicationId(null);
+      void navigate(`/projects/${project.id}/applications/${createdApplicationId}`);
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [createdApplicationId, navigate, project]);
+
   function discardCreate() {
     attempt.current.abandon();
     setCreating(false);
@@ -77,6 +89,11 @@ export function ApplicationsPage() {
     if (project === null) return;
     const form = event.currentTarget;
     const fields = new FormData(form);
+    const displayName = text(fields, "display_name");
+    if (displayName.trim() === "") {
+      setCreateError("Display name must include a non-space character.");
+      return;
+    }
     const idempotencyKey = attempt.current.begin();
     if (idempotencyKey === null) return;
     setCreateError(null);
@@ -88,19 +105,22 @@ export function ApplicationsPage() {
           header: { "Idempotency-Key": idempotencyKey },
         },
         body: {
-          display_name: text(fields, "display_name"),
+          display_name: displayName,
           application_type: text(fields, "application_type") === "native" ? "native" : "web",
         },
       });
       const created = requireData(result.data, result.error, result.response);
       attempt.current.settle();
-      await refresh();
+      setApplications((current) => [
+        ...current.filter((application) => application.id !== created.id),
+        created,
+      ]);
       setCreating(false);
       setCreateName("");
       setCreateType("web");
       setCreateError(null);
       setMessage(`Application “${created.display_name}” created.`, "success");
-      void navigate(`/projects/${project.id}/applications/${created.id}`);
+      setCreatedApplicationId(created.id);
     } catch (error) {
       attempt.current.settle(error);
       setCreateError(
@@ -123,7 +143,7 @@ export function ApplicationsPage() {
     );
   }
 
-  const createDirty = creating && (createName.trim() !== "" || createType !== "web");
+  const createDirty = creating && (createName !== "" || createType !== "web");
   return (
     <div className={styles["page"]}>
       <UnsavedChangesGuard dirty={createDirty} submitting={submitting} onDiscard={discardCreate} />

@@ -27,6 +27,7 @@ interface ControlContextValue {
   readonly toasts: readonly ToastMessage[];
   readonly dismissToast: (id: number) => void;
   readonly clearFeedback: () => void;
+  readonly upsertProject: (project: Project) => void;
   readonly refreshProjects: () => Promise<Project[]>;
   readonly setMessage: (
     message: string | null,
@@ -76,6 +77,13 @@ export function ControlProvider({
   const clearFeedback = useCallback(() => {
     setCurrentMessage(null);
     setToasts([]);
+  }, []);
+
+  const upsertProject = useCallback((project: Project) => {
+    setProjects((current) => [
+      ...current.filter((candidate) => candidate.id !== project.id),
+      project,
+    ]);
   }, []);
 
   const setMessage = useCallback<ControlContextValue["setMessage"]>(
@@ -160,6 +168,7 @@ export function ControlProvider({
       toasts,
       dismissToast,
       clearFeedback,
+      upsertProject,
       refreshProjects,
       setMessage,
       handleError,
@@ -178,6 +187,7 @@ export function ControlProvider({
       session,
       setMessage,
       toasts,
+      upsertProject,
     ],
   );
 

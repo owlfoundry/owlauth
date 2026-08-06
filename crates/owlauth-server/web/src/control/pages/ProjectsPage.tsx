@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { Link, useNavigate } from "react-router";
 
@@ -13,14 +13,26 @@ import { ControlRequestError, IdempotencyAttempt, requireData } from "../client"
 import styles from "./pages.module.css";
 
 export function ProjectsPage() {
-  const { session, projects, loadingProjects, refreshProjects, setMessage, handleError } =
+  const { session, projects, loadingProjects, upsertProject, setMessage, handleError } =
     useControl();
   const [creating, setCreating] = useState(false);
   const [createName, setCreateName] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
+  const [createdProjectId, setCreatedProjectId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const attempt = useRef(new IdempotencyAttempt());
   const navigate = useNavigate();
+
+  useEffect(() => {
+    if (createdProjectId === null) return;
+    const timer = window.setTimeout(() => {
+      setCreatedProjectId(null);
+      void navigate(`/projects/${createdProjectId}`);
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [createdProjectId, navigate]);
 
   function discardCreate() {
     attempt.current.abandon();
@@ -37,6 +49,11 @@ export function ProjectsPage() {
     event.preventDefault();
     const form = event.currentTarget;
     const fields = new FormData(form);
+    const displayName = text(fields, "display_name");
+    if (displayName.trim() === "") {
+      setCreateError("Display name must include a non-space character.");
+      return;
+    }
     const idempotencyKey = attempt.current.begin();
     if (idempotencyKey === null) return;
     setCreateError(null);
@@ -45,18 +62,18 @@ export function ProjectsPage() {
       const result = await session.client.POST("/v1/projects", {
         params: { header: { "Idempotency-Key": idempotencyKey } },
         body: {
-          display_name: text(fields, "display_name"),
+          display_name: displayName,
           belongs_to: null,
         },
       });
       const created = requireData(result.data, result.error, result.response);
       attempt.current.settle();
-      await refreshProjects();
+      upsertProject(created);
       setCreating(false);
       setCreateName("");
       setCreateError(null);
       setMessage(`Project “${created.display_name}” created.`, "success");
-      void navigate(`/projects/${created.id}`);
+      setCreatedProjectId(created.id);
     } catch (error) {
       attempt.current.settle(error);
       setCreateError(
@@ -68,7 +85,7 @@ export function ProjectsPage() {
     }
   }
 
-  const createDirty = creating && createName.trim() !== "";
+  const createDirty = creating && createName !== "";
   return (
     <div className={styles["page"]}>
       <UnsavedChangesGuard dirty={createDirty} submitting={submitting} onDiscard={discardCreate} />

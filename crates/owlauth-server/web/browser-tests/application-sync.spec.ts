@@ -284,6 +284,7 @@ test("Block D public journey delivers immutable events and dispatches through Co
     await expect(
       page.getByRole("heading", { name: new RegExp(`Block D Application ${suffix}`, "u") }),
     ).toBeVisible();
+    await page.getByRole("link", { name: "Webhooks" }).click();
     await expect(page.getByRole("heading", { name: "Immutable user events" })).toBeVisible();
     await expect(
       page.locator("code").filter({ hasText: "user.projection.created" }).first(),
@@ -314,6 +315,7 @@ test("Application sync Console is keyboard and accessibility safe", async ({
   await expect(
     page.getByRole("heading", { name: new RegExp(`Block D Application ${suffix}`, "u") }),
   ).toBeVisible();
+  await page.getByRole("link", { name: "Webhooks" }).press("Enter");
   await page.getByRole("button", { name: "Create webhook endpoint" }).focus();
   await page.getByRole("button", { name: "Create webhook endpoint" }).press("Enter");
   const dialog = page.getByRole("dialog", { name: "Create webhook endpoint" });
@@ -321,6 +323,14 @@ test("Application sync Console is keyboard and accessibility safe", async ({
   await dialog.getByLabel("HTTPS URL").focus();
   await expect(dialog.getByLabel("HTTPS URL")).toBeFocused();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await dialog.getByLabel("HTTPS URL").fill("https://hooks.example.test/events");
+  await page.goBack({ waitUntil: "commit", timeout: 2_000 }).catch(() => null);
+  const discard = page.getByRole("dialog", { name: "Discard unsaved changes?" });
+  await expect(discard).toBeVisible();
+  await discard.getByRole("button", { name: "Discard and leave" }).click();
+  await expect(
+    page.getByRole("heading", { name: new RegExp(`Block D Application ${suffix}`, "u") }),
+  ).toBeVisible();
   expect(authority.application.id).not.toBe("");
 });
 
