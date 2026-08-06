@@ -124,13 +124,13 @@ CLI commands use the deployment operator credential and therefore carry full Con
 
 Components use independent SemVer and tags:
 
-| Component               | Package                           | Tag                     |
-| ----------------------- | --------------------------------- | ----------------------- |
-| Server and public types | `owlauth-server`, `owlauth-types` | `server-v{version}`     |
-| CLI                     | `owlauth-cli`                     | `cli-v{version}`        |
-| TypeScript SDK          | `@owlauth/client`                 | `typescript-v{version}` |
-| Python SDK              | `owlauth-client`                  | `python-v{version}`     |
-| Rust SDK                | `owlauth-client`                  | `rust-v{version}`       |
+| Component                    | Package                                                   | Tag                     |
+| ---------------------------- | --------------------------------------------------------- | ----------------------- |
+| Server and dependency crates | `owlauth-key-provider`, `owlauth-types`, `owlauth-server` | `server-v{version}`     |
+| CLI and exact public types   | `owlauth-types`, `owlauth-cli`                            | `cli-v{version}`        |
+| TypeScript SDK               | `@owlauth/client`                                         | `typescript-v{version}` |
+| Python SDK                   | `owlauth-client`                                          | `python-v{version}`     |
+| Rust SDK                     | `owlauth-client`                                          | `rust-v{version}`       |
 
 Tags point at the selected `main` commit; release workflows materialize component versions in isolated workspaces rather than requiring version-bump commits. Matching version numbers do not imply server/SDK compatibility.
 

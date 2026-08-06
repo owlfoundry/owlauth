@@ -107,7 +107,7 @@ jobs:
           [[ "$verified_sha" == "$ARCHIVE_SHA256" ]]
           actual_descriptor_sha="$(sha256sum candidate/candidate.json | cut -d ' ' -f 1)"
           [[ "$actual_descriptor_sha" == "$DESCRIPTOR_SHA256" ]]
-      - name: Verify final Block E evidence
+      - name: Verify final exact-artifact evidence
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |

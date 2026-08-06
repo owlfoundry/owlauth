@@ -4,7 +4,7 @@
 
 - **Decision date:** 2026-07-29
 - **Requirement owner:** spec 09
-- **Implementation validation:** one narrow two-plane build/package spike; remaining evidence comes from ordinary build, browser, integration, and release tests
+- **Implementation validation:** one narrow two-browser-surface build/package spike; remaining evidence comes from ordinary build, browser, integration, and release tests
 
 ### Selection
 
