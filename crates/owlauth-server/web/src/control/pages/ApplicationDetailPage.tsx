@@ -54,7 +54,7 @@ export function ApplicationDetailPage() {
   const refresh = useCallback(
     async (signal?: AbortSignal) => {
       if (project === null || applicationId === undefined) return;
-      setLoadState("loading");
+      setLoadState((current) => (current === "ready" ? current : "loading"));
       try {
         const result = await session.client.GET(
           "/v1/projects/{project_id}/applications/{application_id}",
@@ -102,7 +102,7 @@ export function ApplicationDetailPage() {
     return () => {
       window.cancelAnimationFrame(frame);
     };
-  }, [application, loadState]);
+  }, [application?.id, loadState]);
 
   async function updateMetadata(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();

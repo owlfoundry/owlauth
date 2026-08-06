@@ -30,7 +30,7 @@ export function ApplicationsPage() {
   const refresh = useCallback(
     async (signal?: AbortSignal) => {
       if (project === null) return;
-      setLoadState("loading");
+      setLoadState((current) => (current === "ready" ? current : "loading"));
       try {
         const result = await session.client.GET("/v1/projects/{project_id}/applications", {
           params: { path: { project_id: project.id } },
