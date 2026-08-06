@@ -87,7 +87,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   ).toBeVisible();
 
   await page.getByRole("link", { name: "Signing keys" }).click();
-  await expect(page.getByText("active", { exact: true }).first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("Status: active", { exact: true }).first()).toBeVisible({
+    timeout: 30_000,
+  });
   await expect(page.getByRole("button", { name: "Rotate signing key" })).toBeEnabled();
   const firstJwks = await page.request.get(
     `${runtimeBase}projects/${encodeURIComponent(projectPublicId)}/.well-known/jwks.json`,
