@@ -481,7 +481,9 @@ test("identity Runtime and Console flows are keyboard and accessibility safe", a
     await expect(consolePage.getByLabel("Operation")).toBeFocused();
     await consolePage.getByLabel("Read an existing intent by ID").fill("not-a-uuid");
     await consolePage.getByRole("button", { name: "Read intent" }).press("Enter");
-    await expect(consolePage.getByRole("status")).toContainText("Enter a valid intent ID");
+    await expect(
+      consolePage.getByRole("status").filter({ hasText: "Enter a valid intent ID" }),
+    ).toBeVisible();
     expect((await new AxeBuilder({ page: consolePage }).analyze()).violations).toEqual([]);
     expect(consolePage.url()).not.toContain(operatorKey);
   } finally {
@@ -680,7 +682,7 @@ async function completeEmailSlot(
   const code = otp(only(await waitForMail(page.request, 1)));
   await item.getByLabel("One-time code").fill(code);
   await item.getByRole("button", { name: "Verify newest code" }).click();
-  await expect(item).toContainText("state: proved", { timeout: 30_000 });
+  await expect(item).toContainText("Status: Proof complete.", { timeout: 30_000 });
 }
 
 async function completeEmailMagicSlot(
@@ -810,7 +812,7 @@ async function completeEmailMagicSlot(
 
   await page.reload();
   await expect(page.getByRole("listitem").filter({ hasText: roleLabel(role) })).toContainText(
-    "state: proved",
+    "Status: Proof complete.",
   );
   return snapshots;
 }
@@ -821,7 +823,7 @@ async function completeProviderSlot(page: Page, role: Slot["role"]): Promise<str
   await page.waitForURL(/auth\/identity-mutations\//u, { timeout: 30_000 });
   const callback = page.url();
   await expect(page.getByRole("listitem").filter({ hasText: roleLabel(role) })).toContainText(
-    "state: proved",
+    "Status: Proof complete.",
   );
   return callback;
 }

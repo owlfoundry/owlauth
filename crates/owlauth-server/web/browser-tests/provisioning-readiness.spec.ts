@@ -35,12 +35,12 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.getByRole("button", { name: "Edit metadata" }).click();
   await page.getByLabel("External owner metadata").fill(`deployment-${suffix}`);
   await page.getByRole("button", { name: "Save metadata" }).click();
-  await expect(page.getByRole("status")).toContainText("metadata updated");
+  await expect(page.getByRole("status").filter({ hasText: "metadata updated" })).toBeVisible();
   await page.getByRole("button", { name: "Edit policy" }).click();
   await page.getByLabel("Access token lifetime in seconds").fill("1200");
   await page.getByLabel("Allow explicit browser-session reuse confirmation").check();
   await page.getByRole("button", { name: "Save policy" }).click();
-  await expect(page.getByRole("status")).toContainText("policy updated");
+  await expect(page.getByRole("status").filter({ hasText: "policy updated" })).toBeVisible();
   await expect(page.locator("dt", { hasText: /^Claims revision$/u }).locator("+ dd")).toHaveText(
     "2",
   );
@@ -62,7 +62,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.getByLabel("Redirect URIs").fill("https://app.example/callback");
   await page.getByLabel("Allowed origins").fill("https://app.example");
   await page.getByRole("button", { name: "Replace configuration" }).click();
-  await expect(page.getByRole("status")).toContainText("configuration replaced");
+  await expect(
+    page.getByRole("status").filter({ hasText: "configuration replaced" }),
+  ).toBeVisible();
 
   await page.getByRole("link", { name: "Signing keys" }).click();
   await page.getByRole("button", { name: "Provision signing key" }).click();
@@ -87,12 +89,12 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await providerDialog.getByLabel("Client ID").fill(`client-${suffix}`);
   await providerDialog.getByLabel("Client secret").fill(providerSecret);
   await providerDialog.getByRole("button", { name: "Add provider" }).click();
-  await expect(page.getByRole("status")).toContainText("secret was discarded");
+  await expect(page.getByRole("status").filter({ hasText: "secret was discarded" })).toBeVisible();
   await expect(page.locator("body")).not.toContainText(providerSecret);
 
   await page.getByLabel("Assign to Application").selectOption({ label: applicationName });
   await page.getByRole("button", { name: "Assign provider" }).click();
-  await expect(page.getByRole("status")).toContainText("assigned");
+  await expect(page.getByRole("status").filter({ hasText: "assigned" })).toBeVisible();
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
