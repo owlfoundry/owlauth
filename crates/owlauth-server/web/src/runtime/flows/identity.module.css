@@ -24,6 +24,7 @@
 }
 
 .method {
+  color: #fff;
   background: var(--owl-accent-strong);
   border-color: var(--owl-accent-strong);
 }
@@ -38,7 +39,11 @@
   border-color: var(--owl-danger-border);
 }
 
-.method:hover,
+.method:hover {
+  background: var(--owl-accent-hover);
+  border-color: var(--owl-accent-hover);
+}
+
 .secondary:hover,
 .danger:hover {
   background: var(--owl-surface-hover);

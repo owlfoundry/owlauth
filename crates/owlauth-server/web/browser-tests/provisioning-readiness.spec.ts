@@ -28,8 +28,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.getByRole("dialog").getByRole("button", { name: "Create Project" }).click();
   await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
   const projectPublicId = await page
-    .locator("dt", { hasText: /^Public ID$/u })
-    .locator("+ dd")
+    .getByRole("button", { name: "Copy Project public ID" })
+    .locator("..")
+    .locator("code")
     .innerText();
 
   await page.getByRole("link", { name: "Settings" }).click();

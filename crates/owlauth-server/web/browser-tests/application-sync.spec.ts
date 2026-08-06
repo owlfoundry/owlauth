@@ -315,7 +315,11 @@ test("Application sync Console is keyboard and accessibility safe", async ({
   await expect(
     page.getByRole("heading", { name: new RegExp(`Block D Application ${suffix}`, "u") }),
   ).toBeVisible();
-  await page.getByRole("link", { name: "Webhooks" }).press("Enter");
+  const webhooksTab = page.getByRole("link", { name: "Webhooks" });
+  await webhooksTab.focus();
+  await expect(webhooksTab).toBeFocused();
+  await webhooksTab.press("Enter");
+  await expect(page).toHaveURL(/section=webhooks/u);
   await page.getByRole("button", { name: "Create webhook endpoint" }).focus();
   await page.getByRole("button", { name: "Create webhook endpoint" }).press("Enter");
   const dialog = page.getByRole("dialog", { name: "Create webhook endpoint" });
