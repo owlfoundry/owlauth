@@ -7248,11 +7248,19 @@ async fn preflight_oidc_provider(
     };
     match provider_onboarding(&state) {
         Ok(service) => match service
-            .preflight(project_id, body.issuer, request_uuid(&request_id))
+            .preflight_registration(
+                project_id,
+                body.provider_key,
+                body.issuer,
+                request_uuid(&request_id),
+            )
             .await
         {
-            Ok((summary, policy)) => Json(control_types::OidcPreflightResult {
+            Ok((summary, policy, callback_url)) => Json(control_types::OidcPreflightResult {
                 canonical_issuer: summary.canonical_issuer,
+                callback_url,
+                callback_guidance:
+                    control_types::ProviderCallbackGuidance::RegisterExactRedirectUri,
                 admitted_endpoint_origins: summary.admitted_endpoint_origins,
                 exact_scopes: summary.exact_scopes,
                 authorization_code_supported: summary.authorization_code_supported,

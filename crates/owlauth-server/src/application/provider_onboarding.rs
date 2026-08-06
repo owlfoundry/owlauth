@@ -162,6 +162,21 @@ impl ProviderOnboardingService {
         })
     }
 
+    pub(crate) async fn preflight_registration(
+        &self,
+        project_id: Uuid,
+        provider_key: String,
+        issuer: String,
+        correlation_id: Uuid,
+    ) -> Result<(OidcPreflightSummary, ProviderEgressPolicyRecord, String), ApplicationError> {
+        let provider_key = ProviderKey::parse(provider_key)?;
+        let project_public_id = self.policy.get_active_project_public_id(project_id).await?;
+        let (summary, policy) = self.preflight(project_id, issuer, correlation_id).await?;
+        let callback_url =
+            provider_callback_url(&self.runtime_base, &project_public_id, &provider_key)?;
+        Ok((summary, policy, callback_url))
+    }
+
     pub(crate) async fn preflight_for_create(
         &self,
         project_id: Uuid,
@@ -407,6 +422,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_preflight_returns_runtime_registration_authority() {
+        let project_id = Uuid::new_v4();
+        let service = ProviderOnboardingService::new(
+            Arc::new(RecordingPolicy {
+                record: ProviderEgressPolicyRecord {
+                    project_id,
+                    mode: ProviderEgressMode::AllowAll,
+                    exact_origins: Vec::new(),
+                    revision: 3,
+                },
+                active_error: None,
+                outcomes: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(FixedDiscovery(Ok(summary()))),
+            Arc::new(Url::parse("https://identity.example/runtime/").expect("runtime base")),
+            false,
+        );
+
+        let (summary, policy, callback_url) = service
+            .preflight_registration(
+                project_id,
+                "custom-workforce".to_owned(),
+                "https://identity.example".to_owned(),
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("Custom OIDC registration settings");
+        assert_eq!(summary.canonical_issuer, "https://identity.example");
+        assert_eq!(policy.revision, 3);
+        assert_eq!(
+            callback_url,
+            "https://identity.example/runtime/projects/prj_provider_test/auth/callback/custom-workforce"
+        );
+        assert_eq!(
+            service
+                .preflight_registration(
+                    project_id,
+                    "Custom".to_owned(),
+                    "https://identity.example".to_owned(),
+                    Uuid::new_v4(),
+                )
+                .await,
+            Err(ApplicationError::InvalidInput)
+        );
+    }
+
+    #[tokio::test]
     async fn create_preflight_rejects_unsupported_managed_profile() {
         let project_id = Uuid::new_v4();
         let correlation_id = Uuid::new_v4();
@@ -478,8 +540,9 @@ mod tests {
 
         assert_eq!(
             service
-                .preflight(
+                .preflight_registration(
                     project_id,
+                    "custom".to_owned(),
                     "https://identity.example".to_owned(),
                     Uuid::new_v4(),
                 )

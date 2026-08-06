@@ -144,10 +144,19 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   providerChooser = page.getByRole("dialog", { name: "Choose a provider" });
   await providerChooser.getByRole("button", { name: /Custom OIDC/u }).click();
   const providerDialog = page.getByRole("dialog", { name: "Add Custom OIDC" });
+  const customProviderKey = `provider-${suffix}`;
+  await expect(providerDialog.getByLabel("Client ID")).toBeDisabled();
+  await providerDialog.getByLabel("Provider key").fill(customProviderKey);
   await providerDialog.getByLabel("Canonical HTTPS issuer").fill(providerOrigin);
-  await providerDialog.getByRole("button", { name: "Run preflight" }).click();
+  await providerDialog.getByRole("button", { name: "Review registration settings" }).click();
   await expect(providerDialog.getByRole("heading", { name: "Preflight result" })).toBeVisible();
-  await providerDialog.getByLabel("Provider key").fill(`provider-${suffix}`);
+  await expect(
+    providerDialog.getByText(
+      `${runtimeBase}projects/${projectPublicId}/auth/callback/${customProviderKey}`,
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(providerDialog.getByLabel("Client ID")).toBeEnabled();
   await providerDialog.getByLabel("Display name").fill(providerName);
   await providerDialog.getByLabel("Client ID").fill(`client-${suffix}`);
   await providerDialog.getByLabel("Client secret").fill(providerSecret);

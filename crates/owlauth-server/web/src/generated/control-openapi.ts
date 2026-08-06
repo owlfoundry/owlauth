@@ -1534,10 +1534,13 @@ export interface components {
         };
         OidcPreflightRequest: {
             issuer: string;
+            provider_key: string;
         };
         OidcPreflightResult: {
             admitted_endpoint_origins: string[];
             authorization_code_supported: boolean;
+            callback_guidance: components["schemas"]["ProviderCallbackGuidance"];
+            callback_url: string;
             canonical_issuer: string;
             exact_scopes: string[];
             managed_profile_supported: boolean;

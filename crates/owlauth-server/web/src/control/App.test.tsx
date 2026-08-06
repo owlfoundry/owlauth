@@ -442,7 +442,8 @@ describe("Control application shell", () => {
     expect(screen.getByText("kid_second_project")).toBeVisible();
   });
 
-  it("requires reviewed Custom OIDC preflight and discards its write-only secret", async () => {
+  it("requires reviewed Custom OIDC registration guidance and discards its write-only secret", async () => {
+    const preflightBodies: unknown[] = [];
     const submittedBodies: unknown[] = [];
     const policyUpdates: unknown[] = [];
     vi.stubGlobal(
@@ -458,9 +459,13 @@ describe("Control application shell", () => {
           return Response.json({ items: [application] });
         }
         if (url.pathname.endsWith(`/v1/projects/${project.id}/providers/oidc/preflight`)) {
+          preflightBodies.push((await request.clone().json()) as unknown);
           return Response.json({
             admitted_endpoint_origins: ["https://issuer.example"],
             authorization_code_supported: true,
+            callback_guidance: "register_exact_redirect_uri",
+            callback_url:
+              "https://identity.example/runtime/projects/prj_public/auth/callback/custom-provider",
             canonical_issuer: "https://issuer.example/",
             exact_scopes: ["openid", "profile", "email"],
             managed_profile_supported: true,
@@ -530,16 +535,27 @@ describe("Control application shell", () => {
     let dialog = screen.getByRole("dialog", { name: "Add Custom OIDC" });
     const addProvider = within(dialog).getByRole("button", { name: "Add provider" });
     expect(addProvider).toBeDisabled();
+    fireEvent.change(within(dialog).getByLabelText("Provider key"), {
+      target: { value: "custom-provider" },
+    });
     fireEvent.change(within(dialog).getByLabelText("Canonical HTTPS issuer"), {
       target: { value: "https://issuer.example" },
     });
     const secretInput = within(dialog).getByLabelText("Client secret");
     fireEvent.change(secretInput, { target: { value: "discard-before-preflight" } });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Run preflight" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Review registration settings" }));
     expect(secretInput).toHaveValue("");
     await within(dialog).findByRole("heading", { name: "Preflight result" });
     expect(within(dialog).getByText("Safe discovered origins are allowed")).toBeVisible();
     expect(within(dialog).getByText("https://issuer.example")).toBeVisible();
+    expect(
+      within(dialog).getByText(
+        "https://identity.example/runtime/projects/prj_public/auth/callback/custom-provider",
+      ),
+    ).toBeVisible();
+    expect(preflightBodies).toEqual([
+      { issuer: "https://issuer.example", provider_key: "custom-provider" },
+    ]);
     fireEvent.change(secretInput, { target: { value: "discard-before-policy-change" } });
 
     fireEvent.click(
@@ -554,12 +570,9 @@ describe("Control application shell", () => {
     expect(secretInput).toHaveValue("");
     expect(addProvider).toBeDisabled();
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Run preflight" }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Review registration settings" }));
     await within(dialog).findByRole("heading", { name: "Preflight result" });
     dialog = screen.getByRole("dialog", { name: "Add Custom OIDC" });
-    fireEvent.change(within(dialog).getByLabelText("Provider key"), {
-      target: { value: "custom-provider" },
-    });
     fireEvent.change(within(dialog).getByLabelText("Display name"), {
       target: { value: "Custom provider" },
     });

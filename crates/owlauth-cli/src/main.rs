@@ -392,6 +392,8 @@ mod tests {
                 "provider",
                 "preflight",
                 PROJECT,
+                "--provider-key",
+                "workforce",
                 "--issuer",
                 "https://identity.example",
             ],

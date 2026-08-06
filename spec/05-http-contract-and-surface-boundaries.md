@@ -159,7 +159,7 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/projects`                                               | create/read/update/disable; read/write/filter exact `belongs_to`; list/create/revoke Project client keys with one-time create reveal                                                                                                                                                                                                                                               |
 | `/projects/{project}/applications`                        | register/disable app; origins, redirects, publishable keys                                                                                                                                                                                                                                                                                                                         |
-| `/projects/{project}/providers`                           | configure/disable provider client registrations, preflight custom OIDC, resource-keyed reconcile of interrupted secret provisioning with write-only secret re-entry, and assign Applications                                                                                                                                                                                       |
+| `/projects/{project}/providers`                           | configure/disable provider client registrations, obtain secret-free server-owned registration guidance for custom OIDC and named adapters, resource-keyed reconcile of interrupted secret provisioning with write-only secret re-entry, and assign Applications                                                                                                                    |
 | `/projects/{project}/provider-egress-policy`              | read or revision-CAS the Project's custom-provider origin policy; default allow-all mode or recommended exact-origin mode                                                                                                                                                                                                                                                          |
 | `/projects/{project}/users`                               | query/disable users; inspect revision/source provenance, exact primary source, identities, bindings, and managed-connection metadata; inspect/sync/revoke/disconnect connections; idempotently create/read/cancel exact managed-reauthorization interactions, returning the opaque Hosted target only from create or identical create-result replay through expiry                 |
 | `/projects/{project}/identity-mutation-intents`           | idempotently create a short-lived revisioned explicit link/unlink/merge intent whose mandatory proof roles are server-derived and receive its opaque Hosted target; read only bounded intent/slot status; cancel, or confirm an explicitly Hosted-confirmed `ready` intent by ID/expected revision so receipts, mutation, candidate cleanup, completion, and audit commit together |
@@ -206,33 +206,60 @@ without rewriting provider rows. Runtime exposes none of this policy. Developmen
 loopback HTTP additionally requires the process development opt-in and, in `exact_origins` mode, a
 matching Project origin.
 
-Authenticated Project-qualified `POST /v1/projects/{project_id}/providers/oidc/preflight` accepts only a proposed canonical custom OIDC
-issuer. It performs one bounded non-persistent discovery validation under the Project's current
-egress-policy revision and returns only a normalized safe summary: the canonical issuer, sorted
-admitted endpoint origins, observed policy revision/mode, fixed login scopes, whether OwlAuth's exact
-managed-profile profile is currently supported, and that profile's fixed scopes and capability
-flags. It never accepts a client secret, changes policy, persists provider state, returns endpoint
-paths, DNS answers, headers, raw metadata, response bodies, or vendor errors. A malformed or
-policy-denied issuer and locally rejected metadata/profile return
+Authenticated Project-qualified `POST /v1/projects/{project_id}/providers/oidc/preflight`
+accepts exactly one proposed Project-owned provider key and canonical custom OIDC issuer. The key is
+validated before network dispatch. The operation reads the active PostgreSQL Project public ID and
+configured Runtime external base, derives the exact callback through the same callback authority
+used by provider persistence, then performs one bounded non-persistent discovery validation under
+the Project's current egress-policy revision. It returns only the callback URL and exact-registration
+guidance plus a normalized safe discovery summary: canonical issuer, sorted admitted endpoint
+origins, observed policy revision/mode, fixed login scopes, whether OwlAuth's exact managed-profile
+profile is currently supported, and that profile's fixed scopes and capability flags. The callback
+is always `{runtime_external_base}/projects/{project_public_id}/auth/callback/{provider_key}` after
+base-path-safe URL construction; Control origin, browser origin, request forwarding headers, and
+caller-supplied Project public IDs or callback overrides have no authority.
+
+Authenticated Project-qualified `POST /v1/projects/{project_id}/providers/named/preflight` accepts
+exactly one closed named kind (`google` or `github`) and proposed Project-owned provider key. It
+rejects `oidc`, unknown fields, issuer, client registration, secret, endpoint, scope, consent,
+capability, callback, and other low-level overrides. From the closed domain profile it returns only
+the exact server-owned issuer, callback URL and registration guidance, fixed login scopes/consent,
+and the optional fixed managed-profile scopes/consent. Google exposes its reviewed login and managed
+profile; GitHub remains fixed login-only. This operation performs no upstream request and shares the
+same active-Project, PostgreSQL public-ID, configured Runtime-base, provider-key validation, and
+callback helper authority as custom OIDC preflight and provider persistence.
+
+Neither preflight accepts a client secret, changes policy, persists provider state, creates an
+upstream registration, or returns endpoint paths, DNS answers, headers, raw metadata, response
+bodies, or vendor errors. Missing or cross-Project resources retain ordinary non-disclosing Control
+resource semantics; a disabled Project is rejected before discovery or guidance is returned; an
+invalid key, kind, or request shape is an ordinary bounded input error. For custom OIDC, a malformed
+or policy-denied issuer and locally rejected metadata/profile return
 `422 provider_preflight_rejected`; discovery transport failure, malformed remote metadata, or an
-unavailable provider return `503 provider_preflight_unavailable`. Invalid HTTP request shape remains
-an ordinary bounded input error. No diagnostic exposes remote detail.
+unavailable provider return `503 provider_preflight_unavailable`. No diagnostic exposes remote
+detail.
 
 A successful preflight is advisory and carries no authorization token, digest, lease, or later
-commit authority. Custom OIDC create repeats canonicalization, discovery, capability, and current
-Project origin-policy validation before any PostgreSQL provider operation or configuration-secret
-write. A policy or metadata change between preflight and create therefore fails create without
-partial provisioning. Runtime does not pin or trust the create-time document: every authorization,
-exchange, managed-profile, and reauthorization dispatch reads the current Project policy and repeats
-strict discovery and endpoint-origin validation. Later metadata or policy drift can only make the
-affected method unavailable; it cannot silently widen scopes, algorithms, or capabilities, and an
-exact-origin policy cannot be bypassed. Reconciliation of an already prepared provider resumes only
-its frozen original request and secret fingerprint after current-policy revalidation; it is not a
-bypass.
+commit authority. Changing kind, provider key, issuer, or egress policy invalidates the reviewed
+result. Provider create accepts no callback or preflight result and independently derives all named
+profile and callback state. Custom OIDC create repeats canonicalization, discovery, capability, and
+current Project origin-policy validation before any PostgreSQL provider operation or
+configuration-secret write. A policy or metadata change between preflight and create therefore fails
+create without partial provisioning. Runtime does not pin or trust the create-time document: every
+authorization, exchange, managed-profile, and reauthorization dispatch reads the current Project
+policy and repeats strict discovery and endpoint-origin validation. Later metadata or policy drift
+can only make the affected method unavailable; it cannot silently widen scopes, algorithms, or
+capabilities, and an exact-origin policy cannot be bypassed. Reconciliation of an already prepared
+provider resumes only its frozen original request and secret fingerprint after current-policy
+revalidation; it is not a bypass.
 
-Preflight is rate/concurrency/deadline bounded independently from provider callback exchanges. Its
-audit/telemetry records only Project, operation, safe outcome class, correlation, and bounded
-latency—never issuer, endpoint, DNS, remote body, client registration, or secret material.
+Custom discovery preflight is rate/concurrency/deadline bounded independently from provider callback
+exchanges. Its durable safe-outcome audit and operational telemetry record only Project, operation,
+safe outcome class, correlation, and bounded latency. Named guidance performs no network or durable
+mutation, remains under ordinary authenticated Control request admission/deadline limits, and does
+not create a durable audit event; its operational telemetry uses the same bounded safe dimensions.
+Neither path records provider key, callback, issuer, endpoint, DNS, remote body, client registration,
+or secret material.
 
 A provider resource that remains pending after an ambiguous response or process restart is visible
 in its ordinary bounded list. Its Project-qualified resource ID addresses the existing durable

@@ -583,7 +583,10 @@ pub struct UpdateProviderEgressPolicyRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OidcPreflightRequest {
+    #[schema(min_length = 1, max_length = 64)]
+    pub provider_key: String,
     #[schema(min_length = 8, max_length = 2048)]
     pub issuer: String,
 }
@@ -595,6 +598,8 @@ pub struct OidcPreflightRequest {
 )]
 pub struct OidcPreflightResult {
     pub canonical_issuer: String,
+    pub callback_url: String,
+    pub callback_guidance: ProviderCallbackGuidance,
     #[schema(max_items = 8)]
     pub admitted_endpoint_origins: Vec<String>,
     #[schema(max_items = 8)]
@@ -2111,7 +2116,37 @@ control_path!(
 mod tests {
     use serde_json::json;
 
-    use super::{CreateIdentityMutationIntentRequest, IdentityMutationProofAuthority};
+    use super::{
+        CreateIdentityMutationIntentRequest, IdentityMutationProofAuthority,
+        NamedProviderPreflightRequest, OidcPreflightRequest,
+    };
+
+    #[test]
+    fn provider_preflight_requests_reject_secret_and_callback_authority() {
+        assert!(
+            serde_json::from_value::<OidcPreflightRequest>(json!({
+                "provider_key": "custom-main",
+                "issuer": "https://identity.example",
+            }))
+            .is_ok()
+        );
+        for forbidden in ["client_secret", "callback_url", "project_public_id"] {
+            let mut request = json!({
+                "provider_key": "custom-main",
+                "issuer": "https://identity.example",
+            });
+            request[forbidden] = json!("caller-owned");
+            assert!(serde_json::from_value::<OidcPreflightRequest>(request).is_err());
+        }
+        for forbidden in ["client_secret", "callback_url", "issuer"] {
+            let mut request = json!({
+                "kind": "google",
+                "provider_key": "google-main",
+            });
+            request[forbidden] = json!("caller-owned");
+            assert!(serde_json::from_value::<NamedProviderPreflightRequest>(request).is_err());
+        }
+    }
 
     #[test]
     fn user_and_session_lifecycle_contract_is_bounded_and_control_only() {

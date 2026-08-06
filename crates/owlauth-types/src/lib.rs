@@ -63,7 +63,11 @@ mod tests {
             );
         }
         assert!(runtime["paths"].get("/v1/projects").is_none());
-        for forbidden_schema in ["CreateProviderRequest", "NamedProviderPreflightRequest"] {
+        for forbidden_schema in [
+            "CreateProviderRequest",
+            "NamedProviderPreflightRequest",
+            "OidcPreflightRequest",
+        ] {
             assert!(
                 runtime["components"]["schemas"]
                     .get(forbidden_schema)
@@ -100,6 +104,7 @@ mod tests {
         for forbidden_schema in [
             "CreateProviderRequest",
             "NamedProviderPreflightRequest",
+            "OidcPreflightRequest",
             "PublicApplicationConfig",
             "RefreshSessionRequest",
             "ProjectClientKey",
@@ -154,15 +159,27 @@ mod tests {
                 .is_none()
         );
         assert!(control["components"]["securitySchemes"]["operator_api_key"].is_object());
-        assert!(
-            control["paths"]["/v1/projects/{project_id}/providers/named/preflight"]["post"]
-                .is_object()
-        );
-        assert!(
-            control["components"]["schemas"]["NamedProviderPreflightRequest"]["properties"]
-                .get("client_secret")
-                .is_none()
-        );
+        for (path, request_schema) in [
+            (
+                "/v1/projects/{project_id}/providers/oidc/preflight",
+                "OidcPreflightRequest",
+            ),
+            (
+                "/v1/projects/{project_id}/providers/named/preflight",
+                "NamedProviderPreflightRequest",
+            ),
+        ] {
+            assert!(control["paths"][path]["post"].is_object());
+            let properties = &control["components"]["schemas"][request_schema]["properties"];
+            assert!(properties["provider_key"].is_object());
+            assert!(properties.get("client_secret").is_none());
+            assert!(properties.get("callback_url").is_none());
+        }
+        for result_schema in ["OidcPreflightResult", "NamedProviderPreflightResult"] {
+            let properties = &control["components"]["schemas"][result_schema]["properties"];
+            assert!(properties["callback_url"].is_object());
+            assert!(properties["callback_guidance"].is_object());
+        }
         assert_eq!(
             control["components"]["schemas"]["CreateProviderRequest"]["properties"]["client_secret"]
                 ["writeOnly"],

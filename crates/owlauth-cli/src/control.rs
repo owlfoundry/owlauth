@@ -406,6 +406,8 @@ enum ProviderCommand {
     Preflight {
         project_id: String,
         #[arg(long)]
+        provider_key: String,
+        #[arg(long)]
         issuer: String,
     },
     List {
@@ -1149,12 +1151,19 @@ pub(crate) fn run_provider(profile: Option<&str>, args: ProviderArgs) -> Result<
             )?;
             print_json(&value)
         }
-        ProviderCommand::Preflight { project_id, issuer } => {
+        ProviderCommand::Preflight {
+            project_id,
+            provider_key,
+            issuer,
+        } => {
             resource(&project_id)?;
             let value: OidcPreflightResult = authenticated_server(profile)?.send(
                 Method::POST,
                 &format!("projects/{project_id}/providers/oidc/preflight"),
-                &OidcPreflightRequest { issuer },
+                &OidcPreflightRequest {
+                    provider_key,
+                    issuer,
+                },
                 None,
             )?;
             print_json(&value)
@@ -2093,10 +2102,14 @@ mod tests {
             Method::POST,
             &format!("projects/{PROJECT}/providers/oidc/preflight"),
             &OidcPreflightRequest {
+                provider_key: "workforce".to_owned(),
                 issuer: "https://identity.example".to_owned(),
             },
             None,
-            json!({"issuer":"https://identity.example"}),
+            json!({
+                "provider_key":"workforce",
+                "issuer":"https://identity.example"
+            }),
         );
 
         let provider = CreateProviderRequest {
