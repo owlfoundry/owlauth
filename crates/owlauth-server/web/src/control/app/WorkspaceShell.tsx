@@ -1,5 +1,4 @@
-import { useEffect, useId, useState } from "react";
-import type { ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useState, type ReactNode } from "react";
 import { NavLink, Outlet, useLocation, useNavigate, useParams } from "react-router";
 
 import { Breadcrumbs } from "../../shared/layout/Layout";
@@ -23,13 +22,8 @@ export function WorkspaceShell() {
     clearFeedback();
   }, [clearFeedback, location.key]);
 
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      document.querySelector<HTMLElement>("#console-main h1")?.focus();
-    });
-    return () => {
-      window.cancelAnimationFrame(frame);
-    };
+  useLayoutEffect(() => {
+    document.querySelector<HTMLElement>("#console-main h1")?.focus();
   }, [location.pathname]);
 
   const navigation = (
