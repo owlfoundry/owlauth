@@ -9872,7 +9872,6 @@ pub(crate) mod tests {
             "test-deployment",
             "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0",
             "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
-            "RkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkY",
             "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c",
         )
     }
@@ -9884,7 +9883,6 @@ pub(crate) mod tests {
             "identity-mutation-test",
             "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws",
             "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw",
-            "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0",
             "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
         )
     }
@@ -9900,7 +9898,6 @@ pub(crate) mod tests {
         instance_id: &str,
         email_digest_key: &str,
         email_protection_key: &str,
-        projection_digest_key: &str,
         projection_protection_key: &str,
     ) -> ServerConfig {
         let key = format!("owl_ctrl_v1_{}", "A".repeat(43));
@@ -9942,10 +9939,6 @@ pub(crate) mod tests {
             (
                 "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION".to_owned(),
                 "1".to_owned(),
-            ),
-            (
-                "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY".to_owned(),
-                projection_digest_key.to_owned(),
             ),
             (
                 "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY".to_owned(),

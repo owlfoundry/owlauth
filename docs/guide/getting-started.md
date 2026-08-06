@@ -15,7 +15,7 @@ The repository's pinned development baseline is:
 - pnpm 11.17.0;
 - Python 3.11 through 3.14;
 - `uv` 0.11.32;
-- Docker when building the server image.
+- Docker Engine/Desktop with Compose v2 when running `make dev`, container-backed tests, or building the server image.
 
 The TypeScript SDK package itself supports Node.js 20 or later. Use the versions pinned by the repository lockfiles and package-manager metadata rather than installing ad hoc dependency versions.
 
@@ -44,11 +44,18 @@ They do not run every CI runtime matrix or the long real PostgreSQL/provider/bro
 
 ## Run the development topology
 
-Start the disposable development infrastructure:
+Copy the current local template and start all three planes with disposable PostgreSQL and Redis:
 
 ```bash
-make dev-up
+cp .env.example .env
+make dev
 ```
+
+Run `make dev-check` for a non-mutating preflight. It reports stale `.env` templates, missing tools,
+or an unavailable Docker daemon before any service starts. `make dev` prints directly openable
+Runtime Hosted Auth, Client readiness, and Control Console URLs once the listeners are ready. Use
+`make dev-status`, `make dev-logs`, and `make dev-down` to inspect or stop infrastructure;
+`make dev-reset` deletes all local PostgreSQL and Redis data.
 
 OwlAuth rejects unknown `OWLAUTH_*` variables and validates selected-plane database, listener, key-store, Runtime protection, Client key/digest readiness, provider egress, admission, and Control credential configuration before binding. Runtime and Client admission share a stable admission-only digest key and optional Redis coordination but retain independent local shares; set `OWLAUTH_RUNTIME_MAX_PROCESSES` and `OWLAUTH_CLIENT_MAX_PROCESSES` to conservative plane-specific deployment maxima rather than current replica counts. The complete variable reference, Redis namespace/deadline settings, and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration).
 

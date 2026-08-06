@@ -2832,7 +2832,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         SoftwareProjectionVerifiedEmailProtector::new(
             "identity-mutation-test".to_owned(),
             1,
-            RuntimeKeyMaterial::new([61; 32], [62; 32]),
+            [62; 32],
             BTreeMap::new(),
         )
         .expect("Control projection-email protector"),
@@ -2853,7 +2853,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         SoftwareProjectionVerifiedEmailProtector::new(
             "identity-mutation-test".to_owned(),
             2,
-            RuntimeKeyMaterial::new([71; 32], [72; 32]),
+            [72; 32],
             BTreeMap::new(),
         )
         .expect("stale projection writer"),
@@ -2962,10 +2962,10 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
             )
             .expect("Runtime durable email ring"),
         ),
-        SoftwareRuntimeProtector::new(
+        SoftwareProjectionVerifiedEmailProtector::new(
             "identity-mutation-test".to_owned(),
             1,
-            RuntimeKeyMaterial::new([61; 32], [62; 32]),
+            [62; 32],
             BTreeMap::new(),
         )
         .expect("Runtime dedicated projection email ring"),

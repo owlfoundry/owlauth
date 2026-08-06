@@ -104,10 +104,13 @@ cp .env.example .env
 make dev
 ```
 
-Runtime is served at `http://127.0.0.1:8080/`, Client at `http://127.0.0.1:8082/`, and the Control Console at
-`http://127.0.0.1:8081/console/`. The development Control key is the
-`OWLAUTH_CONTROL_API_KEY` value in `.env`. Stop the foreground server with `Ctrl-C`, then run
-`make dev-down` when the PostgreSQL and Redis containers are no longer needed.
+`make dev` first runs the non-mutating `make dev-check` preflight and reports a stale `.env`, missing
+tools, or unavailable Docker before starting services. Once ready, startup logs print direct links
+to Runtime Hosted Auth, Client readiness, and the Control Console. With the default template these
+are `http://127.0.0.1:8080/auth/`, `http://127.0.0.1:8082/ready`, and
+`http://127.0.0.1:8081/console/`. The development Control key is the `OWLAUTH_CONTROL_API_KEY` value
+in `.env`. Stop the foreground server with `Ctrl-C`, then run `make dev-down` when the PostgreSQL and
+Redis containers are no longer needed.
 
 Use `make openapi` to export all three plane contracts and `make web-e2e` to run the isolated real-browser
 gate. The browser gate starts its own PostgreSQL, OwlAuth Runtime, Client, and Control listeners, a

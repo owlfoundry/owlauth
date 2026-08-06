@@ -15,15 +15,15 @@ install: ## Install locked development dependencies
 .PHONY: format
 format: ## Format Rust and Python sources
 	@cargo fmt --all
-	@uv run --locked ruff format $(PYTHON_DIR)
+	@uv run --locked ruff format $(PYTHON_DIR) scripts/check-dev-env.py scripts/test-dev-env.py
 
 .PHONY: check
 check: web-verify markdown-check ## Run formatting, lint, package metadata, and workflow checks
 	@cargo fmt --all --check
 	@cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	@uv lock --check
-	@uv run --locked ruff check $(PYTHON_DIR)
-	@uv run --locked ruff format --check $(PYTHON_DIR)
+	@uv run --locked ruff check $(PYTHON_DIR) scripts/check-dev-env.py scripts/test-dev-env.py
+	@uv run --locked ruff format --check $(PYTHON_DIR) scripts/check-dev-env.py scripts/test-dev-env.py
 	@pnpm --filter @owlauth/server-web check
 	@pnpm --filter @owlauth/client check
 	@python3 scripts/check-markdown-links.py
@@ -45,6 +45,7 @@ check: web-verify markdown-check ## Run formatting, lint, package metadata, and 
 test: web-build ## Run Rust, Python, and TypeScript unit tests
 	@cargo test --workspace --all-features --locked
 	@uv run --locked pytest
+	@uv run --locked pytest scripts/test-dev-env.py
 	@pnpm --filter @owlauth/server-web test
 	@pnpm --filter @owlauth/client test
 
@@ -120,11 +121,23 @@ docs-deploy: ## Deploy documentation to Cloudflare Workers
 	@pnpm --filter @owlauth/docs run deploy
 
 .PHONY: dev
-dev: ## Build web assets, start local infrastructure, and run all three planes
-	@test -f .env || { echo "Missing .env; run: cp .env.example .env" >&2; exit 1; }
-	@$(MAKE) web-build
-	@$(MAKE) dev-up
-	@set -a; . ./.env; set +a; exec cargo run --locked --package owlauth-server
+dev: dev-check ## Build web assets, start local infrastructure, and run all three planes
+	@set -e; \
+		for key in $$(env | sed -n 's/^\(OWLAUTH_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$$key"; done; \
+		set -a; . ./.env; set +a; \
+		$(MAKE) web-build; \
+		$(MAKE) dev-up; \
+		exec cargo run --locked --package owlauth-server
+
+.PHONY: dev-check
+dev-check: ## Check local application config, tools, Docker, and Compose without starting services
+	@python3 scripts/check-dev-env.py
+	@command -v cargo >/dev/null || { echo "cargo is required; install the pinned Rust toolchain" >&2; exit 1; }
+	@command -v pnpm >/dev/null || { echo "pnpm is required; run: make install" >&2; exit 1; }
+	@test -d node_modules || { echo "Development dependencies are missing; run: make install" >&2; exit 1; }
+	@command -v docker >/dev/null || { echo "Docker with Compose v2 is required by make dev" >&2; exit 1; }
+	@docker compose version >/dev/null 2>&1 || { echo "Docker Compose v2 is required by make dev" >&2; exit 1; }
+	@docker info >/dev/null 2>&1 || { echo "Docker is not running; start Docker Desktop or the Docker daemon" >&2; exit 1; }
 
 .PHONY: dev-up
 dev-up: ## Start healthy local PostgreSQL and Redis services

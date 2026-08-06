@@ -11,7 +11,7 @@ use crate::config::{MigrationMode, PostgresConfig};
 mod contention_tests;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-const BINARY_SCHEMA_LEVEL: i64 = 20_260_805_130_000;
+const BINARY_SCHEMA_LEVEL: i64 = 20_260_805_140_000;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SchemaError {

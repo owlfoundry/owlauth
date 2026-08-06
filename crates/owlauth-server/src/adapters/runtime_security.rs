@@ -35,6 +35,7 @@ const DIGEST_DOMAIN: &[u8] = b"owlauth-runtime-digest-v1\0";
 const DERIVATION_DOMAIN: &[u8] = b"owlauth-runtime-derived-opaque-v1\0";
 const PROTECTION_DOMAIN: &[u8] = b"owlauth-runtime-protection-v1\0";
 const MANAGED_CREDENTIAL_DOMAIN: &[u8] = b"owlauth-managed-credential-aead-v1\0";
+const PROJECTION_EMAIL_PROTECTION_DOMAIN: &[u8] = b"owlauth-projection-email-aead-v1\0";
 const NONCE_BYTES: usize = 24;
 const TAG_BYTES: usize = 16;
 const SIGNING_ALGORITHM: &str = "EdDSA";
@@ -271,7 +272,7 @@ impl RuntimeProtector for SoftwareRuntimeProtector {
 pub(crate) struct SplitRuntimeProtector {
     short_term: SoftwareRuntimeProtector,
     email_identity: Option<SoftwareRuntimeProtector>,
-    projection_email: Option<SoftwareRuntimeProtector>,
+    projection_email: Option<SoftwareProjectionVerifiedEmailProtector>,
 }
 
 impl SplitRuntimeProtector {
@@ -290,7 +291,7 @@ impl SplitRuntimeProtector {
     pub(crate) fn new_with_projection_email(
         short_term: SoftwareRuntimeProtector,
         email_identity: Option<SoftwareRuntimeProtector>,
-        projection_email: SoftwareRuntimeProtector,
+        projection_email: SoftwareProjectionVerifiedEmailProtector,
     ) -> Self {
         Self {
             short_term,
@@ -347,10 +348,7 @@ impl SplitRuntimeProtector {
                 .email_identity
                 .as_ref()
                 .ok_or(ApplicationError::Disabled),
-            ProtectedPurpose::ApplicationProjectionVerifiedEmail => self
-                .projection_email
-                .as_ref()
-                .ok_or(ApplicationError::Disabled),
+            ProtectedPurpose::ApplicationProjectionVerifiedEmail => Err(ApplicationError::Disabled),
             ProtectedPurpose::ApplicationState
             | ProtectedPurpose::ProviderPkce
             | ProtectedPurpose::EmailChallengeAddress
@@ -418,6 +416,13 @@ impl RuntimeProtector for SplitRuntimeProtector {
         context: &[u8],
         value: &[u8],
     ) -> Result<ProtectedValue, ApplicationError> {
+        if purpose == ProtectedPurpose::ApplicationProjectionVerifiedEmail {
+            return self
+                .projection_email
+                .as_ref()
+                .ok_or(ApplicationError::Disabled)?
+                .protect_context(context, value);
+        }
         self.protected_ring(purpose)?
             .protect(purpose, context, value)
     }
@@ -428,6 +433,13 @@ impl RuntimeProtector for SplitRuntimeProtector {
         context: &[u8],
         value: &ProtectedValue,
     ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        if purpose == ProtectedPurpose::ApplicationProjectionVerifiedEmail {
+            return self
+                .projection_email
+                .as_ref()
+                .ok_or(ApplicationError::Disabled)?
+                .unprotect_context(context, value);
+        }
         self.protected_ring(purpose)?
             .unprotect(purpose, context, value)
     }
@@ -439,13 +451,14 @@ impl RuntimeProtector for SplitRuntimeProtector {
     fn projection_email_write_version(&self) -> i32 {
         self.projection_email
             .as_ref()
-            .map_or(0, SoftwareRuntimeProtector::active_version)
+            .map_or(0, SoftwareProjectionVerifiedEmailProtector::active_version)
     }
 
     fn projection_email_readable_versions(&self) -> BTreeSet<i32> {
-        self.projection_email
-            .as_ref()
-            .map_or_else(BTreeSet::new, RuntimeProtector::readable_key_versions)
+        self.projection_email.as_ref().map_or_else(
+            BTreeSet::new,
+            SoftwareProjectionVerifiedEmailProtector::readable_versions,
+        )
     }
 }
 
@@ -505,7 +518,11 @@ impl crate::application::DurableEmailAddressReader for SoftwareDurableEmailAddre
     }
 }
 
-struct ProjectionVerifiedEmailKeyRing(SoftwareRuntimeProtector);
+struct ProjectionVerifiedEmailKeyRing {
+    deployment_context: Arc<str>,
+    active_version: i32,
+    keys: BTreeMap<i32, Zeroizing<[u8; 32]>>,
+}
 
 #[derive(Clone)]
 pub(crate) struct SoftwareProjectionVerifiedEmailProtector(Arc<ProjectionVerifiedEmailKeyRing>);
@@ -514,13 +531,35 @@ impl SoftwareProjectionVerifiedEmailProtector {
     pub(crate) fn new(
         deployment_context: String,
         active_version: i32,
-        active: RuntimeKeyMaterial,
-        retained: BTreeMap<i32, RuntimeKeyMaterial>,
+        active_key: [u8; 32],
+        retained: BTreeMap<i32, [u8; 32]>,
     ) -> Result<Self, ApplicationError> {
-        SoftwareRuntimeProtector::new(deployment_context, active_version, active, retained)
-            .map(ProjectionVerifiedEmailKeyRing)
-            .map(Arc::new)
-            .map(Self)
+        if deployment_context.is_empty()
+            || deployment_context.len() > 128
+            || active_version <= 0
+            || retained.keys().any(|version| *version <= 0)
+            || retained.contains_key(&active_version)
+        {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let mut keys = retained
+            .into_iter()
+            .map(|(version, key)| (version, Zeroizing::new(key)))
+            .collect::<BTreeMap<_, _>>();
+        keys.insert(active_version, Zeroizing::new(active_key));
+        Ok(Self(Arc::new(ProjectionVerifiedEmailKeyRing {
+            deployment_context: Arc::from(deployment_context),
+            active_version,
+            keys,
+        })))
+    }
+
+    fn active_version(&self) -> i32 {
+        self.0.active_version
+    }
+
+    fn readable_versions(&self) -> BTreeSet<i32> {
+        self.0.keys.keys().copied().collect()
     }
 
     fn context(
@@ -541,17 +580,104 @@ impl SoftwareProjectionVerifiedEmailProtector {
         context.extend_from_slice(crate::domain::USER_PROJECTION_SCHEMA_V1.as_bytes());
         Ok(context)
     }
+
+    fn associated_data(
+        &self,
+        key_version: i32,
+        context: &[u8],
+    ) -> Result<Vec<u8>, ApplicationError> {
+        let purpose = ProtectedPurpose::ApplicationProjectionVerifiedEmail;
+        let mut associated_data = Vec::with_capacity(
+            PROJECTION_EMAIL_PROTECTION_DOMAIN.len()
+                + self.0.deployment_context.len()
+                + purpose.as_str().len()
+                + context.len()
+                + 48,
+        );
+        associated_data.extend_from_slice(PROJECTION_EMAIL_PROTECTION_DOMAIN);
+        append_framed(&mut associated_data, self.0.deployment_context.as_bytes())?;
+        append_framed(&mut associated_data, &key_version.to_be_bytes())?;
+        append_framed(&mut associated_data, purpose.as_str().as_bytes())?;
+        append_framed(&mut associated_data, context)?;
+        Ok(associated_data)
+    }
+
+    fn protect_context(
+        &self,
+        context: &[u8],
+        value: &[u8],
+    ) -> Result<ProtectedValue, ApplicationError> {
+        let key = self
+            .0
+            .keys
+            .get(&self.0.active_version)
+            .ok_or(ApplicationError::Integrity)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
+            .map_err(|_| ApplicationError::Integrity)?;
+        let mut nonce = [0_u8; NONCE_BYTES];
+        getrandom::fill(&mut nonce).map_err(|_| ApplicationError::ExternalStore)?;
+        let associated_data = self.associated_data(self.0.active_version, context)?;
+        let nonce_value = XNonce::from(nonce);
+        let encrypted = cipher
+            .encrypt(
+                &nonce_value,
+                Payload {
+                    msg: value,
+                    aad: &associated_data,
+                },
+            )
+            .map_err(|_| ApplicationError::Integrity)?;
+        let mut ciphertext = Vec::with_capacity(NONCE_BYTES + encrypted.len());
+        ciphertext.extend_from_slice(&nonce);
+        ciphertext.extend_from_slice(&encrypted);
+        nonce.fill(0);
+        Ok(ProtectedValue {
+            ciphertext,
+            key_version: self.0.active_version,
+        })
+    }
+
+    fn unprotect_context(
+        &self,
+        context: &[u8],
+        value: &ProtectedValue,
+    ) -> Result<Zeroizing<Vec<u8>>, ApplicationError> {
+        if value.ciphertext.len() < NONCE_BYTES + TAG_BYTES {
+            return Err(ApplicationError::Integrity);
+        }
+        let key = self
+            .0
+            .keys
+            .get(&value.key_version)
+            .ok_or(ApplicationError::Integrity)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
+            .map_err(|_| ApplicationError::Integrity)?;
+        let (nonce, ciphertext) = value.ciphertext.split_at(NONCE_BYTES);
+        let nonce: [u8; NONCE_BYTES] = nonce.try_into().map_err(|_| ApplicationError::Integrity)?;
+        let nonce_value = XNonce::from(nonce);
+        let associated_data = self.associated_data(value.key_version, context)?;
+        cipher
+            .decrypt(
+                &nonce_value,
+                Payload {
+                    msg: ciphertext,
+                    aad: &associated_data,
+                },
+            )
+            .map(Zeroizing::new)
+            .map_err(|_| ApplicationError::Integrity)
+    }
 }
 
 impl crate::application::ProjectionVerifiedEmailProtector
     for SoftwareProjectionVerifiedEmailProtector
 {
     fn write_version(&self) -> i32 {
-        self.0.0.active_version()
+        self.active_version()
     }
 
     fn readable_versions(&self) -> BTreeSet<i32> {
-        RuntimeProtector::readable_key_versions(&self.0.0)
+        self.readable_versions()
     }
 
     fn protect_verified_email(
@@ -562,8 +688,7 @@ impl crate::application::ProjectionVerifiedEmailProtector
         projection_revision: i64,
         email: &[u8],
     ) -> Result<ProtectedValue, ApplicationError> {
-        self.0.0.protect(
-            ProtectedPurpose::ApplicationProjectionVerifiedEmail,
+        self.protect_context(
             &Self::context(project_id, application_id, user_id, projection_revision)?,
             email,
         )
@@ -577,8 +702,7 @@ impl crate::application::ProjectionVerifiedEmailProtector
         projection_revision: i64,
         value: &ProtectedValue,
     ) -> Result<Zeroizing<String>, ApplicationError> {
-        let plaintext = self.0.0.unprotect(
-            ProtectedPurpose::ApplicationProjectionVerifiedEmail,
+        let plaintext = self.unprotect_context(
             &Self::context(project_id, application_id, user_id, projection_revision)?,
             value,
         )?;
@@ -2046,7 +2170,7 @@ mod tests {
         let projection = SoftwareProjectionVerifiedEmailProtector::new(
             "deployment".to_owned(),
             7,
-            material(41, 42),
+            [42; 32],
             BTreeMap::new(),
         )
         .unwrap();

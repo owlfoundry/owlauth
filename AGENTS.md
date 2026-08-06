@@ -35,7 +35,7 @@ cp .env.example .env
 make dev
 ```
 
-`make dev` rebuilds embedded Runtime and Control assets, starts PostgreSQL and Redis, and runs all three HTTP planes. Use `make dev-status`, `make dev-logs`, `make dev-postgres`, or `make dev-redis` while debugging and `make dev-down` when finished. `make dev-reset` deletes all local PostgreSQL and Redis data and is intentionally destructive.
+`make dev-check` performs a non-mutating `.env`, toolchain, Docker, and Compose preflight. `make dev` runs that check, rebuilds embedded Runtime and Control assets, starts PostgreSQL and Redis, runs all three HTTP planes, and logs directly openable plane URLs. Use `make dev-status`, `make dev-logs`, `make dev-postgres`, or `make dev-redis` while debugging and `make dev-down` when finished. `make dev-reset` deletes all local PostgreSQL and Redis data and is intentionally destructive.
 
 Common targets:
 

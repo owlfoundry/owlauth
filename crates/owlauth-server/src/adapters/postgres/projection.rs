@@ -699,7 +699,8 @@ pub(super) fn authoritative_projection_material(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "Runtime projection materialization keeps exact policy and encryption authority visible"
+    clippy::too_many_lines,
+    reason = "Runtime projection materialization keeps exact policy, authority version, and encryption decisions visible"
 )]
 pub(super) async fn authoritative_runtime_projection_material<
     P: ProjectionCryptography + ?Sized,
@@ -720,11 +721,13 @@ pub(super) async fn authoritative_runtime_projection_material<
     } else {
         None
     };
-    if source_email.is_some()
+    let projection_write_version = if source_email.is_some()
         || projection.is_some_and(|existing| existing.verified_email_ciphertext.is_some())
     {
-        assert_projection_crypto_authority(transaction, protector).await?;
-    }
+        Some(projection_authority_write_version(transaction, protector).await?)
+    } else {
+        None
+    };
     let source_identity_id = source_email.as_ref().map(|(identity_id, _)| *identity_id);
     let semantic_change = projection.is_none_or(|existing| {
         existing.user_id != user.id
@@ -748,6 +751,7 @@ pub(super) async fn authoritative_runtime_projection_material<
             && existing.verified_email_source_identity_id == source_identity_id
             && existing.verified_email_ciphertext.is_some() == source_email.is_some()
             && existing.verified_email_key_version.is_some() == source_email.is_some()
+            && existing.verified_email_key_version == projection_write_version
     });
 
     let (ciphertext, key_version) = match source_email.as_ref() {
@@ -1006,12 +1010,22 @@ pub(super) async fn assert_projection_write_authority(
         &protector.readable_versions(),
     )
     .await
+    .map(|_| ())
 }
 
 pub(super) async fn assert_projection_crypto_authority<P: ProjectionCryptography + ?Sized>(
     transaction: &sea_orm::DatabaseTransaction,
     protector: &P,
 ) -> Result<(), ApplicationError> {
+    projection_authority_write_version(transaction, protector)
+        .await
+        .map(|_| ())
+}
+
+async fn projection_authority_write_version<P: ProjectionCryptography + ?Sized>(
+    transaction: &sea_orm::DatabaseTransaction,
+    protector: &P,
+) -> Result<i32, ApplicationError> {
     assert_projection_versions(
         transaction,
         protector.projection_write_version(),
@@ -1024,7 +1038,7 @@ async fn assert_projection_versions(
     transaction: &sea_orm::DatabaseTransaction,
     local_write_version: i32,
     readable: &std::collections::BTreeSet<i32>,
-) -> Result<(), ApplicationError> {
+) -> Result<i32, ApplicationError> {
     let row = transaction
         .query_one_raw(Statement::from_string(
             DbBackend::Postgres,
@@ -1043,7 +1057,7 @@ async fn assert_projection_versions(
     {
         return Err(ApplicationError::Disabled);
     }
-    Ok(())
+    Ok(write_version)
 }
 
 const MAX_PROJECTION_AUTHORITY_DURATION_MILLIS: i64 = 86_400_000;
@@ -1070,6 +1084,136 @@ pub(crate) struct PostgresProjectionEmailKeyAuthority {
 impl PostgresProjectionEmailKeyAuthority {
     pub(crate) fn new(database: sea_orm::DatabaseConnection) -> Self {
         Self { database }
+    }
+
+    /// Re-encrypts a bounded set of stored projection fields under the authority-backed write
+    /// version. Rows are claimed with `SKIP LOCKED`, so concurrent supervisors make disjoint
+    /// progress and a process restart safely resumes from the remaining old-version inventory.
+    /// Public projection semantics and immutable events are deliberately untouched.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded transaction keeps authority validation, exact-context crypto, and conditional storage-only writes together"
+    )]
+    pub(crate) async fn rewrap_projection_email_batch(
+        &self,
+        protector: &dyn ProjectionVerifiedEmailProtector,
+        limit: u64,
+    ) -> Result<u64, ApplicationError> {
+        const MAX_BATCH: u64 = 256;
+        if !(1..=MAX_BATCH).contains(&limit) {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let limit = i64::try_from(limit).map_err(|_| ApplicationError::InvalidInput)?;
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        let authority = transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT write_version,accepted_versions FROM projection_email_key_authority \
+                 WHERE singleton=TRUE FOR SHARE"
+                    .to_owned(),
+            ))
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+        let write_version: i32 = authority
+            .try_get("", "write_version")
+            .map_err(persistence)?;
+        let accepted: Vec<i32> = authority
+            .try_get("", "accepted_versions")
+            .map_err(persistence)?;
+        let readable = protector.readable_versions();
+        if protector.write_version() != write_version
+            || !accepted.contains(&write_version)
+            || accepted.iter().any(|version| !readable.contains(version))
+        {
+            return Err(ApplicationError::Disabled);
+        }
+
+        let rows = transaction
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id,project_id,application_id,user_id,projection_revision, \
+                        verified_email_ciphertext,verified_email_key_version \
+                   FROM application_user_projections \
+                  WHERE verified_email_key_version IS NOT NULL \
+                    AND verified_email_key_version<>$1 \
+                  ORDER BY verified_email_key_version,id \
+                  LIMIT $2 FOR UPDATE SKIP LOCKED",
+                [write_version.into(), limit.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        let mut rewrapped = 0_u64;
+        for row in rows {
+            let id: uuid::Uuid = row.try_get("", "id").map_err(persistence)?;
+            let project_id: uuid::Uuid = row.try_get("", "project_id").map_err(persistence)?;
+            let application_id: uuid::Uuid =
+                row.try_get("", "application_id").map_err(persistence)?;
+            let user_id: uuid::Uuid = row.try_get("", "user_id").map_err(persistence)?;
+            let projection_revision: i64 = row
+                .try_get("", "projection_revision")
+                .map_err(persistence)?;
+            let ciphertext: Vec<u8> = row
+                .try_get("", "verified_email_ciphertext")
+                .map_err(persistence)?;
+            let old_version: i32 = row
+                .try_get("", "verified_email_key_version")
+                .map_err(persistence)?;
+            if old_version <= 0
+                || !accepted.contains(&old_version)
+                || !readable.contains(&old_version)
+            {
+                return Err(ApplicationError::Disabled);
+            }
+            let old = ProtectedValue {
+                ciphertext: ciphertext.clone(),
+                key_version: old_version,
+            };
+            let plaintext = protector.unprotect_verified_email(
+                project_id,
+                application_id,
+                user_id,
+                projection_revision,
+                &old,
+            )?;
+            let protected = protector.protect_verified_email(
+                project_id,
+                application_id,
+                user_id,
+                projection_revision,
+                plaintext.as_bytes(),
+            )?;
+            if protected.key_version != write_version {
+                return Err(ApplicationError::Disabled);
+            }
+            let result = transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE application_user_projections \
+                        SET verified_email_ciphertext=$1,verified_email_key_version=$2 \
+                      WHERE id=$3 AND projection_revision=$4 \
+                        AND verified_email_key_version=$5 \
+                        AND verified_email_ciphertext=$6",
+                    [
+                        protected.ciphertext.into(),
+                        protected.key_version.into(),
+                        id.into(),
+                        projection_revision.into(),
+                        old_version.into(),
+                        ciphertext.into(),
+                    ],
+                ))
+                .await
+                .map_err(persistence)?;
+            if result.rows_affected() != 1 {
+                return Err(ApplicationError::Integrity);
+            }
+            rewrapped = rewrapped
+                .checked_add(1)
+                .ok_or(ApplicationError::Integrity)?;
+        }
+        transaction.commit().await.map_err(persistence)?;
+        Ok(rewrapped)
     }
 
     pub(crate) async fn observe_runtime(
@@ -1399,77 +1543,57 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{projection_verified_email_context, protect_projection_verified_email};
     use crate::{
-        adapters::runtime_security::{RuntimeKeyMaterial, SoftwareRuntimeProtector},
-        application::{ApplicationError, ProtectedPurpose, RuntimeProtector},
+        adapters::runtime_security::SoftwareProjectionVerifiedEmailProtector,
+        application::{ApplicationError, ProjectionVerifiedEmailProtector},
     };
 
     #[test]
     fn verified_email_ciphertext_is_bound_to_the_exact_projection_context() {
-        let protector = SoftwareRuntimeProtector::new(
+        let protector = SoftwareProjectionVerifiedEmailProtector::new(
             "projection-context-test".to_owned(),
             1,
-            RuntimeKeyMaterial::new([41; 32], [42; 32]),
+            [42; 32],
             BTreeMap::new(),
         )
         .expect("projection protector");
         let project_id = Uuid::new_v4();
         let application_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        let protected = protect_projection_verified_email(
-            &protector,
-            project_id,
-            application_id,
-            user_id,
-            7,
-            "ada@example.test",
-        )
-        .expect("protect verified email");
-        let exact = projection_verified_email_context(project_id, application_id, user_id, 7)
-            .expect("exact context");
+        let protected = protector
+            .protect_verified_email(project_id, application_id, user_id, 7, b"ada@example.test")
+            .expect("protect verified email");
         assert_eq!(
             protector
-                .unprotect(
-                    ProtectedPurpose::ApplicationProjectionVerifiedEmail,
-                    &exact,
-                    &protected,
-                )
+                .unprotect_verified_email(project_id, application_id, user_id, 7, &protected,)
                 .expect("exact context decrypts")
-                .as_slice(),
-            b"ada@example.test"
+                .as_str(),
+            "ada@example.test"
         );
 
         let substitutions = [
-            projection_verified_email_context(Uuid::new_v4(), application_id, user_id, 7)
-                .expect("different Project context"),
-            projection_verified_email_context(project_id, Uuid::new_v4(), user_id, 7)
-                .expect("different Application context"),
-            projection_verified_email_context(project_id, application_id, Uuid::new_v4(), 7)
-                .expect("different user context"),
-            projection_verified_email_context(project_id, application_id, user_id, 8)
-                .expect("different revision context"),
+            (Uuid::new_v4(), application_id, user_id, 7),
+            (project_id, Uuid::new_v4(), user_id, 7),
+            (project_id, application_id, Uuid::new_v4(), 7),
+            (project_id, application_id, user_id, 8),
         ];
-        for substituted in substitutions {
+        for (
+            substituted_project,
+            substituted_application,
+            substituted_user,
+            substituted_revision,
+        ) in substitutions
+        {
             assert_eq!(
-                protector.unprotect(
-                    ProtectedPurpose::ApplicationProjectionVerifiedEmail,
-                    &substituted,
+                protector.unprotect_verified_email(
+                    substituted_project,
+                    substituted_application,
+                    substituted_user,
+                    substituted_revision,
                     &protected,
                 ),
                 Err(ApplicationError::Integrity)
             );
         }
-
-        let mut substituted_schema = exact;
-        *substituted_schema.last_mut().expect("schema context byte") ^= 1;
-        assert_eq!(
-            protector.unprotect(
-                ProtectedPurpose::ApplicationProjectionVerifiedEmail,
-                &substituted_schema,
-                &protected,
-            ),
-            Err(ApplicationError::Integrity)
-        );
     }
 }

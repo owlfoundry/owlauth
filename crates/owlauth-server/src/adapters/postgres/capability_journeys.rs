@@ -616,10 +616,6 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
             "1".to_owned(),
         ),
         (
-            "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY".to_owned(),
-            "RkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkY".to_owned(),
-        ),
-        (
             "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY".to_owned(),
             "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c".to_owned(),
         ),
@@ -4316,7 +4312,7 @@ async fn migrate_and_verify_main_database(
         .await
         .expect("baseline binary should accept its own compatibility floor");
     sqlx::query("UPDATE schema_compatibility SET minimum_binary_schema_level=$1 WHERE singleton")
-        .bind(20_260_805_130_001_i64)
+        .bind(20_260_805_140_001_i64)
         .execute(&mut compatibility_connection)
         .await
         .expect("newer compatibility floor should install");
@@ -4327,7 +4323,7 @@ async fn migrate_and_verify_main_database(
         SchemaError::IncompatibleHistory
     );
     sqlx::query("UPDATE schema_compatibility SET minimum_binary_schema_level=$1 WHERE singleton")
-        .bind(20_260_805_130_000_i64)
+        .bind(20_260_805_140_000_i64)
         .execute(&mut compatibility_connection)
         .await
         .expect("current compatibility floor should restore");

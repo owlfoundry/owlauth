@@ -35,7 +35,7 @@ use crate::{
         ManagedConnectionService, ProjectionExpansionWorker, ProviderEgressPolicyPort,
         RuntimeAuthService, SmtpCredentialResolver, SmtpTlsMode, WebhookWorker,
     },
-    config::{DeploymentSmtpStatus, PlaneMode, ServerConfig},
+    config::{DeploymentSmtpStatus, ListenerConfig, PlaneMode, ServerConfig},
     domain::{ProviderEgressMode, ProviderEgressPolicy},
     http::{PlaneRouters, build_routers_with_capabilities},
     providers::{ActiveProvider, ProviderRegistrations},
@@ -359,6 +359,15 @@ pub async fn run_with_providers(
         client_digest_readiness.map(spawn_client_digest_readiness_renewal);
 
     routers.mark_ready();
+    if config.mode.has_runtime() {
+        log_listener_ready("Runtime", &config.runtime, "auth/");
+    }
+    if config.mode.has_client() {
+        log_listener_ready("Client", &config.client, "ready");
+    }
+    if config.mode.has_control() {
+        log_listener_ready("Control", &config.control, "console/");
+    }
     tracing::info!(
         event = "server_ready",
         mode = ?config.mode,
@@ -799,22 +808,10 @@ fn projection_email_protector(
     config: &ServerConfig,
 ) -> Result<SoftwareProjectionVerifiedEmailProtector, crate::application::ApplicationError> {
     let protection = &config.projection_email_protection;
-    let active = RuntimeKeyMaterial::new(
-        protection.active.digest_key.expose_copy(),
-        protection.active.protection_key.expose_copy(),
-    );
     let retained = protection
         .retained
         .iter()
-        .map(|(version, keys)| {
-            (
-                *version,
-                RuntimeKeyMaterial::new(
-                    keys.digest_key.expose_copy(),
-                    keys.protection_key.expose_copy(),
-                ),
-            )
-        })
+        .map(|(version, key)| (*version, key.expose_copy()))
         .collect::<BTreeMap<_, _>>();
     SoftwareProjectionVerifiedEmailProtector::new(
         config
@@ -822,9 +819,89 @@ fn projection_email_protector(
             .clone()
             .ok_or(crate::application::ApplicationError::Integrity)?,
         protection.active_version,
-        active,
+        protection.active_key.expose_copy(),
         retained,
     )
+}
+
+#[derive(Clone)]
+struct ProjectionEmailMaintenance {
+    authority: PostgresProjectionEmailKeyAuthority,
+    protector: SoftwareProjectionVerifiedEmailProtector,
+    process_id: String,
+    runtime_incarnation: Uuid,
+    required_process_ids: Vec<String>,
+    lease: time::Duration,
+    retention: time::Duration,
+    cutover: Option<i32>,
+    retirement: Option<i32>,
+}
+
+impl ProjectionEmailMaintenance {
+    async fn observe(&self) -> Result<(), crate::application::ApplicationError> {
+        self.authority
+            .observe_runtime(
+                &self.process_id,
+                self.runtime_incarnation,
+                &self.protector,
+                self.lease,
+            )
+            .await
+    }
+
+    async fn reconcile(&self) -> Result<(), crate::application::ApplicationError> {
+        self.authority
+            .reconcile(
+                &self.required_process_ids,
+                &self.protector,
+                self.cutover,
+                self.retirement,
+                self.retention,
+            )
+            .await
+    }
+
+    async fn maintain(
+        &self,
+    ) -> (
+        Result<(), crate::application::ApplicationError>,
+        Result<u64, crate::application::ApplicationError>,
+    ) {
+        // Rewrap remains independent of lifecycle reconciliation so a blocked retirement cannot
+        // prevent the mutable storage inventory from converging.
+        let reconciliation = self.reconcile().await;
+        let rewrap = self
+            .authority
+            .rewrap_projection_email_batch(&self.protector, 100)
+            .await;
+        (reconciliation, rewrap)
+    }
+}
+
+fn log_projection_email_maintenance(
+    reconciliation: Result<(), crate::application::ApplicationError>,
+    rewrap: Result<u64, crate::application::ApplicationError>,
+) {
+    if reconciliation.is_ok() && rewrap.is_ok() {
+        return;
+    }
+    let unexpected = [reconciliation.as_ref().err(), rewrap.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .any(|error| !matches!(error, crate::application::ApplicationError::Disabled));
+    if unexpected {
+        tracing::warn!(
+            event = "projection_email_key_reconciliation_pending",
+            reconciliation_error = ?reconciliation.as_ref().err(),
+            rewrap_error = ?rewrap.as_ref().err(),
+            "projection verified-email key lifecycle failed closed and will retry"
+        );
+    } else {
+        tracing::debug!(
+            event = "projection_email_key_reconciliation_pending",
+            "projection verified-email key lifecycle is waiting on bounded convergence"
+        );
+    }
 }
 
 async fn reconcile_projection_email_protection(
@@ -839,72 +916,47 @@ async fn reconcile_projection_email_protection(
         .runtime
         .as_ref()
         .ok_or(crate::application::ApplicationError::Persistence)?;
-    let authority = PostgresProjectionEmailKeyAuthority::new(database.clone());
-    let protector = projection_email_protector(config)?;
-    let lease = time::Duration::seconds(
-        i64::try_from(
-            config
-                .publication_lease_ttl
-                .as_secs()
-                .max(5)
-                .saturating_mul(2),
-        )
-        .map_err(|_| crate::application::ApplicationError::Integrity)?,
-    );
-    let retention = time::Duration::try_from(config.key_propagation_delay)
-        .map_err(|_| crate::application::ApplicationError::Integrity)?;
-    let cutover = config.projection_email_protection.cutover_version;
-    let retirement = config.projection_email_protection.retire_version;
-    let first = authority
-        .reconcile(
-            &config.required_runtime_process_ids,
-            &protector,
-            cutover,
-            retirement,
-            retention,
-        )
-        .await;
-    if first.is_err() && cutover.is_none() && retirement.is_none() {
+    let lease_seconds = config
+        .publication_lease_ttl
+        .as_secs()
+        .max(5)
+        .saturating_mul(2);
+    let maintenance = ProjectionEmailMaintenance {
+        authority: PostgresProjectionEmailKeyAuthority::new(database.clone()),
+        protector: projection_email_protector(config)?,
+        process_id: config.runtime_process_id.clone(),
+        runtime_incarnation,
+        required_process_ids: config.required_runtime_process_ids.clone(),
+        lease: time::Duration::seconds(
+            i64::try_from(lease_seconds)
+                .map_err(|_| crate::application::ApplicationError::Integrity)?,
+        ),
+        retention: time::Duration::try_from(config.key_propagation_delay)
+            .map_err(|_| crate::application::ApplicationError::Integrity)?,
+        cutover: config.projection_email_protection.cutover_version,
+        retirement: config.projection_email_protection.retire_version,
+    };
+    let first = maintenance.reconcile().await;
+    if first.is_err() && maintenance.cutover.is_none() && maintenance.retirement.is_none() {
         first?;
     }
-    authority
-        .observe_runtime(
-            &config.runtime_process_id,
-            runtime_incarnation,
-            &protector,
-            lease,
-        )
-        .await?;
-    let _ = authority
-        .reconcile(
-            &config.required_runtime_process_ids,
-            &protector,
-            cutover,
-            retirement,
-            retention,
-        )
-        .await;
+    maintenance.observe().await?;
+    let (reconciliation, rewrap) = maintenance.maintain().await;
+    log_projection_email_maintenance(reconciliation, rewrap);
 
-    let process_id = config.runtime_process_id.clone();
-    let required = config.required_runtime_process_ids.clone();
     Ok(Some(tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let result = async {
-                authority
-                    .observe_runtime(&process_id, runtime_incarnation, &protector, lease)
-                    .await?;
-                authority
-                    .reconcile(&required, &protector, cutover, retirement, retention)
-                    .await
-            }
-            .await;
-            if result.is_err() {
+            if let Err(error) = maintenance.observe().await {
                 tracing::warn!(
                     event = "projection_email_key_reconciliation_pending",
-                    "projection verified-email key lifecycle remains fail-closed and will retry"
+                    error = ?error,
+                    "projection verified-email observation failed closed and will retry"
                 );
+                continue;
             }
+            let (reconciliation, rewrap) = maintenance.maintain().await;
+            log_projection_email_maintenance(reconciliation, rewrap);
         }
     })))
 }
@@ -1132,13 +1184,39 @@ async fn reconcile_project_smtp_readiness_batch_before(
             unavailable = unavailable.saturating_add(1);
         }
     }
-    tracing::info!(
-        event = "project_smtp_readiness_reconciled",
-        ready,
-        unavailable,
-        "bounded Project SMTP readiness inventory completed"
-    );
+    if observed == 0 {
+        tracing::debug!(
+            event = "project_smtp_readiness_reconciled",
+            ready,
+            unavailable,
+            "bounded Project SMTP readiness inventory completed without candidates"
+        );
+    } else {
+        tracing::info!(
+            event = "project_smtp_readiness_reconciled",
+            ready,
+            unavailable,
+            "bounded Project SMTP readiness inventory completed"
+        );
+    }
     Ok(observed)
+}
+
+fn log_listener_ready(plane: &'static str, listener: &ListenerConfig, open_path: &str) {
+    let open_url = listener
+        .external_base
+        .join(open_path)
+        .unwrap_or_else(|_| listener.external_base.clone());
+    tracing::info!(
+        event = "listener_ready",
+        plane,
+        bind_address = %listener.bind,
+        base_url = %listener.external_base,
+        open_url = %open_url,
+        "{plane} listening at {}; open {}",
+        listener.external_base,
+        open_url
+    );
 }
 
 async fn bind_selected(

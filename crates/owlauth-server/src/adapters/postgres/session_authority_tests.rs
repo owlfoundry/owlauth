@@ -5297,7 +5297,7 @@ async fn identity_creation_is_serialized_and_project_scoped_in_postgres() {
             SoftwareProjectionVerifiedEmailProtector::new(
                 "provider-profile-event-test".to_owned(),
                 1,
-                RuntimeKeyMaterial::new([101; 32], [102; 32]),
+                [102; 32],
                 BTreeMap::new(),
             )
             .expect("provider profile projection protector"),

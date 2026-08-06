@@ -12,15 +12,18 @@ From the repository root, copy the public disposable development configuration a
 planes plus PostgreSQL and Redis:
 
 ```bash
+make install
 cp .env.example .env
 make dev
 ```
 
-Runtime defaults to `http://127.0.0.1:8080/`; its liveness and readiness endpoints are `/health`
-and `/ready`, and the Hosted Authentication UI shell is at `/auth/`. Control defaults to
-`http://127.0.0.1:8081/`, with the Management Console at `/console/`. The fixed keys in
-`.env.example` are public development values and must never be reused outside disposable local
-state.
+`make dev-check` runs the same non-mutating `.env`, tool, Docker, and Compose preflight without
+starting services. Runtime defaults to `http://127.0.0.1:8080/`; its liveness and readiness endpoints
+are `/health` and `/ready`, and the Hosted Authentication UI shell is at `/auth/`. Client defaults to
+`http://127.0.0.1:8082/`; its directly openable readiness endpoint is `/ready`. Control defaults to
+`http://127.0.0.1:8081/`, with the Management Console at `/console/`. Startup logs print these direct
+links. The fixed keys in `.env.example` are public development values and must never be reused outside
+disposable local state.
 
 To compose all three planes, configure independent listeners and a canonical operator key:
 
@@ -42,7 +45,6 @@ OWLAUTH_EMAIL_IDENTITY_KEY_VERSION=1 \
 OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY='<independent-43-character-long-term-digest-key>' \
 OWLAUTH_EMAIL_IDENTITY_PROTECTION_KEY='<independent-43-character-long-term-protection-key>' \
 OWLAUTH_PROJECTION_EMAIL_KEY_VERSION=1 \
-OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY='<independent-43-character-projection-digest-key>' \
 OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY='<independent-43-character-projection-protection-key>' \
 OWLAUTH_MANAGED_REAUTHORIZATION_KEY_VERSION=1 \
 OWLAUTH_MANAGED_REAUTHORIZATION_DIGEST_KEY='<dedicated-43-character-base64url-target-digest-key>' \
@@ -110,10 +112,9 @@ The process rejects unknown `OWLAUTH_*` variables and validates all selected-pla
 | `OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY`                 | required with email identity key version          | Independent 32-byte long-term email identity digest root; must not equal any short-term or retained root                                                                                   |
 | `OWLAUTH_EMAIL_IDENTITY_PROTECTION_KEY`             | required with email identity key version          | Independent 32-byte long-term email identity AEAD root; must not equal any other active or retained root                                                                                   |
 | `OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS`              | unset                                             | JSON map of at most 15 independently retained older long-term email identity digest/AEAD versions                                                                                          |
-| `OWLAUTH_PROJECTION_EMAIL_KEY_VERSION`              | required for every serving plane                  | Positive active version for the narrow verified-email projection field ring                                                                                                                |
-| `OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY`               | required for every serving plane                  | Independent 32-byte verified-email projection digest key encoded as 43 unpadded base64url characters                                                                                       |
+| `OWLAUTH_PROJECTION_EMAIL_KEY_VERSION`              | required for every serving plane                  | Positive active version for the narrow verified-email projection AEAD ring                                                                                                                 |
 | `OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY`           | required for every serving plane                  | Independent 32-byte verified-email projection AEAD key encoded as 43 unpadded base64url characters                                                                                         |
-| `OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS`            | unset                                             | JSON map of retained projection digest/protection versions required until roster observation and ciphertext inventory prove retirement safe                                                |
+| `OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS`            | unset                                             | JSON map from at most 15 retained positive versions to 43-character projection AEAD keys required until roster observation and ciphertext inventory prove retirement safe                  |
 | `OWLAUTH_PROJECTION_EMAIL_CUTOVER_VERSION`          | unset                                             | Explicit deployment-wide projection write cutover authorization                                                                                                                            |
 | `OWLAUTH_PROJECTION_EMAIL_RETIRE_VERSION`           | unset                                             | Separate retire-only authorization after every required Runtime observation and predecessor reference clears                                                                               |
 | `OWLAUTH_EMAIL_IDENTITY_ALIAS_CUTOVER_VERSION`      | unset                                             | Explicit email-identity lookup-alias write cutover or pre-retirement rollback; must equal the active email identity version and cannot coexist with retirement                             |
@@ -159,6 +160,34 @@ The process rejects unknown `OWLAUTH_*` variables and validates all selected-pla
 | `OWLAUTH_MAX_REQUEST_BYTES`                         | `1048576`                                         | Request body limit                                                                                                                                                                         |
 | `OWLAUTH_SHUTDOWN_TIMEOUT_MS`                       | `10000`                                           | Graceful drain deadline                                                                                                                                                                    |
 
+### Key-version and rotation model
+
+A `*_KEY_VERSION` selects the active entry in one purpose-specific data-protection or digest ring;
+it is not a command to rotate every OwlAuth secret. New values use the active version and persisted
+rows retain the exact version required to read or verify them. Add the predecessor to the matching
+`*_RETAINED_KEYS` map before changing an active version, deploy the readable set to every process
+that needs that capability, and remove it only after the corresponding PostgreSQL inventory and
+roster/readiness checks prove zero live references.
+
+Rotation behavior is purpose-specific:
+
+- short-lived Runtime, managed-reauthorization, and identity-mutation material drains by expiry or
+  bounded terminalization rather than full-table re-encryption;
+- durable email identity PII/aliases, Application verified-email projection fields, and managed
+  provider credentials converge through bounded background rewrap before an old version may retire;
+  projection events are immutable and drain only through their retention lifecycle;
+- Project client-key digests cannot be rehashed because plaintext client secrets are never stored;
+  retain the old digest key, or revoke and reissue affected Project client keys;
+- Project JWT signing keys and provider/SMTP/webhook secret generations use their PostgreSQL-backed
+  resource lifecycle APIs, not these environment versions;
+- `OWLAUTH_SOFTWARE_CUSTODY_KEY` is a separate static v1 root with no online rotation or retained
+  set. Never replace it in place; custody-root rotation requires a future explicit envelope/rewrap
+  design.
+
+There is intentionally no generic “rotate all” endpoint. The email-identity runbook below documents
+the most involved environment-ring transition; every other ring must follow its own inventory and
+readiness contract in the normative specifications.
+
 ## Upstream provider profiles
 
 Provider creation names one closed adapter kind; dispatch never falls back from a named adapter to generic OIDC semantics:
@@ -179,13 +208,59 @@ Deployment SMTP fields are an all-or-none process registry. For first-time combi
 
 Runtime retains protected challenge addresses and outbox envelope/body payloads only while they are useful plus a fixed 10-minute terminal investigation window. Bounded Runtime maintenance terminalizes abandoned or exhausted work, irreversibly sets those ciphertext/key-version columns to `NULL`, and deletes expired or terminal magic transfer contexts while retaining safe statuses, timestamps, message IDs, and audit metadata. Each cleanup class runs in an independently timed transaction under a shared 100-row/200 ms tick budget. A cleanup timeout is reported and retried but cannot prevent the same worker tick from claiming due mail.
 
-Runtime uses two independent protection inventories and lifecycles. The short-term `OWLAUTH_RUNTIME_*` ring protects interactions, challenges, and outbox payloads; remove a predecessor from `OWLAUTH_RUNTIME_RETAINED_KEYS` only after the short-term inventory is clear. The durable `OWLAUTH_EMAIL_IDENTITY_*` ring protects encrypted identity addresses and lookup aliases; first rewrap identity PII, backfill and retire aliases under the durable active version, verify the durable inventory is clear, and only then remove that predecessor from `OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS`. Clearing one inventory never authorizes retirement from the other ring. Missing short-term material is terminalized without cross-purpose fallback; missing durable email-identity material fails readiness closed because silently discarding or substituting identity data would break uniqueness and recovery. Durable active plus retained versions are capped at 16 so every login can atomically backfill the complete accepted alias set. All `OWLAUTH_EMAIL_IDENTITY_*` settings, including long-term secrets and alias rollout flags, are Runtime-only; Control-only configuration explicitly rejects them and must never receive their values.
+Runtime uses two independent protection inventories and lifecycles. The short-term `OWLAUTH_RUNTIME_*` ring protects interactions, challenges, and outbox payloads; remove a predecessor from `OWLAUTH_RUNTIME_RETAINED_KEYS` only after the short-term inventory is clear. The durable `OWLAUTH_EMAIL_IDENTITY_*` ring protects encrypted identity addresses and lookup aliases; first rewrap identity PII, backfill and retire aliases under the durable active version, verify the durable inventory is clear, and only then remove that predecessor from `OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS`. Clearing one inventory never authorizes retirement from the other ring. Missing short-term material is terminalized without cross-purpose fallback; missing durable email-identity material fails readiness closed because silently discarding or substituting identity data would break uniqueness and recovery. Durable active plus retained versions are capped at 16 so every login can atomically backfill the complete accepted alias set. Runtime owns email lookup, writes, alias authority, and rewrap. A Control process that materializes verified-email projections may load the same physical `OWLAUTH_EMAIL_IDENTITY_*` ring only behind the exact `(Project, identity, protected value)` decrypt-only designated-address reader; it receives no lookup digest, alias, encryption, arbitrary-context, or generic Runtime protection capability.
+
+### Verified-email projection key rotation runbook
+
+The projection ring is AEAD-only: its versioned keys protect the verified-email field, while the
+public projection document digest remains an unkeyed canonical SHA-256 digest and has no secret
+root. Retained-key JSON therefore has the simple shape `{"1":"<43-character-base64url-key>"}`.
+Treat `OWLAUTH_PROJECTION_EMAIL_CUTOVER_VERSION` and
+`OWLAUTH_PROJECTION_EMAIL_RETIRE_VERSION` as separate deployment-wide phases. Mutable
+`application_user_projections` rows are storage-only rewrapped in bounded 100-row transactions with
+`FOR UPDATE SKIP LOCKED`; this covers cold rows and rows owned by disabled Projects, Applications,
+users, or bindings without changing projection revisions, public documents/digests, source/policy
+metadata, or emitting an event. Opportunity-driven materialization also refuses to reuse a
+ciphertext whose key version differs from the PostgreSQL-authoritative write version.
+
+1. Keep the predecessor as `OWLAUTH_PROJECTION_EMAIL_KEY_VERSION` and add the future version to
+   `OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS` so both are readable. Deploy the same readable set to
+   every serving plane and confirm `OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS` names the complete Runtime
+   roster. Leave both projection rotation flags unset during this verifier-first rollout.
+2. Promote the new version into `OWLAUTH_PROJECTION_EMAIL_KEY_VERSION` and its active key, move the
+   predecessor into `OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS`, and set only
+   `OWLAUTH_PROJECTION_EMAIL_CUTOVER_VERSION` to the new active version. Runtime stages the version,
+   waits for live observations from every
+   required Runtime process, and only then advances the PostgreSQL write authority. A missing or
+   stale roster observation leaves projection writes and maintenance fail-closed.
+3. After cutover, remove the cutover flag and leave retirement unset. Keep all predecessor key
+   material deployed while the continuous bounded rewrap lane and ordinary projection access drain
+   every mutable projection row. Concurrent Runtime supervisors claim disjoint rows and safely
+   resume the remaining inventory after restart.
+4. Verify `application_user_projections` has zero rows referencing the predecessor. Do **not** infer
+   retirement safety from that inventory alone: `application_user_events` is immutable, so its
+   protected verified-email snapshot is never rewrapped or rewritten.
+5. Wait for the longest old-version event lifetime and the cleanup backlog to drain. Events have a
+   fixed maximum `retain_until` of 30 days from `occurred_at` (the replay window is 29 days), but
+   bounded cleanup may take longer when deliveries, attempts, replay descendants, contention, or
+   downtime leave a backlog. Continue retaining the predecessor until PostgreSQL reports zero
+   `application_user_events.verified_email_key_version` references; an elapsed wall-clock estimate
+   is not sufficient.
+6. In a later rollout, set only `OWLAUTH_PROJECTION_EMAIL_RETIRE_VERSION` to the predecessor
+   version. Keep the complete readable set and exact Runtime roster live. Retirement remains
+   blocked while either mutable projections or retained immutable events reference the predecessor;
+   once reference-free, authority records retirement and waits the configured propagation delay
+   before removing that version from `accepted_versions`.
+7. Only after PostgreSQL authority no longer accepts the predecessor, clear the retire flag and
+   remove that predecessor entry from `OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS`. Never combine
+   cutover and retirement, bypass the observation/retention gates, delete retained events early, or
+   rewrite event ciphertext in place.
 
 ### Email identity alias cutover runbook
 
 Treat `OWLAUTH_EMAIL_IDENTITY_ALIAS_CUTOVER_VERSION` as a deployment-wide, explicitly staged operation rather than an ordinary rolling environment change:
 
-1. Add the new durable digest and protection keys as the active Runtime version while retaining every old durable version in `OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS`. Leave the cutover variable unset. Deploy this readable-key set only to the complete split-topology Runtime roster; never send it to Control's validation path. Keep the separate short-term `OWLAUTH_RUNTIME_*` ring unchanged unless it is undergoing its own independently inventoried rotation.
+1. Add the new durable digest and protection keys as the active version while retaining every old durable version in `OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS`. Leave the cutover variable unset. Deploy this readable-key set to the complete split-topology Runtime roster and to any Control process that materializes verified-email projections; Control receives it only through the designated-address reader described above and does not participate in alias authority. Keep the separate short-term `OWLAUTH_RUNTIME_*` ring unchanged unless it is undergoing its own independently inventoried rotation.
 2. Confirm `OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS` exactly names every Runtime-capable process. Wait until every required process has a live observation lease for the current email-alias authority revision and active key version. An extra live process, a missing roster member, or a stale revision blocks cutover.
 3. Drain stale Runtime nodes: stop new traffic and workers, stop lease renewal, wait for the publication lease to expire, and verify the node no longer appears in the live observation set. Do not bypass the roster check.
 4. Set `OWLAUTH_EMAIL_IDENTITY_ALIAS_CUTOVER_VERSION` to the active `OWLAUTH_EMAIL_IDENTITY_KEY_VERSION` on the complete Runtime roster. `OWLAUTH_EMAIL_IDENTITY_ALIAS_RETIRE_VERSION` must remain unset; configuration parsing rejects both flags together. Restart or roll only after all members have the readable key set. The authority changes `write_version` only when the exact live roster has observed the predecessor revision; it deliberately keeps both predecessor and new versions in `accepted_versions` and deletes no predecessor rows.
@@ -194,7 +269,7 @@ Treat `OWLAUTH_EMAIL_IDENTITY_ALIAS_CUTOVER_VERSION` as a deployment-wide, expli
 7. Only after the durable overlap-verification revision exists and every Runtime has observed it, begin a later deployment with **only** `OWLAUTH_EMAIL_IDENTITY_ALIAS_RETIRE_VERSION` set to the active version. Every live/required process must transition from retirement unset to set at or after that exact revision. A flag pre-set before observation remains durably stale and must be rolled off before this rollout. Only the complete later roster authorization records a retirement revision, collapses `accepted_versions`, and begins bounded predecessor deletion.
 8. Verify the durable alias and email-identity protection inventories contain no predecessor references, then remove the predecessor durable digest/protection material from `OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS`. Independently, remove a predecessor from `OWLAUTH_RUNTIME_RETAINED_KEYS` only after the short-term challenge/outbox inventory for that ring is clear; neither inventory substitutes for the other.
 
-This ordering is mandatory in combined and split deployments: Runtime-only readable-key rollout, exact Runtime-roster observation, stale-node drain, cutover-only write transition with overlap, cutover flag removal, durable post-cutover overlap verification, later retire-only complete-roster authorization, bounded alias retirement, then durable protector retirement. Simultaneous/pre-authorized cutover and retirement is invalid. The required Runtime roster, requested cutover/retirement versions, observation revisions, and authority events are non-secret operational metadata, but the `OWLAUTH_EMAIL_IDENTITY_*` environment settings remain confined to Runtime; Control observes only the persisted non-secret lifecycle state exposed by its authorized operational surface.
+This ordering is mandatory in combined and split deployments: readable-key rollout to the complete Runtime roster and designated Control projection readers, exact Runtime-roster observation, stale-node drain, cutover-only write transition with overlap, cutover flag removal, durable post-cutover overlap verification, later retire-only complete-roster authorization, bounded alias retirement, then durable protector retirement. Simultaneous/pre-authorized cutover and retirement is invalid. The required Runtime roster, requested cutover/retirement versions, observation revisions, and authority events are non-secret operational metadata; Control's only access to the physical ring remains the narrow designated-address reader.
 
 ## Database lock and migration recovery
 

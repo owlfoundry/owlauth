@@ -10,7 +10,10 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use owlauth_types::FEDERATED_PROJECT_AUTH_AVAILABLE;
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    de::{Error as _, MapAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -71,7 +74,6 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_EMAIL_IDENTITY_ALIAS_CUTOVER_VERSION",
     "OWLAUTH_EMAIL_IDENTITY_ALIAS_RETIRE_VERSION",
     "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION",
-    "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY",
     "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY",
     "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS",
     "OWLAUTH_PROJECTION_EMAIL_CUTOVER_VERSION",
@@ -361,8 +363,8 @@ pub struct ProjectionEmailProtectionConfig {
     pub active_version: i32,
     pub cutover_version: Option<i32>,
     pub retire_version: Option<i32>,
-    pub active: RuntimeKeyConfig,
-    pub retained: BTreeMap<i32, RuntimeKeyConfig>,
+    pub active_key: StoreMasterKey,
+    pub retained: BTreeMap<i32, StoreMasterKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -1460,6 +1462,40 @@ struct SerializedRuntimeKeyConfig {
     protection_key: String,
 }
 
+struct UniqueVersionedKeys(BTreeMap<i32, String>);
+
+impl<'de> Deserialize<'de> for UniqueVersionedKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueVersionedKeysVisitor;
+
+        impl<'de> Visitor<'de> for UniqueVersionedKeysVisitor {
+            type Value = UniqueVersionedKeys;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object with unique integer key versions")
+            }
+
+            fn visit_map<M>(self, mut entries: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut keys = BTreeMap::new();
+                while let Some((version, key)) = entries.next_entry::<i32, String>()? {
+                    if keys.insert(version, key).is_some() {
+                        return Err(M::Error::custom("duplicate key version"));
+                    }
+                }
+                Ok(UniqueVersionedKeys(keys))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueVersionedKeysVisitor)
+    }
+}
+
 fn parse_runtime_protection(
     mode: PlaneMode,
     values: &BTreeMap<String, String>,
@@ -1559,13 +1595,47 @@ fn parse_projection_email_protection(
             reason: "cutover and retirement require separate rollouts".to_owned(),
         });
     }
-    let (active_version, active, retained) = parse_protection_ring(
-        values,
-        "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION",
-        "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY",
+    let active_version = required(values, "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION")?
+        .parse::<i32>()
+        .ok()
+        .filter(|version| *version > 0)
+        .ok_or_else(|| ConfigError::InvalidValue {
+            key: "OWLAUTH_PROJECTION_EMAIL_KEY_VERSION",
+            reason: "must be a positive integer".to_owned(),
+        })?;
+    let active_key = StoreMasterKey::parse(
         "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY",
-        "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS",
+        required(values, "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY")?,
     )?;
+    let retained = serde_json::from_str::<UniqueVersionedKeys>(
+        optional(values, "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS").unwrap_or("{}"),
+    )
+    .map_err(|_| ConfigError::InvalidValue {
+        key: "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS",
+        reason: "must be a JSON object keyed by unique positive key versions".to_owned(),
+    })?
+    .0
+    .into_iter()
+    .map(|(version, key)| {
+        if version <= 0 || version == active_version {
+            return Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS",
+                reason: "versions must be positive and must not repeat the active version"
+                    .to_owned(),
+            });
+        }
+        Ok((
+            version,
+            StoreMasterKey::parse("OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS", key)?,
+        ))
+    })
+    .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if retained.len() > 15 {
+        return Err(ConfigError::InvalidValue {
+            key: "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS",
+            reason: "at most 15 retained versions are supported".to_owned(),
+        });
+    }
     let parse_authorization = |key: &'static str| {
         optional(values, key)
             .map(|value| {
@@ -1584,7 +1654,7 @@ fn parse_projection_email_protection(
         active_version,
         cutover_version: parse_authorization("OWLAUTH_PROJECTION_EMAIL_CUTOVER_VERSION")?,
         retire_version: parse_authorization("OWLAUTH_PROJECTION_EMAIL_RETIRE_VERSION")?,
-        active,
+        active_key,
         retained,
     })
 }
@@ -1805,15 +1875,10 @@ fn validate_protection_root_separation(
             )?;
         }
     }
-    for key in std::iter::once(&projection_email.active).chain(projection_email.retained.values()) {
-        insert(
-            key.digest_key.0.as_ref(),
-            "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY",
-        )?;
-        insert(
-            key.protection_key.0.as_ref(),
-            "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY",
-        )?;
+    for key in
+        std::iter::once(&projection_email.active_key).chain(projection_email.retained.values())
+    {
+        insert(key.0.as_ref(), "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY")?;
     }
     if let Some(managed_credential) = managed_credential {
         for key in std::iter::once(&managed_credential.active_key)
@@ -2351,10 +2416,6 @@ mod tests {
                 "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
             ),
             ("OWLAUTH_PROJECTION_EMAIL_KEY_VERSION", "1"),
-            (
-                "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY",
-                "RkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkY",
-            ),
             (
                 "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY",
                 "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c",
@@ -2992,6 +3053,43 @@ mod tests {
     }
 
     #[test]
+    fn projection_email_ring_accepts_only_aead_keys() {
+        let mut input = runtime_values();
+        input.extend(control_store_values());
+        input.insert(
+            "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS".to_owned(),
+            r#"{"2":"SEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEg"}"#.to_owned(),
+        );
+        let config = ServerConfig::from_values(&input).expect("AEAD-only projection ring parses");
+        assert_eq!(
+            config
+                .projection_email_protection
+                .retained
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([2])
+        );
+
+        for invalid in [
+            r#"{"2":{"digest_key":"SEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEg","protection_key":"SUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUk"}}"#,
+            r#"{"2":"SEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEg","2":"SUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUk"}"#,
+        ] {
+            input.insert(
+                "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS".to_owned(),
+                invalid.to_owned(),
+            );
+            assert!(matches!(
+                ServerConfig::from_values(&input),
+                Err(ConfigError::InvalidValue {
+                    key: "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn projection_roots_are_separate_from_admission_and_provisioning_roots() {
         let families = [
             (
@@ -3007,7 +3105,7 @@ mod tests {
             let mut active_alias = runtime_values();
             active_alias.extend(control_store_values());
             active_alias.insert(
-                "OWLAUTH_PROJECTION_EMAIL_DIGEST_KEY".to_owned(),
+                "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY".to_owned(),
                 family_material.to_owned(),
             );
             assert!(matches!(
@@ -3019,9 +3117,7 @@ mod tests {
             retained_alias.extend(control_store_values());
             retained_alias.insert(
                 "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS".to_owned(),
-                format!(
-                    r#"{{"2":{{"digest_key":"{family_material}","protection_key":"CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"}}}}"#
-                ),
+                format!(r#"{{"2":"{family_material}"}}"#),
             );
             assert!(matches!(
                 ServerConfig::from_values(&retained_alias),

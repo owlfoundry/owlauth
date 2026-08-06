@@ -740,18 +740,29 @@ fn build_projection_materializer_capabilities(
             }
             None => Arc::new(UnavailableDurableEmailAddressReader),
         };
-    let projection = &config.projection_email_protection;
-    let (active, retained) = build_material(&projection.active, &projection.retained);
-    let projection_protector = Arc::new(
-        SoftwareProjectionVerifiedEmailProtector::new(
-            deployment,
-            projection.active_version,
-            active,
-            retained,
-        )
-        .expect("validated projection verified-email protection configuration"),
-    );
+    let projection_protector = Arc::new(build_projection_email_protector(config));
     (source_reader, projection_protector)
+}
+
+fn build_projection_email_protector(
+    config: &ServerConfig,
+) -> SoftwareProjectionVerifiedEmailProtector {
+    let projection = &config.projection_email_protection;
+    let retained = projection
+        .retained
+        .iter()
+        .map(|(version, key)| (*version, key.expose_copy()))
+        .collect::<BTreeMap<_, _>>();
+    SoftwareProjectionVerifiedEmailProtector::new(
+        config
+            .instance_id
+            .clone()
+            .expect("validated projection protection has an instance ID"),
+        projection.active_version,
+        projection.active_key.expose_copy(),
+        retained,
+    )
+    .expect("validated projection verified-email protection configuration")
 }
 
 fn protection_material(
@@ -813,16 +824,10 @@ fn build_identity_runtime_protector(config: &ServerConfig) -> Arc<SplitRuntimePr
         };
         build(&runtime_shape)
     });
-    let projection = &config.projection_email_protection;
-    let projection_shape = crate::config::RuntimeProtectionConfig {
-        active_version: projection.active_version,
-        active: projection.active.clone(),
-        retained: projection.retained.clone(),
-    };
     Arc::new(SplitRuntimeProtector::new_with_projection_email(
         build(runtime),
         email,
-        build(&projection_shape),
+        build_projection_email_protector(config),
     ))
 }
 
@@ -1044,7 +1049,6 @@ fn build_runtime_auth_service(
             )
             .expect("validated Runtime protection configuration")
         };
-    let projection_email = &config.projection_email_protection;
     let protector = SplitRuntimeProtector::new_with_projection_email(
         build_ring(
             protection.active_version,
@@ -1061,11 +1065,7 @@ fn build_runtime_auth_service(
                     &email_identity.retained,
                 )
             }),
-        build_ring(
-            projection_email.active_version,
-            &projection_email.active,
-            &projection_email.retained,
-        ),
+        build_projection_email_protector(config),
     );
     let interaction_readable_key_versions = protector.readable_key_versions();
     let protector = Arc::new(protector);
