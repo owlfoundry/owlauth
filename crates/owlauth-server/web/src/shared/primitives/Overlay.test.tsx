@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import { Dialog } from "./Overlay";
 
@@ -15,7 +16,55 @@ function surface(open: boolean, onClose: () => void) {
   );
 }
 
+function NavigationSurface() {
+  const [open, setOpen] = useState(false);
+  const [route, setRoute] = useState("Projects");
+  const heading = useRef<HTMLHeadingElement>(null);
+  useLayoutEffect(() => {
+    heading.current?.focus();
+  }, [route]);
+  return (
+    <>
+      <h1 ref={heading} tabIndex={-1}>
+        {route}
+      </h1>
+      <button
+        type="button"
+        onClick={() => {
+          setOpen(true);
+        }}
+      >
+        Open navigation
+      </button>
+      <Dialog
+        open={open}
+        title="Navigation"
+        onClose={() => {
+          setOpen(false);
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            setOpen(false);
+            setRoute("Applications");
+          }}
+        >
+          Applications
+        </button>
+      </Dialog>
+    </>
+  );
+}
+
 describe("modal focus lifecycle", () => {
+  it("settles focus restoration before a navigation layout focuses the destination", () => {
+    render(<NavigationSurface />);
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Applications" }));
+    expect(screen.getByRole("heading", { name: "Applications" })).toHaveFocus();
+  });
+
   it("keeps focus across parent rerenders, uses the latest close callback, and restores once", () => {
     const firstClose = vi.fn();
     const latestClose = vi.fn();

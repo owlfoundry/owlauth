@@ -27,6 +27,8 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.getByLabel("Display name").fill(projectName);
   await page.getByRole("dialog").getByRole("button", { name: "Create Project" }).click();
   await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
+  const projectId = new URL(page.url()).pathname.split("/").at(-1);
+  if (projectId === undefined || projectId === "") throw new Error("Project route ID is absent");
   const projectPublicId = await page
     .getByRole("button", { name: "Copy Project public ID" })
     .locator("..")
@@ -239,7 +241,18 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await navigationSheet.getByText("Project context", { exact: true }).click();
   await expect(projectSwitcher).toBeFocused();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
-  await navigationSheet.getByRole("button", { name: "Close panel" }).click();
+  const mobileApplicationsLink = navigationSheet.getByRole("link", {
+    name: "Applications",
+    exact: true,
+  });
+  await mobileApplicationsLink.focus();
+  await expect(mobileApplicationsLink).toBeFocused();
+  await mobileApplicationsLink.press("Enter");
+  await expect(navigationSheet).toHaveCount(0);
+  await expect(page).toHaveURL(new RegExp(`/console/projects/${projectId}/applications$`, "u"));
+  const mobileDestinationHeading = page.getByRole("heading", { name: "Applications", exact: true });
+  await expect(mobileDestinationHeading).toBeVisible();
+  await expect(mobileDestinationHeading).toBeFocused();
 
   // A 1440px desktop at 200% browser zoom exposes roughly a 720 CSS-pixel layout viewport.
   for (const candidate of [page, runtimePage]) {

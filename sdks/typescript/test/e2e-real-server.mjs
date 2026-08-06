@@ -114,6 +114,7 @@ await assert.rejects(client.currentUser(logoutCredentials.accessToken), (error) 
 });
 
 const faultClient = sdkClient(process.env.OWLAUTH_E2E_FAULT_PROXY_BASE);
+await assertRejectedFaultDoesNotRemainArmed();
 const handoffFault = await browserCallback(faultClient);
 await armFault("exchange_handoff", "typescript-handoff");
 await assert.rejects(
@@ -208,6 +209,35 @@ function sdkClient(baseUrl) {
     allowInsecureLoopback: process.env.OWLAUTH_E2E_ALLOW_INSECURE_LOOPBACK === "1",
     timeoutMs: 15_000,
   });
+}
+
+async function assertRejectedFaultDoesNotRemainArmed() {
+  const label = "typescript-rejected-refresh";
+  await armFault("refresh_session", label);
+  const response = await fetch(
+    new URL(
+      `v1/projects/${encodeURIComponent(process.env.OWLAUTH_E2E_PROJECT_ID)}/auth/sessions/refresh`,
+      process.env.OWLAUTH_E2E_FAULT_PROXY_BASE,
+    ),
+    {
+      method: "POST",
+      redirect: "error",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: "{}",
+    },
+  );
+  assert.notEqual(response.status, 200, "malformed refresh unexpectedly committed");
+  const events = await fetch(
+    new URL("__e2e/events", process.env.OWLAUTH_E2E_FAULT_PROXY_BASE),
+    { headers: { authorization: `Bearer ${process.env.OWLAUTH_E2E_FAULT_PROXY_TOKEN}` } },
+  );
+  assert.equal(events.status, 200);
+  const document = await events.json();
+  assert.equal(
+    document.items.some((item) => item.label === label),
+    false,
+    "a rejected Runtime response was recorded as an injected transport fault",
+  );
 }
 
 async function armFault(operation, label) {

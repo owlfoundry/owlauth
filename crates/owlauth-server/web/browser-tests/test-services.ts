@@ -613,28 +613,29 @@ function createRuntimeFaultProxy(runtimeOrigin: string, controlToken: string) {
         }
         const fault = armed;
         const definition = fault === undefined ? undefined : faultDefinitions[fault.operation];
-        // Inject ambiguity only after the Runtime committed the operation successfully. Destroying
-        // a denial or admission response would misclassify an ordinary typed failure as a transport
-        // fault and could let the SDK evidence pass for the wrong reason.
+        // A matching request always consumes exactly one arm. Inject ambiguity only after the
+        // Runtime committed successfully; a denial or admission response must remain an ordinary
+        // typed response and must not leave stale global fault state for a retry or later operation.
         if (
           definition?.method === method &&
           definition.pattern.test(url.pathname) &&
-          fault !== undefined &&
-          upstream.status === 200
+          fault !== undefined
         ) {
-          const projectMatch = /^\/v1\/projects\/([^/]+)\//u.exec(url.pathname);
-          if (projectMatch?.[1] === undefined) throw new Error("fault project is absent");
           armed = undefined;
-          faultEvents.push({
-            ...fault,
-            method,
-            pathTemplate: definition.pathTemplate,
-            projectId: decodeURIComponent(projectMatch[1]),
-            upstreamStatus: upstream.status,
-          });
-          if (faultEvents.length > 64) faultEvents.shift();
-          response.destroy();
-          return;
+          if (upstream.status === 200) {
+            const projectMatch = /^\/v1\/projects\/([^/]+)\//u.exec(url.pathname);
+            if (projectMatch?.[1] === undefined) throw new Error("fault project is absent");
+            faultEvents.push({
+              ...fault,
+              method,
+              pathTemplate: definition.pathTemplate,
+              projectId: decodeURIComponent(projectMatch[1]),
+              upstreamStatus: upstream.status,
+            });
+            if (faultEvents.length > 64) faultEvents.shift();
+            response.destroy();
+            return;
+          }
         }
         const responseHeaders = { ...upstream.headers };
         delete responseHeaders.connection;
