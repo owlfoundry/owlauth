@@ -8,7 +8,8 @@ import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Field, Input, Select } from "../../shared/primitives/Field";
 import { Dialog } from "../../shared/primitives/Overlay";
 import { useControl, useProject } from "../app/ControlContext";
-import { type Application, IdempotencyAttempt, requireData } from "../client";
+import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
+import { type Application, ControlRequestError, IdempotencyAttempt, requireData } from "../client";
 import styles from "./pages.module.css";
 
 export function ApplicationsPage() {
@@ -18,33 +19,58 @@ export function ApplicationsPage() {
   const [applications, setApplications] = useState<Application[]>([]);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "failed">("loading");
   const [creating, setCreating] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createType, setCreateType] = useState<"web" | "native">("web");
+  const [createError, setCreateError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const attempt = useRef(new IdempotencyAttempt());
   const navigate = useNavigate();
 
-  const refresh = useCallback(async () => {
-    if (project === null) return;
-    setLoadState("loading");
-    try {
-      const result = await session.client.GET("/v1/projects/{project_id}/applications", {
-        params: { path: { project_id: project.id } },
-      });
-      setApplications(requireData(result.data, result.error, result.response).items);
-      setLoadState("ready");
-    } catch (error) {
-      setLoadState("failed");
-      throw error;
-    }
-  }, [project, session]);
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      if (project === null) return;
+      setLoadState("loading");
+      try {
+        const result = await session.client.GET("/v1/projects/{project_id}/applications", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        });
+        if (signal?.aborted !== true) {
+          setApplications(requireData(result.data, result.error, result.response).items);
+          setLoadState("ready");
+        }
+      } catch (error) {
+        if (signal?.aborted !== true) setLoadState("failed");
+        throw error;
+      }
+    },
+    [project, session],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void refresh().catch(handleError);
+      void refresh(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void handleError(error);
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
     };
   }, [handleError, refresh]);
+
+  function discardCreate() {
+    attempt.current.abandon();
+    setCreating(false);
+    setCreateName("");
+    setCreateType("web");
+    setCreateError(null);
+  }
+
+  function closeCreate() {
+    if (!submitting) discardCreate();
+  }
 
   async function createApplication(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();
@@ -53,6 +79,7 @@ export function ApplicationsPage() {
     const fields = new FormData(form);
     const idempotencyKey = attempt.current.begin();
     if (idempotencyKey === null) return;
+    setCreateError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST("/v1/projects/{project_id}/applications", {
@@ -69,10 +96,16 @@ export function ApplicationsPage() {
       attempt.current.settle();
       await refresh();
       setCreating(false);
-      setMessage("Application created.", "success");
+      setCreateName("");
+      setCreateType("web");
+      setCreateError(null);
+      setMessage(`Application “${created.display_name}” created.`, "success");
       void navigate(`/projects/${project.id}/applications/${created.id}`);
     } catch (error) {
       attempt.current.settle(error);
+      setCreateError(
+        error instanceof ControlRequestError ? error.message : "Application could not be created.",
+      );
       await handleError(error, refresh);
     } finally {
       setSubmitting(false);
@@ -90,8 +123,10 @@ export function ApplicationsPage() {
     );
   }
 
+  const createDirty = creating && (createName.trim() !== "" || createType !== "web");
   return (
     <div className={styles["page"]}>
+      <UnsavedChangesGuard dirty={createDirty} submitting={submitting} onDiscard={discardCreate} />
       <PageHeader
         title="Applications"
         description={`Applications that use ${project.display_name} as their authentication authority.`}
@@ -101,6 +136,7 @@ export function ApplicationsPage() {
               type="button"
               variant="primary"
               onClick={() => {
+                setCreateError(null);
                 setCreating(true);
               }}
             >
@@ -122,22 +158,9 @@ export function ApplicationsPage() {
         <EmptyState
           title="No Applications"
           description="Create an Application to define exact redirects, origins, and user delivery."
-          action={
-            project.status === "active" ? (
-              <Button
-                type="button"
-                variant="primary"
-                onClick={() => {
-                  setCreating(true);
-                }}
-              >
-                Create Application
-              </Button>
-            ) : undefined
-          }
         />
       ) : loadState === "ready" ? (
-        <DataTable caption="Applications" headings={["Application", "Type", "Status", "Revision"]}>
+        <DataTable caption="Applications" headings={["Application", "Type", "Status"]}>
           {applications.map((application) => (
             <tr key={application.id}>
               <td>
@@ -153,7 +176,6 @@ export function ApplicationsPage() {
               <td>
                 <StatusBadge status={application.status} />
               </td>
-              <td>{String(application.metadata_revision)}</td>
             </tr>
           ))}
         </DataTable>
@@ -161,22 +183,10 @@ export function ApplicationsPage() {
       <Dialog
         open={creating}
         title="Create Application"
-        onClose={() => {
-          if (!submitting) {
-            attempt.current.abandon();
-            setCreating(false);
-          }
-        }}
+        onClose={closeCreate}
         actions={
           <>
-            <Button
-              type="button"
-              variant="quiet"
-              disabled={submitting}
-              onClick={() => {
-                setCreating(false);
-              }}
-            >
+            <Button type="button" variant="quiet" disabled={submitting} onClick={closeCreate}>
               Cancel
             </Button>
             <Button type="submit" variant="primary" form="create-application" busy={submitting}>
@@ -185,6 +195,11 @@ export function ApplicationsPage() {
           </>
         }
       >
+        {createError === null ? null : (
+          <InlineAlert tone="danger" role="alert">
+            {createError}
+          </InlineAlert>
+        )}
         <form
           id="create-application"
           className={styles["form"]}
@@ -196,11 +211,22 @@ export function ApplicationsPage() {
               name="display_name"
               required
               maxLength={128}
+              value={createName}
+              onChange={(event) => {
+                setCreateName(event.currentTarget.value);
+              }}
               data-owl-initial-focus
             />
           </Field>
           <Field label="Application type" htmlFor="application-type">
-            <Select id="application-type" name="application_type" defaultValue="web">
+            <Select
+              id="application-type"
+              name="application_type"
+              value={createType}
+              onChange={(event) => {
+                setCreateType(event.currentTarget.value === "native" ? "native" : "web");
+              }}
+            >
               <option value="web">Web</option>
               <option value="native">Native</option>
             </Select>

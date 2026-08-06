@@ -160,7 +160,7 @@
 .cards .danger {
   color: var(--owl-danger);
   background: var(--owl-danger-surface);
-  border-color: #81444d;
+  border-color: var(--owl-danger-border);
 }
 
 .identityMutation {

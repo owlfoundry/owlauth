@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router";
+import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { ControlApp } from "./App";
 import type { ProjectClientKey } from "./client";
@@ -40,11 +40,10 @@ const application = {
 } as const;
 
 function renderConsole(path = "/") {
-  return render(
-    <MemoryRouter initialEntries={[path]}>
-      <ControlApp />
-    </MemoryRouter>,
-  );
+  const router = createMemoryRouter([{ path: "*", element: <ControlApp /> }], {
+    initialEntries: [path],
+  });
+  return render(<RouterProvider router={router} />);
 }
 
 async function unlock(key = "owl_ctrl_v1_test", heading = "Projects") {
@@ -232,10 +231,8 @@ describe("Control application shell", () => {
 
     renderConsole(`/projects/${project.id}/security/signing-keys`);
     await unlock("owl_ctrl_v1_test", "Signing keys");
-    expect(await screen.findByText(/provisioning, ring revision 1/u)).toBeVisible();
-    expect(
-      await screen.findByText(/active, ring revision 2/u, {}, { timeout: 2_000 }),
-    ).toBeVisible();
+    expect(await screen.findByText("provisioning")).toBeVisible();
+    expect(await screen.findByText("active", {}, { timeout: 2_000 })).toBeVisible();
     expect(signingKeyReads).toBe(3);
     expect(screen.getByRole("button", { name: "Rotate signing key" })).toBeEnabled();
   });
@@ -527,7 +524,9 @@ describe("Control application shell", () => {
     renderConsole(`/projects/${project.id}/authentication/providers`);
     await unlock("owl_ctrl_v1_test", "Authentication providers");
 
-    fireEvent.click(await screen.findByRole("button", { name: "Add Custom OIDC" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Add provider" }));
+    const chooser = screen.getByRole("dialog", { name: "Choose a provider" });
+    fireEvent.click(within(chooser).getByRole("button", { name: /Custom OIDC/u }));
     let dialog = screen.getByRole("dialog", { name: "Add Custom OIDC" });
     const addProvider = within(dialog).getByRole("button", { name: "Add provider" });
     expect(addProvider).toBeDisabled();
@@ -539,7 +538,7 @@ describe("Control application shell", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Run preflight" }));
     expect(secretInput).toHaveValue("");
     await within(dialog).findByRole("heading", { name: "Preflight result" });
-    expect(within(dialog).getByText("allow_all, revision 1")).toBeVisible();
+    expect(within(dialog).getByText("Safe discovered origins are allowed")).toBeVisible();
     expect(within(dialog).getByText("https://issuer.example")).toBeVisible();
     fireEvent.change(secretInput, { target: { value: "discard-before-policy-change" } });
 
@@ -625,7 +624,7 @@ describe("Control application shell", () => {
     expect(screen.queryByText("Loading Project policy")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Retry Project policy" }));
-    expect(await screen.findByText("900 seconds")).toBeVisible();
+    expect(await screen.findByText("15 minutes")).toBeVisible();
     expect(policyReads).toBe(2);
   });
 

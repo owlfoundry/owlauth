@@ -4,7 +4,7 @@ import { NavLink, Outlet, useLocation, useNavigate, useParams } from "react-rout
 
 import { Breadcrumbs } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
-import { NotificationRegion } from "../../shared/primitives/Feedback";
+import { NotificationRegion, ToastRegion } from "../../shared/primitives/Feedback";
 import { SideSheet } from "../../shared/primitives/Overlay";
 import { useControl, useProject } from "./ControlContext";
 import styles from "./control-shell.module.css";
@@ -13,10 +13,15 @@ import { OwlAuthWordmark } from "./LockedEntry";
 export function WorkspaceShell() {
   const { projectId } = useParams();
   const project = useProject(projectId);
-  const { projects, message, messageTone, lock } = useControl();
+  const { projects, message, messageTone, toasts, dismissToast, clearFeedback, lock } =
+    useControl();
   const [navigationOpen, setNavigationOpen] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    clearFeedback();
+  }, [clearFeedback, location.key]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -93,6 +98,7 @@ export function WorkspaceShell() {
         <NotificationRegion message={message} tone={messageTone} />
         <Outlet />
       </main>
+      <ToastRegion toasts={toasts} onDismiss={dismissToast} />
       <SideSheet
         open={navigationOpen}
         title="Console navigation"
@@ -166,30 +172,44 @@ function Navigation({
       </ConsoleNavLink>
       {base === null ? null : (
         <>
-          <ConsoleNavLink to={base} end onNavigate={onNavigate}>
-            Overview
-          </ConsoleNavLink>
-          <ConsoleNavLink to={`${base}/applications`} onNavigate={onNavigate}>
-            Applications
-          </ConsoleNavLink>
-          <ConsoleNavLink to={`${base}/authentication/providers`} onNavigate={onNavigate}>
-            Providers
-          </ConsoleNavLink>
-          <ConsoleNavLink to={`${base}/authentication/email`} onNavigate={onNavigate}>
-            Passwordless email
-          </ConsoleNavLink>
-          <ConsoleNavLink to={`${base}/users`} onNavigate={onNavigate}>
-            Users
-          </ConsoleNavLink>
-          <ConsoleNavLink to={`${base}/security/signing-keys`} onNavigate={onNavigate}>
-            Signing keys
-          </ConsoleNavLink>
-          <ConsoleNavLink to={`${base}/security/client-keys`} onNavigate={onNavigate}>
-            Client API keys
-          </ConsoleNavLink>
-          <ConsoleNavLink to={`${base}/settings`} onNavigate={onNavigate}>
-            Settings
-          </ConsoleNavLink>
+          <div className={styles["navigationGroup"]}>
+            <span className={styles["navigationLabel"]}>Project</span>
+            <ConsoleNavLink to={base} end onNavigate={onNavigate}>
+              Overview
+            </ConsoleNavLink>
+            <ConsoleNavLink to={`${base}/applications`} onNavigate={onNavigate}>
+              Applications
+            </ConsoleNavLink>
+          </div>
+          <div className={styles["navigationGroup"]}>
+            <span className={styles["navigationLabel"]}>Authentication</span>
+            <ConsoleNavLink to={`${base}/authentication/providers`} onNavigate={onNavigate}>
+              Providers
+            </ConsoleNavLink>
+            <ConsoleNavLink to={`${base}/authentication/email`} onNavigate={onNavigate}>
+              Passwordless email
+            </ConsoleNavLink>
+          </div>
+          <div className={styles["navigationGroup"]}>
+            <span className={styles["navigationLabel"]}>User management</span>
+            <ConsoleNavLink to={`${base}/users`} onNavigate={onNavigate}>
+              Users
+            </ConsoleNavLink>
+          </div>
+          <div className={styles["navigationGroup"]}>
+            <span className={styles["navigationLabel"]}>Security</span>
+            <ConsoleNavLink to={`${base}/security/signing-keys`} onNavigate={onNavigate}>
+              Signing keys
+            </ConsoleNavLink>
+            <ConsoleNavLink to={`${base}/security/client-keys`} onNavigate={onNavigate}>
+              Client API keys
+            </ConsoleNavLink>
+          </div>
+          <div className={styles["navigationGroup"]}>
+            <ConsoleNavLink to={`${base}/settings`} onNavigate={onNavigate}>
+              Settings
+            </ConsoleNavLink>
+          </div>
         </>
       )}
     </nav>

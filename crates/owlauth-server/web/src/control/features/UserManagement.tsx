@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { Button } from "../../shared/primitives/Button";
+import { InlineAlert } from "../../shared/primitives/Feedback";
 import { useControlConfirmation } from "../app/Confirmation";
 import { safeHostedTarget } from "../safe-target";
 import styles from "./features.module.css";
@@ -32,7 +34,7 @@ interface UserManagementProps {
   readonly setMessage: (message: string | null) => void;
 }
 
-type LoadState = "idle" | "loading" | "ready";
+type LoadState = "idle" | "loading" | "ready" | "failed";
 type UserStatusFilter = "all" | "active" | "disabled" | "merged";
 
 const EMPTY_SESSIONS: ProjectUserSessions = {
@@ -70,6 +72,7 @@ export function UserManagement({
       preferredUserId?: string,
       cursor?: string,
       append = false,
+      signal?: AbortSignal,
     ): Promise<ProjectUser | null> => {
       const result = await session.client.GET("/v1/projects/{project_id}/users", {
         params: {
@@ -80,8 +83,10 @@ export function UserManagement({
             limit: 50,
           },
         },
+        signal: signal ?? null,
       });
       const page = requireData(result.data, result.error, result.response);
+      if (signal?.aborted === true) return null;
       setNextCursor(page.next_cursor ?? null);
       setLoadState("ready");
       if (append) {
@@ -101,25 +106,32 @@ export function UserManagement({
   );
 
   const loadUser = useCallback(
-    async (userId: string) => {
+    async (userId: string, signal?: AbortSignal): Promise<boolean> => {
       setPendingAction(`load:${userId}`);
       setIdentities(null);
       try {
         const [userResult, sessionResult, connectionResult, identityResult] = await Promise.all([
           session.client.GET("/v1/projects/{project_id}/users/{user_id}", {
             params: { path: { project_id: project.id, user_id: userId } },
+            signal: signal ?? null,
           }),
           session.client.GET("/v1/projects/{project_id}/users/{user_id}/sessions", {
             params: { path: { project_id: project.id, user_id: userId } },
+            signal: signal ?? null,
           }),
           session.client.GET(
             "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections",
-            { params: { path: { project_id: project.id, user_id: userId } } },
+            {
+              params: { path: { project_id: project.id, user_id: userId } },
+              signal: signal ?? null,
+            },
           ),
           session.client.GET("/v1/projects/{project_id}/users/{user_id}/identities", {
             params: { path: { project_id: project.id, user_id: userId } },
+            signal: signal ?? null,
           }),
         ]);
+        if (signal?.aborted === true) return false;
         const user = requireData(userResult.data, userResult.error, userResult.response);
         const nextSessions = requireData(
           sessionResult.data,
@@ -146,40 +158,57 @@ export function UserManagement({
           throw new Error("Unsafe identity inventory response");
         }
         setIdentities(nextIdentities);
+        return true;
       } catch (error) {
+        if (signal?.aborted === true) return false;
+        if (error instanceof ControlRequestError && error.status === 404) {
+          setSelectedUser(null);
+          setSessions(EMPTY_SESSIONS);
+          setConnections([]);
+          setIdentities([]);
+          return true;
+        }
         await onError(error);
+        return false;
       } finally {
-        setPendingAction(null);
+        if (signal?.aborted !== true) setPendingAction(null);
       }
     },
     [onError, project.id, session],
   );
 
-  const beginLoad = useCallback(async () => {
-    setLoadState("loading");
-    setMessage(null);
-    try {
-      if (detailOnly && initialUserId !== undefined) {
-        setUsers([]);
-        setNextCursor(null);
-        await loadUser(initialUserId);
-        setLoadState("ready");
-        return;
+  const beginLoad = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoadState("loading");
+      setMessage(null);
+      try {
+        if (detailOnly && initialUserId !== undefined) {
+          setUsers([]);
+          setNextCursor(null);
+          const loaded = await loadUser(initialUserId, signal);
+          if (signal?.aborted !== true) setLoadState(loaded ? "ready" : "failed");
+          return;
+        }
+        const selected = await loadUsers(initialUserId, undefined, false, signal);
+        if (selected !== null) await loadUser(selected.id, signal);
+      } catch (error) {
+        if (signal?.aborted !== true) {
+          setLoadState("failed");
+          await onError(error);
+        }
       }
-      const selected = await loadUsers(initialUserId);
-      if (selected !== null) await loadUser(selected.id);
-    } catch (error) {
-      setLoadState("idle");
-      await onError(error);
-    }
-  }, [detailOnly, initialUserId, loadUser, loadUsers, onError, setMessage]);
+    },
+    [detailOnly, initialUserId, loadUser, loadUsers, onError, setMessage],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void beginLoad();
+      void beginLoad(controller.signal);
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
     };
   }, [beginLoad]);
 
@@ -392,9 +421,7 @@ export function UserManagement({
         } else {
           reauthorizationPopup?.close();
         }
-        setMessage(
-          `Managed reauthorization ${created.status}; revision ${String(created.revision)}.`,
-        );
+        setMessage(`Managed reauthorization ${created.status}.`);
         return;
       }
       const result = await session.client.POST(
@@ -508,16 +535,26 @@ export function UserManagement({
               </select>
             </label>
           )}
-          <button type="button" onClick={() => void beginLoad()} disabled={loadState === "loading"}>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => void beginLoad()}
+            disabled={loadState === "loading"}
+          >
             {loadState === "loading" ? "Loading users" : "Refresh users"}
-          </button>
+          </Button>
         </div>
       </div>
 
-      {loadState === "idle" ? (
-        <p>User records are loaded only when requested.</p>
-      ) : loadState === "loading" ? (
+      {loadState === "idle" || loadState === "loading" ? (
         <p role="status">Loading Project users…</p>
+      ) : loadState === "failed" ? (
+        <InlineAlert tone="danger" role="alert">
+          <p>Project users could not be loaded.</p>
+          <Button type="button" variant="secondary" onClick={() => void beginLoad()}>
+            Retry users
+          </Button>
+        </InlineAlert>
       ) : users.length === 0 && !detailOnly ? (
         <p>No Project users match this status.</p>
       ) : detailOnly && selectedUser === null ? (
@@ -564,35 +601,32 @@ export function UserManagement({
                   <p>
                     User ID: <code>{selectedUser.public_id}</code>
                   </p>
-                  <p>
-                    Status: {selectedUser.status}; user revision{" "}
-                    {String(selectedUser.user_revision)}; security revision{" "}
-                    {String(selectedUser.security_revision)}
-                  </p>
+                  <p>Status: {selectedUser.status}</p>
                 </div>
                 {selectedUser.status === "active" ? (
-                  <button
-                    className={styles["danger"]}
+                  <Button
+                    variant="danger"
                     type="button"
                     onClick={() => void disableSelectedUser()}
                     disabled={pendingAction !== null}
                   >
                     Disable Project user
-                  </button>
+                  </Button>
                 ) : selectedUser.status === "disabled" ? (
-                  <button
+                  <Button
+                    variant="secondary"
                     type="button"
                     onClick={() => void enableSelectedUser()}
                     disabled={pendingAction !== null}
                   >
                     Enable Project user
-                  </button>
+                  </Button>
                 ) : null}
               </div>
               {selectedUser.status === "disabled" ? (
                 <p>
-                  Persisted session rows may still display as active, but their security revision is
-                  stale and Runtime and Client online checks reject them.
+                  Existing sessions remain listed for audit history, but they cannot be used.
+                  Enabling this user permits only fresh sign-in.
                 </p>
               ) : null}
               {pendingAction === `load:${selectedUser.id}` || sessions === null ? (
@@ -631,7 +665,9 @@ export function UserManagement({
                   identities={identities}
                   applications={applications}
                   providers={providers}
-                  reloadSelectedUser={() => loadUser(selectedUser.id)}
+                  reloadSelectedUser={async () => {
+                    await loadUser(selectedUser.id);
+                  }}
                   onError={onError}
                   setMessage={setMessage}
                 />
@@ -668,19 +704,17 @@ function SessionLists({
             {sessions.application_sessions.map((session) => (
               <li key={session.id}>
                 <strong>{session.application_display_name}</strong>
-                <span>
-                  {session.status}; revision {String(session.session_revision)}
-                </span>
+                <span>Status: {session.status}</span>
                 <span>Expires {session.absolute_expires_at}</span>
                 {session.status === "active" ? (
-                  <button
-                    className={styles["danger"]}
+                  <Button
+                    variant="danger"
                     type="button"
                     onClick={() => void revokeApplicationSession(session)}
                     disabled={pendingAction !== null}
                   >
                     Revoke Application session
-                  </button>
+                  </Button>
                 ) : null}
               </li>
             ))}
@@ -695,20 +729,18 @@ function SessionLists({
           <ul className={styles["cards"]}>
             {sessions.browser_sessions.map((session) => (
               <li key={session.id}>
-                <span>
-                  {session.status}; revision {String(session.session_revision)}
-                </span>
+                <span>Status: {session.status}</span>
                 <span>Last activity {session.last_activity_at}</span>
                 <span>Expires {session.absolute_expires_at}</span>
                 {session.status === "active" ? (
-                  <button
-                    className={styles["danger"]}
+                  <Button
+                    variant="danger"
                     type="button"
                     onClick={() => void revokeBrowserSession(session)}
                     disabled={pendingAction !== null}
                   >
                     Revoke Project browser session
-                  </button>
+                  </Button>
                 ) : null}
               </li>
             ))}
@@ -742,9 +774,7 @@ function ManagedConnectionList({
   return (
     <section aria-labelledby="managed-connections-heading">
       <h4 id="managed-connections-heading">Managed provider connections</h4>
-      <p>
-        Credentials are never displayed. Actions are bound to the shown revision and generation.
-      </p>
+      <p>Credentials are never displayed. Actions always use the latest loaded connection state.</p>
       {connections.length === 0 ? (
         <p>No managed provider connections.</p>
       ) : (
@@ -752,11 +782,7 @@ function ManagedConnectionList({
           {connections.map((connection) => (
             <li key={connection.id}>
               <strong>{connection.capability_key}</strong>
-              <span>
-                {connection.state}; revision {String(connection.revision)}; generation{" "}
-                {String(connection.generation)}; credential generation{" "}
-                {String(connection.credential_generation)}
-              </span>
+              <span>Status: {connection.state}</span>
               <span>Source schema: {connection.source_schema}</span>
               <span>Required scopes: {connection.required_scopes.join(" ")}</span>
               <span>Last safe outcome: {connection.last_safe_outcome}</span>

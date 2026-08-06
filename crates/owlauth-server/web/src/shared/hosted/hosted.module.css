@@ -4,7 +4,7 @@
   place-items: center;
   padding: 2rem 1rem;
   background:
-    radial-gradient(circle at 50% 15%, rgb(21 61 53 / 42%), transparent 32rem), var(--owl-canvas);
+    radial-gradient(circle at 50% 15%, rgb(223 244 239 / 78%), transparent 32rem), var(--owl-canvas);
 }
 
 .card {

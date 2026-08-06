@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
-import { classes } from "./Button";
+import { CheckIcon, CloseIcon, ErrorIcon, InfoIcon, WarningIcon } from "../icons/Icons";
+import { Button, classes } from "./Button";
 import styles from "./primitives.module.css";
 
 export type AlertTone = "info" | "success" | "warning" | "danger";
@@ -17,7 +18,7 @@ export function InlineAlert({ tone = "info", children, role }: InlineAlertProps)
       className={classes(styles["alert"], toneClass(tone))}
       role={role ?? (tone === "danger" ? "alert" : "status")}
     >
-      <span aria-hidden="true">{toneSymbol(tone)}</span>
+      <span className={styles["alertIcon"]}>{toneIcon(tone)}</span>
       <div>{children}</div>
     </div>
   );
@@ -45,9 +46,49 @@ interface NotificationRegionProps {
 }
 
 export function NotificationRegion({ message, tone = "info" }: NotificationRegionProps) {
+  return message === null ? null : (
+    <div className={styles["notificationRegion"]}>
+      <InlineAlert tone={tone}>{message}</InlineAlert>
+    </div>
+  );
+}
+
+export interface ToastMessage {
+  readonly id: number;
+  readonly message: string;
+  readonly tone: "info" | "success";
+}
+
+export function ToastRegion({
+  toasts,
+  onDismiss,
+}: {
+  readonly toasts: readonly ToastMessage[];
+  readonly onDismiss: (id: number) => void;
+}) {
   return (
-    <div className={styles["notificationRegion"]} aria-live="polite" aria-atomic="true">
-      {message === null ? null : <InlineAlert tone={tone}>{message}</InlineAlert>}
+    <div className={styles["toastRegion"]} aria-live="polite" aria-atomic="true">
+      {toasts.map((toast) => (
+        <div
+          className={classes(styles["toast"], toneClass(toast.tone))}
+          key={toast.id}
+          role="status"
+        >
+          <span className={styles["alertIcon"]}>{toneIcon(toast.tone)}</span>
+          <span>{toast.message}</span>
+          <Button
+            type="button"
+            variant="quiet"
+            iconOnly
+            aria-label="Dismiss notification"
+            onClick={() => {
+              onDismiss(toast.id);
+            }}
+          >
+            <CloseIcon />
+          </Button>
+        </div>
+      ))}
     </div>
   );
 }
@@ -95,15 +136,15 @@ function toneClass(tone: AlertTone): string {
   }
 }
 
-function toneSymbol(tone: AlertTone): string {
+function toneIcon(tone: AlertTone): ReactNode {
   switch (tone) {
     case "success":
-      return "ok";
+      return <CheckIcon />;
     case "warning":
-      return "!";
+      return <WarningIcon />;
     case "danger":
-      return "x";
+      return <ErrorIcon />;
     case "info":
-      return "i";
+      return <InfoIcon />;
   }
 }

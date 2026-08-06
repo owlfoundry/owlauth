@@ -207,7 +207,8 @@ describe("Project user and session lifecycle", () => {
 
     await loadUserPanel();
 
-    expect(screen.getByText(/security revision 4/u)).toBeVisible();
+    expect(screen.getAllByText("Status: active").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/security revision/u)).toBeNull();
     expect(screen.getByText("Dashboard")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Project browser sessions" })).toBeVisible();
     expect(document.body.textContent).not.toContain("never-render-provider-secret");
@@ -231,7 +232,8 @@ describe("Project user and session lifecycle", () => {
 
     expect(screen.getByRole("heading", { name: "Managed provider connections" })).toBeVisible();
     expect(screen.getByText(/offline_access openid profile/u)).toBeVisible();
-    expect(screen.getByText(/generation 3; credential generation 2/u)).toBeVisible();
+    expect(screen.getAllByText("Status: active").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/credential generation/u)).toBeNull();
     expect(
       screen.getByRole("button", { name: "Reauthorize with selected Application" }),
     ).toBeDisabled();
@@ -430,7 +432,7 @@ describe("Project user and session lifecycle", () => {
         expect.objectContaining({ body: { expected_session_revision: 7 } }),
       );
     });
-    expect(screen.getByText(/revoked; revision 8/u)).toBeVisible();
+    expect(screen.getAllByText("Status: revoked")).toHaveLength(1);
 
     fireEvent.click(screen.getByRole("button", { name: "Revoke Project browser session" }));
     confirmDialog("Revoke session");
@@ -440,7 +442,7 @@ describe("Project user and session lifecycle", () => {
         expect.objectContaining({ body: { expected_session_revision: 9 } }),
       );
     });
-    expect(screen.getByText(/revoked; revision 10/u)).toBeVisible();
+    expect(screen.getAllByText("Status: revoked")).toHaveLength(2);
   });
 
   it("refreshes lifecycle state and reports a stale-revision conflict", async () => {

@@ -45,6 +45,63 @@
   color: var(--owl-text-muted);
 }
 
+.setupList {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: setup-step;
+}
+
+.setupStep {
+  counter-increment: setup-step;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+  box-shadow: var(--owl-shadow-subtle);
+}
+
+.setupStep > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 0.75rem;
+}
+
+.setupStep > div::before {
+  grid-row: 1 / 4;
+  width: 2rem;
+  height: 2rem;
+  display: grid;
+  place-items: center;
+  color: var(--owl-accent);
+  background: var(--owl-accent-soft);
+  border-radius: 999px;
+  content: counter(setup-step);
+  font-weight: 700;
+}
+
+.setupStep h3,
+.setupStep p {
+  grid-column: 2;
+  margin: 0;
+}
+
+.setupStep h3 {
+  margin-top: 0.3rem;
+  font-size: 1rem;
+}
+
+.setupStep p {
+  color: var(--owl-text-muted);
+}
+
 .resourceLink {
   color: var(--owl-text);
   font-weight: 600;
@@ -98,7 +155,7 @@
   margin-top: 3rem;
   padding: 1.25rem;
   background: color-mix(in srgb, var(--owl-danger-surface) 55%, var(--owl-surface));
-  border: 1px solid #81444d;
+  border: 1px solid var(--owl-danger-border);
   border-radius: var(--owl-radius-surface);
 }
 
@@ -161,6 +218,48 @@
   display: flex;
   flex-wrap: wrap;
   gap: 0.75rem;
+}
+
+.providerChoices {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.providerChoice {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.85rem;
+  padding: 1rem;
+  color: var(--owl-text);
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+  cursor: pointer;
+  text-align: left;
+}
+
+.providerChoice:hover {
+  background: var(--owl-surface-hover);
+  border-color: var(--owl-border-strong);
+}
+
+.providerChoice svg {
+  width: 1.5rem;
+  height: 1.5rem;
+  color: var(--owl-accent);
+}
+
+.providerChoice span {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.providerChoice small {
+  color: var(--owl-text-muted);
+  font-size: 0.8125rem;
 }
 
 @media (width <= 54rem) {

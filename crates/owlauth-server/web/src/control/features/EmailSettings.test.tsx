@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
+import { createMemoryRouter, RouterProvider } from "react-router";
 
 import {
   type Application,
@@ -174,11 +175,17 @@ function renderHarness(options?: { failSmtp?: boolean; conflictPolicy?: boolean 
     );
   }
 
-  render(
-    <ControlConfirmationProvider>
-      <Harness />
-    </ControlConfirmationProvider>,
-  );
+  const router = createMemoryRouter([
+    {
+      path: "*",
+      element: (
+        <ControlConfirmationProvider>
+          <Harness />
+        </ControlConfirmationProvider>
+      ),
+    },
+  ]);
+  render(<RouterProvider router={router} />);
   return { onError, post, put, setMessage };
 }
 

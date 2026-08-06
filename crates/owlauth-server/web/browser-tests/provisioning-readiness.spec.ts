@@ -13,6 +13,7 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   const suffix = `${browserName}-${Date.now().toString(36)}`;
   const injectionMarker = `<img src=x onerror=alert('${suffix}')>`;
   const projectName = `E2E Project ${injectionMarker}`;
+  const updatedProjectName = `${projectName} updated`;
   const applicationName = `E2E Application ${injectionMarker}`;
   const providerName = `E2E Provider ${injectionMarker}`;
   const providerSecret = `secret-${suffix}`;
@@ -33,19 +34,22 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
 
   await page.getByRole("link", { name: "Settings" }).click();
   await page.getByRole("button", { name: "Edit metadata" }).click();
-  await page.getByLabel("External owner metadata").fill(`deployment-${suffix}`);
-  await page.getByRole("button", { name: "Save metadata" }).click();
+  await page
+    .getByRole("dialog", { name: "Edit Project name" })
+    .getByLabel("Display name")
+    .fill(updatedProjectName);
+  await page.getByRole("button", { name: "Save Project name" }).click();
   await expect(page.getByRole("status").filter({ hasText: "metadata updated" })).toBeVisible();
   await page.getByRole("button", { name: "Edit policy" }).click();
   await page.getByLabel("Access token lifetime in seconds").fill("1200");
-  await page.getByLabel("Allow explicit browser-session reuse confirmation").check();
+  await page.getByLabel("Allow users to explicitly confirm reuse of their browser session").check();
   await page.getByRole("button", { name: "Save policy" }).click();
   await expect(page.getByRole("status").filter({ hasText: "policy updated" })).toBeVisible();
-  await expect(page.locator("dt", { hasText: /^Claims revision$/u }).locator("+ dd")).toHaveText(
-    "2",
-  );
-  await expect(page.locator("dt", { hasText: /^Session revision$/u }).locator("+ dd")).toHaveText(
-    "2",
+  await expect(
+    page.locator("dt", { hasText: /^Access token lifetime$/u }).locator("+ dd"),
+  ).toHaveText("20 minutes");
+  await expect(page.locator("dt", { hasText: /^Session reuse$/u }).locator("+ dd")).toHaveText(
+    "Explicit confirmation allowed",
   );
 
   await page.getByRole("link", { name: "Applications", exact: true }).click();
@@ -58,16 +62,31 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
     .locator("+ dd")
     .innerText();
 
-  await page.getByRole("button", { name: "Edit configuration" }).click();
-  await page.getByLabel("Redirect URIs").fill("https://app.example/callback");
-  await page.getByLabel("Allowed origins").fill("https://app.example");
-  await page.getByRole("button", { name: "Replace configuration" }).click();
+  await page.getByRole("button", { name: "Edit name" }).click();
+  const nameEditor = page.getByRole("dialog", { name: "Edit Application name" });
+  await nameEditor.getByLabel("Display name").fill(`${applicationName} draft`);
+  await page.goBack({ waitUntil: "commit", timeout: 2_000 }).catch(() => null);
+  await expect(page.getByRole("dialog", { name: "Discard unsaved changes?" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Discard unsaved changes?" })).toHaveCount(0);
+  await expect(nameEditor).toBeVisible();
+  await expect(nameEditor.getByLabel("Display name")).toHaveValue(`${applicationName} draft`);
+  await nameEditor.getByRole("button", { name: "Cancel" }).click();
+
+  await page.getByRole("link", { name: "Login URLs" }).click();
+  await page.getByRole("button", { name: "Edit login URLs" }).click();
+  const urlEditor = page.getByRole("dialog", { name: "Edit login URLs" });
+  await urlEditor
+    .getByLabel("Redirect URL 1", { exact: true })
+    .fill("https://app.example/callback");
+  await urlEditor.getByLabel("Allowed origin 1", { exact: true }).fill("https://app.example");
+  await urlEditor.getByRole("button", { name: "Save login URLs" }).click();
   await expect(
     page.getByRole("status").filter({ hasText: "configuration replaced" }),
   ).toBeVisible();
 
   await page.getByRole("link", { name: "Signing keys" }).click();
-  await expect(page.getByText(/active, ring revision/u)).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("active", { exact: true }).first()).toBeVisible({ timeout: 30_000 });
   await expect(page.getByRole("button", { name: "Rotate signing key" })).toBeEnabled();
   const firstJwks = await page.request.get(
     `${runtimeBase}projects/${encodeURIComponent(projectPublicId)}/.well-known/jwks.json`,
@@ -76,7 +95,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   expect((await firstJwks.json()) as { keys: unknown[] }).toMatchObject({ keys: [{}] });
 
   await page.getByRole("link", { name: "Providers" }).click();
-  await page.getByRole("button", { name: "Add Custom OIDC" }).click();
+  await page.getByRole("button", { name: "Add provider" }).click();
+  const providerChooser = page.getByRole("dialog", { name: "Choose a provider" });
+  await providerChooser.getByRole("button", { name: /Custom OIDC/u }).click();
   const providerDialog = page.getByRole("dialog", { name: "Add Custom OIDC" });
   await providerDialog.getByLabel("Canonical HTTPS issuer").fill(providerOrigin);
   await providerDialog.getByRole("button", { name: "Run preflight" }).click();
@@ -114,7 +135,7 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
     application_display_name: applicationName,
     application_public_id: applicationPublicId,
     login_available: true,
-    project_display_name: projectName,
+    project_display_name: updatedProjectName,
     project_public_id: projectPublicId,
     providers: [{ display_name: providerName }],
   });
@@ -164,7 +185,7 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await navigationSheet.getByText("Project context", { exact: true }).click();
   await expect(projectSwitcher).toBeFocused();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
-  await navigationSheet.getByRole("button", { name: "Close navigation" }).click();
+  await navigationSheet.getByRole("button", { name: "Close panel" }).click();
 
   // A 1440px desktop at 200% browser zoom exposes roughly a 720 CSS-pixel layout viewport.
   for (const candidate of [page, runtimePage]) {

@@ -1,5 +1,5 @@
 :root {
-  color-scheme: dark;
+  color-scheme: light;
   font-family:
     Inter,
     ui-sans-serif,
@@ -10,30 +10,39 @@
     sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --owl-canvas: #0b1110;
-  --owl-sidebar: #0d1513;
-  --owl-surface: #121b18;
-  --owl-surface-raised: #17231f;
-  --owl-surface-hover: #1d2b27;
-  --owl-border: #293833;
-  --owl-border-strong: #587069;
-  --owl-text: #f1f7f5;
-  --owl-text-muted: #a7b4af;
-  --owl-text-subtle: #7f8e88;
-  --owl-accent: #2dd4bf;
-  --owl-accent-strong: #087a68;
-  --owl-accent-soft: #153d35;
-  --owl-danger: #fca5a5;
-  --owl-danger-surface: #3b1d22;
-  --owl-warning: #fbbf24;
-  --owl-warning-surface: #352c13;
-  --owl-info: #93c5fd;
-  --owl-info-surface: #172940;
-  --owl-success: #5eead4;
-  --owl-focus: #5eead4;
+  --owl-canvas: #f7faf9;
+  --owl-sidebar: #f1f5f3;
+  --owl-surface: #ffffff;
+  --owl-surface-raised: #f7faf9;
+  --owl-surface-hover: #edf4f1;
+  --owl-border: #d6e1dd;
+  --owl-border-strong: #83978f;
+  --owl-text: #13201c;
+  --owl-text-muted: #4f625b;
+  --owl-text-subtle: #667770;
+  --owl-accent: #0f766e;
+  --owl-accent-hover: #0b5f59;
+  --owl-accent-strong: #0f766e;
+  --owl-accent-soft: #dff4ef;
+  --owl-danger: #b42318;
+  --owl-danger-hover: #8f1c13;
+  --owl-danger-border: #e6a6a1;
+  --owl-danger-surface: #fff1f0;
+  --owl-warning: #7a5200;
+  --owl-warning-border: #dfc477;
+  --owl-warning-surface: #fff8e1;
+  --owl-info: #175cd3;
+  --owl-info-border: #9fc3f5;
+  --owl-info-surface: #eff6ff;
+  --owl-success: #067647;
+  --owl-success-border: #8ccab0;
+  --owl-success-surface: #ecfdf3;
+  --owl-backdrop: rgb(19 32 28 / 48%);
+  --owl-focus: #0f766e;
   --owl-radius-control: 0.5rem;
   --owl-radius-surface: 0.75rem;
-  --owl-shadow-raised: 0 1rem 3rem rgb(0 0 0 / 35%);
+  --owl-shadow-raised: 0 1rem 3rem rgb(19 32 28 / 16%);
+  --owl-shadow-subtle: 0 0.125rem 0.5rem rgb(19 32 28 / 8%);
 }
 
 * {
@@ -88,7 +97,7 @@ a {
 }
 
 a:hover {
-  color: var(--owl-success);
+  color: var(--owl-accent-hover);
 }
 
 h1,
@@ -113,7 +122,7 @@ code,
 }
 
 ::selection {
-  color: var(--owl-text);
+  color: #fff;
   background: var(--owl-accent-strong);
 }
 

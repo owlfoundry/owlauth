@@ -2,13 +2,15 @@ import { useCallback, useEffect, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { Link, useParams } from "react-router";
 
+import { CopyValue, formatDuration } from "../../shared/compositions/CopyValue";
 import { DescriptionList, EmptyState, PageHeader, Section } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Checkbox, Field, Input } from "../../shared/primitives/Field";
 import { Dialog } from "../../shared/primitives/Overlay";
 import { useControl, useProject } from "../app/ControlContext";
-import { type ProjectPolicy, requireData } from "../client";
+import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
+import { ControlRequestError, type ProjectPolicy, requireData } from "../client";
 import styles from "./pages.module.css";
 
 type LoadState = "loading" | "ready" | "failed";
@@ -23,29 +25,42 @@ export function ProjectSettingsPage() {
   const [editingPolicy, setEditingPolicy] = useState(false);
   const [confirmDisable, setConfirmDisable] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [metadataError, setMetadataError] = useState<string | null>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const [disableError, setDisableError] = useState<string | null>(null);
 
-  const refreshPolicy = useCallback(async () => {
-    if (project === null) return;
-    setPolicyLoadState("loading");
-    try {
-      const result = await session.client.GET("/v1/projects/{project_id}/policy", {
-        params: { path: { project_id: project.id } },
-      });
-      setPolicy(requireData(result.data, result.error, result.response));
-      setPolicyLoadState("ready");
-    } catch (error) {
-      setPolicyLoadState("failed");
-      throw error;
-    }
-  }, [project, session]);
+  const refreshPolicy = useCallback(
+    async (signal?: AbortSignal) => {
+      if (project === null) return;
+      setPolicyLoadState("loading");
+      try {
+        const result = await session.client.GET("/v1/projects/{project_id}/policy", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        });
+        if (signal?.aborted !== true) {
+          setPolicy(requireData(result.data, result.error, result.response));
+          setPolicyLoadState("ready");
+        }
+      } catch (error) {
+        if (signal?.aborted !== true) setPolicyLoadState("failed");
+        throw error;
+      }
+    },
+    [project, session],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
       setPolicy(null);
-      void refreshPolicy().catch(handleError);
+      void refreshPolicy(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void handleError(error);
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
     };
   }, [handleError, refreshPolicy]);
 
@@ -53,13 +68,14 @@ export function ProjectSettingsPage() {
     event.preventDefault();
     if (project === null) return;
     const fields = new FormData(event.currentTarget);
+    setMetadataError(null);
     setSubmitting(true);
     try {
       const result = await session.client.PATCH("/v1/projects/{project_id}", {
         params: { path: { project_id: project.id } },
         body: {
           display_name: text(fields, "display_name"),
-          belongs_to: optionalText(fields, "belongs_to"),
+          belongs_to: project.belongs_to ?? null,
           expected_metadata_revision: project.metadata_revision,
         },
       });
@@ -68,9 +84,19 @@ export function ProjectSettingsPage() {
       setEditingMetadata(false);
       setMessage("Project metadata updated.", "success");
     } catch (error) {
+      const conflict =
+        error instanceof ControlRequestError &&
+        error.status === 409 &&
+        error.code === "revision_conflict";
+      if (conflict) setEditingMetadata(false);
+      else
+        setMetadataError(
+          error instanceof ControlRequestError
+            ? error.message
+            : "Project name could not be updated.",
+        );
       await handleError(error, async () => {
         await refreshProjects();
-        setEditingMetadata(false);
       });
     } finally {
       setSubmitting(false);
@@ -81,6 +107,7 @@ export function ProjectSettingsPage() {
     event.preventDefault();
     if (project === null || policy === null) return;
     const fields = new FormData(event.currentTarget);
+    setPolicyError(null);
     setSubmitting(true);
     try {
       const result = await session.client.PUT("/v1/projects/{project_id}/policy", {
@@ -96,9 +123,19 @@ export function ProjectSettingsPage() {
       setEditingPolicy(false);
       setMessage("Project policy updated.", "success");
     } catch (error) {
+      const conflict =
+        error instanceof ControlRequestError &&
+        error.status === 409 &&
+        error.code === "revision_conflict";
+      if (conflict) setEditingPolicy(false);
+      else
+        setPolicyError(
+          error instanceof ControlRequestError
+            ? error.message
+            : "Project policy could not be updated.",
+        );
       await handleError(error, async () => {
         await refreshPolicy();
-        setEditingPolicy(false);
       });
     } finally {
       setSubmitting(false);
@@ -107,6 +144,7 @@ export function ProjectSettingsPage() {
 
   async function disableProject() {
     if (project === null) return;
+    setDisableError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST("/v1/projects/{project_id}/disable", {
@@ -118,6 +156,15 @@ export function ProjectSettingsPage() {
       setConfirmDisable(false);
       setMessage("Project disabled.", "success");
     } catch (error) {
+      const conflict =
+        error instanceof ControlRequestError &&
+        error.status === 409 &&
+        error.code === "revision_conflict";
+      if (conflict) setConfirmDisable(false);
+      else
+        setDisableError(
+          error instanceof ControlRequestError ? error.message : "Project could not be disabled.",
+        );
       await handleError(error, async () => {
         await refreshProjects();
       });
@@ -140,6 +187,16 @@ export function ProjectSettingsPage() {
   const active = project.status === "active";
   return (
     <div className={styles["page"]}>
+      <UnsavedChangesGuard
+        dirty={editingMetadata || editingPolicy}
+        submitting={submitting}
+        onDiscard={() => {
+          setEditingMetadata(false);
+          setEditingPolicy(false);
+          setMetadataError(null);
+          setPolicyError(null);
+        }}
+      />
       <PageHeader
         title="Project settings"
         description="Review committed metadata and security policy before entering an edit."
@@ -151,11 +208,12 @@ export function ProjectSettingsPage() {
       <Section
         title="Project metadata"
         action={
-          active && !editingMetadata ? (
+          active ? (
             <Button
               type="button"
               variant="secondary"
               onClick={() => {
+                setMetadataError(null);
                 setEditingMetadata(true);
               }}
             >
@@ -164,64 +222,33 @@ export function ProjectSettingsPage() {
           ) : undefined
         }
       >
-        {editingMetadata ? (
-          <form className={styles["form"]} onSubmit={(event) => void updateProject(event)}>
-            <Field label="Display name" htmlFor="project-update-name">
-              <Input
-                id="project-update-name"
-                name="display_name"
-                defaultValue={project.display_name}
-                required
-                maxLength={128}
-                data-owl-initial-focus
-              />
-            </Field>
-            <Field label="External owner metadata" htmlFor="project-update-owner" optional>
-              <Input
-                id="project-update-owner"
-                name="belongs_to"
-                defaultValue={project.belongs_to ?? ""}
-                maxLength={256}
-              />
-            </Field>
-            <div className={styles["formActions"]}>
-              <Button
-                type="button"
-                variant="quiet"
-                disabled={submitting}
-                onClick={() => {
-                  setEditingMetadata(false);
-                }}
-              >
-                Cancel
-              </Button>
-              <Button type="submit" variant="primary" busy={submitting}>
-                Save metadata
-              </Button>
-            </div>
-          </form>
-        ) : (
-          <DescriptionList
-            items={[
-              { term: "Display name", detail: project.display_name },
-              { term: "External owner", detail: project.belongs_to ?? "Not set" },
-              {
-                term: "Public ID",
-                detail: <span className={styles["machineValue"]}>{project.public_id}</span>,
-              },
-              { term: "Metadata revision", detail: String(project.metadata_revision) },
-            ]}
-          />
-        )}
+        <DescriptionList
+          items={[
+            { term: "Display name", detail: project.display_name },
+            {
+              term: "Public ID",
+              detail: (
+                <CopyValue
+                  value={project.public_id}
+                  label="Project public ID"
+                  onCopied={(message) => {
+                    setMessage(message, "success");
+                  }}
+                />
+              ),
+            },
+          ]}
+        />
       </Section>
       <Section
         title="Session and token policy"
         action={
-          active && policy !== null && policyLoadState === "ready" && !editingPolicy ? (
+          active && policy !== null && policyLoadState === "ready" ? (
             <Button
               type="button"
               variant="secondary"
               onClick={() => {
+                setPolicyError(null);
                 setEditingPolicy(true);
               }}
             >
@@ -246,9 +273,103 @@ export function ProjectSettingsPage() {
           policyLoadState === "loading" ? (
             <p role="status">Loading Project policy</p>
           ) : null
-        ) : editingPolicy ? (
-          <form className={styles["form"]} onSubmit={(event) => void updatePolicy(event)}>
-            <Field label="Access token lifetime in seconds" htmlFor="access-token-lifetime">
+        ) : (
+          <DescriptionList
+            items={[
+              {
+                term: "Access token lifetime",
+                detail: formatDuration(policy.access_token_lifetime_seconds),
+              },
+              {
+                term: "Session reuse",
+                detail: policy.browser_session_reuse ? "Explicit confirmation allowed" : "Disabled",
+              },
+            ]}
+          />
+        )}
+      </Section>
+      <Dialog
+        open={editingMetadata}
+        title="Edit Project name"
+        onClose={() => {
+          if (!submitting) setEditingMetadata(false);
+        }}
+        actions={
+          <>
+            <Button
+              type="button"
+              variant="quiet"
+              disabled={submitting}
+              onClick={() => {
+                setEditingMetadata(false);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" form="project-metadata-form" variant="primary" busy={submitting}>
+              Save Project name
+            </Button>
+          </>
+        }
+      >
+        <form id="project-metadata-form" onSubmit={(event) => void updateProject(event)}>
+          {metadataError === null ? null : (
+            <InlineAlert tone="danger" role="alert">
+              {metadataError}
+            </InlineAlert>
+          )}
+          <Field label="Display name" htmlFor="project-update-name">
+            <Input
+              id="project-update-name"
+              name="display_name"
+              defaultValue={project.display_name}
+              required
+              maxLength={128}
+              data-owl-initial-focus
+            />
+          </Field>
+        </form>
+      </Dialog>
+      <Dialog
+        open={editingPolicy && policy !== null}
+        title="Edit session and token policy"
+        onClose={() => {
+          if (!submitting) setEditingPolicy(false);
+        }}
+        actions={
+          <>
+            <Button
+              type="button"
+              variant="quiet"
+              disabled={submitting}
+              onClick={() => {
+                setEditingPolicy(false);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" form="project-policy-form" variant="primary" busy={submitting}>
+              Save policy
+            </Button>
+          </>
+        }
+      >
+        {policy === null ? null : (
+          <form
+            id="project-policy-form"
+            className={styles["form"]}
+            onSubmit={(event) => void updatePolicy(event)}
+          >
+            {policyError === null ? null : (
+              <InlineAlert tone="danger" role="alert">
+                {policyError}
+              </InlineAlert>
+            )}
+            <Field
+              label="Access token lifetime in seconds"
+              htmlFor="access-token-lifetime"
+              description={`Currently ${formatDuration(policy.access_token_lifetime_seconds)}.`}
+            >
               <Input
                 id="access-token-lifetime"
                 name="access_token_lifetime_seconds"
@@ -261,41 +382,11 @@ export function ProjectSettingsPage() {
               />
             </Field>
             <Checkbox name="browser_session_reuse" defaultChecked={policy.browser_session_reuse}>
-              Allow explicit browser-session reuse confirmation
+              Allow users to explicitly confirm reuse of their browser session
             </Checkbox>
-            <div className={styles["formActions"]}>
-              <Button
-                type="button"
-                variant="quiet"
-                disabled={submitting}
-                onClick={() => {
-                  setEditingPolicy(false);
-                }}
-              >
-                Cancel
-              </Button>
-              <Button type="submit" variant="primary" busy={submitting}>
-                Save policy
-              </Button>
-            </div>
           </form>
-        ) : (
-          <DescriptionList
-            items={[
-              {
-                term: "Access token lifetime",
-                detail: `${String(policy.access_token_lifetime_seconds)} seconds`,
-              },
-              {
-                term: "Session reuse",
-                detail: policy.browser_session_reuse ? "Explicit confirmation allowed" : "Disabled",
-              },
-              { term: "Claims revision", detail: String(policy.claims_revision) },
-              { term: "Session revision", detail: String(policy.session_revision) },
-            ]}
-          />
         )}
-      </Section>
+      </Dialog>
       {active ? (
         <section className={styles["dangerZone"]}>
           <h2>Danger zone</h2>
@@ -304,6 +395,7 @@ export function ProjectSettingsPage() {
             type="button"
             variant="danger"
             onClick={() => {
+              setDisableError(null);
               setConfirmDisable(true);
             }}
           >
@@ -340,6 +432,11 @@ export function ProjectSettingsPage() {
           </>
         }
       >
+        {disableError === null ? null : (
+          <InlineAlert tone="danger" role="alert">
+            {disableError}
+          </InlineAlert>
+        )}
         <p>
           Disable <strong>{project.display_name}</strong>? New authentication and configuration
           actions will be blocked.
@@ -352,9 +449,4 @@ export function ProjectSettingsPage() {
 function text(fields: FormData, name: string): string {
   const value = fields.get(name);
   return typeof value === "string" ? value : "";
-}
-
-function optionalText(fields: FormData, name: string): string | null {
-  const value = text(fields, name).trim();
-  return value === "" ? null : value;
 }

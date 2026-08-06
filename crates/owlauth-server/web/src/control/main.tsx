@@ -1,6 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter } from "react-router";
+import { createBrowserRouter, RouterProvider } from "react-router";
 
 import { readConfiguredBase } from "../shared/configured-base";
 import "../shared/styles/tokens.css";
@@ -12,10 +12,9 @@ if (root === null) {
 }
 
 const basename = `${readConfiguredBase("control")}console`;
+const router = createBrowserRouter([{ path: "*", element: <ControlApp /> }], { basename });
 createRoot(root).render(
   <StrictMode>
-    <BrowserRouter basename={basename}>
-      <ControlApp />
-    </BrowserRouter>
+    <RouterProvider router={router} />
   </StrictMode>,
 );

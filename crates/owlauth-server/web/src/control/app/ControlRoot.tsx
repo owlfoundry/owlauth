@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, Route, Routes, useNavigate } from "react-router";
+import { Link, Route, Routes, useNavigate, useParams } from "react-router";
 
 import { EmptyState } from "../../shared/layout/Layout";
 import { ControlProvider } from "./ControlContext";
@@ -196,7 +196,10 @@ export function ControlRoot() {
             <Route path="projects/:projectId/users" element={<UsersPage />} />
             <Route path="projects/:projectId/users/:userId" element={<UserDetailPage />} />
             <Route path="projects/:projectId/security/signing-keys" element={<SigningKeysPage />} />
-            <Route path="projects/:projectId/security/client-keys" element={<ClientKeysPage />} />
+            <Route
+              path="projects/:projectId/security/client-keys"
+              element={<ProjectScopedClientKeysPage />}
+            />
             <Route path="projects/:projectId/settings" element={<ProjectSettingsPage />} />
             <Route
               path="*"
@@ -214,4 +217,9 @@ export function ControlRoot() {
       </ControlConfirmationProvider>
     </ControlProvider>
   );
+}
+
+function ProjectScopedClientKeysPage() {
+  const { projectId } = useParams();
+  return <ClientKeysPage key={projectId} />;
 }

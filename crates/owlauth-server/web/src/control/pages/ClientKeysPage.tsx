@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import type { SyntheticEvent } from "react";
 import { Link, useParams } from "react-router";
 
+import { CopyValue } from "../../shared/compositions/CopyValue";
 import { DataTable, EmptyState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
@@ -85,48 +86,76 @@ export function ClientKeysPage() {
   const createBaselineKeyIds = useRef<readonly string[]>([]);
   const acknowledgeAttempts = useRef(new Map<string, IdempotencyAttempt>());
   const revokeAttempts = useRef(new Map<string, IdempotencyAttempt>());
+  const loadMoreController = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
   const hasUnacknowledgedActiveKey = activeUnacknowledgedKey !== null;
+
+  const ownsProject = useCallback(
+    (ownerProjectId: string): boolean => mounted.current && project?.id === ownerProjectId,
+    [project?.id],
+  );
 
   function commitUnresolvedCreate(next: UnresolvedCreate | null) {
     setUnresolvedCreate(next);
   }
 
-  const refresh = useCallback(async (): Promise<ClientKeyInventoryPage> => {
-    if (project === null) return { items: [], nextCursor: null, activeUnacknowledgedKey: null };
-    setInventoryState("loading");
-    try {
-      const result = await session.client.GET("/v1/projects/{project_id}/client-keys", {
-        params: {
-          path: { project_id: project.id },
-          query: { limit: PAGE_SIZE },
-        },
-      });
-      const page = requireData(result.data, result.error, result.response);
-      const authority = page.active_unacknowledged_key;
-      const items = mergeAuthorityKey(page.items, authority);
-      setKeys(items);
-      setNextCursor(page.next_cursor ?? null);
-      setActiveUnacknowledgedKey(authority);
-      setInventoryState("ready");
-      return {
-        items,
-        nextCursor: page.next_cursor ?? null,
-        activeUnacknowledgedKey: authority,
-      };
-    } catch (error) {
-      setInventoryState("failed");
-      throw error;
-    }
-  }, [project, session]);
+  const refresh = useCallback(
+    async (signal?: AbortSignal): Promise<ClientKeyInventoryPage> => {
+      if (project === null) return { items: [], nextCursor: null, activeUnacknowledgedKey: null };
+      const ownerProjectId = project.id;
+      setInventoryState("loading");
+      try {
+        const result = await session.client.GET("/v1/projects/{project_id}/client-keys", {
+          params: {
+            path: { project_id: project.id },
+            query: { limit: PAGE_SIZE },
+          },
+          signal: signal ?? null,
+        });
+        const page = requireData(result.data, result.error, result.response);
+        const authority = page.active_unacknowledged_key;
+        const items = mergeAuthorityKey(page.items, authority);
+        if (signal?.aborted !== true && ownsProject(ownerProjectId)) {
+          setKeys(items);
+          setNextCursor(page.next_cursor ?? null);
+          setActiveUnacknowledgedKey(authority);
+          setInventoryState("ready");
+        }
+        return {
+          items,
+          nextCursor: page.next_cursor ?? null,
+          activeUnacknowledgedKey: authority,
+        };
+      } catch (error) {
+        if (signal?.aborted !== true && ownsProject(ownerProjectId)) setInventoryState("failed");
+        throw error;
+      }
+    },
+    [ownsProject, project, session],
+  );
 
   useEffect(() => {
+    mounted.current = true;
+    const controller = new AbortController();
+    const ownedCreateAttempt = createAttempt.current;
+    const ownedAcknowledgeAttempts = acknowledgeAttempts.current;
+    const ownedRevokeAttempts = revokeAttempts.current;
     const timer = window.setTimeout(() => {
       setUnresolvedCreate(null);
-      void refresh().catch(handleError);
+      void refresh(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void handleError(error);
+      });
     }, 0);
     return () => {
+      mounted.current = false;
       window.clearTimeout(timer);
+      controller.abort();
+      loadMoreController.current?.abort();
+      loadMoreController.current = null;
       credential.current = "";
+      ownedCreateAttempt.abandon();
+      ownedAcknowledgeAttempts.clear();
+      ownedRevokeAttempts.clear();
     };
   }, [handleError, project, refresh]);
 
@@ -141,15 +170,22 @@ export function ClientKeysPage() {
 
   async function loadMore() {
     if (project === null || nextCursor === null || loadingMore) return;
+    const ownerProjectId = project.id;
+    const cursor = nextCursor;
+    const controller = new AbortController();
+    loadMoreController.current?.abort();
+    loadMoreController.current = controller;
     setLoadingMore(true);
     try {
       const result = await session.client.GET("/v1/projects/{project_id}/client-keys", {
         params: {
-          path: { project_id: project.id },
-          query: { cursor: nextCursor, limit: PAGE_SIZE },
+          path: { project_id: ownerProjectId },
+          query: { cursor, limit: PAGE_SIZE },
         },
+        signal: controller.signal,
       });
       const page = requireData(result.data, result.error, result.response);
+      if (controller.signal.aborted || !ownsProject(ownerProjectId)) return;
       setKeys((current) => {
         const known = new Set(current.map((key) => key.id));
         const merged = [...current, ...page.items.filter((key) => !known.has(key.id))];
@@ -158,9 +194,10 @@ export function ClientKeysPage() {
       setActiveUnacknowledgedKey(page.active_unacknowledged_key);
       setNextCursor(page.next_cursor ?? null);
     } catch (error) {
-      await handleError(error);
+      if (!controller.signal.aborted && ownsProject(ownerProjectId)) await handleError(error);
     } finally {
-      setLoadingMore(false);
+      if (loadMoreController.current === controller) loadMoreController.current = null;
+      if (ownsProject(ownerProjectId)) setLoadingMore(false);
     }
   }
 
@@ -194,11 +231,11 @@ export function ClientKeysPage() {
   async function issueKey(
     label: string,
     idempotencyKey: string,
+    ownerProjectId: string,
   ): Promise<CreateProjectClientKeyResponse> {
-    if (project === null) throw new Error("Project context is unavailable");
     const result = await session.client.POST("/v1/projects/{project_id}/client-keys", {
       params: {
-        path: { project_id: project.id },
+        path: { project_id: ownerProjectId },
         header: { "Idempotency-Key": idempotencyKey },
       },
       body: { label },
@@ -206,15 +243,22 @@ export function ClientKeysPage() {
     return requireData(result.data, result.error, result.response);
   }
 
-  async function getClientKey(keyId: string): Promise<ProjectClientKey> {
-    if (project === null) throw new Error("Project context is unavailable");
+  async function getClientKey(
+    keyId: string,
+    ownerProjectId = project?.id,
+  ): Promise<ProjectClientKey> {
+    if (ownerProjectId === undefined) throw new Error("Project context is unavailable");
     const result = await session.client.GET("/v1/projects/{project_id}/client-keys/{key_id}", {
-      params: { path: { project_id: project.id, key_id: keyId } },
+      params: { path: { project_id: ownerProjectId, key_id: keyId } },
     });
     return requireData(result.data, result.error, result.response);
   }
 
-  async function presentCreatedKey(created: CreateProjectClientKeyResponse) {
+  async function presentCreatedKey(
+    created: CreateProjectClientKeyResponse,
+    ownerProjectId: string,
+  ) {
+    if (!ownsProject(ownerProjectId)) return;
     credential.current = created.credential;
     setRevealedKey(created.key);
     setRevealAcknowledged(false);
@@ -228,14 +272,16 @@ export function ClientKeysPage() {
     try {
       await refresh();
     } catch (refreshError) {
-      await handleError(refreshError);
+      if (ownsProject(ownerProjectId)) await handleError(refreshError);
     }
   }
 
   async function loadUnresolvedInventory(
     label: string,
     baselineKeyIds: readonly string[],
+    ownerProjectId = project?.id,
   ): Promise<boolean> {
+    if (ownerProjectId === undefined || !ownsProject(ownerProjectId)) return false;
     const knownImplicatedKeyIds =
       unresolvedCreate?.label === label ? unresolvedCreate.implicatedKeyIds : [];
     commitUnresolvedCreate({
@@ -246,6 +292,7 @@ export function ClientKeysPage() {
     });
     try {
       const page = await refresh();
+      if (!ownsProject(ownerProjectId)) return false;
       const gate = page.activeUnacknowledgedKey;
       const baseline = new Set(baselineKeyIds);
       const newlyImplicated =
@@ -253,7 +300,7 @@ export function ClientKeysPage() {
       const knownStillActive = knownImplicatedKeyIds.filter((id) => gate?.id === id);
       const knownObservations = await Promise.all(
         knownImplicatedKeyIds.map((id) =>
-          gate?.id === id ? Promise.resolve(gate) : getClientKey(id),
+          gate?.id === id ? Promise.resolve(gate) : getClientKey(id, ownerProjectId),
         ),
       );
       const knownAreAuthoritativelyResolved =
@@ -282,6 +329,7 @@ export function ClientKeysPage() {
       );
       return true;
     } catch (refreshError) {
+      if (!ownsProject(ownerProjectId)) return false;
       setInventoryState("failed");
       commitUnresolvedCreate({
         label,
@@ -298,10 +346,13 @@ export function ClientKeysPage() {
     label: string,
     baselineKeyIds: readonly string[],
     error: unknown,
+    ownerProjectId: string,
   ) {
+    if (!ownsProject(ownerProjectId)) return;
     credential.current = "";
     setCreateOpen(false);
-    const inventoryLoaded = await loadUnresolvedInventory(label, baselineKeyIds);
+    const inventoryLoaded = await loadUnresolvedInventory(label, baselineKeyIds, ownerProjectId);
+    if (!ownsProject(ownerProjectId)) return;
     const prefix =
       error instanceof ControlRequestError && error.code === "secret_unavailable"
         ? error.message
@@ -314,17 +365,24 @@ export function ClientKeysPage() {
     );
   }
 
-  async function reconcileUncertainCreate(label: string, baselineKeyIds: readonly string[]) {
+  async function reconcileUncertainCreate(
+    label: string,
+    baselineKeyIds: readonly string[],
+    ownerProjectId: string,
+  ) {
+    if (!ownsProject(ownerProjectId)) return;
     const idempotencyKey = createAttempt.current.begin();
     if (idempotencyKey === null) return;
     try {
-      const created = await issueKey(label, idempotencyKey);
+      const created = await issueKey(label, idempotencyKey, ownerProjectId);
+      if (!ownsProject(ownerProjectId)) return;
       createAttempt.current.settle();
-      await presentCreatedKey(created);
+      await presentCreatedKey(created, ownerProjectId);
     } catch (error) {
+      if (!ownsProject(ownerProjectId)) return;
       createAttempt.current.settle(error);
       createAttempt.current.abandon();
-      await blockReplacementAfterUnresolvedCreate(label, baselineKeyIds, error);
+      await blockReplacementAfterUnresolvedCreate(label, baselineKeyIds, error, ownerProjectId);
     }
   }
 
@@ -334,31 +392,34 @@ export function ClientKeysPage() {
     const fields = new FormData(event.currentTarget);
     const labelValue = fields.get("label");
     const label = typeof labelValue === "string" ? labelValue : "";
+    const ownerProjectId = project.id;
     const baselineKeyIds = createBaselineKeyIds.current;
     const idempotencyKey = createAttempt.current.begin();
     if (idempotencyKey === null) return;
     setCreating(true);
     try {
-      const created = await issueKey(label, idempotencyKey);
+      const created = await issueKey(label, idempotencyKey, ownerProjectId);
+      if (!ownsProject(ownerProjectId)) return;
       createAttempt.current.settle();
-      await presentCreatedKey(created);
+      await presentCreatedKey(created, ownerProjectId);
     } catch (error) {
+      if (!ownsProject(ownerProjectId)) return;
       createAttempt.current.settle(error);
       if (isAmbiguousIdempotencyFailure(error)) {
         // Reconcile exactly once with the retained idempotency identity. This either returns the
         // original successful response when no commit occurred, or identifies the committed safe
         // record as secret_unavailable without pretending the credential can be recovered.
-        await reconcileUncertainCreate(label, baselineKeyIds);
+        await reconcileUncertainCreate(label, baselineKeyIds, ownerProjectId);
       } else if (error instanceof ControlRequestError && error.code === "secret_unavailable") {
         createAttempt.current.abandon();
-        await blockReplacementAfterUnresolvedCreate(label, baselineKeyIds, error);
+        await blockReplacementAfterUnresolvedCreate(label, baselineKeyIds, error, ownerProjectId);
       } else {
         await handleError(error, async () => {
           await refresh();
         });
       }
     } finally {
-      setCreating(false);
+      if (ownsProject(ownerProjectId)) setCreating(false);
     }
   }
 
@@ -666,35 +727,26 @@ export function ClientKeysPage() {
         <EmptyState
           title="No client keys"
           description="Create a key when a customer backend is ready to use the Project-scoped Client API."
-          action={
-            <Button
-              type="button"
-              variant="primary"
-              busy={creating && !createOpen}
-              disabled={
-                project.status !== "active" ||
-                unresolvedCreate !== null ||
-                hasUnacknowledgedActiveKey
-              }
-              onClick={openCreate}
-            >
-              Create client key
-            </Button>
-          }
         />
       ) : null}
       {keys.length > 0 ? (
         <>
           <DataTable
             caption="Project client keys"
-            headings={["Key", "Status", "Created", "Last used", "Revision", "Actions"]}
+            headings={["Key", "Status", "Created", "Last used", "Actions"]}
           >
             {keys.map((key) => (
               <tr key={key.id}>
                 <td>
                   <strong>{key.label}</strong>
                   <span className={styles["machineValue"]}>{key.display_prefix}</span>
-                  <span className={styles["machineValue"]}>Public ID: {key.public_key_id}</span>
+                  <CopyValue
+                    value={key.public_key_id}
+                    label="client key public ID"
+                    onCopied={(message) => {
+                      setMessage(message, "success");
+                    }}
+                  />
                 </td>
                 <td>
                   <StatusBadge status={key.status} />
@@ -719,7 +771,6 @@ export function ClientKeysPage() {
                     ? "Never recorded"
                     : readableTime(key.last_used_at)}
                 </td>
-                <td>{String(key.revision)}</td>
                 <td>
                   {key.status === "active" ? (
                     <div className={styles["actions"]}>

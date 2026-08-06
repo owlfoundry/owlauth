@@ -35,7 +35,7 @@
 .danger {
   color: var(--owl-danger);
   background: var(--owl-danger-surface);
-  border-color: #81444d;
+  border-color: var(--owl-danger-border);
 }
 
 .method:hover,
@@ -69,7 +69,7 @@
 .error {
   color: var(--owl-danger);
   background: var(--owl-danger-surface);
-  border-color: #81444d;
+  border-color: var(--owl-danger-border);
 }
 
 .actions {
@@ -111,8 +111,9 @@
   font: inherit;
 }
 
-.focusTarget:focus {
-  outline: none;
+.focusTarget:focus-visible {
+  outline: 2px solid var(--owl-focus);
+  outline-offset: 3px;
 }
 
 @media (width <= 30rem) {

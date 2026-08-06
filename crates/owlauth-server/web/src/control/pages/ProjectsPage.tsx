@@ -4,25 +4,33 @@ import { Link, useNavigate } from "react-router";
 
 import { DataTable, EmptyState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
+import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Field, Input } from "../../shared/primitives/Field";
 import { Dialog } from "../../shared/primitives/Overlay";
-import { StatusBadge } from "../../shared/primitives/Feedback";
 import { useControl } from "../app/ControlContext";
-import { IdempotencyAttempt, requireData } from "../client";
+import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
+import { ControlRequestError, IdempotencyAttempt, requireData } from "../client";
 import styles from "./pages.module.css";
 
 export function ProjectsPage() {
   const { session, projects, loadingProjects, refreshProjects, setMessage, handleError } =
     useControl();
   const [creating, setCreating] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [createError, setCreateError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const attempt = useRef(new IdempotencyAttempt());
   const navigate = useNavigate();
 
-  function closeCreate() {
-    if (submitting) return;
+  function discardCreate() {
     attempt.current.abandon();
     setCreating(false);
+    setCreateName("");
+    setCreateError(null);
+  }
+
+  function closeCreate() {
+    if (!submitting) discardCreate();
   }
 
   async function createProject(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
@@ -31,31 +39,39 @@ export function ProjectsPage() {
     const fields = new FormData(form);
     const idempotencyKey = attempt.current.begin();
     if (idempotencyKey === null) return;
+    setCreateError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST("/v1/projects", {
         params: { header: { "Idempotency-Key": idempotencyKey } },
         body: {
           display_name: text(fields, "display_name"),
-          belongs_to: optionalText(fields, "belongs_to"),
+          belongs_to: null,
         },
       });
       const created = requireData(result.data, result.error, result.response);
       attempt.current.settle();
       await refreshProjects();
       setCreating(false);
-      setMessage("Project created.", "success");
+      setCreateName("");
+      setCreateError(null);
+      setMessage(`Project “${created.display_name}” created.`, "success");
       void navigate(`/projects/${created.id}`);
     } catch (error) {
       attempt.current.settle(error);
+      setCreateError(
+        error instanceof ControlRequestError ? error.message : "Project could not be created.",
+      );
       await handleError(error);
     } finally {
       setSubmitting(false);
     }
   }
 
+  const createDirty = creating && createName.trim() !== "";
   return (
     <div className={styles["page"]}>
+      <UnsavedChangesGuard dirty={createDirty} submitting={submitting} onDiscard={discardCreate} />
       <PageHeader
         title="Projects"
         description="Select a Project or create a bounded authentication authority."
@@ -64,6 +80,7 @@ export function ProjectsPage() {
             type="button"
             variant="primary"
             onClick={() => {
+              setCreateError(null);
               setCreating(true);
             }}
           >
@@ -76,23 +93,9 @@ export function ProjectsPage() {
         <EmptyState
           title="No Projects yet"
           description="Create the first Project to configure Applications and authentication methods."
-          action={
-            <Button
-              type="button"
-              variant="primary"
-              onClick={() => {
-                setCreating(true);
-              }}
-            >
-              Create Project
-            </Button>
-          }
         />
       ) : (
-        <DataTable
-          caption="Projects in this deployment"
-          headings={["Project", "Status", "External owner", "Revision"]}
-        >
+        <DataTable caption="Projects in this deployment" headings={["Project", "Status"]}>
           {projects.map((project) => (
             <tr key={project.id}>
               <td>
@@ -104,8 +107,6 @@ export function ProjectsPage() {
               <td>
                 <StatusBadge status={project.status} />
               </td>
-              <td>{project.belongs_to ?? "Not set"}</td>
-              <td>{String(project.metadata_revision)}</td>
             </tr>
           ))}
         </DataTable>
@@ -125,6 +126,11 @@ export function ProjectsPage() {
           </>
         }
       >
+        {createError === null ? null : (
+          <InlineAlert tone="danger" role="alert">
+            {createError}
+          </InlineAlert>
+        )}
         <form
           id="create-project-form"
           className={styles["form"]}
@@ -136,16 +142,12 @@ export function ProjectsPage() {
               name="display_name"
               required
               maxLength={128}
+              value={createName}
+              onChange={(event) => {
+                setCreateName(event.currentTarget.value);
+              }}
               data-owl-initial-focus
             />
-          </Field>
-          <Field
-            label="External owner metadata"
-            htmlFor="project-owner"
-            optional
-            description="A safe operator-defined reference; it does not grant authority."
-          >
-            <Input id="project-owner" name="belongs_to" maxLength={256} />
           </Field>
         </form>
       </Dialog>
@@ -156,9 +158,4 @@ export function ProjectsPage() {
 function text(fields: FormData, name: string): string {
   const value = fields.get(name);
   return typeof value === "string" ? value : "";
-}
-
-function optionalText(fields: FormData, name: string): string | null {
-  const value = text(fields, name).trim();
-  return value === "" ? null : value;
 }

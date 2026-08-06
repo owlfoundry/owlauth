@@ -16,31 +16,44 @@ export function EmailPage() {
   const [applications, setApplications] = useState<Application[]>([]);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "failed">("loading");
 
-  const refreshApplications = useCallback(async () => {
-    if (project === null) return;
-    const result = await session.client.GET("/v1/projects/{project_id}/applications", {
-      params: { path: { project_id: project.id } },
-    });
-    setApplications(requireData(result.data, result.error, result.response).items);
-  }, [project, session]);
+  const refreshApplications = useCallback(
+    async (signal?: AbortSignal) => {
+      if (project === null) return;
+      const result = await session.client.GET("/v1/projects/{project_id}/applications", {
+        params: { path: { project_id: project.id } },
+        signal: signal ?? null,
+      });
+      if (signal?.aborted !== true) {
+        setApplications(requireData(result.data, result.error, result.response).items);
+      }
+    },
+    [project, session],
+  );
 
-  const loadApplications = useCallback(async () => {
-    setLoadState("loading");
-    try {
-      await refreshApplications();
-      setLoadState("ready");
-    } catch (error) {
-      setLoadState("failed");
-      throw error;
-    }
-  }, [refreshApplications]);
+  const loadApplications = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoadState("loading");
+      try {
+        await refreshApplications(signal);
+        if (signal?.aborted !== true) setLoadState("ready");
+      } catch (error) {
+        if (signal?.aborted !== true) setLoadState("failed");
+        throw error;
+      }
+    },
+    [refreshApplications],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void loadApplications().catch(handleError);
+      void loadApplications(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void handleError(error);
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
     };
   }, [handleError, loadApplications]);
 

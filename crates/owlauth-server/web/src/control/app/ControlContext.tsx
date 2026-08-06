@@ -1,6 +1,16 @@
-import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useLocation } from "react-router";
 import type { ReactNode } from "react";
 
+import type { ToastMessage } from "../../shared/primitives/Feedback";
 import {
   ControlRequestError,
   type DisposableControlClient,
@@ -13,7 +23,10 @@ interface ControlContextValue {
   readonly projects: readonly Project[];
   readonly loadingProjects: boolean;
   readonly message: string | null;
-  readonly messageTone: "info" | "success" | "warning" | "danger";
+  readonly messageTone: "warning" | "danger";
+  readonly toasts: readonly ToastMessage[];
+  readonly dismissToast: (id: number) => void;
+  readonly clearFeedback: () => void;
   readonly refreshProjects: () => Promise<Project[]>;
   readonly setMessage: (
     message: string | null,
@@ -41,12 +54,52 @@ export function ControlProvider({
   const [projects, setProjects] = useState<readonly Project[]>(initialProjects);
   const [loadingProjects, setLoadingProjects] = useState(false);
   const [message, setCurrentMessage] = useState<string | null>(null);
-  const [messageTone, setMessageTone] = useState<ControlContextValue["messageTone"]>("info");
+  const [messageTone, setMessageTone] = useState<ControlContextValue["messageTone"]>("warning");
+  const [toasts, setToasts] = useState<readonly ToastMessage[]>([]);
+  const nextToastId = useRef(1);
+  const location = useLocation();
+  const previousRouteKey = useRef(location.key);
+  const activeRouteGeneration = useRef(0);
+  const [routeGeneration, setRouteGeneration] = useState(0);
 
-  const setMessage = useCallback<ControlContextValue["setMessage"]>((next, tone = "info") => {
-    setCurrentMessage(next);
-    setMessageTone(tone);
+  useLayoutEffect(() => {
+    if (previousRouteKey.current === location.key) return;
+    previousRouteKey.current = location.key;
+    activeRouteGeneration.current += 1;
+    setRouteGeneration(activeRouteGeneration.current);
+  }, [location.key]);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
   }, []);
+
+  const clearFeedback = useCallback(() => {
+    setCurrentMessage(null);
+    setToasts([]);
+  }, []);
+
+  const setMessage = useCallback<ControlContextValue["setMessage"]>(
+    (next, tone = "info") => {
+      if (activeRouteGeneration.current !== routeGeneration) return;
+      if (next === null) {
+        setCurrentMessage(null);
+        return;
+      }
+      if (tone === "success" || tone === "info") {
+        setCurrentMessage(null);
+        const id = nextToastId.current++;
+        setToasts((current) => [...current.slice(-2), { id, message: next, tone }]);
+        window.setTimeout(() => {
+          dismissToast(id);
+        }, 5000);
+        return;
+      }
+      setToasts([]);
+      setCurrentMessage(next);
+      setMessageTone(tone);
+    },
+    [dismissToast, routeGeneration],
+  );
 
   const refreshProjects = useCallback(async () => {
     setLoadingProjects(true);
@@ -104,12 +157,17 @@ export function ControlProvider({
       loadingProjects,
       message,
       messageTone,
+      toasts,
+      dismissToast,
+      clearFeedback,
       refreshProjects,
       setMessage,
       handleError,
       lock,
     }),
     [
+      clearFeedback,
+      dismissToast,
       handleError,
       loadingProjects,
       lock,
@@ -119,6 +177,7 @@ export function ControlProvider({
       refreshProjects,
       session,
       setMessage,
+      toasts,
     ],
   );
 

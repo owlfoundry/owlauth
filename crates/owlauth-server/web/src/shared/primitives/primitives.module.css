@@ -30,7 +30,8 @@
 }
 
 .primary:not(:disabled):hover {
-  background: #0a907a;
+  background: var(--owl-accent-hover);
+  border-color: var(--owl-accent-hover);
 }
 
 .secondary {
@@ -53,11 +54,13 @@
 .danger {
   color: var(--owl-danger);
   background: var(--owl-danger-surface);
-  border-color: #81444d;
+  border-color: var(--owl-danger-border);
 }
 
 .danger:not(:disabled):hover {
-  background: #4a252b;
+  color: #fff;
+  background: var(--owl-danger-hover);
+  border-color: var(--owl-danger-hover);
 }
 
 .fullWidth {
@@ -163,25 +166,30 @@
 .info {
   color: var(--owl-info);
   background: var(--owl-info-surface);
-  border-color: #355779;
+  border-color: var(--owl-info-border);
 }
 
 .success {
   color: var(--owl-success);
-  background: var(--owl-accent-soft);
-  border-color: #286f62;
+  background: var(--owl-success-surface);
+  border-color: var(--owl-success-border);
 }
 
 .warning {
   color: var(--owl-warning);
   background: var(--owl-warning-surface);
-  border-color: #76611d;
+  border-color: var(--owl-warning-border);
 }
 
 .alertDanger {
   color: var(--owl-danger);
   background: var(--owl-danger-surface);
-  border-color: #81444d;
+  border-color: var(--owl-danger-border);
+}
+
+.alertIcon {
+  display: inline-flex;
+  margin-top: 0.08rem;
 }
 
 .badge {
@@ -231,6 +239,31 @@
 .notificationRegion {
   display: grid;
   gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.toastRegion {
+  position: fixed;
+  z-index: 120;
+  top: 4.5rem;
+  right: 1.25rem;
+  width: min(24rem, calc(100vw - 2rem));
+  display: grid;
+  gap: 0.75rem;
+  pointer-events: none;
+}
+
+.toast {
+  min-height: 3.25rem;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.65rem 0.65rem 0.65rem 0.85rem;
+  border: 1px solid;
+  border-radius: var(--owl-radius-surface);
+  box-shadow: var(--owl-shadow-raised);
+  pointer-events: auto;
 }
 
 .backdrop {
@@ -240,7 +273,7 @@
   display: grid;
   place-items: center;
   padding: 1rem;
-  background: rgb(2 8 7 / 78%);
+  background: var(--owl-backdrop);
 }
 
 .dialog {
@@ -283,7 +316,7 @@
   position: fixed;
   z-index: 90;
   inset: 0;
-  background: rgb(2 8 7 / 70%);
+  background: var(--owl-backdrop);
 }
 
 .sheet {
@@ -295,6 +328,15 @@
   background: var(--owl-sidebar);
   border-right: 1px solid var(--owl-border-strong);
   box-shadow: var(--owl-shadow-raised);
+}
+
+.sheetRight {
+  right: 0;
+  left: auto;
+  width: min(38rem, calc(100vw - 2rem));
+  background: var(--owl-surface);
+  border-right: 0;
+  border-left: 1px solid var(--owl-border-strong);
 }
 
 .srOnly {
@@ -309,6 +351,12 @@
 }
 
 @media (width <= 30rem) {
+  .toastRegion {
+    top: 4.25rem;
+    right: 1rem;
+    width: calc(100vw - 2rem);
+  }
+
   .backdrop {
     padding: 0;
     align-items: stretch;

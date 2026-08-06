@@ -4,7 +4,7 @@
   place-items: center;
   padding: 1rem;
   background:
-    radial-gradient(circle at 50% 10%, rgb(21 61 53 / 42%), transparent 30rem), var(--owl-canvas);
+    radial-gradient(circle at 50% 10%, rgb(223 244 239 / 72%), transparent 30rem), var(--owl-canvas);
 }
 
 .lockedPanel {
@@ -100,6 +100,21 @@
   margin: 0.5rem 0;
 }
 
+.navigationGroup {
+  display: grid;
+  gap: 0.15rem;
+  margin-top: 0.65rem;
+}
+
+.navigationLabel {
+  padding: 0.4rem 0.65rem 0.15rem;
+  color: var(--owl-text-subtle);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
 .navigation a {
   min-height: 2.5rem;
   display: flex;
@@ -137,9 +152,9 @@
   align-items: center;
   gap: 1rem;
   padding: 0 2rem;
-  background: rgb(11 17 16 / 92%);
+  background: var(--owl-surface);
   border-bottom: 1px solid var(--owl-border);
-  backdrop-filter: blur(12px);
+  box-shadow: var(--owl-shadow-subtle);
 }
 
 .menuButton {

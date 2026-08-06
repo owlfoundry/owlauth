@@ -50,35 +50,37 @@ Authority separation also applies to presentation assets. Authority-free tokens 
 
 ### Canonical theme
 
-V1 uses one deliberate dark teal-neutral theme. It MUST NOT expose a theme selector or persist a visual preference. This keeps the product coherent, avoids a storage exception in the Console credential boundary, and gives implementation and accessibility testing one canonical baseline. A later light theme is a reversible presentation extension, not a prerequisite for the redesign.
+V1 uses one deliberate light teal-neutral theme. It MUST NOT expose a theme selector or persist a visual preference. This keeps the product coherent, avoids a storage exception in the Console credential boundary, and gives implementation and accessibility testing one canonical baseline. A later dark theme is a reversible presentation extension, not a prerequisite for the redesign.
 
-The visual character is near-black and low-chroma rather than navy. Teal is reserved for focus, selected navigation, primary actions, and positive emphasis. Large areas remain neutral so operational status colors and untrusted content stay legible.
+The visual character is bright, quiet, and low-chroma rather than clinical white. Teal is reserved for focus, selected navigation, primary actions, and positive emphasis. Large areas remain neutral so operational status colors and untrusted content stay legible.
 
 ### Semantic color tokens
 
 The following values define the canonical palette. Components consume semantic CSS custom properties rather than raw palette values.
 
-| Semantic token         | Canonical value | Use                                                               |
-| ---------------------- | --------------- | ----------------------------------------------------------------- |
-| `--owl-canvas`         | `#0b1110`       | page background                                                   |
-| `--owl-sidebar`        | `#0d1513`       | persistent Console navigation                                     |
-| `--owl-surface`        | `#121b18`       | primary panels, fields, and Runtime card                          |
-| `--owl-surface-raised` | `#17231f`       | menus, dialogs, selected rows, and raised controls                |
-| `--owl-surface-hover`  | `#1d2b27`       | neutral hover state                                               |
-| `--owl-border`         | `#293833`       | nonessential structural boundaries and dividers                   |
-| `--owl-border-strong`  | `#587069`       | essential control boundaries and emphasized structure             |
-| `--owl-text`           | `#f1f7f5`       | primary text                                                      |
-| `--owl-text-muted`     | `#a7b4af`       | descriptions and secondary metadata                               |
-| `--owl-text-subtle`    | `#7f8e88`       | tertiary metadata that is not required to complete a task         |
-| `--owl-accent`         | `#2dd4bf`       | focus, selection, and decorative accent                           |
-| `--owl-accent-strong`  | `#087a68`       | primary button background; white text has at least 4.5:1 contrast |
-| `--owl-accent-soft`    | `#153d35`       | selected navigation and informational emphasis                    |
-| `--owl-danger`         | `#fca5a5`       | destructive text and icon                                         |
-| `--owl-danger-surface` | `#3b1d22`       | destructive confirmation surface                                  |
-| `--owl-warning`        | `#fbbf24`       | warning text and icon                                             |
-| `--owl-info`           | `#93c5fd`       | informational text and icon                                       |
-| `--owl-success`        | `#5eead4`       | successful state text and icon                                    |
-| `--owl-focus`          | `#5eead4`       | focus ring                                                        |
+| Semantic token          | Canonical value | Use                                                               |
+| ----------------------- | --------------- | ----------------------------------------------------------------- |
+| `--owl-canvas`          | `#f7faf9`       | page background                                                   |
+| `--owl-sidebar`         | `#f1f5f3`       | persistent Console navigation                                     |
+| `--owl-surface`         | `#ffffff`       | primary panels, fields, and Runtime card                          |
+| `--owl-surface-raised`  | `#f7faf9`       | menus, dialogs, selected rows, and raised controls                |
+| `--owl-surface-hover`   | `#edf4f1`       | neutral hover state                                               |
+| `--owl-border`          | `#d6e1dd`       | nonessential structural boundaries and dividers                   |
+| `--owl-border-strong`   | `#83978f`       | essential control boundaries and emphasized structure             |
+| `--owl-text`            | `#13201c`       | primary text                                                      |
+| `--owl-text-muted`      | `#4f625b`       | descriptions and secondary metadata                               |
+| `--owl-text-subtle`     | `#667770`       | tertiary metadata that is not required to complete a task         |
+| `--owl-accent`          | `#0f766e`       | focus, selection, and decorative accent                           |
+| `--owl-accent-strong`   | `#0f766e`       | primary button background; white text has at least 4.5:1 contrast |
+| `--owl-accent-soft`     | `#dff4ef`       | selected navigation and informational emphasis                    |
+| `--owl-danger`          | `#b42318`       | destructive text and icon                                         |
+| `--owl-danger-surface`  | `#fff1f0`       | destructive confirmation surface                                  |
+| `--owl-warning`         | `#7a5200`       | warning text and icon                                             |
+| `--owl-warning-surface` | `#fff8e1`       | warning surface                                                   |
+| `--owl-info`            | `#175cd3`       | informational text and icon                                       |
+| `--owl-info-surface`    | `#eff6ff`       | informational surface                                             |
+| `--owl-success`         | `#067647`       | successful state text and icon                                    |
+| `--owl-focus`           | `#0f766e`       | focus ring                                                        |
 
 Primary text and muted text exceed WCAG AA contrast against the canvas and ordinary surfaces. `--owl-border` is decorative and MUST NOT be the only visual boundary of a control; fields, buttons, and other essential components use `--owl-border-strong` or another measured combination with at least `3:1` non-text contrast. Implementations MUST remeasure contrast after changing any value. Accent color alone MUST NOT represent success because selected or active controls also use teal.
 
@@ -144,7 +146,7 @@ At desktop widths:
 - a `3.75rem` top bar owns the breadcrumb, narrow-page navigation control when applicable, and exact current context;
 - content uses fluid width with a `92rem` maximum, `2rem` desktop padding, and no single global card;
 - page headers contain title, one-line purpose text when needed, resource status, and at most one visually primary action;
-- success/error status messages appear in a consistent notification region below the page header and move focus only when required by the initiating workflow.
+- successful and low-risk informational outcomes appear in a route-scoped top-right toast stack; errors, conflicts, and uncertain mutations remain persistent beside the affected form or section and move focus only when required by the initiating workflow.
 
 Content width follows the task rather than one universal narrow column:
 
@@ -199,9 +201,9 @@ These routes organize existing or contract-backed workflows; they do not require
 
 ### Project directory and overview
 
-The Project directory uses a compact table on ordinary desktop widths and a stacked row treatment at narrow widths. Each row displays display name, public ID, status, optional `belongs_to` metadata, and the safe revision or update metadata that is actually returned. The whole row MAY be clickable, but its name remains a real link and row actions remain keyboard-operable controls.
+The Project directory uses a compact table on ordinary desktop widths and a stacked row treatment at narrow widths. Each row displays the display name, public ID, and user-facing status. The `belongs_to` extension pointer and optimistic-concurrency revisions are API-level integration details and MUST NOT appear in ordinary lists, summaries, creation, or editing. The whole row MAY be clickable, but its name remains a real link and row actions remain keyboard-operable controls.
 
-Project creation opens a focused dialog or narrow side sheet instead of placing a permanent create form above the inventory. The surface contains only display name and optional external-owner metadata, preserves idempotency, and moves to the created Project overview after success.
+Project creation opens a focused dialog or narrow side sheet instead of placing a permanent create form above the inventory. The surface contains only the display name, preserves idempotency, and moves to the created Project overview after success.
 
 The Project overview is an operational starting point, not an analytics dashboard. It MAY show:
 
@@ -274,7 +276,7 @@ Destructive controls are not styled as the page's primary teal action. Project a
 
 The Runtime surface remains a centered, single-column interaction card, but it receives a polished authentication-specific shell rather than sharing the Console workspace or its current generic shell.
 
-- The page canvas uses the canonical near-black background and an optional static low-contrast teal glow.
+- The page canvas uses the canonical light background and an optional static low-contrast teal tint.
 - The ordinary sign-in, email, reauthorization, logout, progress, and terminal-state card is at most `30rem` wide, uses `1.5–2rem` responsive padding, and has a subtle border and shadow.
 - Identity mutation or another exact-review ceremony MAY enter a `40–42rem` wide card when its proof-slot comparison or immutable plan needs it. The wider profile is flow-owned, not viewport-filling, and returns to one column on narrow screens.
 - The header displays bounded Project and Application context. The Application name is the task title for ordinary login; the Project name is supporting trust context.

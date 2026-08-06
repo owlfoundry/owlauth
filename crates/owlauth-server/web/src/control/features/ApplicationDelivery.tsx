@@ -11,6 +11,7 @@ import {
   type Application,
   type ApplicationUserEvent,
   type ApplicationUserEventType,
+  ControlRequestError,
   type DisposableControlClient,
   IdempotencyAttempt,
   type WebhookDelivery,
@@ -28,11 +29,17 @@ const EVENT_TYPES: readonly ApplicationUserEventType[] = [
 type ErrorHandler = (error: unknown, refreshConflict?: () => Promise<void>) => Promise<void>;
 type LoadState = "loading" | "ready" | "failed";
 
+export interface ApplicationDeliveryDraft {
+  readonly submitting: boolean;
+  readonly discard: () => void;
+}
+
 interface ApplicationDeliveryProps {
   readonly session: DisposableControlClient;
   readonly application: Application;
   readonly onError: ErrorHandler;
   readonly setMessage: (message: string | null) => void;
+  readonly onDraftChange?: (draft: ApplicationDeliveryDraft | null) => void;
 }
 
 interface PreparedRotation {
@@ -45,6 +52,7 @@ export function ApplicationDelivery({
   application,
   onError,
   setMessage,
+  onDraftChange,
 }: ApplicationDeliveryProps) {
   const confirm = useControlConfirmation();
   const [endpoints, setEndpoints] = useState<WebhookEndpoint[]>([]);
@@ -56,72 +64,103 @@ export function ApplicationDelivery({
   const [creatingEndpoint, setCreatingEndpoint] = useState(false);
   const [editingEndpointId, setEditingEndpointId] = useState<string | null>(null);
   const [rotatingEndpointId, setRotatingEndpointId] = useState<string | null>(null);
+  const [overlayError, setOverlayError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const createAttempt = useRef(new IdempotencyAttempt());
   const rotationAttempt = useRef(new IdempotencyAttempt());
+  const discardDraft = useCallback(() => {
+    createAttempt.current.abandon();
+    rotationAttempt.current.abandon();
+    setCreatingEndpoint(false);
+    setEditingEndpointId(null);
+    setRotatingEndpointId(null);
+    setOverlayError(null);
+  }, []);
+  const draftDirty = creatingEndpoint || editingEndpointId !== null || rotatingEndpointId !== null;
+
+  useEffect(() => {
+    if (onDraftChange === undefined) return;
+    onDraftChange(draftDirty ? { submitting, discard: discardDraft } : null);
+    return () => {
+      onDraftChange(null);
+    };
+  }, [discardDraft, draftDirty, onDraftChange, submitting]);
 
   const path = useMemo(
     () => ({ project_id: application.project_id, application_id: application.id }),
     [application.id, application.project_id],
   );
 
-  const refresh = useCallback(async () => {
-    setLoadState("loading");
-    try {
-      const [endpointResult, eventResult, deliveryResult] = await Promise.all([
-        session.client.GET(
-          "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
-          { params: { path } },
-        ),
-        session.client.GET("/v1/projects/{project_id}/applications/{application_id}/user-events", {
-          params: { path },
-        }),
-        session.client.GET(
-          "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries",
-          { params: { path, query: {} } },
-        ),
-      ]);
-      const nextEndpoints = requireData(
-        endpointResult.data,
-        endpointResult.error,
-        endpointResult.response,
-      ).items;
-      const nextEvents = requireData(
-        eventResult.data,
-        eventResult.error,
-        eventResult.response,
-      ).items;
-      const nextDeliveries = requireData(
-        deliveryResult.data,
-        deliveryResult.error,
-        deliveryResult.response,
-      ).items;
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoadState("loading");
+      try {
+        const [endpointResult, eventResult, deliveryResult] = await Promise.all([
+          session.client.GET(
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
+            { params: { path }, signal: signal ?? null },
+          ),
+          session.client.GET(
+            "/v1/projects/{project_id}/applications/{application_id}/user-events",
+            {
+              params: { path },
+              signal: signal ?? null,
+            },
+          ),
+          session.client.GET(
+            "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries",
+            { params: { path, query: {} }, signal: signal ?? null },
+          ),
+        ]);
+        const nextEndpoints = requireData(
+          endpointResult.data,
+          endpointResult.error,
+          endpointResult.response,
+        ).items;
+        const nextEvents = requireData(
+          eventResult.data,
+          eventResult.error,
+          eventResult.response,
+        ).items;
+        const nextDeliveries = requireData(
+          deliveryResult.data,
+          deliveryResult.error,
+          deliveryResult.response,
+        ).items;
 
-      setEndpoints(nextEndpoints);
-      setEvents(nextEvents);
-      setDeliveries(nextDeliveries);
-      setHasLoaded(true);
-      setLoadState("ready");
-    } catch (error) {
-      setLoadState("failed");
-      throw error;
-    }
-  }, [path, session]);
+        if (signal?.aborted !== true) {
+          setEndpoints(nextEndpoints);
+          setEvents(nextEvents);
+          setDeliveries(nextDeliveries);
+          setHasLoaded(true);
+          setLoadState("ready");
+        }
+      } catch (error) {
+        if (signal?.aborted !== true) setLoadState("failed");
+        throw error;
+      }
+    },
+    [path, session],
+  );
 
   useEffect(() => {
     const endpointAttempt = createAttempt.current;
     const secretRotationAttempt = rotationAttempt.current;
     endpointAttempt.abandon();
     secretRotationAttempt.abandon();
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
       setEndpoints([]);
       setEvents([]);
       setDeliveries([]);
       setHasLoaded(false);
-      void refresh().catch(onError);
+      void refresh(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void onError(error);
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
       endpointAttempt.abandon();
       secretRotationAttempt.abandon();
     };
@@ -136,6 +175,7 @@ export function ApplicationDelivery({
     const secretInput = form.elements.namedItem("secret");
     const secret = fieldText(fields, "secret");
     if (secretInput instanceof HTMLInputElement) secretInput.value = "";
+    setOverlayError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST(
@@ -157,6 +197,7 @@ export function ApplicationDelivery({
       setMessage("Pending webhook endpoint created. Test it before activation.");
     } catch (error) {
       createAttempt.current.settle(error);
+      setOverlayError(deliveryError(error, "Webhook endpoint could not be created."));
       await onError(error, async () => {
         createAttempt.current.abandon();
         await refresh();
@@ -173,6 +214,7 @@ export function ApplicationDelivery({
   ) {
     event.preventDefault();
     const fields = new FormData(event.currentTarget);
+    setOverlayError(null);
     setSubmitting(true);
     try {
       const result = await session.client.PUT(
@@ -190,6 +232,7 @@ export function ApplicationDelivery({
       setEditingEndpointId(null);
       setMessage("Webhook subscriptions updated.");
     } catch (error) {
+      setOverlayError(deliveryError(error, "Webhook subscriptions could not be updated."));
       await onError(error, async () => {
         await refresh();
         setEditingEndpointId(null);
@@ -241,6 +284,7 @@ export function ApplicationDelivery({
   async function prepareRotation(endpoint: WebhookEndpoint, secret: string) {
     const idempotencyKey = rotationAttempt.current.begin();
     if (idempotencyKey === null) return;
+    setOverlayError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST(
@@ -266,6 +310,7 @@ export function ApplicationDelivery({
       setMessage("Webhook secret generation prepared; activate it after consumer rollout.");
     } catch (error) {
       rotationAttempt.current.settle(error);
+      setOverlayError(deliveryError(error, "Webhook secret rotation could not be prepared."));
       await onError(error, async () => {
         rotationAttempt.current.abandon();
         await refresh();
@@ -281,6 +326,7 @@ export function ApplicationDelivery({
     prepared: PreparedRotation,
     overlapSeconds: number,
   ) {
+    setOverlayError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST(
@@ -304,6 +350,7 @@ export function ApplicationDelivery({
       setRotatingEndpointId(null);
       setMessage("Webhook secret generation activated with bounded overlap.");
     } catch (error) {
+      setOverlayError(deliveryError(error, "Webhook secret rotation could not be activated."));
       await onError(error, async () => {
         rotationAttempt.current.abandon();
         await refresh();
@@ -366,6 +413,7 @@ export function ApplicationDelivery({
               type="button"
               variant="primary"
               onClick={() => {
+                setOverlayError(null);
                 setCreatingEndpoint(true);
               }}
             >
@@ -404,6 +452,7 @@ export function ApplicationDelivery({
                       variant="quiet"
                       disabled={submitting || endpoint.status === "disabled" || disabled}
                       onClick={() => {
+                        setOverlayError(null);
                         setEditingEndpointId(endpoint.id);
                       }}
                     >
@@ -436,6 +485,7 @@ export function ApplicationDelivery({
                           disabled={submitting}
                           onClick={() => {
                             rotationAttempt.current.abandon();
+                            setOverlayError(null);
                             setRotatingEndpointId(endpoint.id);
                           }}
                         >
@@ -456,7 +506,6 @@ export function ApplicationDelivery({
                 <DescriptionList
                   items={[
                     { term: "Subscriptions", detail: endpoint.subscribed_event_types.join(", ") },
-                    { term: "Revision", detail: String(endpoint.revision) },
                     {
                       term: "Current secret",
                       detail:
@@ -504,7 +553,7 @@ export function ApplicationDelivery({
         ) : (
           <DataTable
             caption="Immutable Application user events"
-            headings={["Event", "User", "Revisions", "Body"]}
+            headings={["Event", "User", "Body"]}
           >
             {events.map((item) => (
               <tr key={item.event_id}>
@@ -514,9 +563,6 @@ export function ApplicationDelivery({
                 </td>
                 <td>
                   <code>{item.user_id}</code>
-                </td>
-                <td>
-                  User {String(item.user_revision)}; projection {String(item.projection_revision)}
                 </td>
                 <td>
                   <details>
@@ -597,6 +643,7 @@ export function ApplicationDelivery({
         onClose={() => {
           if (submitting) return;
           createAttempt.current.abandon();
+          setOverlayError(null);
           setCreatingEndpoint(false);
         }}
         actions={
@@ -623,6 +670,11 @@ export function ApplicationDelivery({
           className={styles["form"]}
           onSubmit={(event) => void createEndpoint(event)}
         >
+          {overlayError === null ? null : (
+            <InlineAlert tone="danger" role="alert">
+              {overlayError}
+            </InlineAlert>
+          )}
           <Field label="HTTPS URL" htmlFor={`webhook-url-${application.id}`}>
             <Input
               id={`webhook-url-${application.id}`}
@@ -653,7 +705,10 @@ export function ApplicationDelivery({
         open={editingEndpoint !== null}
         title="Edit webhook subscriptions"
         onClose={() => {
-          if (!submitting) setEditingEndpointId(null);
+          if (!submitting) {
+            setOverlayError(null);
+            setEditingEndpointId(null);
+          }
         }}
         actions={
           <>
@@ -662,6 +717,7 @@ export function ApplicationDelivery({
               variant="quiet"
               disabled={submitting}
               onClick={() => {
+                setOverlayError(null);
                 setEditingEndpointId(null);
               }}
             >
@@ -684,6 +740,11 @@ export function ApplicationDelivery({
             className={styles["form"]}
             onSubmit={(event) => void updateEndpoint(editingEndpoint, event)}
           >
+            {overlayError === null ? null : (
+              <InlineAlert tone="danger" role="alert">
+                {overlayError}
+              </InlineAlert>
+            )}
             <EventTypeFields
               prefix={`endpoint-${editingEndpoint.id}`}
               selected={editingEndpoint.subscribed_event_types}
@@ -696,8 +757,10 @@ export function ApplicationDelivery({
         endpoint={rotatingEndpoint}
         prepared={rotatingEndpoint === null ? undefined : preparedRotations[rotatingEndpoint.id]}
         submitting={submitting}
+        error={overlayError}
         onClose={() => {
           rotationAttempt.current.abandon();
+          setOverlayError(null);
           setRotatingEndpointId(null);
         }}
         onPrepare={prepareRotation}
@@ -711,6 +774,7 @@ function WebhookRotationDialog({
   endpoint,
   prepared,
   submitting,
+  error,
   onClose,
   onPrepare,
   onActivate,
@@ -718,6 +782,7 @@ function WebhookRotationDialog({
   readonly endpoint: WebhookEndpoint | null;
   readonly prepared: PreparedRotation | undefined;
   readonly submitting: boolean;
+  readonly error: string | null;
   readonly onClose: () => void;
   readonly onPrepare: (endpoint: WebhookEndpoint, secret: string) => Promise<void>;
   readonly onActivate: (
@@ -726,8 +791,7 @@ function WebhookRotationDialog({
     overlapSeconds: number,
   ) => Promise<void>;
 }) {
-  const secretInput = useRef<HTMLInputElement>(null);
-  const overlapInput = useRef<HTMLInputElement>(null);
+  const formId = "webhook-rotation-form";
   return (
     <Dialog
       open={endpoint !== null}
@@ -741,67 +805,81 @@ function WebhookRotationDialog({
             <Button type="button" variant="quiet" disabled={submitting} onClick={onClose}>
               Cancel
             </Button>
-            {prepared === undefined ? (
-              <Button
-                type="button"
-                variant="primary"
-                busy={submitting}
-                onClick={() => {
-                  const secret = secretInput.current?.value ?? "";
-                  if (secretInput.current !== null) secretInput.current.value = "";
-                  void onPrepare(endpoint, secret);
-                }}
-              >
-                Prepare secret rotation
-              </Button>
-            ) : (
-              <Button
-                type="button"
-                variant="primary"
-                busy={submitting}
-                onClick={() =>
-                  void onActivate(endpoint, prepared, Number(overlapInput.current?.value ?? 3600))
-                }
-              >
-                Activate generation {String(prepared.generation)}
-              </Button>
-            )}
+            <Button type="submit" form={formId} variant="primary" busy={submitting}>
+              {prepared === undefined
+                ? "Prepare secret rotation"
+                : `Activate generation ${String(prepared.generation)}`}
+            </Button>
           </>
         )
       }
     >
-      {prepared === undefined ? (
-        <Field label="Next signing secret" htmlFor="rotation-secret">
-          <Input
-            key="rotation-secret"
-            ref={secretInput}
-            id="rotation-secret"
-            type="password"
-            minLength={32}
-            maxLength={128}
-            autoComplete="new-password"
-            required
-            data-owl-initial-focus
-          />
-        </Field>
-      ) : (
-        <Field
-          label="Overlap seconds"
-          htmlFor="rotation-overlap"
-          description="Keep the prior generation valid only for the bounded consumer rollout window."
-        >
-          <Input
-            key="rotation-overlap"
-            ref={overlapInput}
-            id="rotation-overlap"
-            type="number"
-            min={300}
-            max={86400}
-            defaultValue={3600}
-            data-owl-initial-focus
-          />
-        </Field>
-      )}
+      <form
+        id={formId}
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (endpoint === null) return;
+          const form = event.currentTarget;
+          if (!form.checkValidity()) return;
+          const fields = new FormData(form);
+          if (prepared === undefined) {
+            const secret = fieldText(fields, "secret");
+            if (secret.length < 32 || secret.length > 128) return;
+            const secretInput = form.elements.namedItem("secret");
+            if (secretInput instanceof HTMLInputElement) secretInput.value = "";
+            void onPrepare(endpoint, secret);
+          } else {
+            const overlapSeconds = Number(fieldText(fields, "overlap_seconds"));
+            if (
+              !Number.isInteger(overlapSeconds) ||
+              overlapSeconds < 300 ||
+              overlapSeconds > 86400
+            ) {
+              return;
+            }
+            void onActivate(endpoint, prepared, overlapSeconds);
+          }
+        }}
+      >
+        {error === null ? null : (
+          <InlineAlert tone="danger" role="alert">
+            {error}
+          </InlineAlert>
+        )}
+        {prepared === undefined ? (
+          <Field label="Next signing secret" htmlFor="rotation-secret">
+            <Input
+              key="rotation-secret"
+              id="rotation-secret"
+              name="secret"
+              type="password"
+              minLength={32}
+              maxLength={128}
+              autoComplete="new-password"
+              required
+              data-owl-initial-focus
+            />
+          </Field>
+        ) : (
+          <Field
+            label="Overlap window in seconds"
+            htmlFor="rotation-overlap"
+            description="Keep the prior generation valid only while consumers adopt the new secret."
+          >
+            <Input
+              key="rotation-overlap"
+              id="rotation-overlap"
+              name="overlap_seconds"
+              type="number"
+              min={300}
+              max={86400}
+              defaultValue={3600}
+              required
+              data-owl-initial-focus
+            />
+          </Field>
+        )}
+      </form>
     </Dialog>
   );
 }
@@ -829,6 +907,10 @@ function EventTypeFields({
       ))}
     </fieldset>
   );
+}
+
+function deliveryError(error: unknown, fallback: string): string {
+  return error instanceof ControlRequestError ? error.message : fallback;
 }
 
 function fieldText(fields: FormData, name: string): string {

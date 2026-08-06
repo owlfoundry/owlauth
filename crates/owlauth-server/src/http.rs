@@ -362,11 +362,13 @@ fn build_control_plane(
 fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &ServerConfig) -> Router {
     let public = Router::new()
         .route("/", get(runtime_root))
+        .route("/auth", get(runtime_not_found))
         .route("/auth/", get(runtime_shell))
         .route(
             "/auth/assets/{*path}",
             get(runtime_asset).layer(CompressionLayer::new().br(true).gzip(true)),
         )
+        .route("/auth/{*path}", get(runtime_not_found))
         .route("/health", get(liveness))
         .route("/ready", get(runtime_readiness))
         .route(
@@ -915,6 +917,16 @@ async fn runtime_root(State(state): State<RuntimeState>) -> Redirect {
 
 async fn runtime_shell(State(state): State<RuntimeState>) -> Response {
     web_assets::shell(WebPlane::Runtime, &state.probe.base_path)
+}
+
+async fn runtime_not_found(State(state): State<RuntimeState>) -> Response {
+    let mut response = runtime_document_error(
+        &state,
+        "Page not found",
+        "Return to your Application and start sign-in again.",
+    );
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
 }
 
 fn runtime_document_error(state: &RuntimeState, title: &str, message: &str) -> Response {
@@ -10784,6 +10796,29 @@ pub(crate) mod tests {
         .unwrap();
         assert!(runtime_document.contains("name=\"owlauth-runtime-base\" content=\"/runtime/\""));
         assert!(!runtime_document.contains("<script>"));
+
+        for path in ["/runtime/auth", "/runtime/auth/unknown"] {
+            let runtime_not_found = runtime
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(runtime_not_found.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                runtime_not_found.headers()[header::CACHE_CONTROL],
+                HeaderValue::from_static("no-store")
+            );
+            let not_found_document = String::from_utf8(
+                to_bytes(runtime_not_found.into_body(), 1_000_000)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(not_found_document.contains("Page not found"));
+            assert!(not_found_document.contains("owlauth-runtime-flow\" content=\"error"));
+        }
+
         let runtime_asset_path = attribute(&runtime_document, "src");
         assert!(runtime_asset_path.starts_with("/runtime/auth/assets/runtime-"));
 

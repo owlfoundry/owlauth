@@ -2,6 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject, SyntheticEvent } from "react";
 import { Link, useParams } from "react-router";
 
+import { CopyValue } from "../../shared/compositions/CopyValue";
+import {
+  compactStringList,
+  isValidStringList,
+  StringListField,
+} from "../../shared/compositions/StringListField";
+import { ProviderIcon } from "../../shared/icons/Icons";
 import {
   DataTable,
   DescriptionList,
@@ -11,11 +18,13 @@ import {
 } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
-import { Checkbox, Field, Input, Select, Textarea } from "../../shared/primitives/Field";
-import { Dialog } from "../../shared/primitives/Overlay";
+import { Checkbox, Field, Input, Select } from "../../shared/primitives/Field";
+import { Dialog, SideSheet } from "../../shared/primitives/Overlay";
 import { useControl, useProject } from "../app/ControlContext";
+import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
 import {
   type Application,
+  ControlRequestError,
   IdempotencyAttempt,
   type OidcPreflightResult,
   type Provider,
@@ -39,10 +48,15 @@ export function ProvidersPage() {
   const [policy, setPolicy] = useState<ProviderEgressPolicy | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "failed">("loading");
   const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [choosingProvider, setChoosingProvider] = useState(false);
   const [onboarding, setOnboarding] = useState<OnboardingKind | null>(null);
   const [preflight, setPreflight] = useState<OidcPreflightResult | null>(null);
   const [preflightIssuer, setPreflightIssuer] = useState("");
   const [editingEgressPolicy, setEditingEgressPolicy] = useState(false);
+  const [egressMode, setEgressMode] = useState<"allow_all" | "exact_origins">("allow_all");
+  const [egressOrigins, setEgressOrigins] = useState<string[]>([""]);
+  const [egressError, setEgressError] = useState<string | null>(null);
+  const [overlayError, setOverlayError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [reconcileProvider, setReconcileProvider] = useState<Provider | null>(null);
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
@@ -53,53 +67,69 @@ export function ProvidersPage() {
     if (onboardingSecretInput.current !== null) onboardingSecretInput.current.value = "";
   }, []);
 
-  const refresh = useCallback(async () => {
-    if (project === null) return;
-    setLoadState("loading");
-    try {
-      const [providerResult, applicationResult, policyResult] = await Promise.all([
-        session.client.GET("/v1/projects/{project_id}/providers", {
-          params: { path: { project_id: project.id } },
-        }),
-        session.client.GET("/v1/projects/{project_id}/applications", {
-          params: { path: { project_id: project.id } },
-        }),
-        session.client.GET("/v1/projects/{project_id}/provider-egress-policy", {
-          params: { path: { project_id: project.id } },
-        }),
-      ]);
-      const nextProviders = requireData(
-        providerResult.data,
-        providerResult.error,
-        providerResult.response,
-      ).items;
-      const nextApplications = requireData(
-        applicationResult.data,
-        applicationResult.error,
-        applicationResult.response,
-      ).items;
-      const nextPolicy = requireData(policyResult.data, policyResult.error, policyResult.response);
-      setProviders(nextProviders);
-      setApplications(nextApplications);
-      setPolicy(nextPolicy);
-      setSelectedProviderId((current) =>
-        current !== null && nextProviders.some((provider) => provider.id === current)
-          ? current
-          : (nextProviders[0]?.id ?? null),
-      );
-      setLoadState("ready");
-    } catch (error) {
-      setLoadState("failed");
-      throw error;
-    }
-  }, [project, session]);
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      if (project === null) return;
+      setLoadState("loading");
+      try {
+        const [providerResult, applicationResult, policyResult] = await Promise.all([
+          session.client.GET("/v1/projects/{project_id}/providers", {
+            params: { path: { project_id: project.id } },
+            signal: signal ?? null,
+          }),
+          session.client.GET("/v1/projects/{project_id}/applications", {
+            params: { path: { project_id: project.id } },
+            signal: signal ?? null,
+          }),
+          session.client.GET("/v1/projects/{project_id}/provider-egress-policy", {
+            params: { path: { project_id: project.id } },
+            signal: signal ?? null,
+          }),
+        ]);
+        const nextProviders = requireData(
+          providerResult.data,
+          providerResult.error,
+          providerResult.response,
+        ).items;
+        const nextApplications = requireData(
+          applicationResult.data,
+          applicationResult.error,
+          applicationResult.response,
+        ).items;
+        const nextPolicy = requireData(
+          policyResult.data,
+          policyResult.error,
+          policyResult.response,
+        );
+        if (signal?.aborted !== true) {
+          setProviders(nextProviders);
+          setApplications(nextApplications);
+          setPolicy(nextPolicy);
+          setSelectedProviderId((current) =>
+            current !== null && nextProviders.some((provider) => provider.id === current)
+              ? current
+              : (nextProviders[0]?.id ?? null),
+          );
+          setLoadState("ready");
+        }
+      } catch (error) {
+        if (signal?.aborted !== true) setLoadState("failed");
+        throw error;
+      }
+    },
+    [project, session],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void refresh().catch(handleError);
+      void refresh(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void handleError(error);
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
     };
   }, [handleError, refresh]);
 
@@ -109,6 +139,7 @@ export function ProvidersPage() {
     createAttempt.current.abandon();
     setPreflight(null);
     setPreflightIssuer("");
+    setOverlayError(null);
     setOnboarding(null);
   }
 
@@ -118,6 +149,7 @@ export function ProvidersPage() {
     const fields = new FormData(event.currentTarget);
     const issuer = text(fields, "issuer").trim();
     clearOnboardingSecret();
+    setOverlayError(null);
     setSubmitting(true);
     setPreflight(null);
     try {
@@ -133,6 +165,7 @@ export function ProvidersPage() {
       setPreflightIssuer(issuer);
       setMessage("Custom OIDC metadata passed preflight review.", "success");
     } catch (error) {
+      setOverlayError(errorMessage(error, "Custom OIDC preflight could not be completed."));
       await handleError(error, async () => {
         setPreflight(null);
         setPreflightIssuer("");
@@ -145,17 +178,21 @@ export function ProvidersPage() {
 
   async function updateEgressPolicy(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();
-    if (project === null || policy === null) return;
-    const fields = new FormData(event.currentTarget);
-    const mode = text(fields, "mode") === "exact_origins" ? "exact_origins" : "allow_all";
+    if (
+      project === null ||
+      policy === null ||
+      (egressMode === "exact_origins" && !isValidStringList(egressOrigins, true))
+    )
+      return;
     clearOnboardingSecret();
+    setEgressError(null);
     setSubmitting(true);
     try {
       const result = await session.client.PUT("/v1/projects/{project_id}/provider-egress-policy", {
         params: { path: { project_id: project.id } },
         body: {
-          mode,
-          exact_origins: mode === "exact_origins" ? lines(fields, "exact_origins") : [],
+          mode: egressMode,
+          exact_origins: egressMode === "exact_origins" ? compactStringList(egressOrigins) : [],
           expected_revision: policy.revision,
         },
       });
@@ -167,6 +204,7 @@ export function ProvidersPage() {
     } catch (error) {
       setPreflight(null);
       setPreflightIssuer("");
+      setEgressError("Provider destination policy could not be updated.");
       await handleError(error, async () => {
         await refresh();
         setEditingEgressPolicy(false);
@@ -179,6 +217,7 @@ export function ProvidersPage() {
   async function adoptPreflightOrigins() {
     if (project === null || policy === null || preflight === null) return;
     clearOnboardingSecret();
+    setOverlayError(null);
     setSubmitting(true);
     try {
       const result = await session.client.PUT("/v1/projects/{project_id}/provider-egress-policy", {
@@ -196,6 +235,7 @@ export function ProvidersPage() {
     } catch (error) {
       setPreflight(null);
       setPreflightIssuer("");
+      setOverlayError(errorMessage(error, "The reviewed origins could not be adopted."));
       await handleError(error, refresh);
     } finally {
       setSubmitting(false);
@@ -214,9 +254,8 @@ export function ProvidersPage() {
     if (idempotencyKey === null) return;
     if (onboarding === "oidc" && preflight === null) {
       createAttempt.current.abandon();
-      setMessage(
+      setOverlayError(
         "Run Custom OIDC preflight and review its result before creating the provider.",
-        "warning",
       );
       return;
     }
@@ -233,6 +272,7 @@ export function ProvidersPage() {
         onboarding !== "github" && fields.get("managed_profile_enabled") === "on",
       expected_project_revision: project.metadata_revision,
     };
+    setOverlayError(null);
     setSubmitting(true);
     try {
       const result = await (async () => {
@@ -259,6 +299,7 @@ export function ProvidersPage() {
       createAttempt.current.settle(error);
       setPreflight(null);
       setPreflightIssuer("");
+      setOverlayError(errorMessage(error, "Provider setup could not be completed."));
       if (!createAttempt.current.retainsKey) form.reset();
       await handleError(error, async () => {
         await Promise.all([refresh(), refreshProjects()]);
@@ -286,6 +327,7 @@ export function ProvidersPage() {
       expected_project_revision: project.metadata_revision,
     };
     if (secretInput instanceof HTMLInputElement) secretInput.value = "";
+    setOverlayError(null);
     setSubmitting(true);
     try {
       const result = await (async () => {
@@ -307,6 +349,7 @@ export function ProvidersPage() {
       setMessage("Provider provisioning reconciled.", "success");
     } catch (error) {
       body.client_secret = "";
+      setOverlayError(errorMessage(error, "Provider provisioning could not be resumed."));
       await handleError(error, refresh);
     } finally {
       setSubmitting(false);
@@ -345,6 +388,7 @@ export function ProvidersPage() {
 
   async function confirmAction() {
     if (project === null || confirmation === null) return;
+    setOverlayError(null);
     setSubmitting(true);
     try {
       if (confirmation.kind === "disable") {
@@ -377,6 +421,13 @@ export function ProvidersPage() {
       await refresh();
       setConfirmation(null);
     } catch (error) {
+      if (
+        error instanceof ControlRequestError &&
+        error.status === 409 &&
+        error.code === "revision_conflict"
+      )
+        setConfirmation(null);
+      else setOverlayError(errorMessage(error, "The provider action could not be completed."));
       await handleError(error, refresh);
     } finally {
       setSubmitting(false);
@@ -399,7 +450,7 @@ export function ProvidersPage() {
       <div className={styles["page"]}>
         <PageHeader
           title="Authentication providers"
-          description="Configure closed provider profiles, exact egress policy, and Application assignments."
+          description="Choose how users sign in and assign each provider to an Application."
         />
         {loadState === "loading" ? <p role="status">Loading authentication providers</p> : null}
         {loadState === "failed" ? (
@@ -417,103 +468,62 @@ export function ProvidersPage() {
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? null;
   return (
     <div className={styles["page"]}>
+      <UnsavedChangesGuard
+        dirty={editingEgressPolicy || onboarding !== null || reconcileProvider !== null}
+        submitting={submitting}
+        onDiscard={() => {
+          clearOnboardingSecret();
+          createAttempt.current.abandon();
+          setEditingEgressPolicy(false);
+          setOnboarding(null);
+          setReconcileProvider(null);
+          setPreflight(null);
+          setPreflightIssuer("");
+          setEgressError(null);
+          setOverlayError(null);
+        }}
+      />
       <PageHeader
         title="Authentication providers"
-        description="Configure closed provider profiles, exact egress policy, and Application assignments."
+        description="Choose how users sign in and assign each provider to an Application."
         actions={
           project.status === "active" ? (
-            <div className={styles["actions"]}>
-              <Button
-                type="button"
-                variant="primary"
-                onClick={() => {
-                  setOnboarding("google");
-                }}
-              >
-                Add Google
-              </Button>
-              <Button
-                type="button"
-                variant="secondary"
-                onClick={() => {
-                  setOnboarding("oidc");
-                }}
-              >
-                Add Custom OIDC
-              </Button>
-              <Button
-                type="button"
-                variant="quiet"
-                onClick={() => {
-                  setOnboarding("github");
-                }}
-              >
-                Add GitHub
-              </Button>
-            </div>
+            <Button
+              type="button"
+              variant="primary"
+              onClick={() => {
+                setChoosingProvider(true);
+              }}
+            >
+              Add provider
+            </Button>
           ) : undefined
         }
       />
       <Section
-        title="Provider egress policy"
-        description="Preflight and provider traffic are fenced by this Project policy."
+        title="Allowed provider destinations"
+        description="Control which HTTPS origins providers may contact during sign-in."
         action={
-          policy !== null && project.status === "active" && !editingEgressPolicy ? (
+          policy !== null && project.status === "active" ? (
             <Button
               type="button"
+              variant="secondary"
               onClick={() => {
+                setEgressMode(policy.mode);
+                setEgressOrigins(
+                  policy.exact_origins.length === 0 ? [""] : [...policy.exact_origins],
+                );
+                setEgressError(null);
                 setEditingEgressPolicy(true);
               }}
             >
-              Edit egress policy
+              Edit destinations
             </Button>
           ) : undefined
         }
       >
         {policy === null ? (
-          <p role="status">Loading egress policy</p>
-        ) : editingEgressPolicy ? (
-          <form className={styles["form"]} onSubmit={(event) => void updateEgressPolicy(event)}>
-            <Field label="Policy mode" htmlFor="egress-mode">
-              <Select
-                id="egress-mode"
-                name="mode"
-                defaultValue={policy.mode}
-                data-owl-initial-focus
-              >
-                <option value="allow_all">Allow all safe discovered origins</option>
-                <option value="exact_origins">Allow only exact origins</option>
-              </Select>
-            </Field>
-            <Field
-              label="Exact origins"
-              htmlFor="egress-origins"
-              optional
-              description="One normalized HTTPS origin per line; ignored in allow-all mode."
-            >
-              <Textarea
-                id="egress-origins"
-                name="exact_origins"
-                rows={4}
-                defaultValue={policy.exact_origins.join("\n")}
-              />
-            </Field>
-            <div className={styles["formActions"]}>
-              <Button
-                type="button"
-                variant="quiet"
-                disabled={submitting}
-                onClick={() => {
-                  setEditingEgressPolicy(false);
-                }}
-              >
-                Cancel
-              </Button>
-              <Button type="submit" variant="primary" busy={submitting}>
-                Save egress policy
-              </Button>
-            </div>
-          </form>
+          <p role="status">Loading allowed destinations</p>
         ) : (
           <DescriptionList
             items={[
@@ -524,18 +534,24 @@ export function ProvidersPage() {
                     ? "Allow all safe discovered origins"
                     : "Allow exact origins only",
               },
-              {
-                term: "Exact origins",
-                detail:
-                  policy.exact_origins.length === 0
-                    ? "None configured"
-                    : policy.exact_origins.map((origin) => (
-                        <span className={styles["machineValue"]} key={origin}>
-                          {origin}
-                        </span>
-                      )),
-              },
-              { term: "Revision", detail: String(policy.revision) },
+              ...(policy.mode === "exact_origins"
+                ? [
+                    {
+                      term: "Allowed origins",
+                      detail:
+                        policy.exact_origins.length === 0
+                          ? "None configured"
+                          : policy.exact_origins.map((origin) => (
+                              <CopyValue
+                                key={origin}
+                                value={origin}
+                                label="provider origin"
+                                block
+                              />
+                            )),
+                    },
+                  ]
+                : []),
             ]}
           />
         )}
@@ -593,22 +609,131 @@ export function ProvidersPage() {
           applications={applications}
           onAssign={assign}
           onReconcile={() => {
+            setOverlayError(null);
             setReconcileProvider(selectedProvider);
           }}
           onDisable={() => {
+            setOverlayError(null);
             setConfirmation({ kind: "disable", provider: selectedProvider });
           }}
           onUnassign={(application) => {
+            setOverlayError(null);
             setConfirmation({ kind: "unassign", provider: selectedProvider, application });
           }}
         />
       )}
+      <Dialog
+        open={choosingProvider}
+        title="Choose a provider"
+        onClose={() => {
+          setChoosingProvider(false);
+        }}
+      >
+        <p className={styles["muted"]}>
+          Select the provider profile that matches your identity service.
+        </p>
+        <div className={styles["providerChoices"]}>
+          {(
+            [
+              ["google", "Google", "Google sign-in with optional managed profile sync."],
+              ["github", "GitHub", "GitHub sign-in using OwlAuth’s fixed login profile."],
+              ["oidc", "Custom OIDC", "Any compatible OIDC provider, verified before setup."],
+            ] as const
+          ).map(([kind, title, description]) => (
+            <button
+              key={kind}
+              type="button"
+              className={styles["providerChoice"]}
+              onClick={() => {
+                setChoosingProvider(false);
+                setOverlayError(null);
+                setOnboarding(kind);
+              }}
+            >
+              <ProviderIcon kind={kind} />
+              <span>
+                <strong>{title}</strong>
+                <small>{description}</small>
+              </span>
+            </button>
+          ))}
+        </div>
+      </Dialog>
+      <Dialog
+        open={editingEgressPolicy && policy !== null}
+        title="Edit allowed provider destinations"
+        onClose={() => {
+          if (!submitting) setEditingEgressPolicy(false);
+        }}
+        actions={
+          <>
+            <Button
+              type="button"
+              variant="quiet"
+              disabled={submitting}
+              onClick={() => {
+                setEditingEgressPolicy(false);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" form="provider-egress-form" variant="primary" busy={submitting}>
+              Save destinations
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="provider-egress-form"
+          className={styles["form"]}
+          onSubmit={(event) => void updateEgressPolicy(event)}
+        >
+          {egressError === null ? null : (
+            <InlineAlert tone="danger" role="alert">
+              {egressError}
+            </InlineAlert>
+          )}
+          <Field label="Destination policy" htmlFor="egress-mode">
+            <Select
+              id="egress-mode"
+              value={egressMode}
+              data-owl-initial-focus
+              onChange={(event) => {
+                setEgressMode(
+                  event.target.value === "exact_origins" ? "exact_origins" : "allow_all",
+                );
+              }}
+            >
+              <option value="allow_all">
+                Allow safe origins discovered from provider metadata
+              </option>
+              <option value="exact_origins">Allow only the origins listed below</option>
+            </Select>
+          </Field>
+          {egressMode === "exact_origins" ? (
+            <StringListField
+              label="Allowed origins"
+              description="Add each normalized HTTPS origin providers may contact."
+              itemLabel="Origin"
+              placeholder={`https://identity.example.com`}
+              values={egressOrigins}
+              onChange={setEgressOrigins}
+              required
+            />
+          ) : (
+            <InlineAlert tone="info">
+              OwlAuth will use the safe HTTPS origins discovered during provider preflight.
+            </InlineAlert>
+          )}
+        </form>
+      </Dialog>
       <ProviderOnboardingDialog
         kind={onboarding}
         preflight={preflight}
         preflightIssuer={preflightIssuer}
         policy={policy}
         submitting={submitting}
+        error={overlayError}
         onClose={closeOnboarding}
         secretInputRef={onboardingSecretInput}
         onIssuerChanged={() => {
@@ -649,6 +774,11 @@ export function ProvidersPage() {
           className={styles["form"]}
           onSubmit={(event) => void reconcile(event)}
         >
+          {overlayError === null ? null : (
+            <InlineAlert tone="danger" role="alert">
+              {overlayError}
+            </InlineAlert>
+          )}
           <p>Re-enter the write-only client secret for {reconcileProvider?.display_name}.</p>
           <Field label="Client secret" htmlFor="reconcile-secret">
             <Input
@@ -691,6 +821,11 @@ export function ProvidersPage() {
           </>
         }
       >
+        {overlayError === null ? null : (
+          <InlineAlert tone="danger" role="alert">
+            {overlayError}
+          </InlineAlert>
+        )}
         {confirmation?.kind === "disable" ? (
           <p>
             Disable <strong>{confirmation.provider.display_name}</strong> and prevent all of its
@@ -827,6 +962,7 @@ function ProviderOnboardingDialog({
   preflightIssuer,
   policy,
   submitting,
+  error,
   secretInputRef,
   onClose,
   onIssuerChanged,
@@ -839,6 +975,7 @@ function ProviderOnboardingDialog({
   readonly preflightIssuer: string;
   readonly policy: ProviderEgressPolicy | null;
   readonly submitting: boolean;
+  readonly error: string | null;
   readonly secretInputRef: RefObject<HTMLInputElement | null>;
   readonly onClose: () => void;
   readonly onIssuerChanged: () => void;
@@ -850,9 +987,11 @@ function ProviderOnboardingDialog({
     kind === "google" ? "Add Google" : kind === "github" ? "Add GitHub" : "Add Custom OIDC";
   const formId = "provider-onboarding";
   return (
-    <Dialog
+    <SideSheet
       open={kind !== null}
+      side="right"
       title={title}
+      closeLabel="Close provider setup"
       onClose={onClose}
       actions={
         <>
@@ -871,6 +1010,11 @@ function ProviderOnboardingDialog({
         </>
       }
     >
+      {error === null ? null : (
+        <InlineAlert tone="danger" role="alert">
+          {error}
+        </InlineAlert>
+      )}
       {kind === "oidc" ? (
         <form className={styles["form"]} onSubmit={(event) => void onPreflight(event)}>
           <Field label="Canonical HTTPS issuer" htmlFor="provider-preflight-issuer">
@@ -907,7 +1051,10 @@ function ProviderOnboardingDialog({
               },
               {
                 term: "Policy",
-                detail: `${preflight.policy_mode}, revision ${String(preflight.policy_revision)}`,
+                detail:
+                  preflight.policy_mode === "exact_origins"
+                    ? "Allowed origins match the Project destination policy"
+                    : "Safe discovered origins are allowed",
               },
               {
                 term: "PKCE S256",
@@ -988,18 +1135,15 @@ function ProviderOnboardingDialog({
           </Checkbox>
         )}
       </form>
-    </Dialog>
+    </SideSheet>
   );
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof ControlRequestError ? error.message : fallback;
 }
 
 function text(fields: FormData, name: string): string {
   const value = fields.get(name);
   return typeof value === "string" ? value : "";
-}
-
-function lines(fields: FormData, name: string): string[] {
-  return text(fields, name)
-    .split(/\r?\n/u)
-    .map((value) => value.trim())
-    .filter(Boolean);
 }

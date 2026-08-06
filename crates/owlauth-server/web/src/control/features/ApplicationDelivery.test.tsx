@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { createMemoryRouter, RouterProvider } from "react-router";
 
 import {
   type Application,
@@ -160,16 +161,22 @@ function renderPanel(options?: {
     client: { GET: get, PUT: put, POST: post },
     dispose: vi.fn(),
   } as unknown as DisposableControlClient;
-  render(
-    <ControlConfirmationProvider>
-      <ApplicationDelivery
-        session={session}
-        application={application}
-        onError={onError}
-        setMessage={setMessage}
-      />
-    </ControlConfirmationProvider>,
-  );
+  const router = createMemoryRouter([
+    {
+      path: "*",
+      element: (
+        <ControlConfirmationProvider>
+          <ApplicationDelivery
+            session={session}
+            application={application}
+            onError={onError}
+            setMessage={setMessage}
+          />
+        </ControlConfirmationProvider>
+      ),
+    },
+  ]);
+  render(<RouterProvider router={router} />);
   return { get, onError, post, put, setMessage };
 }
 
@@ -276,6 +283,9 @@ describe("Application sync Console", () => {
     expect(await screen.findByLabelText("Next signing secret")).toBeVisible();
 
     const secret = screen.getByLabelText("Next signing secret");
+    fireEvent.change(secret, { target: { value: "too-short" } });
+    fireEvent.click(screen.getByRole("button", { name: "Prepare secret rotation" }));
+    expect(post).not.toHaveBeenCalled();
     fireEvent.change(secret, { target: { value: "b".repeat(32) } });
     fireEvent.click(screen.getByRole("button", { name: "Prepare secret rotation" }));
     await waitFor(() => {
@@ -284,7 +294,11 @@ describe("Application sync Console", () => {
     expect(secret).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("b".repeat(32));
 
-    fireEvent.change(screen.getByLabelText("Overlap seconds"), { target: { value: "600" } });
+    const overlap = screen.getByLabelText("Overlap window in seconds");
+    fireEvent.change(overlap, { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Activate generation 2" }));
+    expect(post).toHaveBeenCalledTimes(1);
+    fireEvent.change(overlap, { target: { value: "600" } });
     fireEvent.click(screen.getByRole("button", { name: "Activate generation 2" }));
     await waitFor(() => {
       expect(

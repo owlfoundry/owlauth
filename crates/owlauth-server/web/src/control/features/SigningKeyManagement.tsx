@@ -1,5 +1,7 @@
 import { useRef } from "react";
 
+import { Button } from "../../shared/primitives/Button";
+import { StatusBadge } from "../../shared/primitives/Feedback";
 import { useControlConfirmation } from "../app/Confirmation";
 import styles from "./features.module.css";
 import {
@@ -87,16 +89,17 @@ export function SigningKeyManagement({
     <section aria-labelledby="signing-keys-heading">
       <div className={styles["sectionHeader"]}>
         <div>
-          <h3 id="signing-keys-heading">Signing keys</h3>
+          <h2 id="signing-keys-heading">Signing keys</h2>
           <p>OwlAuth provisions, publishes, activates, and retires keys automatically.</p>
         </div>
-        <button
+        <Button
           type="button"
+          variant="primary"
           onClick={() => void rotate()}
           disabled={project.status !== "active" || rotationPending}
         >
           Rotate signing key
-        </button>
+        </Button>
       </div>
       {keys.length === 0 ? (
         <p>Initial signing key setup is pending.</p>
@@ -104,19 +107,14 @@ export function SigningKeyManagement({
         <ul className={styles["cards"]}>
           {keys.map((key) => (
             <li key={key.id}>
-              <strong>{key.kid}</strong> — {key.algorithm}, {key.state}, ring revision{" "}
-              {key.ring_revision}
+              <strong>{key.kid}</strong> — {key.algorithm} <StatusBadge status={key.state} />
               <div className={styles["actions"]}>
                 {!["retired", "revoked", "abandoned"].includes(key.state) ? (
-                  <button
-                    className={styles["danger"]}
-                    type="button"
-                    onClick={() => void revoke(key)}
-                  >
+                  <Button variant="danger" type="button" onClick={() => void revoke(key)}>
                     {key.state === "provisioning" && key.public_jwk === null
                       ? "Cancel incomplete rotation"
                       : "Emergency revoke"}
-                  </button>
+                  </Button>
                 ) : null}
               </div>
             </li>

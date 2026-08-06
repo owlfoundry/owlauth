@@ -14,31 +14,42 @@ export function UserDetailPage() {
   const [applications, setApplications] = useState<Application[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
 
-  const refreshDependencies = useCallback(async () => {
-    if (project === null) return;
-    const [applicationResult, providerResult] = await Promise.all([
-      session.client.GET("/v1/projects/{project_id}/applications", {
-        params: { path: { project_id: project.id } },
-      }),
-      session.client.GET("/v1/projects/{project_id}/providers", {
-        params: { path: { project_id: project.id } },
-      }),
-    ]);
-    setApplications(
-      requireData(applicationResult.data, applicationResult.error, applicationResult.response)
-        .items,
-    );
-    setProviders(
-      requireData(providerResult.data, providerResult.error, providerResult.response).items,
-    );
-  }, [project, session]);
+  const refreshDependencies = useCallback(
+    async (signal?: AbortSignal) => {
+      if (project === null) return;
+      const [applicationResult, providerResult] = await Promise.all([
+        session.client.GET("/v1/projects/{project_id}/applications", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        }),
+        session.client.GET("/v1/projects/{project_id}/providers", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        }),
+      ]);
+      if (signal?.aborted !== true) {
+        setApplications(
+          requireData(applicationResult.data, applicationResult.error, applicationResult.response)
+            .items,
+        );
+        setProviders(
+          requireData(providerResult.data, providerResult.error, providerResult.response).items,
+        );
+      }
+    },
+    [project, session],
+  );
 
   useEffect(() => {
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void refreshDependencies().catch(handleError);
+      void refreshDependencies(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void handleError(error);
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
     };
   }, [handleError, refreshDependencies]);
 

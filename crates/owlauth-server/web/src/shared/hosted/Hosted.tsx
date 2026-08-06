@@ -67,7 +67,7 @@ export function TerminalState({ title, children, action, announce = true }: Term
   const heading = useRef<HTMLHeadingElement | null>(null);
   useEffect(() => {
     heading.current?.focus();
-  }, []);
+  }, [title]);
   return (
     <section className={styles["terminal"]} aria-live={announce ? "polite" : undefined}>
       <h2 ref={heading} tabIndex={-1}>

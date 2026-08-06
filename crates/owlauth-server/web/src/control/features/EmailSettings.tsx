@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 
+import { formatDuration } from "../../shared/compositions/CopyValue";
 import { DataTable, DescriptionList, EmptyState, Section } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Checkbox, Field, Input, Select } from "../../shared/primitives/Field";
-import { Dialog } from "../../shared/primitives/Overlay";
+import { Dialog, SideSheet } from "../../shared/primitives/Overlay";
 import { useControlConfirmation } from "../app/Confirmation";
+import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
 import {
   type Application,
   type DisposableControlClient,
@@ -46,47 +48,64 @@ export function EmailSettings({
   const [editingPolicy, setEditingPolicy] = useState(false);
   const [creatingSmtp, setCreatingSmtp] = useState(false);
   const [testingSmtp, setTestingSmtp] = useState<SmtpConfiguration | null>(null);
+  const [editorError, setEditorError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const createAttempt = useRef(new IdempotencyAttempt());
   const smtpTestAttempts = useRef(new Map<string, IdempotencyAttempt>());
 
-  const refresh = useCallback(async () => {
-    const [policyResult, assignmentResult, smtpResult] = await Promise.all([
-      session.client.GET("/v1/projects/{project_id}/email-method", {
-        params: { path: { project_id: project.id } },
-      }),
-      session.client.GET("/v1/projects/{project_id}/email-method/assignments", {
-        params: { path: { project_id: project.id } },
-      }),
-      session.client.GET("/v1/projects/{project_id}/smtp-configurations", {
-        params: { path: { project_id: project.id } },
-      }),
-    ]);
-    setPolicy(requireData(policyResult.data, policyResult.error, policyResult.response));
-    setAssignments(
-      requireData(assignmentResult.data, assignmentResult.error, assignmentResult.response).items,
-    );
-    setSmtp(requireData(smtpResult.data, smtpResult.error, smtpResult.response).items);
-  }, [project.id, session]);
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      const [policyResult, assignmentResult, smtpResult] = await Promise.all([
+        session.client.GET("/v1/projects/{project_id}/email-method", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        }),
+        session.client.GET("/v1/projects/{project_id}/email-method/assignments", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        }),
+        session.client.GET("/v1/projects/{project_id}/smtp-configurations", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        }),
+      ]);
+      if (signal?.aborted !== true) {
+        setPolicy(requireData(policyResult.data, policyResult.error, policyResult.response));
+        setAssignments(
+          requireData(assignmentResult.data, assignmentResult.error, assignmentResult.response)
+            .items,
+        );
+        setSmtp(requireData(smtpResult.data, smtpResult.error, smtpResult.response).items);
+      }
+    },
+    [project.id, session],
+  );
 
-  const load = useCallback(async () => {
-    setLoadState("loading");
-    try {
-      await refresh();
-      setLoadState("ready");
-    } catch (error) {
-      setLoadState("failed");
-      throw error;
-    }
-  }, [refresh]);
+  const load = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoadState("loading");
+      try {
+        await refresh(signal);
+        if (signal?.aborted !== true) setLoadState("ready");
+      } catch (error) {
+        if (signal?.aborted !== true) setLoadState("failed");
+        throw error;
+      }
+    },
+    [refresh],
+  );
 
   useEffect(() => {
     const attempt = createAttempt.current;
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void load().catch(onError);
+      void load(controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) void onError(error);
+      });
     }, 0);
     return () => {
       window.clearTimeout(timer);
+      controller.abort();
       attempt.abandon();
     };
   }, [load, onError]);
@@ -100,6 +119,7 @@ export function EmailSettings({
     event.preventDefault();
     if (policy === null) return;
     const fields = new FormData(event.currentTarget);
+    setEditorError(null);
     setSubmitting(true);
     try {
       const result = await session.client.PUT("/v1/projects/{project_id}/email-method", {
@@ -125,6 +145,7 @@ export function EmailSettings({
       setEditingPolicy(false);
       setMessage("Email method policy updated.");
     } catch (error) {
+      setEditorError("Email method policy could not be updated.");
       await onError(error, async () => {
         await refresh();
         setEditingPolicy(false);
@@ -188,6 +209,7 @@ export function EmailSettings({
     fields.set("password", "");
     username = "";
     password = "";
+    setEditorError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST("/v1/projects/{project_id}/smtp-configurations", {
@@ -204,6 +226,7 @@ export function EmailSettings({
       setMessage("Pending SMTP generation reconciled. Test it before activation.");
     } catch (error) {
       createAttempt.current.settle(error);
+      setEditorError("SMTP generation could not be created. Re-enter write-only credentials.");
       await onError(error, async () => {
         createAttempt.current.abandon();
         await Promise.all([onProjectChanged(), refresh()]);
@@ -226,6 +249,7 @@ export function EmailSettings({
     }
     const idempotencyKey = attempt.begin();
     if (idempotencyKey === null) return;
+    setEditorError(null);
     setSubmitting(true);
     try {
       const result = await session.client.POST(
@@ -244,6 +268,7 @@ export function EmailSettings({
       setMessage("Bounded SMTP test accepted.");
     } catch (error) {
       attempt.settle(error);
+      setEditorError("The SMTP test could not be confirmed. Review the recipient and retry.");
       await onError(error, async () => {
         await refresh();
         setTestingSmtp(null);
@@ -313,6 +338,17 @@ export function EmailSettings({
   const active = project.status === "active";
   return (
     <>
+      <UnsavedChangesGuard
+        dirty={editingPolicy || creatingSmtp || testingSmtp !== null}
+        submitting={submitting}
+        onDiscard={() => {
+          createAttempt.current.abandon();
+          setEditingPolicy(false);
+          setCreatingSmtp(false);
+          setTestingSmtp(null);
+          setEditorError(null);
+        }}
+      />
       <Section
         title="Passwordless policy"
         description="Committed proof, signup, and delivery-selection policy."
@@ -321,6 +357,7 @@ export function EmailSettings({
             <Button
               type="button"
               onClick={() => {
+                setEditorError(null);
                 setEditingPolicy(true);
               }}
             >
@@ -332,41 +369,52 @@ export function EmailSettings({
         <DescriptionList
           items={[
             { term: "Project method", detail: policy.enabled ? "Enabled" : "Disabled" },
-            {
-              term: "Proof modes",
-              detail:
-                [
-                  policy.otp_enabled ? "One-time code" : null,
-                  policy.magic_link_enabled ? "Magic link" : null,
+            ...(policy.enabled
+              ? [
+                  {
+                    term: "Proof modes",
+                    detail:
+                      [
+                        policy.otp_enabled ? "One-time code" : null,
+                        policy.magic_link_enabled ? "Magic link" : null,
+                      ]
+                        .filter(Boolean)
+                        .join(", ") || "None enabled",
+                  },
+                  ...(policy.otp_enabled
+                    ? [
+                        {
+                          term: "One-time code",
+                          detail: `${String(policy.otp_digits)} digits, ${formatDuration(policy.otp_validity_seconds)}, ${String(policy.otp_max_attempts)} attempts`,
+                        },
+                        {
+                          term: "Resend and generation limits",
+                          detail: `${formatDuration(policy.resend_after_seconds)} between messages; ${String(policy.max_generations)} active generations`,
+                        },
+                      ]
+                    : []),
+                  ...(policy.magic_link_enabled
+                    ? [
+                        {
+                          term: "Magic-link lifetime",
+                          detail: formatDuration(policy.magic_validity_seconds),
+                        },
+                      ]
+                    : []),
+                  {
+                    term: "New email users",
+                    detail: policy.signup_enabled ? "Allowed" : "Blocked",
+                  },
+                  {
+                    term: "Transferred browser",
+                    detail: policy.transferred_magic_link_enabled ? "Allowed" : "Blocked",
+                  },
+                  {
+                    term: "Deployment-default SMTP",
+                    detail: policy.allow_deployment_default ? "Allowed" : "Not allowed",
+                  },
                 ]
-                  .filter(Boolean)
-                  .join(", ") || "None enabled",
-            },
-            {
-              term: "One-time code",
-              detail: `${String(policy.otp_digits)} digits, ${String(policy.otp_validity_seconds)} second lifetime, ${String(policy.otp_max_attempts)} attempts`,
-            },
-            {
-              term: "Generation limits",
-              detail: `${String(policy.resend_after_seconds)} second resend delay; ${String(policy.max_generations)} maximum generations`,
-            },
-            {
-              term: "Magic-link lifetime",
-              detail: `${String(policy.magic_validity_seconds)} seconds`,
-            },
-            { term: "New email users", detail: policy.signup_enabled ? "Allowed" : "Blocked" },
-            {
-              term: "Transferred browser",
-              detail: policy.transferred_magic_link_enabled ? "Allowed" : "Blocked",
-            },
-            {
-              term: "Deployment-default SMTP",
-              detail: policy.allow_deployment_default ? "Allowed" : "Not allowed",
-            },
-            {
-              term: "Revisions",
-              detail: `Policy ${String(policy.policy_revision)}; security ${String(policy.security_revision)}`,
-            },
+              : []),
           ]}
         />
       </Section>
@@ -384,7 +432,7 @@ export function EmailSettings({
         ) : (
           <DataTable
             caption="Passwordless email Application assignments"
-            headings={["Application", "Status", "Application revision", "Action"]}
+            headings={["Application", "Status", "Action"]}
           >
             {applications.map((application) => {
               const enabled = assignmentByApplication.get(application.id)?.enabled === true;
@@ -397,7 +445,6 @@ export function EmailSettings({
                       family={enabled ? "active" : "disabled"}
                     />
                   </td>
-                  <td>{String(application.security_revision)}</td>
                   <td>
                     <Button
                       type="button"
@@ -424,6 +471,7 @@ export function EmailSettings({
               type="button"
               variant="primary"
               onClick={() => {
+                setEditorError(null);
                 setCreatingSmtp(true);
               }}
             >
@@ -465,6 +513,7 @@ export function EmailSettings({
                       variant="quiet"
                       disabled={submitting}
                       onClick={() => {
+                        setEditorError(null);
                         setTestingSmtp(configuration);
                       }}
                     >
@@ -509,8 +558,10 @@ export function EmailSettings({
         )}
       </Section>
 
-      <Dialog
+      <SideSheet
         open={editingPolicy}
+        side="right"
+        closeLabel="Close passwordless policy editor"
         title="Edit passwordless policy"
         onClose={() => {
           if (!submitting) setEditingPolicy(false);
@@ -538,6 +589,11 @@ export function EmailSettings({
           className={styles["form"]}
           onSubmit={(event) => void updatePolicy(event)}
         >
+          {editorError === null ? null : (
+            <InlineAlert tone="danger" role="alert">
+              {editorError}
+            </InlineAlert>
+          )}
           <Checkbox name="enabled" defaultChecked={policy.enabled} data-owl-initial-focus>
             Enable Project email method
           </Checkbox>
@@ -629,7 +685,7 @@ export function EmailSettings({
             Allow deployment-default SMTP
           </Checkbox>
         </form>
-      </Dialog>
+      </SideSheet>
 
       <Dialog
         open={creatingSmtp}
@@ -663,6 +719,11 @@ export function EmailSettings({
           className={styles["form"]}
           onSubmit={(event) => void createSmtp(event)}
         >
+          {editorError === null ? null : (
+            <InlineAlert tone="danger" role="alert">
+              {editorError}
+            </InlineAlert>
+          )}
           <Field label="Hostname" htmlFor="smtp-host">
             <Input id="smtp-host" name="host" required maxLength={253} data-owl-initial-focus />
           </Field>
@@ -711,6 +772,7 @@ export function EmailSettings({
       <SmtpTestDialog
         configuration={testingSmtp}
         submitting={submitting}
+        error={editorError}
         onClose={() => {
           setTestingSmtp(null);
         }}
@@ -723,19 +785,21 @@ export function EmailSettings({
 function SmtpTestDialog({
   configuration,
   submitting,
+  error,
   onClose,
   onTest,
 }: {
   readonly configuration: SmtpConfiguration | null;
   readonly submitting: boolean;
+  readonly error: string | null;
   readonly onClose: () => void;
   readonly onTest: (configuration: SmtpConfiguration, recipient: string) => Promise<void>;
 }) {
-  const input = useRef<HTMLInputElement>(null);
+  const formId = "smtp-test-form";
   return (
     <Dialog
       open={configuration !== null}
-      title="Send bounded SMTP test"
+      title="Send SMTP test"
       onClose={() => {
         if (!submitting) onClose();
       }}
@@ -744,29 +808,37 @@ function SmtpTestDialog({
           <Button type="button" variant="quiet" disabled={submitting} onClick={onClose}>
             Cancel
           </Button>
-          <Button
-            type="button"
-            variant="primary"
-            busy={submitting}
-            onClick={() => {
-              if (configuration !== null) void onTest(configuration, input.current?.value ?? "");
-            }}
-          >
+          <Button type="submit" form={formId} variant="primary" busy={submitting}>
             Send test
           </Button>
         </>
       }
     >
-      <Field label="Test recipient" htmlFor="smtp-test-recipient">
-        <Input
-          ref={input}
-          id="smtp-test-recipient"
-          type="email"
-          required
-          maxLength={254}
-          data-owl-initial-focus
-        />
-      </Field>
+      <form
+        id={formId}
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!event.currentTarget.checkValidity()) return;
+          const recipient = field(new FormData(event.currentTarget), "recipient");
+          if (configuration !== null) void onTest(configuration, recipient);
+        }}
+      >
+        {error === null ? null : (
+          <InlineAlert tone="danger" role="alert">
+            {error}
+          </InlineAlert>
+        )}
+        <Field label="Test recipient" htmlFor="smtp-test-recipient">
+          <Input
+            id="smtp-test-recipient"
+            name="recipient"
+            type="email"
+            required
+            maxLength={254}
+            data-owl-initial-focus
+          />
+        </Field>
+      </form>
     </Dialog>
   );
 }
