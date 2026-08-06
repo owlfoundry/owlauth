@@ -370,6 +370,65 @@ describe("Runtime Hosted Authentication", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("renders a completed managed callback only on its matching provider route", () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/runtime/projects/prj_public/auth/callback/workforce-main?code=bounded&state=bounded",
+    );
+    installFlow("managed_reauthorization", {
+      project_public_id: "prj_public",
+      provider_key: "workforce-main",
+      provider_display_name: "Workforce SSO",
+      provider_kind: "oidc",
+      status: "completed",
+      revision: 3,
+      expires_at: future,
+    });
+
+    render(<RuntimeApp />);
+
+    expect(screen.getByRole("heading", { name: "Connection reauthorized" })).toBeVisible();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "You can close this page and return to the Console.",
+    );
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "a different provider",
+      "/runtime/projects/prj_public/auth/callback/other-provider?code=bounded&state=bounded",
+      "completed",
+    ],
+    [
+      "a different Project",
+      "/runtime/projects/prj_other/auth/callback/workforce-main?code=bounded&state=bounded",
+      "completed",
+    ],
+    [
+      "a non-terminal status",
+      "/runtime/projects/prj_public/auth/callback/workforce-main?code=bounded&state=bounded",
+      "provider_exchange_in_progress",
+    ],
+  ])("rejects a managed callback with %s", (_case, path, status) => {
+    window.history.replaceState({}, "", path);
+    installFlow("managed_reauthorization", {
+      project_public_id: "prj_public",
+      provider_key: "workforce-main",
+      provider_display_name: "Workforce SSO",
+      provider_kind: "oidc",
+      status,
+      revision: 3,
+      expires_at: future,
+    });
+
+    render(<RuntimeApp />);
+
+    expect(screen.getByRole("heading", { name: "No sign-in is active" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Connection reauthorized" })).toBeNull();
+  });
+
   it("directs a just-expired managed reauthorization back to the management flow", () => {
     window.history.replaceState(
       {},

@@ -289,7 +289,13 @@ export function consumeRuntimeFlow(): RuntimeFlow | null {
     return handle === null ? null : { kind: "identity-mutation", handle, bootstrap: parsed };
   }
   if (flow === "managed_reauthorization" && validManagedReauthorization(parsed)) {
-    const handle = pathHandle("/auth/managed-reauthorizations/");
+    const hostedHandle = pathHandle("/auth/managed-reauthorizations/");
+    const callbackProvider =
+      parsed.status === "completed"
+        ? pathHandle(`/projects/${encodeURIComponent(parsed.project_public_id)}/auth/callback/`)
+        : null;
+    const handle =
+      hostedHandle ?? (callbackProvider === parsed.provider_key ? callbackProvider : null);
     return handle === null ? null : { kind: "managed-reauthorization", handle, bootstrap: parsed };
   }
   if (flow === "browser-logout" && validBrowserLogout(parsed)) {
