@@ -631,6 +631,9 @@ test("same SDK artifact completes browser-direct and backend-custody Project Aut
   await expect(managedPage.getByText("does not sign you in to an Application")).toBeVisible();
   await expect(managedPage.getByRole("button")).toHaveCount(1);
   await managedPage.getByRole("button").click();
+  await expect(
+    managedPage.getByRole("heading", { name: "Connection reauthorized", exact: true }),
+  ).toBeVisible({ timeout: 30_000 });
   await expect
     .poll(
       async () => {

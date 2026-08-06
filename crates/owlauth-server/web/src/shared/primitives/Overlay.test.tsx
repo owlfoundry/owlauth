@@ -60,7 +60,10 @@ function NavigationSurface() {
 describe("modal focus lifecycle", () => {
   it("settles focus restoration before a navigation layout focuses the destination", () => {
     render(<NavigationSurface />);
-    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const trigger = screen.getByRole("button", { name: "Open navigation" });
+    trigger.focus();
+    expect(trigger).toHaveFocus();
+    fireEvent.click(trigger);
     fireEvent.click(screen.getByRole("button", { name: "Applications" }));
     expect(screen.getByRole("heading", { name: "Applications" })).toHaveFocus();
   });

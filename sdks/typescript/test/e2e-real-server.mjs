@@ -226,7 +226,20 @@ async function assertRejectedFaultDoesNotRemainArmed() {
       body: "{}",
     },
   );
-  assert.notEqual(response.status, 200, "malformed refresh unexpectedly committed");
+  assert.equal(response.status, 400, "malformed refresh did not preserve the Runtime status");
+  assert.match(
+    response.headers.get("content-type") ?? "",
+    /^application\/json(?:;|$)/,
+    "malformed refresh did not preserve the Runtime media type",
+  );
+  const problem = await response.json();
+  assert.deepEqual(Object.keys(problem).sort(), ["code", "message", "request_id"]);
+  assert.equal(problem.code, "invalid_json");
+  assert.equal(typeof problem.message, "string");
+  assert.ok(problem.message.length > 0);
+  assert.equal(typeof problem.request_id, "string");
+  assert.ok(problem.request_id.length > 0);
+  assert.notEqual(problem.code, "fault_proxy_failure");
   const events = await fetch(
     new URL("__e2e/events", process.env.OWLAUTH_E2E_FAULT_PROXY_BASE),
     { headers: { authorization: `Bearer ${process.env.OWLAUTH_E2E_FAULT_PROXY_TOKEN}` } },
