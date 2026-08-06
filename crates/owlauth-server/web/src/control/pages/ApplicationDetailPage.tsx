@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
@@ -94,14 +94,8 @@ export function ApplicationDetailPage() {
     };
   }, [handleError, refresh]);
 
-  useEffect(() => {
-    if (loadState === "loading") return;
-    const frame = window.requestAnimationFrame(() => {
-      headingRef.current?.focus();
-    });
-    return () => {
-      window.cancelAnimationFrame(frame);
-    };
+  useLayoutEffect(() => {
+    if (loadState !== "loading") headingRef.current?.focus();
   }, [application?.id, loadState]);
 
   async function updateMetadata(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
