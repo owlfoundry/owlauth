@@ -41,6 +41,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
+url = "2.5.8"
 EOF
 cat > "$consumer/tests/artifact_origin.rs" <<EOF
 #[test]
