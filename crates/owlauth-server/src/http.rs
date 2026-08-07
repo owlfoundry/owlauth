@@ -3289,7 +3289,7 @@ async fn refresh_session(
             .and_then(credential_pair_response),
         Err(error) => Err(error),
     };
-    let mut response = runtime_json(result, &request_id);
+    let mut response = runtime_refresh_json(result, &request_id);
     if let Some(origin) = cors_origin {
         apply_cors(&mut response, &origin, false);
     }
@@ -7751,6 +7751,18 @@ where
     }
 }
 
+fn runtime_refresh_json<T>(result: Result<T, ApplicationError>, request_id: &str) -> Response
+where
+    T: Serialize,
+{
+    match result {
+        Err(ApplicationError::NotFound | ApplicationError::Disabled) => {
+            runtime_problem(ApplicationError::InvalidInput, request_id)
+        }
+        result => runtime_json(result, request_id),
+    }
+}
+
 fn runtime_status_json<T>(
     status: StatusCode,
     result: Result<T, ApplicationError>,
@@ -11680,6 +11692,19 @@ pub(crate) mod tests {
             client_types::ClientErrorCode::InvalidCredential,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn refresh_hides_absent_credentials_behind_the_declared_bad_request_status() {
+        for error in [ApplicationError::NotFound, ApplicationError::Disabled] {
+            let response = runtime_refresh_json::<serde_json::Value>(Err(error), "request-refresh");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: runtime_types::RuntimeError =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body.code, "invalid_request");
+            assert_eq!(body.request_id, "request-refresh");
+        }
     }
 
     #[tokio::test]

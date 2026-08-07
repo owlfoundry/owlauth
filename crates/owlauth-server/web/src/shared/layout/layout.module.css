@@ -77,7 +77,7 @@
   min-width: 0;
   max-width: 100%;
   overflow-x: auto;
-  contain: inline-size;
+  contain: inline-size paint;
   border: 1px solid var(--owl-border);
   border-radius: var(--owl-radius-surface);
 }
