@@ -44,6 +44,9 @@ resolver = "3"
 owlauth-types = { path = "owlauth-types-${types_version}" }
 EOF
 
+host_target="$(rustc -vV | sed -n 's/^host: //p')"
+test -n "$host_target"
+cargo fetch --locked --target "$host_target"
 CARGO_NET_OFFLINE=true cargo generate-lockfile \
   --manifest-path "$work_directory/Cargo.toml"
 CARGO_NET_OFFLINE=true cargo build \
