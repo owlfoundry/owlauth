@@ -200,6 +200,7 @@
 .main {
   grid-area: main;
   width: 100%;
+  min-width: 0;
   max-width: 80rem;
   padding: 2rem;
 }
