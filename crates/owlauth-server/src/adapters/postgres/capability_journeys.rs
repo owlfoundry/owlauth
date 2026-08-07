@@ -1206,6 +1206,10 @@ async fn verify_application_and_publication_journeys(
         .get_project_policy(created_project.id)
         .await
         .expect("current policy should be queryable");
+    assert!(
+        policy_before_reduction.browser_session_reuse,
+        "new Projects should allow explicit browser-session reuse by default"
+    );
     provisioning
         .update_project_policy(
             created_project.id,

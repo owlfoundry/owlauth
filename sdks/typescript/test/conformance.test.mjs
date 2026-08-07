@@ -50,8 +50,17 @@ function validateExpected(expected) {
     if (expected.values !== undefined) exactObject(expected.values, Object.keys(expected.values), [], "values");
   } else {
     assert.equal(expected.outcome, "error");
-    exactObject(expected, [...common, "category", "code", "retry", "action"], [], "expected error");
+    exactObject(
+      expected,
+      [...common, "category", "code", "retry", "action"],
+      ["retryAfterSeconds"],
+      "expected error",
+    );
     for (const key of ["category", "code", "retry", "action"]) boundedString(expected[key], 64);
+    if (expected.retryAfterSeconds !== undefined) {
+      assert.ok(Number.isInteger(expected.retryAfterSeconds));
+      assert.ok(expected.retryAfterSeconds >= 0 && expected.retryAfterSeconds <= 86_400);
+    }
   }
   assert.ok(
     new Set(["not_applicable", "preserved", "discard_required", "quarantined", "consumed"]).has(
@@ -339,14 +348,23 @@ async function invokeTransport(entry, setup) {
   }
   outcomes.push(failureFor(entry.loadedFixture));
   const client = makeClient(entry, outcomes, calls);
+  const controller = new AbortController();
+  if (entry.requestPhase === "before_dispatch") {
+    const reason =
+      entry.loadedFixture.exchange.failureKind === "timeout"
+        ? new DOMException("synthetic timeout", "TimeoutError")
+        : new DOMException("synthetic cancellation", "AbortError");
+    controller.abort(reason);
+  }
+  const options = entry.requestPhase === "before_dispatch" ? { signal: controller.signal } : {};
   let pending;
   let result;
   if (entry.operationId === "get_public_application_config") {
-    result = await client.getPublicConfiguration();
+    result = await client.getPublicConfiguration(options);
   } else if (entry.operationId === "exchange_handoff") {
     const started = await client.beginLogin({ redirectUri: REDIRECT });
     pending = started.pending;
-    result = await client.completeLogin(callbackUrl("success", pending.state), pending);
+    result = await client.completeLogin(callbackUrl("success", pending.state), pending, options);
   } else if (entry.operationId === "refresh_session") {
     result = await client.refresh(await setupCredential(client));
   } else {
@@ -426,6 +444,7 @@ test("every required schema v3 case executes through the public SDK", async (t) 
         assert.equal(error.operation, entry.operationId, entry.name);
         assert.equal(error.retry, entry.expected.retry, entry.name);
         assert.equal(error.action, entry.expected.action, entry.name);
+        assert.equal(error.retryAfterSeconds, entry.expected.retryAfterSeconds, entry.name);
         assertNoSentinels(error, entry.loadedFixture);
       }
     });
@@ -464,6 +483,19 @@ test("schema v3 pending dispositions enforce guard and replay behavior", async (
         }
       }
       assert.ok(["preserved", "discard_required"].includes(entry.expected.pendingDisposition));
+      assert.equal(started.pending.consumed, false, entry.name);
+      assert.equal(calls.length, 1, entry.name);
+      continue;
+    }
+
+    if (entry.expected.pendingDisposition === "preserved") {
+      const controller = new AbortController();
+      controller.abort();
+      await assert.rejects(
+        client.completeLogin(callbackUrl("success", started.pending.state), started.pending, {
+          signal: controller.signal,
+        }),
+      );
       assert.equal(started.pending.consumed, false, entry.name);
       assert.equal(calls.length, 1, entry.name);
       continue;

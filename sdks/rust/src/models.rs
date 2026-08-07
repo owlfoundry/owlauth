@@ -1,13 +1,62 @@
 use std::{
     fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Deserializer, Serialize};
 use zeroize::Zeroizing;
+
+use crate::error::{Error, ErrorCategory, LocalAction, RetryPolicy};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffState {
+    Available,
+    Reserved,
+    Consumed,
+}
+
+pub(crate) struct HandoffGuard {
+    state: Mutex<HandoffState>,
+}
+
+impl HandoffGuard {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(HandoffState::Available),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, HandoffState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn reserve(&self) -> bool {
+        let mut state = self.state();
+        if *state != HandoffState::Available {
+            return false;
+        }
+        *state = HandoffState::Reserved;
+        true
+    }
+
+    pub(crate) fn release(&self) {
+        *self.state() = HandoffState::Available;
+    }
+
+    pub(crate) fn consume(&self) {
+        *self.state() = HandoffState::Consumed;
+    }
+
+    pub(crate) fn available(&self) -> bool {
+        *self.state() == HandoffState::Available
+    }
+
+    pub(crate) fn consumed(&self) -> bool {
+        *self.state() == HandoffState::Consumed
+    }
+}
 
 fn deserialize_required_nullable<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
@@ -45,7 +94,6 @@ secret_string!(RefreshToken, "RefreshToken");
 
 /// Public provider presentation returned by Runtime.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct PublicProvider {
     pub key: String,
     pub display_name: String,
@@ -54,7 +102,6 @@ pub struct PublicProvider {
 
 /// Public Project/Application login configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "the public wire contract exposes orthogonal current capability facts"
@@ -87,7 +134,6 @@ pub struct PublicJwk {
 
 /// Project JWKS plus authoritative revision metadata.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct JwksDocument {
     pub keys: Vec<PublicJwk>,
     pub revision: i64,
@@ -95,7 +141,7 @@ pub struct JwksDocument {
 }
 
 /// Deterministic bounded Application user projection.
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserProjection {
     pub user_id: String,
@@ -133,6 +179,7 @@ impl fmt::Debug for UserProjection {
 pub struct PendingLogin {
     pub(crate) schema_version: u8,
     pub(crate) runtime_origin: String,
+    pub(crate) runtime_base_path: String,
     pub(crate) project_id: String,
     pub(crate) application_id: String,
     pub(crate) redirect_uri: String,
@@ -140,7 +187,41 @@ pub struct PendingLogin {
     pub(crate) state: Zeroizing<String>,
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
-    pub(crate) guard: Arc<AtomicBool>,
+    pub(crate) guard: Arc<HandoffGuard>,
+}
+
+/// Explicit secret-bearing pending-login record for Application-owned protected storage.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingLoginRecord {
+    pub(crate) schema_version: u8,
+    pub(crate) runtime_origin: String,
+    pub(crate) runtime_base_path: String,
+    pub(crate) project_id: String,
+    pub(crate) application_id: String,
+    pub(crate) redirect_uri: String,
+    pub(crate) verifier: String,
+    pub(crate) state: String,
+    pub(crate) created_at: i64,
+    pub(crate) expires_at: i64,
+}
+
+impl fmt::Debug for PendingLoginRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingLoginRecord")
+            .field("schema_version", &self.schema_version)
+            .field("runtime_origin", &self.runtime_origin)
+            .field("runtime_base_path", &self.runtime_base_path)
+            .field("project_id", &self.project_id)
+            .field("application_id", &self.application_id)
+            .field("redirect_uri", &"[REDACTED]")
+            .field("verifier", &"[REDACTED]")
+            .field("state", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl PendingLogin {
@@ -174,9 +255,46 @@ impl PendingLogin {
         self.expires_at
     }
 
+    /// Exports secret-bearing state for explicit Application-owned protected storage.
+    ///
+    /// # Errors
+    /// Returns an error once exchange has reserved or consumed this pending login.
+    pub fn export_record(&self) -> Result<PendingLoginRecord, Error> {
+        let state = self.guard.state();
+        if *state != HandoffState::Available {
+            return Err(Error::new(
+                ErrorCategory::Handoff,
+                "pending_consumed",
+                "Reserved or consumed pending login state cannot be exported.",
+                RetryPolicy::Never,
+                LocalAction::DiscardPendingLogin,
+                "exchange_handoff",
+            ));
+        }
+        let record = PendingLoginRecord {
+            schema_version: self.schema_version,
+            runtime_origin: self.runtime_origin.clone(),
+            runtime_base_path: self.runtime_base_path.clone(),
+            project_id: self.project_id.clone(),
+            application_id: self.application_id.clone(),
+            redirect_uri: self.redirect_uri.clone(),
+            verifier: self.verifier.to_string(),
+            state: self.state.to_string(),
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+        };
+        drop(state);
+        Ok(record)
+    }
+
+    #[must_use]
+    pub fn available(&self) -> bool {
+        self.guard.available()
+    }
+
     #[must_use]
     pub fn consumed(&self) -> bool {
-        self.guard.load(Ordering::Acquire)
+        self.guard.consumed()
     }
 }
 
@@ -186,6 +304,7 @@ impl fmt::Debug for PendingLogin {
             .debug_struct("PendingLogin")
             .field("schema_version", &self.schema_version)
             .field("runtime_origin", &self.runtime_origin)
+            .field("runtime_base_path", &self.runtime_base_path)
             .field("project_id", &self.project_id)
             .field("application_id", &self.application_id)
             .field("redirect_uri", &"[REDACTED]")
@@ -218,7 +337,7 @@ impl fmt::Debug for LoginStart {
 pub struct ValidatedCallback {
     pub(crate) handoff: Zeroizing<String>,
     pub(crate) verifier: Zeroizing<String>,
-    pub(crate) guard: Arc<AtomicBool>,
+    pub(crate) guard: Arc<HandoffGuard>,
 }
 
 impl fmt::Debug for ValidatedCallback {
@@ -227,8 +346,54 @@ impl fmt::Debug for ValidatedCallback {
     }
 }
 
+/// Explicit secret-bearing atomic credential record for Application-owned protected storage.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialPairRecord {
+    pub(crate) schema_version: u8,
+    pub(crate) runtime_origin: String,
+    pub(crate) runtime_base_path: String,
+    pub(crate) project_id: String,
+    pub(crate) application_id: String,
+    pub(crate) user_id: String,
+    pub(crate) session_id: String,
+    pub(crate) refresh_generation: i64,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+    pub(crate) token_type: String,
+    pub(crate) access_expires_at: i64,
+    pub(crate) projection: UserProjection,
+    pub(crate) projection_revision: i64,
+    pub(crate) session_expires_at: String,
+}
+
+impl fmt::Debug for CredentialPairRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialPairRecord")
+            .field("schema_version", &self.schema_version)
+            .field("runtime_origin", &self.runtime_origin)
+            .field("runtime_base_path", &self.runtime_base_path)
+            .field("project_id", &self.project_id)
+            .field("application_id", &self.application_id)
+            .field("user_id", &self.user_id)
+            .field("session_id", &self.session_id)
+            .field("refresh_generation", &self.refresh_generation)
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("access_expires_at", &self.access_expires_at)
+            .field("projection", &"[REDACTED]")
+            .field("projection_revision", &self.projection_revision)
+            .field("session_expires_at", &self.session_expires_at)
+            .finish()
+    }
+}
+
 /// Atomic access/refresh generation returned by Runtime.
 pub struct CredentialPair {
+    runtime_origin: String,
+    runtime_base_path: String,
     project_id: String,
     application_id: String,
     user_id: String,
@@ -238,12 +403,21 @@ pub struct CredentialPair {
     refresh_token: RefreshToken,
     token_type: String,
     expires_in: i64,
+    access_expires_at: i64,
     projection: UserProjection,
     projection_revision: i64,
     session_expires_at: String,
 }
 
 impl CredentialPair {
+    #[must_use]
+    pub fn runtime_origin(&self) -> &str {
+        &self.runtime_origin
+    }
+    #[must_use]
+    pub fn runtime_base_path(&self) -> &str {
+        &self.runtime_base_path
+    }
     #[must_use]
     pub fn project_id(&self) -> &str {
         &self.project_id
@@ -281,6 +455,10 @@ impl CredentialPair {
         self.expires_in
     }
     #[must_use]
+    pub const fn access_expires_at(&self) -> i64 {
+        self.access_expires_at
+    }
+    #[must_use]
     pub const fn projection(&self) -> &UserProjection {
         &self.projection
     }
@@ -293,8 +471,57 @@ impl CredentialPair {
         &self.session_expires_at
     }
 
-    pub(crate) fn from_wire(value: CredentialPairWire) -> Self {
+    /// Exports this complete secret-bearing generation for protected Application storage.
+    #[must_use]
+    pub fn export_record(&self) -> CredentialPairRecord {
+        CredentialPairRecord {
+            schema_version: 1,
+            runtime_origin: self.runtime_origin.clone(),
+            runtime_base_path: self.runtime_base_path.clone(),
+            project_id: self.project_id.clone(),
+            application_id: self.application_id.clone(),
+            user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            refresh_generation: self.refresh_generation,
+            access_token: self.access_token.expose().to_owned(),
+            refresh_token: self.refresh_token.expose().to_owned(),
+            token_type: self.token_type.clone(),
+            access_expires_at: self.access_expires_at,
+            projection: self.projection.clone(),
+            projection_revision: self.projection_revision,
+            session_expires_at: self.session_expires_at.clone(),
+        }
+    }
+
+    pub(crate) fn from_record(value: CredentialPairRecord, expires_in: i64) -> Self {
         Self {
+            runtime_origin: value.runtime_origin,
+            runtime_base_path: value.runtime_base_path,
+            project_id: value.project_id,
+            application_id: value.application_id,
+            user_id: value.user_id,
+            session_id: value.session_id,
+            refresh_generation: value.refresh_generation,
+            access_token: AccessToken::new(value.access_token),
+            refresh_token: RefreshToken::new(value.refresh_token),
+            token_type: value.token_type,
+            expires_in,
+            access_expires_at: value.access_expires_at,
+            projection: value.projection,
+            projection_revision: value.projection_revision,
+            session_expires_at: value.session_expires_at,
+        }
+    }
+
+    pub(crate) fn from_wire(
+        value: CredentialPairWire,
+        runtime_origin: String,
+        runtime_base_path: String,
+        access_expires_at: i64,
+    ) -> Self {
+        Self {
+            runtime_origin,
+            runtime_base_path,
             project_id: value.project_id,
             application_id: value.application_id,
             user_id: value.user_id,
@@ -304,6 +531,7 @@ impl CredentialPair {
             refresh_token: RefreshToken::new(value.refresh_token),
             token_type: value.token_type,
             expires_in: value.expires_in,
+            access_expires_at,
             projection: value.projection,
             projection_revision: value.projection_revision,
             session_expires_at: value.session_expires_at,
@@ -315,6 +543,8 @@ impl fmt::Debug for CredentialPair {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CredentialPair")
+            .field("runtime_origin", &self.runtime_origin)
+            .field("runtime_base_path", &self.runtime_base_path)
             .field("project_id", &self.project_id)
             .field("application_id", &self.application_id)
             .field("user_id", &self.user_id)
@@ -324,6 +554,7 @@ impl fmt::Debug for CredentialPair {
             .field("refresh_token", &self.refresh_token)
             .field("token_type", &self.token_type)
             .field("expires_in", &self.expires_in)
+            .field("access_expires_at", &self.access_expires_at)
             .field("projection", &"[REDACTED]")
             .field("projection_revision", &self.projection_revision)
             .field("session_expires_at", &self.session_expires_at)
@@ -361,7 +592,6 @@ impl fmt::Debug for CurrentUser {
 
 /// Project browser logout target. The SDK never navigates to it.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct BrowserLogoutPreparation {
     pub hosted_url: String,
     pub expires_at: String,
@@ -388,7 +618,6 @@ pub(crate) struct LoginStartRequest<'a> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct LoginStartResponse {
     pub hosted_url: String,
     pub expires_at: String,
@@ -427,7 +656,6 @@ pub(crate) struct CredentialPairWire {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct CompletionResponse {
     pub completed: bool,
 }
@@ -437,5 +665,5 @@ pub(crate) struct CompletionResponse {
 pub(crate) struct RuntimeErrorWire {
     pub code: String,
     pub message: String,
-    pub request_id: Option<String>,
+    pub request_id: String,
 }

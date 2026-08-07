@@ -137,6 +137,8 @@ struct Expected {
     retry: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    #[serde(default)]
+    retry_after_seconds: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -351,6 +353,7 @@ fn validate_expected(expected: &Expected) {
         assert!(expected.code.is_none());
         assert!(expected.retry.is_none());
         assert!(expected.action.is_none());
+        assert!(expected.retry_after_seconds.is_none());
         return;
     }
     assert!(expected.values.is_none());
@@ -366,6 +369,11 @@ fn validate_expected(expected: &Expected) {
                 .is_some_and(|item| !item.is_empty() && item.len() <= 64)
         );
     }
+    assert!(
+        expected
+            .retry_after_seconds
+            .is_none_or(|value| value <= 86_400)
+    );
     let action = expected.action.as_deref().unwrap();
     match expected.pending_disposition.as_str() {
         "discard_required" => assert_eq!(action, "discard_pending"),
@@ -462,7 +470,7 @@ fn callback_url(kind: &str) -> String {
 async fn setup_credentials(client: &Client) -> Result<owlauth_client::CredentialPair, Error> {
     let login = client.begin_login(REDIRECT, Some(STATE), None).await?;
     client
-        .complete_login(&callback_url("success"), login.pending)
+        .complete_login(&callback_url("success"), &login.pending)
         .await
 }
 
@@ -525,7 +533,7 @@ async fn execute_http(
             "exchange_handoff" => {
                 let login = client.begin_login(REDIRECT, Some(STATE), None).await?;
                 let value = client
-                    .complete_login(&callback_url("success"), login.pending)
+                    .complete_login(&callback_url("success"), &login.pending)
                     .await?;
                 format!("{value:?}")
             }
@@ -536,7 +544,7 @@ async fn execute_http(
             }
             "get_current_user" => {
                 let credentials = setup_credentials(&client).await?;
-                let value = client.current_user(credentials.access_token()).await?;
+                let value = client.current_user(&credentials).await?;
                 let expected = success_values(case);
                 assert_eq!(
                     expected.get("userId").and_then(Value::as_str),
@@ -546,16 +554,12 @@ async fn execute_http(
             }
             "logout_application_session" => {
                 let credentials = setup_credentials(&client).await?;
-                client
-                    .logout_application(credentials.access_token())
-                    .await?;
+                client.logout_application(&credentials).await?;
                 "logout completed".to_owned()
             }
             "prepare_browser_logout" => {
                 let credentials = setup_credentials(&client).await?;
-                let value = client
-                    .prepare_browser_logout(credentials.access_token())
-                    .await?;
+                let value = client.prepare_browser_logout(&credentials).await?;
                 format!("{value:?}")
             }
             other => panic!("unsupported operation {other}"),
@@ -639,7 +643,7 @@ async fn execute_transport(
                 format!(
                     "{:?}",
                     client
-                        .complete_login(&callback_url("success"), login.pending)
+                        .complete_login(&callback_url("success"), &login.pending)
                         .await?
                 )
             }
@@ -716,7 +720,7 @@ async fn assert_pending_disposition(case: &Case, fixture: &Fixture, setup: &Setu
 
     assert!(matches!(
         case.expected.pending_disposition.as_str(),
-        "discard_required" | "quarantined"
+        "preserved" | "discard_required" | "quarantined"
     ));
     let first = client
         .validate_callback(&callback_url("success"), &pending)
@@ -724,13 +728,17 @@ async fn assert_pending_disposition(case: &Case, fixture: &Fixture, setup: &Setu
     let replay = client
         .validate_callback(&callback_url("success"), &pending)
         .unwrap();
-    let _ = client.exchange_handoff(first).await;
-    assert!(pending.consumed(), "{}", case.name);
-    let request_count = transport.request_count();
-    let replay_error = client.exchange_handoff(replay).await.unwrap_err();
-    assert_eq!(replay_error.code(), "pending_consumed", "{}", case.name);
-    assert_eq!(transport.request_count(), request_count, "{}", case.name);
-    assert_eq!(request_count, 2, "{}", case.name);
+    let _ = client.exchange_handoff(&first).await;
+    let consumed = case.expected.pending_disposition != "preserved";
+    assert_eq!(pending.consumed(), consumed, "{}", case.name);
+    assert_eq!(pending.available(), !consumed, "{}", case.name);
+    assert_eq!(transport.request_count(), 2, "{}", case.name);
+    if consumed {
+        let request_count = transport.request_count();
+        let replay_error = client.exchange_handoff(&replay).await.unwrap_err();
+        assert_eq!(replay_error.code(), "pending_consumed", "{}", case.name);
+        assert_eq!(transport.request_count(), request_count, "{}", case.name);
+    }
 }
 
 fn category_name(value: ErrorCategory) -> &'static str {
@@ -848,6 +856,12 @@ fn assert_execution(
             assert_eq!(
                 action_name(error.local_action()),
                 case.expected.action.as_deref().unwrap(),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                error.retry_after_seconds(),
+                case.expected.retry_after_seconds,
                 "{}",
                 case.name
             );

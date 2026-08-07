@@ -10,18 +10,18 @@ mod error;
 mod models;
 mod transport;
 
-pub use client::{Client, ClientConfig, Clock, EntropySource};
+pub use client::{CancellationToken, Client, ClientConfig, Clock, EntropySource, OperationOptions};
 pub use error::{Error, ErrorCategory, LocalAction, RetryPolicy};
 pub use models::{
-    AccessToken, BrowserLogoutPreparation, CredentialPair, CurrentUser, JwksDocument, LoginStart,
-    PendingLogin, PublicConfiguration, PublicJwk, PublicProvider, RefreshToken, UserProjection,
-    ValidatedCallback,
+    AccessToken, BrowserLogoutPreparation, CredentialPair, CredentialPairRecord, CurrentUser,
+    JwksDocument, LoginStart, PendingLogin, PendingLoginRecord, PublicConfiguration, PublicJwk,
+    PublicProvider, RefreshToken, UserProjection, ValidatedCallback,
 };
 pub use transport::{
     HttpMethod, HttpRequest, HttpResponse, Transport, TransportFailure, TransportFailureKind,
 };
 
 pub(crate) use models::{
-    CompletionResponse, CredentialPairWire, HandoffRequest, LoginStartRequest, LoginStartResponse,
-    RefreshRequest, RuntimeErrorWire,
+    CompletionResponse, CredentialPairWire, HandoffGuard, HandoffRequest, LoginStartRequest,
+    LoginStartResponse, RefreshRequest, RuntimeErrorWire,
 };

@@ -35,7 +35,7 @@ A `Client` is immutable and bound to one Runtime origin, Project, and Applicatio
 
 After the Application receives Runtime's exact callback, pass the complete callback and caller-held pending value to `complete_login`. Local redirect/state/context/expiry validation happens before network dispatch. Malformed inspection does not consume pending state; handoff exchange consumes it atomically and is never automatically retried.
 
-Callers that inspect callbacks separately may use `validate_callback(&pending)` and then `exchange_handoff(validated)`. Validation borrows `PendingLogin`, and the validated callback shares its one-attempt guard; the guard is consumed only when exchange starts. The owned `complete_login(callback, pending)` convenience remains available. A malformed or context-invalid success response received after a sensitive dispatch is `ErrorCategory::Indeterminate` with code `invalid_response_after_dispatch`, because the remote commit cannot be disproved.
+Callers that inspect callbacks separately may use `validate_callback(&pending)` and then `exchange_handoff(&validated)`. Both exchange APIs borrow their one-use material, so a proven before-dispatch cancellation or transport failure leaves the caller-held value available; the shared guard is consumed only after a possibly dispatched attempt. A malformed or context-invalid success response received after a sensitive dispatch is `ErrorCategory::Indeterminate` with code `invalid_response_after_dispatch`, because the remote commit cannot be disproved.
 
 ```rust,no_run
 # use owlauth_client::{Client, ClientConfig};
@@ -44,28 +44,32 @@ let login = client
     .begin_login("https://app.example/auth/callback", None, None)
     .await?;
 // The Application explicitly navigates to login.hosted_url and retains login.pending.
-let credentials = client.complete_login(callback, login.pending).await?;
-let user = client.current_user(credentials.access_token()).await?;
+let credentials = client.complete_login(callback, &login.pending).await?;
+let user = client.current_user(&credentials).await?;
 // Exact `owlauth.user.v1`; None means the Application projection has no admitted value.
 let (_locale, _verified_email) = (&user.projection.locale, &user.projection.verified_email);
 let successor = client.refresh(&credentials).await?;
-client.logout_application(successor.access_token()).await?;
+client.logout_application(&successor).await?;
 # let _ = user;
 # Ok(())
 # }
 ```
 
-`CredentialPair` contains one atomic access/refresh generation. Tokens are redacted from `Debug`; raw values are exposed only through deliberate `expose()` calls. The core does not serialize refresh, persist credentials, or atomically replace caller storage. Applications must single-flight each family and replace or quarantine the complete pair.
+`CredentialPair` contains one atomic access/refresh generation. Tokens are redacted from `Debug`; raw values are exposed only through deliberate `expose()` calls. The core does not persist credentials or atomically replace caller storage. Applications must single-flight each family and replace or quarantine the complete pair.
+
+`PendingLogin::export_record` and `CredentialPair::export_record` are the deliberate secret-bearing persisted-state transfer boundaries. `Client::restore_pending_login` and `Client::restore_credentials` accept the corresponding closed, versioned records, validate timing and value grammar, require the exact Runtime origin/base path, Project, and Application, and perform no I/O. The Application owns serialization, encryption, atomic storage, CAS, and deletion; default `Debug` output stays redacted.
 
 `prepare_browser_logout` returns a Hosted confirmation target as data and never navigates.
 
 ## Errors and one-use ambiguity
 
-`Error` exposes stable `ErrorCategory`, machine code, retry policy, local-state action, operation, optional request ID, and status. Messages and `Debug` output never contain request bodies, callbacks, PKCE, handoff tickets, or tokens.
+`Error` exposes stable `ErrorCategory`, machine code, retry policy, local-state action, operation, optional request ID, status, and `retry_after_seconds()`. A complete valid `429 rate_limited` exposes a decimal delay in `0..=86_400`; the SDK never sleeps or retries automatically. Messages and `Debug` output never contain request bodies, callbacks, PKCE, handoff tickets, or tokens.
 
 A timeout, cancellation, or disconnect after handoff, refresh, or logout dispatch is `ErrorCategory::Indeterminate`. The SDK never blind-replays one-use material. The caller must follow `local_action()` and reauthenticate or reconcile rather than retrying the same generation.
 
-The public `Transport`, `EntropySource`, and `Clock` boundaries support deterministic contract testing without creating a fake end-to-end claim. The production transport verifies TLS, refuses redirects, enforces an overall deadline, and bounds responses.
+Every async operation has a `*_with_options` form accepting `OperationOptions`. A caller-provided `CancellationToken` returns `Cancelled` when cancellation was observed before dispatch. Once a sensitive transport future has been polled, explicit cancellation is conservatively `Indeterminate` and consumes or quarantines one-use state. Dropping or aborting a Rust future cannot return an SDK error and remains an Application-owned possibly-dispatched outcome.
+
+The public `Transport`, `EntropySource`, and `Clock` boundaries support deterministic contract testing without creating a fake end-to-end claim. The production transport verifies TLS, refuses redirects and automatic retries, ignores environment proxies, enforces an overall deadline, and rejects both declared and observed oversized responses.
 
 ## Real-server and exact-crate qualification
 

@@ -69,6 +69,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
     .innerText();
 
   await page.getByRole("link", { name: "Settings" }).click();
+  await expect(page.locator("dt", { hasText: /^Session reuse$/u }).locator("+ dd")).toHaveText(
+    "Explicit confirmation allowed",
+  );
   await page.getByRole("button", { name: "Edit metadata" }).click();
   await page
     .getByRole("dialog", { name: "Edit Project name" })
@@ -78,7 +81,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await expect(page.getByRole("status").filter({ hasText: "metadata updated" })).toBeVisible();
   await page.getByRole("button", { name: "Edit policy" }).click();
   await page.getByLabel("Access token lifetime in seconds").fill("1200");
-  await page.getByLabel("Allow users to explicitly confirm reuse of their browser session").check();
+  await expect(
+    page.getByLabel("Allow users to explicitly confirm reuse of their browser session"),
+  ).toBeChecked();
   await page.getByRole("button", { name: "Save policy" }).click();
   await expect(page.getByRole("status").filter({ hasText: "policy updated" })).toBeVisible();
   await expect(

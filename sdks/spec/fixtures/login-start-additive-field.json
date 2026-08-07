@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 3,
+  "synthetic": true,
+  "exchange": {
+    "kind": "http",
+    "status": 201,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "encoding": "json",
+      "value": {
+        "hosted_url": "https://runtime.conformance.example/auth/interactions/synthetic",
+        "expires_at": "2099-01-01T00:10:00Z",
+        "compatible_addition": {
+          "ignored": true
+        }
+      }
+    }
+  }
+}

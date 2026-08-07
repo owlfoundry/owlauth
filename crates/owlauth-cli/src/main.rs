@@ -363,6 +363,16 @@ mod tests {
                 APPLICATION,
                 TARGET,
             ],
+            vec![
+                "owlauth",
+                "provider",
+                "egress-set",
+                PROJECT,
+                "--mode",
+                "allow-all",
+                "--expected-revision",
+                "1",
+            ],
         ];
         for arguments in commands {
             let error = run(Cli::try_parse_from(arguments).unwrap()).unwrap_err();
@@ -386,6 +396,7 @@ mod tests {
                 "https://identity.example",
                 "--expected-revision",
                 "1",
+                "--yes",
             ],
             vec![
                 "owlauth",

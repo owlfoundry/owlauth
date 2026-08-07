@@ -75,7 +75,7 @@ impl PostgresProvisioningAdapter {
             session_revision: Set(1),
             claims_policy: Set(json!({ "access_token_lifetime_seconds": 900 })),
             session_policy: Set(json!({
-                "browser_session_reuse": false,
+                "browser_session_reuse": true,
                 "browser_session_reuse_max_age_seconds": 28_800,
             })),
         }

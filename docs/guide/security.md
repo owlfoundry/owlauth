@@ -57,7 +57,7 @@ Each Application receives only its policy-approved revisioned projection after i
 
 ## Sessions, refresh, and revocation
 
-A Project browser session is opaque, hardened, and Project/user/browser bound. It may support sign-in reuse among Applications in that Project. Application sessions and refresh families remain Application-bound.
+A Project browser session is opaque, hardened, and Project/user/browser bound. New Projects allow explicit sign-in reuse among Applications in that Project by default, with a maximum authentication age of 8 hours; operators can disable reuse in Project policy. Application sessions and refresh families remain Application-bound.
 
 Refresh tokens are high-entropy opaque values stored as digests. Every generation is one-use. At most one concurrent presentation creates a successor; later or concurrent reuse revokes the whole family. Core SDKs never blindly replay an ambiguous refresh; the Application or an external stateful integration serializes refresh per family, atomically replaces the credential pair, and treats an ambiguous lost response as reauthentication.
 

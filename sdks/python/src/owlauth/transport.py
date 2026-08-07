@@ -6,6 +6,7 @@ import socket
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from http.client import HTTPException
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -19,6 +20,7 @@ class FailureKind(StrEnum):
     TRANSPORT = "transport"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    RESPONSE_INVALID = "response_invalid"
 
 
 class TransportFailure(Exception):
@@ -83,7 +85,7 @@ class StdlibTransport:
                 response_headers = _bounded_headers(response.headers.items())
                 response_body = response.read(_MAX_RESPONSE_BYTES + 1)
                 if len(response_body) > _MAX_RESPONSE_BYTES:
-                    raise TransportFailure(FailureKind.TRANSPORT, dispatched=True)
+                    raise TransportFailure(FailureKind.RESPONSE_INVALID, dispatched=True)
                 return TransportResponse(
                     status=int(response.status), headers=response_headers, body=response_body
                 )
@@ -91,6 +93,8 @@ class StdlibTransport:
             raise
         except TimeoutError as error:
             raise TransportFailure(FailureKind.TIMEOUT, dispatched=True) from error
+        except HTTPException as error:
+            raise TransportFailure(FailureKind.RESPONSE_INVALID, dispatched=True) from error
         except URLError as error:
             kind = (
                 FailureKind.TIMEOUT
@@ -104,15 +108,16 @@ class StdlibTransport:
 
 def _bounded_headers(items: list[tuple[str, str]]) -> dict[str, str]:
     if len(items) > _MAX_HEADER_COUNT:
-        raise TransportFailure(FailureKind.TRANSPORT, dispatched=True)
+        raise TransportFailure(FailureKind.RESPONSE_INVALID, dispatched=True)
     total = 0
     result: dict[str, str] = {}
     for name, value in items:
         total += len(name) + len(value)
         if total > _MAX_HEADER_BYTES:
-            raise TransportFailure(FailureKind.TRANSPORT, dispatched=True)
+            raise TransportFailure(FailureKind.RESPONSE_INVALID, dispatched=True)
         lowered = name.lower()
         if lowered in result:
-            continue
-        result[lowered] = value
+            result[lowered] = f"{result[lowered]},{value}"
+        else:
+            result[lowered] = value
     return result

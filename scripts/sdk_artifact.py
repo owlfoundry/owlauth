@@ -394,6 +394,7 @@ def inspect_python(path: Path) -> ArchiveIdentity:
     dist_info = next(iter(dist_infos))
     expected_modules = {
         "owlauth/__init__.py",
+        "owlauth/_json.py",
         "owlauth/client.py",
         "owlauth/conformance.py",
         "owlauth/errors.py",
@@ -439,6 +440,7 @@ def inspect_python(path: Path) -> ArchiveIdentity:
         source_directory=REPOSITORY_ROOT / "sdks/python/src/owlauth",
         names=(
             "__init__.py",
+            "_json.py",
             "client.py",
             "conformance.py",
             "errors.py",

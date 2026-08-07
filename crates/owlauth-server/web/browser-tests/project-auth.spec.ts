@@ -2305,13 +2305,7 @@ async function provision(request: APIRequestContext, suffix: string): Promise<Pr
     },
     `project-${suffix}`,
   );
-  let policy = await controlGet<ProjectPolicy>(request, `projects/${project.id}/policy`);
-  policy = await control<ProjectPolicy>(request, "PUT", `projects/${project.id}/policy`, {
-    access_token_lifetime_seconds: policy.access_token_lifetime_seconds,
-    browser_session_reuse: true,
-    expected_claims_revision: policy.claims_revision,
-    expected_session_revision: policy.session_revision,
-  });
+  const policy = await controlGet<ProjectPolicy>(request, `projects/${project.id}/policy`);
   expect(policy.browser_session_reuse).toBe(true);
   const otherProject = await control<Project>(
     request,

@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 clap = { version = "4.5.54", features = ["derive"] }
+fs2 = "0.4.3"
 owlauth-types = { version = "=0.0.0-dev", path = "../owlauth-types" }
 reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "json", "rustls"] }
 semver = "1.0.27"

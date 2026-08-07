@@ -96,7 +96,11 @@ Application backends validate the JWT against the exact Project issuer/audience 
 
 The core SDK does not choose or implement persistent credential storage and does not silently retain an Application session. It returns pending-login state and credential results explicitly. Browser storage, native secure storage, backend sessions, backup, deletion, request interception, and framework state belong to the Application or another integration library.
 
-Any persisted record includes a schema version and exact Runtime/Project/Application binding. Loading state under another binding fails and never migrates credentials across Projects. Pending-login state is short-lived secret material and is stored separately from post-login credentials.
+Any persisted record includes a schema version and exact normalized Runtime origin/base-path, Project, and Application binding. Loading state under another binding fails before network dispatch and never migrates credentials across Runtime authorities, path-mounted deployments, Projects, or Applications. Pending-login state is short-lived secret material and is stored separately from post-login credentials.
+
+Each SDK provides deliberately named secret-bearing record export plus a `Client`-bound restore API for pending login and credential pairs. Export is never invoked by default formatting, logging, JSON conversion, ordinary serialization, or transport. Restore accepts only the current record schema, rejects unknown fields, validates all secret/value grammar and timing bounds, binds the result to the receiving Client's exact context, and never performs I/O. The Application remains responsible for encryption, access control, storage, atomic writes, deletion, and browser-history cleanup; the SDK does not choose a store.
+
+Access and refresh values created from Runtime responses or restored records carry the same immutable context binding and token grammar. A bounded access token accepts only the RFC 6750 bearer-token characters (`ALPHA`, `DIGIT`, `-`, `.`, `_`, `~`, `+`, `/`, and `=`); a bounded opaque refresh token accepts only ASCII alphanumerics plus `-`, `.`, `_`, and `~`. Control characters, whitespace, and other header-unsafe values fail before request construction. Every credential-bearing operation verifies exact Runtime origin/base-path, Project, and Application before constructing a request. If an SDK supports deliberate import of an external raw access token, that API explicitly adopts it into the current Client context; ordinary token constructors remain unavailable or unusable for transport.
 
 A credential update is atomic at the Application boundary: the new access/refresh pair and associated generation/version replace the old pair together. Crashes or partial writes cannot create a mixed generation that an Application treats as valid. The core API returns each pair as one result and never offers separate partial-update operations.
 
@@ -142,7 +146,7 @@ PKCE verifiers, handoff tickets, Project access tokens, refresh tokens, cookies,
 
 - Deterministic tests verify S256 vectors and fresh verifier/state generation.
 - Cases cover Project/Application mismatch, state mismatch/replay/expiry, safe provider failure, handoff one-use behavior, and redaction.
-- Explicit-state tests prove exact context binding, paired credential results with no partial-update operation, and no hidden persistence or navigation side effects.
+- Explicit-state tests prove exact Runtime origin/base-path/Project/Application context binding, paired credential results with no partial-update operation, reviewed record export/restore, and no hidden persistence or navigation side effects.
 - Refresh tests cover replay-family revocation, definitive invalidation, ambiguous lost responses, no automatic replay, and the documented caller coordination contract.
 - Current-user and both logout modes preserve Project/Application/session semantics without claiming cleanup of caller-owned state.
 - Real-server E2E passes before any of these capabilities is advertised as implemented.

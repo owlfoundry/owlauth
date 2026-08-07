@@ -59,7 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
+      id-token: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -86,11 +87,6 @@ jobs:
         with:
           name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
           path: final-evidence
-      - name: Download release changelog
-        uses: actions/download-artifact@v7
-        with:
-          name: python-release-notes
-          path: release-metadata
       - name: Re-verify release and exact candidate
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -120,24 +116,42 @@ jobs:
             --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --tag "$GITHUB_REF_NAME" --descriptor candidate/candidate.json \
             --manifest final-evidence/python-final-evidence.json >/dev/null
-          cat final-evidence/summary.md >> release-metadata/release-notes.md
-      - name: Require PyPI token
+      - name: Stage only the qualified wheel for publication
         env:
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: test -n "$TWINE_PASSWORD"
-      - name: Publish the qualified wheel
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          uv run --locked twine upload --non-interactive \
-            "candidate/owlauth_client-${VERSION}-py3-none-any.whl"
+          mkdir publish
+          cp "candidate/owlauth_client-${VERSION}-py3-none-any.whl" publish/
+      - name: Publish the qualified wheel with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: publish
+
+  release:
+    name: Create Python SDK GitHub Release
+    needs: [verify, ci, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download final SDK evidence
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
+          path: final-evidence
+      - name: Download release changelog
+        uses: actions/download-artifact@v7
+        with:
+          name: python-release-notes
+          path: release-metadata
       - name: Create GitHub Release
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          cat final-evidence/summary.md >> release-metadata/release-notes.md
           gh release create "python-v${VERSION}" \
             final-evidence/python-final-evidence.json \
             --notes-file release-metadata/release-notes.md \

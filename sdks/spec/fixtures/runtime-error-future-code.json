@@ -11,7 +11,8 @@
       "encoding": "json",
       "value": {
         "code": "future_runtime_code",
-        "message": "Synthetic future rejection. SENTINEL_UNKNOWN_BODY_MUST_NOT_LEAK"
+        "message": "Synthetic future rejection. SENTINEL_UNKNOWN_BODY_MUST_NOT_LEAK",
+        "request_id": "req_conformance_future_runtime_code"
       }
     }
   },

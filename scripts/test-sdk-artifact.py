@@ -136,6 +136,9 @@ def python_wheel(path: Path, *, injected: bytes = b"") -> None:
         "owlauth/__init__.py": (
             REPOSITORY_ROOT / "sdks/python/src/owlauth/__init__.py"
         ).read_bytes(),
+        "owlauth/_json.py": (
+            REPOSITORY_ROOT / "sdks/python/src/owlauth/_json.py"
+        ).read_bytes(),
         "owlauth/client.py": (REPOSITORY_ROOT / "sdks/python/src/owlauth/client.py").read_bytes()
         + injected,
         "owlauth/conformance.py": (

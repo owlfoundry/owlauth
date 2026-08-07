@@ -2,13 +2,13 @@
   "schemaVersion": 1,
   "normalization": "replace exact exported VERSION string with <VERSION> in index.js and index.d.ts",
   "files": {
-    "client.d.ts": "17f462273289c21cdc3088a686f787c33c06cdaeb9799760e9309770b2e69f43",
-    "client.js": "a9227de4c84c63565e91cb3cd826b2b2264f0e3ea62407cc64e0beecb1852fac",
-    "errors.d.ts": "183b68d4fa55e53b309ba2635b6d3ebff07916a6f7b315878e662dd2ff5401b4",
-    "errors.js": "88686c4c409349ac9e6de25f6a73a9fe3850c89c5b260fc997a1de70ee247a62",
-    "index.d.ts": "d10b9069e6d9e77d7e5c4f32de3c43c2eedde64dfcff6c2cc97aa9723b53a161",
+    "client.d.ts": "6d30b8b61350fd5c414a806ec9a993234b6ad1422d8797586442035bcc0a9c42",
+    "client.js": "bc90ba7821e9cf7a689cff8eb67f1d2755b150f026431dd8bb774ebd831f3ee4",
+    "errors.d.ts": "4a96d30c039f58db92b25f4dd4f5c07cde9472f3bec00ad78c3054ca20a3d771",
+    "errors.js": "4b39dc7947d07c56de891773946d5f1615229016602f3399587ba0e4e1087f13",
+    "index.d.ts": "165569cbcbb1e359ec00cf6f8e8e95d6a90d345d91865f57444f466ea6f8f291",
     "index.js": "3b0abb2fcde9b08f8853fcb5cd45de82e0d9ee89b5051c30141985d7cecf9c2d",
-    "types.d.ts": "dc4a97b1253de7f000717d28b255e1f7ad6e7e76a30005958f2c4825e038ef19",
-    "types.js": "d92ef1a37f6a3bc4fb2a73cc01a1e68c3c33bf62bab27769dc872682c59a151c"
+    "types.d.ts": "6b5bb51c53e8f536b971e6aae1df2e28dcb8cda7a33df37179ef8ca804ed682b",
+    "types.js": "e7cde0a15f69641fbbb6fc9c8eb1df9280992c8def9ac9212ef0ff3e0c07f4e7"
   }
 }

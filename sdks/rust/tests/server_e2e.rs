@@ -126,14 +126,11 @@ async fn real_runtime_project_auth_lifecycle() {
         true,
     )
     .await;
-    let current = sdk
-        .current_user(first.access_token())
-        .await
-        .expect("current user");
+    let current = sdk.current_user(&first).await.expect("current user");
     assert_eq!(current.user_id, first.user_id());
     let successor = sdk.refresh(&first).await.expect("strict refresh rotation");
     let browser_logout = sdk
-        .prepare_browser_logout(successor.access_token())
+        .prepare_browser_logout(&successor)
         .await
         .expect("browser logout preparation");
 
@@ -172,7 +169,7 @@ async fn real_runtime_project_auth_lifecycle() {
         .await
         .expect_err("browser logout must revoke the Application session");
     assert_eq!(blocked.category(), ErrorCategory::Refresh);
-    sdk.logout_application(successor.access_token())
+    sdk.logout_application(&successor)
         .await
         .expect("idempotent Application logout confirmation");
 
@@ -221,7 +218,7 @@ async fn real_runtime_project_auth_lifecycle() {
     )
     .await;
     let handoff_error = sdk
-        .exchange_handoff(handoff)
+        .exchange_handoff(&handoff)
         .await
         .expect_err("dropped handoff response must be indeterminate");
     assert_indeterminate(&handoff_error, LocalAction::QuarantinePendingLogin);
@@ -292,7 +289,7 @@ async fn real_runtime_project_auth_lifecycle() {
     )
     .await;
     let logout_error = sdk
-        .logout_application(logout_fault.access_token())
+        .logout_application(&logout_fault)
         .await
         .expect_err("dropped logout response must be indeterminate");
     assert_indeterminate(&logout_error, LocalAction::QuarantineCredentials);
@@ -305,7 +302,7 @@ async fn real_runtime_project_auth_lifecycle() {
     )
     .await;
     let logged_out = sdk
-        .current_user(logout_fault.access_token())
+        .current_user(&logout_fault)
         .await
         .expect_err("ambiguous logout must commit at Runtime");
     assert_eq!(logged_out.category(), ErrorCategory::Authentication);
@@ -337,12 +334,12 @@ async fn login(
     )
     .await;
     let credentials = sdk
-        .exchange_handoff(callback)
+        .exchange_handoff(&callback)
         .await
         .expect("handoff exchange");
     if let Some(replay) = replay {
         let error = sdk
-            .exchange_handoff(replay)
+            .exchange_handoff(&replay)
             .await
             .expect_err("handoff callback must be one use");
         assert_eq!(error.category(), ErrorCategory::Handoff);

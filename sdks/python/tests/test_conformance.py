@@ -255,7 +255,7 @@ def assert_pending_disposition(case: Any, setup: dict[str, Any]) -> None:
     if operation == "start_login":
         transport = FixtureTransport(wire_response(case.fixture))
         started = begin(client_for(case.definition, transport))
-        assert started.pending._guard._consumed is False, case.name
+        assert started.pending._guard.consumed is False, case.name
         assert len(transport.requests) == 1, case.name
         return
     if case.definition["precondition"] != "pending_login":
@@ -279,11 +279,15 @@ def assert_pending_disposition(case: Any, setup: dict[str, Any]) -> None:
             except OwlAuthError:
                 pass
         assert case.expected["pendingDisposition"] in {"preserved", "discard_required"}
-        assert started.pending._guard._consumed is False, case.name
+        assert started.pending._guard.consumed is False, case.name
         assert len(transport.requests) == 1, case.name
         return
 
-    assert case.expected["pendingDisposition"] in {"discard_required", "quarantined"}
+    assert case.expected["pendingDisposition"] in {
+        "preserved",
+        "discard_required",
+        "quarantined",
+    }
     callback = sdk.validate_callback(
         callback_url("success", started.pending._state.reveal()), started.pending
     )
@@ -291,11 +295,14 @@ def assert_pending_disposition(case: Any, setup: dict[str, Any]) -> None:
         sdk.exchange_handoff(callback, started.pending)
     except OwlAuthError:
         pass
-    assert started.pending._guard._consumed is True, case.name
-    request_count = len(transport.requests)
-    with pytest.raises(HandoffError):
-        sdk.exchange_handoff(callback, started.pending)
-    assert len(transport.requests) == request_count == 2, case.name
+    consumed = case.expected["pendingDisposition"] != "preserved"
+    assert started.pending._guard.consumed is consumed, case.name
+    assert len(transport.requests) == 2, case.name
+    if consumed:
+        request_count = len(transport.requests)
+        with pytest.raises(HandoffError):
+            sdk.exchange_handoff(callback, started.pending)
+        assert len(transport.requests) == request_count, case.name
 
 
 def assert_request(case: Any, transport: FixtureTransport) -> None:
@@ -351,6 +358,7 @@ def test_every_required_shared_case_executes_through_the_public_sdk() -> None:
             assert error.operation == case.definition["operationId"], case.name
             assert error.retry.value == expected["retry"], case.name
             assert error.action.value == expected["action"], case.name
+            assert error.retry_after_seconds == expected.get("retryAfterSeconds"), case.name
             exchange = case.fixture.get("exchange")
             if expected["category"] == "indeterminate" and exchange.get("kind") == "http":
                 assert error.status == exchange["status"], case.name
@@ -366,7 +374,7 @@ def test_every_required_shared_case_executes_through_the_public_sdk() -> None:
         for sentinel in sentinels:
             assert sentinel not in rendered, case.name
         if case.expected["pendingDisposition"] == "preserved" and pending is not None:
-            assert pending._guard._consumed is False, case.name
+            assert pending._guard.consumed is False, case.name
 
     for case in corpus.cases:
         assert_pending_disposition(case, setup)
@@ -422,6 +430,23 @@ def write_fixture(root: Path) -> Path:
         )
     )
     return conformance / "cases.json"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+        b'{"value":1e999}',
+        b'{"value":"\\ud800"}',
+        b"[" * 20_000 + b"0" + b"]" * 20_000,
+    ],
+)
+def test_conformance_loader_rejects_non_rfc_or_unsafe_json(tmp_path: Path, body: bytes) -> None:
+    path = tmp_path / "cases.json"
+    path.write_bytes(body)
+    with pytest.raises(ProtocolError):
+        load_conformance_corpus(path)
 
 
 @pytest.mark.parametrize(

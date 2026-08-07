@@ -1,12 +1,14 @@
 use std::{
     collections::BTreeMap,
     env, fs,
+    fs::OpenOptions,
     io::{Read, Write},
     net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use fs2::FileExt;
 use reqwest::{
     Method,
     blocking::{Client, Response},
@@ -193,16 +195,17 @@ pub fn add_profile(
     }
 
     let path = store_path()?;
-    let mut store = load_store(&path)?;
-    if store.profiles.contains_key(name) {
-        return Err(RemoteError::ProfileExists(name.to_owned()));
-    }
     let profile = profile_from_descriptor(&endpoint, descriptor, credential_environment)?;
-    store.profiles.insert(name.to_owned(), profile);
-    if store.current_profile.is_none() {
-        store.current_profile = Some(name.to_owned());
-    }
-    save_store(&path, &store)
+    mutate_store(&path, |store| {
+        if store.profiles.contains_key(name) {
+            return Err(RemoteError::ProfileExists(name.to_owned()));
+        }
+        store.profiles.insert(name.to_owned(), profile);
+        if store.current_profile.is_none() {
+            store.current_profile = Some(name.to_owned());
+        }
+        Ok(())
+    })
 }
 
 pub fn inspect_profile(name: Option<&str>) -> Result<(), RemoteError> {
@@ -218,14 +221,15 @@ pub fn inspect_profile(name: Option<&str>) -> Result<(), RemoteError> {
 pub fn use_profile(name: &str) -> Result<(), RemoteError> {
     validate_profile_name(name)?;
     let path = store_path()?;
-    let mut store = load_store(&path)?;
-    let profile = store
+    let snapshot = load_store(&path)?
         .profiles
         .get(name)
+        .cloned()
         .ok_or_else(|| RemoteError::ProfileMissing(name.to_owned()))?;
-    validate_current_identity(name, profile)?;
-    store.current_profile = Some(name.to_owned());
-    save_store(&path, &store)
+    let descriptor = validate_current_identity(name, &snapshot)?;
+    mutate_store(&path, |store| {
+        merge_capability_cache(store, name, &snapshot, &descriptor, true)
+    })
 }
 
 pub fn rebind_profile(
@@ -252,16 +256,16 @@ fn rebind_profile_at(
 ) -> Result<(), RemoteError> {
     validate_profile_name(name)?;
     validate_credential_environment(credential_environment)?;
-    let mut store = load_store(path)?;
-    let old = store
+    let old = load_store(path)?
         .profiles
         .get(name)
+        .cloned()
         .ok_or_else(|| RemoteError::ProfileMissing(name.to_owned()))?;
-    validate_new_credential_environment(old, credential_environment)?;
+    validate_new_credential_environment(&old, credential_environment)?;
     let endpoint = validate_endpoint(endpoint)?;
     let descriptor = discover(&endpoint)?;
     print_json(&RebindPreview {
-        old,
+        old: &old,
         new: &descriptor,
         proposed_credential_environment: credential_environment,
     })?;
@@ -269,14 +273,29 @@ fn rebind_profile_at(
         return Err(RemoteError::ConfirmationRequired);
     }
     let profile = profile_from_descriptor(&endpoint, descriptor, Some(credential_environment))?;
-    store.profiles.insert(name.to_owned(), profile);
-    save_store(path, &store)
+    mutate_store(path, |store| {
+        let current = store
+            .profiles
+            .get(name)
+            .ok_or_else(|| RemoteError::ProfileMissing(name.to_owned()))?;
+        if !same_profile_authority(current, &old) {
+            return Err(RemoteError::IdentityChanged(name.to_owned()));
+        }
+        store.profiles.insert(name.to_owned(), profile);
+        Ok(())
+    })
 }
 
 pub fn check_profile(name: Option<&str>) -> Result<(), RemoteError> {
-    let store = load_store(&store_path()?)?;
-    let (name, profile) = select_profile(&store, name)?;
-    let descriptor = validate_current_identity(name, profile)?;
+    let path = store_path()?;
+    let snapshot_store = load_store(&path)?;
+    let (name, profile) = select_profile(&snapshot_store, name)?;
+    let name = name.to_owned();
+    let snapshot = profile.clone();
+    let descriptor = validate_current_identity(&name, &snapshot)?;
+    mutate_store(&path, |store| {
+        merge_capability_cache(store, &name, &snapshot, &descriptor, false)
+    })?;
     print_json(&descriptor)
 }
 
@@ -513,16 +532,55 @@ fn profile_from_descriptor(
 fn validate_current_identity(name: &str, profile: &Profile) -> Result<Descriptor, RemoteError> {
     let endpoint = validate_endpoint(&profile.endpoint)?;
     let descriptor = discover(&endpoint)?;
-    let matches = descriptor.product == profile.product
-        && descriptor.instance_id == profile.instance_id
-        && descriptor.api_base_url == profile.api_base_url
-        && descriptor.api_versions == profile.api_versions
-        && descriptor.credential_class == profile.credential_class
-        && descriptor.mcp_url == profile.mcp_url;
-    if !matches {
+    if !descriptor_matches_identity(profile, &descriptor) {
         return Err(RemoteError::IdentityChanged(name.to_owned()));
     }
     Ok(descriptor)
+}
+
+fn descriptor_matches_identity(profile: &Profile, descriptor: &Descriptor) -> bool {
+    descriptor.product == profile.product
+        && descriptor.instance_id == profile.instance_id
+        && descriptor.api_base_url == profile.api_base_url
+        && descriptor.credential_class == profile.credential_class
+}
+
+fn same_profile_authority(left: &Profile, right: &Profile) -> bool {
+    left.endpoint == right.endpoint
+        && left.product == right.product
+        && left.instance_id == right.instance_id
+        && left.api_base_url == right.api_base_url
+        && left.credential_class == right.credential_class
+        && left.credential_environment == right.credential_environment
+}
+
+fn refresh_capability_cache(profile: &mut Profile, descriptor: &Descriptor) -> bool {
+    let changed =
+        profile.api_versions != descriptor.api_versions || profile.mcp_url != descriptor.mcp_url;
+    profile.api_versions.clone_from(&descriptor.api_versions);
+    profile.mcp_url.clone_from(&descriptor.mcp_url);
+    changed
+}
+
+fn merge_capability_cache(
+    store: &mut ProfileStore,
+    name: &str,
+    snapshot: &Profile,
+    descriptor: &Descriptor,
+    select: bool,
+) -> Result<(), RemoteError> {
+    let profile = store
+        .profiles
+        .get_mut(name)
+        .ok_or_else(|| RemoteError::ProfileMissing(name.to_owned()))?;
+    if !same_profile_authority(profile, snapshot) {
+        return Err(RemoteError::IdentityChanged(name.to_owned()));
+    }
+    refresh_capability_cache(profile, descriptor);
+    if select {
+        store.current_profile = Some(name.to_owned());
+    }
+    Ok(())
 }
 
 fn discover(endpoint: &Url) -> Result<Descriptor, RemoteError> {
@@ -923,6 +981,28 @@ fn load_store(path: &Path) -> Result<ProfileStore, RemoteError> {
     Ok(store)
 }
 
+fn mutate_store<T>(
+    path: &Path,
+    mutation: impl FnOnce(&mut ProfileStore) -> Result<T, RemoteError>,
+) -> Result<T, RemoteError> {
+    let parent = path.parent().ok_or(RemoteError::ProfileStorage)?;
+    fs::create_dir_all(parent).map_err(|_| RemoteError::ProfileStorage)?;
+    let lock_path = parent.join("profiles.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|_| RemoteError::ProfileStorage)?;
+    lock.lock_exclusive()
+        .map_err(|_| RemoteError::ProfileStorage)?;
+    let mut store = load_store(path)?;
+    let output = mutation(&mut store)?;
+    save_store(path, &store)?;
+    Ok(output)
+}
+
 fn save_store(path: &Path, store: &ProfileStore) -> Result<(), RemoteError> {
     let parent = path.parent().ok_or(RemoteError::ProfileStorage)?;
     fs::create_dir_all(parent).map_err(|_| RemoteError::ProfileStorage)?;
@@ -1104,6 +1184,102 @@ mod tests {
             mcp_url: None,
         };
         assert!(validate_descriptor(&endpoint, noncanonical).is_err());
+    }
+
+    #[test]
+    fn capability_cache_changes_do_not_change_endpoint_identity() {
+        let profile = test_profile("https://control.example/", "OPERATOR_KEY");
+        let mut descriptor = Descriptor {
+            schema_version: "1".to_owned(),
+            product: profile.product,
+            instance_id: profile.instance_id.clone(),
+            api_base_url: profile.api_base_url.clone(),
+            api_versions: vec!["v1".to_owned(), "v2".to_owned()],
+            credential_class: profile.credential_class,
+            mcp_url: Some("https://control.example/mcp".to_owned()),
+        };
+        assert!(descriptor_matches_identity(&profile, &descriptor));
+
+        descriptor.mcp_url = None;
+        assert!(descriptor_matches_identity(&profile, &descriptor));
+
+        let mut refreshed = profile.clone();
+        let credential_environment = refreshed.credential_environment.clone();
+        assert!(refresh_capability_cache(&mut refreshed, &descriptor));
+        assert_eq!(refreshed.api_versions, descriptor.api_versions);
+        assert_eq!(refreshed.mcp_url, descriptor.mcp_url);
+        assert_eq!(refreshed.instance_id, profile.instance_id);
+        assert_eq!(refreshed.api_base_url, profile.api_base_url);
+        assert_eq!(refreshed.credential_environment, credential_environment);
+        assert!(!refresh_capability_cache(&mut refreshed, &descriptor));
+
+        descriptor.instance_id = "different-instance".to_owned();
+        assert!(!descriptor_matches_identity(&profile, &descriptor));
+    }
+
+    #[test]
+    fn capability_cache_merge_persists_both_transitions_without_rebinding_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        let original = test_profile("https://control.example/", "OPERATOR_KEY");
+        let mut store = ProfileStore::default();
+        store
+            .profiles
+            .insert("production".to_owned(), original.clone());
+        save_store(&path, &store).unwrap();
+
+        let enabled = Descriptor {
+            schema_version: "1".to_owned(),
+            product: original.product,
+            instance_id: original.instance_id.clone(),
+            api_base_url: original.api_base_url.clone(),
+            api_versions: vec!["v1".to_owned(), "v2".to_owned()],
+            credential_class: original.credential_class,
+            mcp_url: Some("https://control.example/mcp".to_owned()),
+        };
+        mutate_store(&path, |store| {
+            merge_capability_cache(store, "production", &original, &enabled, true)
+        })
+        .unwrap();
+        let enabled_store = load_store(&path).unwrap();
+        let enabled_profile = enabled_store.profiles.get("production").unwrap();
+        assert_eq!(enabled_profile.api_versions, enabled.api_versions);
+        assert_eq!(enabled_profile.mcp_url, enabled.mcp_url);
+        assert_eq!(enabled_profile.credential_environment, "OPERATOR_KEY");
+        assert_eq!(enabled_store.current_profile.as_deref(), Some("production"));
+
+        let disabled = Descriptor {
+            mcp_url: None,
+            api_versions: vec!["v1".to_owned()],
+            ..enabled.clone()
+        };
+        mutate_store(&path, |store| {
+            merge_capability_cache(store, "production", enabled_profile, &disabled, false)
+        })
+        .unwrap();
+        let disabled_store = load_store(&path).unwrap();
+        let disabled_profile = disabled_store.profiles.get("production").unwrap();
+        assert_eq!(disabled_profile.mcp_url, None);
+        assert_eq!(disabled_profile.api_versions, vec!["v1"]);
+
+        let stale = disabled_profile.clone();
+        mutate_store(&path, |store| {
+            let rebound = store.profiles.get_mut("production").unwrap();
+            rebound.endpoint = "https://replacement.example/".to_owned();
+            rebound.api_base_url = "https://replacement.example/v1/".to_owned();
+            rebound.credential_environment = "REPLACEMENT_KEY".to_owned();
+            Ok(())
+        })
+        .unwrap();
+        let error = mutate_store(&path, |store| {
+            merge_capability_cache(store, "production", &stale, &enabled, false)
+        })
+        .unwrap_err();
+        assert!(matches!(error, RemoteError::IdentityChanged(_)));
+        let preserved = load_store(&path).unwrap();
+        let preserved = preserved.profiles.get("production").unwrap();
+        assert_eq!(preserved.endpoint, "https://replacement.example/");
+        assert_eq!(preserved.credential_environment, "REPLACEMENT_KEY");
     }
 
     #[test]

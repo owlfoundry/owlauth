@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+output_binary="${1:-}"
 cd "$repository_root"
 
 package_version() {
@@ -49,5 +50,12 @@ CARGO_NET_OFFLINE=true cargo build \
   --manifest-path "$work_directory/Cargo.toml" \
   --package owlauth-cli \
   --locked
+packaged_binary="$work_directory/target/debug/owlauth"
+"$packaged_binary" --version >/dev/null
+if [[ -n "$output_binary" ]]; then
+  mkdir -p "$(dirname "$output_binary")"
+  cp "$packaged_binary" "$output_binary"
+  chmod +x "$output_binary"
+fi
 
-printf 'verified offline build of packaged owlauth-cli %s\n' "$cli_version"
+printf 'verified offline build and execution of packaged owlauth-cli %s\n' "$cli_version"

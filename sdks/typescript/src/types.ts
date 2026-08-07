@@ -8,7 +8,7 @@ abstract class SecretValue {
     this.#value = value;
   }
 
-  /** Deliberately reveals protocol material for an explicit outbound request. */
+  /** Deliberately reveals protocol material for an explicit outbound request or record export. */
   expose(): string {
     return this.#value;
   }
@@ -22,22 +22,54 @@ abstract class SecretValue {
   }
 }
 
-export class AccessToken extends SecretValue {
-  constructor(value: string) {
+interface RuntimeBinding {
+  readonly runtimeOrigin: string;
+  readonly runtimeBasePath: string;
+  readonly projectId: string;
+  readonly applicationId: string;
+}
+
+export class AccessToken extends SecretValue implements RuntimeBinding {
+  readonly runtimeOrigin: string;
+  readonly runtimeBasePath: string;
+  readonly projectId: string;
+  readonly applicationId: string;
+
+  constructor(token: typeof INTERNAL_CONSTRUCTOR, value: string, binding: RuntimeBinding) {
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("AccessToken is created or restored by Client.");
     super(value);
+    this.runtimeOrigin = binding.runtimeOrigin;
+    this.runtimeBasePath = binding.runtimeBasePath;
+    this.projectId = binding.projectId;
+    this.applicationId = binding.applicationId;
   }
 }
 
-export class RefreshToken extends SecretValue {
-  constructor(value: string) {
+export class RefreshToken extends SecretValue implements RuntimeBinding {
+  readonly runtimeOrigin: string;
+  readonly runtimeBasePath: string;
+  readonly projectId: string;
+  readonly applicationId: string;
+
+  constructor(token: typeof INTERNAL_CONSTRUCTOR, value: string, binding: RuntimeBinding) {
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("RefreshToken is created or restored by Client.");
     super(value);
+    this.runtimeOrigin = binding.runtimeOrigin;
+    this.runtimeBasePath = binding.runtimeBasePath;
+    this.projectId = binding.projectId;
+    this.applicationId = binding.applicationId;
   }
 }
 
 export class PkceVerifier extends SecretValue {
-  constructor(value: string) {
+  constructor(token: typeof INTERNAL_CONSTRUCTOR, value: string) {
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("PkceVerifier is created or restored by Client.");
     super(value);
   }
+}
+
+export function createPkceVerifier(value: string): PkceVerifier {
+  return new PkceVerifier(INTERNAL_CONSTRUCTOR, value);
 }
 
 export interface PublicProvider {
@@ -98,7 +130,23 @@ export interface CurrentUser {
   readonly sessionExpiresAt: string;
 }
 
-export class CredentialPair {
+export interface CredentialPairRecord extends RuntimeBinding {
+  readonly schemaVersion: 1;
+  readonly userId: string;
+  readonly sessionId: string;
+  readonly refreshGeneration: number;
+  readonly accessToken: string;
+  readonly refreshToken: string;
+  readonly tokenType: "Bearer";
+  readonly expiresIn: number;
+  readonly projection: UserProjection;
+  readonly projectionRevision: number;
+  readonly sessionExpiresAt: string;
+}
+
+export class CredentialPair implements RuntimeBinding {
+  readonly runtimeOrigin: string;
+  readonly runtimeBasePath: string;
   readonly projectId: string;
   readonly applicationId: string;
   readonly userId: string;
@@ -112,35 +160,49 @@ export class CredentialPair {
   readonly projectionRevision: number;
   readonly sessionExpiresAt: string;
 
-  constructor(
-    token: typeof INTERNAL_CONSTRUCTOR,
-    value: {
-      projectId: string;
-      applicationId: string;
-      userId: string;
-      sessionId: string;
-      refreshGeneration: number;
-      accessToken: string;
-      refreshToken: string;
-      expiresIn: number;
-      projection: UserProjection;
-      projectionRevision: number;
-      sessionExpiresAt: string;
-    },
-  ) {
-    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("CredentialPair is created by Client.");
+  constructor(token: typeof INTERNAL_CONSTRUCTOR, value: Omit<CredentialPairRecord, "schemaVersion" | "tokenType">) {
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("CredentialPair is created or restored by Client.");
+    const binding: RuntimeBinding = {
+      runtimeOrigin: value.runtimeOrigin,
+      runtimeBasePath: value.runtimeBasePath,
+      projectId: value.projectId,
+      applicationId: value.applicationId,
+    };
+    this.runtimeOrigin = value.runtimeOrigin;
+    this.runtimeBasePath = value.runtimeBasePath;
     this.projectId = value.projectId;
     this.applicationId = value.applicationId;
     this.userId = value.userId;
     this.sessionId = value.sessionId;
     this.refreshGeneration = value.refreshGeneration;
-    this.accessToken = new AccessToken(value.accessToken);
-    this.refreshToken = new RefreshToken(value.refreshToken);
+    this.accessToken = new AccessToken(INTERNAL_CONSTRUCTOR, value.accessToken, binding);
+    this.refreshToken = new RefreshToken(INTERNAL_CONSTRUCTOR, value.refreshToken, binding);
     this.tokenType = "Bearer";
     this.expiresIn = value.expiresIn;
     this.projection = value.projection;
     this.projectionRevision = value.projectionRevision;
     this.sessionExpiresAt = value.sessionExpiresAt;
+  }
+
+  /** Explicitly exports secret-bearing state for Application-owned protected storage. */
+  exportRecord(): CredentialPairRecord {
+    return {
+      schemaVersion: 1,
+      runtimeOrigin: this.runtimeOrigin,
+      runtimeBasePath: this.runtimeBasePath,
+      projectId: this.projectId,
+      applicationId: this.applicationId,
+      userId: this.userId,
+      sessionId: this.sessionId,
+      refreshGeneration: this.refreshGeneration,
+      accessToken: this.accessToken.expose(),
+      refreshToken: this.refreshToken.expose(),
+      tokenType: "Bearer",
+      expiresIn: this.expiresIn,
+      projection: this.projection,
+      projectionRevision: this.projectionRevision,
+      sessionExpiresAt: this.sessionExpiresAt,
+    };
   }
 
   toString(): string {
@@ -149,6 +211,8 @@ export class CredentialPair {
 
   toJSON(): Record<string, unknown> {
     return {
+      runtimeOrigin: this.runtimeOrigin,
+      runtimeBasePath: this.runtimeBasePath,
       projectId: this.projectId,
       applicationId: this.applicationId,
       userId: this.userId,
@@ -164,11 +228,24 @@ export class CredentialPair {
   }
 }
 
-export function createCredentialPair(value: ConstructorParameters<typeof CredentialPair>[1]): CredentialPair {
+export function createCredentialPair(
+  value: Omit<CredentialPairRecord, "schemaVersion" | "tokenType">,
+): CredentialPair {
   return new CredentialPair(INTERNAL_CONSTRUCTOR, value);
 }
 
-export class PendingLogin {
+export interface PendingLoginRecord extends RuntimeBinding {
+  readonly schemaVersion: 1;
+  readonly redirectUri: string;
+  readonly state: string;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  readonly verifier: string;
+}
+
+type PendingState = "available" | "reserved" | "consumed";
+
+export class PendingLogin implements RuntimeBinding {
   readonly runtimeOrigin: string;
   readonly runtimeBasePath: string;
   readonly projectId: string;
@@ -178,23 +255,13 @@ export class PendingLogin {
   readonly createdAt: number;
   readonly expiresAt: number;
   readonly #verifier: PkceVerifier;
-  #consumed = false;
+  #state: PendingState = "available";
 
   constructor(
     token: typeof INTERNAL_CONSTRUCTOR,
-    value: {
-      runtimeOrigin: string;
-      runtimeBasePath: string;
-      projectId: string;
-      applicationId: string;
-      redirectUri: string;
-      state: string;
-      createdAt: number;
-      expiresAt: number;
-      verifier: PkceVerifier;
-    },
+    value: Omit<PendingLoginRecord, "schemaVersion" | "verifier"> & { readonly verifier: PkceVerifier },
   ) {
-    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("PendingLogin is created by Client.");
+    if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("PendingLogin is created or restored by Client.");
     this.runtimeOrigin = value.runtimeOrigin;
     this.runtimeBasePath = value.runtimeBasePath;
     this.projectId = value.projectId;
@@ -207,14 +274,41 @@ export class PendingLogin {
   }
 
   get consumed(): boolean {
-    return this.#consumed;
+    return this.#state === "consumed";
   }
 
   /** @internal */
-  consume(): PkceVerifier | null {
-    if (this.#consumed) return null;
-    this.#consumed = true;
+  reserve(): PkceVerifier | null {
+    if (this.#state !== "available") return null;
+    this.#state = "reserved";
     return this.#verifier;
+  }
+
+  /** @internal */
+  commit(): void {
+    if (this.#state === "reserved") this.#state = "consumed";
+  }
+
+  /** @internal */
+  release(): void {
+    if (this.#state === "reserved") this.#state = "available";
+  }
+
+  /** Explicitly exports secret-bearing state for Application-owned protected storage. */
+  exportRecord(): PendingLoginRecord {
+    if (this.#state !== "available") throw new TypeError("Only available pending login state can be exported.");
+    return {
+      schemaVersion: 1,
+      runtimeOrigin: this.runtimeOrigin,
+      runtimeBasePath: this.runtimeBasePath,
+      projectId: this.projectId,
+      applicationId: this.applicationId,
+      redirectUri: this.redirectUri,
+      state: this.state,
+      createdAt: this.createdAt,
+      expiresAt: this.expiresAt,
+      verifier: this.#verifier.expose(),
+    };
   }
 
   toString(): string {
@@ -233,12 +327,14 @@ export class PendingLogin {
       createdAt: this.createdAt,
       expiresAt: this.expiresAt,
       verifier: REDACTED,
-      consumed: this.#consumed,
+      consumed: this.consumed,
     };
   }
 }
 
-export function createPendingLogin(value: ConstructorParameters<typeof PendingLogin>[1]): PendingLogin {
+export function createPendingLogin(
+  value: Omit<PendingLoginRecord, "schemaVersion" | "verifier"> & { readonly verifier: PkceVerifier },
+): PendingLogin {
   return new PendingLogin(INTERNAL_CONSTRUCTOR, value);
 }
 
@@ -250,7 +346,7 @@ export interface LoginStartResult {
 export class ValidatedCallback {
   readonly #handoff: string;
   readonly #pending: PendingLogin;
-  #consumed = false;
+  #reserved = false;
 
   constructor(token: typeof INTERNAL_CONSTRUCTOR, handoff: string, pending: PendingLogin) {
     if (token !== INTERNAL_CONSTRUCTOR) throw new TypeError("ValidatedCallback is created by Client.");
@@ -259,12 +355,25 @@ export class ValidatedCallback {
   }
 
   /** @internal */
-  consume(): { handoff: string; verifier: PkceVerifier } | null {
-    if (this.#consumed) return null;
-    const verifier = this.#pending.consume();
+  reserve(): { handoff: string; verifier: PkceVerifier } | null {
+    if (this.#reserved) return null;
+    const verifier = this.#pending.reserve();
     if (verifier === null) return null;
-    this.#consumed = true;
+    this.#reserved = true;
     return { handoff: this.#handoff, verifier };
+  }
+
+  /** @internal */
+  commit(): void {
+    if (!this.#reserved) return;
+    this.#pending.commit();
+  }
+
+  /** @internal */
+  release(): void {
+    if (!this.#reserved) return;
+    this.#pending.release();
+    this.#reserved = false;
   }
 
   toString(): string {

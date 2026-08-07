@@ -2,24 +2,44 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Lock
-from typing import Any
+from typing import Any, TypeVar
 
 from owlauth.errors import HandoffError, LocalAction, RetryDisposition
 
+_Snapshot = TypeVar("_Snapshot")
+
 
 class _OneUseGuard:
-    __slots__ = ("_consumed", "_lock")
+    __slots__ = ("_state", "_lock")
 
     def __init__(self) -> None:
-        self._consumed = False
+        self._state = "available"
         self._lock = Lock()
 
-    def consume(self) -> None:
+    @property
+    def available(self) -> bool:
         with self._lock:
-            if self._consumed:
+            return self._state == "available"
+
+    @property
+    def consumed(self) -> bool:
+        with self._lock:
+            return self._state == "consumed"
+
+    def snapshot_if_available(self, factory: Callable[[], _Snapshot]) -> _Snapshot:
+        """Linearize an explicit secret snapshot against exchange reservation."""
+        with self._lock:
+            if self._state != "available":
+                raise ValueError("Reserved or consumed pending login state cannot be exported.")
+            return factory()
+
+    def reserve(self) -> None:
+        with self._lock:
+            if self._state != "available":
                 raise HandoffError(
                     "pending_login_consumed",
                     "The pending login has already been used.",
@@ -27,7 +47,17 @@ class _OneUseGuard:
                     action=LocalAction.DISCARD_PENDING,
                     operation="exchange_handoff",
                 )
-            self._consumed = True
+            self._state = "reserved"
+
+    def commit(self) -> None:
+        with self._lock:
+            if self._state == "reserved":
+                self._state = "consumed"
+
+    def release(self) -> None:
+        with self._lock:
+            if self._state == "reserved":
+                self._state = "available"
 
 
 class SecretValue:
@@ -60,6 +90,16 @@ class SecretValue:
     def __deepcopy__(self, memo: dict[int, object]) -> SecretValue:
         del memo
         return self
+
+    def __reduce__(self) -> object:
+        raise TypeError("SecretValue cannot be serialized.")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("SecretValue cannot be serialized.")
+
+    def __getstate__(self) -> object:
+        raise TypeError("SecretValue cannot be serialized.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +182,24 @@ class PendingLogin:
     _pkce_verifier: SecretValue
     _guard: _OneUseGuard = field(default_factory=_OneUseGuard, compare=False)
     _marker: object = field(default_factory=object, compare=False)
+    _client_marker: object = field(default_factory=object, init=False, compare=False)
+
+    def export_record(self) -> dict[str, object]:
+        """Explicitly export secret-bearing state for protected Application storage."""
+        return self._guard.snapshot_if_available(
+            lambda: {
+                "schema_version": 1,
+                "runtime_base_url": self.runtime_base_url,
+                "project_id": self.project_id,
+                "application_id": self.application_id,
+                "redirect_uri": self.redirect_uri,
+                "hosted_url": self.hosted_url,
+                "created_at": self.created_at.isoformat(),
+                "expires_at": self.expires_at.isoformat(),
+                "state": self._state.reveal(),
+                "pkce_verifier": self._pkce_verifier.reveal(),
+            }
+        )
 
     def __repr__(self) -> str:
         return (
@@ -178,6 +236,7 @@ class LoginStart:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class CredentialPair:
+    runtime_base_url: str
     project_id: str
     application_id: str
     user_id: str
@@ -189,10 +248,42 @@ class CredentialPair:
     access_expires_at: datetime
     session_expires_at: datetime
     projection: UserProjection
+    _client_marker: object = field(default_factory=object, init=False, compare=False)
+
+    def export_record(self) -> dict[str, object]:
+        """Explicitly export one atomic secret-bearing credential generation."""
+        return {
+            "schema_version": 1,
+            "runtime_base_url": self.runtime_base_url,
+            "project_id": self.project_id,
+            "application_id": self.application_id,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "refresh_generation": self.refresh_generation,
+            "access_token": self.access_token.reveal(),
+            "refresh_token": self.refresh_token.reveal(),
+            "token_type": self.token_type,
+            "access_expires_at": self.access_expires_at.isoformat(),
+            "session_expires_at": self.session_expires_at.isoformat(),
+            "projection": {
+                "user_id": self.projection.user_id,
+                "user_revision": self.projection.user_revision,
+                "projection_schema": self.projection.projection_schema,
+                "projection_revision": self.projection.projection_revision,
+                "display_name": self.projection.display_name,
+                "picture_url": self.projection.picture_url,
+                "locale": self.projection.locale,
+                "verified_email": self.projection.verified_email,
+                "status": self.projection.status,
+                "created_at": self.projection.created_at.isoformat(),
+                "updated_at": self.projection.updated_at.isoformat(),
+            },
+        }
 
     def __repr__(self) -> str:
         return (
             "CredentialPair("
+            f"runtime_base_url={self.runtime_base_url!r}, "
             f"project_id={self.project_id!r}, "
             f"application_id={self.application_id!r}, "
             f"user_id={self.user_id!r}, "

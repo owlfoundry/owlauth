@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import base64
 import binascii
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from owlauth._json import loads_strict_json
 from owlauth.errors import ProtocolError
 
 _SCHEMA_VERSION = 3
@@ -159,9 +159,21 @@ def _validate_expected(value: object) -> dict[str, Any]:
             if not all(isinstance(key, str) for key in values):
                 raise _invalid()
     elif outcome == "error":
-        _exact_object(expected, common | {"category", "code", "retry", "action"})
+        _exact_object(
+            expected,
+            common | {"category", "code", "retry", "action"},
+            {"retryAfterSeconds"},
+        )
         for field in ("category", "code", "retry", "action"):
             _bounded_string(expected[field], 64)
+        if "retryAfterSeconds" in expected:
+            retry_after = expected["retryAfterSeconds"]
+            if (
+                not isinstance(retry_after, int)
+                or isinstance(retry_after, bool)
+                or not 0 <= retry_after <= 86_400
+            ):
+                raise _invalid()
     else:
         raise _invalid()
     if expected["pendingDisposition"] not in _PENDING_DISPOSITIONS:
@@ -282,8 +294,14 @@ def _read_json(path: Path) -> Any:
         body = path.read_bytes()
         if len(body) > 1_048_576:
             raise _invalid()
-        return json.loads(body.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return loads_strict_json(body)
+    except (
+        OSError,
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+        RecursionError,
+    ) as error:
         raise _invalid() from error
 
 

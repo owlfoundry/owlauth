@@ -50,6 +50,7 @@ pub struct Error {
     action: LocalAction,
     operation: &'static str,
     status: Option<u16>,
+    retry_after_seconds: Option<u64>,
 }
 
 impl Error {
@@ -70,12 +71,18 @@ impl Error {
             action,
             operation,
             status: None,
+            retry_after_seconds: None,
         }
     }
 
     pub(crate) fn with_runtime(mut self, status: u16, request_id: Option<String>) -> Self {
         self.status = Some(status);
         self.request_id = request_id.filter(|value| value.len() <= 128);
+        self
+    }
+
+    pub(crate) const fn with_retry_after(mut self, retry_after_seconds: u64) -> Self {
+        self.retry_after_seconds = Some(retry_after_seconds);
         self
     }
 
@@ -118,6 +125,11 @@ impl Error {
     pub const fn status(&self) -> Option<u16> {
         self.status
     }
+
+    #[must_use]
+    pub const fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
+    }
 }
 
 impl fmt::Display for Error {
@@ -138,6 +150,7 @@ impl fmt::Debug for Error {
             .field("action", &self.action)
             .field("operation", &self.operation)
             .field("status", &self.status)
+            .field("retry_after_seconds", &self.retry_after_seconds)
             .finish()
     }
 }

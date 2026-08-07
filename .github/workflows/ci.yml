@@ -111,6 +111,8 @@ jobs:
         run: |
           pnpm --filter @owlauth/server-web build
           cargo build --locked --package owlauth-server
+      - name: Build and execute packaged CLI candidate
+        run: scripts/test-cli-package.sh "${RUNNER_TEMP}/packaged-cli/owlauth"
       - name: Install declared browsers
         run: pnpm --filter @owlauth/server-web exec playwright install --with-deps chromium firefox
       - name: Run real PostgreSQL Project Auth journeys from exact SDK artifacts
@@ -129,6 +131,7 @@ jobs:
           OWLAUTH_E2E_RUST_ARCHIVE_SHA256: ${{ needs.rust-candidate.outputs.archive-sha256 }}
           OWLAUTH_E2E_RUST_DESCRIPTOR_SHA256: ${{ needs.rust-candidate.outputs.descriptor-sha256 }}
           OWLAUTH_E2E_EVIDENCE_DIRECTORY: ${{ runner.temp }}/sdk-e2e-evidence
+          OWLAUTH_E2E_CLI_BINARY: ${{ runner.temp }}/packaged-cli/owlauth
         run: pnpm --filter @owlauth/server-web exec playwright test
       - name: Upload same-server exact-artifact evidence
         uses: actions/upload-artifact@v6

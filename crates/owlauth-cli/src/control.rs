@@ -400,8 +400,10 @@ enum ProviderCommand {
         mode: ProviderEgressModeArg,
         #[arg(long, value_delimiter = ',')]
         exact_origin: Vec<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         expected_revision: i64,
+        #[arg(long)]
+        yes: bool,
     },
     Preflight {
         project_id: String,
@@ -1120,6 +1122,19 @@ fn run_application_user_event(
     }
 }
 
+fn provider_egress_confirmation_effect(
+    project_id: &str,
+    request: &UpdateProviderEgressPolicyRequest,
+) -> serde_json::Value {
+    serde_json::json!({
+        "effect": "replace the Project provider egress allowlist",
+        "project_id": project_id,
+        "mode": &request.mode,
+        "exact_origins": &request.exact_origins,
+        "expected_revision": request.expected_revision,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "typed provider dispatch keeps each reviewed command and trust transition visible"
@@ -1137,16 +1152,26 @@ pub(crate) fn run_provider(profile: Option<&str>, args: ProviderArgs) -> Result<
             mode,
             exact_origin,
             expected_revision,
+            yes,
         } => {
             resource(&project_id)?;
-            let value: ProviderEgressPolicy = authenticated_server(profile)?.send(
+            let target = format!("projects/{project_id}/provider-egress-policy");
+            let request = UpdateProviderEgressPolicyRequest {
+                mode: mode.into(),
+                exact_origins: exact_origin,
+                expected_revision,
+            };
+            let stored = require_confirmation(
+                yes,
+                profile,
+                "provider.egress-set",
+                &target,
+                &provider_egress_confirmation_effect(&project_id, &request),
+            )?;
+            let value: ProviderEgressPolicy = authenticated_server_snapshot(stored)?.send(
                 Method::PUT,
-                &format!("projects/{project_id}/provider-egress-policy"),
-                &UpdateProviderEgressPolicyRequest {
-                    mode: mode.into(),
-                    exact_origins: exact_origin,
-                    expected_revision,
-                },
+                &target,
+                &request,
                 None,
             )?;
             print_json(&value)
@@ -1757,6 +1782,31 @@ mod tests {
         (origin, server)
     }
 
+    fn openapi_operation(method: &Method, path: &str) -> Value {
+        let document = serde_json::to_value(owlauth_types::control::openapi()).unwrap();
+        let paths = document["paths"].as_object().unwrap();
+        let expected_segments = path.split('/').collect::<Vec<_>>();
+        let operation = paths.iter().find_map(|(template, operations)| {
+            let template = template.strip_prefix("/v1/")?;
+            let template_segments = template.split('/').collect::<Vec<_>>();
+            (template_segments.len() == expected_segments.len()
+                && template_segments
+                    .iter()
+                    .zip(&expected_segments)
+                    .all(|(template, actual)| {
+                        template == actual || template.starts_with('{') && template.ends_with('}')
+                    }))
+            .then_some(operations)
+        });
+        let method = method.as_str().to_ascii_lowercase();
+        operation
+            .and_then(|operations| operations.get(&method))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("CLI route {method} /v1/{path} is absent from Control OpenAPI")
+            })
+    }
+
     #[allow(
         clippy::needless_pass_by_value,
         reason = "owned table entries keep each transport case compact and independent"
@@ -1768,6 +1818,15 @@ mod tests {
         idempotency_key: Option<&str>,
         expected_body: Value,
     ) {
+        let operation = openapi_operation(&method, path);
+        let schema = &operation["requestBody"]["content"]["application/json"]["schema"];
+        let request_type = std::any::type_name::<B>().rsplit("::").next().unwrap();
+        assert_eq!(
+            schema["$ref"],
+            format!("#/components/schemas/{request_type}"),
+            "CLI request type for {} /v1/{path} drifted from Control OpenAPI",
+            method.as_str()
+        );
         let (origin, server) = capture_server();
         let client = AuthenticatedServerClient::for_transport_test(
             Url::parse(&format!("{origin}v1/")).unwrap(),
@@ -1794,6 +1853,8 @@ mod tests {
     }
 
     fn assert_get<T: serde::de::DeserializeOwned>(path: &str, response: Value) {
+        let operation = openapi_operation(&Method::GET, path);
+        assert!(operation.get("requestBody").is_none());
         let (origin, server) = capture_server_with_response(response);
         let client = AuthenticatedServerClient::for_transport_test(
             Url::parse(&format!("{origin}v1/")).unwrap(),
@@ -1809,6 +1870,8 @@ mod tests {
     }
 
     fn assert_get_query(path: &str, query: &[(&str, &str)], expected_target: &str) {
+        let operation = openapi_operation(&Method::GET, path);
+        assert!(operation.get("requestBody").is_none());
         let (origin, server) = capture_server();
         let client = AuthenticatedServerClient::for_transport_test(
             Url::parse(&format!("{origin}v1/")).unwrap(),
@@ -1917,6 +1980,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_egress_confirmation_binds_project_mode_origins_and_revision() {
+        let request = UpdateProviderEgressPolicyRequest {
+            mode: ProviderEgressMode::ExactOrigins,
+            exact_origins: vec!["https://identity.example".to_owned()],
+            expected_revision: 7,
+        };
+        assert_eq!(
+            provider_egress_confirmation_effect("project-id", &request),
+            json!({
+                "effect": "replace the Project provider egress allowlist",
+                "project_id": "project-id",
+                "mode": "exact_origins",
+                "exact_origins": ["https://identity.example"],
+                "expected_revision": 7,
+            })
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one table-like transport test keeps every typed Control command family auditable"
@@ -1945,6 +2027,7 @@ mod tests {
             format!("projects/{PROJECT}/provider-egress-policy"),
             format!("projects/{PROJECT}/signing-keys"),
             format!("projects/{PROJECT}/applications/{APPLICATION}/webhook-endpoints"),
+            format!("projects/{PROJECT}/applications/{APPLICATION}/webhook-endpoints/{ENDPOINT}"),
             format!("projects/{PROJECT}/applications/{APPLICATION}/user-events"),
             format!("projects/{PROJECT}/applications/{APPLICATION}/webhook-deliveries"),
             format!("projects/{PROJECT}/users"),
@@ -2082,6 +2165,22 @@ mod tests {
             None,
             json!({"expected_security_revision":4}),
         );
+        assert_send(
+            Method::POST,
+            &format!("projects/{PROJECT}/disable"),
+            &security_revision,
+            None,
+            json!({"expected_security_revision":4}),
+        );
+        for action in ["disable", "enable"] {
+            assert_send(
+                Method::POST,
+                &format!("projects/{PROJECT}/users/{USER}/{action}"),
+                &security_revision,
+                None,
+                json!({"expected_security_revision":4}),
+            );
+        }
 
         assert_send(
             Method::PUT,

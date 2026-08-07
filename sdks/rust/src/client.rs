@@ -1,4 +1,5 @@
 use std::{
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,17 +16,120 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
-    AccessToken, BrowserLogoutPreparation, CompletionResponse, CredentialPair, CredentialPairWire,
-    CurrentUser, Error, ErrorCategory, HandoffRequest, HttpMethod, HttpRequest, HttpResponse,
-    JwksDocument, LocalAction, LoginStart, LoginStartRequest, LoginStartResponse, PendingLogin,
-    PublicConfiguration, RefreshRequest, RetryPolicy, RuntimeErrorWire, Transport,
-    TransportFailure, TransportFailureKind, ValidatedCallback,
+    BrowserLogoutPreparation, CompletionResponse, CredentialPair, CredentialPairRecord,
+    CredentialPairWire, CurrentUser, Error, ErrorCategory, HandoffGuard, HandoffRequest,
+    HttpMethod, HttpRequest, HttpResponse, JwksDocument, LocalAction, LoginStart,
+    LoginStartRequest, LoginStartResponse, PendingLogin, PendingLoginRecord, PublicConfiguration,
+    RefreshRequest, RetryPolicy, RuntimeErrorWire, Transport, TransportFailure,
+    TransportFailureKind, ValidatedCallback,
     error::{configuration, protocol},
     transport::default_transport,
 };
 
 const MAX_RESPONSE_BYTES: usize = 65_536;
 const PENDING_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Clone, Copy)]
+struct ResponsePolicy {
+    operation: &'static str,
+    expected_status: u16,
+    sensitive: bool,
+    action: LocalAction,
+}
+
+impl ResponsePolicy {
+    const fn new(
+        operation: &'static str,
+        expected_status: u16,
+        sensitive: bool,
+        action: LocalAction,
+    ) -> Self {
+        Self {
+            operation,
+            expected_status,
+            sensitive,
+            action,
+        }
+    }
+}
+
+/// Cloneable caller-controlled cancellation boundary for one SDK operation.
+#[derive(Clone, Default)]
+pub struct CancellationToken {
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancellationToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cancellation. Calling this method more than once has no additional effect.
+    pub fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl std::fmt::Debug for CancellationToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CancellationToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+/// Optional controls for one SDK operation.
+#[derive(Clone, Debug, Default)]
+pub struct OperationOptions {
+    cancellation: Option<CancellationToken>,
+}
+
+impl OperationOptions {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { cancellation: None }
+    }
+
+    #[must_use]
+    pub fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation: Some(cancellation),
+        }
+    }
+
+    #[must_use]
+    pub const fn cancellation(&self) -> Option<&CancellationToken> {
+        self.cancellation.as_ref()
+    }
+}
 
 /// Immutable one-Project/one-Application client configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,11 +292,113 @@ impl Client {
         &self.application_id
     }
 
+    /// Restores an explicitly exported pending-login record into this exact client without I/O.
+    ///
+    /// # Errors
+    /// Returns a configuration error for a stale, malformed, or cross-context record.
+    pub fn restore_pending_login(&self, value: PendingLoginRecord) -> Result<PendingLogin, Error> {
+        let now = self.clock.now_unix_seconds();
+        let now = i128::from(now);
+        let created_at = i128::from(value.created_at);
+        let expires_at = i128::from(value.expires_at);
+        if value.schema_version != PENDING_SCHEMA_VERSION
+            || value.runtime_origin != self.origin
+            || value.runtime_base_path != self.base.path()
+            || value.project_id != self.project_id
+            || value.application_id != self.application_id
+            || validate_redirect(&value.redirect_uri).is_err()
+            || !(43..=128).contains(&value.verifier.len())
+            || !value
+                .verifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || value.state.is_empty()
+            || value.state.chars().count() > 1024
+            || created_at > now + 60
+            || expires_at < created_at - 60
+            || expires_at > created_at + 660
+            || expires_at > now + 660
+            || now > expires_at + 60
+        {
+            return Err(configuration(
+                "invalid_pending_record",
+                "The pending-login record is invalid or belongs to another client.",
+            ));
+        }
+        Ok(PendingLogin {
+            schema_version: value.schema_version,
+            runtime_origin: value.runtime_origin,
+            runtime_base_path: value.runtime_base_path,
+            project_id: value.project_id,
+            application_id: value.application_id,
+            redirect_uri: value.redirect_uri,
+            verifier: Zeroizing::new(value.verifier),
+            state: Zeroizing::new(value.state),
+            created_at: value.created_at,
+            expires_at: value.expires_at,
+            guard: Arc::new(HandoffGuard::new()),
+        })
+    }
+
+    /// Restores an explicitly exported credential generation into this exact client without I/O.
+    ///
+    /// # Errors
+    /// Returns a configuration error for a malformed, expired, or cross-context record.
+    pub fn restore_credentials(
+        &self,
+        value: CredentialPairRecord,
+    ) -> Result<CredentialPair, Error> {
+        let now = self.clock.now_unix_seconds();
+        let now_bound = i128::from(now);
+        let access_expiry = i128::from(value.access_expires_at);
+        let remaining =
+            i64::try_from((access_expiry - now_bound).clamp(0, 3600)).unwrap_or_default();
+        let session_expiry = parse_time(&value.session_expires_at, "restore_credentials").ok();
+        if value.schema_version != 1
+            || value.runtime_origin != self.origin
+            || value.runtime_base_path != self.base.path()
+            || value.project_id != self.project_id
+            || value.application_id != self.application_id
+            || value.user_id.is_empty()
+            || value.user_id.len() > 96
+            || value.session_id.is_empty()
+            || value.session_id.len() > 64
+            || value.refresh_generation <= 0
+            || !valid_bearer_token(&value.access_token, 16_384)
+            || !valid_opaque_token(&value.refresh_token, 256)
+            || value.token_type != "Bearer"
+            || access_expiry > now_bound + 3660
+            || value.projection_revision <= 0
+            || value.projection_revision != value.projection.projection_revision
+            || value.user_id != value.projection.user_id
+            || !valid_projection(&value.projection)
+            || session_expiry.is_none_or(|expiry| i128::from(expiry) < now_bound - 60)
+        {
+            return Err(configuration(
+                "invalid_credential_record",
+                "The credential record is invalid or belongs to another client.",
+            ));
+        }
+        Ok(CredentialPair::from_record(value, remaining))
+    }
+
     /// Fetches bounded public Project/Application configuration.
     ///
     /// # Errors
     /// Returns a typed transport, Runtime, or protocol error.
     pub async fn public_configuration(&self) -> Result<PublicConfiguration, Error> {
+        self.public_configuration_with_options(&OperationOptions::default())
+            .await
+    }
+
+    /// Fetches public configuration with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns a typed transport, Runtime, or protocol error.
+    pub async fn public_configuration_with_options(
+        &self,
+        options: &OperationOptions,
+    ) -> Result<PublicConfiguration, Error> {
         let mut url = self.endpoint(&format!(
             "v1/projects/{}/auth/config",
             encode_path(&self.project_id)
@@ -200,7 +406,7 @@ impl Client {
         url.query_pairs_mut()
             .append_pair("application_id", &self.application_id);
         let value: PublicConfiguration = self
-            .get_json(url, "get_public_application_config", 200)
+            .get_json(url, "get_public_application_config", 200, options)
             .await?;
         if value.project_public_id != self.project_id
             || value.application_public_id != self.application_id
@@ -215,9 +421,9 @@ impl Client {
             ));
         }
         if value.project_display_name.is_empty()
-            || value.project_display_name.len() > 128
+            || value.project_display_name.chars().count() > 128
             || value.application_display_name.is_empty()
-            || value.application_display_name.len() > 128
+            || value.application_display_name.chars().count() > 128
             || value.providers.len() > 50
             || value.publishable_keys.len() > 50
             || value
@@ -228,7 +434,7 @@ impl Client {
                 provider.key.is_empty()
                     || provider.key.len() > 64
                     || provider.display_name.is_empty()
-                    || provider.display_name.len() > 128
+                    || provider.display_name.chars().count() > 128
                     || !matches!(provider.kind.as_str(), "oidc" | "google" | "github")
             })
             || {
@@ -252,11 +458,23 @@ impl Client {
     /// # Errors
     /// Returns a typed transport, Runtime, or protocol error.
     pub async fn project_jwks(&self) -> Result<JwksDocument, Error> {
+        self.project_jwks_with_options(&OperationOptions::default())
+            .await
+    }
+
+    /// Fetches Project JWKS with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns a typed transport, Runtime, or protocol error.
+    pub async fn project_jwks_with_options(
+        &self,
+        options: &OperationOptions,
+    ) -> Result<JwksDocument, Error> {
         let url = self.endpoint(&format!(
             "projects/{}/.well-known/jwks.json",
             encode_path(&self.project_id)
         ))?;
-        let value: JwksDocument = self.get_json(url, "get_project_jwks", 200).await?;
+        let value: JwksDocument = self.get_json(url, "get_project_jwks", 200, options).await?;
         if value.keys.len() > 100
             || value.revision <= 0
             || value.signing_epoch <= 0
@@ -289,8 +507,28 @@ impl Client {
         application_state: Option<&str>,
         presentation_hint: Option<&str>,
     ) -> Result<LoginStart, Error> {
+        self.begin_login_with_options(
+            redirect_uri,
+            application_state,
+            presentation_hint,
+            &OperationOptions::default(),
+        )
+        .await
+    }
+
+    /// Starts Hosted login with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns a configuration, entropy, transport, login, or protocol error.
+    pub async fn begin_login_with_options(
+        &self,
+        redirect_uri: &str,
+        application_state: Option<&str>,
+        presentation_hint: Option<&str>,
+        options: &OperationOptions,
+    ) -> Result<LoginStart, Error> {
         validate_redirect(redirect_uri)?;
-        if presentation_hint.is_some_and(|value| value.is_empty() || value.len() > 64) {
+        if presentation_hint.is_some_and(|value| value.is_empty() || value.chars().count() > 64) {
             return Err(configuration(
                 "invalid_presentation_hint",
                 "The presentation hint is invalid.",
@@ -299,7 +537,7 @@ impl Client {
         let verifier = self.random_base64(32, "start_login")?;
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = match application_state {
-            Some(value) if !value.is_empty() && value.len() <= 1024 => value.to_owned(),
+            Some(value) if !value.is_empty() && value.chars().count() <= 1024 => value.to_owned(),
             Some(_) => {
                 return Err(configuration(
                     "invalid_application_state",
@@ -320,16 +558,20 @@ impl Client {
             "v1/projects/{}/auth/login/start",
             encode_path(&self.project_id)
         ))?;
+        let created_at = self.clock.now_unix_seconds();
         let response: LoginStartResponse = self
             .post_json(
                 url,
                 &request,
-                "start_login",
-                201,
-                false,
-                LocalAction::DiscardPendingLogin,
+                ResponsePolicy::new("start_login", 201, false, LocalAction::DiscardPendingLogin),
+                None,
+                options,
             )
             .await?;
+        if response.hosted_url.chars().count() > 512 || has_ambiguous_url_path(&response.hosted_url)
+        {
+            return Err(protocol("start_login", "invalid_hosted_url"));
+        }
         let hosted = Url::parse(&response.hosted_url)
             .map_err(|_| protocol("start_login", "invalid_hosted_url"))?;
         if hosted.origin().ascii_serialization() != self.origin
@@ -341,8 +583,9 @@ impl Client {
             return Err(protocol("start_login", "invalid_hosted_url"));
         }
         let expires_at = parse_time(&response.expires_at, "start_login")?;
-        let created_at = self.clock.now_unix_seconds();
-        if expires_at < created_at - 60 || expires_at > created_at + 660 {
+        let created_at_bound = i128::from(created_at);
+        let expires_at_bound = i128::from(expires_at);
+        if expires_at_bound < created_at_bound - 60 || expires_at_bound > created_at_bound + 660 {
             return Err(protocol("start_login", "invalid_expiry"));
         }
         Ok(LoginStart {
@@ -350,6 +593,7 @@ impl Client {
             pending: PendingLogin {
                 schema_version: PENDING_SCHEMA_VERSION,
                 runtime_origin: self.origin.clone(),
+                runtime_base_path: self.base.path().to_owned(),
                 project_id: self.project_id.clone(),
                 application_id: self.application_id.clone(),
                 redirect_uri: redirect_uri.to_owned(),
@@ -357,7 +601,7 @@ impl Client {
                 state: Zeroizing::new(state),
                 created_at,
                 expires_at,
-                guard: Arc::new(AtomicBool::new(false)),
+                guard: Arc::new(HandoffGuard::new()),
             },
         })
     }
@@ -382,14 +626,15 @@ impl Client {
                 "exchange_handoff",
             )
         };
-        if pending.consumed() {
+        if !pending.available() {
             return Err(fail("pending_consumed"));
         }
         if pending.schema_version != PENDING_SCHEMA_VERSION
             || pending.runtime_origin != self.origin
+            || pending.runtime_base_path != self.base.path()
             || pending.project_id != self.project_id
             || pending.application_id != self.application_id
-            || self.clock.now_unix_seconds() > pending.expires_at.saturating_add(60)
+            || i128::from(self.clock.now_unix_seconds()) > i128::from(pending.expires_at) + 60
         {
             return Err(fail("pending_context_mismatch"));
         }
@@ -432,7 +677,7 @@ impl Client {
             }
         }
         let state = state
-            .filter(|value| !value.is_empty() && value.len() <= 1024)
+            .filter(|value| !value.is_empty() && value.chars().count() <= 1024)
             .ok_or_else(|| fail("state_mismatch"))?;
         if remaining != expected_query
             || !bool::from(state.as_bytes().ct_eq(pending.state.as_bytes()))
@@ -465,18 +710,21 @@ impl Client {
     /// Returns `Indeterminate` when a post-dispatch outcome cannot be known safely.
     pub async fn exchange_handoff(
         &self,
-        callback: ValidatedCallback,
+        callback: &ValidatedCallback,
     ) -> Result<CredentialPair, Error> {
-        if callback.guard.swap(true, Ordering::AcqRel) {
-            return Err(Error::new(
-                ErrorCategory::Handoff,
-                "pending_consumed",
-                "The pending login has already been used.",
-                RetryPolicy::Never,
-                LocalAction::DiscardPendingLogin,
-                "exchange_handoff",
-            ));
-        }
+        self.exchange_handoff_with_options(callback, &OperationOptions::default())
+            .await
+    }
+
+    /// Exchanges handoff material with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns `Indeterminate` when a post-dispatch outcome cannot be known safely.
+    pub async fn exchange_handoff_with_options(
+        &self,
+        callback: &ValidatedCallback,
+        options: &OperationOptions,
+    ) -> Result<CredentialPair, Error> {
         let request = HandoffRequest {
             application_id: &self.application_id,
             publishable_key: &self.publishable_key,
@@ -491,10 +739,14 @@ impl Client {
             .post_json(
                 url,
                 &request,
-                "exchange_handoff",
-                200,
-                true,
-                LocalAction::QuarantinePendingLogin,
+                ResponsePolicy::new(
+                    "exchange_handoff",
+                    200,
+                    true,
+                    LocalAction::QuarantinePendingLogin,
+                ),
+                Some(&callback.guard),
+                options,
             )
             .await?;
         self.validate_credentials(
@@ -511,10 +763,24 @@ impl Client {
     pub async fn complete_login(
         &self,
         callback_url: &str,
-        pending: PendingLogin,
+        pending: &PendingLogin,
     ) -> Result<CredentialPair, Error> {
-        let callback = self.validate_callback(callback_url, &pending)?;
-        self.exchange_handoff(callback).await
+        self.complete_login_with_options(callback_url, pending, &OperationOptions::default())
+            .await
+    }
+
+    /// Validates and exchanges a login callback with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns a handoff, transport, protocol, cancellation, or indeterminate error.
+    pub async fn complete_login_with_options(
+        &self,
+        callback_url: &str,
+        pending: &PendingLogin,
+        options: &OperationOptions,
+    ) -> Result<CredentialPair, Error> {
+        let callback = self.validate_callback(callback_url, pending)?;
+        self.exchange_handoff_with_options(&callback, options).await
     }
 
     /// Rotates one explicit credential generation without automatic retry.
@@ -522,6 +788,19 @@ impl Client {
     /// # Errors
     /// Returns a refresh, protocol, transport, or indeterminate error.
     pub async fn refresh(&self, current: &CredentialPair) -> Result<CredentialPair, Error> {
+        self.refresh_with_options(current, &OperationOptions::default())
+            .await
+    }
+
+    /// Rotates one credential generation with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns a refresh, protocol, transport, cancellation, or indeterminate error.
+    pub async fn refresh_with_options(
+        &self,
+        current: &CredentialPair,
+        options: &OperationOptions,
+    ) -> Result<CredentialPair, Error> {
         self.check_pair_context(current, "refresh_session")?;
         let request = RefreshRequest {
             application_id: &self.application_id,
@@ -536,17 +815,24 @@ impl Client {
             .post_json(
                 url,
                 &request,
-                "refresh_session",
-                200,
-                true,
-                LocalAction::QuarantineCredentials,
+                ResponsePolicy::new(
+                    "refresh_session",
+                    200,
+                    true,
+                    LocalAction::QuarantineCredentials,
+                ),
+                None,
+                options,
             )
             .await?;
         let next =
             self.validate_credentials(wire, "refresh_session", LocalAction::QuarantineCredentials)?;
         if next.user_id() != current.user_id()
             || next.session_id() != current.session_id()
-            || next.refresh_generation() != current.refresh_generation().saturating_add(1)
+            || current
+                .refresh_generation()
+                .checked_add(1)
+                .is_none_or(|generation| next.refresh_generation() != generation)
         {
             return Err(indeterminate_response(
                 "refresh_session",
@@ -558,11 +844,24 @@ impl Client {
         Ok(next)
     }
 
-    /// Retrieves the bounded current Project user for an explicit access token.
+    /// Retrieves the bounded current Project user for an exact context-bound credential pair.
     ///
     /// # Errors
     /// Returns an authentication, protocol, or transport error.
-    pub async fn current_user(&self, access_token: &AccessToken) -> Result<CurrentUser, Error> {
+    pub async fn current_user(&self, credentials: &CredentialPair) -> Result<CurrentUser, Error> {
+        self.current_user_with_options(credentials, &OperationOptions::default())
+            .await
+    }
+
+    /// Retrieves the current user with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns an authentication, protocol, transport, or cancellation error.
+    pub async fn current_user_with_options(
+        &self,
+        credentials: &CredentialPair,
+        options: &OperationOptions,
+    ) -> Result<CurrentUser, Error> {
         let url = self.endpoint(&format!(
             "v1/projects/{}/auth/users/me",
             encode_path(&self.project_id)
@@ -571,10 +870,9 @@ impl Client {
             .bearer_json(
                 HttpMethod::Get,
                 url,
-                access_token,
-                "get_current_user",
-                200,
-                false,
+                credentials,
+                ResponsePolicy::new("get_current_user", 200, false, LocalAction::None),
+                options,
             )
             .await?;
         if value.project_id != self.project_id
@@ -584,7 +882,7 @@ impl Client {
             || !valid_projection(&value.projection)
             || parse_time(&value.authenticated_at, "get_current_user").is_err()
             || parse_time(&value.session_expires_at, "get_current_user").map_or(true, |expiry| {
-                expiry < self.clock.now_unix_seconds().saturating_sub(60)
+                i128::from(expiry) < i128::from(self.clock.now_unix_seconds()) - 60
             })
         {
             return Err(protocol("get_current_user", "context_mismatch"));
@@ -592,11 +890,24 @@ impl Client {
         Ok(value)
     }
 
-    /// Revokes only the exact Application session represented by the access token.
+    /// Revokes only the exact Application session represented by a context-bound pair.
     ///
     /// # Errors
     /// Returns a session error or `Indeterminate` after an ambiguous dispatch.
-    pub async fn logout_application(&self, access_token: &AccessToken) -> Result<(), Error> {
+    pub async fn logout_application(&self, credentials: &CredentialPair) -> Result<(), Error> {
+        self.logout_application_with_options(credentials, &OperationOptions::default())
+            .await
+    }
+
+    /// Revokes an Application session with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns a session, cancellation, or indeterminate error.
+    pub async fn logout_application_with_options(
+        &self,
+        credentials: &CredentialPair,
+        options: &OperationOptions,
+    ) -> Result<(), Error> {
         let url = self.endpoint(&format!(
             "v1/projects/{}/auth/sessions/logout",
             encode_path(&self.project_id)
@@ -605,10 +916,14 @@ impl Client {
             .bearer_json(
                 HttpMethod::Post,
                 url,
-                access_token,
-                "logout_application_session",
-                200,
-                true,
+                credentials,
+                ResponsePolicy::new(
+                    "logout_application_session",
+                    200,
+                    true,
+                    LocalAction::QuarantineCredentials,
+                ),
+                options,
             )
             .await?;
         if !value.completed {
@@ -628,7 +943,20 @@ impl Client {
     /// Returns a session, protocol, transport, or indeterminate error.
     pub async fn prepare_browser_logout(
         &self,
-        access_token: &AccessToken,
+        credentials: &CredentialPair,
+    ) -> Result<BrowserLogoutPreparation, Error> {
+        self.prepare_browser_logout_with_options(credentials, &OperationOptions::default())
+            .await
+    }
+
+    /// Creates a browser logout target with explicit operation controls.
+    ///
+    /// # Errors
+    /// Returns a session, protocol, transport, cancellation, or indeterminate error.
+    pub async fn prepare_browser_logout_with_options(
+        &self,
+        credentials: &CredentialPair,
+        options: &OperationOptions,
     ) -> Result<BrowserLogoutPreparation, Error> {
         let url = self.endpoint(&format!(
             "v1/projects/{}/auth/browser-logout/prepare",
@@ -638,12 +966,24 @@ impl Client {
             .bearer_json(
                 HttpMethod::Post,
                 url,
-                access_token,
-                "prepare_browser_logout",
-                201,
-                true,
+                credentials,
+                ResponsePolicy::new(
+                    "prepare_browser_logout",
+                    201,
+                    true,
+                    LocalAction::QuarantineCredentials,
+                ),
+                options,
             )
             .await?;
+        if value.hosted_url.chars().count() > 512 || has_ambiguous_url_path(&value.hosted_url) {
+            return Err(indeterminate_response(
+                "prepare_browser_logout",
+                "invalid_response_after_dispatch",
+                LocalAction::QuarantineCredentials,
+                201,
+            ));
+        }
         let hosted = Url::parse(&value.hosted_url).map_err(|_| {
             indeterminate_response(
                 "prepare_browser_logout",
@@ -673,10 +1013,9 @@ impl Client {
                 201,
             )
         })?;
-        let received_at = self.clock.now_unix_seconds();
-        if expires_at < received_at.saturating_sub(60)
-            || expires_at > received_at.saturating_add(120)
-        {
+        let received_at = i128::from(self.clock.now_unix_seconds());
+        let expires_at_bound = i128::from(expires_at);
+        if expires_at_bound < received_at - 60 || expires_at_bound > received_at + 120 {
             return Err(indeterminate_response(
                 "prepare_browser_logout",
                 "invalid_response_after_dispatch",
@@ -713,6 +1052,7 @@ impl Client {
         url: Url,
         operation: &'static str,
         expected_status: u16,
+        options: &OperationOptions,
     ) -> Result<T, Error> {
         self.execute(
             HttpRequest {
@@ -722,10 +1062,9 @@ impl Client {
                 body: None,
                 max_response_bytes: MAX_RESPONSE_BYTES,
             },
-            operation,
-            expected_status,
-            false,
-            LocalAction::None,
+            ResponsePolicy::new(operation, expected_status, false, LocalAction::None),
+            None,
+            options,
         )
         .await
     }
@@ -734,13 +1073,12 @@ impl Client {
         &self,
         url: Url,
         body: &B,
-        operation: &'static str,
-        expected_status: u16,
-        sensitive: bool,
-        action: LocalAction,
+        policy: ResponsePolicy,
+        one_use_guard: Option<&Arc<HandoffGuard>>,
+        options: &OperationOptions,
     ) -> Result<T, Error> {
-        let body =
-            serde_json::to_vec(body).map_err(|_| protocol(operation, "request_serialization"))?;
+        let body = serde_json::to_vec(body)
+            .map_err(|_| protocol(policy.operation, "request_serialization"))?;
         self.execute(
             HttpRequest {
                 method: HttpMethod::Post,
@@ -752,10 +1090,9 @@ impl Client {
                 body: Some(body),
                 max_response_bytes: MAX_RESPONSE_BYTES,
             },
-            operation,
-            expected_status,
-            sensitive,
-            action,
+            policy,
+            one_use_guard,
+            options,
         )
         .await
     }
@@ -764,30 +1101,28 @@ impl Client {
         &self,
         method: HttpMethod,
         url: Url,
-        token: &AccessToken,
-        operation: &'static str,
-        expected_status: u16,
-        sensitive: bool,
+        credentials: &CredentialPair,
+        policy: ResponsePolicy,
+        options: &OperationOptions,
     ) -> Result<T, Error> {
+        self.check_pair_context(credentials, policy.operation)?;
         self.execute(
             HttpRequest {
                 method,
                 url: url.to_string(),
                 headers: vec![
                     ("accept".into(), "application/json".into()),
-                    ("authorization".into(), format!("Bearer {}", token.expose())),
+                    (
+                        "authorization".into(),
+                        format!("Bearer {}", credentials.access_token().expose()),
+                    ),
                 ],
                 body: None,
                 max_response_bytes: MAX_RESPONSE_BYTES,
             },
-            operation,
-            expected_status,
-            sensitive,
-            if sensitive {
-                LocalAction::QuarantineCredentials
-            } else {
-                LocalAction::None
-            },
+            policy,
+            None,
+            options,
         )
         .await
     }
@@ -795,17 +1130,76 @@ impl Client {
     async fn execute<T: DeserializeOwned>(
         &self,
         request: HttpRequest,
-        operation: &'static str,
-        expected_status: u16,
-        sensitive: bool,
-        action: LocalAction,
+        policy: ResponsePolicy,
+        one_use_guard: Option<&Arc<HandoffGuard>>,
+        options: &OperationOptions,
     ) -> Result<T, Error> {
-        let response = self
-            .transport
-            .send(request, self.deadline)
-            .await
-            .map_err(|failure| transport_error(failure, operation, sensitive, action))?;
-        parse_response(&response, operation, expected_status, sensitive, action)
+        if options
+            .cancellation()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(transport_error(
+                TransportFailure::new(TransportFailureKind::Cancelled, false),
+                policy.operation,
+                policy.sensitive,
+                policy.action,
+            ));
+        }
+        if one_use_guard.is_some_and(|guard| !guard.reserve()) {
+            return Err(Error::new(
+                ErrorCategory::Handoff,
+                "pending_consumed",
+                "The pending login has already been reserved or consumed.",
+                RetryPolicy::Never,
+                LocalAction::DiscardPendingLogin,
+                policy.operation,
+            ));
+        }
+
+        let send = self.transport.send(request, self.deadline);
+        tokio::pin!(send);
+        let outcome = if let Some(cancellation) = options.cancellation() {
+            tokio::select! {
+                biased;
+                response = &mut send => response,
+                () = cancellation.cancelled() => Err(TransportFailure::new(
+                    TransportFailureKind::Cancelled,
+                    true,
+                )),
+            }
+        } else {
+            send.await
+        };
+        let response = match outcome {
+            Ok(response) => {
+                if let Some(guard) = one_use_guard {
+                    guard.consume();
+                }
+                response
+            }
+            Err(failure) => {
+                if let Some(guard) = one_use_guard {
+                    if failure.dispatched {
+                        guard.consume();
+                    } else {
+                        guard.release();
+                    }
+                }
+                return Err(transport_error(
+                    failure,
+                    policy.operation,
+                    policy.sensitive,
+                    policy.action,
+                ));
+            }
+        };
+        parse_response(
+            &response,
+            policy.operation,
+            policy.expected_status,
+            policy.sensitive,
+            policy.action,
+        )
     }
 
     fn validate_credentials(
@@ -814,25 +1208,24 @@ impl Client {
         operation: &'static str,
         action: LocalAction,
     ) -> Result<CredentialPair, Error> {
+        let now = self.clock.now_unix_seconds();
         if wire.project_id != self.project_id
             || wire.application_id != self.application_id
             || wire.user_id.is_empty()
             || wire.user_id.len() > 96
+            || wire.session_id.is_empty()
             || wire.session_id.len() > 64
             || wire.refresh_generation <= 0
-            || wire.access_token.is_empty()
-            || wire.access_token.len() > 16_384
-            || wire.refresh_token.is_empty()
-            || wire.refresh_token.len() > 256
+            || !valid_bearer_token(&wire.access_token, 16_384)
+            || !valid_opaque_token(&wire.refresh_token, 256)
             || wire.token_type != "Bearer"
             || !(1..=3600).contains(&wire.expires_in)
             || wire.projection_revision <= 0
             || wire.projection_revision != wire.projection.projection_revision
             || wire.user_id != wire.projection.user_id
             || !valid_projection(&wire.projection)
-            || parse_time(&wire.session_expires_at, operation).map_or(true, |expiry| {
-                expiry < self.clock.now_unix_seconds().saturating_sub(60)
-            })
+            || parse_time(&wire.session_expires_at, operation)
+                .map_or(true, |expiry| i128::from(expiry) < i128::from(now) - 60)
         {
             return Err(indeterminate_response(
                 operation,
@@ -841,7 +1234,15 @@ impl Client {
                 200,
             ));
         }
-        Ok(CredentialPair::from_wire(wire))
+        let access_expires_at = now.checked_add(wire.expires_in).ok_or_else(|| {
+            indeterminate_response(operation, "invalid_response_after_dispatch", action, 200)
+        })?;
+        Ok(CredentialPair::from_wire(
+            wire,
+            self.origin.clone(),
+            self.base.path().to_owned(),
+            access_expires_at,
+        ))
     }
 
     fn check_pair_context(
@@ -849,7 +1250,9 @@ impl Client {
         pair: &CredentialPair,
         operation: &'static str,
     ) -> Result<(), Error> {
-        if pair.project_id() != self.project_id
+        if pair.runtime_origin() != self.origin
+            || pair.runtime_base_path() != self.base.path()
+            || pair.project_id() != self.project_id
             || pair.application_id() != self.application_id
             || pair.refresh_generation() <= 0
         {
@@ -860,6 +1263,12 @@ impl Client {
 }
 
 fn validate_base_url(value: &str, allow_loopback: bool) -> Result<Url, Error> {
+    if has_ambiguous_url_path(value) {
+        return Err(configuration(
+            "invalid_runtime_url",
+            "The Runtime URL is invalid.",
+        ));
+    }
     let mut url = Url::parse(value)
         .map_err(|_| configuration("invalid_runtime_url", "The Runtime URL is invalid."))?;
     if url.username() != ""
@@ -873,7 +1282,7 @@ fn validate_base_url(value: &str, allow_loopback: bool) -> Result<Url, Error> {
             "The Runtime URL is invalid.",
         ));
     }
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    let loopback = url.host_str().is_some_and(is_loopback_host);
     if url.scheme() != "https" && !(allow_loopback && loopback && url.scheme() == "http") {
         return Err(configuration(
             "insecure_runtime_url",
@@ -885,6 +1294,30 @@ fn validate_base_url(value: &str, allow_loopback: bool) -> Result<Url, Error> {
         url.set_path(&path);
     }
     Ok(url)
+}
+
+fn has_ambiguous_url_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if value.contains('\\')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains("%25")
+    {
+        return true;
+    }
+    let Some((_, authority_and_path)) = value.split_once("://") else {
+        return true;
+    };
+    let Some(path_start) = authority_and_path.find('/') else {
+        return false;
+    };
+    let path = &authority_and_path[path_start..];
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    let path = path.split_once('#').map_or(path, |(path, _)| path);
+    path.split('/').any(|segment| {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        decoded == "." || decoded == ".."
+    })
 }
 
 fn validate_identifier(value: &str, maximum: usize, field: &str) -> Result<(), Error> {
@@ -903,21 +1336,60 @@ fn validate_identifier(value: &str, maximum: usize, field: &str) -> Result<(), E
 }
 
 fn validate_redirect(value: &str) -> Result<(), Error> {
-    if value.len() > 2048 {
-        return Err(configuration(
-            "invalid_redirect_uri",
-            "The redirect URI is invalid.",
-        ));
+    let invalid = || configuration("invalid_redirect_uri", "The redirect URI is invalid.");
+    let lower = value.to_ascii_lowercase();
+    if !(8..=2048).contains(&value.len())
+        || value.contains('\\')
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+    {
+        return Err(invalid());
     }
-    let url = Url::parse(value)
-        .map_err(|_| configuration("invalid_redirect_uri", "The redirect URI is invalid."))?;
-    if url.fragment().is_some() || url.username() != "" || url.password().is_some() {
-        return Err(configuration(
-            "invalid_redirect_uri",
-            "The redirect URI is invalid.",
-        ));
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if url.as_str() != value
+        || url.fragment().is_some()
+        || url.username() != ""
+        || url.password().is_some()
+        || url.host_str().is_some_and(|host| host.contains('*'))
+        || url
+            .query_pairs()
+            .any(|(name, _)| matches!(name.as_ref(), "handoff" | "error" | "state"))
+    {
+        return Err(invalid());
+    }
+    let admitted = match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => url.host_str().is_some_and(is_loopback_host),
+        scheme => {
+            scheme.contains('.')
+                && url.host_str().is_none()
+                && !matches!(
+                    scheme,
+                    "about"
+                        | "blob"
+                        | "data"
+                        | "file"
+                        | "ftp"
+                        | "javascript"
+                        | "mailto"
+                        | "vbscript"
+                        | "ws"
+                        | "wss"
+                )
+        }
+    };
+    if !admitted {
+        return Err(invalid());
     }
     Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn encode_path(value: &str) -> String {
@@ -939,6 +1411,23 @@ fn valid_ed25519_key(value: &str) -> bool {
         .is_ok_and(|bytes| bytes.len() == 32 && URL_SAFE_NO_PAD.encode(bytes) == value)
 }
 
+fn valid_bearer_token(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        })
+}
+
+fn valid_opaque_token(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+}
+
 fn valid_projection(value: &crate::UserProjection) -> bool {
     !value.user_id.is_empty()
         && value.user_id.len() <= 96
@@ -948,11 +1437,11 @@ fn valid_projection(value: &crate::UserProjection) -> bool {
         && value
             .display_name
             .as_ref()
-            .is_none_or(|name| name.len() <= 128)
+            .is_none_or(|name| name.chars().count() <= 128)
         && value
             .picture_url
             .as_ref()
-            .is_none_or(|url| url.len() <= 2048)
+            .is_none_or(|url| url.chars().count() <= 2048)
         && value.locale.as_ref().is_none_or(|locale| {
             (2..=35).contains(&locale.len())
                 && !locale.starts_with('-')
@@ -963,7 +1452,7 @@ fn valid_projection(value: &crate::UserProjection) -> bool {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
         && value.verified_email.as_ref().is_none_or(|email| {
-            (3..=320).contains(&email.len()) && !email.chars().any(char::is_control)
+            (3..=320).contains(&email.chars().count()) && !email.chars().any(char::is_control)
         })
         && value.status == "active"
         && parse_time(&value.created_at, "projection").is_ok()
@@ -999,7 +1488,7 @@ fn transport_error(
         ),
         TransportFailureKind::ResponseTooLarge => (
             ErrorCategory::Protocol,
-            "response_too_large",
+            "invalid_response",
             "Runtime returned an invalid or incompatible response.",
         ),
         TransportFailureKind::Transport => (
@@ -1012,8 +1501,16 @@ fn transport_error(
         category,
         code,
         message,
-        RetryPolicy::ApplicationDecision,
-        action,
+        if failure.kind == TransportFailureKind::ResponseTooLarge {
+            RetryPolicy::Never
+        } else {
+            RetryPolicy::ApplicationDecision
+        },
+        if failure.dispatched {
+            action
+        } else {
+            LocalAction::None
+        },
         operation,
     )
 }
@@ -1076,12 +1573,13 @@ fn parse_response<T: DeserializeOwned>(
             response.status,
         ));
     }
-    let content_type = response
+    let content_types: Vec<&str> = response
         .headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.split(';').next().unwrap_or_default().trim());
-    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.split(';').next().unwrap_or_default().trim())
+        .collect();
+    if content_types.len() != 1 || !content_types[0].eq_ignore_ascii_case("application/json") {
         return Err(invalid_response(
             operation,
             "invalid_content_type",
@@ -1101,10 +1599,10 @@ fn parse_response<T: DeserializeOwned>(
             )
         });
     }
-    if (200..300).contains(&response.status) {
+    if !allowed_error_statuses(operation).contains(&response.status) {
         return Err(invalid_response(
             operation,
-            "unexpected_success_status",
+            "unexpected_status",
             sensitive,
             action,
             response.status,
@@ -1128,7 +1626,11 @@ fn parse_runtime_error<T>(
             response.status,
         )
     })?;
-    if wire.message.is_empty() || wire.message.len() > 256 {
+    if wire.message.is_empty()
+        || wire.message.chars().count() > 256
+        || wire.request_id.is_empty()
+        || wire.request_id.chars().count() > 128
+    {
         return Err(invalid_response(
             operation,
             "invalid_error_response",
@@ -1137,20 +1639,31 @@ fn parse_runtime_error<T>(
             response.status,
         ));
     }
-    let request_id = wire.request_id.filter(|value| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
-            })
-    });
+    let retry_after_seconds = if response.status == 429 {
+        if wire.code != "rate_limited" {
+            return Err(invalid_response(
+                operation,
+                "invalid_rate_limit_response",
+                sensitive,
+                action,
+                response.status,
+            ));
+        }
+        Some(retry_after_seconds(response).ok_or_else(|| {
+            invalid_response(
+                operation,
+                "invalid_rate_limit_response",
+                sensitive,
+                action,
+                response.status,
+            )
+        })?)
+    } else {
+        None
+    };
+    let request_id = sanitize_request_id(Some(wire.request_id));
     let code = wire.code;
-    if code.is_empty()
-        || code.len() > 64
-        || !code
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
+    if !valid_runtime_error_code(&code) {
         return Err(invalid_response(
             operation,
             "invalid_error_response",
@@ -1169,31 +1682,7 @@ fn parse_runtime_error<T>(
     }
     let (category, retry, local_action) =
         runtime_error_semantics(response.status, &code, operation, action);
-    let known = matches!(
-        code.as_str(),
-        "not_found"
-            | "invalid_request"
-            | "invalid_state"
-            | "authority_unavailable"
-            | "unauthorized"
-            | "origin_not_allowed"
-            | "invalid_preflight"
-            | "forbidden_hosted_request"
-            | "invalid_cookie"
-            | "rate_limited"
-    );
-    if !known {
-        return Err(Error::new(
-            ErrorCategory::Protocol,
-            code,
-            "Runtime returned an unrecognized error.",
-            RetryPolicy::Never,
-            local_action,
-            operation,
-        )
-        .with_runtime(response.status, request_id));
-    }
-    Err(Error::new(
+    let mut error = Error::new(
         category,
         code,
         "Runtime rejected the Project Auth operation.",
@@ -1201,7 +1690,59 @@ fn parse_runtime_error<T>(
         local_action,
         operation,
     )
-    .with_runtime(response.status, request_id))
+    .with_runtime(response.status, request_id);
+    if let Some(seconds) = retry_after_seconds {
+        error = error.with_retry_after(seconds);
+    }
+    Err(error)
+}
+
+fn sanitize_request_id(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+    })
+}
+
+fn valid_runtime_error_code(code: &str) -> bool {
+    let mut bytes = code.bytes();
+    code.len() <= 64
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn allowed_error_statuses(operation: &str) -> &'static [u16] {
+    match operation {
+        "get_public_application_config" | "start_login" => &[400, 404, 429, 503],
+        "get_project_jwks" => &[404, 429, 503],
+        "exchange_handoff" | "refresh_session" => &[400, 409, 429, 503],
+        "get_current_user" | "logout_application_session" | "prepare_browser_logout" => {
+            &[401, 429, 503]
+        }
+        _ => &[],
+    }
+}
+
+fn retry_after_seconds(response: &HttpResponse) -> Option<u64> {
+    let values: Vec<&str> = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    if values.len() != 1
+        || values[0].is_empty()
+        || !values[0].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    values[0]
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= 86_400)
 }
 
 fn runtime_error_semantics(

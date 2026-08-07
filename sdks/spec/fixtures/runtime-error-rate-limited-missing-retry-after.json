@@ -5,8 +5,7 @@
     "kind": "http",
     "status": 429,
     "headers": {
-      "content-type": "application/json",
-      "retry-after": "007"
+      "content-type": "application/json"
     },
     "body": {
       "encoding": "json",

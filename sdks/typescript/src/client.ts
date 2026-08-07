@@ -3,14 +3,16 @@ import {
   AccessToken,
   type BrowserLogoutPreparation,
   CredentialPair,
+  type CredentialPairRecord,
   createCredentialPair,
   createPendingLogin,
+  createPkceVerifier,
   createValidatedCallback,
   type CurrentUser,
   type LoginStartResult,
   type OperationOptions,
   PendingLogin,
-  PkceVerifier,
+  type PendingLoginRecord,
   type ProjectJwks,
   type PublicApplicationConfiguration,
   type PublicJwk,
@@ -58,6 +60,7 @@ interface RequestPolicy {
   readonly sensitive: boolean;
   readonly action: CallerAction;
   readonly success: readonly number[];
+  readonly errors: readonly number[];
 }
 
 interface RuntimeProblem {
@@ -74,8 +77,27 @@ function boundedString(value: unknown, maximum: number, allowEmpty = false): val
   return typeof value === "string" && value.length <= maximum && (allowEmpty || value.length > 0);
 }
 
+function validBearerToken(value: unknown): value is string {
+  return boundedString(value, 16_384) && /^[A-Za-z0-9\-._~+/=]+$/u.test(value);
+}
+
+function validOpaqueToken(value: unknown): value is string {
+  return boundedString(value, 256) && /^[A-Za-z0-9\-._~]+$/u.test(value);
+}
+
 function positiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function exactFields(value: Record<string, unknown>, fields: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === fields.length && fields.every((field) => Object.hasOwn(value, field));
+}
+
+function validRetryAfter(value: string | null): number | null {
+  if (value === null || !/^[0-9]{1,6}$/u.test(value)) return null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds <= 86_400 ? seconds : null;
 }
 
 function validDate(value: unknown): value is string {
@@ -115,9 +137,53 @@ function loopback(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
 
+function validRedirectScheme(url: URL): boolean {
+  if (url.protocol === "https:") return true;
+  if (url.protocol === "http:") return loopback(url.hostname);
+  const scheme = url.protocol.slice(0, -1);
+  return (
+    scheme.includes(".") &&
+    url.hostname === "" &&
+    ![
+      "about",
+      "blob",
+      "data",
+      "file",
+      "ftp",
+      "http",
+      "https",
+      "javascript",
+      "mailto",
+      "vbscript",
+      "ws",
+      "wss",
+    ].includes(scheme)
+  );
+}
+
+function hasAmbiguousUrlPath(value: string): boolean {
+  const lower = value.toLowerCase();
+  if (value.includes("\\") || lower.includes("%2f") || lower.includes("%5c") || lower.includes("%25")) {
+    return true;
+  }
+  const authorityStart = value.indexOf("://");
+  if (authorityStart < 0) return true;
+  const pathStart = value.indexOf("/", authorityStart + 3);
+  const rawPath = pathStart < 0 ? "" : value.slice(pathStart).split(/[?#]/u, 1)[0];
+  try {
+    return rawPath.split("/").some((segment) => {
+      const decoded = decodeURIComponent(segment).toLowerCase();
+      return decoded === "." || decoded === "..";
+    });
+  } catch {
+    return true;
+  }
+}
+
 function parseBaseUrl(value: string, allowInsecureLoopback: boolean): URL {
   let url: URL;
   try {
+    if (hasAmbiguousUrlPath(value)) throw new Error("ambiguous Runtime path");
     url = new URL(value);
   } catch {
     throw configurationError("invalid_base_url", "Runtime base URL must be absolute.");
@@ -150,9 +216,11 @@ function parseProblem(value: unknown): RuntimeProblem | null {
   if (!isObject(value)) return null;
   const fields = Object.keys(value);
   if (
+    fields.length !== 3 ||
     !fields.every((field) => ["code", "message", "request_id"].includes(field)) ||
     !Object.hasOwn(value, "code") ||
     !Object.hasOwn(value, "message") ||
+    !Object.hasOwn(value, "request_id") ||
     !boundedString(value["code"], 64) ||
     !/^[a-z][a-z0-9_]*$/u.test(value["code"]) ||
     !boundedString(value["message"], 256)
@@ -160,9 +228,8 @@ function parseProblem(value: unknown): RuntimeProblem | null {
     return null;
   }
   const requestId = value["request_id"];
-  if (requestId !== undefined && typeof requestId !== "string") return null;
+  if (!boundedString(requestId, 128)) return null;
   const allowedRequestId =
-    typeof requestId === "string" &&
     boundedString(requestId, 128) &&
     /^[A-Za-z0-9._:-]+$/u.test(requestId)
       ? requestId
@@ -178,6 +245,7 @@ function mapRuntimeError(
   problem: RuntimeProblem,
   status: number,
   policy: RequestPolicy,
+  retryAfterSeconds?: number,
 ): OwlAuthError {
   if (status === 429 && problem.code === "rate_limited") {
     const handoff = policy.operation === "exchange_handoff";
@@ -194,6 +262,7 @@ function mapRuntimeError(
       retry: handoff ? "never" : callerDecision ? "application_decision" : "safe_after_delay",
       action: handoff ? "discard_pending" : "none",
       ...(problem.requestId === undefined ? {} : { requestId: problem.requestId }),
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
       status,
     });
   }
@@ -318,6 +387,56 @@ function parseProjection(value: unknown): UserProjection {
   };
 }
 
+function parseProjectionRecord(value: unknown): UserProjection {
+  if (!isObject(value)) throw new Error("invalid_projection");
+  const fields = [
+    "userId",
+    "userRevision",
+    "projectionSchema",
+    "projectionRevision",
+    "displayName",
+    "pictureUrl",
+    "locale",
+    "verifiedEmail",
+    "status",
+    "createdAt",
+    "updatedAt",
+  ] as const;
+  const displayName = value["displayName"];
+  const pictureUrl = value["pictureUrl"];
+  const locale = value["locale"];
+  const verifiedEmail = value["verifiedEmail"];
+  if (
+    !exactFields(value, fields) ||
+    !boundedString(value["userId"], 96) ||
+    !positiveInteger(value["userRevision"]) ||
+    value["projectionSchema"] !== "owlauth.user.v1" ||
+    !positiveInteger(value["projectionRevision"]) ||
+    !(displayName === null || boundedString(displayName, 128)) ||
+    !(pictureUrl === null || boundedString(pictureUrl, 2_048)) ||
+    !validProjectionLocale(locale) ||
+    !validProjectionEmail(verifiedEmail) ||
+    value["status"] !== "active" ||
+    !validDate(value["createdAt"]) ||
+    !validDate(value["updatedAt"])
+  ) {
+    throw new Error("invalid_projection");
+  }
+  return {
+    userId: value["userId"],
+    userRevision: value["userRevision"],
+    projectionSchema: value["projectionSchema"],
+    projectionRevision: value["projectionRevision"],
+    displayName,
+    pictureUrl,
+    locale,
+    verifiedEmail,
+    status: "active",
+    createdAt: value["createdAt"],
+    updatedAt: value["updatedAt"],
+  };
+}
+
 /** Stateless, Project/Application-bound OwlAuth Runtime protocol client. */
 export class Client {
   readonly baseUrl: string;
@@ -356,6 +475,124 @@ export class Client {
     this.#timeoutMs = timeout;
   }
 
+  /** Restores an explicitly exported pending-login record into this exact Client context. */
+  restorePendingLogin(record: unknown): PendingLogin {
+    const fields = [
+      "schemaVersion",
+      "runtimeOrigin",
+      "runtimeBasePath",
+      "projectId",
+      "applicationId",
+      "redirectUri",
+      "state",
+      "createdAt",
+      "expiresAt",
+      "verifier",
+    ] as const;
+    if (
+      !isObject(record) ||
+      !exactFields(record, fields) ||
+      record["schemaVersion"] !== 1 ||
+      record["runtimeOrigin"] !== this.#base.origin ||
+      record["runtimeBasePath"] !== this.#base.pathname ||
+      record["projectId"] !== this.projectId ||
+      record["applicationId"] !== this.applicationId ||
+      !boundedString(record["redirectUri"], MAX_REDIRECT_LENGTH) ||
+      !boundedString(record["state"], MAX_STATE_LENGTH) ||
+      !TOKEN_PATTERN.test(record["state"]) ||
+      typeof record["createdAt"] !== "number" ||
+      !Number.isSafeInteger(record["createdAt"]) ||
+      typeof record["expiresAt"] !== "number" ||
+      !Number.isSafeInteger(record["expiresAt"]) ||
+      record["expiresAt"] < record["createdAt"] - 60_000 ||
+      record["expiresAt"] > record["createdAt"] + 660_000 ||
+      this.#now() > record["expiresAt"] + 60_000 ||
+      !boundedString(record["verifier"], 128) ||
+      !/^[A-Za-z0-9_-]{43,128}$/u.test(record["verifier"])
+    ) {
+      throw configurationError("invalid_pending_record", "The pending-login record is invalid or belongs to another client.");
+    }
+    const redirect = this.#redirect(record["redirectUri"]);
+    return createPendingLogin({
+      runtimeOrigin: this.#base.origin,
+      runtimeBasePath: this.#base.pathname,
+      projectId: this.projectId,
+      applicationId: this.applicationId,
+      redirectUri: redirect.href,
+      state: record["state"],
+      createdAt: record["createdAt"],
+      expiresAt: record["expiresAt"],
+      verifier: createPkceVerifier(record["verifier"]),
+    });
+  }
+
+  /** Restores an explicitly exported credential pair into this exact Client context. */
+  restoreCredentialPair(record: unknown): CredentialPair {
+    const fields = [
+      "schemaVersion",
+      "runtimeOrigin",
+      "runtimeBasePath",
+      "projectId",
+      "applicationId",
+      "userId",
+      "sessionId",
+      "refreshGeneration",
+      "accessToken",
+      "refreshToken",
+      "tokenType",
+      "expiresIn",
+      "projection",
+      "projectionRevision",
+      "sessionExpiresAt",
+    ] as const;
+    if (
+      !isObject(record) ||
+      !exactFields(record, fields) ||
+      record["schemaVersion"] !== 1 ||
+      record["runtimeOrigin"] !== this.#base.origin ||
+      record["runtimeBasePath"] !== this.#base.pathname ||
+      record["projectId"] !== this.projectId ||
+      record["applicationId"] !== this.applicationId ||
+      !boundedString(record["userId"], 96) ||
+      !boundedString(record["sessionId"], 64) ||
+      !positiveInteger(record["refreshGeneration"]) ||
+      !validBearerToken(record["accessToken"]) ||
+      !validOpaqueToken(record["refreshToken"]) ||
+      record["tokenType"] !== "Bearer" ||
+      !positiveInteger(record["expiresIn"]) ||
+      record["expiresIn"] > 3_600 ||
+      !positiveInteger(record["projectionRevision"]) ||
+      !validDate(record["sessionExpiresAt"]) ||
+      Date.parse(record["sessionExpiresAt"]) < this.#now() - 60_000
+    ) {
+      throw configurationError("invalid_credential_record", "The credential record is invalid or belongs to another client.");
+    }
+    let projection: UserProjection;
+    try {
+      projection = parseProjectionRecord(record["projection"]);
+    } catch {
+      throw configurationError("invalid_credential_record", "The credential record is invalid or belongs to another client.");
+    }
+    if (projection.userId !== record["userId"] || projection.projectionRevision !== record["projectionRevision"]) {
+      throw configurationError("invalid_credential_record", "The credential record is invalid or belongs to another client.");
+    }
+    return createCredentialPair({
+      runtimeOrigin: this.#base.origin,
+      runtimeBasePath: this.#base.pathname,
+      projectId: this.projectId,
+      applicationId: this.applicationId,
+      userId: record["userId"],
+      sessionId: record["sessionId"],
+      refreshGeneration: record["refreshGeneration"],
+      accessToken: record["accessToken"],
+      refreshToken: record["refreshToken"],
+      expiresIn: record["expiresIn"],
+      projection,
+      projectionRevision: record["projectionRevision"],
+      sessionExpiresAt: record["sessionExpiresAt"],
+    });
+  }
+
   async getPublicConfiguration(options: OperationOptions = {}): Promise<PublicApplicationConfiguration> {
     const path = `v1/projects/${encodeURIComponent(this.projectId)}/auth/config`;
     const url = this.#url(path);
@@ -366,6 +603,7 @@ export class Client {
       sensitive: false,
       action: "none",
       success: [200],
+      errors: [400, 404, 429, 503],
     });
     if (!isObject(value)) throw this.#protocol("invalid_response", "get_public_application_config");
     const providers = value["providers"];
@@ -395,7 +633,8 @@ export class Client {
         !boundedString(provider["key"], 64) ||
         providerKeys.has(provider["key"]) ||
         !boundedString(provider["display_name"], 128) ||
-        !["oidc", "google", "github"].includes(String(provider["kind"]))
+        typeof provider["kind"] !== "string" ||
+        !["oidc", "google", "github"].includes(provider["kind"])
       ) {
         throw this.#protocol("invalid_response", "get_public_application_config");
       }
@@ -431,6 +670,7 @@ export class Client {
         sensitive: false,
         action: "none",
         success: [200],
+        errors: [404, 429, 503],
       },
     );
     if (!isObject(value) || !positiveInteger(value["revision"]) || !positiveInteger(value["signing_epoch"])) {
@@ -469,7 +709,7 @@ export class Client {
     if (input.presentationHint !== undefined && !boundedString(input.presentationHint, MAX_HINT_LENGTH)) {
       throw configurationError("invalid_presentation_hint", "Presentation hint is invalid.");
     }
-    const verifier = new PkceVerifier(this.#random(32));
+    const verifier = createPkceVerifier(this.#random(32));
     const challenge = base64Url(
       new Uint8Array(await this.#crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier.expose()))),
     );
@@ -489,7 +729,14 @@ export class Client {
         }),
       },
       input,
-      { operation: "start_login", category: "Login", sensitive: false, action: "discard_pending", success: [201] },
+      {
+        operation: "start_login",
+        category: "Login",
+        sensitive: false,
+        action: "discard_pending",
+        success: [201],
+        errors: [400, 404, 429, 503],
+      },
     );
     if (!isObject(value) || !boundedString(value["hosted_url"], 512) || !validDate(value["expires_at"])) {
       throw this.#protocol("invalid_response", "start_login");
@@ -559,22 +806,33 @@ export class Client {
     callback: ValidatedCallback,
     options: OperationOptions = {},
   ): Promise<CredentialPair> {
-    const material = callback.consume();
+    this.#validateOperationOptions(options, "exchange_handoff");
+    const material = callback.reserve();
     if (material === null) throw this.#handoff("handoff_already_attempted");
+    const url = this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/handoff/exchange`);
+    const init: RequestInit = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        application_id: this.applicationId,
+        publishable_key: this.publishableKey,
+        handoff: material.handoff,
+        pkce_verifier: material.verifier.expose(),
+      }),
+    };
+    callback.commit();
     const value = await this.#request(
-      this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/handoff/exchange`),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          application_id: this.applicationId,
-          publishable_key: this.publishableKey,
-          handoff: material.handoff,
-          pkce_verifier: material.verifier.expose(),
-        }),
-      },
+      url,
+      init,
       options,
-      { operation: "exchange_handoff", category: "Handoff", sensitive: true, action: "quarantine_pending", success: [200] },
+      {
+        operation: "exchange_handoff",
+        category: "Handoff",
+        sensitive: true,
+        action: "quarantine_pending",
+        success: [200],
+        errors: [400, 409, 429, 503],
+      },
     );
     return this.#credentials(value, "exchange_handoff", "quarantine_pending");
   }
@@ -601,7 +859,14 @@ export class Client {
         }),
       },
       options,
-      { operation: "refresh_session", category: "Refresh", sensitive: true, action: "quarantine_credentials", success: [200] },
+      {
+        operation: "refresh_session",
+        category: "Refresh",
+        sensitive: true,
+        action: "quarantine_credentials",
+        success: [200],
+        errors: [400, 409, 429, 503],
+      },
     );
     const successor = this.#credentials(value, "refresh_session", "quarantine_credentials");
     if (
@@ -615,13 +880,32 @@ export class Client {
   }
 
   async currentUser(accessToken: AccessToken, options: OperationOptions = {}): Promise<CurrentUser> {
+    this.#accessTokenContext(accessToken, "get_current_user");
     const value = await this.#request(
       this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/users/me`),
       { method: "GET", headers: { authorization: `Bearer ${accessToken.expose()}` } },
       options,
-      { operation: "get_current_user", category: "Authentication", sensitive: false, action: "reauthenticate", success: [200] },
+      {
+        operation: "get_current_user",
+        category: "Authentication",
+        sensitive: false,
+        action: "reauthenticate",
+        success: [200],
+        errors: [401, 429, 503],
+      },
     );
-    if (!isObject(value)) throw this.#protocol("invalid_response", "get_current_user");
+    const fields = [
+      "project_id",
+      "application_id",
+      "user_id",
+      "projection",
+      "projection_revision",
+      "authenticated_at",
+      "session_expires_at",
+    ] as const;
+    if (!isObject(value) || !exactFields(value, fields)) {
+      throw this.#protocol("invalid_response", "get_current_user");
+    }
     if (
       value["project_id"] !== this.projectId ||
       value["application_id"] !== this.applicationId ||
@@ -654,11 +938,19 @@ export class Client {
   }
 
   async logoutApplication(accessToken: AccessToken, options: OperationOptions = {}): Promise<void> {
+    this.#accessTokenContext(accessToken, "logout_application_session");
     const value = await this.#request(
       this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/sessions/logout`),
       { method: "POST", headers: { authorization: `Bearer ${accessToken.expose()}` } },
       options,
-      { operation: "logout_application_session", category: "Session", sensitive: true, action: "quarantine_credentials", success: [200] },
+      {
+        operation: "logout_application_session",
+        category: "Session",
+        sensitive: true,
+        action: "quarantine_credentials",
+        success: [200],
+        errors: [401, 429, 503],
+      },
     );
     if (!isObject(value) || value["completed"] !== true) {
       throw this.#indeterminate("invalid_response_after_dispatch", "logout_application_session", "quarantine_credentials", 200);
@@ -669,11 +961,19 @@ export class Client {
     accessToken: AccessToken,
     options: OperationOptions = {},
   ): Promise<BrowserLogoutPreparation> {
+    this.#accessTokenContext(accessToken, "prepare_browser_logout");
     const value = await this.#request(
       this.#url(`v1/projects/${encodeURIComponent(this.projectId)}/auth/browser-logout/prepare`),
       { method: "POST", headers: { authorization: `Bearer ${accessToken.expose()}` } },
       options,
-      { operation: "prepare_browser_logout", category: "Session", sensitive: true, action: "quarantine_credentials", success: [201] },
+      {
+        operation: "prepare_browser_logout",
+        category: "Session",
+        sensitive: true,
+        action: "quarantine_credentials",
+        success: [201],
+        errors: [401, 429, 503],
+      },
     );
     if (!isObject(value) || !boundedString(value["hosted_url"], 512) || !validDate(value["expires_at"])) {
       throw this.#indeterminate("invalid_response_after_dispatch", "prepare_browser_logout", "quarantine_credentials", 201);
@@ -697,6 +997,7 @@ export class Client {
   #serverUrl(value: string, operation: string): URL {
     let url: URL;
     try {
+      if (hasAmbiguousUrlPath(value)) throw new Error("ambiguous Runtime path");
       url = new URL(value);
     } catch {
       throw this.#protocol("invalid_navigation_target", operation);
@@ -723,13 +1024,19 @@ export class Client {
     } catch {
       throw configurationError("invalid_redirect_uri", "redirectUri must be absolute.");
     }
+    const lower = value.toLowerCase();
     if (
-      ["javascript:", "data:", "file:", "blob:"].includes(url.protocol) ||
-      (url.protocol === "http:" && !loopback(url.hostname)) ||
+      url.href !== value ||
+      value.includes("\\") ||
+      /\s/u.test(value) ||
+      lower.includes("%2f") ||
+      lower.includes("%5c") ||
+      !validRedirectScheme(url) ||
       url.username !== "" ||
       url.password !== "" ||
       url.hash !== "" ||
       url.searchParams.has("handoff") ||
+      url.searchParams.has("error") ||
       url.searchParams.has("state")
     ) {
       throw configurationError("invalid_redirect_uri", "redirectUri contains reserved or unsafe components.");
@@ -742,15 +1049,31 @@ export class Client {
   }
 
   #credentials(value: unknown, operation: string, action: CallerAction): CredentialPair {
-    if (!isObject(value)) throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
+    const fields = [
+      "project_id",
+      "application_id",
+      "user_id",
+      "session_id",
+      "refresh_generation",
+      "access_token",
+      "refresh_token",
+      "token_type",
+      "expires_in",
+      "projection",
+      "projection_revision",
+      "session_expires_at",
+    ] as const;
+    if (!isObject(value) || !exactFields(value, fields)) {
+      throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
+    }
     if (
       value["project_id"] !== this.projectId ||
       value["application_id"] !== this.applicationId ||
       !boundedString(value["user_id"], 96) ||
       !boundedString(value["session_id"], 64) ||
       !positiveInteger(value["refresh_generation"]) ||
-      !boundedString(value["access_token"], 16_384) ||
-      !boundedString(value["refresh_token"], 256) ||
+      !validBearerToken(value["access_token"]) ||
+      !validOpaqueToken(value["refresh_token"]) ||
       value["token_type"] !== "Bearer" ||
       !positiveInteger(value["expires_in"]) ||
       value["expires_in"] > 3_600 ||
@@ -773,6 +1096,8 @@ export class Client {
       throw this.#indeterminate("invalid_response_after_dispatch", operation, action, 200);
     }
     return createCredentialPair({
+      runtimeOrigin: this.#base.origin,
+      runtimeBasePath: this.#base.pathname,
       projectId: this.projectId,
       applicationId: this.applicationId,
       userId: value["user_id"],
@@ -788,9 +1113,46 @@ export class Client {
   }
 
   #credentialContext(credentials: CredentialPair, operation: string): void {
-    if (credentials.projectId !== this.projectId || credentials.applicationId !== this.applicationId) {
+    if (
+      credentials.runtimeOrigin !== this.#base.origin ||
+      credentials.runtimeBasePath !== this.#base.pathname ||
+      credentials.projectId !== this.projectId ||
+      credentials.applicationId !== this.applicationId
+    ) {
       throw this.#protocol("credential_context_mismatch", operation);
     }
+  }
+
+  #accessTokenContext(accessToken: AccessToken, operation: string): void {
+    if (
+      accessToken.runtimeOrigin !== this.#base.origin ||
+      accessToken.runtimeBasePath !== this.#base.pathname ||
+      accessToken.projectId !== this.projectId ||
+      accessToken.applicationId !== this.applicationId
+    ) {
+      throw this.#protocol("credential_context_mismatch", operation);
+    }
+  }
+
+  #validateOperationOptions(options: OperationOptions, operation: string): number {
+    const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 120_000) {
+      throw configurationError("invalid_timeout", "timeoutMs must be between 1 and 120000.");
+    }
+    if (options.signal?.aborted === true) {
+      const timedOut = options.signal.reason instanceof DOMException && options.signal.reason.name === "TimeoutError";
+      throw new OwlAuthError({
+        category: timedOut ? "Timeout" : "Cancelled",
+        code: timedOut ? "timeout" : "cancelled_before_dispatch",
+        message: timedOut
+          ? "The operation timed out before dispatch."
+          : "The operation was cancelled before dispatch.",
+        operation,
+        retry: "application_decision",
+        action: "none",
+      });
+    }
+    return timeoutMs;
   }
 
   async #request(
@@ -802,20 +1164,7 @@ export class Client {
     if (url.origin !== this.#base.origin || !url.pathname.startsWith(this.#base.pathname)) {
       throw this.#protocol("url_boundary_violation", policy.operation);
     }
-    if (options.signal?.aborted === true) {
-      throw new OwlAuthError({
-        category: "Cancelled",
-        code: "cancelled_before_dispatch",
-        message: "The operation was cancelled before dispatch.",
-        operation: policy.operation,
-        retry: "never",
-        action: policy.action,
-      });
-    }
-    const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 120_000) {
-      throw configurationError("invalid_timeout", "timeoutMs must be between 1 and 120000.");
-    }
+    const timeoutMs = this.#validateOperationOptions(options, policy.operation);
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = () => controller.abort();
@@ -860,15 +1209,23 @@ export class Client {
         throw this.#invalidResponse(policy, response.status, invalidAction);
       }
       if (!policy.success.includes(response.status)) {
-        if (response.status >= 200 && response.status < 300) {
+        if (!policy.errors.includes(response.status)) {
           throw this.#invalidResponse(policy, response.status, invalidAction);
         }
         const problem = parseProblem(value);
         if (problem === null) throw this.#invalidResponse(policy, response.status, invalidAction);
+        let retryAfterSeconds: number | undefined;
+        if (response.status === 429) {
+          const parsed = validRetryAfter(response.headers.get("retry-after"));
+          if (problem.code !== "rate_limited" || parsed === null) {
+            throw this.#invalidResponse(policy, response.status, invalidAction);
+          }
+          retryAfterSeconds = parsed;
+        }
         if (policy.sensitive && response.status >= 500) {
           throw this.#indeterminate("runtime_5xx_after_dispatch", policy.operation, policy.action, response.status);
         }
-        throw mapRuntimeError(problem, response.status, policy);
+        throw mapRuntimeError(problem, response.status, policy, retryAfterSeconds);
       }
       return value;
     } catch (error) {
@@ -893,7 +1250,7 @@ export class Client {
         message: timedOut ? "The Runtime request timed out." : cancelled ? "The Runtime request was cancelled." : "The Runtime request failed.",
         operation: policy.operation,
         retry: policy.sensitive ? "never" : "application_decision",
-        action: policy.action,
+        action: "none",
         cause: new Error("redacted transport failure"),
       });
     } finally {

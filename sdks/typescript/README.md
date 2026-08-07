@@ -30,20 +30,23 @@ const { hostedUrl, pending } = await owlauth.beginLogin({
   redirectUri: "https://app.example.com/auth/callback",
 });
 
-// The Application owns navigation and custody of `pending`.
+// Explicitly export secret-bearing state into Application-owned protected custody.
+await applicationSession.storePendingLogin(pending.exportRecord());
 window.location.assign(hostedUrl);
 
-// After Runtime returns to the exact registered callback:
-const credentials = await owlauth.completeLogin(window.location.href, pending);
+// After Runtime returns to the exact registered callback, atomically take the record.
+const pendingRecord = await applicationSession.takePendingLogin();
+const restoredPending = owlauth.restorePendingLogin(pendingRecord);
+const credentials = await owlauth.completeLogin(window.location.href, restoredPending);
 ```
 
 `beginLogin` creates PKCE S256 and Application state with Web Crypto. It does not select a provider, navigate, persist state, mutate history, or create a framework session. The Application must remove callback values from browser history before loading third-party resources.
 
-`PendingLogin`, `ValidatedCallback`, `CredentialPair`, and token wrappers redact protocol secrets from `toString()` and JSON output. Raw tokens are available only through the deliberate `expose()` method.
+`PendingLogin`, `ValidatedCallback`, `CredentialPair`, and token wrappers redact protocol secrets from `toString()` and JSON output. `exportRecord()` is a deliberately named secret-bearing boundary for Application-owned protected storage; `restorePendingLogin()` and `restoreCredentialPair()` reject unknown fields, stale values, and another Runtime origin/base path, Project, or Application. Raw tokens are otherwise available only through the deliberate `expose()` method. The example's `applicationSession` is Application code, not SDK storage.
 
 ### Migration notes
 
-`PendingLogin`, `CredentialPair`, and `ValidatedCallback` are Client-produced values and can no longer be constructed by callers. `PkceVerifier` is no longer exported from the package root. Applications should retain the values returned by `beginLogin`, `validateCallback`, `completeLogin`, and `refresh` rather than reconstructing secret-bearing lifecycle state. Malformed callback inspection preserves pending state, while exchange consumes it atomically. A malformed or context-invalid success response received after a sensitive operation was dispatched is now reported as `Indeterminate` with code `invalid_response_after_dispatch`, because the remote commit cannot be disproved.
+`AccessToken`, `PendingLogin`, `CredentialPair`, and `ValidatedCallback` are Client-produced or Client-restored values and cannot be constructed as unbound transport credentials. `PkceVerifier` is not exported from the package root. Applications retain opaque values in memory or use the explicit versioned record boundary rather than reconstructing lifecycle state. Malformed callback inspection and a positively prevented dispatch preserve pending state, while exchange consumes it immediately before dispatch. A malformed, uncontracted-status, or context-invalid response received after a sensitive operation was dispatched is `Indeterminate` with code `invalid_response_after_dispatch`, because the remote commit cannot be disproved.
 
 ## Credential lifecycle
 
@@ -83,7 +86,8 @@ Every network method accepts `{ signal, timeoutMs }`. Client construction also a
 - `operation`;
 - `retry`: `never`, `safe_after_delay`, or `application_decision`;
 - caller `action`, such as `discard_pending` or `quarantine_credentials`;
-- an allowlisted request ID and HTTP status when available.
+- an allowlisted request ID and HTTP status when available;
+- bounded `retryAfterSeconds` for a contract-valid `429 rate_limited` response.
 
 Unknown Runtime codes remain conservative and non-retryable. Raw response bodies, callback URLs, tokens, handoff tickets, and PKCE verifiers are never copied into public errors.
 
@@ -97,7 +101,7 @@ From a clean repository root, run:
 make web-e2e
 ```
 
-The repository gate generates current Runtime contract provenance, builds one npm tarball and canonical candidate descriptor, verifies both digests, installs the tarball in an external consumer, and runs that exact package against one real OwlAuth topology in Chromium and Firefox. It provisions a distinct Project/Application for TypeScript, checks wrong-context rejection, and covers all eight claimed operations, one-use replay/concurrent-refresh behavior, Application and browser logout, and dropped committed responses for handoff, refresh, and logout.
+The repository gate generates current Runtime contract provenance, builds one npm tarball and canonical candidate descriptor, verifies both digests, installs the tarball in an external consumer, serves that candidate's `dist` modules from the controlled Application origin, and executes the public SDK API in Chromium and Firefox page realms against one real OwlAuth topology. It provisions a distinct Project/Application for TypeScript, validates browser Fetch/CORS/Web Crypto/callback behavior, checks wrong-context rejection, and covers all eight claimed operations, one-use replay/concurrent-refresh behavior, Application and browser logout, and dropped committed responses for handoff, refresh, and logout.
 
 The internal `test/e2e-real-server.mjs` runner intentionally rejects a package resolved inside the repository. It is copied into the clean consumer by the product harness and receives bounded isolation, browser-driver, evidence-run, expected-version, and loopback fault-proxy values from that harness. The browser driver accepts `{ hostedUrl, redirectUri, providerKey, browserName, evidenceRunId }`, performs a real top-level journey without intercepting Runtime, and returns bounded `{ callbackUrl }` data. Do not invoke the workspace runner or a manually installed package as exact-artifact evidence.
 

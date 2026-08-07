@@ -31,6 +31,7 @@ export interface ClientErrorOptions {
   readonly action: CallerAction;
   readonly requestId?: string;
   readonly status?: number;
+  readonly retryAfterSeconds?: number;
   readonly cause?: Error;
 }
 
@@ -43,6 +44,7 @@ export class OwlAuthError extends Error {
   readonly action: CallerAction;
   readonly requestId: string | undefined;
   readonly status: number | undefined;
+  readonly retryAfterSeconds: number | undefined;
 
   constructor(options: ClientErrorOptions) {
     super(options.message, options.cause === undefined ? undefined : { cause: options.cause });
@@ -54,6 +56,7 @@ export class OwlAuthError extends Error {
     this.action = options.action;
     this.requestId = options.requestId;
     this.status = options.status;
+    this.retryAfterSeconds = options.retryAfterSeconds;
   }
 
   override toString(): string {

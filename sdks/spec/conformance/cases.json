@@ -14,7 +14,9 @@
     "malformed success JSON is rejected",
     "empty success body is rejected",
     "oversized success body is rejected",
-    "unknown runtime code without request id is conservative",
+    "runtime error without required request id is invalid",
+    "unknown Runtime code on read maps conservatively",
+    "unknown Runtime code on refresh invalidates credentials",
     "public configuration rate limit is safely retryable",
     "handoff rejection discards pending state",
     "handoff rate limit does not permit replay",
@@ -39,7 +41,15 @@
     "handoff invalid UTF-8 success is indeterminate",
     "refresh unexpected success status is indeterminate",
     "refresh malformed rate limit is indeterminate",
-    "current user rejects expired session metadata"
+    "current user rejects expired session metadata",
+    "open login response ignores bounded additive field",
+    "closed credential response rejects additive field",
+    "closed current user response rejects additive field",
+    "uncontracted read error status is protocol failure",
+    "uncontracted refresh error status is indeterminate",
+    "handoff timeout before dispatch preserves pending",
+    "missing rate limit guidance is protocol failure",
+    "missing refresh rate limit guidance is indeterminate"
   ],
   "cases": [
     {
@@ -374,11 +384,36 @@
       }
     },
     {
-      "name": "unknown runtime code without request id is conservative",
+      "name": "runtime error without required request id is invalid",
       "required": true,
       "capability": "errors",
       "operationId": "get_public_application_config",
       "fixture": "../fixtures/runtime-error-unknown.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "unknown Runtime code on read maps conservatively",
+      "required": true,
+      "capability": "errors",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/runtime-error-future-code.json",
       "precondition": "none",
       "requestPhase": "response_received",
       "responseReceived": true,
@@ -396,6 +431,31 @@
         "action": "none",
         "pendingDisposition": "not_applicable",
         "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "unknown Runtime code on refresh invalidates credentials",
+      "required": true,
+      "capability": "errors",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/runtime-error-future-code.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "refresh",
+        "code": "future_runtime_code",
+        "retry": "never",
+        "action": "invalidate_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "invalidated"
       }
     },
     {
@@ -420,7 +480,8 @@
         "retry": "safe_after_delay",
         "action": "none",
         "pendingDisposition": "not_applicable",
-        "credentialDisposition": "not_applicable"
+        "credentialDisposition": "not_applicable",
+        "retryAfterSeconds": 7
       }
     },
     {
@@ -470,7 +531,8 @@
         "retry": "never",
         "action": "discard_pending",
         "pendingDisposition": "discard_required",
-        "credentialDisposition": "not_applicable"
+        "credentialDisposition": "not_applicable",
+        "retryAfterSeconds": 7
       }
     },
     {
@@ -570,7 +632,8 @@
         "retry": "application_decision",
         "action": "none",
         "pendingDisposition": "not_applicable",
-        "credentialDisposition": "preserved"
+        "credentialDisposition": "preserved",
+        "retryAfterSeconds": 7
       }
     },
     {
@@ -721,7 +784,8 @@
         "retry": "application_decision",
         "action": "none",
         "pendingDisposition": "not_applicable",
-        "credentialDisposition": "preserved"
+        "credentialDisposition": "preserved",
+        "retryAfterSeconds": 7
       }
     },
     {
@@ -1020,6 +1084,202 @@
         "action": "none",
         "pendingDisposition": "not_applicable",
         "credentialDisposition": "preserved"
+      }
+    },
+    {
+      "name": "open login response ignores bounded additive field",
+      "required": true,
+      "capability": "schema_policy",
+      "operationId": "start_login",
+      "fixture": "../fixtures/login-start-additive-field.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "success",
+        "pendingDisposition": "preserved",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "closed credential response rejects additive field",
+      "required": true,
+      "capability": "schema_policy",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/credential-pair-additive-field.json",
+      "precondition": "pending_login",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_pending",
+        "pendingDisposition": "quarantined",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "closed current user response rejects additive field",
+      "required": true,
+      "capability": "schema_policy",
+      "operationId": "get_current_user",
+      "fixture": "../fixtures/current-user-additive-field.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "preserved"
+      }
+    },
+    {
+      "name": "uncontracted read error status is protocol failure",
+      "required": true,
+      "capability": "status_policy",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/runtime-error-uncontracted-status.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "uncontracted refresh error status is indeterminate",
+      "required": true,
+      "capability": "status_policy",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/runtime-error-uncontracted-status.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
+      }
+    },
+    {
+      "name": "handoff timeout before dispatch preserves pending",
+      "required": true,
+      "capability": "transport_phase",
+      "operationId": "exchange_handoff",
+      "fixture": "../fixtures/transport-timeout-before-dispatch.json",
+      "precondition": "pending_login",
+      "requestPhase": "before_dispatch",
+      "responseReceived": false,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "timeout",
+        "code": "timeout",
+        "retry": "application_decision",
+        "action": "none",
+        "pendingDisposition": "preserved",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "missing rate limit guidance is protocol failure",
+      "required": true,
+      "capability": "errors",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/runtime-error-rate-limited-missing-retry-after.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "missing refresh rate limit guidance is indeterminate",
+      "required": true,
+      "capability": "refresh",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/runtime-error-rate-limited-missing-retry-after.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
       }
     }
   ]

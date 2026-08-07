@@ -16,7 +16,7 @@ fi
 source_commit="$(git rev-parse HEAD)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/owlauth-web-e2e.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/typescript" "$work/python" "$work/rust"
+mkdir -p "$work/typescript" "$work/python" "$work/rust" "$work/cli"
 
 "$python" scripts/sdk-contract.py check --provenance "$work/sdk-contract-provenance.json"
 
@@ -84,5 +84,8 @@ export OWLAUTH_E2E_RUST_DESCRIPTOR="$work/rust/candidate.json"
 export OWLAUTH_E2E_RUST_UPLOAD_METADATA="$rust_upload_metadata"
 export OWLAUTH_E2E_RUST_ARCHIVE_SHA256="$(sha256 "$rust_archive")"
 export OWLAUTH_E2E_RUST_DESCRIPTOR_SHA256="$(sha256 "$work/rust/candidate.json")"
+
+scripts/test-cli-package.sh "$work/cli/owlauth"
+export OWLAUTH_E2E_CLI_BINARY="$work/cli/owlauth"
 
 pnpm --filter @owlauth/server-web exec playwright test "$@"

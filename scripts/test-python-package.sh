@@ -24,6 +24,7 @@ python_bin="$work_directory/venv/bin/python"
 mkdir -p "$work_directory/sdks/python/tests" "$work_directory/sdks/spec"
 cp "$repository_root/sdks/python/tests/test_client.py" "$work_directory/sdks/python/tests/"
 cp "$repository_root/sdks/python/tests/test_conformance.py" "$work_directory/sdks/python/tests/"
+cp "$repository_root/sdks/python/tests/test_transport.py" "$work_directory/sdks/python/tests/"
 cp -R "$repository_root/sdks/spec/conformance" "$work_directory/sdks/spec/"
 cp -R "$repository_root/sdks/spec/fixtures" "$work_directory/sdks/spec/"
 

@@ -88,7 +88,7 @@ Release qualification is build-once and publish-the-same-bytes:
 7. Registry publication uploads the already-qualified archive directly. It must not rebuild, repackage, or regenerate metadata between qualification and publication.
 8. The component final manifest is attached to the GitHub Release. Non-PR runs attest candidate archives/descriptors and final manifests through repository provenance.
 
-TypeScript publishes the qualified `.tgz` with `npm publish`; Python publishes the qualified wheel with the locked `uv`/Twine toolchain; Rust uploads the qualified `.crate` bytes through the reviewed direct-upload helper and its archive-bound metadata. Registry-specific trusted publishing authenticates the upload but does not replace the candidate/evidence binding.
+TypeScript publishes the qualified `.tgz` with `npm publish`; Python validates the qualified wheel with the locked `uv`/Twine toolchain and uploads only that staged wheel through PyPI's reviewed OIDC trusted-publishing action; Rust uploads the qualified `.crate` bytes through the reviewed direct-upload helper and its archive-bound metadata. Registry-specific trusted publishing authenticates the upload but does not replace the candidate/evidence binding.
 
 Final manifests list an operation as exact-artifact and same-server passed only when the raw same-server observed-operation set exactly equals the candidate's claimed operation set. TypeScript has Chromium and Firefox assignments; Python and Rust have Chromium assignments only. These manifests remain Beta exact-coordinate evidence, not production certification.
 

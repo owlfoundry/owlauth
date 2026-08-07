@@ -169,6 +169,7 @@ test("Block D public journey delivers immutable events and dispatches through Co
       createdEvent.event_id,
     );
     expect(mcpDelivery["state"]).toBe("delivered");
+    await verifyMcpReadCatalog(authority, endpoint);
 
     for (let index = 1; index < events.length; index += 1) {
       const previous = requiredValue(events[index - 1], "missing previous event");
@@ -177,13 +178,21 @@ test("Block D public journey delivers immutable events and dispatches through Co
       expect(previous.user_revision).toBeGreaterThanOrEqual(current.user_revision);
     }
 
-    await run(repository, "cargo", ["build", "--quiet", "--locked", "-p", "owlauth-cli"]);
-    const cli = resolve(
-      repository,
-      "target",
-      "debug",
-      process.platform === "win32" ? "owlauth.exe" : "owlauth",
-    );
+    const packagedCli = process.env["OWLAUTH_E2E_CLI_BINARY"];
+    if (packagedCli === undefined && process.env["CI"] === "true") {
+      throw new Error("CI requires OWLAUTH_E2E_CLI_BINARY from the packaged-crate gate");
+    }
+    if (packagedCli === undefined) {
+      await run(repository, "cargo", ["build", "--quiet", "--locked", "-p", "owlauth-cli"]);
+    }
+    const cli =
+      packagedCli ??
+      resolve(
+        repository,
+        "target",
+        "debug",
+        process.platform === "win32" ? "owlauth.exe" : "owlauth",
+      );
     const cliEnvironment = {
       ...process.env,
       OWLAUTH_CONFIG_DIR: configDirectory,
@@ -512,34 +521,119 @@ async function waitForSigningKey(
   );
 }
 
+async function mcpRequest(
+  id: string,
+  method: string,
+  params: Record<string, unknown>,
+  protocolVersion: string | null = "2025-06-18",
+): Promise<Record<string, unknown>> {
+  const headers: Record<string, string> = {
+    accept: "application/json, text/event-stream",
+    authorization: `Bearer ${operatorKey}`,
+    "content-type": "application/json",
+    origin: new URL(controlBase).origin,
+  };
+  if (protocolVersion !== null) headers["mcp-protocol-version"] = protocolVersion;
+  const response = await fetch(`${controlBase}mcp`, {
+    body: JSON.stringify({ id, jsonrpc: "2.0", method, params }),
+    headers,
+    method: "POST",
+  });
+  const body = await response.text();
+  expect(response.ok, `${method}: ${body}`).toBe(true);
+  const document = JSON.parse(body) as Record<string, unknown>;
+  expect(document["error"], `${method}: ${body}`).toBeUndefined();
+  return document;
+}
+
 async function mcpCall(
   name: string,
   arguments_: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(`${controlBase}mcp`, {
-    body: JSON.stringify({
-      id: `block-d-${name}`,
-      jsonrpc: "2.0",
-      method: "tools/call",
-      params: { arguments: arguments_, name },
-    }),
-    headers: {
-      accept: "application/json, text/event-stream",
-      authorization: `Bearer ${operatorKey}`,
-      "content-type": "application/json",
-      "mcp-protocol-version": "2025-06-18",
-      origin: new URL(controlBase).origin,
-    },
-    method: "POST",
-  });
-  const document = await response.text();
-  expect(response.ok, `${name}: ${document}`).toBe(true);
-  const result = JSON.parse(document) as {
+  const document = (await mcpRequest(`block-d-${name}`, "tools/call", {
+    arguments: arguments_,
+    name,
+  })) as {
     result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
   };
-  expect(result.result?.isError).toBe(false);
-  expect(result.result?.structuredContent).toBeDefined();
-  return result.result?.structuredContent ?? {};
+  expect(document.result?.isError).toBe(false);
+  expect(document.result?.structuredContent).toBeDefined();
+  return document.result?.structuredContent ?? {};
+}
+
+async function verifyMcpReadCatalog(
+  authority: ProvisionedAuthority,
+  endpoint: WebhookEndpoint,
+): Promise<void> {
+  const initialized = await mcpRequest(
+    "block-d-initialize",
+    "initialize",
+    {
+      capabilities: {},
+      clientInfo: { name: "owlauth-web-e2e", version: "1.0.0" },
+      protocolVersion: "2025-06-18",
+    },
+    null,
+  );
+  const initialization = initialized["result"] as Record<string, unknown>;
+  expect(initialization["protocolVersion"]).toBe("2025-06-18");
+  expect((initialization["serverInfo"] as Record<string, unknown>)["name"]).toBe("owlauth-server");
+  const capabilities = initialization["capabilities"] as Record<string, unknown>;
+  expect(Object.keys(capabilities).sort()).toEqual(["tools"]);
+  expect(capabilities["tools"]).toEqual(expect.any(Object));
+  expect(capabilities["prompts"]).toBeUndefined();
+  expect(capabilities["resources"]).toBeUndefined();
+
+  const listed = await mcpRequest("block-d-tools-list", "tools/list", {});
+  const tools = ((listed["result"] as Record<string, unknown>)["tools"] ?? []) as Record<
+    string,
+    unknown
+  >[];
+  expect(tools.map((tool) => tool["name"]).sort()).toEqual([
+    "owlauth_application_get",
+    "owlauth_applications_list",
+    "owlauth_project_get",
+    "owlauth_projects_list",
+    "owlauth_system_get",
+    "owlauth_webhook_deliveries_list",
+    "owlauth_webhook_endpoints_list",
+  ]);
+  for (const tool of tools) {
+    expect((tool["annotations"] as Record<string, unknown>)["readOnlyHint"]).toBe(true);
+    expect((tool["inputSchema"] as Record<string, unknown>)["additionalProperties"]).toBe(false);
+  }
+
+  const system = await mcpCall("owlauth_system_get", {});
+  expect(system["product"]).toBe("owlauth-server");
+
+  const projects = await mcpCall("owlauth_projects_list", { belongs_to: null });
+  expect(projects["items"]).toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: authority.project.id })]),
+  );
+  const project = await mcpCall("owlauth_project_get", {
+    project_id: authority.project.id,
+  });
+  expect(project["id"]).toBe(authority.project.id);
+
+  const applications = await mcpCall("owlauth_applications_list", {
+    project_id: authority.project.id,
+  });
+  expect(applications["items"]).toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: authority.application.id })]),
+  );
+  const application = await mcpCall("owlauth_application_get", {
+    application_id: authority.application.id,
+    project_id: authority.project.id,
+  });
+  expect(application["id"]).toBe(authority.application.id);
+
+  const endpoints = await mcpCall("owlauth_webhook_endpoints_list", {
+    application_id: authority.application.id,
+    project_id: authority.project.id,
+  });
+  expect(endpoints["items"]).toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: endpoint.id })]),
+  );
 }
 
 async function waitForMcpDelivery(

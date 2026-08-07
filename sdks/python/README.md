@@ -52,6 +52,22 @@ The callback is validated locally before a handoff request is sent. Project, App
 Runtime, redirect, state, expiry, and one-attempt binding are checked. Handoff tickets and PKCE
 verifiers are redacted by default and are never automatically replayed.
 
+A page transition, process restart, or other deliberate custody boundary may use the explicit
+secret-bearing record API:
+
+```python
+pending_record = started.pending.export_record()
+# Encrypt and store the entire record under Application-owned access control.
+restored_pending = client.restore_pending_login(decrypted_pending_record)
+credentials = client.complete_login(callback_url, restored_pending)
+```
+
+`restore_pending_login()` accepts only the current closed record schema, exact normalized Runtime
+base URL (including path prefix), Project, and Application. It validates redirect, state, PKCE, and
+expiry bounds without I/O. The Application must delete or atomically mark its durable pending copy
+consumed immediately before exchange and must not restore it after a definitive or ambiguous
+outcome.
+
 ## Credential lifecycle
 
 ```python
@@ -63,11 +79,17 @@ completion = client.logout_application(successor)
 logout_target = client.prepare_browser_logout(successor)
 ```
 
-A `CredentialPair` contains one atomic access/refresh generation. Raw credentials are available
-only through the explicit `SecretValue.reveal()` method and are redacted from `str` and `repr`.
-The SDK does not persist credentials, serialize refresh, or atomically replace Application state.
-Applications must single-flight refresh per family and atomically replace or quarantine the full
-pair.
+A `CredentialPair` contains one atomic access/refresh generation bound to the exact normalized
+Runtime base URL, Project, and Application. Credential-bearing operations accept that bound pair,
+not an unbound raw token, and reject a context mismatch before dispatch. Raw credentials are
+available only through the explicit `SecretValue.reveal()` method and are redacted from `str` and
+`repr`; ordinary pickle serialization is rejected.
+
+For deliberate durable custody, `credentials.export_record()` returns the complete secret-bearing
+atomic generation and `client.restore_credentials(record)` validates and restores it without I/O.
+The record must be encrypted and replaced as one unit. The SDK does not choose storage, serialize
+refresh, or atomically replace Application state. Applications must single-flight refresh per
+family and atomically replace or quarantine the full pair.
 
 ### Migration notes
 
@@ -84,8 +106,10 @@ returns a Hosted confirmation target as data; the SDK never navigates to it.
 ## Errors and ambiguous outcomes
 
 All public failures derive from `OwlAuthError` and expose stable `category`, `code`, `retry`,
-`action`, `operation`, and optional validated `request_id` fields. Messages are SDK-owned and do
-not include raw Runtime bodies, callback URLs, tokens, tickets, or PKCE values.
+`action`, `operation`, optional validated `request_id`, and optional `retry_after_seconds` fields.
+A valid `429` requires one decimal-seconds `Retry-After` value between 0 and 86400; malformed or
+missing guidance is an invalid response rather than an invented delay. Messages are SDK-owned and
+do not include raw Runtime bodies, callback URLs, tokens, tickets, or PKCE values.
 
 Handoff, refresh, Application logout, and Project browser-logout preparation are never retried.
 If a timeout, cancellation, disconnect, or server failure occurs after dispatch and the commit
@@ -95,7 +119,9 @@ outcome cannot be known, the SDK raises `IndeterminateError`. The caller must fo
 Every operation accepts an optional bounded `timeout`. The default standard-library transport is
 synchronous, verifies TLS, disables redirects, and bounds headers and JSON bodies. Tests and
 specialized integrations may inject the exported narrow `Transport` protocol; a custom transport
-uses `TransportFailure(kind, dispatched=...)` to preserve ambiguity semantics.
+uses `TransportFailure(kind, dispatched=...)` to preserve ambiguity semantics. Pending handoff
+material is released for another explicit attempt only when the transport positively reports
+`dispatched=False`.
 
 ## Conformance and real-Runtime qualification
 

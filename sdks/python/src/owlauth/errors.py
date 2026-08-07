@@ -56,6 +56,7 @@ class OwlAuthError(Exception):
         request_id: str | None = None,
         operation: str | None = None,
         status: int | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -65,6 +66,7 @@ class OwlAuthError(Exception):
         self.request_id = request_id
         self.operation = operation
         self.status = status
+        self.retry_after_seconds = retry_after_seconds
 
     def __str__(self) -> str:
         request = f" request_id={self.request_id}" if self.request_id is not None else ""
@@ -74,7 +76,8 @@ class OwlAuthError(Exception):
         return (
             f"{type(self).__name__}(category={self.category.value!r}, code={self.code!r}, "
             f"retry={self.retry.value!r}, action={self.action.value!r}, "
-            f"operation={self.operation!r}, request_id={self.request_id!r})"
+            f"operation={self.operation!r}, request_id={self.request_id!r}, "
+            f"retry_after_seconds={self.retry_after_seconds!r})"
         )
 
 

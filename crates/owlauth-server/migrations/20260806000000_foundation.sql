@@ -4128,7 +4128,7 @@ CREATE TABLE public.project_policies (
     claims_revision bigint DEFAULT 1 NOT NULL,
     session_revision bigint DEFAULT 1 NOT NULL,
     claims_policy jsonb DEFAULT '{"access_token_lifetime_seconds": 900}'::jsonb NOT NULL,
-    session_policy jsonb DEFAULT '{"browser_session_reuse": false, "browser_session_reuse_max_age_seconds": 28800}'::jsonb NOT NULL,
+    session_policy jsonb DEFAULT '{"browser_session_reuse": true, "browser_session_reuse_max_age_seconds": 28800}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
     updated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
     CONSTRAINT project_policies_claims_policy_check CHECK ((jsonb_typeof(claims_policy) = 'object'::text)),

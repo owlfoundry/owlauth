@@ -91,6 +91,37 @@ function credentialResponse(generation = 1) {
   };
 }
 
+function boundCredential(overrides = {}) {
+  return createCredentialPair({
+    runtimeOrigin: "https://identity.example",
+    runtimeBasePath: "/runtime/",
+    projectId: PROJECT,
+    applicationId: APPLICATION,
+    userId: "usr_public",
+    sessionId: "00000000-0000-4000-8000-000000000001",
+    refreshGeneration: 1,
+    accessToken: "access",
+    refreshToken: "refresh",
+    expiresIn: 60,
+    projection: {
+      userId: "usr_public",
+      userRevision: 1,
+      projectionSchema: "owlauth.user.v1",
+      projectionRevision: 1,
+      displayName: null,
+      pictureUrl: null,
+      locale: null,
+      verifiedEmail: null,
+      status: "active",
+      createdAt: "2026-07-30T00:00:00Z",
+      updatedAt: "2026-07-30T00:00:00Z",
+    },
+    projectionRevision: 1,
+    sessionExpiresAt: "2026-08-30T00:00:00Z",
+    ...overrides,
+  });
+}
+
 function fixedCrypto(bytes) {
   return {
     subtle: globalThis.crypto.subtle,
@@ -143,6 +174,25 @@ test("Client enforces secure immutable Runtime context and preserves a path pref
       }),
     OwlAuthError,
   );
+  for (const baseUrl of [
+    "https://identity.example/runtime\\control",
+    "https://identity.example/runtime/%2f/control",
+    "https://identity.example/runtime/%5c/control",
+    "https://identity.example/runtime/../control",
+    "https://identity.example/runtime/%2e%2e/control",
+    "https://identity.example/runtime/%252e%252e/control",
+  ]) {
+    assert.throws(
+      () =>
+        new Client({
+          baseUrl,
+          projectId: PROJECT,
+          applicationId: APPLICATION,
+          publishableKey: KEY,
+        }),
+      OwlAuthError,
+    );
+  }
   const calls = [];
   const instance = new Client({
     baseUrl: "http://127.0.0.1:8080/prefix",
@@ -188,6 +238,36 @@ test("beginLogin derives the RFC S256 vector and returns redacted explicit state
   assert.equal(serialized.includes(verifier), false);
   assert.equal(serialized.includes("application-state"), false);
   assert.equal(JSON.parse(serialized).state, "[REDACTED]");
+});
+
+test("redirect validation matches reviewed web, loopback, and private-scheme policy", async () => {
+  const instance = client(queuedFetch([]));
+  for (const redirectUri of [
+    "javascript:alert(1)",
+    "ftp://app.example/callback",
+    "https://app.example/callback?error=reserved",
+    "https://app.example/callback?handoff=reserved",
+    "https://app.example/callback?state=reserved",
+  ]) {
+    await assert.rejects(
+      instance.beginLogin({ redirectUri }),
+      (error) => error instanceof OwlAuthError && error.code === "invalid_redirect_uri",
+    );
+  }
+
+  const responses = [];
+  const native = client(queuedFetch(responses));
+  responses.push(
+    jsonResponse(
+      {
+        hosted_url: "https://identity.example/runtime/auth/interactions/native",
+        expires_at: "2026-07-31T00:10:00Z",
+      },
+      201,
+    ),
+  );
+  const started = await native.beginLogin({ redirectUri: "com.example.app:/callback" });
+  assert.equal(started.pending.redirectUri, "com.example.app:/callback");
 });
 
 test("callback validation is local, exact, expiring, and one-attempt", async () => {
@@ -375,6 +455,16 @@ test("handoff success-response failures quarantine pending state without retry",
         }),
       code: "context_mismatch",
     },
+    {
+      name: "access token contains header controls",
+      response: () => jsonResponse({ ...credentialResponse(1), access_token: "bad\r\nheader" }),
+      code: "invalid_response",
+    },
+    {
+      name: "refresh token is not opaque token grammar",
+      response: () => jsonResponse({ ...credentialResponse(1), refresh_token: "bad token" }),
+      code: "invalid_response",
+    },
   ];
 
   for (const fixture of cases) {
@@ -444,6 +534,8 @@ test("refresh success-response failures quarantine credentials without retry", a
       const calls = [];
       const instance = client(queuedFetch([fixture.response()], calls));
       const credentials = createCredentialPair({
+        runtimeOrigin: "https://identity.example",
+        runtimeBasePath: "/runtime/",
         projectId: PROJECT,
         applicationId: APPLICATION,
         userId: "usr_public",
@@ -493,7 +585,7 @@ test("unknown Runtime errors remain conservative and secret-free", async () => {
         message: "unreviewed sentinel secret",
         request_id: "request-public",
       },
-      409,
+      404,
     ),
   ];
   const instance = client(queuedFetch(responses));
@@ -509,6 +601,7 @@ test("unknown Runtime errors remain conservative and secret-free", async () => {
 });
 
 test("secret-bearing lifecycle construction is reserved for Client results", () => {
+  assert.throws(() => new AccessToken(Symbol("external"), "secret", {}), TypeError);
   assert.throws(() => new CredentialPair(Symbol("external"), {}), TypeError);
   assert.throws(() => new PendingLogin(Symbol("external"), {}), TypeError);
   assert.throws(() => new ValidatedCallback(Symbol("external"), "handoff", {}), TypeError);
@@ -518,6 +611,8 @@ test("credential context mismatch is a protocol error before refresh dispatch", 
   const calls = [];
   const instance = client(queuedFetch([], calls));
   const foreign = createCredentialPair({
+    runtimeOrigin: "https://identity.example",
+    runtimeBasePath: "/runtime/",
     projectId: "another_project",
     applicationId: APPLICATION,
     userId: "usr_public",
@@ -546,10 +641,64 @@ test("credential context mismatch is a protocol error before refresh dispatch", 
   assert.equal(calls.length, 0);
 });
 
+test("credentials are bound to exact Runtime origin and base path before dispatch", async () => {
+  for (const overrides of [
+    { runtimeOrigin: "https://other.example" },
+    { runtimeBasePath: "/other/" },
+  ]) {
+    const calls = [];
+    const instance = client(queuedFetch([], calls));
+    const foreign = boundCredential(overrides);
+    await assert.rejects(instance.refresh(foreign), (error) => error.code === "credential_context_mismatch");
+    await assert.rejects(
+      instance.currentUser(foreign.accessToken),
+      (error) => error.code === "credential_context_mismatch",
+    );
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("explicit pending and credential records restore only into the exact Client context", async () => {
+  const responses = [];
+  const instance = client(queuedFetch(responses));
+  const started = await begin(instance, responses);
+  const pendingRecord = started.pending.exportRecord();
+  assert.equal(pendingRecord.state, "application-state");
+  assert.equal(JSON.stringify(started.pending).includes(pendingRecord.verifier), false);
+  const restoredPending = instance.restorePendingLogin(structuredClone(pendingRecord));
+  responses.push(jsonResponse(credentialResponse(1)));
+  const credentials = await instance.completeLogin(
+    "https://app.example/callback?handoff=ticket&state=application-state",
+    restoredPending,
+  );
+  const credentialRecord = credentials.exportRecord();
+  assert.equal(credentialRecord.accessToken, "access-token-1");
+  assert.equal(JSON.stringify(credentials).includes(credentialRecord.accessToken), false);
+  const restoredCredentials = instance.restoreCredentialPair(structuredClone(credentialRecord));
+  assert.equal(restoredCredentials.refreshGeneration, 1);
+
+  for (const invalid of [
+    { ...pendingRecord, runtimeOrigin: "https://other.example" },
+    { ...pendingRecord, unexpected: true },
+  ]) {
+    assert.throws(() => instance.restorePendingLogin(invalid), OwlAuthError);
+  }
+  for (const invalid of [
+    { ...credentialRecord, runtimeBasePath: "/other/" },
+    { ...credentialRecord, accessToken: "bad\r\nheader" },
+    { ...credentialRecord, refreshToken: "bad token" },
+    { ...credentialRecord, unexpected: true },
+  ]) {
+    assert.throws(() => instance.restoreCredentialPair(invalid), OwlAuthError);
+  }
+});
+
 test("refresh transport ambiguity is quarantined and never replayed", async () => {
   const calls = [];
   const instance = client(queuedFetch([new Error("lost response")], calls));
   const credentials = createCredentialPair({
+    runtimeOrigin: "https://identity.example",
+    runtimeBasePath: "/runtime/",
     projectId: PROJECT,
     applicationId: APPLICATION,
     userId: "usr_public",
@@ -588,7 +737,7 @@ test("pre-dispatch cancellation performs no request", async () => {
   controller.abort();
   const instance = client(queuedFetch([], calls));
   await assert.rejects(
-    instance.currentUser(new AccessToken("sentinel-access"), { signal: controller.signal }),
+    instance.currentUser(boundCredential().accessToken, { signal: controller.signal }),
     (error) => error.category === "Cancelled" && error.code === "cancelled_before_dispatch",
   );
   assert.equal(calls.length, 0);
@@ -620,7 +769,7 @@ test("user projection requires the exact schema and explicit nullable fields", a
   nullable.locale = null;
   nullable.verified_email = null;
   const accepted = await client(queuedFetch([currentResponse(nullable)])).currentUser(
-    new AccessToken("access"),
+    boundCredential().accessToken,
   );
   assert.equal(accepted.projection.locale, null);
   assert.equal(accepted.projection.verifiedEmail, null);
@@ -636,7 +785,7 @@ test("user projection requires the exact schema and explicit nullable fields", a
     ...fixtureInvalid,
   ]) {
     await assert.rejects(
-      client(queuedFetch([currentResponse(invalid)])).currentUser(new AccessToken("access")),
+      client(queuedFetch([currentResponse(invalid)])).currentUser(boundCredential().accessToken),
       OwlAuthError,
     );
   }

@@ -6,6 +6,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import secrets
@@ -15,8 +16,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any, Literal, ParamSpec, TypeVar, cast
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
+from owlauth._json import loads_strict_json
 from owlauth.errors import (
     AuthenticationError,
     CancelledError,
@@ -49,12 +51,53 @@ from owlauth.models import (
     SecretValue,
     UserProjection,
     ValidatedCallback,
+    _OneUseGuard,
 )
 from owlauth.transport import FailureKind, StdlibTransport, Transport, TransportFailure
 
 _MAX_JSON_BYTES = 65_536
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]+$")
+_PKCE_VERIFIER = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+_BEARER_TOKEN = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
+_OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9._~-]+$")
+_ALLOWED_ERROR_STATUSES = {
+    "get_public_application_config": frozenset({400, 404, 429, 503}),
+    "get_project_jwks": frozenset({404, 429, 503}),
+    "start_login": frozenset({400, 404, 429, 503}),
+    "exchange_handoff": frozenset({400, 409, 429, 503}),
+    "refresh_session": frozenset({400, 409, 429, 503}),
+    "get_current_user": frozenset({401, 429, 503}),
+    "logout_application_session": frozenset({401, 429, 503}),
+    "prepare_browser_logout": frozenset({401, 429, 503}),
+}
+_CREDENTIAL_RESPONSE_FIELDS = frozenset(
+    {
+        "project_id",
+        "application_id",
+        "user_id",
+        "session_id",
+        "refresh_generation",
+        "access_token",
+        "refresh_token",
+        "token_type",
+        "expires_in",
+        "projection",
+        "projection_revision",
+        "session_expires_at",
+    }
+)
+_CURRENT_USER_RESPONSE_FIELDS = frozenset(
+    {
+        "project_id",
+        "application_id",
+        "user_id",
+        "projection",
+        "projection_revision",
+        "authenticated_at",
+        "session_expires_at",
+    }
+)
 _SENSITIVE_OPERATIONS = frozenset(
     {
         "exchange_handoff",
@@ -94,6 +137,11 @@ def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
+def _bind_client_value(value: _Result, marker: object) -> _Result:
+    object.__setattr__(value, "_client_marker", marker)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class Client:
     """Immutable synchronous client bound to one Runtime, Project, and Application.
@@ -112,6 +160,7 @@ class Client:
     transport: Transport = field(default_factory=StdlibTransport, repr=False, compare=False)
     _clock: Callable[[], datetime] = field(default=_utc_now, repr=False, compare=False)
     _entropy: Callable[[int], bytes] = field(default=secrets.token_bytes, repr=False, compare=False)
+    _client_marker: object = field(default_factory=object, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -128,6 +177,140 @@ class Client:
         now = self._clock()
         if not isinstance(now, datetime) or now.tzinfo is None:
             raise ConfigurationError("invalid_clock", "The configured clock must return UTC time.")
+
+    def restore_pending_login(self, record: object) -> PendingLogin:
+        """Restore an explicitly exported pending-login record into this exact client."""
+        fields = {
+            "schema_version",
+            "runtime_base_url",
+            "project_id",
+            "application_id",
+            "redirect_uri",
+            "hosted_url",
+            "created_at",
+            "expires_at",
+            "state",
+            "pkce_verifier",
+        }
+        try:
+            payload = _record_object(record, fields)
+            if (
+                not isinstance(payload["schema_version"], int)
+                or isinstance(payload["schema_version"], bool)
+                or payload["schema_version"] != 1
+                or payload["runtime_base_url"] != self.base_url
+                or payload["project_id"] != self.project_id
+                or payload["application_id"] != self.application_id
+            ):
+                raise ValueError
+            redirect_uri = _validate_redirect_uri(_record_string(payload, "redirect_uri", 2048))
+            hosted_url = _record_string(payload, "hosted_url", 512)
+            _require_runtime_url(self.base_url, hosted_url)
+            created_at = _record_timestamp(payload, "created_at")
+            expires_at = _record_timestamp(payload, "expires_at")
+            state = _record_string(payload, "state", 1024)
+            verifier = _record_string(payload, "pkce_verifier", 128)
+            now = self._now()
+            if (
+                _PKCE_VERIFIER.fullmatch(verifier) is None
+                or expires_at < created_at - timedelta(seconds=60)
+                or expires_at > created_at + timedelta(minutes=11)
+                or created_at > now + timedelta(seconds=60)
+                or expires_at > now + timedelta(minutes=11)
+                or now > expires_at + timedelta(seconds=60)
+            ):
+                raise ValueError
+        except (OwlAuthError, KeyError, OverflowError, TypeError, ValueError) as error:
+            raise ConfigurationError(
+                "invalid_pending_record",
+                "The pending-login record is invalid or belongs to another client.",
+            ) from error
+        return _bind_client_value(
+            PendingLogin(
+                runtime_base_url=self.base_url,
+                project_id=self.project_id,
+                application_id=self.application_id,
+                redirect_uri=redirect_uri,
+                hosted_url=hosted_url,
+                created_at=created_at,
+                expires_at=expires_at,
+                _state=SecretValue(state, "application state"),
+                _pkce_verifier=SecretValue(verifier, "PKCE verifier"),
+            ),
+            self._client_marker,
+        )
+
+    def restore_credentials(self, record: object) -> CredentialPair:
+        """Restore an explicitly exported atomic credential pair into this exact client."""
+        fields = {
+            "schema_version",
+            "runtime_base_url",
+            "project_id",
+            "application_id",
+            "user_id",
+            "session_id",
+            "refresh_generation",
+            "access_token",
+            "refresh_token",
+            "token_type",
+            "access_expires_at",
+            "session_expires_at",
+            "projection",
+        }
+        try:
+            payload = _record_object(record, fields)
+            if (
+                not isinstance(payload["schema_version"], int)
+                or isinstance(payload["schema_version"], bool)
+                or payload["schema_version"] != 1
+                or payload["runtime_base_url"] != self.base_url
+                or payload["project_id"] != self.project_id
+                or payload["application_id"] != self.application_id
+            ):
+                raise ValueError
+            user_id = _record_string(payload, "user_id", 96)
+            session_id = _record_string(payload, "session_id", 64)
+            generation = _record_positive_int(payload, "refresh_generation")
+            access_token = _record_string(payload, "access_token", 16_384)
+            refresh_token = _record_string(payload, "refresh_token", 256)
+            if (
+                _BEARER_TOKEN.fullmatch(access_token) is None
+                or _OPAQUE_TOKEN.fullmatch(refresh_token) is None
+                or payload["token_type"] != "Bearer"
+            ):
+                raise ValueError
+            access_expires_at = _record_timestamp(payload, "access_expires_at")
+            session_expires_at = _record_timestamp(payload, "session_expires_at")
+            now = self._now()
+            if access_expires_at > now + timedelta(
+                minutes=61
+            ) or session_expires_at < now - timedelta(seconds=60):
+                raise ValueError
+            projection = _projection(payload["projection"])
+            if projection.user_id != user_id:
+                raise ValueError
+        except (OwlAuthError, KeyError, OverflowError, TypeError, ValueError) as error:
+            raise ConfigurationError(
+                "invalid_credential_record",
+                "The credential record is invalid or belongs to another client.",
+            ) from error
+        return _bind_client_value(
+            CredentialPair(
+                runtime_base_url=self.base_url,
+                project_id=self.project_id,
+                application_id=self.application_id,
+                user_id=user_id,
+                session_id=session_id,
+                refresh_generation=generation,
+                access_token=SecretValue(access_token, "access token"),
+                refresh_token=SecretValue(refresh_token, "refresh token"),
+                token_type="Bearer",
+                access_expires_at=access_expires_at,
+                session_expires_at=session_expires_at,
+                projection=projection,
+            ),
+            self._client_marker,
+        )
 
     @_bind_protocol_operation("get_public_application_config")
     def get_public_configuration(self, *, timeout: float | None = None) -> PublicApplicationConfig:
@@ -274,16 +457,19 @@ class Client:
         expires_at = _timestamp(payload, "expires_at")
         if expires_at < now - timedelta(seconds=60) or expires_at > now + timedelta(minutes=11):
             raise _protocol("invalid_login_expiry", "Runtime returned an invalid login expiry.")
-        pending = PendingLogin(
-            runtime_base_url=self.base_url,
-            project_id=self.project_id,
-            application_id=self.application_id,
-            redirect_uri=redirect,
-            hosted_url=hosted_url,
-            created_at=now,
-            expires_at=expires_at,
-            _state=SecretValue(application_state, "application state"),
-            _pkce_verifier=SecretValue(verifier, "PKCE verifier"),
+        pending = _bind_client_value(
+            PendingLogin(
+                runtime_base_url=self.base_url,
+                project_id=self.project_id,
+                application_id=self.application_id,
+                redirect_uri=redirect,
+                hosted_url=hosted_url,
+                created_at=now,
+                expires_at=expires_at,
+                _state=SecretValue(application_state, "application state"),
+                _pkce_verifier=SecretValue(verifier, "PKCE verifier"),
+            ),
+            self._client_marker,
         )
         return LoginStart(hosted_url=hosted_url, pending=pending)
 
@@ -299,8 +485,11 @@ class Client:
             )
         if not isinstance(callback_url, str) or len(callback_url) > 4096:
             raise _handoff_local("invalid_callback", "The callback URL is invalid.")
-        expected = urlsplit(pending.redirect_uri)
-        actual = urlsplit(callback_url)
+        try:
+            expected = urlsplit(pending.redirect_uri)
+            actual = urlsplit(callback_url)
+        except ValueError as error:
+            raise _handoff_local("invalid_callback", "The callback URL is invalid.") from error
         if actual.fragment or actual.username is not None or actual.password is not None:
             raise _handoff_local("invalid_callback", "The callback URL is invalid.")
         if (actual.scheme, actual.netloc, actual.path) != (
@@ -331,7 +520,9 @@ class Client:
         if remaining != expected_query or any(len(items) != 1 for items in values.values()):
             raise _handoff_local("invalid_callback", "The callback URL is invalid.")
         returned_state = values.get("state", [""])[0]
-        if not hmac.compare_digest(returned_state, pending._state.reveal()):
+        if not hmac.compare_digest(
+            returned_state.encode("utf-8"), pending._state.reveal().encode("utf-8")
+        ):
             raise _handoff_local("state_mismatch", "The callback state does not match.")
         if "error" in values:
             if "handoff" in values:
@@ -358,7 +549,6 @@ class Client:
         self._validate_pending_context(pending)
         if callback._pending_marker is not pending._marker:
             raise _handoff_local("pending_context_mismatch", "The callback context does not match.")
-        pending._guard.consume()
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/handoff/exchange",
@@ -371,6 +561,7 @@ class Client:
                 "pkce_verifier": pending._pkce_verifier.reveal(),
             },
             timeout=timeout,
+            one_use_guard=pending._guard,
         )
         try:
             return self._credential_pair(payload, previous=None)
@@ -412,17 +603,19 @@ class Client:
 
     @_bind_protocol_operation("get_current_user")
     def current_user(
-        self, access: SecretValue | CredentialPair, *, timeout: float | None = None
+        self, credentials: CredentialPair, *, timeout: float | None = None
     ) -> CurrentUser:
-        token = self._access_token(access)
+        self._validate_credentials_context(credentials)
         payload = self._request_json(
             "GET",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/users/me",
             operation="get_current_user",
             expected_status=200,
-            authorization=token.reveal(),
+            authorization=credentials.access_token.reveal(),
             timeout=timeout,
         )
+        if set(payload) != _CURRENT_USER_RESPONSE_FIELDS:
+            raise _protocol("invalid_response", "Runtime returned an invalid current user.")
         project_id = _string(payload, "project_id", 96)
         application_id = _string(payload, "application_id", 96)
         self._require_context(project_id, application_id)
@@ -449,15 +642,15 @@ class Client:
 
     @_bind_protocol_operation("logout_application_session")
     def logout_application(
-        self, access: SecretValue | CredentialPair, *, timeout: float | None = None
+        self, credentials: CredentialPair, *, timeout: float | None = None
     ) -> Completion:
-        token = self._access_token(access)
+        self._validate_credentials_context(credentials)
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/sessions/logout",
             operation="logout_application_session",
             expected_status=200,
-            authorization=token.reveal(),
+            authorization=credentials.access_token.reveal(),
             timeout=timeout,
         )
         try:
@@ -472,15 +665,15 @@ class Client:
 
     @_bind_protocol_operation("prepare_browser_logout")
     def prepare_browser_logout(
-        self, access: SecretValue | CredentialPair, *, timeout: float | None = None
+        self, credentials: CredentialPair, *, timeout: float | None = None
     ) -> BrowserLogoutPreparation:
-        token = self._access_token(access)
+        self._validate_credentials_context(credentials)
         payload = self._request_json(
             "POST",
             f"v1/projects/{quote(self.project_id, safe='')}/auth/browser-logout/prepare",
             operation="prepare_browser_logout",
             expected_status=201,
-            authorization=token.reveal(),
+            authorization=credentials.access_token.reveal(),
             timeout=timeout,
         )
         try:
@@ -501,6 +694,8 @@ class Client:
     def _credential_pair(
         self, payload: JsonObject, *, previous: CredentialPair | None
     ) -> CredentialPair:
+        if set(payload) != _CREDENTIAL_RESPONSE_FIELDS:
+            raise _protocol("invalid_response", "Runtime returned invalid credentials.")
         project_id = _string(payload, "project_id", 96)
         application_id = _string(payload, "application_id", 96)
         self._require_context(project_id, application_id)
@@ -534,38 +729,50 @@ class Client:
         session_expires_at = _timestamp(payload, "session_expires_at")
         if session_expires_at < now - timedelta(seconds=60):
             raise _protocol("invalid_session_expiry", "Runtime returned an invalid session expiry.")
-        return CredentialPair(
-            project_id=project_id,
-            application_id=application_id,
-            user_id=user_id,
-            session_id=session_id,
-            refresh_generation=generation,
-            access_token=SecretValue(_string(payload, "access_token", 16_384), "access token"),
-            refresh_token=SecretValue(_string(payload, "refresh_token", 256), "refresh token"),
-            token_type=token_type,
-            access_expires_at=now + timedelta(seconds=expires_in),
-            session_expires_at=session_expires_at,
-            projection=projection,
+        access_token = _string(payload, "access_token", 16_384)
+        refresh_token = _string(payload, "refresh_token", 256)
+        if (
+            _BEARER_TOKEN.fullmatch(access_token) is None
+            or _OPAQUE_TOKEN.fullmatch(refresh_token) is None
+        ):
+            raise _protocol("invalid_response", "Runtime returned an invalid token.")
+        return _bind_client_value(
+            CredentialPair(
+                runtime_base_url=self.base_url,
+                project_id=project_id,
+                application_id=application_id,
+                user_id=user_id,
+                session_id=session_id,
+                refresh_generation=generation,
+                access_token=SecretValue(access_token, "access token"),
+                refresh_token=SecretValue(refresh_token, "refresh token"),
+                token_type=token_type,
+                access_expires_at=now + timedelta(seconds=expires_in),
+                session_expires_at=session_expires_at,
+                projection=projection,
+            ),
+            self._client_marker,
         )
-
-    def _access_token(self, access: SecretValue | CredentialPair) -> SecretValue:
-        if isinstance(access, CredentialPair):
-            self._validate_credentials_context(access)
-            return access.access_token
-        if isinstance(access, SecretValue):
-            return access
-        raise ConfigurationError("invalid_access_token", "An access credential is required.")
 
     def _validate_credentials_context(self, credentials: CredentialPair) -> None:
         if not isinstance(credentials, CredentialPair):
             raise ConfigurationError("invalid_credentials", "A credential pair is required.")
-        self._require_context(credentials.project_id, credentials.application_id)
+        if (
+            credentials._client_marker is not self._client_marker
+            or credentials.runtime_base_url != self.base_url
+            or credentials.project_id != self.project_id
+            or credentials.application_id != self.application_id
+        ):
+            raise _protocol(
+                "credential_context_mismatch", "Credentials belong to another client context."
+            )
 
     def _validate_pending_context(self, pending: PendingLogin) -> None:
         if not isinstance(pending, PendingLogin):
             raise ConfigurationError("invalid_pending_login", "A pending login is required.")
         if (
-            pending.runtime_base_url != self.base_url
+            pending._client_marker is not self._client_marker
+            or pending.runtime_base_url != self.base_url
             or pending.project_id != self.project_id
             or pending.application_id != self.application_id
         ):
@@ -599,6 +806,7 @@ class Client:
         body: Mapping[str, Any] | None = None,
         authorization: str | None = None,
         timeout: float | None = None,
+        one_use_guard: _OneUseGuard | None = None,
     ) -> JsonObject:
         request_timeout = self.timeout if timeout is None else _validate_timeout(timeout)
         url = _runtime_join(self.base_url, relative_url)
@@ -609,12 +817,27 @@ class Client:
             headers["Content-Type"] = "application/json"
         if authorization is not None:
             headers["Authorization"] = f"Bearer {authorization}"
+        if one_use_guard is not None:
+            one_use_guard.reserve()
         try:
             response = self.transport.request(
                 method, url, headers=headers, body=encoded, timeout=request_timeout
             )
         except TransportFailure as failure:
+            if one_use_guard is not None:
+                if failure.dispatched:
+                    one_use_guard.commit()
+                else:
+                    one_use_guard.release()
             raise _map_transport_failure(operation, failure) from None
+        except Exception:
+            if one_use_guard is not None:
+                one_use_guard.commit()
+            raise _map_transport_failure(
+                operation, TransportFailure(FailureKind.TRANSPORT, dispatched=True)
+            ) from None
+        if one_use_guard is not None:
+            one_use_guard.commit()
         try:
             if not isinstance(response.body, bytes) or len(response.body) > _MAX_JSON_BYTES:
                 raise _protocol("invalid_response", "Runtime returned an oversized response.")
@@ -635,30 +858,58 @@ class Client:
             if operation in _SENSITIVE_OPERATIONS:
                 raise _indeterminate_protocol(error, operation, response.status) from None
             raise
-        if response.status != expected_status:
-            if 200 <= response.status < 300:
+        if response.status == expected_status:
+            return payload
+        if response.status not in _ALLOWED_ERROR_STATUSES[operation]:
+            error = _protocol("invalid_response", "Runtime returned an unexpected status.")
+            if operation in _SENSITIVE_OPERATIONS:
+                raise _indeterminate_protocol(error, operation, response.status) from None
+            raise error
+        retry_after_seconds = None
+        if response.status == 429:
+            retry_after_seconds = _retry_after_seconds(response.headers)
+            if retry_after_seconds is None or payload.get("code") != "rate_limited":
                 error = _protocol(
-                    "invalid_response", "Runtime returned an unexpected success status."
+                    "invalid_response", "Runtime returned invalid rate-limit guidance."
                 )
                 if operation in _SENSITIVE_OPERATIONS:
                     raise _indeterminate_protocol(error, operation, response.status) from None
                 raise error
-            raise _map_runtime_error(operation, response.status, payload)
-        return payload
+        raise _map_runtime_error(
+            operation,
+            response.status,
+            payload,
+            retry_after_seconds=retry_after_seconds,
+        )
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
     lowered = name.lower()
-    for key, value in headers.items():
-        if isinstance(key, str) and key.lower() == lowered and isinstance(value, str):
-            return value
-    return None
+    values = [
+        value
+        for key, value in headers.items()
+        if isinstance(key, str) and key.lower() == lowered and isinstance(value, str)
+    ]
+    return values[0] if len(values) == 1 else None
+
+
+def _retry_after_seconds(headers: Mapping[str, str]) -> int | None:
+    value = _header_value(headers, "retry-after")
+    if value is None or len(value) > 6 or re.fullmatch(r"[0-9]+", value) is None:
+        return None
+    parsed = int(value)
+    return parsed if parsed <= 86_400 else None
 
 
 def _validate_runtime_base(value: str, allow_loopback: bool) -> str:
     if not isinstance(value, str) or len(value) > 2048:
         raise ConfigurationError("invalid_runtime_url", "The Runtime base URL is invalid.")
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as error:
+        raise ConfigurationError(
+            "invalid_runtime_url", "The Runtime base URL is invalid."
+        ) from error
     if (
         not parsed.scheme
         or not parsed.netloc
@@ -673,27 +924,91 @@ def _validate_runtime_base(value: str, allow_loopback: bool) -> str:
         if parsed.scheme != "http" or not allow_loopback or not loopback:
             raise ConfigurationError("https_required", "HTTPS is required for the Runtime URL.")
     path = parsed.path or "/"
+    if _ambiguous_url_path(path):
+        raise ConfigurationError("invalid_runtime_url", "The Runtime base URL is invalid.")
     if not path.endswith("/"):
         path += "/"
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
 def _validate_redirect_uri(value: str) -> str:
-    if not isinstance(value, str) or not (1 <= len(value) <= 2048):
+    if not isinstance(value, str) or not (8 <= len(value) <= 2048):
         raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
-    parsed = urlsplit(value)
+    lower = value.lower()
+    if (
+        not value.isascii()
+        or "\\" in value
+        or any(character.isspace() for character in value)
+        or "%2f" in lower
+        or "%5c" in lower
+    ):
+        raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
+    scheme_match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):", value)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.") from error
     if (
         not parsed.scheme
+        or scheme_match is None
+        or scheme_match.group(1) != parsed.scheme
         or parsed.fragment
         or parsed.username is not None
         or parsed.password is not None
+        or parsed.hostname is not None
+        and "*" in parsed.hostname
     ):
         raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
-    if parsed.scheme in {"http", "https"} and not parsed.netloc:
+    if any(unquote(segment).lower() in {".", ".."} for segment in parsed.path.split("/")):
         raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
-    if parsed.scheme not in {"http", "https"} and not (parsed.netloc or parsed.path):
+    scheme = parsed.scheme
+    if scheme in {"https", "http"}:
+        if parsed.hostname is None or not parsed.path.startswith("/"):
+            raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
+        if scheme == "http" and not _is_loopback_host(parsed.hostname):
+            raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
+        if (scheme, port) in {("http", 80), ("https", 443)}:
+            raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
+        canonical_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        canonical_authority = canonical_host if port is None else f"{canonical_host}:{port}"
+        if parsed.netloc != canonical_authority:
+            raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
+    elif (
+        "." not in scheme
+        or parsed.netloc
+        or not parsed.path
+        or scheme
+        in {
+            "about",
+            "blob",
+            "data",
+            "file",
+            "ftp",
+            "javascript",
+            "mailto",
+            "vbscript",
+            "ws",
+            "wss",
+        }
+    ):
+        raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
+    try:
+        query = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=32)
+    except ValueError as error:
+        raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.") from error
+    if any(name in {"handoff", "error", "state"} for name, _ in query):
         raise ConfigurationError("invalid_redirect_uri", "The redirect URI is invalid.")
     return value
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _runtime_join(base: str, relative: str) -> str:
@@ -707,17 +1022,29 @@ def _runtime_join(base: str, relative: str) -> str:
 def _require_runtime_url(base: str, value: str) -> None:
     if not isinstance(value, str) or len(value) > 4096:
         raise _protocol("invalid_runtime_url", "Runtime returned an invalid URL.")
-    expected = urlsplit(base)
-    actual = urlsplit(value)
+    try:
+        expected = urlsplit(base)
+        actual = urlsplit(value)
+    except ValueError as error:
+        raise _protocol("invalid_runtime_url", "Runtime returned an invalid URL.") from error
     if (
         actual.scheme != expected.scheme
         or actual.netloc != expected.netloc
         or actual.username is not None
         or actual.password is not None
         or actual.fragment
+        or _ambiguous_url_path(actual.path)
         or not actual.path.startswith(expected.path)
     ):
         raise _protocol("runtime_origin_mismatch", "Runtime returned a URL outside its authority.")
+
+
+def _ambiguous_url_path(path: str) -> bool:
+    lower = path.lower()
+    if "\\" in path or "%2f" in lower or "%5c" in lower or "%25" in lower:
+        return True
+    decoded = unquote(path)
+    return any(segment.lower() in {".", ".."} for segment in decoded.split("/"))
 
 
 def _validate_identifier(name: str, value: str, maximum: int) -> None:
@@ -730,7 +1057,7 @@ def _validate_identifier(name: str, value: str, maximum: int) -> None:
 
 
 def _bounded_text(name: str, value: str, maximum: int) -> None:
-    if not isinstance(value, str) or not (1 <= len(value) <= maximum):
+    if not isinstance(value, str) or not (1 <= len(value) <= maximum) or not _valid_unicode(value):
         raise ConfigurationError(f"invalid_{name}", f"The {name} value is invalid.")
 
 
@@ -742,16 +1069,66 @@ def _validate_timeout(value: float) -> float:
 
 def _decode_json(body: bytes) -> JsonObject:
     try:
-        value = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = loads_strict_json(body)
+    except (UnicodeDecodeError, UnicodeEncodeError, ValueError, RecursionError) as error:
         raise _protocol("invalid_response", "Runtime returned invalid JSON.") from error
     return _object(value)
+
+
+def _valid_unicode(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _object(value: object) -> JsonObject:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise _protocol("invalid_response", "Runtime returned an invalid response.")
     return cast(JsonObject, value)
+
+
+def _record_object(value: object, fields: set[str]) -> JsonObject:
+    if (
+        not isinstance(value, dict)
+        or not all(isinstance(key, str) for key in value)
+        or set(value) != fields
+    ):
+        raise ValueError
+    return cast(JsonObject, value)
+
+
+def _record_string(value: JsonObject, name: str, maximum: int) -> str:
+    item = value[name]
+    if not isinstance(item, str) or not (1 <= len(item) <= maximum) or not _valid_unicode(item):
+        raise ValueError
+    return item
+
+
+def _record_positive_int(value: JsonObject, name: str) -> int:
+    item = value[name]
+    if (
+        not isinstance(item, int)
+        or isinstance(item, bool)
+        or not 1 <= item <= 9_223_372_036_854_775_807
+    ):
+        raise ValueError
+    return item
+
+
+def _record_timestamp(value: JsonObject, name: str) -> datetime:
+    text = _record_string(value, name, 64)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (OverflowError, ValueError) as error:
+        raise ValueError from error
+    if parsed.tzinfo is None:
+        raise ValueError
+    try:
+        return parsed.astimezone(UTC)
+    except (OverflowError, ValueError) as error:
+        raise ValueError from error
 
 
 def _list(value: JsonObject, name: str, maximum: int) -> list[object]:
@@ -780,7 +1157,11 @@ def _boolean(value: JsonObject, name: str) -> bool:
 
 def _positive_int(value: JsonObject, name: str) -> int:
     item = value.get(name)
-    if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+    if (
+        not isinstance(item, int)
+        or isinstance(item, bool)
+        or not 1 <= item <= 9_223_372_036_854_775_807
+    ):
         raise _protocol("invalid_response", "Runtime returned an invalid response.")
     return item
 
@@ -789,11 +1170,14 @@ def _timestamp(value: JsonObject, name: str) -> datetime:
     text = _string(value, name, 64)
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as error:
+    except (OverflowError, ValueError) as error:
         raise _protocol("invalid_timestamp", "Runtime returned an invalid timestamp.") from error
     if parsed.tzinfo is None:
         raise _protocol("invalid_timestamp", "Runtime returned an invalid timestamp.")
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except (OverflowError, ValueError) as error:
+        raise _protocol("invalid_timestamp", "Runtime returned an invalid timestamp.") from error
 
 
 def _optional_string(value: JsonObject, name: str, maximum: int) -> str | None:
@@ -862,7 +1246,6 @@ def _projection(value: object) -> UserProjection:
         or projection.status != "active"
         or not _valid_projection_locale(projection.locale)
         or not _valid_projection_email(projection.verified_email)
-        or projection.updated_at < projection.created_at
     ):
         raise _protocol("invalid_projection", "Runtime returned an invalid user projection.")
     return projection
@@ -880,6 +1263,13 @@ def _map_transport_failure(operation: str, failure: TransportFailure) -> OwlAuth
             "The Runtime operation outcome is unknown. Do not retry the credential.",
             retry=RetryDisposition.NEVER,
             action=action,
+            operation=operation,
+        )
+    if failure.kind == FailureKind.RESPONSE_INVALID:
+        return ProtocolError(
+            "invalid_response",
+            "Runtime returned an invalid or oversized response.",
+            retry=RetryDisposition.NEVER,
             operation=operation,
         )
     if failure.kind == FailureKind.TIMEOUT:
@@ -904,19 +1294,25 @@ def _map_transport_failure(operation: str, failure: TransportFailure) -> OwlAuth
     )
 
 
-def _map_runtime_error(operation: str, status: int, payload: JsonObject) -> OwlAuthError:
+def _map_runtime_error(
+    operation: str,
+    status: int,
+    payload: JsonObject,
+    *,
+    retry_after_seconds: int | None = None,
+) -> OwlAuthError:
     fields = set(payload)
     code_value = payload.get("code")
     message_value = payload.get("message")
     if (
-        not {"code", "message"}.issubset(fields)
-        or not fields <= {"code", "message", "request_id"}
+        fields != {"code", "message", "request_id"}
         or not isinstance(code_value, str)
         or not 1 <= len(code_value) <= 64
         or re.fullmatch(r"[a-z][a-z0-9_]*", code_value) is None
         or not isinstance(message_value, str)
         or not 1 <= len(message_value) <= 256
-        or ("request_id" in payload and not isinstance(payload["request_id"], str))
+        or not isinstance(payload["request_id"], str)
+        or not 1 <= len(payload["request_id"]) <= 128
     ):
         if operation in _SENSITIVE_OPERATIONS:
             action = (
@@ -971,6 +1367,7 @@ def _map_runtime_error(operation: str, status: int, payload: JsonObject) -> OwlA
             request_id=request_id,
             operation=operation,
             status=status,
+            retry_after_seconds=retry_after_seconds,
         )
     if status >= 500 and operation in _SENSITIVE_OPERATIONS:
         action = (

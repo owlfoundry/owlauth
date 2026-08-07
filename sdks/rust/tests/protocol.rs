@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    future::pending,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -7,8 +8,9 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use owlauth_client::{
-    Client, ClientConfig, Clock, EntropySource, Error, ErrorCategory, HttpRequest, HttpResponse,
-    LocalAction, RetryPolicy, Transport, TransportFailure, TransportFailureKind,
+    CancellationToken, Client, ClientConfig, Clock, CredentialPairRecord, EntropySource, Error,
+    ErrorCategory, HttpRequest, HttpResponse, LocalAction, OperationOptions, PendingLoginRecord,
+    RetryPolicy, Transport, TransportFailure, TransportFailureKind,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -59,6 +61,43 @@ impl Transport for MockTransport {
             .unwrap()
             .pop_front()
             .expect("mock response")
+    }
+}
+
+#[derive(Default)]
+struct BlockingTransport {
+    outcomes: Mutex<VecDeque<Result<HttpResponse, TransportFailure>>>,
+    requests: Mutex<Vec<HttpRequest>>,
+    entered_block: tokio::sync::Notify,
+}
+
+impl BlockingTransport {
+    fn with_prefix(outcomes: Vec<Result<HttpResponse, TransportFailure>>) -> Self {
+        Self {
+            outcomes: Mutex::new(outcomes.into()),
+            ..Self::default()
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl Transport for BlockingTransport {
+    async fn send(
+        &self,
+        request: HttpRequest,
+        _deadline: Duration,
+    ) -> Result<HttpResponse, TransportFailure> {
+        self.requests.lock().unwrap().push(request);
+        let outcome = self.outcomes.lock().unwrap().pop_front();
+        if let Some(outcome) = outcome {
+            return outcome;
+        }
+        self.entered_block.notify_one();
+        pending().await
     }
 }
 
@@ -149,7 +188,7 @@ fn credentials(generation: i64) -> Value {
     })
 }
 
-fn client(transport: Arc<MockTransport>) -> Client {
+fn client_with_transport(transport: Arc<dyn Transport>) -> Client {
     Client::with_dependencies(
         ClientConfig::new(
             "https://runtime.example/base/",
@@ -164,11 +203,36 @@ fn client(transport: Arc<MockTransport>) -> Client {
     .unwrap()
 }
 
+fn client(transport: Arc<MockTransport>) -> Client {
+    client_with_transport(transport)
+}
+
 #[test]
 fn url_policy_preserves_prefix_and_requires_explicit_loopback() {
     let transport = Arc::new(MockTransport::default());
     let configured = client(transport);
     assert_eq!(configured.base_url(), "https://runtime.example/base/");
+
+    for base_url in [
+        "https://runtime.example/runtime\\control",
+        "https://runtime.example/runtime/%2f/control",
+        "https://runtime.example/runtime/%5c/control",
+        "https://runtime.example/runtime/../control",
+        "https://runtime.example/runtime/%2e%2e/control",
+        "https://runtime.example/runtime/%252e%252e/control",
+    ] {
+        let config = ClientConfig::new(base_url, "project", "application", "key");
+        assert!(
+            Client::with_dependencies(
+                config,
+                Arc::new(MockTransport::default()),
+                Arc::new(DeterministicEntropy::new()),
+                Arc::new(FixedClock(0)),
+            )
+            .is_err(),
+            "ambiguous Runtime path must fail: {base_url}"
+        );
+    }
 
     let mut loopback = ClientConfig::new(
         "http://127.0.0.1:8080/runtime",
@@ -213,6 +277,163 @@ async fn begin_login_uses_deterministic_s256_and_keeps_provider_selection_out() 
     assert!(body.get("provider_key").is_none());
     assert!(format!("{:?}", login.pending).contains("[REDACTED]"));
     assert!(!format!("{:?}", login.pending).contains(&verifier));
+}
+
+#[tokio::test]
+async fn unicode_state_and_pending_records_round_trip_without_io() {
+    let transport = Arc::new(MockTransport::with(vec![begin_response()]));
+    let client = client(Arc::clone(&transport));
+    let state = "return=東京/资料";
+    let login = client
+        .begin_login("https://app.example/callback", Some(state), None)
+        .await
+        .unwrap();
+    assert_eq!(transport.bodies()[0]["state"], state);
+
+    let record = login.pending.export_record().unwrap();
+    let mut encoded = serde_json::to_value(&record).unwrap();
+    assert_eq!(transport.request_count(), 1);
+    let decoded: PendingLoginRecord = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, record);
+    let restored = client.restore_pending_login(decoded).unwrap();
+    assert_eq!(transport.request_count(), 1);
+
+    let mut callback = url::Url::parse("https://app.example/callback").unwrap();
+    callback
+        .query_pairs_mut()
+        .append_pair("handoff", "ticket")
+        .append_pair("state", state);
+    client
+        .validate_callback(callback.as_str(), &restored)
+        .unwrap();
+
+    encoded["unexpected"] = json!(true);
+    assert!(serde_json::from_value::<PendingLoginRecord>(encoded).is_err());
+
+    let mut future = serde_json::to_value(record).unwrap();
+    future["created_at"] = json!(10_000);
+    future["expires_at"] = json!(10_600);
+    let future: PendingLoginRecord = serde_json::from_value(future).unwrap();
+    assert!(client.restore_pending_login(future).is_err());
+    assert_eq!(transport.request_count(), 1);
+}
+
+#[tokio::test]
+async fn credential_records_are_closed_context_bound_and_restore_without_io() {
+    let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+    let transport = Arc::new(MockTransport::with(vec![
+        begin_response(),
+        response(200, credentials(1)),
+    ]));
+    let client = client(Arc::clone(&transport));
+    let login = client
+        .begin_login("https://app.example/callback", None, None)
+        .await
+        .unwrap();
+    let pair = client
+        .complete_login(
+            &format!("https://app.example/callback?handoff=ticket&state={state}"),
+            &login.pending,
+        )
+        .await
+        .unwrap();
+    let record = pair.export_record();
+    let encoded = serde_json::to_value(&record).unwrap();
+    let decoded: CredentialPairRecord = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, record);
+    let restored = client.restore_credentials(decoded).unwrap();
+    assert_eq!(restored.access_token().expose(), "access-token-1");
+    assert_eq!(restored.refresh_token().expose(), "refresh-token-1");
+    assert_eq!(transport.request_count(), 2);
+
+    let mut additive = encoded.clone();
+    additive["unexpected"] = json!(true);
+    assert!(serde_json::from_value::<CredentialPairRecord>(additive).is_err());
+
+    let other = Client::with_dependencies(
+        ClientConfig::new(
+            "https://runtime.example/base/",
+            "project_public",
+            "another_application",
+            "publishable_key",
+        ),
+        transport.clone(),
+        Arc::new(DeterministicEntropy::new()),
+        Arc::new(FixedClock(0)),
+    )
+    .unwrap();
+    let cross_context: CredentialPairRecord = serde_json::from_value(encoded).unwrap();
+    assert!(other.restore_credentials(cross_context).is_err());
+    assert_eq!(transport.request_count(), 2);
+}
+
+#[tokio::test]
+async fn cancellation_before_sensitive_dispatch_preserves_pending_state() {
+    let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+    let transport = Arc::new(MockTransport::with(vec![begin_response()]));
+    let client = client(Arc::clone(&transport));
+    let login = client
+        .begin_login("https://app.example/callback", None, None)
+        .await
+        .unwrap();
+    let callback = client
+        .validate_callback(
+            &format!("https://app.example/callback?handoff=ticket&state={state}"),
+            &login.pending,
+        )
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = client
+        .exchange_handoff_with_options(
+            &callback,
+            &OperationOptions::with_cancellation(cancellation),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Cancelled);
+    assert_eq!(error.local_action(), LocalAction::None);
+    assert!(login.pending.available());
+    assert!(login.pending.export_record().is_ok());
+    assert_eq!(transport.request_count(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_after_sensitive_dispatch_is_indeterminate_and_consumes_pending() {
+    let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+    let transport = Arc::new(BlockingTransport::with_prefix(vec![begin_response()]));
+    let client = client_with_transport(transport.clone());
+    let login = client
+        .begin_login("https://app.example/callback", None, None)
+        .await
+        .unwrap();
+    let callback = client
+        .validate_callback(
+            &format!("https://app.example/callback?handoff=ticket&state={state}"),
+            &login.pending,
+        )
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let cancellation_for_task = cancellation.clone();
+    let transport_for_task = Arc::clone(&transport);
+    let canceller = tokio::spawn(async move {
+        transport_for_task.entered_block.notified().await;
+        cancellation_for_task.cancel();
+    });
+    let error = client
+        .exchange_handoff_with_options(
+            &callback,
+            &OperationOptions::with_cancellation(cancellation),
+        )
+        .await
+        .unwrap_err();
+    canceller.await.unwrap();
+    assert_eq!(error.category(), ErrorCategory::Indeterminate);
+    assert_eq!(error.local_action(), LocalAction::QuarantinePendingLogin);
+    assert_eq!(error.retry_policy(), RetryPolicy::Never);
+    assert!(login.pending.consumed());
+    assert!(login.pending.export_record().is_err());
+    assert_eq!(transport.request_count(), 2);
 }
 
 #[tokio::test]
@@ -263,23 +484,17 @@ async fn handoff_refresh_current_user_and_logout_use_explicit_atomic_values() {
     let pair = client
         .complete_login(
             &format!("https://app.example/callback?handoff=ticket&state={state}"),
-            login.pending,
+            &login.pending,
         )
         .await
         .unwrap();
     assert_eq!(pair.refresh_generation(), 1);
     let next = client.refresh(&pair).await.unwrap();
     assert_eq!(next.refresh_generation(), 2);
-    let user = client.current_user(next.access_token()).await.unwrap();
+    let user = client.current_user(&next).await.unwrap();
     assert_eq!(user.user_id, "user_public");
-    client
-        .logout_application(next.access_token())
-        .await
-        .unwrap();
-    let logout = client
-        .prepare_browser_logout(next.access_token())
-        .await
-        .unwrap();
+    client.logout_application(&next).await.unwrap();
+    let logout = client.prepare_browser_logout(&next).await.unwrap();
     assert!(logout.hosted_url.ends_with("/auth/browser-logout/prep"));
     assert_eq!(transport.request_count(), 6);
     let bodies = transport.bodies();
@@ -306,7 +521,7 @@ async fn post_dispatch_handoff_failure_is_indeterminate_and_never_retried() {
     let error = client
         .complete_login(
             &format!("https://app.example/callback?handoff=synthetic-ticket&state={state}"),
-            login.pending,
+            &login.pending,
         )
         .await
         .unwrap_err();
@@ -332,7 +547,7 @@ async fn malformed_handoff_success_quarantines_pending_without_retry_or_secret_d
     let error = client
         .complete_login(
             &format!("https://app.example/callback?handoff=sensitive-handoff-ticket&state={state}"),
-            login.pending,
+            &login.pending,
         )
         .await
         .unwrap_err();
@@ -366,7 +581,7 @@ async fn mismatched_handoff_success_quarantines_pending_without_retry_or_secret_
     let error = client
         .complete_login(
             &format!("https://app.example/callback?handoff=ticket&state={state}"),
-            login.pending,
+            &login.pending,
         )
         .await
         .unwrap_err();
@@ -397,7 +612,7 @@ async fn malformed_refresh_success_quarantines_without_retry_or_secret_disclosur
     let pair = client
         .complete_login(
             &format!("https://app.example/callback?handoff=ticket&state={state}"),
-            login.pending,
+            &login.pending,
         )
         .await
         .unwrap();
@@ -433,7 +648,7 @@ async fn mismatched_refresh_success_quarantines_without_retry_or_secret_disclosu
     let pair = client
         .complete_login(
             &format!("https://app.example/callback?handoff=ticket&state={state}"),
-            login.pending,
+            &login.pending,
         )
         .await
         .unwrap();
@@ -466,7 +681,7 @@ async fn post_dispatch_refresh_cancellation_quarantines_without_retry() {
     let pair = client
         .complete_login(
             &format!("https://app.example/callback?handoff=ticket&state={state}"),
-            login.pending,
+            &login.pending,
         )
         .await
         .unwrap();
@@ -478,7 +693,161 @@ async fn post_dispatch_refresh_cancellation_quarantines_without_retry() {
 }
 
 #[tokio::test]
-async fn unknown_runtime_error_is_conservative_and_safe() {
+async fn incomplete_rate_limit_envelopes_are_indeterminate_for_refresh() {
+    for request_id in [None, Some(Value::Null)] {
+        let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+        let mut body = json!({"code": "rate_limited", "message": "limited"});
+        if let Some(request_id) = request_id {
+            body["request_id"] = request_id;
+        }
+        let rate_limited = Ok(HttpResponse {
+            status: 429,
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("retry-after".into(), "1".into()),
+            ],
+            body: serde_json::to_vec(&body).unwrap(),
+        });
+        let transport = Arc::new(MockTransport::with(vec![
+            begin_response(),
+            response(200, credentials(1)),
+            rate_limited,
+        ]));
+        let client = client(transport);
+        let login = client
+            .begin_login("https://app.example/callback", None, None)
+            .await
+            .unwrap();
+        let pair = client
+            .complete_login(
+                &format!("https://app.example/callback?handoff=ticket&state={state}"),
+                &login.pending,
+            )
+            .await
+            .unwrap();
+        let error = client.refresh(&pair).await.unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Indeterminate);
+        assert_eq!(error.local_action(), LocalAction::QuarantineCredentials);
+    }
+}
+
+#[tokio::test]
+async fn unsafe_but_present_request_id_is_not_exposed() {
+    let response = Ok(HttpResponse {
+        status: 429,
+        headers: vec![
+            ("content-type".into(), "application/json".into()),
+            ("retry-after".into(), "7".into()),
+        ],
+        body: br#"{"code":"rate_limited","message":"limited","request_id":"bad id"}"#.to_vec(),
+    });
+    let error = client(Arc::new(MockTransport::with(vec![response])))
+        .public_configuration()
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::RateLimited);
+    assert_eq!(error.retry_after_seconds(), Some(7));
+    assert_eq!(error.request_id(), None);
+}
+
+#[tokio::test]
+async fn complete_login_pre_cancel_preserves_caller_owned_pending() {
+    let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+    let transport = Arc::new(MockTransport::with(vec![begin_response()]));
+    let client = client(Arc::clone(&transport));
+    let login = client
+        .begin_login("https://app.example/callback", None, None)
+        .await
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = client
+        .complete_login_with_options(
+            &format!("https://app.example/callback?handoff=ticket&state={state}"),
+            &login.pending,
+            &OperationOptions::with_cancellation(cancellation),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Cancelled);
+    assert!(login.pending.available());
+    assert!(login.pending.export_record().is_ok());
+    assert_eq!(transport.request_count(), 1);
+}
+
+#[tokio::test]
+async fn production_response_overflow_signal_is_protocol_for_reads() {
+    let failure = TransportFailure::new(TransportFailureKind::ResponseTooLarge, true);
+    let error = client(Arc::new(MockTransport::with(vec![Err(failure)])))
+        .public_configuration()
+        .await
+        .unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Protocol);
+    assert_eq!(error.code(), "invalid_response");
+    assert_eq!(error.retry_policy(), RetryPolicy::Never);
+}
+
+#[tokio::test]
+async fn closed_jwk_rejects_additive_fields_while_document_stays_open() {
+    let transport = Arc::new(MockTransport::with(vec![response(
+        200,
+        json!({
+            "keys": [{
+                "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
+                "kid": "key", "x": URL_SAFE_NO_PAD.encode([1_u8; 32]), "unexpected": true
+            }],
+            "revision": 1,
+            "signing_epoch": 1,
+            "future": true
+        }),
+    )]));
+    let error = client(transport).project_jwks().await.unwrap_err();
+    assert_eq!(error.category(), ErrorCategory::Protocol);
+}
+
+#[tokio::test]
+async fn credential_records_reject_header_controls_and_empty_session_ids() {
+    let state = URL_SAFE_NO_PAD.encode([1_u8; 32]);
+    let transport = Arc::new(MockTransport::with(vec![
+        begin_response(),
+        response(200, credentials(1)),
+    ]));
+    let client = client(transport);
+    let login = client
+        .begin_login("https://app.example/callback", None, None)
+        .await
+        .unwrap();
+    let pair = client
+        .complete_login(
+            &format!("https://app.example/callback?handoff=ticket&state={state}"),
+            &login.pending,
+        )
+        .await
+        .unwrap();
+    for (field, value) in [("access_token", "bad\r\nheader"), ("session_id", "")] {
+        let mut encoded = serde_json::to_value(pair.export_record()).unwrap();
+        encoded[field] = json!(value);
+        let record: CredentialPairRecord = serde_json::from_value(encoded).unwrap();
+        assert!(client.restore_credentials(record).is_err());
+    }
+}
+
+#[tokio::test]
+async fn unicode_runtime_error_message_uses_character_bounds() {
+    let transport = Arc::new(MockTransport::with(vec![response(
+        503,
+        json!({
+            "code": "authority_unavailable",
+            "message": "界".repeat(100),
+            "request_id": "request-1"
+        }),
+    )]));
+    let error = client(transport).public_configuration().await.unwrap_err();
+    assert_eq!(error.code(), "authority_unavailable");
+}
+
+#[tokio::test]
+async fn uncontracted_runtime_status_is_invalid_even_with_safe_error_envelope() {
     let transport = Arc::new(MockTransport::with(vec![response(
         418,
         json!({
@@ -487,7 +856,7 @@ async fn unknown_runtime_error_is_conservative_and_safe() {
     )]));
     let error = client(transport).public_configuration().await.unwrap_err();
     assert_eq!(error.category(), ErrorCategory::Protocol);
-    assert_eq!(error.code(), "future_runtime_code");
+    assert_eq!(error.code(), "invalid_response");
     assert_eq!(error.retry_policy(), RetryPolicy::Never);
     assert!(!error.to_string().contains("provider detail"));
 }
@@ -555,11 +924,11 @@ async fn user_projection_requires_exact_schema_and_explicit_nullable_fields() {
         let pair = client
             .complete_login(
                 &format!("https://app.example/callback?handoff=ticket&state={state}"),
-                login.pending,
+                &login.pending,
             )
             .await
             .unwrap();
-        let result = client.current_user(pair.access_token()).await;
+        let result = client.current_user(&pair).await;
         assert_eq!(result.is_ok(), should_accept);
         if let Ok(accepted) = result {
             assert!(accepted.projection.locale.is_none());

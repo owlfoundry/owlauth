@@ -12,7 +12,7 @@ This portability covers protocol API execution only. The package does not naviga
 
 ## URL and connection policy
 
-A client validates one absolute Runtime base URL at construction. HTTPS is mandatory by default outside an explicit loopback development policy. URL joining preserves a configured path prefix and prevents endpoint paths, provider-returned values, redirects, or headers from changing authority unexpectedly.
+A client validates one absolute Runtime base URL at construction. HTTPS is mandatory by default outside an explicit loopback development policy. URL joining preserves a configured path prefix and prevents endpoint paths, provider-returned values, redirects, or headers from changing authority unexpectedly. Base and Runtime-returned URLs reject raw backslashes, percent-encoded separators, percent-encoded dot segments, and percent-encoded percent signs that could otherwise be normalized into another path or decoded a second time.
 
 TLS certificate and hostname verification remain enabled through each platform's transport. A general “disable verification” option is not a normal public API. Custom trust roots and proxy/environment inheritance are explicit only on platforms whose transport exposes them; browser execution uses the user agent's trust and proxy policy and does not emulate unavailable controls through Node-only shims. Redirect behavior is documented everywhere because it changes trust boundaries.
 
@@ -49,6 +49,21 @@ The following table is normative for the initial SDK surface. An accepted succes
 | `logout_application_session`    | `POST /v1/projects/{project_public_id}/auth/sessions/logout`        | no body and no invented `{}`             | Project access token as Bearer                 | `200`         |
 | `prepare_browser_logout`        | `POST /v1/projects/{project_public_id}/auth/browser-logout/prepare` | no body and no invented `{}`             | Project access token as Bearer                 | `201`         |
 
+The accepted Runtime error statuses are also exact and come from the selected normalized contract:
+
+| Operation ID                    | Exact Runtime error statuses |
+| ------------------------------- | ---------------------------- |
+| `get_public_application_config` | `400`, `404`, `429`, `503`   |
+| `get_project_jwks`              | `404`, `429`, `503`          |
+| `start_login`                   | `400`, `404`, `429`, `503`   |
+| `exchange_handoff`              | `400`, `409`, `429`, `503`   |
+| `refresh_session`               | `400`, `409`, `429`, `503`   |
+| `get_current_user`              | `401`, `429`, `503`          |
+| `logout_application_session`    | `401`, `429`, `503`          |
+| `prepare_browser_logout`        | `401`, `429`, `503`          |
+
+A status outside the operation's exact success and error sets is an invalid response even if it carries a syntactically valid Runtime error envelope. It is `Protocol` for reads and `Indeterminate` with the operation's quarantine action after a possibly dispatched sensitive mutation.
+
 For requests with a JSON body, `Content-Type` is `application/json`; body fields and bounds come from the normalized OpenAPI 3.1 schema and unknown request fields are never added. Bodyless operations do not send a JSON placeholder or claim a content type for a body that is absent.
 
 For responses:
@@ -75,7 +90,7 @@ A request may be retried automatically only when:
 
 1. the operation is classified as safe/replayable (for example, public configuration or Project JWKS retrieval);
 2. no caller cancellation/deadline has occurred;
-3. bounded backoff safely honors reviewed `Retry-After` guidance;
+3. bounded backoff safely honors the single required decimal-seconds `Retry-After` value on a valid `429` response;
 4. credentials are never repeated to another authority;
 5. the retry cannot consume a handoff or rotate/revoke a session twice.
 
@@ -85,20 +100,20 @@ Logout may be designed as idempotent by the Runtime contract, but the SDK must n
 
 ## Cancellation and concurrency
 
-TypeScript accepts `AbortSignal`; Python and Rust expose their selected idiomatic cancellation/deadline mechanisms. Cancellation stops local waiting but does not assert that Runtime did not commit an exchange, refresh, or logout.
+TypeScript accepts `AbortSignal`; Python exposes a transport-specific cancellation boundary; Rust exposes an explicit cancellation future through operation options when the caller needs an SDK semantic result. Dropping a Python call or Rust future/task is outside the returned-error channel and the Application conservatively treats a sensitive dispatched operation as indeterminate. Cancellation stops local waiting but does not assert that Runtime did not commit an exchange, refresh, or logout.
 
 Client instances document thread/task safety. Raw transport is stateless except for connection management. Pending PKCE state and access/refresh credentials are explicit caller-held values. Refresh serialization and durable atomic replacement belong to the Application or an external stateful integration layer and remain Project/Application scoped; the core transport does not imply a process-wide session coordinator.
 
 The initial platform capability matrix is:
 
-| Capability                | TypeScript browser                                 | TypeScript Node.js                         | Python                                           | Rust                                                       |
-| ------------------------- | -------------------------------------------------- | ------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------------- |
-| Overall deadline          | SDK timer plus `AbortSignal`                       | SDK timer plus `AbortSignal`               | explicit timeout passed to transport             | explicit deadline passed to async transport                |
-| Caller cancellation       | `AbortSignal`                                      | `AbortSignal`                              | transport-specific; no false core claim          | task/transport cancellation with dispatched phase retained |
-| Redirect refusal          | Fetch `redirect: error`; user-agent policy applies | Fetch `redirect: error`                    | selected transport must not follow API redirects | selected transport must not follow API redirects           |
-| Trust roots/proxy         | user agent owned                                   | runtime/transport owned; no core override  | transport/platform owned                         | transport/platform owned                                   |
-| Decompression and pooling | user agent owned                                   | runtime owned                              | transport owned                                  | transport owned                                            |
-| Request phase             | before dispatch versus possibly dispatched         | before dispatch versus possibly dispatched | transport failure reports dispatch phase         | transport failure reports dispatch phase                   |
+| Capability                | TypeScript browser                                 | TypeScript Node.js                         | Python                                           | Rust                                                                                             |
+| ------------------------- | -------------------------------------------------- | ------------------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Overall deadline          | SDK timer plus `AbortSignal`                       | SDK timer plus `AbortSignal`               | explicit timeout passed to transport             | explicit deadline passed to async transport                                                      |
+| Caller cancellation       | `AbortSignal`                                      | `AbortSignal`                              | transport-specific; no false core claim          | explicit operation cancellation or transport failure; dropped futures are caller-owned ambiguity |
+| Redirect refusal          | Fetch `redirect: error`; user-agent policy applies | Fetch `redirect: error`                    | selected transport must not follow API redirects | selected transport must not follow API redirects                                                 |
+| Trust roots/proxy         | user agent owned                                   | runtime/transport owned; no core override  | transport/platform owned                         | transport/platform owned                                                                         |
+| Decompression and pooling | user agent owned                                   | runtime owned                              | transport owned                                  | transport owned                                                                                  |
+| Request phase             | before dispatch versus possibly dispatched         | before dispatch versus possibly dispatched | transport failure reports dispatch phase         | transport failure reports dispatch phase                                                         |
 
 An unavailable platform control is documented as unavailable, not emulated by changing the public protocol or by importing a platform-specific implementation into the shared TypeScript core.
 
