@@ -169,6 +169,18 @@ pub struct HostedProvider {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct HostedPendingEmailChallenge {
+    #[schema(min_length = 1, max_length = 96)]
+    pub challenge_id: String,
+    #[schema(minimum = 1)]
+    pub generation: i16,
+    #[schema(min_items = 1, max_items = 2)]
+    pub proof_modes: Vec<EmailProofMode>,
+    #[schema(max_length = 64)]
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct HostedInteractionResponse {
     #[schema(max_length = 96)]
     pub project_id: String,
@@ -189,6 +201,7 @@ pub struct HostedInteractionResponse {
     pub email_available: bool,
     #[schema(max_items = 2)]
     pub email_proof_modes: Vec<EmailProofMode>,
+    pub pending_email_challenge: Option<HostedPendingEmailChallenge>,
     #[schema(max_length = 64)]
     pub csrf: String,
     #[schema(max_length = 64)]
@@ -334,6 +347,13 @@ pub struct SelectEmailRequest {
     pub expected_revision: i64,
     #[schema(max_length = 64)]
     pub csrf: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct SelectEmailResponse {
+    pub status: HostedInteractionStatus,
+    #[schema(minimum = 1)]
+    pub revision: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -592,10 +612,37 @@ pub fn start_login() {}
     get,
     path = "/auth/interactions/{interaction}",
     params(("interaction" = String, Path)),
-    responses((status = 200, description = "Hosted Authentication HTML"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
+    responses((status = 200, description = "Hosted Authentication HTML", body = String, content_type = "text/html"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn get_hosted_interaction() {}
+
+#[utoipa::path(
+    get,
+    path = "/auth/managed-reauthorizations/{interaction}",
+    params(("interaction" = String, Path)),
+    responses((status = 200, description = "Hosted managed-reauthorization HTML", body = String, content_type = "text/html"), (status = 400, body = RuntimeError), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
+)]
+#[doc(hidden)]
+pub fn get_hosted_managed_reauthorization() {}
+
+#[utoipa::path(
+    get,
+    path = "/auth/identity-mutations/{intent}",
+    params(("intent" = String, Path)),
+    responses((status = 200, description = "Hosted identity-mutation HTML", body = String, content_type = "text/html"), (status = 400, body = RuntimeError), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
+)]
+#[doc(hidden)]
+pub fn get_identity_mutation() {}
+
+#[utoipa::path(
+    get,
+    path = "/auth/identity-mutations/email/confirm/{challenge_id}",
+    params(("challenge_id" = String, Path)),
+    responses((status = 200, description = "Generic fragment-only identity-mutation magic-link confirmation shell", body = String, content_type = "text/html"), (status = 400, body = RuntimeError), (status = 404, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
+)]
+#[doc(hidden)]
+pub fn get_identity_mutation_magic_confirmation() {}
 
 #[utoipa::path(
     post,
@@ -612,7 +659,7 @@ pub fn select_provider() {}
     path = "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/select",
     params(("project_public_id" = String, Path), ("interaction" = String, Path)),
     request_body = SelectEmailRequest,
-    responses((status = 200, body = CompletionResponse), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError))
+    responses((status = 200, body = SelectEmailResponse), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn select_email() {}
@@ -622,7 +669,7 @@ pub fn select_email() {}
     path = "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/challenges",
     params(("project_public_id" = String, Path), ("interaction" = String, Path)),
     request_body = BeginEmailChallengeRequest,
-    responses((status = 202, body = EmailChallengeAcceptedResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError))
+    responses((status = 202, body = EmailChallengeAcceptedResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn begin_email_challenge() {}
@@ -632,7 +679,7 @@ pub fn begin_email_challenge() {}
     path = "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/resend",
     params(("project_public_id" = String, Path), ("interaction" = String, Path)),
     request_body = BeginEmailChallengeRequest,
-    responses((status = 202, body = EmailChallengeAcceptedResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError))
+    responses((status = 202, body = EmailChallengeAcceptedResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn resend_email_challenge() {}
@@ -642,7 +689,7 @@ pub fn resend_email_challenge() {}
     path = "/v1/projects/{project_public_id}/auth/interactions/{interaction}/email/otp/verify",
     params(("project_public_id" = String, Path), ("interaction" = String, Path)),
     request_body = VerifyEmailOtpRequest,
-    responses((status = 200, body = EmailProofResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError))
+    responses((status = 200, body = EmailProofResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn verify_email_otp() {}
@@ -651,7 +698,7 @@ pub fn verify_email_otp() {}
     get,
     path = "/auth/email/confirm/{challenge_id}",
     params(("challenge_id" = String, Path)),
-    responses((status = 200, description = "Generic fragment-only magic-link confirmation shell"), (status = 404, body = RuntimeError), (status = 429, body = RuntimeError))
+    responses((status = 200, description = "Generic fragment-only magic-link confirmation shell", body = String, content_type = "text/html"), (status = 404, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn get_email_magic_confirmation() {}
@@ -661,7 +708,7 @@ pub fn get_email_magic_confirmation() {}
     path = "/v1/projects/{project_public_id}/auth/email/magic/confirm",
     params(("project_public_id" = String, Path)),
     request_body = ConfirmEmailMagicRequest,
-    responses((status = 200, body = EmailProofResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError))
+    responses((status = 200, body = EmailProofResponse), (status = 400, body = RuntimeError), (status = 403, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn confirm_email_magic() {}
@@ -835,7 +882,7 @@ pub fn refresh_session() {}
     get,
     path = "/v1/projects/{project_public_id}/auth/users/me",
     params(("project_public_id" = String, Path)),
-    responses((status = 200, body = CurrentUserResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
+    responses((status = 200, body = CurrentUserResponse), (status = 401, body = RuntimeError, headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
     security(("project_bearer" = []))
 )]
 #[doc(hidden)]
@@ -845,7 +892,7 @@ pub fn get_current_user() {}
     post,
     path = "/v1/projects/{project_public_id}/auth/sessions/logout",
     params(("project_public_id" = String, Path)),
-    responses((status = 200, body = CompletionResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
+    responses((status = 200, body = CompletionResponse), (status = 401, body = RuntimeError, headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
     security(("project_bearer" = []))
 )]
 #[doc(hidden)]
@@ -855,7 +902,7 @@ pub fn logout_application_session() {}
     post,
     path = "/v1/projects/{project_public_id}/auth/browser-logout/prepare",
     params(("project_public_id" = String, Path)),
-    responses((status = 201, body = BrowserLogoutPreparationResponse), (status = 401, body = RuntimeError), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
+    responses((status = 201, body = BrowserLogoutPreparationResponse), (status = 401, body = RuntimeError, headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))), (status = 503, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying")))),
     security(("project_bearer" = []))
 )]
 #[doc(hidden)]
@@ -865,7 +912,7 @@ pub fn prepare_browser_logout() {}
     get,
     path = "/auth/browser-logout/{preparation}",
     params(("preparation" = String, Path)),
-    responses((status = 200, description = "Hosted browser-logout confirmation HTML"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
+    responses((status = 200, description = "Hosted browser-logout confirmation HTML", body = String, content_type = "text/html"), (status = 404, body = RuntimeError), (status = 409, body = RuntimeError), (status = 429, body = RuntimeError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))))
 )]
 #[doc(hidden)]
 pub fn get_browser_logout() {}
@@ -914,6 +961,9 @@ struct RuntimeApiDoc;
     paths(
         start_login,
         get_hosted_interaction,
+        get_hosted_managed_reauthorization,
+        get_identity_mutation,
+        get_identity_mutation_magic_confirmation,
         select_provider,
         select_email,
         begin_email_challenge,
@@ -944,6 +994,7 @@ struct RuntimeApiDoc;
             HostedApplicationType,
             HostedInteractionStatus,
             HostedProvider,
+            HostedPendingEmailChallenge,
             HostedInteractionResponse,
             SelectProviderRequest,
             StartManagedReauthorizationRequest,
@@ -962,6 +1013,7 @@ struct RuntimeApiDoc;
             HostedIdentityMutationStatus,
             HostedIdentityMutationResponse,
             SelectEmailRequest,
+            SelectEmailResponse,
             BeginEmailChallengeRequest,
             EmailProofMode,
             EmailChallengeAcceptedResponse,
@@ -1028,11 +1080,7 @@ mod identity_mutation_contract_tests {
         ] {
             assert!(document["paths"][path].is_object(), "missing path: {path}");
         }
-        assert!(
-            document["paths"]
-                .get("/auth/identity-mutations/{intent}")
-                .is_none()
-        );
+        assert!(document["paths"]["/auth/identity-mutations/{intent}"]["get"].is_object());
 
         for schema in [
             "IdentityMutationMethodResponse",

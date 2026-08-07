@@ -1,14 +1,13 @@
 #[cfg(test)]
 mod application_sync_tests;
 mod audit;
+mod auth_incarnation;
 pub(crate) mod authentication;
-pub(crate) mod client_api;
-pub(crate) mod client_key;
-pub(crate) mod client_readiness;
 pub(crate) mod control_lifecycle;
 pub(crate) mod custody;
 pub(crate) mod email;
 pub(crate) mod email_control;
+mod email_identity_lookup;
 #[cfg(test)]
 mod email_tests;
 pub(crate) mod entity;
@@ -28,7 +27,9 @@ mod provider_row;
 pub(crate) mod provisioning;
 pub(crate) mod readiness;
 pub(crate) mod runtime_authority;
-mod runtime_incarnation;
+pub(crate) mod server_api;
+pub(crate) mod server_key;
+pub(crate) mod server_readiness;
 pub(crate) mod session_authority;
 #[cfg(test)]
 mod session_authority_tests;
@@ -51,7 +52,7 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct DatabasePools {
     pub runtime: Option<DatabaseConnection>,
-    pub client: Option<DatabaseConnection>,
+    pub server: Option<DatabaseConnection>,
     pub control: Option<DatabaseConnection>,
 }
 
@@ -60,7 +61,7 @@ impl DatabasePools {
         if let Some(pool) = self.runtime {
             let _ = pool.close().await;
         }
-        if let Some(pool) = self.client {
+        if let Some(pool) = self.server {
             let _ = pool.close().await;
         }
         if let Some(pool) = self.control {
@@ -78,11 +79,11 @@ pub(crate) enum PoolError {
 }
 
 pub(crate) async fn create_pools(config: &ServerConfig) -> Result<DatabasePools, PoolError> {
-    let runtime = if config.mode.has_runtime() {
+    let runtime = if config.mode.has_auth() {
         Some(
             create_pool(
                 config.postgres.runtime_url.expose(),
-                config.runtime.database_max_connections.get(),
+                config.runtime_database_max_connections.get(),
                 config.postgres.connect_timeout,
                 config.postgres.database_lock_timeout,
             )
@@ -92,10 +93,10 @@ pub(crate) async fn create_pools(config: &ServerConfig) -> Result<DatabasePools,
         None
     };
 
-    let client = if config.mode.has_client() {
+    let server = if config.mode.has_auth() {
         match create_pool(
-            config.postgres.client_url.expose(),
-            config.client.database_max_connections.get(),
+            config.postgres.server_url.expose(),
+            config.server_database_max_connections.get(),
             config.postgres.connect_timeout,
             config.postgres.database_lock_timeout,
         )
@@ -116,7 +117,7 @@ pub(crate) async fn create_pools(config: &ServerConfig) -> Result<DatabasePools,
     let control = if config.mode.has_control() {
         match create_pool(
             config.postgres.control_url.expose(),
-            config.control.database_max_connections.get(),
+            config.control_database_max_connections.get(),
             config.postgres.connect_timeout,
             config.postgres.database_lock_timeout,
         )
@@ -127,8 +128,8 @@ pub(crate) async fn create_pools(config: &ServerConfig) -> Result<DatabasePools,
                 if let Some(runtime) = runtime {
                     let _ = runtime.close().await;
                 }
-                if let Some(client) = client {
-                    let _ = client.close().await;
+                if let Some(server) = server {
+                    let _ = server.close().await;
                 }
                 return Err(error);
             }
@@ -139,7 +140,7 @@ pub(crate) async fn create_pools(config: &ServerConfig) -> Result<DatabasePools,
 
     Ok(DatabasePools {
         runtime,
-        client,
+        server,
         control,
     })
 }

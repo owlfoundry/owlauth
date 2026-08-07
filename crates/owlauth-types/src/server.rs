@@ -53,10 +53,10 @@ fn true_schema() -> RefOr<Schema> {
         .into()
 }
 
-/// Stable Client API error codes. Authentication failures intentionally collapse to one code.
+/// Stable Server API error codes. Authentication failures intentionally collapse to one code.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ClientErrorCode {
+pub enum ServerErrorCode {
     InvalidRequest,
     InvalidCredential,
     NotFound,
@@ -66,11 +66,11 @@ pub enum ClientErrorCode {
     InternalError,
 }
 
-/// Complete JSON error envelope for the isolated Client API.
+/// Complete JSON error envelope for the isolated Server API.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ClientError {
-    pub code: ClientErrorCode,
+pub struct ServerError {
+    pub code: ServerErrorCode,
     #[schema(max_length = 256)]
     pub message: String,
     #[schema(max_length = 128)]
@@ -79,7 +79,7 @@ pub struct ClientError {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ClientUserStatus {
+pub enum ServerUserStatus {
     Active,
     Disabled,
     Merged,
@@ -88,12 +88,12 @@ pub enum ClientUserStatus {
 /// Project-owned user read model exposed to one authenticated customer backend.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ClientUser {
+pub struct ServerUser {
     #[schema(max_length = 96)]
     pub user_id: String,
     #[schema(max_length = 96)]
     pub project_id: String,
-    pub status: ClientUserStatus,
+    pub status: ServerUserStatus,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     #[schema(max_length = 128, required = true)]
     pub display_name: Option<String>,
@@ -114,9 +114,9 @@ pub struct ClientUser {
 /// One deterministic keyset page ordered by immutable `(created_at, user_id)`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ClientUserList {
+pub struct ServerUserList {
     #[schema(max_items = 100)]
-    pub items: Vec<ClientUser>,
+    pub items: Vec<ServerUser>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     #[schema(max_length = 64, required = true)]
     pub next_cursor: Option<String>,
@@ -125,7 +125,7 @@ pub struct ClientUserList {
 /// Exact normalized-email lookup body. Email is never carried in a URL.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct LookupClientUserRequest {
+pub struct LookupServerUserRequest {
     #[schema(min_length = 3, max_length = 320)]
     pub email: String,
 }
@@ -133,25 +133,25 @@ pub struct LookupClientUserRequest {
 /// Non-enumerating zero-or-one result inside the already authenticated Project.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct LookupClientUserResponse {
+pub struct LookupServerUserResponse {
     #[serde(deserialize_with = "deserialize_required_nullable_user")]
     #[schema(required = true)]
-    pub user: Option<ClientUser>,
+    pub user: Option<ServerUser>,
 }
 
 fn deserialize_required_nullable_user<'de, D>(
     deserializer: D,
-) -> Result<Option<ClientUser>, D::Error>
+) -> Result<Option<ServerUser>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Option::<ClientUser>::deserialize(deserializer)
+    Option::<ServerUser>::deserialize(deserializer)
 }
 
-/// Existing materialized Application projection; Client never performs an ad hoc reprojection.
+/// Existing materialized Application projection; Server never performs an ad hoc reprojection.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ClientApplicationUserProjection {
+pub struct ServerApplicationUserProjection {
     #[schema(max_length = 96)]
     pub project_id: String,
     #[schema(max_length = 96)]
@@ -246,7 +246,7 @@ pub struct ActiveProjectToken {
     pub session_revision: i64,
     #[schema(minimum = 1)]
     pub application_revision: i64,
-    pub projection: ClientApplicationUserProjection,
+    pub projection: ServerApplicationUserProjection,
 }
 
 /// Non-enumerating introspection union. Invalid or inactive authority is always the inactive arm.
@@ -270,13 +270,13 @@ pub enum ProjectTokenIntrospectionResponse {
         ("limit" = Option<usize>, Query, minimum = 1, maximum = 100)
     ),
     responses(
-        (status = 200, body = ClientUserList),
-        (status = 400, body = ClientError),
-        (status = 401, description = "Missing or invalid Project client key", body = ClientError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 429, body = ClientError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ClientError)
+        (status = 200, body = ServerUserList),
+        (status = 400, body = ServerError),
+        (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
+        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
+        (status = 503, body = ServerError)
     ),
-    security(("project_client_key" = []))
+    security(("project_server_key" = []))
 )]
 #[doc(hidden)]
 pub fn list_project_users() {}
@@ -285,15 +285,15 @@ pub fn list_project_users() {}
     post,
     path = "/v1/projects/{project_id}/users/lookup",
     params(("project_id" = String, Path, max_length = 96)),
-    request_body = LookupClientUserRequest,
+    request_body = LookupServerUserRequest,
     responses(
-        (status = 200, body = LookupClientUserResponse),
-        (status = 400, body = ClientError),
-        (status = 401, description = "Missing or invalid Project client key", body = ClientError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 429, body = ClientError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ClientError)
+        (status = 200, body = LookupServerUserResponse),
+        (status = 400, body = ServerError),
+        (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
+        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
+        (status = 503, body = ServerError)
     ),
-    security(("project_client_key" = []))
+    security(("project_server_key" = []))
 )]
 #[doc(hidden)]
 pub fn lookup_project_user() {}
@@ -306,14 +306,14 @@ pub fn lookup_project_user() {}
         ("user_id" = String, Path, max_length = 96)
     ),
     responses(
-        (status = 200, body = ClientUser),
-        (status = 400, body = ClientError),
-        (status = 401, description = "Missing or invalid Project client key", body = ClientError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 404, body = ClientError),
-        (status = 429, body = ClientError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ClientError)
+        (status = 200, body = ServerUser),
+        (status = 400, body = ServerError),
+        (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
+        (status = 404, body = ServerError),
+        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
+        (status = 503, body = ServerError)
     ),
-    security(("project_client_key" = []))
+    security(("project_server_key" = []))
 )]
 #[doc(hidden)]
 pub fn get_project_user() {}
@@ -327,15 +327,15 @@ pub fn get_project_user() {}
         ("user_id" = String, Path, max_length = 96)
     ),
     responses(
-        (status = 200, body = ClientApplicationUserProjection),
-        (status = 400, body = ClientError),
-        (status = 401, description = "Missing or invalid Project client key", body = ClientError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 404, body = ClientError),
-        (status = 409, body = ClientError),
-        (status = 429, body = ClientError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ClientError)
+        (status = 200, body = ServerApplicationUserProjection),
+        (status = 400, body = ServerError),
+        (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
+        (status = 404, body = ServerError),
+        (status = 409, body = ServerError),
+        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
+        (status = 503, body = ServerError)
     ),
-    security(("project_client_key" = []))
+    security(("project_server_key" = []))
 )]
 #[doc(hidden)]
 pub fn get_application_user_projection() {}
@@ -347,12 +347,12 @@ pub fn get_application_user_projection() {}
     request_body = IntrospectProjectTokenRequest,
     responses(
         (status = 200, body = ProjectTokenIntrospectionResponse),
-        (status = 400, body = ClientError),
-        (status = 401, description = "Missing or invalid Project client key", body = ClientError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 429, body = ClientError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ClientError)
+        (status = 400, body = ServerError),
+        (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
+        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
+        (status = 503, body = ServerError)
     ),
-    security(("project_client_key" = []))
+    security(("project_server_key" = []))
 )]
 #[doc(hidden)]
 pub fn introspect_project_token() {}
@@ -360,8 +360,8 @@ pub fn introspect_project_token() {}
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title = "OwlAuth Client API",
-        description = "Project-scoped customer backend Client API"
+        title = "OwlAuth Server API",
+        description = "Project-scoped customer backend Server API"
     ),
     paths(
         crate::health::get_liveness,
@@ -374,41 +374,41 @@ pub fn introspect_project_token() {}
     ),
     components(schemas(
         HealthResponse,
-        ClientErrorCode,
-        ClientError,
-        ClientUserStatus,
-        ClientUser,
-        ClientUserList,
-        LookupClientUserRequest,
-        LookupClientUserResponse,
-        ClientApplicationUserProjection,
+        ServerErrorCode,
+        ServerError,
+        ServerUserStatus,
+        ServerUser,
+        ServerUserList,
+        LookupServerUserRequest,
+        LookupServerUserResponse,
+        ServerApplicationUserProjection,
         IntrospectProjectTokenRequest,
         InactiveProjectToken,
         ActiveProjectToken,
         ProjectTokenIntrospectionResponse
     )),
-    modifiers(&ClientSecurity)
+    modifiers(&ServerSecurity)
 )]
-struct ClientApiDoc;
+struct ServerApiDoc;
 
-struct ClientSecurity;
+struct ServerSecurity;
 
-impl Modify for ClientSecurity {
+impl Modify for ServerSecurity {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         openapi
             .components
             .get_or_insert_default()
             .add_security_scheme(
-                "project_client_key",
+                "project_server_key",
                 SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
             );
     }
 }
 
-/// Generates the complete Client-plane `OpenAPI` document.
+/// Generates the complete Server-plane `OpenAPI` document.
 #[must_use]
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    ClientApiDoc::openapi()
+    ServerApiDoc::openapi()
 }
 
 #[cfg(test)]
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn request_and_response_models_reject_unknown_fields() {
         assert!(
-            serde_json::from_value::<LookupClientUserRequest>(serde_json::json!({
+            serde_json::from_value::<LookupServerUserRequest>(serde_json::json!({
                 "email": "person@example.com",
                 "prefix": true
             }))

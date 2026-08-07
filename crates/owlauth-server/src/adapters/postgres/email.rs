@@ -25,10 +25,11 @@ use super::{
 
 use crate::application::{
     AdmittedEmailMethod, ApplicationError, CommitEmailGeneration, CompleteEmailProof,
-    EmailGenerationPreparation, EmailIdentityAliasAuthority, EmailProofDecision, EmailProofKind,
-    EstablishMagicTransferContext, IssuedHandoff, PasswordlessEmailRepository, ProtectedValue,
-    ResolveMagicTransferContext, ResolvedMagicTransferContext, SelectEmailMethod,
-    VerifiedEmailChallenge, VerifyEmailProof, VersionedDigest,
+    EmailGenerationPreparation, EmailIdentityAliasAuthority, EmailMethodSelection,
+    EmailProofDecision, EmailProofKind, EstablishMagicTransferContext, IssuedHandoff,
+    PasswordlessEmailRepository, ProtectedValue, ResolveMagicTransferContext,
+    ResolvedMagicTransferContext, SelectEmailMethod, VerifiedEmailChallenge, VerifyEmailProof,
+    VersionedDigest,
 };
 
 const MAX_MAGIC_TRANSFER_CONTEXTS_PER_CHALLENGE: i64 = 8;
@@ -97,9 +98,9 @@ impl EmailProtectionInventory {
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresPasswordlessEmailRepository {
     database: DatabaseConnection,
-    runtime_process_id: String,
-    runtime_incarnation: Uuid,
-    required_runtime_process_ids: Vec<String>,
+    auth_process_id: String,
+    auth_incarnation: Uuid,
+    required_auth_process_ids: Vec<String>,
     readiness_lease: time::Duration,
 }
 
@@ -117,46 +118,46 @@ impl PostgresPasswordlessEmailRepository {
     pub(crate) fn new(database: DatabaseConnection) -> Self {
         Self::new_with_runtime_identity(
             database,
-            "runtime-1".to_owned(),
+            "auth-1".to_owned(),
             Uuid::nil(),
-            vec!["runtime-1".to_owned()],
+            vec!["auth-1".to_owned()],
             time::Duration::minutes(5),
         )
     }
 
     pub(crate) fn new_with_runtime_identity(
         database: DatabaseConnection,
-        runtime_process_id: String,
-        runtime_incarnation: Uuid,
-        required_runtime_process_ids: Vec<String>,
+        auth_process_id: String,
+        auth_incarnation: Uuid,
+        required_auth_process_ids: Vec<String>,
         readiness_lease: time::Duration,
     ) -> Self {
         Self {
             database,
-            runtime_process_id,
-            runtime_incarnation,
-            required_runtime_process_ids,
+            auth_process_id,
+            auth_incarnation,
+            required_auth_process_ids,
             readiness_lease,
         }
     }
 
     fn runtime_roster_json(&self) -> serde_json::Value {
-        serde_json::json!(self.required_runtime_process_ids)
+        serde_json::json!(self.required_auth_process_ids)
     }
 
     /// Acquire the first lock in every Runtime-owned business transaction. The shared row lock
     /// is retained through commit and conflicts with incarnation replacement's UPSERT update.
-    async fn lock_local_runtime_incarnation<C: ConnectionTrait>(
+    async fn lock_local_auth_incarnation<C: ConnectionTrait>(
         &self,
         connection: &C,
     ) -> Result<(), ApplicationError> {
         let current = connection
             .query_one_raw(statement(
-                "SELECT 1 FROM runtime_process_incarnations
+                "SELECT 1 FROM auth_process_incarnations
                  WHERE process_id=$1 AND process_incarnation=$2 FOR SHARE",
                 vec![
-                    self.runtime_process_id.clone().into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_process_id.clone().into(),
+                    self.auth_incarnation.into(),
                 ],
             ))
             .await
@@ -169,20 +170,20 @@ impl PostgresPasswordlessEmailRepository {
         }
     }
 
-    pub(crate) async fn claim_runtime_incarnation(
+    pub(crate) async fn claim_auth_incarnation(
         &self,
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
         self.database
             .execute_raw(statement(
-                "INSERT INTO runtime_process_incarnations
+                "INSERT INTO auth_process_incarnations
                    (process_id,process_incarnation,started_at) VALUES ($1,$2,$3)
                  ON CONFLICT (process_id) DO UPDATE SET
                    process_incarnation=EXCLUDED.process_incarnation,
                    started_at=EXCLUDED.started_at",
                 vec![
-                    self.runtime_process_id.clone().into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_process_id.clone().into(),
+                    self.auth_incarnation.into(),
                     now.into(),
                 ],
             ))
@@ -198,25 +199,25 @@ impl PostgresPasswordlessEmailRepository {
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let lease_expires_at = now + self.readiness_lease;
         let result = transaction
             .execute_raw(statement(
                 "INSERT INTO email_protection_runtime_readiness
                    (process_id,process_incarnation,state,failure_class,checked_at,lease_expires_at)
                  SELECT $1,$2,$3,$4,$5,$6 WHERE EXISTS (
-                   SELECT 1 FROM runtime_process_incarnations current
+                   SELECT 1 FROM auth_process_incarnations current
                    WHERE current.process_id=$1 AND current.process_incarnation=$2)
                  ON CONFLICT (process_id) DO UPDATE SET
                    process_incarnation=EXCLUDED.process_incarnation,state=EXCLUDED.state,
                    failure_class=EXCLUDED.failure_class,checked_at=EXCLUDED.checked_at,
                    lease_expires_at=EXCLUDED.lease_expires_at
                  WHERE EXISTS (
-                   SELECT 1 FROM runtime_process_incarnations current
+                   SELECT 1 FROM auth_process_incarnations current
                    WHERE current.process_id=$1 AND current.process_incarnation=$2)",
                 vec![
-                    self.runtime_process_id.clone().into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_process_id.clone().into(),
+                    self.auth_incarnation.into(),
                     (if ready { "ready" } else { "unavailable" }).into(),
                     failure_class.map(ToOwned::to_owned).into(),
                     now.into(),
@@ -240,7 +241,7 @@ impl PostgresPasswordlessEmailRepository {
         let ready = connection
             .query_one_raw(statement(
                 "SELECT 1 FROM email_protection_runtime_readiness protection
-                 JOIN runtime_process_incarnations current
+                 JOIN auth_process_incarnations current
                    ON current.process_id=protection.process_id
                   AND current.process_incarnation=protection.process_incarnation
                  WHERE protection.process_id=$1 AND protection.process_incarnation=$2
@@ -248,8 +249,8 @@ impl PostgresPasswordlessEmailRepository {
                    AND protection.lease_expires_at>clock_timestamp()
                  FOR SHARE OF protection,current",
                 vec![
-                    self.runtime_process_id.clone().into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_process_id.clone().into(),
+                    self.auth_incarnation.into(),
                 ],
             ))
             .await
@@ -281,11 +282,11 @@ impl PostgresPasswordlessEmailRepository {
         now: OffsetDateTime,
     ) -> Result<u64, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let result = transaction
             .execute_raw(statement(
                 "WITH claimed AS (
-                   SELECT process_id FROM runtime_process_incarnations
+                   SELECT process_id FROM auth_process_incarnations
                    WHERE process_id=$4 AND process_incarnation=$2),
                  cleaned AS (
                    DELETE FROM project_smtp_runtime_readiness obsolete
@@ -307,9 +308,9 @@ impl PostgresPasswordlessEmailRepository {
                         OR (smtp.status='retained' AND smtp.retained_until>$1))",
                 vec![
                     now.into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_incarnation.into(),
                     (now + self.readiness_lease).into(),
-                    self.runtime_process_id.clone().into(),
+                    self.auth_process_id.clone().into(),
                 ],
             ))
             .await
@@ -331,7 +332,7 @@ impl PostgresPasswordlessEmailRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let rows = transaction
             .query_all_raw(statement(
                 "SELECT smtp.project_id,smtp.id,smtp.generation,
@@ -353,8 +354,8 @@ impl PostgresPasswordlessEmailRepository {
                     now.into(),
                     checked_before.into(),
                     i64::from(limit).into(),
-                    self.runtime_process_id.clone().into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_process_id.clone().into(),
+                    self.auth_incarnation.into(),
                 ],
             ))
             .await
@@ -388,7 +389,7 @@ impl PostgresPasswordlessEmailRepository {
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let result = transaction
             .execute_raw(statement(
                 "INSERT INTO project_smtp_runtime_readiness
@@ -399,7 +400,7 @@ impl PostgresPasswordlessEmailRepository {
                AND smtp.credential_material_id=$4
                AND smtp.safe_fingerprint=$5
                AND EXISTS (
-                 SELECT 1 FROM runtime_process_incarnations current
+                 SELECT 1 FROM auth_process_incarnations current
                  WHERE current.process_id=$6 AND current.process_incarnation=$7)
                AND (smtp.status IN ('pending','active')
                     OR (smtp.status='retained' AND smtp.retained_until>$9))
@@ -413,8 +414,8 @@ impl PostgresPasswordlessEmailRepository {
                     candidate.generation.into(),
                     candidate.credential_material_id.into(),
                     candidate.safe_fingerprint.to_vec().into(),
-                    self.runtime_process_id.clone().into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_process_id.clone().into(),
+                    self.auth_incarnation.into(),
                     (if ready { "ready" } else { "unavailable" }).into(),
                     now.into(),
                     (now + self.readiness_lease).into(),
@@ -447,12 +448,12 @@ impl PostgresPasswordlessEmailRepository {
         if limit == 0
             || limit > 100
             || (cutover_requested && retirement_requested)
-            || process_id != self.runtime_process_id
+            || process_id != self.auth_process_id
         {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         transaction
             .execute_raw(statement(
                 "SELECT pg_advisory_xact_lock(hashtextextended('email-identity-alias-authority',0))",
@@ -581,8 +582,8 @@ impl PostgresPasswordlessEmailRepository {
                    retirement_requested=EXCLUDED.retirement_requested,
                    lease_expires_at=EXCLUDED.lease_expires_at,updated_at=EXCLUDED.updated_at",
                 vec![
-                    self.runtime_process_id.clone().into(),
-                    self.runtime_incarnation.into(),
+                    self.auth_process_id.clone().into(),
+                    self.auth_incarnation.into(),
                     protector.email_identity_active_version().into(),
                     authority.revision.into(),
                     retirement_requested.into(),
@@ -701,7 +702,7 @@ impl PostgresPasswordlessEmailRepository {
                             observation.observed_authority_revision,
                             observation.retirement_requested,observation.retirement_request_revision
                      FROM email_identity_alias_runtime_observations observation
-                     JOIN runtime_process_incarnations current
+                     JOIN auth_process_incarnations current
                        ON current.process_id=observation.process_id
                       AND current.process_incarnation=observation.process_incarnation
                      WHERE observation.lease_expires_at>$1
@@ -988,7 +989,7 @@ impl PostgresPasswordlessEmailRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         terminalize_unreadable_short_term(&transaction, &short_term_readable, now).await?;
         let inventory = load_email_protection_inventory(&transaction).await?;
         if !inventory.all_versions_are_readable(&short_term_readable, &email_identity_readable) {
@@ -1009,7 +1010,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
         &self,
     ) -> Result<EmailIdentityAliasAuthority, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
@@ -1028,11 +1029,11 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
     async fn select_email_method(
         &self,
         command: SelectEmailMethod,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<EmailMethodSelection, ApplicationError> {
         validate_digest(&command.browser_binding)?;
         validate_digest(&command.csrf)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
@@ -1076,26 +1077,34 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
             &row,
             command.project_id,
             command.now,
-            &self.runtime_process_id,
-            self.runtime_incarnation,
-            &self.required_runtime_process_ids,
+            &self.auth_process_id,
+            self.auth_incarnation,
+            &self.required_auth_process_ids,
         )
         .await?;
-        let result = transaction
-            .execute_raw(statement(
+        let updated = transaction
+            .query_one_raw(statement(
                 "UPDATE login_transactions SET status = 'email_address_entry', selected_method = 'email', \
                  transaction_revision = transaction_revision + 1, updated_at = $3 \
                  WHERE project_id = $1 AND id = $2 AND status = 'awaiting_method_selection' \
-                 AND transaction_revision = $4",
+                 AND transaction_revision = $4 RETURNING status,transaction_revision",
                 vec![command.project_id.into(), command.transaction_id.into(), command.now.into(), revision.into()],
             ))
             .await
-            .map_err(persistence)?;
-        if result.rows_affected() != 1 {
-            return Err(ApplicationError::RevisionConflict);
+            .map_err(persistence)?
+            .ok_or(ApplicationError::RevisionConflict)?;
+        let updated_status: String = updated.try_get("", "status").map_err(persistence)?;
+        if updated_status != "email_address_entry" {
+            return Err(ApplicationError::Integrity);
         }
+        let selection = EmailMethodSelection {
+            status: crate::domain::LoginTransactionStatus::EmailAddressEntry,
+            transaction_revision: updated
+                .try_get("", "transaction_revision")
+                .map_err(persistence)?,
+        };
         transaction.commit().await.map_err(persistence)?;
-        Ok(())
+        Ok(selection)
     }
 
     async fn prepare_email_generation(
@@ -1110,7 +1119,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
         validate_digest(browser_binding)?;
         validate_digest(csrf)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         let row = transaction.query_one_raw(statement(
             "SELECT login.application_id, login.status, login.transaction_revision, login.expires_at, \
@@ -1223,7 +1232,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
     ) -> Result<(), ApplicationError> {
         validate_generation(&command)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         let row = transaction.query_one_raw(statement(
             "SELECT login.status, login.transaction_revision, login.expires_at, login.application_id,
@@ -1258,9 +1267,9 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
             &row,
             command.project_id,
             command.issued_at,
-            &self.runtime_process_id,
-            self.runtime_incarnation,
-            &self.required_runtime_process_ids,
+            &self.auth_process_id,
+            self.auth_incarnation,
+            &self.required_auth_process_ids,
         )
         .await?;
         transaction.execute_raw(statement(
@@ -1330,7 +1339,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
         validate_digest(&command.context)?;
         validate_digest(&command.csrf)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         let challenge = transaction
             .query_one_raw(statement(
@@ -1414,7 +1423,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
         validate_digest(&command.context)?;
         validate_digest(&command.csrf)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         let row = transaction.query_one_raw(statement(
             "SELECT challenge.project_id, challenge.transaction_id, project.public_id,
@@ -1472,7 +1481,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
              WHERE project_id=$1 AND transaction_id=$2 AND id=$3"
         );
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         let key_version = transaction
             .query_one_raw(statement(
@@ -1502,7 +1511,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
             validate_digest(context)?;
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         // Canonical proof order is login -> Project/Application/policy/assignment -> challenge.
         // Never rely on PostgreSQL's join lock acquisition order for these contended rows.
@@ -1571,9 +1580,9 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
             &row,
             command.project_id,
             command.now,
-            &self.runtime_process_id,
-            self.runtime_incarnation,
-            &self.required_runtime_process_ids,
+            &self.auth_process_id,
+            self.auth_incarnation,
+            &self.required_auth_process_ids,
         )
         .await?;
         let (digest_column, version_column, expiry_column) = match command.proof_kind {
@@ -1658,7 +1667,7 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         lock_project_identity_graph(&transaction, command.verification.project_id).await?;
         // Preserve the same canonical owner order as challenge creation and mail claims.
@@ -1724,9 +1733,9 @@ impl PasswordlessEmailRepository for PostgresPasswordlessEmailRepository {
             &row,
             command.verification.project_id,
             command.verification.now,
-            &self.runtime_process_id,
-            self.runtime_incarnation,
-            &self.required_runtime_process_ids,
+            &self.auth_process_id,
+            self.auth_incarnation,
+            &self.required_auth_process_ids,
         )
         .await?;
         let (digest_column, version_column, expiry_column) = match command.verification.proof_kind {
@@ -2024,7 +2033,7 @@ impl crate::application::DeploymentSmtpRegistry for PostgresPasswordlessEmailRep
     ) -> Result<(), ApplicationError> {
         validate_deployment_smtp_generation(generation)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         transaction
             .execute_raw(statement(
                 "SELECT pg_advisory_xact_lock(hashtextextended('owlauth:deployment-smtp', 0))",
@@ -2111,7 +2120,7 @@ impl crate::application::DeploymentSmtpRegistry for PostgresPasswordlessEmailRep
 
     async fn assert_no_active_deployment_smtp(&self) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let active = transaction
             .query_one_raw(statement(
                 "SELECT 1 FROM deployment_smtp_generations WHERE status='active' LIMIT 1",
@@ -2148,7 +2157,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         // generic child-row cleanup below deliberately excludes this owner kind so no maintenance
         // transaction can violate the deferred challenge/slot/intent owner constraints.
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let mutation_rows =
             terminalize_due_identity_mutations(&transaction, i64::from(row_budget)).await?;
         transaction.commit().await.map_err(persistence)?;
@@ -2221,7 +2230,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                 failed = true;
                 continue;
             };
-            match self.lock_local_runtime_incarnation(&transaction).await {
+            match self.lock_local_auth_incarnation(&transaction).await {
                 Ok(()) => {}
                 Err(ApplicationError::Disabled) => return Err(ApplicationError::Disabled),
                 Err(_) => {
@@ -2278,7 +2287,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         let lease_millis = i64::try_from((lease_until - now).whole_milliseconds())
             .map_err(|_| ApplicationError::InvalidInput)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         self.assert_email_protection_ready(&transaction).await?;
         terminalize_due_identity_mutations(&transaction, 100).await?;
 
@@ -2356,7 +2365,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         };
         let next = next_attempt_at.unwrap_or(job.useful_until);
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let result = transaction.execute_raw(statement(
             "UPDATE mail_outbox SET status=$3, safe_outcome=$4, next_attempt_at=$5, lease_owner=NULL, lease_expires_at=NULL,
              delivered_at=CASE WHEN $3='delivered' THEN $6 ELSE delivered_at END,
@@ -2387,7 +2396,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         let lease_millis = i64::try_from((lease_until - now).whole_milliseconds())
             .map_err(|_| ApplicationError::InvalidInput)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let expired = transaction
             .query_all_raw(statement(
                 "WITH bounded AS (
@@ -2569,7 +2578,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
             }
         };
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
                 "UPDATE project_smtp_test_operations SET state=$4,safe_outcome=$5,completed_at=$6,
@@ -2606,7 +2615,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                        AND (smtp.status IN ('pending','active') OR
                             (smtp.status='retained' AND smtp.retained_until>$10))
                        AND EXISTS (
-                         SELECT 1 FROM runtime_process_incarnations current
+                         SELECT 1 FROM auth_process_incarnations current
                          WHERE current.process_id=$8 AND current.process_incarnation=$9)
                      ON CONFLICT (project_id,configuration_id,generation,process_id)
                      DO UPDATE SET process_incarnation=EXCLUDED.process_incarnation,
@@ -2620,8 +2629,8 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                         job.configuration_security_eligibility_revision.into(),
                         job.credential_material_id.into(),
                         job.safe_fingerprint.to_vec().into(),
-                        self.runtime_process_id.clone().into(),
-                        self.runtime_incarnation.into(),
+                        self.auth_process_id.clone().into(),
+                        self.auth_incarnation.into(),
                         now.into(),
                         (now + self.readiness_lease).into(),
                     ],
@@ -2632,7 +2641,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
                 return Err(ApplicationError::Integrity);
             }
             if readiness.rows_affected() == 0 {
-                self.lock_local_runtime_incarnation(&transaction).await?;
+                self.lock_local_auth_incarnation(&transaction).await?;
             }
         }
         transaction.execute_raw(statement(
@@ -2650,7 +2659,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         lease_until: OffsetDateTime,
     ) -> Result<Option<crate::application::ClaimedSmtpSecretCleanup>, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let stale = transaction
             .query_all_raw(statement(
                 "WITH bounded AS (
@@ -2676,7 +2685,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         transaction.commit().await.map_err(persistence)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
                 "SELECT project_id,idempotency_key,recipient_material_id
@@ -2736,7 +2745,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let owner = transaction
             .query_one_raw(statement(
                 "SELECT recipient_material_id FROM project_smtp_test_operations
@@ -2821,7 +2830,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         lease_until: OffsetDateTime,
     ) -> Result<Option<crate::application::ClaimedSmtpCredentialCleanup>, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let retired_projects = transaction
             .query_all_raw(statement(
                 "WITH bounded AS (
@@ -2962,7 +2971,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         transaction.commit().await.map_err(persistence)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
                 "SELECT cleanup.id,cleanup.material_id
@@ -3023,7 +3032,7 @@ impl crate::application::MailOutboxRepository for PostgresPasswordlessEmailRepos
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let row = transaction
             .query_one_raw(statement(
                 "UPDATE smtp_credential_cleanup_operations
@@ -3564,18 +3573,15 @@ async fn revalidate_policy_and_smtp(
     row: &sea_orm::QueryResult,
     project_id: Uuid,
     now: OffsetDateTime,
-    runtime_process_id: &str,
-    runtime_incarnation: Uuid,
-    required_runtime_process_ids: &[String],
+    auth_process_id: &str,
+    auth_incarnation: Uuid,
+    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     let local_runtime_is_current = transaction
         .query_one_raw(statement(
-            "SELECT 1 FROM runtime_process_incarnations
+            "SELECT 1 FROM auth_process_incarnations
              WHERE process_id=$1 AND process_incarnation=$2",
-            vec![
-                runtime_process_id.to_owned().into(),
-                runtime_incarnation.into(),
-            ],
+            vec![auth_process_id.to_owned().into(), auth_incarnation.into()],
         ))
         .await
         .map_err(persistence)?
@@ -3677,7 +3683,7 @@ async fn revalidate_policy_and_smtp(
                    AND readiness.state='ready'
                    AND readiness.lease_expires_at>$5
                    AND EXISTS (
-                     SELECT 1 FROM runtime_process_incarnations current
+                     SELECT 1 FROM auth_process_incarnations current
                      WHERE current.process_id=readiness.process_id
                        AND current.process_incarnation=readiness.process_incarnation)))
              FOR SHARE OF smtp",
@@ -3689,7 +3695,7 @@ async fn revalidate_policy_and_smtp(
                     generation.into(),
                     revision.into(),
                     now.into(),
-                    serde_json::json!(required_runtime_process_ids).into(),
+                    serde_json::json!(required_auth_process_ids).into(),
                 ],
             ))
             .await
@@ -3785,7 +3791,7 @@ async fn claim_due_login_mail(
                        AND newer.transaction_id=challenge.transaction_id
                        AND newer.generation>challenge.generation)
                    AND EXISTS (
-                     SELECT 1 FROM runtime_process_incarnations local_runtime
+                     SELECT 1 FROM auth_process_incarnations local_runtime
                      WHERE local_runtime.process_id=$3
                        AND local_runtime.process_incarnation=$4)
                    AND ((outbox.smtp_selection_kind='project'
@@ -3803,7 +3809,7 @@ async fn claim_due_login_mail(
                                AND readiness.state='ready'
                                AND readiness.lease_expires_at>$1
                                AND EXISTS (
-                                 SELECT 1 FROM runtime_process_incarnations current
+                                 SELECT 1 FROM auth_process_incarnations current
                                  WHERE current.process_id=readiness.process_id
                                    AND current.process_incarnation=readiness.process_incarnation))))
                      OR (outbox.smtp_selection_kind='deployment_default'
@@ -3813,8 +3819,8 @@ async fn claim_due_login_mail(
                 vec![
                     now.into(),
                     repository.runtime_roster_json().into(),
-                    repository.runtime_process_id.clone().into(),
-                    repository.runtime_incarnation.into(),
+                    repository.auth_process_id.clone().into(),
+                    repository.auth_incarnation.into(),
                     selected_id.into(),
                 ],
             ))
@@ -4014,7 +4020,7 @@ async fn claim_due_login_mail(
                              AND readiness.state='ready'
                              AND readiness.lease_expires_at>$5
                              AND EXISTS (
-                               SELECT 1 FROM runtime_process_incarnations current
+                               SELECT 1 FROM auth_process_incarnations current
                                WHERE current.process_id=readiness.process_id
                                  AND current.process_incarnation=readiness.process_incarnation)))
                      FOR SHARE OF smtp",
@@ -4279,7 +4285,7 @@ async fn identity_mutation_is_earliest_due(
                               FROM jsonb_array_elements_text($2::jsonb) required(process_id)
                              WHERE NOT EXISTS (
                                SELECT 1 FROM project_smtp_runtime_readiness readiness
-                               JOIN runtime_process_incarnations current
+                               JOIN auth_process_incarnations current
                                  ON current.process_id=readiness.process_id
                                 AND current.process_incarnation=readiness.process_incarnation
                               WHERE readiness.project_id=smtp.project_id
@@ -4382,7 +4388,7 @@ async fn claim_due_identity_mutation_mail(
                           FROM jsonb_array_elements_text($2::jsonb) required(process_id)
                          WHERE NOT EXISTS (
                            SELECT 1 FROM project_smtp_runtime_readiness readiness
-                            JOIN runtime_process_incarnations current
+                            JOIN auth_process_incarnations current
                               ON current.process_id=readiness.process_id
                              AND current.process_incarnation=readiness.process_incarnation
                            WHERE readiness.project_id=project_smtp.project_id
@@ -4611,7 +4617,7 @@ async fn claim_due_identity_mutation_mail(
                         FROM jsonb_array_elements_text($4::jsonb) required(process_id)
                        WHERE NOT EXISTS (
                          SELECT 1 FROM project_smtp_runtime_readiness readiness
-                          JOIN runtime_process_incarnations current
+                          JOIN auth_process_incarnations current
                             ON current.process_id=readiness.process_id
                            AND current.process_incarnation=readiness.process_incarnation
                          WHERE readiness.project_id=smtp.project_id

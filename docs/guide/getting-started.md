@@ -1,9 +1,9 @@
 # Getting started
 
-This guide helps contributors run and inspect the current Beta implementation. It is not a production deployment guide.
+This guide helps contributors run and inspect the current Beta implementation. It is not a production deployment guide; use [Deployment](/guide/deployment) before operating a released artifact.
 
 ::: warning Current Beta capability
-`owlauth-server` provides isolated Runtime, Client, and Control listeners over PostgreSQL, automatic or verification-only embedded migrations, OIDC and passwordless-email Project login, Hosted Authentication, PKCE handoff, Project JWT/session/refresh/logout behavior, managed provider connections and bounded profile synchronization, revisioned Application projections with signed durable webhooks, a Project-key backend Client API, provisioning/lifecycle Control APIs, an embedded Management Console, and an optional remote Control MCP endpoint. Three Beta SDKs consume the Runtime protocol; Client is OpenAPI-only. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment; operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and general downstream OAuth-provider behavior are outside the product.
+`owlauth-server` provides one Auth listener with isolated Runtime and Server API surfaces plus an independent Control listener over PostgreSQL, automatic or verification-only embedded migrations, OIDC and passwordless-email Project login, Hosted Authentication, PKCE handoff, Project JWT/session/refresh/logout behavior, managed provider connections and bounded profile synchronization, revisioned Application projections with signed durable webhooks, a Project-key backend Server API, provisioning/lifecycle Control APIs, an embedded Management Console, and an optional remote Control MCP endpoint. Three Beta SDKs consume the Runtime protocol; Server API is OpenAPI-only. Pre-1.0 interfaces and deployment requirements may change. Beta is not deployment certification or a production support commitment; operators own hardening, monitoring, upgrades, and tested backup/PITR/restore. SCIM, bulk directory/export, hosted multi-tenant control, and general downstream OAuth-provider behavior are outside the product.
 :::
 
 ## Prerequisites
@@ -44,7 +44,7 @@ They do not run every CI runtime matrix or the long real PostgreSQL/provider/bro
 
 ## Run the development topology
 
-Copy the current local template and start all three planes with disposable PostgreSQL and Redis:
+Copy the current local template and start Auth and Control with disposable PostgreSQL and Redis:
 
 ```bash
 cp .env.example .env
@@ -53,11 +53,11 @@ make dev
 
 Run `make dev-check` for a non-mutating preflight. It reports stale `.env` templates, missing tools,
 or an unavailable Docker daemon before any service starts. `make dev` prints directly openable
-Runtime Hosted Auth, Client readiness, and Control Console URLs once the listeners are ready. Use
+Auth Hosted UI, Auth readiness, and Control Console URLs once both listeners are ready. Use
 `make dev-status`, `make dev-logs`, and `make dev-down` to inspect or stop infrastructure;
 `make dev-reset` deletes all local PostgreSQL and Redis data.
 
-OwlAuth rejects unknown `OWLAUTH_*` variables and validates selected-plane database, listener, key-store, Runtime protection, Client key/digest readiness, provider egress, admission, and Control credential configuration before binding. Runtime and Client admission share a stable admission-only digest key and optional Redis coordination but retain independent local shares; set `OWLAUTH_RUNTIME_MAX_PROCESSES` and `OWLAUTH_CLIENT_MAX_PROCESSES` to conservative plane-specific deployment maxima rather than current replica counts. The complete variable reference, Redis namespace/deadline settings, and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration).
+OwlAuth rejects unknown `OWLAUTH_*` variables and validates endpoint databases, listeners, key stores, Runtime protection, Server key-digest readiness, provider egress, admission, and Control credentials before binding. Auth and Control independently configure request timeout/body, in-flight requests, accepted connections, headers, and URI bounds; changing one endpoint does not resize the other. Runtime and Server API retain separate admission policies and PostgreSQL pools inside Auth. The old shared `OWLAUTH_REQUEST_TIMEOUT_MS` and `OWLAUTH_MAX_REQUEST_BYTES` names were removed during Beta and now fail as unknown variables. Set `OWLAUTH_AUTH_MAX_PROCESSES` to a conservative maximum Auth replica count rather than the current count. The complete HTTP budget variable table, Redis namespace/deadline settings, and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration-and-operations).
 
 For the fastest executable proof of a correctly provisioned topology, run:
 
@@ -65,17 +65,17 @@ For the fastest executable proof of a correctly provisioned topology, run:
 make web-e2e
 ```
 
-The command requires a clean worktree so archive bytes can be bound honestly to `HEAD`. It generates current Runtime contract provenance, builds one TypeScript tarball, Python wheel, and Rust crate, creates digest-bound candidate descriptors, installs the exact candidates into external clean consumers, and then runs Chromium and Firefox. The gate creates isolated PostgreSQL state, starts real Runtime, Client, and Control processes, provisions distinct Project Auth resources, uses a controlled OIDC provider through the production adapter, and exercises browser-direct, backend-custody, and all three SDK journeys against one server topology. `/health` is liveness only; use `/ready` for selected-plane readiness.
+The command requires a clean worktree so archive bytes can be bound honestly to `HEAD`. It generates current Runtime contract provenance, builds one TypeScript tarball, Python wheel, and Rust crate, creates digest-bound candidate descriptors, installs the exact candidates into external clean consumers, and then runs Chromium and Firefox. The gate creates isolated PostgreSQL state, starts real Auth and Control processes, provisions distinct Project Auth resources, uses a controlled OIDC provider through the production adapter, and exercises browser-direct, backend-custody, and all three SDK journeys against one server topology. `/health` is liveness only; use `/ready` for selected-plane readiness.
 
 ## Generate OpenAPI documents
 
-Reviewed public Rust types in `crates/owlauth-types` generate complete, separate Runtime, Client, and Control OpenAPI documents without compiling the server:
+Reviewed public Rust types in `crates/owlauth-types` generate complete, separate Runtime, Server API, and Control OpenAPI documents without compiling the server:
 
 ```bash
 make openapi
 ```
 
-The files are written to `target/openapi/runtime.json`, `target/openapi/client.json`, and `target/openapi/control.json`. Generated OpenAPI is ephemeral; the hosted-web package commits only its derived plane-pure TypeScript contract files.
+The files are written to `target/openapi/runtime.json`, `target/openapi/server.json`, and `target/openapi/control.json`. Generated OpenAPI is ephemeral; the hosted-web package commits only its derived plane-pure TypeScript contract files.
 
 ## Build the container
 
@@ -85,7 +85,7 @@ Build and smoke-test the current server image:
 make docker-build
 ```
 
-The image runs as a non-root user with `tini` as PID 1 and is smoke-tested through `/health`, `/ready`, and a bounded graceful `SIGTERM` shutdown. Runtime, Client, Control, PostgreSQL, key stores, provider egress, TLS/reverse proxy, backup, and secret configuration remain deployment responsibilities.
+The image runs as a non-root user with `tini` as PID 1 and is smoke-tested through `/health`, `/ready`, and a bounded graceful `SIGTERM` shutdown. Auth, Control, PostgreSQL, key stores, provider egress, TLS/reverse proxy, backup, and secret configuration remain deployment responsibilities. The [deployment guide](/guide/deployment) documents the image defaults, exact configuration boundaries, split topology, probes, upgrades, and recovery checklist.
 
 Published images use `ghcr.io/owlfoundry/owlauth`:
 

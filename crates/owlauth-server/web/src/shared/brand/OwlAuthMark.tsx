@@ -1,0 +1,28 @@
+interface OwlAuthMarkProps {
+  readonly className?: string | undefined;
+  readonly size?: number | undefined;
+}
+
+export function OwlAuthMark({ className, size = 32 }: OwlAuthMarkProps) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={className}
+      width={size}
+      height={size}
+      viewBox="0 0 64 64"
+      focusable="false"
+    >
+      <rect width="64" height="64" rx="14" fill="#101211" />
+      <path
+        fill="#f7f7f5"
+        d="M13 14.5 24.3 20A21.7 21.7 0 0 1 32 18.6c2.7 0 5.3.5 7.7 1.4L51 14.5v17.3C51 44.1 42.5 52 32 52s-19-7.9-19-20.2V14.5Z"
+      />
+      <circle cx="23.5" cy="31" r="7.5" fill="#101211" />
+      <circle cx="40.5" cy="31" r="7.5" fill="#101211" />
+      <circle cx="23.5" cy="31" r="2.5" fill="#f7f7f5" />
+      <circle cx="40.5" cy="31" r="2.5" fill="#f7f7f5" />
+      <path fill="#101211" d="m32 35 4.5 5.5h-9L32 35Z" />
+    </svg>
+  );
+}

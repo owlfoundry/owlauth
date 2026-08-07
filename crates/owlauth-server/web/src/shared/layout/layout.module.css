@@ -80,6 +80,24 @@
   contain: inline-size paint;
   border: 1px solid var(--owl-border);
   border-radius: var(--owl-radius-surface);
+  scrollbar-color: var(--owl-border-strong) transparent;
+  scrollbar-width: thin;
+}
+
+.tableRegion:focus-visible {
+  outline: 3px solid var(--owl-focus);
+  outline-offset: 2px;
+}
+
+.tableScrollHint {
+  display: none;
+  margin: 0;
+  padding: 0.5rem 1rem;
+  color: var(--owl-text-muted);
+  background: var(--owl-surface-raised);
+  border-bottom: 1px solid var(--owl-border);
+  font-size: 0.75rem;
+  white-space: nowrap;
 }
 
 .table {
@@ -118,6 +136,28 @@
   background: var(--owl-surface-hover);
 }
 
+.loading {
+  min-height: 5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  color: var(--owl-text-muted);
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-surface);
+}
+
+.loadingIndicator {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  border: 2px solid var(--owl-border-strong);
+  border-top-color: var(--owl-accent-strong);
+  border-radius: 50%;
+  animation: loading-spin 700ms linear infinite;
+}
+
 .empty {
   display: grid;
   justify-items: start;
@@ -138,6 +178,23 @@
 .empty p {
   max-width: 40rem;
   color: var(--owl-text-muted);
+}
+
+.empty > a {
+  min-height: 2.5rem;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 0.875rem;
+  color: var(--owl-text);
+  background: var(--owl-surface-raised);
+  border: 1px solid var(--owl-border-strong);
+  border-radius: var(--owl-radius-control);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.empty > a:hover {
+  background: var(--owl-surface-hover);
 }
 
 .descriptionList {
@@ -171,7 +228,10 @@
   gap: 0.25rem;
   margin-bottom: 1.5rem;
   overflow-x: auto;
+  overscroll-behavior-inline: contain;
   border-bottom: 1px solid var(--owl-border);
+  scrollbar-color: var(--owl-border-strong) transparent;
+  scrollbar-width: thin;
 }
 
 .tab {
@@ -213,7 +273,25 @@
   color: var(--owl-text-muted);
 }
 
+@keyframes loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loadingIndicator {
+    animation: none;
+    border-top-color: var(--owl-border-strong);
+    background: var(--owl-accent-strong);
+  }
+}
+
 @media (width <= 48rem) {
+  .tableScrollHint {
+    display: block;
+  }
+
   .pageHeader,
   .sectionHeader {
     align-items: stretch;
@@ -239,6 +317,11 @@
 }
 
 @media (width <= 40rem) {
+  .tab {
+    padding-inline: 0.5rem;
+    font-size: 0.875rem;
+  }
+
   .breadcrumbs ol {
     flex-wrap: nowrap;
     overflow: hidden;

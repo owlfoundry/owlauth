@@ -59,12 +59,12 @@ use crate::{
         RuntimeIdentityMutationRepository, RuntimeProtector, SelectEmailMethod,
         VerifyIdentityMutationEmailProof, VersionedDigest, mail_context,
     },
-    config::PlaneMode,
+    config::ProcessMode,
     domain::{
         ApplicationUserEventType, IdentityKind, IdentityMutationKind, IdentityMutationSlotRole,
         IdentityMutationStatus,
     },
-    http::{build_routers_with_runtime_incarnation, tests::identity_mutation_composition_config},
+    http::{build_routers_with_auth_incarnation, tests::identity_mutation_composition_config},
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -265,7 +265,7 @@ async fn fixture_with_provider(
         .expect("connect SeaORM identity-mutation database");
     let incarnation = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO runtime_process_incarnations(process_id,process_incarnation,started_at)
+        "INSERT INTO auth_process_incarnations(process_id,process_incarnation,started_at)
          VALUES ('identity-mutation-test',$1,clock_timestamp())",
     )
     .bind(incarnation)
@@ -2525,15 +2525,15 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     };
 
     // Exercise the production composition, not Option-only sentinels, against this real database.
-    // Runtime-only and All use a real non-nil incarnation fence; split Control and Runtime share
-    // the same PostgreSQL authority while retaining disjoint capabilities.
-    let runtime_config = identity_mutation_composition_config(PlaneMode::Runtime);
+    // Auth and All use a real non-nil incarnation fence; split Control and Auth share the same
+    // PostgreSQL authority while retaining disjoint capabilities.
+    let runtime_config = identity_mutation_composition_config(ProcessMode::Auth);
     let runtime_pools = DatabasePools {
         runtime: Some(fixture.database.clone()),
-        client: None,
+        server: None,
         control: None,
     };
-    let runtime_only = build_routers_with_runtime_incarnation(
+    let runtime_only = build_routers_with_auth_incarnation(
         &runtime_config,
         Some(&runtime_pools),
         fixture.incarnation,
@@ -2541,7 +2541,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     let runtime_repository = runtime_only
         .runtime_identity_mutations
         .clone()
-        .expect("Runtime-only production composition exposes the fenced repository");
+        .expect("Auth production composition exposes the fenced repository");
     assert!(runtime_only.control_identity_mutations.is_none());
     assert_eq!(
         runtime_repository
@@ -2550,11 +2550,8 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         Err(ApplicationError::NotFound),
         "a current non-nil Runtime incarnation reaches the real transaction"
     );
-    let stale_runtime = build_routers_with_runtime_incarnation(
-        &runtime_config,
-        Some(&runtime_pools),
-        Uuid::new_v4(),
-    );
+    let stale_runtime =
+        build_routers_with_auth_incarnation(&runtime_config, Some(&runtime_pools), Uuid::new_v4());
     assert_eq!(
         stale_runtime
             .runtime_identity_mutations
@@ -2565,18 +2562,18 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         "production Runtime composition rejects a stale non-nil incarnation"
     );
 
-    let control_config = identity_mutation_composition_config(PlaneMode::Control);
+    let control_config = identity_mutation_composition_config(ProcessMode::Control);
     assert!(
         control_config.runtime_protection.is_none(),
         "Control-only never receives the generic Runtime protector"
     );
     let control_pools = DatabasePools {
         runtime: None,
-        client: None,
+        server: None,
         control: Some(fixture.database.clone()),
     };
     let split_control =
-        build_routers_with_runtime_incarnation(&control_config, Some(&control_pools), Uuid::nil());
+        build_routers_with_auth_incarnation(&control_config, Some(&control_pools), Uuid::nil());
     assert!(split_control.runtime_identity_mutations.is_none());
     let split_control_repository = split_control
         .control_identity_mutations
@@ -2592,14 +2589,14 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         Err(ApplicationError::NotFound)
     ));
 
-    let all_config = identity_mutation_composition_config(PlaneMode::All);
+    let all_config = identity_mutation_composition_config(ProcessMode::All);
     let all_pools = DatabasePools {
         runtime: Some(fixture.database.clone()),
-        client: None,
+        server: None,
         control: Some(fixture.database.clone()),
     };
     let all =
-        build_routers_with_runtime_incarnation(&all_config, Some(&all_pools), fixture.incarnation);
+        build_routers_with_auth_incarnation(&all_config, Some(&all_pools), fixture.incarnation);
     assert!(all.control_identity_mutations.is_some());
     assert_eq!(
         all.runtime_identity_mutations
@@ -2824,12 +2821,10 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         .await
         .expect("prepare unlink confirmation");
     assert!(preparation.candidate_evidence.is_none());
-    sqlx::query(
-        "DELETE FROM runtime_process_incarnations WHERE process_id='identity-mutation-test'",
-    )
-    .execute(&fixture.sqlx)
-    .await
-    .expect("take Runtime process offline before ordinary Control confirmation");
+    sqlx::query("DELETE FROM auth_process_incarnations WHERE process_id='identity-mutation-test'")
+        .execute(&fixture.sqlx)
+        .await
+        .expect("take Auth process offline before ordinary Control confirmation");
     let confirmation = PreparedIdentityMutationConfirmation {
         project_id: fixture.project_id,
         intent_id,

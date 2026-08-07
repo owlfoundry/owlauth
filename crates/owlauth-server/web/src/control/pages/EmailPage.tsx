@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
 
-import { EmptyState, PageHeader } from "../../shared/layout/Layout";
+import { EmptyState, LoadingState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert } from "../../shared/primitives/Feedback";
 import { useControl, useProject } from "../app/ControlContext";
@@ -74,7 +74,7 @@ export function EmailPage() {
         title="Passwordless email"
         description="Configure proof modes, Application assignments, and SMTP generations."
       />
-      {loadState === "loading" ? <p role="status">Loading Applications</p> : null}
+      {loadState === "loading" ? <LoadingState>Loading email configuration</LoadingState> : null}
       {loadState === "failed" ? (
         <InlineAlert tone="danger" role="alert">
           <p>Applications required for email assignments could not be loaded.</p>

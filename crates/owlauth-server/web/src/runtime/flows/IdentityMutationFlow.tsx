@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { components } from "../../generated/runtime-openapi";
 import { readConfiguredBase } from "../../shared/configured-base";
+import { Button } from "../../shared/primitives/Button";
+import { Input } from "../../shared/primitives/Field";
 import styles from "./identity.module.css";
 import { createRuntimeClient } from "../client";
 
@@ -80,6 +82,9 @@ const EXPECTED_NEXT_ACTION: Record<IdentityMutationSlotState, IdentityMutationNe
 export const identityMutationNavigation = {
   replace(target: string) {
     window.location.replace(target);
+  },
+  reload() {
+    window.location.reload();
   },
 };
 
@@ -312,6 +317,30 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
   }, [error, feedback]);
 
   const allProved = useMemo(() => intent.slots.every((slot) => slot.proved), [intent.slots]);
+  const awaitingExternalEmailProof = useMemo(
+    () => intent.slots.some((slot) => slot.state === "email_challenge_pending"),
+    [intent.slots],
+  );
+  const wasHiddenDuringEmailProof = useRef(false);
+
+  useEffect(() => {
+    if (!awaitingExternalEmailProof) {
+      wasHiddenDuringEmailProof.current = false;
+      return;
+    }
+    wasHiddenDuringEmailProof.current = document.visibilityState === "hidden";
+    const refreshWhenReturning = () => {
+      if (document.visibilityState === "hidden") {
+        wasHiddenDuringEmailProof.current = true;
+      } else if (wasHiddenDuringEmailProof.current) {
+        identityMutationNavigation.reload();
+      }
+    };
+    document.addEventListener("visibilitychange", refreshWhenReturning);
+    return () => {
+      document.removeEventListener("visibilitychange", refreshWhenReturning);
+    };
+  }, [awaitingExternalEmailProof]);
 
   function beginRequest(slotId: string | null): AbortController {
     abort.current?.abort();
@@ -576,6 +605,25 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
           <p role={error === null ? "status" : "alert"}>{error ?? feedback}</p>
         </div>
       )}
+      {awaitingExternalEmailProof ? (
+        <section className={styles["notice"]} aria-labelledby="external-email-proof-heading">
+          <h3 id="external-email-proof-heading">Waiting for email verification</h3>
+          <p>
+            After completing a magic link in another window, return here. This page refreshes when
+            you return, or you can refresh the exact proof status now.
+          </p>
+          <Button
+            variant="secondary"
+            type="button"
+            disabled={pendingSlot !== null}
+            onClick={() => {
+              identityMutationNavigation.reload();
+            }}
+          >
+            Refresh proof status
+          </Button>
+        </section>
+      ) : null}
       <ol className={styles["proofSlots"]} aria-label="Required identity proofs">
         {intent.slots.map((slot) => {
           const challenge = challengeBySlot[slot.id];
@@ -594,8 +642,8 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
               </p>
               <p>{stateDescription(slot)}</p>
               {canStart ? (
-                <button
-                  className={styles["method"]}
+                <Button
+                  variant="primary"
                   type="button"
                   disabled={pendingSlot !== null}
                   onClick={() => void selectMethod(slot)}
@@ -603,7 +651,7 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
                   {slot.next_action === "restart_provider"
                     ? "Restart fixed provider proof"
                     : `Start ${slot.method_kind} proof`}
-                </button>
+                </Button>
               ) : null}
               {canEnterEmail ? (
                 <form
@@ -613,7 +661,7 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
                   }}
                 >
                   <label htmlFor={`identity-email-${slot.id}`}>Email address for this proof</label>
-                  <input
+                  <Input
                     id={`identity-email-${slot.id}`}
                     type="email"
                     autoComplete="email"
@@ -624,15 +672,11 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
                       setEmailBySlot((current) => ({ ...current, [slot.id]: event.target.value }));
                     }}
                   />
-                  <button
-                    className={styles["secondary"]}
-                    type="submit"
-                    disabled={pendingSlot !== null}
-                  >
+                  <Button variant="secondary" type="submit" disabled={pendingSlot !== null}>
                     {slot.next_action === "verify_email"
                       ? "Send a newer email"
                       : "Send verification email"}
-                  </button>
+                  </Button>
                 </form>
               ) : null}
               {challenge?.proofModes.includes("otp") === true &&
@@ -648,7 +692,7 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
                     {new Date(challenge.expiresAt).toLocaleTimeString()}.
                   </p>
                   <label htmlFor={`identity-otp-${slot.id}`}>One-time code</label>
-                  <input
+                  <Input
                     id={`identity-otp-${slot.id}`}
                     inputMode="numeric"
                     autoComplete="one-time-code"
@@ -664,13 +708,9 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
                       }));
                     }}
                   />
-                  <button
-                    className={styles["method"]}
-                    type="submit"
-                    disabled={pendingSlot !== null}
-                  >
+                  <Button variant="primary" type="submit" disabled={pendingSlot !== null}>
                     Verify newest code
-                  </button>
+                  </Button>
                 </form>
               ) : null}
             </li>
@@ -684,14 +724,14 @@ export function IdentityMutationFlow({ handle, bootstrap }: IdentityMutationFlow
             Explicitly mark proof collection ready. The operator must still review and confirm the
             exact plan.
           </p>
-          <button
-            className={styles["method"]}
+          <Button
+            variant="primary"
             type="button"
             disabled={pendingSlot !== null}
             onClick={() => void confirmReady()}
           >
             Mark proofs ready for operator review
-          </button>
+          </Button>
         </section>
       ) : null}
     </section>

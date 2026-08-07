@@ -50,12 +50,12 @@ use crate::{
 
 use super::{
     audit::append_runtime_audit,
+    auth_incarnation::AuthIncarnationFence,
     authentication::persistence,
     entity::project_user,
     projection::{
         IdentityProjectionMaterializer, MAX_APPLICATION_BINDINGS_PER_USER, base_profile_digest,
     },
-    runtime_incarnation::RuntimeIncarnationFence,
 };
 
 const CREATE_OPERATION: &str = "identity_mutation.create";
@@ -65,19 +65,19 @@ const MAX_MAGIC_CONTEXTS: i64 = 8;
 pub(crate) struct PostgresControlIdentityMutationRepository {
     database: DatabaseConnection,
     projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-    required_runtime_process_ids: Vec<String>,
+    required_auth_process_ids: Vec<String>,
 }
 
 impl PostgresControlIdentityMutationRepository {
     pub(crate) fn new(
         database: DatabaseConnection,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
     ) -> Self {
         Self {
             database,
             projection_materializer,
-            required_runtime_process_ids,
+            required_auth_process_ids,
         }
     }
 
@@ -89,8 +89,8 @@ impl PostgresControlIdentityMutationRepository {
 #[derive(Clone)]
 pub(crate) struct PostgresRuntimeIdentityMutationRepository {
     database: DatabaseConnection,
-    fence: RuntimeIncarnationFence,
-    required_runtime_process_ids: Vec<String>,
+    fence: AuthIncarnationFence,
+    required_auth_process_ids: Vec<String>,
 }
 
 impl PostgresRuntimeIdentityMutationRepository {
@@ -98,12 +98,12 @@ impl PostgresRuntimeIdentityMutationRepository {
         database: DatabaseConnection,
         process_id: String,
         incarnation: Uuid,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
     ) -> Self {
         Self {
             database,
-            fence: RuntimeIncarnationFence::new(process_id, incarnation),
-            required_runtime_process_ids,
+            fence: AuthIncarnationFence::new(process_id, incarnation),
+            required_auth_process_ids,
         }
     }
 
@@ -488,7 +488,7 @@ impl ControlIdentityMutationRepository for PostgresControlIdentityMutationReposi
         confirmation: PreparedIdentityMutationConfirmation,
     ) -> Result<IdentityMutationRecord, ApplicationError> {
         let transaction = self.begin().await?;
-        // Control confirmation has no Runtime process incarnation. It locks the Project graph
+        // Control confirmation has no Auth process incarnation. It locks the Project graph
         // before any typed namespace and delegates projection cryptography through one narrow,
         // transaction-scoped materializer.
         lock_project_graph(&transaction, confirmation.project_id).await?;
@@ -508,8 +508,7 @@ impl ControlIdentityMutationRepository for PostgresControlIdentityMutationReposi
             confirmation.expected_kind,
         )
         .await?;
-        revalidate_final_authority(&transaction, &intent, &self.required_runtime_process_ids)
-            .await?;
+        revalidate_final_authority(&transaction, &intent, &self.required_auth_process_ids).await?;
         if confirmation.expected_kind == IdentityMutationKind::Merge
             && merge_binding_union_count(&transaction, &intent).await?
                 > MAX_APPLICATION_BINDINGS_PER_USER
@@ -830,7 +829,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent_row,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await?;
         let timestamp = database_now(&transaction).await?;
@@ -928,7 +927,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await
         {
@@ -1049,7 +1048,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await?;
         let role = parse_role(&get::<String>(&slot, "slot_role")?)?;
@@ -1192,7 +1191,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent_row,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await?;
         let timestamp = database_now(&transaction).await?;
@@ -1256,7 +1255,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent_row,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await?;
         let aggregate = transaction
@@ -1276,7 +1275,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
         let policy =
-            admitted_email_method(&transaction, &slot, &self.required_runtime_process_ids).await?;
+            admitted_email_method(&transaction, &slot, &self.required_auth_process_ids).await?;
         let generation: i16 = get(&aggregate, "generation")?;
         if generation >= policy.max_generations || generation >= 5 {
             return Err(ApplicationError::InvalidTransition);
@@ -1333,11 +1332,11 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await?;
         let policy =
-            admitted_email_method(&transaction, &slot, &self.required_runtime_process_ids).await?;
+            admitted_email_method(&transaction, &slot, &self.required_auth_process_ids).await?;
         if policy != generation.admitted_method {
             return Err(ApplicationError::RevisionConflict);
         }
@@ -1799,7 +1798,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await?;
         if !proof_matches(&challenge, &verification)? {
@@ -1882,7 +1881,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             &transaction,
             &intent,
             &slot,
-            &self.required_runtime_process_ids,
+            &self.required_auth_process_ids,
         )
         .await?;
         require_digest_columns(
@@ -3303,7 +3302,7 @@ async fn revalidate_slot_authority(
     transaction: &DatabaseTransaction,
     intent: &QueryResult,
     slot: &QueryResult,
-    required_runtime_process_ids: &[String],
+    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     let project_id: Uuid = get(intent, "project_id")?;
     let owners = transaction
@@ -3448,7 +3447,7 @@ async fn revalidate_slot_authority(
                     transaction,
                     project_id,
                     &challenge,
-                    required_runtime_process_ids,
+                    required_auth_process_ids,
                 )
                 .await?;
             }
@@ -3461,7 +3460,7 @@ async fn revalidate_slot_authority(
 async fn admitted_email_method(
     transaction: &DatabaseTransaction,
     slot: &QueryResult,
-    required_runtime_process_ids: &[String],
+    required_auth_process_ids: &[String],
 ) -> Result<AdmittedEmailMethod, ApplicationError> {
     let project_id: Uuid = get(slot, "project_id")?;
     let application_id: Uuid = get(slot, "application_id")?;
@@ -3530,7 +3529,7 @@ async fn admitted_email_method(
         transaction,
         project_id,
         &authority,
-        required_runtime_process_ids,
+        required_auth_process_ids,
     )
     .await?;
     Ok(AdmittedEmailMethod {
@@ -3565,7 +3564,7 @@ async fn assert_smtp_authority(
     transaction: &DatabaseTransaction,
     project_id: Uuid,
     row: &QueryResult,
-    required_runtime_process_ids: &[String],
+    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     assert_smtp_values(
         transaction,
@@ -3576,7 +3575,7 @@ async fn assert_smtp_authority(
             generation: get(row, "smtp_generation")?,
             revision: get(row, "smtp_security_eligibility_revision")?,
         },
-        required_runtime_process_ids,
+        required_auth_process_ids,
     )
     .await
 }
@@ -3585,7 +3584,7 @@ async fn assert_smtp_values(
     transaction: &DatabaseTransaction,
     project_id: Uuid,
     authority: &SyntheticSmtpAuthority,
-    required_runtime_process_ids: &[String],
+    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     let present = if authority.selection == "project" {
         transaction
@@ -3599,7 +3598,7 @@ async fn assert_smtp_values(
                       SELECT required.process_id FROM jsonb_array_elements_text($5::jsonb) required(process_id)
                        WHERE NOT EXISTS (
                          SELECT 1 FROM project_smtp_runtime_readiness readiness
-                          JOIN runtime_process_incarnations incarnation
+                          JOIN auth_process_incarnations incarnation
                             ON incarnation.process_id=readiness.process_id
                            AND incarnation.process_incarnation=readiness.process_incarnation
                          WHERE readiness.project_id=smtp.project_id
@@ -3614,7 +3613,7 @@ async fn assert_smtp_values(
                     authority.configuration.into(),
                     authority.generation.into(),
                     authority.revision.into(),
-                    json!(required_runtime_process_ids).into(),
+                    json!(required_auth_process_ids).into(),
                 ],
             ))
             .await
@@ -3645,7 +3644,7 @@ async fn assert_email_ready(
     let ready = transaction
         .query_one_raw(statement(
             "SELECT 1 FROM email_protection_runtime_readiness readiness
-               JOIN runtime_process_incarnations current
+               JOIN auth_process_incarnations current
                  ON current.process_id=readiness.process_id
                 AND current.process_incarnation=readiness.process_incarnation
               WHERE readiness.process_id=$1 AND readiness.process_incarnation=$2
@@ -4056,7 +4055,7 @@ fn verified_challenge(
 async fn revalidate_final_authority(
     transaction: &DatabaseTransaction,
     intent: &QueryResult,
-    required_runtime_process_ids: &[String],
+    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     let project_id: Uuid = get(intent, "project_id")?;
     let project = transaction
@@ -4132,7 +4131,7 @@ async fn revalidate_final_authority(
         if get::<String>(slot, "state")? != "proved" {
             return Err(ApplicationError::InvalidTransition);
         }
-        revalidate_slot_authority(transaction, intent, slot, required_runtime_process_ids).await?;
+        revalidate_slot_authority(transaction, intent, slot, required_auth_process_ids).await?;
         if let Some(id) = get::<Option<Uuid>>(slot, "existing_provider_identity_id")? {
             require_identity(
                 transaction,

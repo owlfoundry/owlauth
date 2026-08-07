@@ -64,7 +64,7 @@ pub struct SystemCapabilities {
     path = "/v1/system",
     responses(
         (status = 200, description = "Authenticated deployment capabilities", body = SystemCapabilities),
-        (status = 401, description = "Missing or invalid operator API key")
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge")))
     ),
     security(("operator_api_key" = []))
 )]
@@ -97,11 +97,11 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::get_project_policy,
         crate::control_resources::update_project_policy,
         crate::control_resources::disable_project,
-        crate::control_resources::list_project_client_keys,
-        crate::control_resources::get_project_client_key,
-        crate::control_resources::create_project_client_key,
-        crate::control_resources::acknowledge_project_client_key_delivery,
-        crate::control_resources::revoke_project_client_key,
+        crate::control_resources::list_project_server_keys,
+        crate::control_resources::get_project_server_key,
+        crate::control_resources::create_project_server_key,
+        crate::control_resources::acknowledge_project_server_key_delivery,
+        crate::control_resources::revoke_project_server_key,
         crate::control_resources::list_applications,
         crate::control_resources::create_application,
         crate::control_resources::get_application,
@@ -119,6 +119,7 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::activate_webhook_secret_rotation,
         crate::control_resources::list_application_user_events,
         crate::control_resources::list_webhook_deliveries,
+        crate::control_resources::get_webhook_delivery,
         crate::control_resources::replay_webhook_delivery,
         crate::control_resources::list_signing_keys,
         crate::control_resources::rotate_signing_key,
@@ -138,6 +139,7 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::list_email_assignments,
         crate::control_resources::assign_email_method,
         crate::control_resources::list_deployment_smtp_generations,
+        crate::control_resources::reconcile_deployment_smtp_generation,
         crate::control_resources::disable_deployment_smtp_generation,
         crate::control_resources::compromise_deployment_smtp_generation,
         crate::control_resources::list_smtp_configurations,
@@ -148,6 +150,7 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::disable_smtp_configuration,
         crate::control_resources::compromise_smtp_configuration,
         crate::control_resources::list_project_users,
+        crate::control_resources::lookup_project_user_by_email,
         crate::control_resources::get_project_user,
         crate::control_resources::list_project_user_identities,
         crate::control_resources::disable_project_user,
@@ -216,13 +219,13 @@ pub fn get_system() -> SystemCapabilities {
         ReplayWebhookDeliveryRequest,
         SigningKey,
         SigningKeyList,
-        ProjectClientKeyStatus,
-        ProjectClientKey,
-        ProjectClientKeyList,
-        CreateProjectClientKeyRequest,
-        CreateProjectClientKeyResponse,
-        AcknowledgeProjectClientKeyDeliveryRequest,
-        RevokeProjectClientKeyRequest,
+        ProjectServerKeyStatus,
+        ProjectServerKey,
+        ProjectServerKeyList,
+        CreateProjectServerKeyRequest,
+        CreateProjectServerKeyResponse,
+        AcknowledgeProjectServerKeyDeliveryRequest,
+        RevokeProjectServerKeyRequest,
         RotateSigningKeyRequest,
         KeyTransitionRequest,
         Provider,
@@ -288,9 +291,13 @@ pub fn get_system() -> SystemCapabilities {
         MergeIdentityMutationConfirmation,
         ConfirmIdentityMutationIntentRequest,
         ProjectUserStatus,
+        ProjectUserSort,
+        ProjectUserIdentityFilter,
         ManagedSessionStatus,
         ProjectUser,
         ProjectUserList,
+        ProjectUserEmailLookupRequest,
+        ProjectUserLookup,
         ProjectUserIdentityStatus,
         RedactedEmailMarker,
         ProjectUserIdentityPresentation,
@@ -395,6 +402,10 @@ mod identity_inventory_tests {
         assert_eq!(
             document["components"]["schemas"]["ProjectUserIdentityList"]["properties"]["items"]["maxItems"],
             100
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ProjectUserLookup"]["required"],
+            serde_json::json!(["user"])
         );
         let identity = document["components"]["schemas"]["ProjectUserIdentity"].to_string();
         for forbidden in [

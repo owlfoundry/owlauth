@@ -36,6 +36,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/identity-mutations/{intent}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_identity_mutation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/identity-mutations/email/confirm/{challenge_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_identity_mutation_magic_confirmation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/interactions/{interaction}": {
         parameters: {
             query?: never;
@@ -44,6 +76,22 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_hosted_interaction"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/managed-reauthorizations/{interaction}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_hosted_managed_reauthorization"];
         put?: never;
         post?: never;
         delete?: never;
@@ -579,6 +627,7 @@ export interface components {
             email_available: boolean;
             email_proof_modes: components["schemas"]["EmailProofMode"][];
             expires_at: string;
+            pending_email_challenge?: null | components["schemas"]["HostedPendingEmailChallenge"];
             presentation_hint?: string | null;
             project_display_name: string;
             project_id: string;
@@ -590,6 +639,13 @@ export interface components {
         };
         /** @enum {string} */
         HostedInteractionStatus: "awaiting_method_selection" | "email_address_entry" | "email_challenge_pending" | "provider_authorization_started" | "provider_exchange_in_progress" | "authenticated" | "handoff_issued" | "completed" | "failed" | "expired";
+        HostedPendingEmailChallenge: {
+            challenge_id: string;
+            expires_at: string;
+            /** Format: int32 */
+            generation: number;
+            proof_modes: components["schemas"]["EmailProofMode"][];
+        };
         HostedProvider: {
             display_name: string;
             key: string;
@@ -696,6 +752,11 @@ export interface components {
             /** Format: int64 */
             expected_revision: number;
         };
+        SelectEmailResponse: {
+            /** Format: int64 */
+            revision: number;
+            status: components["schemas"]["HostedInteractionStatus"];
+        };
         SelectIdentityMutationMethodRequest: {
             csrf: string;
             /** Format: int64 */
@@ -783,7 +844,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "text/html": string;
+                };
             };
             404: {
                 headers: {
@@ -829,7 +892,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "text/html": string;
+                };
             };
             404: {
                 headers: {
@@ -841,6 +906,112 @@ export interface operations {
             };
             429: {
                 headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    get_identity_mutation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hosted identity-mutation HTML */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    get_identity_mutation_magic_confirmation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                challenge_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Generic fragment-only identity-mutation magic-link confirmation shell */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -865,7 +1036,65 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "text/html": string;
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+            429: {
+                headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
+            };
+        };
+    };
+    get_hosted_managed_reauthorization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                interaction: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hosted managed-reauthorization HTML */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
+                };
             };
             404: {
                 headers: {
@@ -1130,6 +1359,8 @@ export interface operations {
             };
             401: {
                 headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate": string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1262,6 +1493,8 @@ export interface operations {
             };
             429: {
                 headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1723,6 +1956,8 @@ export interface operations {
             };
             429: {
                 headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1781,6 +2016,8 @@ export interface operations {
             };
             429: {
                 headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1839,6 +2076,8 @@ export interface operations {
             };
             429: {
                 headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1868,7 +2107,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["CompletionResponse"];
+                    "application/json": components["schemas"]["SelectEmailResponse"];
                 };
             };
             403: {
@@ -1889,6 +2128,8 @@ export interface operations {
             };
             429: {
                 headers: {
+                    /** @description Required delay in whole seconds before retrying */
+                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2149,6 +2390,8 @@ export interface operations {
             };
             401: {
                 headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate": string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2255,6 +2498,8 @@ export interface operations {
             };
             401: {
                 headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate": string;
                     [name: string]: unknown;
                 };
                 content: {

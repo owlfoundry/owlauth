@@ -1,4 +1,4 @@
-# 05 — Runtime, Client, and Control HTTP contracts
+# 05 — Runtime, Server API, and Control HTTP contracts
 
 ## Contract authority
 
@@ -7,29 +7,26 @@ Reviewed Rust definitions in `crates/owlauth-types` are the source of stable HTT
 The package separates contracts by surface:
 
 - `runtime` contains Project Auth, session, current-user, and public key/configuration DTOs;
-- `client` contains Project-key-authenticated customer-backend user/projection/introspection DTOs;
+- `server` contains Project-key-authenticated customer-backend user/projection/introspection DTOs;
 - `control` contains administrative DTOs and problem details;
 - `health` contains minimal listener-specific health vocabulary.
 
-Runtime, Client, and Control operations are never combined merely because one process serves all listeners. Generated OpenAPI is a derived view and cannot grant an operation exposure or authorization.
+Runtime, Server API, and Control operations are never combined merely because one process serves both endpoints. Generated OpenAPI is a derived view and cannot grant an operation exposure or authorization.
 
-## Listener and router isolation
+## Endpoint and router isolation
 
 ```mermaid
 flowchart TB
-    subgraph RuntimeListener[Runtime listener: auth.example.com]
+    subgraph AuthEndpoint[Auth endpoint: auth.example.com]
         HU[Hosted Authentication UI]
-        RM[Public admission and Project resolution]
+        RM[Runtime admission and Project resolution]
         RR[Project Auth router]
         RC[Public Project config and JWKS]
+        SM[Project server-key authentication]
+        SR[Read-only Server API router]
     end
 
-    subgraph ClientListener[Client listener: client.auth.example.com]
-        BM[Project client-key authentication]
-        BR[Read-only Project user and introspection router]
-    end
-
-    subgraph ControlListener[Control listener: admin.auth.example.com or private bind]
+    subgraph ControlEndpoint[Control endpoint: admin.auth.example.com or private bind]
         WC[Embedded Web Console]
         CM[Deployment operator API-key authentication]
         CR[Control API router]
@@ -38,19 +35,19 @@ flowchart TB
     HU --> RM
     RM --> RR
     RM --> RC
-    BM --> BR
+    SM --> SR
     WC --> CM
     CM --> CR
     RR --> APP[Shared application services]
-    BR --> APP
+    SR --> APP
     CR --> APP
 ```
 
-OpenAPI documents are build/release artifacts from `owlauth-types`, not routes on any listener. Each server release attaches exact-version Runtime, Client, and Control JSON documents generated from the same qualified source.
+OpenAPI documents are build/release artifacts from `owlauth-types`, not routes on either endpoint. Each server release attaches exact-version Runtime, Server, and Control JSON documents generated from the same qualified source.
 
-The three listeners have distinct bind addresses, trusted-proxy settings, TLS policy, routers, middleware, authentication, CORS, rate limits, request bounds, connection budgets, metrics dimensions, and readiness. Routing by `Host` on one untrusted socket is not equivalent. Distinct Runtime and Control external origins are recommended to isolate the browser-held operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root base paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary as defined by spec 09. Internal listener isolation remains unchanged.
+Auth and Control have distinct bind addresses, TLS policy, transport budgets, process identities, metrics, and readiness. Within Auth, Runtime and Server API retain distinct routers, state, authentication, CORS/response policy, admission, metrics dimensions, PostgreSQL pools, and readiness inputs. Runtime and Server API share the Auth transport address and external base; routing by path never permits one surface to enter the other's middleware or state. Distinct Auth and Control external origins are recommended to isolate the browser-held operator key from public Runtime script execution. A shared origin requires disjoint non-root Auth/Control base paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary as defined by spec 09.
 
-In `--plane=all`, a request accepted by one listener cannot dispatch to either other surface's router through path, host, forwarding header, content type, or method manipulation.
+In `OWLAUTH_MODE=all`, a request accepted by Auth cannot dispatch to Control, and a request accepted by Control cannot dispatch to either Auth surface through path, host, forwarding header, content type, or method manipulation.
 
 ## Management Console surface
 
@@ -60,7 +57,7 @@ Console HTML/assets and client-side routes are server-owned implementation surfa
 
 ## Hosted Authentication UI surface
 
-The Runtime listener serves typed Project-scoped Hosted interactions and their fingerprinted assets under the configured Runtime base. An ordinary Application login generic start creates the unbound `login` class; Control create commands may create the separate `identity_mutation` class with server-derived immutable proof roles or an exact `managed_reauthorization` class for one existing connection. Only the first eligible top-level Hosted GET may conditionally bind a fresh Runtime interaction-browser credential and CSRF state before rendering its typed next actions; an API fetch, subresource, frame, copied URL after binding, query value, or initiating backend cannot provide or replace that browser authority. Ordinary reads and every method/confirmation command require the already matching class and binding; no class fallback or conversion exists.
+The Auth endpoint's Runtime surface serves typed Project-scoped Hosted interactions and their fingerprinted assets under the configured Runtime base. An ordinary Application login generic start creates the unbound `login` class; Control create commands may create the separate `identity_mutation` class with server-derived immutable proof roles or an exact `managed_reauthorization` class for one existing connection. Only the first eligible top-level Hosted GET may conditionally bind a fresh Runtime interaction-browser credential and CSRF state before rendering its typed next actions; an API fetch, subresource, frame, copied URL after binding, query value, or initiating backend cannot provide or replace that browser authority. Ordinary reads and every method/confirmation command require the already matching class and binding; no class fallback or conversion exists.
 
 For `login`, the UI presents only the transaction's admitted provider/email methods, submits one explicit method-selection command, shows progress or bounded local errors, may reuse a valid Project browser session, and completes an Application return. It resolves all authority from stored login-transaction and public Project/Application state; caller input or an optional start hint cannot select/enable a method or replace Project, Application, provider assignment, callback, exact redirect, browser binding, or PKCE. Only successful `login` authentication returns to the exact registered Application redirect with the short-lived one-use handoff allowed by spec 03.
 
@@ -68,7 +65,11 @@ For `identity_mutation`, the UI renders only the intent's server-derived roles a
 
 For `managed_reauthorization`, the UI renders one fixed provider action for the exact frozen existing user/identity/connection and captured active Application assignment. Its callback requires the adapter's exact managed scopes and may only generation-fence and replace that connection's encrypted renewable credential, restore `active`, complete the interaction, and audit. Only after that successor transaction commits may an optional bounded profile result be obtained and committed through the separate current-generation profile-sync transaction with its user/projection/event guards. It creates no user, identity, browser/Application session, handoff, receipt, or ownership mutation. Hosted UI assets and pages never expose the Control endpoint/key, receipt capability, or mount Control routes.
 
-The Runtime/Control browser route partition, distinct/shared external URL models, key/browser storage behavior, CSP, caching, redirect safety, and packaging requirements are owned by [spec 09](09-hosted-web-surfaces-and-control-auth.md). The JSON-only Client surface and Project client-key boundary are owned by [spec 13](13-client-api-and-project-client-keys.md).
+The Runtime/Control browser route partition, distinct/shared external URL models, key/browser storage behavior, CSP, caching, redirect safety, and packaging requirements are owned by [spec 09](09-hosted-web-surfaces-and-control-auth.md). The JSON-only Server API surface and Project server-key boundary are owned by [spec 13](13-server-api-and-project-server-keys.md).
+
+Runtime OpenAPI includes every stable JSON operation plus only externally initiated Hosted document navigation entrypoints. Those document operations declare their successful `text/html` representation and their request-level JSON rejection statuses. Fingerprinted assets, the internal `/auth/` shell root, SPA fallback behavior, and internal client-side routes are excluded. Control Console documents and assets remain entirely outside Control OpenAPI.
+
+Persisted route classes use stable placeholder vocabulary: ordinary login and managed reauthorization use `{interaction}`; identity mutation uses `{intent}`; an identity-mutation proof child uses `{proof_slot}`. Placeholder names in routers, reviewed contracts, and generated clients must agree even when they do not alter path matching.
 
 ## Runtime Project Auth surface
 
@@ -84,7 +85,8 @@ A representative stable path model is:
 | `GET /projects/{project_public_id}/auth/callback/{provider_key}`                                        | receive the exact upstream callback after stored provider selection; no alias exists                                    | trusted Runtime base plus immutable Project public ID/provider key, server-owned state binding, and exact typed `login`, `identity_mutation`, or `managed_reauthorization` completion class               |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/challenges`                       | accept email after stored email selection, then create an enumeration-safe newest challenge and pinned durable mail job | assigned email method, browser/CSRF/revision binding, email/IP rate policy and server safety floors                                                                                                       |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/otp/verify`                       | consume newest OTP challenge                                                                                            | opaque interaction, proof attempt/expiry/generation and transaction binding                                                                                                                               |
-| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/link/verify`                      | consume a fragment-staged magic-link proof after explicit user confirmation                                             | same-origin CSRF protection, digest-bound token, exact stored transaction and safe local error/redirect policy                                                                                            |
+| `GET /auth/email/confirm/{challenge_id}`                                                                | load the inert fragment-only magic-link transfer document without consuming proof                                       | top-level navigation; raw proof remains in the URL fragment and is removed before explicit confirmation                                                                                                   |
+| `POST /v1/projects/{project_id}/auth/email/magic/confirm`                                               | consume a fragment-staged magic-link proof after explicit user confirmation                                             | same-origin CSRF protection, digest-bound token, exact stored transaction and safe local error/redirect policy                                                                                            |
 | `POST /v1/projects/{project_id}/auth/handoff/exchange`                                                  | exchange one-use ticket for revisioned user/session credentials                                                         | Application binding and PKCE verifier                                                                                                                                                                     |
 | `POST /v1/projects/{project_id}/auth/sessions/refresh`                                                  | rotate refresh family                                                                                                   | Project/Application-bound opaque refresh token                                                                                                                                                            |
 | `GET /v1/projects/{project_id}/auth/users/me`                                                           | return bounded current Project user                                                                                     | valid Project access token                                                                                                                                                                                |
@@ -105,6 +107,22 @@ A representative stable path model is:
 
 These paths define the wire-level resource model. Every Runtime operation is Project-qualified, provider/email proof callbacks and Application redirects remain separate URL classes, and no downstream general-purpose OAuth surface exists. Identity-mutation Hosted paths are not account-portal or mutation authority: they can open only from one stored Control-created intent, attach server-side purpose-bound proof receipts to its exact slots, and mark the ceremony ready; only the later operator-authenticated Control confirmation can consume those receipts and commit link/unlink/merge. Managed-reauthorization Hosted paths can replace only one frozen existing connection generation and return no Application credential. Runtime and Control never return receipt or provider-credential capability bytes. Generic login start never performs a provider redirect or sends email. In ordinary login, method selection is an explicit one-way transaction transition and provider/email methods converge on the same handoff/session contract. Identity-mutation proof is a separate persisted class and can converge only on candidate/existing-identity evidence, a receipt, and intent readiness—never a handoff, session, user creation, or ownership mutation. Managed reauthorization is a third exact typed class, never a mutation or login fallback, and can converge only on the current connection successor/profile/audit. Handoff, refresh, and current-user responses share the generated versioned projection with monotonic `user_revision` and Application-specific `projection_revision` owned by spec 11; Runtime exposes no list-all-users/change-feed route.
 
+### Release operation ledger
+
+This ledger maps normative target families to the released V1 contract without duplicating handler detail. `renamed` means the replacement is authoritative and no compatibility alias is retained.
+
+| Normative target or earlier name                                                            | Released contract                                                                                       | Status      | Decision                                                                                          |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------- |
+| ordinary email-link verification under `/auth/interactions/{interaction}/email/link/verify` | `POST /v1/projects/{project_id}/auth/email/magic/confirm` plus `GET /auth/email/confirm/{challenge_id}` | renamed     | transfer context and fragment proof are confirmed independently of the original browser-bound URL |
+| identity-mutation route placeholders named `{interaction}`                                  | identity-mutation routes named `{intent}` and children named `{proof_slot}`                             | renamed     | placeholder vocabulary follows the persisted class                                                |
+| provider unassignment by `DELETE` with a body                                               | `POST .../assignments/{application_id}/unassign`                                                        | renamed     | revisioned commands do not rely on DELETE request bodies                                          |
+| Project-wide `/projects/{project}/sessions` inventory                                       | user-qualified Application/browser session resources                                                    | renamed     | V1 exposes only bounded exact ownership paths                                                     |
+| one retained webhook delivery                                                               | `GET .../webhook-deliveries/{delivery_id}`                                                              | implemented | supports the canonical `Location` returned by replay-created delivery resources                   |
+| Project and deployment audit-event query APIs                                               | no released HTTP route                                                                                  | deferred    | durable audit writes exist; bounded operator query design remains future work                     |
+| organization or tenant administration                                                       | no released resource family                                                                             | removed     | `belongs_to` remains an opaque extension pointer, not OwlAuth organization authority              |
+| official Server API SDK                                                                     | generated Server OpenAPI only                                                                           | removed     | official SDKs remain Runtime Project Auth only                                                    |
+| WebKit/Safari Hosted qualification                                                          | Chromium and Firefox real-browser gate                                                                  | deferred    | support expands only with equivalent secure end-to-end evidence                                   |
+
 ### Public auth configuration
 
 Public configuration may include:
@@ -116,7 +134,7 @@ Public configuration may include:
 - safe Runtime URLs and SDK feature flags;
 - allowed authentication methods that contain no secret; the server still snapshots and revalidates assignment when starting/selecting a method.
 
-It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal/protected-material IDs, key-provider handles/envelopes, Redis/PostgreSQL topology, or policy internals. Runtime authentication middleware recognizes neither `OWLAUTH_CONTROL_API_KEY` nor Project client keys; presenting either value to a Runtime route never grants access.
+It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal/protected-material IDs, key-provider handles/envelopes, Redis/PostgreSQL topology, or policy internals. Runtime authentication middleware recognizes neither `OWLAUTH_CONTROL_API_KEY` nor Project server keys; presenting either value to a Runtime route never grants access.
 
 ### Runtime parsing and errors
 
@@ -129,6 +147,8 @@ Runtime rejects:
 - unbounded arrays, objects, forms, headers, and URLs;
 - redirects/origins not exactly registered for the selected Application.
 
+Malformed, unsupported, or listener-body-limit JSON extraction uses the plane's stable `400 invalid_json`/invalid-request envelope; OwlAuth does not let middleware order alternate this ordinary JSON contract with an unstructured `413`. A transport or ingress may still reject a wire request earlier under its own parser limits.
+
 Errors use a stable OwlAuth Project Auth shape containing a machine code, safe message, and optional correlation ID. Provider errors are normalized. Responses do not reveal whether another Project, Application, user, identity, ticket, session, or refresh token exists.
 
 An ordinary-login provider callback failure redirects only to the Application URI already validated and stored in that login transaction; otherwise Runtime renders a local safe error. An identity-mutation callback has no Application redirect or handoff authority and returns only to its exact stored Hosted intent/slot continuation with a generic safe outcome.
@@ -139,11 +159,11 @@ CORS is deny-by-default and Application-specific. Runtime compares the exact req
 
 Publishable keys and public IDs can identify rate/quotas but do not authorize user data. Current-user and refresh responses require actual session credentials.
 
-## Customer-backend Client surface
+## Customer-backend Server API surface
 
-Client resources are rooted at `/v1/projects/{project_public_id}/` on the independent Client listener. They require exactly one active Project client key whose authoritative Project matches the route. V1 exposes only bounded user listing/exact lookup, materialized Application projection lookup, and Project access-token introspection. It has no browser CORS, cookies, HTML, redirect, Control mutation, or Runtime login/session endpoint.
+Server API resources are rooted at `/v1/projects/{project_public_id}/` on Auth. They require exactly one active Project server key whose authoritative Project matches the route. V1 exposes only bounded user listing/exact lookup, materialized Application projection lookup, and Project access-token introspection. It has no browser CORS, cookies, HTML, redirect, Control mutation, or Runtime login/session endpoint.
 
-Client uses an independent `project_client_key` bearer security scheme and complete OpenAPI document. Authentication denial, generous configurable abuse limits, PostgreSQL-authoritative permission and read checks, response minimization, and exact routes are defined by spec 13. V1 does not cache Client directory/email/projection/introspection responses. OwlAuth publishes no Client API SDK; existing language SDK surface normalization must prove that no Client operation or security scheme enters their Runtime contract.
+Server API uses an independent `project_server_key` bearer security scheme and complete OpenAPI document. Authentication denial, generous configurable abuse limits, PostgreSQL-authoritative permission and read checks, response minimization, and exact routes are defined by spec 13. V1 does not cache Server API directory/email/projection/introspection responses. OwlAuth publishes no Server API SDK; existing language SDK surface normalization must prove that no Server API operation or security scheme enters their Runtime contract.
 
 ## Control service discovery
 
@@ -157,7 +177,7 @@ Control resources are rooted at `/v1/` and Project-owned operations always carry
 
 | Resource family                                           | Representative operations                                                                                                                                                                                                                                                                                                                                                          |
 | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/projects`                                               | create/read/update/disable; read/write/filter exact `belongs_to`; list/create/revoke Project client keys with one-time create reveal                                                                                                                                                                                                                                               |
+| `/projects`                                               | create/read/update/disable; read/write/filter exact `belongs_to`; list/create/revoke Project server keys with one-time create reveal                                                                                                                                                                                                                                               |
 | `/projects/{project}/applications`                        | register/disable app; origins, redirects, publishable keys                                                                                                                                                                                                                                                                                                                         |
 | `/projects/{project}/providers`                           | configure/disable provider client registrations, obtain secret-free server-owned registration guidance for custom OIDC and named adapters, resource-keyed reconcile of interrupted secret provisioning with write-only secret re-entry, and assign Applications                                                                                                                    |
 | `/projects/{project}/provider-egress-policy`              | read or revision-CAS the Project's custom-provider origin policy; default allow-all mode or recommended exact-origin mode                                                                                                                                                                                                                                                          |

@@ -48,9 +48,9 @@ pub(crate) enum AdmissionEndpoint {
     BrowserLogoutPrepare,
     BrowserLogoutRead,
     BrowserLogoutConfirm,
-    ClientPreAuthority,
-    ClientCredentialFailure,
-    ClientAuthoritative,
+    ServerPreAuthority,
+    ServerCredentialFailure,
+    ServerAuthoritative,
 }
 
 impl AdmissionEndpoint {
@@ -83,9 +83,9 @@ impl AdmissionEndpoint {
         Self::BrowserLogoutPrepare,
         Self::BrowserLogoutRead,
         Self::BrowserLogoutConfirm,
-        Self::ClientPreAuthority,
-        Self::ClientCredentialFailure,
-        Self::ClientAuthoritative,
+        Self::ServerPreAuthority,
+        Self::ServerCredentialFailure,
+        Self::ServerAuthoritative,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -117,16 +117,16 @@ impl AdmissionEndpoint {
             Self::BrowserLogoutPrepare => "browser_logout_prepare",
             Self::BrowserLogoutRead => "browser_logout_read",
             Self::BrowserLogoutConfirm => "browser_logout_confirm",
-            Self::ClientPreAuthority => "client_pre_authority",
-            Self::ClientCredentialFailure => "client_credential_failure",
-            Self::ClientAuthoritative => "client_authoritative",
+            Self::ServerPreAuthority => "server_pre_authority",
+            Self::ServerCredentialFailure => "server_credential_failure",
+            Self::ServerAuthoritative => "server_authoritative",
         }
     }
 
     const fn policy(self) -> AdmissionPolicy {
         let limit = match self {
-            Self::ClientPreAuthority => 60_000,
-            Self::ClientAuthoritative => 6_000,
+            Self::ServerPreAuthority => 60_000,
+            Self::ServerAuthoritative => 6_000,
             Self::PublicConfig | Self::ProjectJwks | Self::CurrentUser => 600,
             Self::HostedInteraction | Self::HostedIdentityMutation => 300,
             Self::Refresh => 240,
@@ -134,7 +134,7 @@ impl AdmissionEndpoint {
             | Self::EmailChallenge
             | Self::EmailResend
             | Self::IdentityMutationEmailChallenge => 256,
-            Self::LoginStart | Self::BrowserLogoutPrepare | Self::ClientCredentialFailure => 120,
+            Self::LoginStart | Self::BrowserLogoutPrepare | Self::ServerCredentialFailure => 120,
             Self::ProviderCallback | Self::HandoffExchange | Self::ApplicationLogout => 96,
             Self::ManagedReauthorizationStart
             | Self::IdentityMutationMethod
@@ -415,7 +415,7 @@ pub(crate) struct AdmissionService {
     distributed: Option<Arc<dyn DistributedAdmissionCounter>>,
     local: Mutex<LocalCounters>,
     backend_state: Mutex<BackendState>,
-    client_failure_blocks: Mutex<HashMap<String, u64>>,
+    server_failure_blocks: Mutex<HashMap<String, u64>>,
     monotonic: Arc<dyn MonotonicClock>,
 }
 
@@ -443,7 +443,7 @@ impl AdmissionService {
         monotonic: Arc<dyn MonotonicClock>,
     ) -> Self {
         let mut mac = HmacSha256::new_from_slice(&digest_root).expect("HMAC accepts any key size");
-        mac.update(b"owlauth/runtime-admission/key/v1");
+        mac.update(b"owlauth/auth-admission/key/v1");
         let digest_key: [u8; 32] = mac.finalize().into_bytes().into();
         Self {
             namespace: Arc::from(namespace),
@@ -452,7 +452,7 @@ impl AdmissionService {
             distributed,
             local: Mutex::new(LocalCounters::new(LOCAL_CAPACITY)),
             backend_state: Mutex::new(BackendState::default()),
-            client_failure_blocks: Mutex::new(HashMap::new()),
+            server_failure_blocks: Mutex::new(HashMap::new()),
             monotonic,
         }
     }
@@ -488,14 +488,14 @@ impl AdmissionService {
     /// limited to dimensions available without `PostgreSQL`: the transport client and the opaque
     /// interaction credential. Its purpose-separated keys cannot consume or replenish the later
     /// owner-scoped quota.
-    /// Strict source-only guard before any Client credential parsing or `PostgreSQL` lookup.
-    pub(crate) async fn admit_client_pre_authority(
+    /// Strict source-only guard before any Server credential parsing or `PostgreSQL` lookup.
+    pub(crate) async fn admit_server_pre_authority(
         &self,
         client_address: &str,
     ) -> AdmissionDecision {
         let now = self.monotonic.elapsed_millis();
         let block_key = self.digest("client_failure_source", client_address);
-        if let Ok(mut blocks) = self.client_failure_blocks.lock() {
+        if let Ok(mut blocks) = self.server_failure_blocks.lock() {
             match blocks.get(&block_key).copied() {
                 Some(expires_at) if expires_at > now => {
                     return AdmissionDecision::Rejected {
@@ -511,7 +511,7 @@ impl AdmissionService {
             }
         }
         self.admit_stage(
-            AdmissionEndpoint::ClientPreAuthority,
+            AdmissionEndpoint::ServerPreAuthority,
             Some(client_address),
             &[],
             "pre_authority",
@@ -520,13 +520,13 @@ impl AdmissionService {
     }
 
     /// Strict failure-only source guard. Valid credentials never consume this budget.
-    pub(crate) async fn admit_client_credential_failure(
+    pub(crate) async fn admit_server_credential_failure(
         &self,
         client_address: &str,
     ) -> AdmissionDecision {
         let decision = self
             .admit_stage(
-                AdmissionEndpoint::ClientCredentialFailure,
+                AdmissionEndpoint::ServerCredentialFailure,
                 Some(client_address),
                 &[],
                 "credential_failure",
@@ -539,7 +539,7 @@ impl AdmissionService {
         {
             let now = self.monotonic.elapsed_millis();
             let block_key = self.digest("client_failure_source", client_address);
-            if let Ok(mut blocks) = self.client_failure_blocks.lock() {
+            if let Ok(mut blocks) = self.server_failure_blocks.lock() {
                 if blocks.len() >= CLIENT_FAILURE_BLOCK_CAPACITY && !blocks.contains_key(&block_key)
                 {
                     blocks.retain(|_, expires_at| *expires_at > now);
@@ -557,7 +557,7 @@ impl AdmissionService {
 
     /// Generous owner-scoped guard after `PostgreSQL`-backed Client authentication. UUID values are
     /// private authoritative identifiers; no raw credential enters an admission key.
-    pub(crate) async fn admit_client_authoritative(
+    pub(crate) async fn admit_server_authoritative(
         &self,
         client_address: &str,
         project_id: &str,
@@ -576,7 +576,7 @@ impl AdmissionService {
             },
         ];
         self.admit_stage(
-            AdmissionEndpoint::ClientAuthoritative,
+            AdmissionEndpoint::ServerAuthoritative,
             Some(client_address),
             &dimensions,
             "authoritative",
@@ -819,7 +819,7 @@ impl AdmissionService {
     fn scoped_email_digest(&self, dimension: &AdmissionDimension<'_>) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.digest_key).expect("HMAC accepts any key size");
-        mac.update(b"owlauth/runtime-admission/scoped-email/v1");
+        mac.update(b"owlauth/auth-admission/scoped-email/v1");
         let Some((project_id, application_id)) = dimension.email_scope else {
             // Only server-resolved interaction authority constructs Email dimensions. Retain a
             // fail-closed domain if an internal caller violates that contract.
@@ -998,9 +998,9 @@ mod tests {
                 "browser_logout_prepare",
                 "browser_logout_read",
                 "browser_logout_confirm",
-                "client_pre_authority",
-                "client_credential_failure",
-                "client_authoritative",
+                "server_pre_authority",
+                "server_credential_failure",
+                "server_authoritative",
             ]
         );
         assert_eq!(

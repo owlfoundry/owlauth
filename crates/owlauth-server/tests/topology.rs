@@ -26,7 +26,7 @@ const IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY: &str =
     "ERERERERERERERERERERERERERERERERERERERERERE";
 const PROJECTION_EMAIL_PROTECTION_KEY: &str = "R0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0c";
 const MANAGED_CREDENTIAL_KEY: &str = "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY";
-const CLIENT_KEY_DIGEST_KEY: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo";
+const SERVER_KEY_DIGEST_KEY: &str = "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo";
 const SOFTWARE_CUSTODY_KEY: &str = "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4";
 
 type Environment = Vec<(String, String)>;
@@ -69,16 +69,16 @@ impl TestEnvironment {
             ("OWLAUTH_INSTANCE_ID".to_owned(), "topology-test".to_owned()),
             ("OWLAUTH_POSTGRES_URL".to_owned(), postgres_url.to_owned()),
             (
-                "OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION".to_owned(),
+                "OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION".to_owned(),
                 "1".to_owned(),
             ),
             (
-                "OWLAUTH_CLIENT_KEY_DIGEST_KEY".to_owned(),
-                CLIENT_KEY_DIGEST_KEY.to_owned(),
+                "OWLAUTH_SERVER_KEY_DIGEST_KEY".to_owned(),
+                SERVER_KEY_DIGEST_KEY.to_owned(),
             ),
             (
-                "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS".to_owned(),
-                "topology-client".to_owned(),
+                "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+                "topology-auth".to_owned(),
             ),
             (
                 "OWLAUTH_SOFTWARE_CUSTODY_KEY".to_owned(),
@@ -234,8 +234,8 @@ fn control_environment(common: &Environment, port: u16) -> Environment {
             OPERATOR_KEY.to_owned(),
         ),
         (
-            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-            "topology-runtime".to_owned(),
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            "topology-auth".to_owned(),
         ),
     ]);
     result
@@ -258,10 +258,10 @@ fn assert_control_key_custody(environment: &Environment) {
     );
 }
 
-fn runtime_environment(common: &Environment, port: u16) -> Environment {
+fn auth_environment(common: &Environment, port: u16) -> Environment {
     let mut result = common.clone();
     result.extend([
-        ("OWLAUTH_MODE".to_owned(), "runtime".to_owned()),
+        ("OWLAUTH_MODE".to_owned(), "auth".to_owned()),
         ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
         (
             "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
@@ -279,17 +279,14 @@ fn runtime_environment(common: &Environment, port: u16) -> Environment {
             "OWLAUTH_MANAGED_CREDENTIAL_KEY".to_owned(),
             MANAGED_CREDENTIAL_KEY.to_owned(),
         ),
+        ("OWLAUTH_AUTH_ADDR".to_owned(), format!("127.0.0.1:{port}")),
         (
-            "OWLAUTH_RUNTIME_ADDR".to_owned(),
-            format!("127.0.0.1:{port}"),
-        ),
-        (
-            "OWLAUTH_RUNTIME_BASE_URL".to_owned(),
+            "OWLAUTH_AUTH_BASE_URL".to_owned(),
             format!("http://127.0.0.1:{port}/"),
         ),
         (
-            "OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
-            "topology-runtime".to_owned(),
+            "OWLAUTH_AUTH_PROCESS_ID".to_owned(),
+            "topology-auth".to_owned(),
         ),
         (
             "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION".to_owned(),
@@ -311,51 +308,10 @@ fn runtime_environment(common: &Environment, port: u16) -> Environment {
     result
 }
 
-fn client_environment(common: &Environment, port: u16) -> Environment {
-    let mut result = common.clone();
-    result.extend([
-        ("OWLAUTH_MODE".to_owned(), "client".to_owned()),
-        (
-            "OWLAUTH_CLIENT_ADDR".to_owned(),
-            format!("127.0.0.1:{port}"),
-        ),
-        (
-            "OWLAUTH_CLIENT_BASE_URL".to_owned(),
-            format!("http://127.0.0.1:{port}/"),
-        ),
-        (
-            "OWLAUTH_CLIENT_PROCESS_ID".to_owned(),
-            "topology-client".to_owned(),
-        ),
-        (
-            "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
-            ADMISSION_DIGEST_KEY.to_owned(),
-        ),
-    ]);
-    result
-}
-
-fn combined_environment(
-    common: &Environment,
-    runtime_port: u16,
-    client_port: u16,
-    control_port: u16,
-) -> Environment {
-    let mut result = runtime_environment(common, runtime_port);
+fn combined_environment(common: &Environment, auth_port: u16, control_port: u16) -> Environment {
+    let mut result = auth_environment(common, auth_port);
     result.extend([
         ("OWLAUTH_MODE".to_owned(), "all".to_owned()),
-        (
-            "OWLAUTH_CLIENT_ADDR".to_owned(),
-            format!("127.0.0.1:{client_port}"),
-        ),
-        (
-            "OWLAUTH_CLIENT_BASE_URL".to_owned(),
-            format!("http://127.0.0.1:{client_port}/"),
-        ),
-        (
-            "OWLAUTH_CLIENT_PROCESS_ID".to_owned(),
-            "topology-client".to_owned(),
-        ),
         (
             "OWLAUTH_CONTROL_ADDR".to_owned(),
             format!("127.0.0.1:{control_port}"),
@@ -401,9 +357,9 @@ struct ProjectIdentity {
     metadata_revision: i64,
 }
 
-struct ClientCredential(String);
+struct ServerCredential(String);
 
-impl Drop for ClientCredential {
+impl Drop for ServerCredential {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.0);
     }
@@ -446,56 +402,56 @@ async fn create_project(client: &Client, control_base: &str, suffix: &str) -> Pr
     }
 }
 
-async fn create_and_acknowledge_client_key(
+async fn create_and_acknowledge_server_key(
     client: &Client,
     control_base: &str,
     project: &ProjectIdentity,
     suffix: &str,
-) -> ClientCredential {
+) -> ServerCredential {
     let response = client
         .post(format!(
-            "{control_base}v1/projects/{}/client-keys",
+            "{control_base}v1/projects/{}/server-keys",
             project.id
         ))
         .bearer_auth(OPERATOR_KEY)
-        .header("Idempotency-Key", format!("topology-{suffix}-client-key"))
+        .header("Idempotency-Key", format!("topology-{suffix}-server-key"))
         .header("Content-Type", "application/json")
         .body(
             serde_json::to_vec(&json!({ "label": format!("Topology {suffix}") }))
-                .expect("client-key request should serialize"),
+                .expect("server-key request should serialize"),
         )
         .send()
         .await
-        .expect("Control client-key creation should respond");
+        .expect("Control server-key creation should respond");
     assert_eq!(response.status(), StatusCode::CREATED);
     let created = serde_json::from_slice::<Value>(
         &response
             .bytes()
             .await
-            .expect("client-key creation response should be readable"),
+            .expect("server-key creation response should be readable"),
     )
-    .expect("client-key creation response should be JSON");
+    .expect("server-key creation response should be JSON");
     let key_id = created["key"]["id"]
         .as_str()
-        .expect("client-key response should contain id");
+        .expect("server-key response should contain id");
     let revision = created["key"]["revision"]
         .as_i64()
-        .expect("client-key response should contain revision");
-    let credential = ClientCredential(
+        .expect("server-key response should contain revision");
+    let credential = ServerCredential(
         created["credential"]
             .as_str()
-            .expect("client-key response should reveal one credential")
+            .expect("server-key response should reveal one credential")
             .to_owned(),
     );
     let response = client
         .post(format!(
-            "{control_base}v1/projects/{}/client-keys/{key_id}/acknowledge",
+            "{control_base}v1/projects/{}/server-keys/{key_id}/acknowledge",
             project.id
         ))
         .bearer_auth(OPERATOR_KEY)
         .header(
             "Idempotency-Key",
-            format!("topology-{suffix}-client-key-ack"),
+            format!("topology-{suffix}-server-key-ack"),
         )
         .header("Content-Type", "application/json")
         .body(
@@ -503,19 +459,19 @@ async fn create_and_acknowledge_client_key(
                 "expected_revision": revision,
                 "confirm_stored": true
             }))
-            .expect("client-key acknowledgement should serialize"),
+            .expect("server-key acknowledgement should serialize"),
         )
         .send()
         .await
-        .expect("Control client-key acknowledgement should respond");
+        .expect("Control server-key acknowledgement should respond");
     assert_eq!(response.status(), StatusCode::OK);
     let acknowledged = serde_json::from_slice::<Value>(
         &response
             .bytes()
             .await
-            .expect("client-key acknowledgement should be readable"),
+            .expect("server-key acknowledgement should be readable"),
     )
-    .expect("client-key acknowledgement should be JSON");
+    .expect("server-key acknowledgement should be JSON");
     assert!(acknowledged["credential_acknowledged_at"].is_string());
     credential
 }
@@ -619,26 +575,26 @@ async fn assert_runtime_reads_project(client: &Client, runtime_base: &str, publi
     );
 }
 
-async fn assert_client_reads_project(
+async fn assert_server_api_reads_project(
     client: &Client,
-    client_base: &str,
+    auth_base: &str,
     public_id: &str,
-    credential: &ClientCredential,
+    credential: &ServerCredential,
 ) {
     let response = client
-        .get(format!("{client_base}v1/projects/{public_id}/users"))
+        .get(format!("{auth_base}v1/projects/{public_id}/users"))
         .bearer_auth(&credential.0)
         .send()
         .await
-        .expect("Client Project directory should respond");
+        .expect("Server API Project directory should respond");
     assert_eq!(response.status(), StatusCode::OK);
     let body = serde_json::from_slice::<Value>(
         &response
             .bytes()
             .await
-            .expect("Client Project directory should be readable"),
+            .expect("Server API Project directory should be readable"),
     )
-    .expect("Client Project directory should be JSON");
+    .expect("Server API Project directory should be JSON");
     assert_eq!(body["items"].as_array().map(Vec::len), Some(0));
 }
 
@@ -682,9 +638,9 @@ fn database_url(host: &str, port: u16, database: &str) -> String {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "one topology journey must retain combined, split, restart, isolation, and authority-mismatch lifecycles"
+    reason = "one topology journey retains combined, split, restart, isolation, and authority-mismatch lifecycles"
 )]
-async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages() {
+async fn combined_and_split_topologies_share_authority_and_isolate_endpoint_outages() {
     let Some(postgres) = start_postgres().await else {
         return;
     };
@@ -704,34 +660,30 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
         .build()
         .expect("HTTP client should build");
 
-    let combined_runtime_port = free_port();
-    let combined_client_port = free_port();
+    let combined_auth_port = free_port();
     let combined_control_port = free_port();
-    let combined_runtime_base = format!("http://127.0.0.1:{combined_runtime_port}/");
-    let combined_client_base = format!("http://127.0.0.1:{combined_client_port}/");
+    let combined_auth_base = format!("http://127.0.0.1:{combined_auth_port}/");
     let combined_control_base = format!("http://127.0.0.1:{combined_control_port}/");
     let mut combined = ServerProcess::spawn(&combined_environment(
         &common,
-        combined_runtime_port,
-        combined_client_port,
+        combined_auth_port,
         combined_control_port,
     ));
-    wait_for_ready(&client, &combined_runtime_base, &mut combined).await;
-    wait_for_ready(&client, &combined_client_base, &mut combined).await;
+    wait_for_ready(&client, &combined_auth_base, &mut combined).await;
     wait_for_ready(&client, &combined_control_base, &mut combined).await;
     let combined_project = create_project(&client, &combined_control_base, "combined").await;
-    let combined_client_credential = create_and_acknowledge_client_key(
+    let combined_server_credential = create_and_acknowledge_server_key(
         &client,
         &combined_control_base,
         &combined_project,
         "combined",
     )
     .await;
-    assert_client_reads_project(
+    assert_server_api_reads_project(
         &client,
-        &combined_client_base,
+        &combined_auth_base,
         &combined_project.public_id,
-        &combined_client_credential,
+        &combined_server_credential,
     )
     .await;
     request_signing_key_rotation(
@@ -741,44 +693,39 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
         "combined",
     )
     .await;
-    assert_runtime_reads_project(&client, &combined_runtime_base, &combined_project.public_id)
-        .await;
+    assert_runtime_reads_project(&client, &combined_auth_base, &combined_project.public_id).await;
     combined.terminate_gracefully().await;
 
-    let runtime_port = free_port();
-    let client_port = free_port();
+    let auth_port = free_port();
     let control_port = free_port();
-    let runtime_base = format!("http://127.0.0.1:{runtime_port}/");
-    let client_base = format!("http://127.0.0.1:{client_port}/");
+    let auth_base = format!("http://127.0.0.1:{auth_port}/");
     let control_base = format!("http://127.0.0.1:{control_port}/");
-    let mut runtime = ServerProcess::spawn(&runtime_environment(&common, runtime_port));
-    let mut client_plane = ServerProcess::spawn(&client_environment(&common, client_port));
+    let mut auth = ServerProcess::spawn(&auth_environment(&common, auth_port));
     let control_configuration = control_environment(&common, control_port);
     assert_control_key_custody(&control_configuration);
     let mut control = ServerProcess::spawn(&control_configuration);
-    wait_for_ready(&client, &runtime_base, &mut runtime).await;
-    wait_for_ready(&client, &client_base, &mut client_plane).await;
+    wait_for_ready(&client, &auth_base, &mut auth).await;
     wait_for_ready(&client, &control_base, &mut control).await;
     let split_project = create_project(&client, &control_base, "split").await;
-    let split_client_credential =
-        create_and_acknowledge_client_key(&client, &control_base, &split_project, "split").await;
+    let split_server_credential =
+        create_and_acknowledge_server_key(&client, &control_base, &split_project, "split").await;
     request_signing_key_rotation(&client, &control_base, &split_project, "split").await;
-    assert_runtime_reads_project(&client, &runtime_base, &split_project.public_id).await;
-    assert_client_reads_project(
+    assert_runtime_reads_project(&client, &auth_base, &split_project.public_id).await;
+    assert_server_api_reads_project(
         &client,
-        &client_base,
+        &auth_base,
         &split_project.public_id,
-        &split_client_credential,
+        &split_server_credential,
     )
     .await;
 
     control.terminate();
-    assert_runtime_reads_project(&client, &runtime_base, &split_project.public_id).await;
-    assert_client_reads_project(
+    assert_runtime_reads_project(&client, &auth_base, &split_project.public_id).await;
+    assert_server_api_reads_project(
         &client,
-        &client_base,
+        &auth_base,
         &split_project.public_id,
-        &split_client_credential,
+        &split_server_credential,
     )
     .await;
 
@@ -788,92 +735,59 @@ async fn combined_and_split_topologies_share_authority_and_isolate_plane_outages
     wait_for_ready(&client, &control_base, &mut restarted_control).await;
     assert_control_reads_project(&client, &control_base, &split_project.public_id).await;
 
-    client_plane.terminate();
-    assert_runtime_reads_project(&client, &runtime_base, &split_project.public_id).await;
+    auth.terminate();
     assert_control_reads_project(&client, &control_base, &split_project.public_id).await;
-    let mut verify_client_configuration = client_environment(&common, client_port);
-    verify_client_configuration.push(("OWLAUTH_MIGRATION_MODE".to_owned(), "verify".to_owned()));
-    let mut restarted_client = ServerProcess::spawn(&verify_client_configuration);
-    wait_for_ready(&client, &client_base, &mut restarted_client).await;
-    assert_client_reads_project(
+    let mut verify_auth_configuration = auth_environment(&common, auth_port);
+    verify_auth_configuration.push(("OWLAUTH_MIGRATION_MODE".to_owned(), "verify".to_owned()));
+    let mut restarted_auth = ServerProcess::spawn(&verify_auth_configuration);
+    wait_for_ready(&client, &auth_base, &mut restarted_auth).await;
+    assert_runtime_reads_project(&client, &auth_base, &split_project.public_id).await;
+    assert_server_api_reads_project(
         &client,
-        &client_base,
+        &auth_base,
         &split_project.public_id,
-        &split_client_credential,
+        &split_server_credential,
     )
     .await;
-
-    runtime.terminate();
-    assert_control_reads_project(&client, &control_base, &split_project.public_id).await;
-    assert_client_reads_project(
-        &client,
-        &client_base,
-        &split_project.public_id,
-        &split_client_credential,
-    )
-    .await;
-
-    let mut verify_runtime_configuration = runtime_environment(&common, runtime_port);
-    verify_runtime_configuration.push(("OWLAUTH_MIGRATION_MODE".to_owned(), "verify".to_owned()));
-    let mut restarted_runtime = ServerProcess::spawn(&verify_runtime_configuration);
-    wait_for_ready(&client, &runtime_base, &mut restarted_runtime).await;
-    assert_runtime_reads_project(&client, &runtime_base, &split_project.public_id).await;
-    restarted_runtime.terminate_gracefully().await;
-    restarted_client.terminate_gracefully().await;
+    restarted_auth.terminate_gracefully().await;
+    restarted_control.terminate_gracefully().await;
 
     create_secondary_database(&primary_url).await;
     let secondary_url = database_url(&host, port, "owlauth_other");
     let secondary_common = TestEnvironment::common_environment(&secondary_url);
-    let secondary_runtime_port = free_port();
-    let secondary_client_port = free_port();
+    let secondary_auth_port = free_port();
     let secondary_control_port = free_port();
-    let secondary_runtime_base = format!("http://127.0.0.1:{secondary_runtime_port}/");
-    let secondary_client_base = format!("http://127.0.0.1:{secondary_client_port}/");
+    let secondary_auth_base = format!("http://127.0.0.1:{secondary_auth_port}/");
     let secondary_control_base = format!("http://127.0.0.1:{secondary_control_port}/");
-    let mut secondary_runtime = ServerProcess::spawn(&runtime_environment(
-        &secondary_common,
-        secondary_runtime_port,
-    ));
-    let mut secondary_client = ServerProcess::spawn(&client_environment(
-        &secondary_common,
-        secondary_client_port,
-    ));
+    let mut secondary_auth =
+        ServerProcess::spawn(&auth_environment(&secondary_common, secondary_auth_port));
     let mut secondary_control = ServerProcess::spawn(&control_environment(
         &secondary_common,
         secondary_control_port,
     ));
-    wait_for_ready(&client, &secondary_runtime_base, &mut secondary_runtime).await;
-    wait_for_ready(&client, &secondary_client_base, &mut secondary_client).await;
+    wait_for_ready(&client, &secondary_auth_base, &mut secondary_auth).await;
     wait_for_ready(&client, &secondary_control_base, &mut secondary_control).await;
-    secondary_runtime.terminate();
-    secondary_client.terminate();
+    secondary_auth.terminate();
     secondary_control.terminate();
 
     for override_key in [
         "OWLAUTH_RUNTIME_POSTGRES_URL",
-        "OWLAUTH_CLIENT_POSTGRES_URL",
+        "OWLAUTH_SERVER_POSTGRES_URL",
         "OWLAUTH_CONTROL_POSTGRES_URL",
         "OWLAUTH_MIGRATION_POSTGRES_URL",
     ] {
-        let mismatch_runtime_port = free_port();
-        let mismatch_client_port = free_port();
+        let mismatch_auth_port = free_port();
         let mismatch_control_port = free_port();
-        let mut mismatch_environment = combined_environment(
-            &common,
-            mismatch_runtime_port,
-            mismatch_client_port,
-            mismatch_control_port,
-        );
+        let mut mismatch_environment =
+            combined_environment(&common, mismatch_auth_port, mismatch_control_port);
         mismatch_environment.push((override_key.to_owned(), secondary_url.clone()));
         let mut mismatch = ServerProcess::spawn(&mismatch_environment);
         assert!(
             !mismatch.wait_for_exit().await.success(),
             "{override_key} must not select an independently migrated database"
         );
-        TcpListener::bind(("127.0.0.1", mismatch_runtime_port))
-            .expect("invalid database authority must fail before Runtime binds");
-        TcpListener::bind(("127.0.0.1", mismatch_client_port))
-            .expect("invalid database authority must fail before Client binds");
+        TcpListener::bind(("127.0.0.1", mismatch_auth_port))
+            .expect("invalid database authority must fail before Auth binds");
         TcpListener::bind(("127.0.0.1", mismatch_control_port))
             .expect("invalid database authority must fail before Control binds");
     }

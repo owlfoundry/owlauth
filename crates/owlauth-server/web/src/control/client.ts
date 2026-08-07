@@ -11,16 +11,19 @@ export type ApplicationUserEvent = components["schemas"]["ApplicationUserEvent"]
 export type WebhookDelivery = components["schemas"]["WebhookDelivery"];
 export type ApplicationUserEventType = components["schemas"]["ApplicationUserEventType"];
 export type SigningKey = components["schemas"]["SigningKey"];
-export type ProjectClientKey = components["schemas"]["ProjectClientKey"];
-export type CreateProjectClientKeyResponse =
-  components["schemas"]["CreateProjectClientKeyResponse"];
+export type ProjectServerKey = components["schemas"]["ProjectServerKey"];
+export type CreateProjectServerKeyResponse =
+  components["schemas"]["CreateProjectServerKeyResponse"];
 export type Provider = components["schemas"]["Provider"];
 export type ProviderEgressPolicy = components["schemas"]["ProviderEgressPolicy"];
 export type OidcPreflightResult = components["schemas"]["OidcPreflightResult"];
 export type NamedProviderPreflightResult = components["schemas"]["NamedProviderPreflightResult"];
 export type EmailMethodPolicy = components["schemas"]["EmailMethodPolicy"];
 export type EmailAssignment = components["schemas"]["EmailAssignment"];
+export type CreateSmtpConfigurationRequest =
+  components["schemas"]["CreateSmtpConfigurationRequest"];
 export type SmtpConfiguration = components["schemas"]["SmtpConfiguration"];
+export type SmtpTestOperation = components["schemas"]["SmtpTestOperation"];
 export type ProjectUser = components["schemas"]["ProjectUser"];
 export type ProjectUserSessions = components["schemas"]["ProjectUserSessions"];
 export type ApplicationSession = components["schemas"]["ApplicationSession"];

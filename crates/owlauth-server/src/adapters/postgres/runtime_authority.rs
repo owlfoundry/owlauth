@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::{
     application::{
         AccessTokenSessionLookup, AdmittedProviderMethod, ApplicationError, BrowserLogoutContext,
-        CurrentSession, HostedInteraction, HostedProviderMethod, LoginStartContext,
-        ProviderRuntimeContext, RuntimeAuthorityRepository, VerificationKey, VersionedDigest,
+        CurrentSession, HostedInteraction, HostedPendingEmailChallenge, HostedProviderMethod,
+        LoginStartContext, ProviderRuntimeContext, RuntimeAuthorityRepository, VerificationKey,
+        VersionedDigest,
     },
     domain::{LoginTransactionStatus, ProviderKind},
 };
@@ -32,6 +33,7 @@ fn validated_login_provider_kind(
 }
 
 use super::{
+    auth_incarnation::AuthIncarnationFence,
     authentication::{optional_digest_matches, parse_login_status, persistence},
     entity::{
         application, application_origin, application_provider_assignment,
@@ -42,14 +44,13 @@ use super::{
         project_signing_key, project_user, provider_configuration, refresh_family,
     },
     projection::IdentityProjectionMaterializer,
-    runtime_incarnation::RuntimeIncarnationFence,
 };
 
 #[derive(Clone)]
 pub(crate) struct PostgresRuntimeAuthorityRepository {
     database: DatabaseConnection,
-    runtime_incarnation: RuntimeIncarnationFence,
-    required_runtime_process_ids: Vec<String>,
+    auth_incarnation: AuthIncarnationFence,
+    required_auth_process_ids: Vec<String>,
     projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
 }
 
@@ -60,18 +61,15 @@ impl PostgresRuntimeAuthorityRepository {
     )]
     pub(crate) fn new_with_runtime_identity(
         database: DatabaseConnection,
-        runtime_process_id: String,
-        runtime_incarnation: Uuid,
-        required_runtime_process_ids: Vec<String>,
+        auth_process_id: String,
+        auth_incarnation: Uuid,
+        required_auth_process_ids: Vec<String>,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
-            runtime_incarnation: RuntimeIncarnationFence::new(
-                runtime_process_id,
-                runtime_incarnation,
-            ),
-            required_runtime_process_ids,
+            auth_incarnation: AuthIncarnationFence::new(auth_process_id, auth_incarnation),
+            required_auth_process_ids,
             projection_materializer,
         }
     }
@@ -83,35 +81,32 @@ impl PostgresRuntimeAuthorityRepository {
     ) -> Self {
         Self {
             database,
-            runtime_incarnation: RuntimeIncarnationFence::test_default(),
-            required_runtime_process_ids: vec!["runtime-1".to_owned()],
+            auth_incarnation: AuthIncarnationFence::test_default(),
+            required_auth_process_ids: vec!["auth-1".to_owned()],
             projection_materializer,
         }
     }
 
     pub(crate) fn new_with_runtime_identity_and_projection_materializer(
         database: DatabaseConnection,
-        runtime_process_id: String,
-        runtime_incarnation: Uuid,
-        required_runtime_process_ids: Vec<String>,
+        auth_process_id: String,
+        auth_incarnation: Uuid,
+        required_auth_process_ids: Vec<String>,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
-            runtime_incarnation: RuntimeIncarnationFence::new(
-                runtime_process_id,
-                runtime_incarnation,
-            ),
-            required_runtime_process_ids,
+            auth_incarnation: AuthIncarnationFence::new(auth_process_id, auth_incarnation),
+            required_auth_process_ids,
             projection_materializer,
         }
     }
 
-    async fn lock_local_runtime_incarnation<C: ConnectionTrait>(
+    async fn lock_local_auth_incarnation<C: ConnectionTrait>(
         &self,
         connection: &C,
     ) -> Result<(), ApplicationError> {
-        self.runtime_incarnation.lock(connection).await
+        self.auth_incarnation.lock(connection).await
     }
 }
 
@@ -129,7 +124,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         redirect_uri: &str,
     ) -> Result<LoginStartContext, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
@@ -231,13 +226,13 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         let admitted_email = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT policy.policy_revision, policy.security_revision, assignment.security_revision AS assignment_security_revision, policy.otp_enabled, policy.magic_link_enabled, policy.otp_digits, policy.otp_validity_seconds, policy.otp_max_attempts, policy.resend_after_seconds, policy.max_generations, policy.magic_validity_seconds, policy.signup_enabled, policy.transferred_magic_link_enabled, CASE WHEN smtp.id IS NOT NULL THEN 'project' ELSE 'deployment_default' END AS smtp_selection_kind, smtp.id AS smtp_configuration_id, COALESCE(smtp.generation, deployment.generation) AS smtp_generation, COALESCE(smtp.security_eligibility_revision, deployment.security_eligibility_revision) AS smtp_security_eligibility_revision FROM project_email_policies policy JOIN application_email_assignments assignment ON assignment.project_id = policy.project_id AND assignment.application_id = $2 LEFT JOIN project_smtp_configurations smtp ON smtp.project_id = policy.project_id AND smtp.status = 'active' LEFT JOIN deployment_smtp_generations deployment ON deployment.status = 'active' AND policy.allow_deployment_default AND smtp.id IS NULL WHERE policy.project_id = $1 AND policy.status = 'enabled' AND assignment.status = 'active' AND EXISTS (SELECT 1 FROM runtime_process_incarnations local_runtime WHERE local_runtime.process_id=$4 AND local_runtime.process_incarnation=$5) AND EXISTS (SELECT 1 FROM email_protection_runtime_readiness protection JOIN runtime_process_incarnations protection_current ON protection_current.process_id=protection.process_id AND protection_current.process_incarnation=protection.process_incarnation WHERE protection.process_id=$4 AND protection.process_incarnation=$5 AND protection.state='ready' AND protection.lease_expires_at>transaction_timestamp()) AND ((smtp.id IS NOT NULL AND NOT EXISTS (SELECT required.process_id FROM jsonb_array_elements_text($3::jsonb) AS required(process_id) WHERE NOT EXISTS (SELECT 1 FROM project_smtp_runtime_readiness readiness WHERE readiness.project_id=smtp.project_id AND readiness.configuration_id=smtp.id AND readiness.generation=smtp.generation AND readiness.process_id=required.process_id AND readiness.state='ready' AND readiness.lease_expires_at>transaction_timestamp() AND EXISTS (SELECT 1 FROM runtime_process_incarnations current WHERE current.process_id=readiness.process_id AND current.process_incarnation=readiness.process_incarnation)))) OR (smtp.id IS NULL AND deployment.generation IS NOT NULL))",
+                "SELECT policy.policy_revision, policy.security_revision, assignment.security_revision AS assignment_security_revision, policy.otp_enabled, policy.magic_link_enabled, policy.otp_digits, policy.otp_validity_seconds, policy.otp_max_attempts, policy.resend_after_seconds, policy.max_generations, policy.magic_validity_seconds, policy.signup_enabled, policy.transferred_magic_link_enabled, CASE WHEN smtp.id IS NOT NULL THEN 'project' ELSE 'deployment_default' END AS smtp_selection_kind, smtp.id AS smtp_configuration_id, COALESCE(smtp.generation, deployment.generation) AS smtp_generation, COALESCE(smtp.security_eligibility_revision, deployment.security_eligibility_revision) AS smtp_security_eligibility_revision FROM project_email_policies policy JOIN application_email_assignments assignment ON assignment.project_id = policy.project_id AND assignment.application_id = $2 LEFT JOIN project_smtp_configurations smtp ON smtp.project_id = policy.project_id AND smtp.status = 'active' LEFT JOIN deployment_smtp_generations deployment ON deployment.status = 'active' AND policy.allow_deployment_default AND smtp.id IS NULL WHERE policy.project_id = $1 AND policy.status = 'enabled' AND assignment.status = 'active' AND EXISTS (SELECT 1 FROM auth_process_incarnations local_runtime WHERE local_runtime.process_id=$4 AND local_runtime.process_incarnation=$5) AND EXISTS (SELECT 1 FROM email_protection_runtime_readiness protection JOIN auth_process_incarnations protection_current ON protection_current.process_id=protection.process_id AND protection_current.process_incarnation=protection.process_incarnation WHERE protection.process_id=$4 AND protection.process_incarnation=$5 AND protection.state='ready' AND protection.lease_expires_at>transaction_timestamp()) AND ((smtp.id IS NOT NULL AND NOT EXISTS (SELECT required.process_id FROM jsonb_array_elements_text($3::jsonb) AS required(process_id) WHERE NOT EXISTS (SELECT 1 FROM project_smtp_runtime_readiness readiness WHERE readiness.project_id=smtp.project_id AND readiness.configuration_id=smtp.id AND readiness.generation=smtp.generation AND readiness.process_id=required.process_id AND readiness.state='ready' AND readiness.lease_expires_at>transaction_timestamp() AND EXISTS (SELECT 1 FROM auth_process_incarnations current WHERE current.process_id=readiness.process_id AND current.process_incarnation=readiness.process_incarnation)))) OR (smtp.id IS NULL AND deployment.generation IS NOT NULL))",
                 vec![
                     project.id.into(),
                     application.id.into(),
-                    serde_json::json!(self.required_runtime_process_ids).into(),
-                    self.runtime_incarnation.process_id().to_owned().into(),
-                    self.runtime_incarnation.incarnation().into(),
+                    serde_json::json!(self.required_auth_process_ids).into(),
+                    self.auth_incarnation.process_id().to_owned().into(),
+                    self.auth_incarnation.incarnation().into(),
                 ],
             ))
             .await
@@ -293,7 +288,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         now: OffsetDateTime,
     ) -> Result<HostedInteraction, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let login = login_transaction::Entity::find()
             .filter(login_transaction::Column::InteractionDigest.eq(interaction.value.to_vec()))
             .filter(
@@ -374,16 +369,16 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                                            AND readiness.state='ready'
                                            AND readiness.lease_expires_at>$4
                                            AND EXISTS (
-                                             SELECT 1 FROM runtime_process_incarnations current
+                                             SELECT 1 FROM auth_process_incarnations current
                                              WHERE current.process_id=readiness.process_id
                                                AND current.process_incarnation=readiness.process_incarnation)))
                                      AND EXISTS (
-                                       SELECT 1 FROM runtime_process_incarnations local_runtime
+                                       SELECT 1 FROM auth_process_incarnations local_runtime
                                        WHERE local_runtime.process_id=$5
                                          AND local_runtime.process_incarnation=$6)
                                      AND EXISTS (
                                        SELECT 1 FROM email_protection_runtime_readiness protection
-                                       JOIN runtime_process_incarnations protection_current
+                                       JOIN auth_process_incarnations protection_current
                                          ON protection_current.process_id=protection.process_id
                                         AND protection_current.process_incarnation=protection.process_incarnation
                                        WHERE protection.process_id=$5
@@ -395,10 +390,10 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
                         vec![
                             login.project_id.into(),
                             login.id.into(),
-                            serde_json::json!(self.required_runtime_process_ids).into(),
+                            serde_json::json!(self.required_auth_process_ids).into(),
                             now.into(),
-                            self.runtime_incarnation.process_id().to_owned().into(),
-                            self.runtime_incarnation.incarnation().into()
+                            self.auth_incarnation.process_id().to_owned().into(),
+                            self.auth_incarnation.incarnation().into()
                         ],
                     ))
                     .await
@@ -427,6 +422,46 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         {
             return Err(ApplicationError::Disabled);
         }
+        let pending_email_challenge = if status == LoginTransactionStatus::EmailChallengePending {
+            let challenge = transaction
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT id,generation,status,expires_at,\
+                            (otp_digest IS NOT NULL AND otp_expires_at>$3) AS otp_available,\
+                            (magic_digest IS NOT NULL AND magic_expires_at>$3) AS magic_link_available \
+                     FROM email_challenges \
+                     WHERE project_id=$1 AND transaction_id=$2 AND owner_kind='login' \
+                     ORDER BY generation DESC LIMIT 1",
+                    vec![login.project_id.into(), login.id.into(), now.into()],
+                ))
+                .await
+                .map_err(persistence)?
+                .ok_or(ApplicationError::Integrity)?;
+            let challenge_status: String = challenge.try_get("", "status").map_err(persistence)?;
+            let expires_at: OffsetDateTime =
+                challenge.try_get("", "expires_at").map_err(persistence)?;
+            let otp_available: bool = challenge
+                .try_get("", "otp_available")
+                .map_err(persistence)?;
+            let magic_link_available: bool = challenge
+                .try_get("", "magic_link_available")
+                .map_err(persistence)?;
+            if challenge_status != "pending"
+                || expires_at <= now
+                || (!otp_available && !magic_link_available)
+            {
+                return Err(ApplicationError::Integrity);
+            }
+            Some(HostedPendingEmailChallenge {
+                challenge_id: challenge.try_get("", "id").map_err(persistence)?,
+                generation: challenge.try_get("", "generation").map_err(persistence)?,
+                otp_available,
+                magic_link_available,
+                expires_at,
+            })
+        } else {
+            None
+        };
         let result = HostedInteraction {
             transaction_id: login.id,
             project_id: login.project_id,
@@ -464,6 +499,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             email_available,
             email_otp_enabled,
             email_magic_link_enabled,
+            pending_email_challenge,
             expires_at: login.expires_at,
         };
         transaction.commit().await.map_err(persistence)?;
@@ -477,7 +513,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         provider_key: &str,
     ) -> Result<ProviderRuntimeContext, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let login = login_transaction::Entity::find_by_id(transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(project_id))
             .lock_shared()
@@ -584,7 +620,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         publishable_key: &str,
     ) -> Result<(Uuid, Uuid), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
@@ -623,7 +659,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         application_public_id: &str,
     ) -> Result<(Uuid, Uuid), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
@@ -653,7 +689,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         origin: &str,
     ) -> Result<bool, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let project = project::Entity::find_by_id(project_id)
             .filter(project::Column::Status.eq("active"))
             .lock_shared()
@@ -682,7 +718,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         origin: &str,
     ) -> Result<bool, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
@@ -724,7 +760,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let Some(project) = project::Entity::find_by_id(project_id)
             .lock_shared()
             .one(&transaction)
@@ -814,7 +850,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
         now: OffsetDateTime,
     ) -> Result<VerificationKey, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
@@ -870,7 +906,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             now,
         } = lookup;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let project = project::Entity::find_by_id(project_id)
             .filter(project::Column::Status.eq("active"))
             .lock_shared()
@@ -1022,7 +1058,7 @@ impl RuntimeAuthorityRepository for PostgresRuntimeAuthorityRepository {
             .await
             .map_err(persistence)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         let routed_interaction = routed_interaction.ok_or(ApplicationError::NotFound)?;
         let project = project::Entity::find_by_id(routed_interaction.project_id)
             .filter(project::Column::Status.eq("active"))

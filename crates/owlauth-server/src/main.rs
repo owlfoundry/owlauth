@@ -10,14 +10,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let arguments: Vec<_> = env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("--openapi") {
         let [_, plane] = arguments.as_slice() else {
-            return Err("usage: owlauth-server --openapi <runtime|control>".into());
+            return Err("usage: owlauth-server --openapi <runtime|server|control>".into());
         };
         let document = owlauth_types::export::to_pretty_json(plane.parse()?)?;
         println!("{document}");
         return Ok(());
     }
     if !arguments.is_empty() {
-        return Err("usage: owlauth-server [--openapi <runtime|control>]".into());
+        return Err("usage: owlauth-server [--openapi <runtime|server|control>]".into());
     }
 
     // Configuration validates and loads the operator key before telemetry starts. Errors

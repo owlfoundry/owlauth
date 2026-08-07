@@ -284,6 +284,13 @@ pub(crate) trait WebhookControlPort: Send + Sync {
         limit: usize,
     ) -> Result<Vec<WebhookDeliveryRecord>, ApplicationError>;
 
+    async fn get_delivery(
+        &self,
+        project_id: Uuid,
+        application_id: Uuid,
+        delivery_id: Uuid,
+    ) -> Result<WebhookDeliveryRecord, ApplicationError>;
+
     async fn replay_delivery(
         &self,
         project_id: Uuid,
@@ -669,6 +676,17 @@ impl WebhookControlService {
             timestamp: record.created_at,
             id: record.id,
         })
+    }
+
+    pub(crate) async fn get_delivery(
+        &self,
+        project_id: Uuid,
+        application_id: Uuid,
+        delivery_id: Uuid,
+    ) -> Result<WebhookDeliveryRecord, ApplicationError> {
+        self.port
+            .get_delivery(project_id, application_id, delivery_id)
+            .await
     }
 
     pub(crate) async fn replay_delivery(
@@ -1234,7 +1252,7 @@ mod tests {
         let repository = Arc::new(OneClaimRepository {
             claim: Mutex::new(Some(ClaimedWebhookDelivery {
                 delivery_id: Uuid::from_u128(1),
-                lease_owner: "runtime-a".to_owned(),
+                lease_owner: "auth-a".to_owned(),
                 lease_incarnation: Uuid::from_u128(2),
                 lease_generation: 1,
                 event_id: "evt_12345678".to_owned(),
@@ -1251,7 +1269,7 @@ mod tests {
             Arc::new(UnavailableSecretResolver),
             Arc::new(UnexpectedTransport),
             Arc::new(FixedClock(now)),
-            "runtime-a".to_owned(),
+            "auth-a".to_owned(),
             Uuid::from_u128(2),
             Duration::from_secs(30),
         )

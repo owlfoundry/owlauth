@@ -359,9 +359,15 @@ impl IdentityMutationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CreatedIdentityMutation {
-    pub intent: IdentityMutationView,
-    pub hosted_target: Option<String>,
+pub(crate) enum IdentityMutationCreateOutcome {
+    Created {
+        intent: IdentityMutationView,
+        hosted_target: Option<String>,
+    },
+    Replayed {
+        intent: IdentityMutationView,
+        hosted_target: Option<String>,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1140,7 +1146,7 @@ impl IdentityMutationControlService {
     pub(crate) async fn create(
         &self,
         command: CreateIdentityMutation,
-    ) -> Result<CreatedIdentityMutation, ApplicationError> {
+    ) -> Result<IdentityMutationCreateOutcome, ApplicationError> {
         validate_create(&command)?;
         let now = self.clock.now();
         let intent_id = Uuid::new_v4();
@@ -1167,10 +1173,12 @@ impl IdentityMutationControlService {
             })
             .await?;
         match result {
-            CreateIdentityMutationResult::Created(intent) => Ok(CreatedIdentityMutation {
-                intent: intent.safe_view(),
-                hosted_target: Some(hosted_target),
-            }),
+            CreateIdentityMutationResult::Created(intent) => {
+                Ok(IdentityMutationCreateOutcome::Created {
+                    intent: intent.safe_view(),
+                    hosted_target: Some(hosted_target),
+                })
+            }
             CreateIdentityMutationResult::Replayed {
                 intent,
                 protected_create_result,
@@ -1182,7 +1190,7 @@ impl IdentityMutationControlService {
                         String::from_utf8(value.to_vec()).map_err(|_| ApplicationError::Integrity)
                     })
                     .transpose()?;
-                Ok(CreatedIdentityMutation {
+                Ok(IdentityMutationCreateOutcome::Replayed {
                     intent: intent.safe_view(),
                     hosted_target: target,
                 })
@@ -4288,14 +4296,19 @@ mod tests {
         )
         .unwrap();
         let created = service.create(command()).await.unwrap();
-        let target = created
-            .hosted_target
-            .expect("live replay returns exact target");
+        let IdentityMutationCreateOutcome::Replayed {
+            intent,
+            hosted_target,
+        } = created
+        else {
+            panic!("the repository replay must remain authoritative at the HTTP boundary");
+        };
+        let target = hosted_target.expect("live replay returns exact target");
         assert_eq!(
             target,
             format!(
                 "https://runtime.example/runtime/auth/identity-mutations/{}.fixed-secret",
-                created.intent.id
+                intent.id
             )
         );
     }

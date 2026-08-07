@@ -96,7 +96,7 @@ export function ControlProvider({
       if (tone === "success" || tone === "info") {
         setCurrentMessage(null);
         const id = nextToastId.current++;
-        setToasts((current) => [...current.slice(-2), { id, message: next, tone }]);
+        setToasts([{ id, message: next, tone }]);
         window.setTimeout(() => {
           dismissToast(id);
         }, 5000);

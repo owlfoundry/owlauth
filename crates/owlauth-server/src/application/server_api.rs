@@ -12,22 +12,25 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use super::{ApplicationError, ClientKeyVerifier, Clock, ParsedClientCredential, VersionedDigest};
+use super::{
+    ApplicationError, Clock, EmailIdentityLookupDigester, ParsedServerCredential,
+    ServerKeyVerifier, VersionedDigest,
+};
 
-pub(crate) const DEFAULT_CLIENT_USER_PAGE_LIMIT: usize = 50;
-pub(crate) const MAX_CLIENT_USER_PAGE_LIMIT: usize = 100;
-pub(crate) const MAX_CLIENT_ACCESS_TOKEN_BYTES: usize = 16_384;
-const CLIENT_CURSOR_BYTES: usize = 33;
-const CLIENT_CURSOR_VERSION: u8 = 1;
-const CLIENT_KEY_USAGE_BUCKET: Duration = Duration::minutes(15);
-const CLIENT_TOKEN_CLOCK_SKEW_SECONDS: i64 = 60;
-const CLIENT_USAGE_TELEMETRY_CAPACITY: usize = 8_192;
-const CLIENT_USAGE_TELEMETRY_CONCURRENCY: usize = 1;
-const CLIENT_USAGE_TELEMETRY_DEADLINE_MILLIS: u64 = 1_000;
-const CLIENT_ACCESS_TOKEN_TYP: &str = "at+jwt";
+pub(crate) const DEFAULT_SERVER_USER_PAGE_LIMIT: usize = 50;
+pub(crate) const MAX_SERVER_USER_PAGE_LIMIT: usize = 100;
+pub(crate) const MAX_SERVER_ACCESS_TOKEN_BYTES: usize = 16_384;
+const SERVER_CURSOR_BYTES: usize = 33;
+const SERVER_CURSOR_VERSION: u8 = 1;
+const SERVER_KEY_USAGE_BUCKET: Duration = Duration::minutes(15);
+const SERVER_TOKEN_CLOCK_SKEW_SECONDS: i64 = 60;
+const SERVER_USAGE_TELEMETRY_CAPACITY: usize = 8_192;
+const SERVER_USAGE_TELEMETRY_CONCURRENCY: usize = 1;
+const SERVER_USAGE_TELEMETRY_DEADLINE_MILLIS: u64 = 1_000;
+const SERVER_ACCESS_TOKEN_TYP: &str = "at+jwt";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClientKeyAuthority {
+pub(crate) struct ServerKeyAuthority {
     pub key_id: Uuid,
     pub project_id: Uuid,
     pub project_public_id: String,
@@ -41,7 +44,7 @@ pub(crate) struct ClientKeyAuthority {
     clippy::struct_field_names,
     reason = "explicit project/key and public/internal identifier names prevent authority confusion"
 )]
-pub(crate) struct ClientPrincipal {
+pub(crate) struct ServerPrincipal {
     pub project_id: Uuid,
     pub project_public_id: String,
     pub key_id: Uuid,
@@ -49,17 +52,17 @@ pub(crate) struct ClientPrincipal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ClientUserStatus {
+pub(crate) enum ServerUserStatus {
     Active,
     Disabled,
     Merged,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ClientUser {
+pub(crate) struct ServerUser {
     pub project_public_id: String,
     pub user_public_id: String,
-    pub status: ClientUserStatus,
+    pub status: ServerUserStatus,
     pub display_name: Option<String>,
     pub picture_url: Option<String>,
     pub primary_verified_email: Option<String>,
@@ -69,15 +72,15 @@ pub(crate) struct ClientUser {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ClientUserCursor {
+pub(crate) struct ServerUserCursor {
     pub created_at: OffsetDateTime,
     pub user_id: Uuid,
 }
 
-impl ClientUserCursor {
+impl ServerUserCursor {
     pub(crate) fn encode(self) -> String {
-        let mut bytes = [0_u8; CLIENT_CURSOR_BYTES];
-        bytes[0] = CLIENT_CURSOR_VERSION;
+        let mut bytes = [0_u8; SERVER_CURSOR_BYTES];
+        bytes[0] = SERVER_CURSOR_VERSION;
         bytes[1..17].copy_from_slice(&self.created_at.unix_timestamp_nanos().to_be_bytes());
         bytes[17..].copy_from_slice(self.user_id.as_bytes());
         URL_SAFE_NO_PAD.encode(bytes)
@@ -90,13 +93,13 @@ impl ClientUserCursor {
         let decoded = URL_SAFE_NO_PAD
             .decode(value)
             .map_err(|_| ApplicationError::InvalidInput)?;
-        if decoded.len() != CLIENT_CURSOR_BYTES || URL_SAFE_NO_PAD.encode(&decoded) != value {
+        if decoded.len() != SERVER_CURSOR_BYTES || URL_SAFE_NO_PAD.encode(&decoded) != value {
             return Err(ApplicationError::InvalidInput);
         }
-        let bytes: [u8; CLIENT_CURSOR_BYTES] = decoded
+        let bytes: [u8; SERVER_CURSOR_BYTES] = decoded
             .try_into()
             .map_err(|_| ApplicationError::InvalidInput)?;
-        if bytes[0] != CLIENT_CURSOR_VERSION {
+        if bytes[0] != SERVER_CURSOR_VERSION {
             return Err(ApplicationError::InvalidInput);
         }
         let timestamp = i128::from_be_bytes(
@@ -117,13 +120,13 @@ impl ClientUserCursor {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ClientUserPage {
-    pub users: Vec<ClientUser>,
+pub(crate) struct ServerUserPage {
+    pub users: Vec<ServerUser>,
     pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ClientApplicationProjection {
+pub(crate) struct ServerApplicationProjection {
     pub project_public_id: String,
     pub application_public_id: String,
     pub user_public_id: String,
@@ -132,7 +135,7 @@ pub(crate) struct ClientApplicationProjection {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ActiveClientToken {
+pub(crate) struct ActiveServerToken {
     pub project_public_id: String,
     pub application_public_id: String,
     pub user_public_id: String,
@@ -149,13 +152,13 @@ pub(crate) struct ActiveClientToken {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ClientTokenIntrospection {
+pub(crate) enum ServerTokenIntrospection {
     Inactive,
-    Active(Box<ActiveClientToken>),
+    Active(Box<ActiveServerToken>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClientVerificationKey {
+pub(crate) struct ServerVerificationKey {
     pub project_id: Uuid,
     pub project_public_id: String,
     pub issuer: String,
@@ -163,7 +166,7 @@ pub(crate) struct ClientVerificationKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClientTokenSessionLookup {
+pub(crate) struct ServerTokenSessionLookup {
     pub project_id: Uuid,
     pub application_public_id: String,
     pub user_public_id: String,
@@ -174,15 +177,7 @@ pub(crate) struct ClientTokenSessionLookup {
     pub now: OffsetDateTime,
 }
 
-pub(crate) trait ClientEmailLookupDigester: Send + Sync {
-    fn digest_candidates(
-        &self,
-        project_id: Uuid,
-        canonical_email: &str,
-    ) -> Result<Vec<VersionedDigest>, ApplicationError>;
-}
-
-pub(crate) trait ClientTokenSignatureVerifier: Send + Sync {
+pub(crate) trait ServerTokenSignatureVerifier: Send + Sync {
     fn verify(
         &self,
         public_jwk: &Value,
@@ -192,11 +187,11 @@ pub(crate) trait ClientTokenSignatureVerifier: Send + Sync {
 }
 
 #[async_trait]
-pub(crate) trait ClientApiRepository: Send + Sync {
-    async fn client_key_authority(
+pub(crate) trait ServerApiRepository: Send + Sync {
+    async fn server_key_authority(
         &self,
         public_key_id: &str,
-    ) -> Result<ClientKeyAuthority, ApplicationError>;
+    ) -> Result<ServerKeyAuthority, ApplicationError>;
 
     async fn confirm_active(&self, project_id: Uuid, key_id: Uuid) -> Result<(), ApplicationError>;
 
@@ -211,23 +206,23 @@ pub(crate) trait ClientApiRepository: Send + Sync {
         &self,
         project_id: Uuid,
         project_public_id: &str,
-        after: Option<ClientUserCursor>,
+        after: Option<ServerUserCursor>,
         limit_plus_one: usize,
-    ) -> Result<Vec<(ClientUserCursor, ClientUser)>, ApplicationError>;
+    ) -> Result<Vec<(ServerUserCursor, ServerUser)>, ApplicationError>;
 
     async fn user_by_public_id(
         &self,
         project_id: Uuid,
         project_public_id: &str,
         user_public_id: &str,
-    ) -> Result<ClientUser, ApplicationError>;
+    ) -> Result<ServerUser, ApplicationError>;
 
     async fn user_by_email_digests(
         &self,
         project_id: Uuid,
         project_public_id: &str,
         candidates: &[VersionedDigest],
-    ) -> Result<Option<ClientUser>, ApplicationError>;
+    ) -> Result<Option<ServerUser>, ApplicationError>;
 
     async fn application_projection(
         &self,
@@ -235,51 +230,51 @@ pub(crate) trait ClientApiRepository: Send + Sync {
         project_public_id: &str,
         application_public_id: &str,
         user_public_id: &str,
-    ) -> Result<ClientApplicationProjection, ApplicationError>;
+    ) -> Result<ServerApplicationProjection, ApplicationError>;
 
     async fn verification_key(
         &self,
         project_id: Uuid,
         kid: &str,
         now: OffsetDateTime,
-    ) -> Result<ClientVerificationKey, ApplicationError>;
+    ) -> Result<ServerVerificationKey, ApplicationError>;
 
     async fn introspect_session(
         &self,
-        lookup: ClientTokenSessionLookup,
-    ) -> Result<ActiveClientToken, ApplicationError>;
+        lookup: ServerTokenSessionLookup,
+    ) -> Result<ActiveServerToken, ApplicationError>;
 }
 
-struct ClientUsageTelemetry {
+struct ServerUsageTelemetry {
     observed_buckets: Mutex<HashMap<(Uuid, Uuid), i64>>,
     permits: Arc<Semaphore>,
 }
 
-impl ClientUsageTelemetry {
+impl ServerUsageTelemetry {
     fn new() -> Self {
         Self {
             observed_buckets: Mutex::new(HashMap::new()),
-            permits: Arc::new(Semaphore::new(CLIENT_USAGE_TELEMETRY_CONCURRENCY)),
+            permits: Arc::new(Semaphore::new(SERVER_USAGE_TELEMETRY_CONCURRENCY)),
         }
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct ClientApiService {
-    repository: Arc<dyn ClientApiRepository>,
-    key_verifier: Arc<dyn ClientKeyVerifier>,
-    email_digester: Arc<dyn ClientEmailLookupDigester>,
-    token_verifier: Arc<dyn ClientTokenSignatureVerifier>,
+pub(crate) struct ServerApiService {
+    repository: Arc<dyn ServerApiRepository>,
+    key_verifier: Arc<dyn ServerKeyVerifier>,
+    email_digester: Arc<dyn EmailIdentityLookupDigester>,
+    token_verifier: Arc<dyn ServerTokenSignatureVerifier>,
     clock: Arc<dyn Clock>,
-    usage_telemetry: Arc<ClientUsageTelemetry>,
+    usage_telemetry: Arc<ServerUsageTelemetry>,
 }
 
-impl ClientApiService {
+impl ServerApiService {
     pub(crate) fn new(
-        repository: Arc<dyn ClientApiRepository>,
-        key_verifier: Arc<dyn ClientKeyVerifier>,
-        email_digester: Arc<dyn ClientEmailLookupDigester>,
-        token_verifier: Arc<dyn ClientTokenSignatureVerifier>,
+        repository: Arc<dyn ServerApiRepository>,
+        key_verifier: Arc<dyn ServerKeyVerifier>,
+        email_digester: Arc<dyn EmailIdentityLookupDigester>,
+        token_verifier: Arc<dyn ServerTokenSignatureVerifier>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -288,7 +283,7 @@ impl ClientApiService {
             email_digester,
             token_verifier,
             clock,
-            usage_telemetry: Arc::new(ClientUsageTelemetry::new()),
+            usage_telemetry: Arc::new(ServerUsageTelemetry::new()),
         }
     }
 
@@ -296,12 +291,12 @@ impl ClientApiService {
         &self,
         route_project_public_id: &str,
         credential: &str,
-    ) -> Result<ClientPrincipal, ApplicationError> {
+    ) -> Result<ServerPrincipal, ApplicationError> {
         let parsed =
-            ParsedClientCredential::parse(credential).map_err(|_| ApplicationError::Disabled)?;
+            ParsedServerCredential::parse(credential).map_err(|_| ApplicationError::Disabled)?;
         let authority = self
             .repository
-            .client_key_authority(parsed.public_key_id())
+            .server_key_authority(parsed.public_key_id())
             .await
             .map_err(generic_auth_error)?;
         if authority.project_public_id != route_project_public_id
@@ -326,7 +321,7 @@ impl ClientApiService {
             .confirm_active(authority.project_id, authority.key_id)
             .await
             .map_err(generic_auth_error)?;
-        Ok(ClientPrincipal {
+        Ok(ServerPrincipal {
             project_id: authority.project_id,
             project_public_id: authority.project_public_id,
             key_id: authority.key_id,
@@ -337,8 +332,8 @@ impl ClientApiService {
     /// Schedules lifecycle-neutral usage telemetry only after authentication and post-authority
     /// admission have both succeeded. Work is coalesced per key/bucket, bounded to one detached
     /// database operation, and dropped on saturation or timeout.
-    pub(crate) fn observe_client_key_usage(&self, principal: &ClientPrincipal) {
-        let bucket_seconds = CLIENT_KEY_USAGE_BUCKET.whole_seconds();
+    pub(crate) fn observe_server_key_usage(&self, principal: &ServerPrincipal) {
+        let bucket_seconds = SERVER_KEY_USAGE_BUCKET.whole_seconds();
         let bucket_unix =
             self.clock.now().unix_timestamp().div_euclid(bucket_seconds) * bucket_seconds;
         let Ok(permit) = Arc::clone(&self.usage_telemetry.permits).try_acquire_owned() else {
@@ -352,7 +347,7 @@ impl ClientApiService {
         if observed
             .get(&identity)
             .is_some_and(|seen| *seen >= bucket_unix)
-            || (observed.len() >= CLIENT_USAGE_TELEMETRY_CAPACITY
+            || (observed.len() >= SERVER_USAGE_TELEMETRY_CAPACITY
                 && !observed.contains_key(&identity))
         {
             return;
@@ -367,7 +362,7 @@ impl ClientApiService {
         tokio::spawn(async move {
             let _permit = permit;
             let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(CLIENT_USAGE_TELEMETRY_DEADLINE_MILLIS),
+                std::time::Duration::from_millis(SERVER_USAGE_TELEMETRY_DEADLINE_MILLIS),
                 repository.record_usage_if_older(identity.0, identity.1, bucket),
             )
             .await;
@@ -376,15 +371,15 @@ impl ClientApiService {
 
     pub(crate) async fn list_users(
         &self,
-        principal: &ClientPrincipal,
+        principal: &ServerPrincipal,
         cursor: Option<&str>,
         limit: Option<usize>,
-    ) -> Result<ClientUserPage, ApplicationError> {
-        let limit = limit.unwrap_or(DEFAULT_CLIENT_USER_PAGE_LIMIT);
-        if limit == 0 || limit > MAX_CLIENT_USER_PAGE_LIMIT {
+    ) -> Result<ServerUserPage, ApplicationError> {
+        let limit = limit.unwrap_or(DEFAULT_SERVER_USER_PAGE_LIMIT);
+        if limit == 0 || limit > MAX_SERVER_USER_PAGE_LIMIT {
             return Err(ApplicationError::InvalidInput);
         }
-        let after = cursor.map(ClientUserCursor::parse).transpose()?;
+        let after = cursor.map(ServerUserCursor::parse).transpose()?;
         let mut rows = self
             .repository
             .list_users(
@@ -401,7 +396,7 @@ impl ClientApiService {
         let next_cursor = has_more
             .then(|| rows.last().map(|(cursor, _)| cursor.encode()))
             .flatten();
-        Ok(ClientUserPage {
+        Ok(ServerUserPage {
             users: rows.into_iter().map(|(_, user)| user).collect(),
             next_cursor,
         })
@@ -409,9 +404,9 @@ impl ClientApiService {
 
     pub(crate) async fn user(
         &self,
-        principal: &ClientPrincipal,
+        principal: &ServerPrincipal,
         user_public_id: &str,
-    ) -> Result<ClientUser, ApplicationError> {
+    ) -> Result<ServerUser, ApplicationError> {
         self.repository
             .user_by_public_id(
                 principal.project_id,
@@ -423,9 +418,9 @@ impl ClientApiService {
 
     pub(crate) async fn lookup_user_by_email(
         &self,
-        principal: &ClientPrincipal,
+        principal: &ServerPrincipal,
         email: &str,
-    ) -> Result<Option<ClientUser>, ApplicationError> {
+    ) -> Result<Option<ServerUser>, ApplicationError> {
         if email.len() > 320 {
             return Err(ApplicationError::InvalidInput);
         }
@@ -448,10 +443,10 @@ impl ClientApiService {
 
     pub(crate) async fn application_projection(
         &self,
-        principal: &ClientPrincipal,
+        principal: &ServerPrincipal,
         application_public_id: &str,
         user_public_id: &str,
-    ) -> Result<ClientApplicationProjection, ApplicationError> {
+    ) -> Result<ServerApplicationProjection, ApplicationError> {
         self.repository
             .application_projection(
                 principal.project_id,
@@ -464,31 +459,31 @@ impl ClientApiService {
 
     pub(crate) async fn introspect(
         &self,
-        principal: &ClientPrincipal,
+        principal: &ServerPrincipal,
         token: &str,
         expected_application_public_id: Option<&str>,
-    ) -> Result<ClientTokenIntrospection, ApplicationError> {
+    ) -> Result<ServerTokenIntrospection, ApplicationError> {
         match self
             .introspect_active(principal, token, expected_application_public_id)
             .await
         {
-            Ok(active) => Ok(ClientTokenIntrospection::Active(Box::new(active))),
+            Ok(active) => Ok(ServerTokenIntrospection::Active(Box::new(active))),
             Err(
                 ApplicationError::InvalidInput
                 | ApplicationError::NotFound
                 | ApplicationError::Disabled
                 | ApplicationError::InvalidTransition,
-            ) => Ok(ClientTokenIntrospection::Inactive),
+            ) => Ok(ServerTokenIntrospection::Inactive),
             Err(error) => Err(error),
         }
     }
 
     async fn introspect_active(
         &self,
-        principal: &ClientPrincipal,
+        principal: &ServerPrincipal,
         token: &str,
         expected_application_public_id: Option<&str>,
-    ) -> Result<ActiveClientToken, ApplicationError> {
+    ) -> Result<ActiveServerToken, ApplicationError> {
         let parsed = ParsedAccessToken::parse(token)?;
         if expected_application_public_id
             .is_some_and(|expected| expected != parsed.claims.application_id)
@@ -514,9 +509,9 @@ impl ClientApiService {
             return Err(ApplicationError::Disabled);
         }
         let now_seconds = now.unix_timestamp();
-        if claims.expires_at <= now_seconds - CLIENT_TOKEN_CLOCK_SKEW_SECONDS
-            || claims.not_before > now_seconds + CLIENT_TOKEN_CLOCK_SKEW_SECONDS
-            || claims.issued_at > now_seconds + CLIENT_TOKEN_CLOCK_SKEW_SECONDS
+        if claims.expires_at <= now_seconds - SERVER_TOKEN_CLOCK_SKEW_SECONDS
+            || claims.not_before > now_seconds + SERVER_TOKEN_CLOCK_SKEW_SECONDS
+            || claims.issued_at > now_seconds + SERVER_TOKEN_CLOCK_SKEW_SECONDS
         {
             return Err(ApplicationError::InvalidTransition);
         }
@@ -526,7 +521,7 @@ impl ClientApiService {
             &parsed.signature,
         )?;
         self.repository
-            .introspect_session(ClientTokenSessionLookup {
+            .introspect_session(ServerTokenSessionLookup {
                 project_id: principal.project_id,
                 application_public_id: claims.application_id.clone(),
                 user_public_id: claims.subject.clone(),
@@ -593,7 +588,7 @@ struct ParsedAccessToken {
 
 impl ParsedAccessToken {
     fn parse(token: &str) -> Result<Self, ApplicationError> {
-        if token.is_empty() || token.len() > MAX_CLIENT_ACCESS_TOKEN_BYTES || !token.is_ascii() {
+        if token.is_empty() || token.len() > MAX_SERVER_ACCESS_TOKEN_BYTES || !token.is_ascii() {
             return Err(ApplicationError::InvalidInput);
         }
         let mut parts = token.split('.');
@@ -612,7 +607,7 @@ impl ParsedAccessToken {
         let claims: AccessTokenClaims = serde_json::from_slice(&decode(encoded_claims)?)
             .map_err(|_| ApplicationError::InvalidInput)?;
         if header.alg != "EdDSA"
-            || header.typ != CLIENT_ACCESS_TOKEN_TYP
+            || header.typ != SERVER_ACCESS_TOKEN_TYP
             || header.kid.is_empty()
             || header.kid.len() > 128
         {
@@ -653,11 +648,11 @@ mod tests {
     }
 
     #[async_trait]
-    impl ClientApiRepository for TelemetryRepository {
-        async fn client_key_authority(
+    impl ServerApiRepository for TelemetryRepository {
+        async fn server_key_authority(
             &self,
             _public_key_id: &str,
-        ) -> Result<ClientKeyAuthority, ApplicationError> {
+        ) -> Result<ServerKeyAuthority, ApplicationError> {
             Err(ApplicationError::NotFound)
         }
 
@@ -687,9 +682,9 @@ mod tests {
             &self,
             _project_id: Uuid,
             _project_public_id: &str,
-            _after: Option<ClientUserCursor>,
+            _after: Option<ServerUserCursor>,
             _limit_plus_one: usize,
-        ) -> Result<Vec<(ClientUserCursor, ClientUser)>, ApplicationError> {
+        ) -> Result<Vec<(ServerUserCursor, ServerUser)>, ApplicationError> {
             Ok(Vec::new())
         }
 
@@ -698,7 +693,7 @@ mod tests {
             _project_id: Uuid,
             _project_public_id: &str,
             _user_public_id: &str,
-        ) -> Result<ClientUser, ApplicationError> {
+        ) -> Result<ServerUser, ApplicationError> {
             Err(ApplicationError::NotFound)
         }
 
@@ -707,7 +702,7 @@ mod tests {
             _project_id: Uuid,
             _project_public_id: &str,
             _candidates: &[VersionedDigest],
-        ) -> Result<Option<ClientUser>, ApplicationError> {
+        ) -> Result<Option<ServerUser>, ApplicationError> {
             Ok(None)
         }
 
@@ -717,7 +712,7 @@ mod tests {
             _project_public_id: &str,
             _application_public_id: &str,
             _user_public_id: &str,
-        ) -> Result<ClientApplicationProjection, ApplicationError> {
+        ) -> Result<ServerApplicationProjection, ApplicationError> {
             Err(ApplicationError::NotFound)
         }
 
@@ -726,21 +721,21 @@ mod tests {
             _project_id: Uuid,
             _kid: &str,
             _now: OffsetDateTime,
-        ) -> Result<ClientVerificationKey, ApplicationError> {
+        ) -> Result<ServerVerificationKey, ApplicationError> {
             Err(ApplicationError::NotFound)
         }
 
         async fn introspect_session(
             &self,
-            _lookup: ClientTokenSessionLookup,
-        ) -> Result<ActiveClientToken, ApplicationError> {
+            _lookup: ServerTokenSessionLookup,
+        ) -> Result<ActiveServerToken, ApplicationError> {
             Err(ApplicationError::Disabled)
         }
     }
 
     struct UnusedKeyVerifier;
 
-    impl ClientKeyVerifier for UnusedKeyVerifier {
+    impl ServerKeyVerifier for UnusedKeyVerifier {
         fn readable_versions(&self) -> std::collections::BTreeSet<i32> {
             std::collections::BTreeSet::from([1])
         }
@@ -750,7 +745,7 @@ mod tests {
             _project_id: Uuid,
             _key_id: Uuid,
             _public_key_id: &str,
-            _secret: &[u8; crate::application::CLIENT_KEY_SECRET_BYTES],
+            _secret: &[u8; crate::application::SERVER_KEY_SECRET_BYTES],
             _digest_key_version: i32,
         ) -> Result<[u8; 32], ApplicationError> {
             Ok([0; 32])
@@ -759,7 +754,7 @@ mod tests {
 
     struct UnusedEmailDigester;
 
-    impl ClientEmailLookupDigester for UnusedEmailDigester {
+    impl EmailIdentityLookupDigester for UnusedEmailDigester {
         fn digest_candidates(
             &self,
             _project_id: Uuid,
@@ -771,7 +766,7 @@ mod tests {
 
     struct UnusedTokenVerifier;
 
-    impl ClientTokenSignatureVerifier for UnusedTokenVerifier {
+    impl ServerTokenSignatureVerifier for UnusedTokenVerifier {
         fn verify(
             &self,
             _public_jwk: &Value,
@@ -794,8 +789,8 @@ mod tests {
     fn telemetry_service(
         repository: Arc<TelemetryRepository>,
         clock: Arc<AdjustableClock>,
-    ) -> ClientApiService {
-        ClientApiService::new(
+    ) -> ServerApiService {
+        ServerApiService::new(
             repository,
             Arc::new(UnusedKeyVerifier),
             Arc::new(UnusedEmailDigester),
@@ -804,8 +799,8 @@ mod tests {
         )
     }
 
-    fn telemetry_principal(key: u128) -> ClientPrincipal {
-        ClientPrincipal {
+    fn telemetry_principal(key: u128) -> ServerPrincipal {
+        ServerPrincipal {
             project_id: Uuid::from_u128(1),
             project_public_id: "project".to_owned(),
             key_id: Uuid::from_u128(key),
@@ -836,16 +831,16 @@ mod tests {
         let principal = telemetry_principal(2);
 
         for _ in 0..32 {
-            service.observe_client_key_usage(&principal);
+            service.observe_server_key_usage(&principal);
         }
         wait_for_calls(&repository, 1).await;
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        service.observe_client_key_usage(&principal);
+        service.observe_server_key_usage(&principal);
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(repository.calls.load(Ordering::SeqCst), 1);
 
         clock.0.fetch_add(15 * 60, Ordering::SeqCst);
-        service.observe_client_key_usage(&principal);
+        service.observe_server_key_usage(&principal);
         wait_for_calls(&repository, 2).await;
         assert_eq!(repository.maximum_active.load(Ordering::SeqCst), 1);
     }
@@ -861,38 +856,38 @@ mod tests {
         let clock = Arc::new(AdjustableClock(AtomicI64::new(1_800_000_000)));
         let service = telemetry_service(repository.clone(), clock);
 
-        service.observe_client_key_usage(&telemetry_principal(2));
+        service.observe_server_key_usage(&telemetry_principal(2));
         wait_for_calls(&repository, 1).await;
-        service.observe_client_key_usage(&telemetry_principal(3));
+        service.observe_server_key_usage(&telemetry_principal(3));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(repository.calls.load(Ordering::SeqCst), 1);
 
         tokio::time::sleep(std::time::Duration::from_millis(
-            CLIENT_USAGE_TELEMETRY_DEADLINE_MILLIS + 30,
+            SERVER_USAGE_TELEMETRY_DEADLINE_MILLIS + 30,
         ))
         .await;
-        service.observe_client_key_usage(&telemetry_principal(3));
+        service.observe_server_key_usage(&telemetry_principal(3));
         wait_for_calls(&repository, 2).await;
         assert_eq!(repository.maximum_active.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn cursor_round_trip_is_fixed_canonical_and_rejects_malleability() {
-        let cursor = ClientUserCursor {
+        let cursor = ServerUserCursor {
             created_at: OffsetDateTime::from_unix_timestamp_nanos(1_234_567_890_123)
                 .expect("timestamp"),
             user_id: Uuid::new_v4(),
         };
         let encoded = cursor.encode();
-        assert_eq!(ClientUserCursor::parse(&encoded), Ok(cursor));
+        assert_eq!(ServerUserCursor::parse(&encoded), Ok(cursor));
         assert_eq!(
-            ClientUserCursor::parse(&format!("{encoded}=")),
+            ServerUserCursor::parse(&format!("{encoded}=")),
             Err(ApplicationError::InvalidInput)
         );
         let mut bytes = URL_SAFE_NO_PAD.decode(encoded).expect("cursor bytes");
         bytes[0] = 2;
         assert_eq!(
-            ClientUserCursor::parse(&URL_SAFE_NO_PAD.encode(bytes)),
+            ServerUserCursor::parse(&URL_SAFE_NO_PAD.encode(bytes)),
             Err(ApplicationError::InvalidInput)
         );
     }

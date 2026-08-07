@@ -3,7 +3,13 @@ import type { SyntheticEvent } from "react";
 import { Link, useParams } from "react-router";
 
 import { CopyValue, formatDuration } from "../../shared/compositions/CopyValue";
-import { DescriptionList, EmptyState, PageHeader, Section } from "../../shared/layout/Layout";
+import {
+  DescriptionList,
+  EmptyState,
+  LoadingState,
+  PageHeader,
+  Section,
+} from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Checkbox, Field, Input } from "../../shared/primitives/Field";
@@ -271,7 +277,7 @@ export function ProjectSettingsPage() {
         ) : null}
         {policy === null ? (
           policyLoadState === "loading" ? (
-            <p role="status">Loading Project policy</p>
+            <LoadingState>Loading project policy</LoadingState>
           ) : null
         ) : (
           <DescriptionList

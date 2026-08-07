@@ -187,6 +187,9 @@ function renderPanel(options?: {
         identities={options?.identities ?? [providerIdentity, emailIdentity]}
         applications={[application]}
         providers={options?.providers ?? [provider]}
+        hasMoreUsers={false}
+        loadingMoreUsers={false}
+        loadMoreUsers={() => Promise.resolve()}
         reloadSelectedUser={reload}
         onError={onError}
         setMessage={setMessage}

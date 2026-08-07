@@ -141,7 +141,7 @@ jobs:
           cargo run --release --locked --package owlauth-types --bin export-openapi -- \
             runtime artifacts/owlauth-runtime-openapi.json
           cargo run --release --locked --package owlauth-types --bin export-openapi -- \
-            client artifacts/owlauth-client-openapi.json
+            server artifacts/owlauth-server-openapi.json
           cargo run --release --locked --package owlauth-types --bin export-openapi -- \
             control artifacts/owlauth-control-openapi.json
       - name: Create checksums
@@ -150,7 +150,7 @@ jobs:
           sha256sum \
             owlauth-server-*.tar.gz \
             owlauth-runtime-openapi.json \
-            owlauth-client-openapi.json \
+            owlauth-server-openapi.json \
             owlauth-control-openapi.json > SHA256SUMS
       - name: Re-verify release eligibility
         run: scripts/release/verify-release.sh server >/dev/null

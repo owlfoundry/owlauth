@@ -12,26 +12,26 @@ use uuid::Uuid;
 
 use super::ApplicationError;
 
-pub(crate) const MAX_CLIENT_DIGEST_VERSIONS: usize = 32;
-pub(crate) const MAX_REQUIRED_CLIENT_PROCESSES: usize = 64;
-pub(crate) const MAX_CLIENT_DIGEST_READINESS_LEASE_TTL: Duration = Duration::from_mins(5);
+pub(crate) const MAX_SERVER_DIGEST_VERSIONS: usize = 32;
+pub(crate) const MAX_REQUIRED_SERVER_PROCESSES: usize = 64;
+pub(crate) const MAX_SERVER_DIGEST_READINESS_LEASE_TTL: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClientDigestReadinessClaim {
+pub(crate) struct ServerDigestReadinessClaim {
     pub process_id: String,
     pub process_incarnation: Uuid,
     pub readable_digest_versions: Vec<i32>,
     pub lease_ttl: Duration,
 }
 
-impl ClientDigestReadinessClaim {
+impl ServerDigestReadinessClaim {
     pub(crate) fn validate(&self) -> Result<(), ApplicationError> {
-        if !valid_client_process_id(&self.process_id)
+        if !valid_server_process_id(&self.process_id)
             || self.process_incarnation.is_nil()
             || self.lease_ttl.is_zero()
-            || self.lease_ttl > MAX_CLIENT_DIGEST_READINESS_LEASE_TTL
+            || self.lease_ttl > MAX_SERVER_DIGEST_READINESS_LEASE_TTL
             || self.readable_digest_versions.is_empty()
-            || self.readable_digest_versions.len() > MAX_CLIENT_DIGEST_VERSIONS
+            || self.readable_digest_versions.len() > MAX_SERVER_DIGEST_VERSIONS
             || self
                 .readable_digest_versions
                 .iter()
@@ -48,7 +48,7 @@ impl ClientDigestReadinessClaim {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ClientDigestReadinessState {
+pub(crate) enum ServerDigestReadinessState {
     Ready,
     LocalObservationUnavailable,
     RequiredRosterUnavailable,
@@ -56,58 +56,58 @@ pub(crate) enum ClientDigestReadinessState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ClientDigestReadinessSnapshot {
-    pub state: ClientDigestReadinessState,
+pub(crate) struct ServerDigestReadinessSnapshot {
+    pub state: ServerDigestReadinessState,
     pub active_digest_versions: Vec<i32>,
 }
 
-impl ClientDigestReadinessSnapshot {
+impl ServerDigestReadinessSnapshot {
     #[must_use]
     pub(crate) const fn is_ready(&self) -> bool {
-        matches!(self.state, ClientDigestReadinessState::Ready)
+        matches!(self.state, ServerDigestReadinessState::Ready)
     }
 }
 
 #[async_trait]
-pub(crate) trait ClientDigestReadinessPort: Send + Sync {
+pub(crate) trait ServerDigestReadinessPort: Send + Sync {
     /// Atomically replaces the current incarnation for `process_id` and records one ready lease
     /// containing exactly `readable_digest_versions`.
-    async fn claim(&self, claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError>;
+    async fn claim(&self, claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError>;
 
     /// Renews only the exact current incarnation and exact version set. A replaced incarnation
     /// must fail closed rather than recreating its observation.
-    async fn renew(&self, claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError>;
+    async fn renew(&self, claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError>;
 
     /// Reads the authoritative active-key inventory and the complete required verifier roster in
-    /// one `PostgreSQL` snapshot. This operation never authorizes a Client request.
+    /// one `PostgreSQL` snapshot. This operation never authorizes a Server request.
     async fn authoritative_snapshot(
         &self,
-        claim: &ClientDigestReadinessClaim,
+        claim: &ServerDigestReadinessClaim,
         required_process_ids: &[String],
-    ) -> Result<ClientDigestReadinessSnapshot, ApplicationError>;
+    ) -> Result<ServerDigestReadinessSnapshot, ApplicationError>;
 }
 
 #[derive(Clone)]
-pub(crate) struct ClientDigestReadinessService {
-    port: Arc<dyn ClientDigestReadinessPort>,
-    claim: ClientDigestReadinessClaim,
+pub(crate) struct ServerDigestReadinessService {
+    port: Arc<dyn ServerDigestReadinessPort>,
+    claim: ServerDigestReadinessClaim,
     required_process_ids: Arc<[String]>,
     renewal_healthy: Arc<AtomicBool>,
 }
 
-impl ClientDigestReadinessService {
+impl ServerDigestReadinessService {
     pub(crate) fn new(
-        port: Arc<dyn ClientDigestReadinessPort>,
+        port: Arc<dyn ServerDigestReadinessPort>,
         process_id: String,
         process_incarnation: Uuid,
         readable_digest_versions: impl IntoIterator<Item = i32>,
         required_process_ids: impl IntoIterator<Item = String>,
         lease_ttl: Duration,
     ) -> Result<Self, ApplicationError> {
-        if !valid_client_process_id(&process_id)
+        if !valid_server_process_id(&process_id)
             || process_incarnation.is_nil()
             || lease_ttl.is_zero()
-            || lease_ttl > MAX_CLIENT_DIGEST_READINESS_LEASE_TTL
+            || lease_ttl > MAX_SERVER_DIGEST_READINESS_LEASE_TTL
         {
             return Err(ApplicationError::InvalidInput);
         }
@@ -116,7 +116,7 @@ impl ClientDigestReadinessService {
             .into_iter()
             .collect::<BTreeSet<_>>();
         if readable_digest_versions.is_empty()
-            || readable_digest_versions.len() > MAX_CLIENT_DIGEST_VERSIONS
+            || readable_digest_versions.len() > MAX_SERVER_DIGEST_VERSIONS
             || readable_digest_versions.iter().any(|version| *version <= 0)
         {
             return Err(ApplicationError::InvalidInput);
@@ -124,16 +124,16 @@ impl ClientDigestReadinessService {
 
         let required_process_ids = required_process_ids.into_iter().collect::<BTreeSet<_>>();
         if required_process_ids.is_empty()
-            || required_process_ids.len() > MAX_REQUIRED_CLIENT_PROCESSES
+            || required_process_ids.len() > MAX_REQUIRED_SERVER_PROCESSES
             || required_process_ids
                 .iter()
-                .any(|required| !valid_client_process_id(required))
+                .any(|required| !valid_server_process_id(required))
             || !required_process_ids.contains(&process_id)
         {
             return Err(ApplicationError::InvalidInput);
         }
 
-        let claim = ClientDigestReadinessClaim {
+        let claim = ServerDigestReadinessClaim {
             process_id,
             process_incarnation,
             readable_digest_versions: readable_digest_versions.into_iter().collect(),
@@ -166,10 +166,10 @@ impl ClientDigestReadinessService {
 
     pub(crate) async fn readiness(
         &self,
-    ) -> Result<ClientDigestReadinessSnapshot, ApplicationError> {
+    ) -> Result<ServerDigestReadinessSnapshot, ApplicationError> {
         if !self.renewal_healthy.load(Ordering::Acquire) {
-            return Ok(ClientDigestReadinessSnapshot {
-                state: ClientDigestReadinessState::LocalObservationUnavailable,
+            return Ok(ServerDigestReadinessSnapshot {
+                state: ServerDigestReadinessState::LocalObservationUnavailable,
                 active_digest_versions: Vec::new(),
             });
         }
@@ -190,7 +190,7 @@ impl ClientDigestReadinessService {
     }
 }
 
-pub(crate) fn valid_client_process_id(value: &str) -> bool {
+pub(crate) fn valid_server_process_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -207,20 +207,20 @@ mod tests {
     struct UnusedPort;
 
     #[async_trait]
-    impl ClientDigestReadinessPort for UnusedPort {
-        async fn claim(&self, _claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
+    impl ServerDigestReadinessPort for UnusedPort {
+        async fn claim(&self, _claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
             unreachable!()
         }
 
-        async fn renew(&self, _claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
+        async fn renew(&self, _claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
             unreachable!()
         }
 
         async fn authoritative_snapshot(
             &self,
-            _claim: &ClientDigestReadinessClaim,
+            _claim: &ServerDigestReadinessClaim,
             _required_process_ids: &[String],
-        ) -> Result<ClientDigestReadinessSnapshot, ApplicationError> {
+        ) -> Result<ServerDigestReadinessSnapshot, ApplicationError> {
             unreachable!()
         }
     }
@@ -229,10 +229,10 @@ mod tests {
         versions: impl IntoIterator<Item = i32>,
         roster: impl IntoIterator<Item = String>,
         ttl: Duration,
-    ) -> Result<ClientDigestReadinessService, ApplicationError> {
-        ClientDigestReadinessService::new(
+    ) -> Result<ServerDigestReadinessService, ApplicationError> {
+        ServerDigestReadinessService::new(
             Arc::new(UnusedPort),
-            "client-b".to_owned(),
+            "server-b".to_owned(),
             Uuid::new_v4(),
             versions,
             roster,
@@ -245,12 +245,12 @@ mod tests {
     }
 
     #[async_trait]
-    impl ClientDigestReadinessPort for RecoveringPort {
-        async fn claim(&self, _claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
+    impl ServerDigestReadinessPort for RecoveringPort {
+        async fn claim(&self, _claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
             Ok(())
         }
 
-        async fn renew(&self, _claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
+        async fn renew(&self, _claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
             if self.renewals.fetch_add(1, Ordering::AcqRel) == 0 {
                 Err(ApplicationError::Persistence)
             } else {
@@ -260,11 +260,11 @@ mod tests {
 
         async fn authoritative_snapshot(
             &self,
-            _claim: &ClientDigestReadinessClaim,
+            _claim: &ServerDigestReadinessClaim,
             _required_process_ids: &[String],
-        ) -> Result<ClientDigestReadinessSnapshot, ApplicationError> {
-            Ok(ClientDigestReadinessSnapshot {
-                state: ClientDigestReadinessState::Ready,
+        ) -> Result<ServerDigestReadinessSnapshot, ApplicationError> {
+            Ok(ServerDigestReadinessSnapshot {
+                state: ServerDigestReadinessState::Ready,
                 active_digest_versions: vec![1],
             })
         }
@@ -272,14 +272,14 @@ mod tests {
 
     #[tokio::test]
     async fn successful_retry_restores_readiness_after_transient_renewal_failure() {
-        let service = ClientDigestReadinessService::new(
+        let service = ServerDigestReadinessService::new(
             Arc::new(RecoveringPort {
                 renewals: AtomicUsize::new(0),
             }),
-            "client-b".to_owned(),
+            "server-b".to_owned(),
             Uuid::new_v4(),
             [1],
-            ["client-b".to_owned()],
+            ["server-b".to_owned()],
             Duration::from_secs(30),
         )
         .expect("valid service");
@@ -291,7 +291,7 @@ mod tests {
                 .await
                 .expect("fail-closed readiness")
                 .state,
-            ClientDigestReadinessState::LocalObservationUnavailable
+            ServerDigestReadinessState::LocalObservationUnavailable
         );
         service.renew().await.expect("retry should recover");
         assert_eq!(
@@ -300,7 +300,7 @@ mod tests {
                 .await
                 .expect("recovered readiness")
                 .state,
-            ClientDigestReadinessState::Ready
+            ServerDigestReadinessState::Ready
         );
     }
 
@@ -309,64 +309,64 @@ mod tests {
         let service = service(
             [3, 1, 2, 3],
             [
-                "client-b".to_owned(),
-                "client-a".to_owned(),
-                "client-a".to_owned(),
+                "server-b".to_owned(),
+                "server-a".to_owned(),
+                "server-a".to_owned(),
             ],
             Duration::from_secs(30),
         )
         .expect("valid service");
         assert_eq!(service.claim.readable_digest_versions, [1, 2, 3]);
-        assert_eq!(&*service.required_process_ids, ["client-a", "client-b"]);
+        assert_eq!(&*service.required_process_ids, ["server-a", "server-b"]);
         assert_eq!(service.renewal_interval(), Duration::from_secs(10));
     }
 
     #[test]
     fn rejects_invalid_process_identity_and_roster() {
         assert_eq!(
-            ClientDigestReadinessService::new(
+            ServerDigestReadinessService::new(
                 Arc::new(UnusedPort),
-                " client".to_owned(),
+                " server".to_owned(),
                 Uuid::new_v4(),
                 [1],
-                [" client".to_owned()],
+                [" server".to_owned()],
                 Duration::from_secs(30),
             )
             .err(),
             Some(ApplicationError::InvalidInput)
         );
         assert_eq!(
-            ClientDigestReadinessService::new(
+            ServerDigestReadinessService::new(
                 Arc::new(UnusedPort),
-                "client-b".to_owned(),
+                "server-b".to_owned(),
                 Uuid::nil(),
                 [1],
-                ["client-b".to_owned()],
+                ["server-b".to_owned()],
                 Duration::from_secs(30),
             )
             .err(),
             Some(ApplicationError::InvalidInput)
         );
-        assert!(service([1], ["client-a".to_owned()], Duration::from_secs(30)).is_err());
+        assert!(service([1], ["server-a".to_owned()], Duration::from_secs(30)).is_err());
     }
 
     #[test]
     fn rejects_out_of_range_ttl_and_version_sets() {
-        assert!(service([1], ["client-b".to_owned()], Duration::ZERO).is_err());
+        assert!(service([1], ["server-b".to_owned()], Duration::ZERO).is_err());
         assert!(
             service(
                 [1],
-                ["client-b".to_owned()],
-                MAX_CLIENT_DIGEST_READINESS_LEASE_TTL + Duration::from_nanos(1),
+                ["server-b".to_owned()],
+                MAX_SERVER_DIGEST_READINESS_LEASE_TTL + Duration::from_nanos(1),
             )
             .is_err()
         );
-        assert!(service([], ["client-b".to_owned()], Duration::from_secs(30)).is_err());
-        assert!(service([0], ["client-b".to_owned()], Duration::from_secs(30)).is_err());
+        assert!(service([], ["server-b".to_owned()], Duration::from_secs(30)).is_err());
+        assert!(service([0], ["server-b".to_owned()], Duration::from_secs(30)).is_err());
         assert!(
             service(
-                1..=i32::try_from(MAX_CLIENT_DIGEST_VERSIONS + 1).expect("small bound"),
-                ["client-b".to_owned()],
+                1..=i32::try_from(MAX_SERVER_DIGEST_VERSIONS + 1).expect("small bound"),
+                ["server-b".to_owned()],
                 Duration::from_secs(30),
             )
             .is_err()

@@ -177,6 +177,50 @@ describe("Hosted identity mutation", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("offers an authoritative refresh while an external email proof is pending", () => {
+    installMutation(
+      bootstrap({
+        revision: 4,
+        slots: [
+          slot({
+            state: "email_challenge_pending",
+            next_action: "verify_email",
+          }),
+        ],
+      }),
+    );
+    const reload = vi
+      .spyOn(identityMutationNavigation, "reload")
+      .mockImplementation(() => undefined);
+    render(<RuntimeApp />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh proof status" }));
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes a pending external proof when an initially hidden tab becomes visible", () => {
+    installMutation(
+      bootstrap({
+        revision: 4,
+        slots: [
+          slot({
+            state: "email_challenge_pending",
+            next_action: "verify_email",
+          }),
+        ],
+      }),
+    );
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    const reload = vi
+      .spyOn(identityMutationNavigation, "reload")
+      .mockImplementation(() => undefined);
+    render(<RuntimeApp />);
+
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
   it("supports email entry, bounded resend, OTP, and explicit ready confirmation", async () => {
     installMutation(bootstrap());
     let challengeGeneration = 0;

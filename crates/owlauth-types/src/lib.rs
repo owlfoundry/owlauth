@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 
-//! Stable public HTTP contracts for `OwlAuth`'s isolated Runtime, Client, and Control planes.
+//! Stable public HTTP contracts for `OwlAuth`'s isolated Runtime, Server, and Control planes.
 
-pub mod client;
 pub mod control;
 mod control_resources;
 pub mod export;
 pub mod health;
 pub mod runtime;
+pub mod server;
 
 pub use health::HealthResponse;
 
@@ -18,7 +18,7 @@ pub const FEDERATED_PROJECT_AUTH_AVAILABLE: bool = true;
 mod tests {
     use serde_json::Value;
 
-    use crate::{client, control, export, runtime};
+    use crate::{control, export, runtime, server};
 
     #[test]
     #[allow(
@@ -28,13 +28,13 @@ mod tests {
     fn generated_documents_are_plane_pure_and_versioned() {
         let runtime =
             serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI should serialize");
-        let client =
-            serde_json::to_value(client::openapi()).expect("Client OpenAPI should serialize");
+        let server =
+            serde_json::to_value(server::openapi()).expect("Server OpenAPI should serialize");
         let control =
             serde_json::to_value(control::openapi()).expect("Control OpenAPI should serialize");
 
         assert_eq!(runtime["info"]["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(client["info"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(server["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(control["info"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(runtime["paths"]["/health"].is_object());
         assert!(runtime["paths"]["/ready"].is_object());
@@ -90,14 +90,14 @@ mod tests {
             "/v1/projects/{project_id}/tokens/introspect",
         ] {
             assert!(
-                client["paths"][path].is_object(),
-                "missing Client path: {path}"
+                server["paths"][path].is_object(),
+                "missing Server path: {path}"
             );
         }
-        assert!(client["components"]["securitySchemes"]["project_client_key"].is_object());
-        assert!(client["paths"].get("/v1/system").is_none());
+        assert!(server["components"]["securitySchemes"]["project_server_key"].is_object());
+        assert!(server["paths"].get("/v1/system").is_none());
         assert!(
-            client["paths"]
+            server["paths"]
                 .get("/v1/projects/{project_public_id}/auth/config")
                 .is_none()
         );
@@ -107,13 +107,13 @@ mod tests {
             "OidcPreflightRequest",
             "PublicApplicationConfig",
             "RefreshSessionRequest",
-            "ProjectClientKey",
+            "ProjectServerKey",
         ] {
             assert!(
-                client["components"]["schemas"]
+                server["components"]["schemas"]
                     .get(forbidden_schema)
                     .is_none(),
-                "Client OpenAPI leaked {forbidden_schema}"
+                "Server OpenAPI leaked {forbidden_schema}"
             );
         }
 
@@ -198,85 +198,201 @@ mod tests {
     }
 
     #[test]
+    fn control_operation_inventory_and_exceptional_responses_are_exact() {
+        let control = serde_json::to_value(control::openapi()).expect("Control OpenAPI serializes");
+        for (path, methods) in [
+            ("/v1/projects", &["get", "post"][..]),
+            ("/v1/projects/{project_id}", &["get", "patch"]),
+            ("/v1/projects/{project_id}/applications", &["get", "post"]),
+            (
+                "/v1/projects/{project_id}/applications/{application_id}",
+                &["get", "patch"],
+            ),
+            (
+                "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
+                &["get", "post"],
+            ),
+            (
+                "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints/{endpoint_id}",
+                &["get", "put"],
+            ),
+            ("/v1/projects/{project_id}/server-keys", &["get", "post"]),
+            ("/v1/projects/{project_id}/email-method", &["get", "put"]),
+            ("/v1/projects/{project_id}/policy", &["get", "put"]),
+            (
+                "/v1/projects/{project_id}/provider-egress-policy",
+                &["get", "put"],
+            ),
+            ("/v1/projects/{project_id}/providers", &["get", "post"]),
+            (
+                "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
+                &["put"],
+            ),
+            (
+                "/v1/projects/{project_id}/smtp-configurations",
+                &["get", "post"],
+            ),
+            ("/v1/system/smtp-default-generations", &["get", "post"]),
+        ] {
+            let path_item = &control["paths"][path];
+            for method in methods {
+                assert!(
+                    path_item[method].is_object(),
+                    "missing Control operation {method} {path}"
+                );
+            }
+        }
+
+        for path in [
+            "/v1/projects/{project_id}/providers/oidc/preflight",
+            "/v1/projects/{project_id}/providers/named/preflight",
+        ] {
+            assert!(control["paths"][path]["post"]["responses"]["422"].is_object());
+        }
+        let smtp_test = &control["paths"]["/v1/projects/{project_id}/smtp-configurations/{smtp_id}/test"]
+            ["post"];
+        assert!(smtp_test["responses"].get("200").is_none());
+        let accepted = &smtp_test["responses"]["202"];
+        assert_eq!(accepted["headers"]["Location"]["schema"]["type"], "string");
+        assert!(
+            accepted["headers"]["Location"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Exact Control path"))
+        );
+
+        for path in [
+            "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations",
+            "/v1/projects/{project_id}/identity-mutation-intents",
+        ] {
+            let responses = &control["paths"][path]["post"]["responses"];
+            assert!(responses["200"].is_object(), "{path} must describe replay");
+            assert_eq!(
+                responses["201"]["headers"]["Location"]["schema"]["type"],
+                "string"
+            );
+        }
+        assert_eq!(
+            control["paths"]["/v1/projects/{project_id}/server-keys"]["post"]["responses"]["201"]["headers"]
+                ["Location"]["schema"]["type"],
+            "string"
+        );
+        assert!(
+            control["paths"]["/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}"]["get"].is_object()
+        );
+        let replay = &control["paths"]["/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}/replay"]
+            ["post"]["responses"];
+        assert!(replay.get("200").is_none());
+        assert_eq!(
+            replay["201"]["headers"]["Location"]["schema"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn runtime_pending_email_and_hosted_document_contracts_are_minimal() {
+        let runtime = serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI serializes");
+        let pending = &runtime["components"]["schemas"]["HostedPendingEmailChallenge"];
+        let properties = pending["properties"]
+            .as_object()
+            .expect("pending properties");
+        assert_eq!(
+            properties
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["challenge_id", "expires_at", "generation", "proof_modes"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+        for forbidden in [
+            "email",
+            "address",
+            "account",
+            "delivery",
+            "otp",
+            "magic_proof",
+            "smtp",
+        ] {
+            assert!(properties.get(forbidden).is_none());
+        }
+        assert!(
+            runtime["components"]["schemas"]["HostedInteractionResponse"]["properties"]
+                ["pending_email_challenge"]
+                .is_object()
+        );
+        for path in [
+            "/auth/interactions/{interaction}",
+            "/auth/email/confirm/{challenge_id}",
+            "/auth/browser-logout/{preparation}",
+            "/auth/managed-reauthorizations/{interaction}",
+            "/auth/identity-mutations/{intent}",
+            "/auth/identity-mutations/email/confirm/{challenge_id}",
+        ] {
+            assert_eq!(
+                runtime["paths"][path]["get"]["responses"]["200"]["content"]["text/html"]["schema"]
+                    ["type"],
+                "string",
+                "Hosted document must declare text/html for {path}"
+            );
+        }
+        for excluded in ["/auth/", "/auth/assets/{asset}"] {
+            assert!(runtime["paths"].get(excluded).is_none());
+        }
+    }
+
+    #[test]
     fn every_runtime_rate_limit_response_requires_integer_retry_after_seconds() {
         let runtime: Value = serde_json::from_str(
             &export::to_pretty_json(export::OpenApiPlane::Runtime)
                 .expect("Runtime OpenAPI should serialize"),
         )
         .expect("exported Runtime OpenAPI should be JSON");
-        let operations = [
-            ("/v1/projects/{project_public_id}/auth/config", "get"),
-            ("/projects/{project_public_id}/.well-known/jwks.json", "get"),
-            ("/v1/projects/{project_public_id}/auth/login/start", "post"),
-            ("/auth/interactions/{interaction}", "get"),
-            (
-                "/v1/projects/{project_public_id}/auth/interactions/{interaction}/method",
-                "post",
-            ),
-            (
-                "/v1/projects/{project_public_id}/auth/interactions/{interaction}/session/reuse",
-                "post",
-            ),
-            (
-                "/projects/{project_public_id}/auth/callback/{provider_key}",
-                "get",
-            ),
-            (
-                "/v1/projects/{project_public_id}/auth/handoff/exchange",
-                "post",
-            ),
-            (
-                "/v1/projects/{project_public_id}/auth/sessions/refresh",
-                "post",
-            ),
-            ("/v1/projects/{project_public_id}/auth/users/me", "get"),
-            (
-                "/v1/projects/{project_public_id}/auth/sessions/logout",
-                "post",
-            ),
-            (
-                "/v1/projects/{project_public_id}/auth/browser-logout/prepare",
-                "post",
-            ),
-            ("/auth/browser-logout/{preparation}", "get"),
-            (
-                "/v1/projects/{project_public_id}/auth/browser-logout/{preparation}/confirm",
-                "post",
-            ),
-        ];
-
-        for (path, method) in operations {
-            let response = &runtime["paths"][path][method]["responses"]["429"];
-            assert!(
-                response.is_object(),
-                "429 response missing for {method} {path}"
-            );
-            let retry_after = &response["headers"]["Retry-After"];
-            assert_eq!(
-                retry_after["schema"]["type"], "integer",
-                "Retry-After must be integer seconds for {method} {path}"
-            );
-            assert_eq!(
-                retry_after["required"], true,
-                "Retry-After must be required for {method} {path}"
-            );
-            assert!(
-                retry_after["description"]
-                    .as_str()
-                    .is_some_and(|description| description.contains("Required")
-                        && description.contains("whole seconds")),
-                "Retry-After must be documented as required whole seconds for {method} {path}"
-            );
+        let paths = runtime["paths"]
+            .as_object()
+            .expect("Runtime paths should be an object");
+        let mut checked = 0;
+        for (path, path_item) in paths {
+            let Some(methods) = path_item.as_object() else {
+                continue;
+            };
+            for (method, operation) in methods {
+                let response = &operation["responses"]["429"];
+                if !response.is_object() {
+                    continue;
+                }
+                checked += 1;
+                let retry_after = &response["headers"]["Retry-After"];
+                assert_eq!(
+                    retry_after["schema"]["type"], "integer",
+                    "Retry-After must be integer seconds for {method} {path}"
+                );
+                assert_eq!(
+                    retry_after["required"], true,
+                    "Retry-After must be required for {method} {path}"
+                );
+                assert!(
+                    retry_after["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("Required")
+                            && description.contains("whole seconds")),
+                    "Retry-After must be documented as required whole seconds for {method} {path}"
+                );
+            }
         }
+        assert!(
+            checked >= 20,
+            "Runtime rate-limit inventory unexpectedly shrank"
+        );
     }
 
     #[test]
-    fn every_client_rate_limit_response_requires_integer_retry_after_seconds() {
-        let client: Value = serde_json::from_str(
-            &export::to_pretty_json(export::OpenApiPlane::Client)
-                .expect("Client OpenAPI should serialize"),
+    fn every_server_rate_limit_response_requires_integer_retry_after_seconds() {
+        let server: Value = serde_json::from_str(
+            &export::to_pretty_json(export::OpenApiPlane::Server)
+                .expect("Server OpenAPI should serialize"),
         )
-        .expect("exported Client OpenAPI should be JSON");
+        .expect("exported Server OpenAPI should be JSON");
         let operations = [
             ("/v1/projects/{project_id}/users", "get"),
             ("/v1/projects/{project_id}/users/lookup", "post"),
@@ -289,7 +405,7 @@ mod tests {
         ];
         for (path, method) in operations {
             let retry_after =
-                &client["paths"][path][method]["responses"]["429"]["headers"]["Retry-After"];
+                &server["paths"][path][method]["responses"]["429"]["headers"]["Retry-After"];
             assert_eq!(retry_after["schema"]["type"], "integer");
             assert_eq!(retry_after["required"], true);
             assert!(
@@ -302,12 +418,12 @@ mod tests {
     }
 
     #[test]
-    fn client_auth_projection_and_introspection_contract_is_exact() {
-        let client: Value = serde_json::from_str(
-            &export::to_pretty_json(export::OpenApiPlane::Client)
-                .expect("Client OpenAPI should serialize"),
+    fn server_auth_projection_and_introspection_contract_is_exact() {
+        let server: Value = serde_json::from_str(
+            &export::to_pretty_json(export::OpenApiPlane::Server)
+                .expect("Server OpenAPI should serialize"),
         )
-        .expect("exported Client OpenAPI should be JSON");
+        .expect("exported Server OpenAPI should be JSON");
         let operations = [
             ("/v1/projects/{project_id}/users", "get"),
             ("/v1/projects/{project_id}/users/lookup", "post"),
@@ -320,12 +436,12 @@ mod tests {
         ];
         for (path, method) in operations {
             let challenge =
-                &client["paths"][path][method]["responses"]["401"]["headers"]["WWW-Authenticate"];
+                &server["paths"][path][method]["responses"]["401"]["headers"]["WWW-Authenticate"];
             assert_eq!(challenge["required"], true, "{method} {path}");
             assert_eq!(challenge["schema"]["type"], "string", "{method} {path}");
         }
 
-        let schemas = &client["components"]["schemas"];
+        let schemas = &server["components"]["schemas"];
         assert_eq!(
             schemas["InactiveProjectToken"]["properties"]["active"]["const"],
             false
@@ -335,32 +451,32 @@ mod tests {
             true
         );
         assert!(
-            schemas["ClientApplicationUserProjection"]["required"]
+            schemas["ServerApplicationUserProjection"]["required"]
                 .as_array()
                 .is_some_and(|required| required.iter().any(|field| field == "user_revision"))
         );
         assert_eq!(
-            schemas["ClientApplicationUserProjection"]["properties"]["user_revision"]["minimum"],
+            schemas["ServerApplicationUserProjection"]["properties"]["user_revision"]["minimum"],
             1
         );
         assert!(
-            schemas["ClientUserList"]["required"]
+            schemas["ServerUserList"]["required"]
                 .as_array()
                 .is_some_and(|required| required.iter().any(|field| field == "next_cursor"))
         );
         assert_eq!(
-            schemas["ClientUserList"]["properties"]["next_cursor"]["maxLength"],
+            schemas["ServerUserList"]["properties"]["next_cursor"]["maxLength"],
             64
         );
 
-        let parameters = client["paths"]["/v1/projects/{project_id}/users"]["get"]["parameters"]
+        let parameters = server["paths"]["/v1/projects/{project_id}/users"]["get"]["parameters"]
             .as_array()
-            .expect("Client list parameters");
+            .expect("Server list parameters");
         let parameter = |name: &str| {
             parameters
                 .iter()
                 .find(|parameter| parameter["name"] == name)
-                .unwrap_or_else(|| panic!("missing Client parameter {name}"))
+                .unwrap_or_else(|| panic!("missing Server parameter {name}"))
         };
         assert_eq!(parameter("project_id")["schema"]["maxLength"], 96);
         assert_eq!(parameter("cursor")["schema"]["maxLength"], 64);
@@ -405,7 +521,7 @@ mod tests {
     fn separate_exports_are_deterministic() {
         for plane in [
             export::OpenApiPlane::Runtime,
-            export::OpenApiPlane::Client,
+            export::OpenApiPlane::Server,
             export::OpenApiPlane::Control,
         ] {
             let first = export::to_pretty_json(plane).expect("OpenAPI should serialize");

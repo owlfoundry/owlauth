@@ -319,7 +319,10 @@ impl RuntimeAuthService {
         })
     }
 
-    pub(crate) async fn select_email(&self, request: SelectEmail) -> Result<(), ApplicationError> {
+    pub(crate) async fn select_email(
+        &self,
+        request: SelectEmail,
+    ) -> Result<super::EmailMethodSelection, ApplicationError> {
         let transaction_id = credential_id(&request.interaction)?;
         let interaction_digest = self.digest_id_credential(
             OpaquePurpose::Interaction,

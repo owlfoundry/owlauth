@@ -393,15 +393,15 @@ features = ["macros", "rt"]
     assert_fails(lambda: validate_upload_metadata(metadata_path, identity, archive_path))
 
 
-def test_sdk_archives_reject_client_plane_contamination(root: Path) -> None:
+def test_sdk_archives_reject_server_api_contamination(root: Path) -> None:
     surface = root / "typescript-artifact-surface.json"
     typescript_surface_manifest(surface)
     sdk_artifact.TYPESCRIPT_ARTIFACT_SURFACE_PATH = surface
     markers = (
-        b"project_client_key",
-        b"owl_client_v1.AAAAAAAAAAAAAAAAAAAAAA.secret",
+        b"project_server_key",
+        b"owl_server_v1.AAAAAAAAAAAAAAAAAAAAAA.secret",
         b"/v1/projects/{project_id}/tokens/introspect",
-        b"owlauth-client-openapi.json",
+        b"owlauth-server-openapi.json",
         b"listProjectUsers(`/v1/projects/${projectId}/users`)",
         b"list_project_users(f'/v1/projects/{project_id}/users')",
         b'list_project_users(format!("/v1/projects/{project_id}/users"))',
@@ -525,7 +525,7 @@ def main() -> None:
         test_rust_upload_metadata_is_reconstructed_from_exact_crate(root)
     with tempfile.TemporaryDirectory() as temporary_directory:
         root = Path(temporary_directory)
-        test_sdk_archives_reject_client_plane_contamination(root)
+        test_sdk_archives_reject_server_api_contamination(root)
     with tempfile.TemporaryDirectory() as temporary_directory:
         root = Path(temporary_directory)
         test_archive_resource_bounds(root)

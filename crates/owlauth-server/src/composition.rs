@@ -1,15 +1,28 @@
 mod http_capabilities;
 
 use std::collections::BTreeMap;
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use owlauth_key_provider::{ProviderFormatVersion, ProviderId};
 
-use axum::Router;
+use axum::{Router, serve::Listener};
 use owlauth_types::FEDERATED_PROJECT_AUTH_AVAILABLE;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use thiserror::Error;
-use tokio::{net::TcpListener, sync::watch, task::JoinSet, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    task::JoinSet,
+    time::timeout,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -31,13 +44,13 @@ use crate::{
         ManagedConnectionService, RuntimeAuthService, SmtpCredentialResolver, SmtpTlsMode,
         WebhookWorker,
     },
-    config::{DeploymentSmtpStatus, ListenerConfig, PlaneMode, ServerConfig},
-    http::{PlaneRouters, build_routers_with_capabilities},
+    config::{DeploymentSmtpStatus, ListenerConfig, ProcessMode, ServerConfig},
+    http::{DirectPeer, PlaneRouters, build_routers_with_capabilities},
     providers::{ActiveProvider, ProviderRegistrations},
 };
 
 pub(crate) use http_capabilities::{
-    ClientHttpCapabilities, ControlHttpCapabilities, HttpCapabilities, RuntimeHttpCapabilities,
+    ControlHttpCapabilities, HttpCapabilities, RuntimeHttpCapabilities, ServerHttpCapabilities,
     build_http_capabilities,
 };
 #[cfg(test)]
@@ -91,10 +104,10 @@ pub enum ServerError {
     DatabasePools,
     #[error("stored material requires an unavailable provider capability")]
     ProviderReadiness,
-    #[error("Runtime process incarnation could not be claimed")]
-    RuntimeIncarnation,
-    #[error("Client digest readiness could not be claimed")]
-    ClientDigestReadiness,
+    #[error("Auth process incarnation could not be claimed")]
+    AuthIncarnation,
+    #[error("Server key-digest readiness could not be claimed")]
+    ServerDigestReadiness,
     #[error("email protection inventory could not be reconciled")]
     EmailProtection,
     #[error("projection verified-email key authority could not be reconciled")]
@@ -116,7 +129,7 @@ pub enum ServerError {
 /// Runs the selected production-shaped composition root through bounded shutdown.
 ///
 /// Schema preparation and all selected pool checks complete before any listener binds.
-/// In `all` mode all three sockets bind before any begins serving.
+/// In `all` mode the Auth and Control sockets both bind before either begins serving.
 ///
 /// # Errors
 ///
@@ -156,39 +169,33 @@ pub async fn run_with_providers(
         pools.close().await;
         return Err(error);
     }
-    // One startup incarnation is claimed once, then shared by reconciliation and every Runtime
-    // serving/claim path. No delayed startup phase may reclaim the stable process identity.
-    let runtime_incarnation = Uuid::new_v4();
-    let client_incarnation = Uuid::new_v4();
-    claim_runtime_incarnation(&config, &pools, runtime_incarnation)
+    // One startup incarnation is claimed once, then shared by every Auth reconciliation and
+    // serving path. No delayed startup phase may reclaim the stable process identity.
+    let auth_incarnation = Uuid::new_v4();
+    claim_auth_incarnation(&config, &pools, auth_incarnation)
         .await
-        .map_err(|_| ServerError::RuntimeIncarnation)?;
+        .map_err(|_| ServerError::AuthIncarnation)?;
     let email_protection_maintenance =
-        reconcile_email_protection(&config, &pools, runtime_incarnation)
+        reconcile_email_protection(&config, &pools, auth_incarnation)
             .await
             .map_err(|_| ServerError::EmailProtection)?;
     let projection_email_maintenance =
-        reconcile_projection_email_protection(&config, &pools, runtime_incarnation)
+        reconcile_projection_email_protection(&config, &pools, auth_incarnation)
             .await
             .map_err(|_| ServerError::ProjectionEmailProtection)?;
-    reconcile_deployment_smtp(&config, &pools, runtime_incarnation, &providers)
+    reconcile_deployment_smtp(&config, &pools, auth_incarnation, &providers)
         .await
         .map_err(|_| ServerError::DeploymentSmtp)?;
     let project_smtp_readiness =
-        reconcile_project_smtp_readiness(&config, &pools, runtime_incarnation, &providers)
+        reconcile_project_smtp_readiness(&config, &pools, auth_incarnation, &providers)
             .await
             .map_err(|_| ServerError::ProjectSmtpReadiness)?;
-    let capabilities = build_http_capabilities(
-        &config,
-        Some(&pools),
-        runtime_incarnation,
-        client_incarnation,
-        providers.as_ref(),
-    );
-    let client_digest_readiness = capabilities
-        .client
+    let capabilities =
+        build_http_capabilities(&config, Some(&pools), auth_incarnation, providers.as_ref());
+    let server_digest_readiness = capabilities
+        .server
         .as_ref()
-        .and_then(|client| client.readiness.clone());
+        .and_then(|server| server.readiness.clone());
     let signing_lifecycle = capabilities
         .control
         .as_ref()
@@ -212,22 +219,14 @@ pub async fn run_with_providers(
         }
     }
 
-    if let Some(readiness) = client_digest_readiness.as_deref()
+    if let Some(readiness) = server_digest_readiness.as_deref()
         && readiness.claim().await.is_err()
     {
         pools.close().await;
-        return Err(ServerError::ClientDigestReadiness);
+        return Err(ServerError::ServerDigestReadiness);
     }
 
-    let runtime_listener = match bind_selected(config.mode.has_runtime(), config.runtime.bind).await
-    {
-        Ok(listener) => listener,
-        Err(error) => {
-            pools.close().await;
-            return Err(error);
-        }
-    };
-    let client_listener = match bind_selected(config.mode.has_client(), config.client.bind).await {
+    let auth_listener = match bind_selected(config.mode.has_auth(), config.auth.bind).await {
         Ok(listener) => listener,
         Err(error) => {
             pools.close().await;
@@ -243,18 +242,15 @@ pub async fn run_with_providers(
         }
     };
 
-    let client_digest_readiness_maintenance =
-        client_digest_readiness.map(spawn_client_digest_readiness_renewal);
+    let server_digest_readiness_maintenance =
+        server_digest_readiness.map(spawn_server_digest_readiness_renewal);
     let signing_lifecycle_maintenance = signing_lifecycle.map(spawn_signing_lifecycle_maintenance);
     let signing_observation_maintenance =
         signing_observation.map(spawn_signing_observation_maintenance);
 
     routers.mark_ready();
-    if config.mode.has_runtime() {
-        log_listener_ready("Runtime", &config.runtime, "auth/");
-    }
-    if config.mode.has_client() {
-        log_listener_ready("Client", &config.client, "ready");
+    if config.mode.has_auth() {
+        log_listener_ready("Auth", &config.auth, "auth/");
     }
     if config.mode.has_control() {
         log_listener_ready("Control", &config.control, "console/");
@@ -267,13 +263,20 @@ pub async fn run_with_providers(
 
     let result = serve_until_shutdown(
         &mut routers,
-        runtime_listener,
-        client_listener,
-        control_listener,
+        PlaneListeners {
+            auth: PlaneListener {
+                socket: auth_listener,
+                max_connections: config.auth.http.max_connections,
+            },
+            control: PlaneListener {
+                socket: control_listener,
+                max_connections: config.control.http.max_connections,
+            },
+        },
         config.shutdown_timeout,
     )
     .await;
-    if let Some(maintenance) = client_digest_readiness_maintenance {
+    if let Some(maintenance) = server_digest_readiness_maintenance {
         maintenance.abort();
         let _ = maintenance.await;
     }
@@ -335,8 +338,8 @@ fn spawn_signing_observation_maintenance(
     })
 }
 
-fn spawn_client_digest_readiness_renewal(
-    readiness: Arc<crate::application::ClientDigestReadinessService>,
+fn spawn_server_digest_readiness_renewal(
+    readiness: Arc<crate::application::ServerDigestReadinessService>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = readiness.renewal_interval();
@@ -349,15 +352,15 @@ fn spawn_client_digest_readiness_renewal(
                     // retrying the same exact incarnation so a transient database outage can
                     // recover without ever claiming readiness during the failed interval.
                     tracing::error!(
-                        event = "client_digest_readiness_renewal_failed",
-                        "Client digest readiness renewal failed closed; retrying"
+                        event = "server_digest_readiness_renewal_failed",
+                        "Server key-digest readiness renewal failed closed; retrying"
                     );
                 }
                 Err(error) => {
                     tracing::error!(
-                        event = "client_digest_readiness_renewal_stopped",
+                        event = "server_digest_readiness_renewal_stopped",
                         error = %error,
-                        "Client digest readiness renewal stopped after a terminal failure"
+                        "Server key-digest readiness renewal stopped after a terminal failure"
                     );
                     return;
                 }
@@ -369,12 +372,6 @@ fn spawn_client_digest_readiness_renewal(
 pub(crate) fn bundled_software_providers(
     config: &ServerConfig,
 ) -> Result<ProviderRegistrations, ServerError> {
-    // Client verification owns no signing or secret-custody role. A Client-only binary must not
-    // require Control/Runtime provisioning keys merely to construct an intentionally empty
-    // provider registry.
-    if !config.mode.has_control() && !config.mode.has_runtime() {
-        return Ok(ProviderRegistrations::new());
-    }
     let provisioning = config
         .provisioning
         .as_ref()
@@ -411,7 +408,7 @@ pub(crate) fn bundled_software_providers(
                 format_version,
             ));
     }
-    if config.mode.has_runtime() {
+    if config.mode.has_auth() {
         providers
             .register_runtime_signer(provider_id.clone(), software.clone())
             .and_then(|providers| providers.register_secret_opener(provider_id, software.clone()))
@@ -425,7 +422,7 @@ pub(crate) async fn validate_provider_readiness(
     pools: &DatabasePools,
     providers: &ProviderRegistrations,
 ) -> Result<(), ServerError> {
-    if !config.mode.has_control() && !config.mode.has_runtime() {
+    if !config.mode.has_control() && !config.mode.has_auth() {
         return Ok(());
     }
     let database = pools
@@ -439,7 +436,7 @@ pub(crate) async fn validate_provider_readiness(
         .ok_or(ServerError::ProviderReadiness)?;
     let materials = ProtectedMaterialRepository::new(database.clone(), deployment_id)
         .map_err(|_| ServerError::ProviderReadiness)?;
-    if !config.mode.has_runtime() {
+    if !config.mode.has_auth() {
         return Ok(());
     }
     let custody = PostgresProtectedRuntimeCustody::from_registrations(
@@ -526,12 +523,12 @@ fn lease_duration_from_config(
     )?))
 }
 
-async fn claim_runtime_incarnation(
+async fn claim_auth_incarnation(
     config: &ServerConfig,
     pools: &DatabasePools,
-    runtime_incarnation: Uuid,
+    auth_incarnation: Uuid,
 ) -> Result<(), crate::application::ApplicationError> {
-    if !config.mode.has_runtime() {
+    if !config.mode.has_auth() {
         return Ok(());
     }
     let database = pools
@@ -540,17 +537,17 @@ async fn claim_runtime_incarnation(
         .ok_or(crate::application::ApplicationError::Persistence)?;
     PostgresPasswordlessEmailRepository::new_with_runtime_identity(
         database.clone(),
-        config.runtime_process_id.clone(),
-        runtime_incarnation,
-        config.required_runtime_process_ids.clone(),
+        config.auth_process_id.clone(),
+        auth_incarnation,
+        config.required_auth_process_ids.clone(),
         lease_duration_from_config(config)?,
     )
-    .claim_runtime_incarnation(time::OffsetDateTime::now_utc())
+    .claim_auth_incarnation(time::OffsetDateTime::now_utc())
     .await
 }
 
-fn should_reconcile_email_protection(mode: PlaneMode, configured: bool) -> bool {
-    mode.has_runtime() && configured
+fn should_reconcile_email_protection(mode: ProcessMode, configured: bool) -> bool {
+    mode.has_auth() && configured
 }
 
 #[allow(
@@ -560,7 +557,7 @@ fn should_reconcile_email_protection(mode: PlaneMode, configured: bool) -> bool 
 async fn reconcile_email_protection(
     config: &ServerConfig,
     pools: &DatabasePools,
-    runtime_incarnation: Uuid,
+    auth_incarnation: Uuid,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, crate::application::ApplicationError> {
     if !should_reconcile_email_protection(config.mode, config.email_identity_protection.is_some()) {
         return Ok(None);
@@ -611,13 +608,13 @@ async fn reconcile_email_protection(
     )?;
     let repository = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
         database.clone(),
-        config.runtime_process_id.clone(),
-        runtime_incarnation,
-        config.required_runtime_process_ids.clone(),
+        config.auth_process_id.clone(),
+        auth_incarnation,
+        config.required_auth_process_ids.clone(),
         lease_duration_from_config(config)?,
     );
     // Startup performs at most one bounded batch. A durable authority keeps identity alias
-    // writes on the old version until every configured Runtime process has observed the staged
+    // writes on the old version until every configured Auth process has observed the staged
     // version and the operator explicitly requests cutover.
     let now = time::OffsetDateTime::now_utc();
     let lease_duration = time::Duration::seconds(
@@ -629,8 +626,8 @@ async fn reconcile_email_protection(
             .rewrap_durable_email_identities(
                 &protector,
                 100,
-                &config.runtime_process_id,
-                &config.required_runtime_process_ids,
+                &config.auth_process_id,
+                &config.required_auth_process_ids,
                 now + lease_duration,
                 protection.identity_alias_cutover_version == Some(protection.active_version),
                 protection.identity_alias_retire_version == Some(protection.active_version),
@@ -670,8 +667,8 @@ async fn reconcile_email_protection(
     }
     let maintenance_repository = repository.clone();
     let maintenance_protector = protector.clone();
-    let maintenance_process_id = config.runtime_process_id.clone();
-    let required_process_ids = config.required_runtime_process_ids.clone();
+    let maintenance_process_id = config.auth_process_id.clone();
+    let required_process_ids = config.required_auth_process_ids.clone();
     let cutover_requested =
         protection.identity_alias_cutover_version == Some(protection.active_version);
     let retirement_requested =
@@ -753,7 +750,7 @@ struct ProjectionEmailMaintenance {
     authority: PostgresProjectionEmailKeyAuthority,
     protector: SoftwareProjectionVerifiedEmailProtector,
     process_id: String,
-    runtime_incarnation: Uuid,
+    auth_incarnation: Uuid,
     required_process_ids: Vec<String>,
     lease: time::Duration,
     retention: time::Duration,
@@ -766,7 +763,7 @@ impl ProjectionEmailMaintenance {
         self.authority
             .observe_runtime(
                 &self.process_id,
-                self.runtime_incarnation,
+                self.auth_incarnation,
                 &self.protector,
                 self.lease,
             )
@@ -831,9 +828,9 @@ fn log_projection_email_maintenance(
 async fn reconcile_projection_email_protection(
     config: &ServerConfig,
     pools: &DatabasePools,
-    runtime_incarnation: Uuid,
+    auth_incarnation: Uuid,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, crate::application::ApplicationError> {
-    if !config.mode.has_runtime() {
+    if !config.mode.has_auth() {
         return Ok(None);
     }
     let database = pools
@@ -848,9 +845,9 @@ async fn reconcile_projection_email_protection(
     let maintenance = ProjectionEmailMaintenance {
         authority: PostgresProjectionEmailKeyAuthority::new(database.clone()),
         protector: projection_email_protector(config)?,
-        process_id: config.runtime_process_id.clone(),
-        runtime_incarnation,
-        required_process_ids: config.required_runtime_process_ids.clone(),
+        process_id: config.auth_process_id.clone(),
+        auth_incarnation,
+        required_process_ids: config.required_auth_process_ids.clone(),
         lease: time::Duration::seconds(
             i64::try_from(lease_seconds)
                 .map_err(|_| crate::application::ApplicationError::Integrity)?,
@@ -886,19 +883,19 @@ async fn reconcile_projection_email_protection(
 }
 
 fn allows_unsealed_deployment_smtp_bootstrap(
-    mode: PlaneMode,
+    mode: ProcessMode,
     status: DeploymentSmtpStatus,
 ) -> bool {
-    mode == PlaneMode::All && status == DeploymentSmtpStatus::Reconciled
+    mode == ProcessMode::All && status == DeploymentSmtpStatus::Reconciled
 }
 
 async fn reconcile_deployment_smtp(
     config: &ServerConfig,
     pools: &DatabasePools,
-    runtime_incarnation: Uuid,
+    auth_incarnation: Uuid,
     providers: &ProviderRegistrations,
 ) -> Result<(), crate::application::ApplicationError> {
-    if !config.mode.has_runtime() {
+    if !config.mode.has_auth() {
         return Ok(());
     }
     let database = pools
@@ -907,9 +904,9 @@ async fn reconcile_deployment_smtp(
         .ok_or(crate::application::ApplicationError::Persistence)?;
     let registry = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
         database.clone(),
-        config.runtime_process_id.clone(),
-        runtime_incarnation,
-        config.required_runtime_process_ids.clone(),
+        config.auth_process_id.clone(),
+        auth_incarnation,
+        config.required_auth_process_ids.clone(),
         lease_duration_from_config(config)?,
     );
     let Some(configured) = config.deployment_smtp.as_ref() else {
@@ -918,7 +915,7 @@ async fn reconcile_deployment_smtp(
     let Some(safe_fingerprint) = configured.safe_fingerprint else {
         if allows_unsealed_deployment_smtp_bootstrap(config.mode, configured.status) {
             // Combined topology may bind Control once with non-active metadata so the ordinary
-            // authenticated API can seal the first credential generation. Runtime-only processes
+            // authenticated API can seal the first credential generation. Auth-only processes
             // never own that bootstrap capability, and an already-active database generation
             // still fails closed here.
             return registry.assert_no_active_deployment_smtp().await;
@@ -1004,10 +1001,10 @@ async fn reconcile_deployment_smtp(
 async fn reconcile_project_smtp_readiness(
     config: &ServerConfig,
     pools: &DatabasePools,
-    runtime_incarnation: Uuid,
+    auth_incarnation: Uuid,
     providers: &ProviderRegistrations,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, crate::application::ApplicationError> {
-    if !config.mode.has_runtime() {
+    if !config.mode.has_auth() {
         return Ok(None);
     }
     let database = pools
@@ -1025,9 +1022,9 @@ async fn reconcile_project_smtp_readiness(
         )?);
     let repository = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
         database.clone(),
-        config.runtime_process_id.clone(),
-        runtime_incarnation,
-        config.required_runtime_process_ids.clone(),
+        config.auth_process_id.clone(),
+        auth_incarnation,
+        config.required_auth_process_ids.clone(),
         lease_duration_from_config(config)?,
     );
     reconcile_project_smtp_readiness_restore(
@@ -1170,11 +1167,19 @@ async fn bind_selected(
         .map_err(|_| ServerError::Bind)
 }
 
+struct PlaneListener {
+    socket: Option<TcpListener>,
+    max_connections: usize,
+}
+
+struct PlaneListeners {
+    auth: PlaneListener,
+    control: PlaneListener,
+}
+
 async fn serve_until_shutdown(
     routers: &mut PlaneRouters,
-    runtime_listener: Option<TcpListener>,
-    client_listener: Option<TcpListener>,
-    control_listener: Option<TcpListener>,
+    listeners: PlaneListeners,
     shutdown_timeout: Duration,
 ) -> Result<(), ServerError> {
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -1204,20 +1209,16 @@ async fn serve_until_shutdown(
     let mut servers = JoinSet::new();
     spawn_selected(
         &mut servers,
-        runtime_listener,
-        routers.runtime.take(),
+        listeners.auth.socket,
+        routers.auth.take(),
+        listeners.auth.max_connections,
         shutdown_receiver.clone(),
     );
     spawn_selected(
         &mut servers,
-        client_listener,
-        routers.client.take(),
-        shutdown_receiver.clone(),
-    );
-    spawn_selected(
-        &mut servers,
-        control_listener,
+        listeners.control.socket,
         routers.control.take(),
+        listeners.control.max_connections,
         shutdown_receiver,
     );
 
@@ -1487,10 +1488,107 @@ async fn run_webhook_worker(worker: Arc<WebhookWorker>, mut shutdown: watch::Rec
     }
 }
 
+struct ConnectionLimitedListener {
+    listener: TcpListener,
+    permits: Arc<Semaphore>,
+}
+
+struct ConnectionPermitStream {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectionLimitedListener {
+    fn new(listener: TcpListener, max_connections: usize) -> Self {
+        Self {
+            listener,
+            permits: Arc::new(Semaphore::new(max_connections)),
+        }
+    }
+}
+
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, ConnectionLimitedListener>,
+    > for DirectPeer
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, ConnectionLimitedListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl Listener for ConnectionLimitedListener {
+    type Io = ConnectionPermitStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("the listener connection semaphore remains open");
+        let (stream, address) = Listener::accept(&mut self.listener).await;
+        (
+            ConnectionPermitStream {
+                stream,
+                _permit: permit,
+            },
+            address,
+        )
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+impl AsyncRead for ConnectionPermitStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ConnectionPermitStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(context, buffers)
+    }
+}
+
 fn spawn_selected(
     servers: &mut JoinSet<Result<(), std::io::Error>>,
     listener: Option<TcpListener>,
     router: Option<Router>,
+    max_connections: usize,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let (Some(listener), Some(router)) = (listener, router) else {
@@ -1498,8 +1596,8 @@ fn spawn_selected(
     };
     servers.spawn(async move {
         axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            ConnectionLimitedListener::new(listener, max_connections),
+            router.into_make_service_with_connect_info::<DirectPeer>(),
         )
         .with_graceful_shutdown(async move {
             while !*shutdown.borrow() {
@@ -1548,10 +1646,10 @@ mod tests {
     #[test]
     fn only_control_capable_reconciled_smtp_can_bootstrap_without_a_fingerprint() {
         assert!(allows_unsealed_deployment_smtp_bootstrap(
-            PlaneMode::All,
+            ProcessMode::All,
             DeploymentSmtpStatus::Reconciled
         ));
-        for mode in [PlaneMode::Runtime, PlaneMode::Control] {
+        for mode in [ProcessMode::Auth, ProcessMode::Control] {
             assert!(!allows_unsealed_deployment_smtp_bootstrap(
                 mode,
                 DeploymentSmtpStatus::Reconciled
@@ -1563,7 +1661,7 @@ mod tests {
             DeploymentSmtpStatus::Compromised,
         ] {
             assert!(!allows_unsealed_deployment_smtp_bootstrap(
-                PlaneMode::All,
+                ProcessMode::All,
                 status
             ));
         }
@@ -1571,13 +1669,13 @@ mod tests {
 
     #[test]
     fn control_only_never_runs_runtime_email_protection_reconciliation() {
-        assert!(!should_reconcile_email_protection(PlaneMode::Control, true));
         assert!(!should_reconcile_email_protection(
-            PlaneMode::Runtime,
-            false
+            ProcessMode::Control,
+            true
         ));
-        assert!(should_reconcile_email_protection(PlaneMode::Runtime, true));
-        assert!(should_reconcile_email_protection(PlaneMode::All, true));
+        assert!(!should_reconcile_email_protection(ProcessMode::Auth, false));
+        assert!(should_reconcile_email_protection(ProcessMode::Auth, true));
+        assert!(should_reconcile_email_protection(ProcessMode::All, true));
     }
 
     #[test]
@@ -1610,6 +1708,30 @@ mod tests {
                 webhook_delivery: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn connection_limit_holds_a_permit_for_the_transport_lifetime() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut listener = ConnectionLimitedListener::new(listener, 1);
+
+        let first_client = TcpStream::connect(address).await.unwrap();
+        let (first_connection, first_peer) = Listener::accept(&mut listener).await;
+        assert_eq!(first_peer.ip(), first_client.local_addr().unwrap().ip());
+
+        let _second_client = TcpStream::connect(address).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), Listener::accept(&mut listener))
+                .await
+                .is_err(),
+            "a second connection must remain in the listen backlog while capacity is occupied"
+        );
+
+        drop(first_connection);
+        tokio::time::timeout(Duration::from_secs(1), Listener::accept(&mut listener))
+            .await
+            .expect("dropping the accepted IO must release listener capacity");
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ import type { SyntheticEvent } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { CopyValue } from "../../shared/compositions/CopyValue";
+import { ArrowLeftIcon } from "../../shared/icons/Icons";
 import {
   compactStringList,
   isValidStringList,
@@ -11,6 +12,7 @@ import {
 import {
   DescriptionList,
   EmptyState,
+  LoadingState,
   PageHeader,
   Section,
   tabClassName,
@@ -238,7 +240,7 @@ export function ApplicationDetailPage() {
           description="Loading committed Application state."
           headingRef={headingRef}
         />
-        <p role="status">Loading Application</p>
+        <LoadingState>Loading application</LoadingState>
       </div>
     );
   }
@@ -306,11 +308,12 @@ export function ApplicationDetailPage() {
         actions={
           <Button
             type="button"
-            variant="quiet"
+            variant="secondary"
             onClick={() => {
               void navigate(`/projects/${project.id}/applications`);
             }}
           >
+            <ArrowLeftIcon />
             Back to Applications
           </Button>
         }

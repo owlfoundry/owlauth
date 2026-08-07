@@ -17,6 +17,6 @@
   ],
   "forbiddenSecuritySchemes": [
     "operator_api_key",
-    "project_client_key"
+    "project_server_key"
   ]
 }

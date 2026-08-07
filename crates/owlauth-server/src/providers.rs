@@ -6,7 +6,7 @@ use owlauth_key_provider::{
 };
 use thiserror::Error;
 
-use crate::config::PlaneMode;
+use crate::config::ProcessMode;
 
 /// Exact provider and provider-owned format selected for newly created material.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,7 +173,7 @@ impl ProviderRegistrations {
     /// # Errors
     ///
     /// Returns a fail-closed composition error for missing or unsupported capabilities.
-    pub fn validate_for_mode(&self, mode: PlaneMode) -> Result<(), ProviderCompositionError> {
+    pub fn validate_for_mode(&self, mode: ProcessMode) -> Result<(), ProviderCompositionError> {
         if mode.has_control() {
             let active_signing = self
                 .active_signing
@@ -208,7 +208,7 @@ impl ProviderRegistrations {
             }
         }
 
-        if mode.has_runtime() {
+        if mode.has_auth() {
             if self.runtime_signers.is_empty() || self.secret_openers.is_empty() {
                 return Err(ProviderCompositionError::MissingCapability);
             }
@@ -221,7 +221,7 @@ impl ProviderRegistrations {
             }
         }
 
-        if mode.has_control() && mode.has_runtime() {
+        if mode.has_control() && mode.has_auth() {
             let active_signing = self
                 .active_signing
                 .as_ref()

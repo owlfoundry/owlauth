@@ -13,8 +13,7 @@ const operatorKey = `owl_ctrl_v1_${"A".repeat(43)}`;
 export default async function globalSetup() {
   const repository = resolve(import.meta.dirname, "../../../..");
   const temporaryRoot = await mkdtemp(resolve(tmpdir(), "owlauth-browser-e2e-"));
-  const runtimePort = await freePort();
-  const clientPort = await freePort();
+  const authPort = await freePort();
   const controlPort = await freePort();
   const providerPort = await freePort();
   const faultProxyPort = await freePort();
@@ -28,11 +27,9 @@ export default async function globalSetup() {
   const smtpRootCertificateFile = resolve(temporaryRoot, "smtp-root.pem");
   const smtpRootCertificateDerFile = resolve(temporaryRoot, "smtp-root.der");
   const smtpExtensionsFile = resolve(temporaryRoot, "smtp-extensions.cnf");
-  const runtimeLogFile = resolve(temporaryRoot, "runtime.log");
-  const clientLogFile = resolve(temporaryRoot, "client.log");
+  const authLogFile = resolve(temporaryRoot, "auth.log");
   const controlLogFile = resolve(temporaryRoot, "control.log");
-  const runtimeLog = openSync(runtimeLogFile, "a");
-  const clientLog = openSync(clientLogFile, "a");
+  const authLog = openSync(authLogFile, "a");
   const controlLog = openSync(controlLogFile, "a");
   command("openssl", [
     "req",
@@ -113,14 +110,13 @@ export default async function globalSetup() {
     "postgres:17-bookworm",
   ]).trim();
 
-  let runtimeServer: ReturnType<typeof spawn> | undefined;
-  let clientServer: ReturnType<typeof spawn> | undefined;
+  let authServer: ReturnType<typeof spawn> | undefined;
   let controlServer: ReturnType<typeof spawn> | undefined;
   let services: ControlledServices | undefined;
   try {
     // The release-grade project-auth runner supplies reviewed SDK candidates. UI-only local
-    // journeys can start the same real servers without manufacturing SDK provenance they do not
-    // consume; the Application fixture then points at the local built TypeScript tree.
+    // journeys can start the same real Auth and Control endpoints without manufacturing SDK
+    // provenance they do not consume; the Application fixture then points at the local build.
     const sdkCandidates =
       process.env["OWLAUTH_E2E_TYPESCRIPT_ARCHIVE"] === undefined
         ? null
@@ -129,7 +125,7 @@ export default async function globalSetup() {
       sdkCandidates?.typescript.sdkRoot ?? resolve(repository, "sdks/typescript/dist"),
       providerPort,
       applicationPort,
-      runtimePort,
+      authPort,
       faultProxyPort,
       smtpPort,
       webhookPort,
@@ -140,9 +136,8 @@ export default async function globalSetup() {
     const mapping = command("docker", ["port", container, "5432/tcp"]).trim();
     const postgresPort = mapping.slice(mapping.lastIndexOf(":") + 1);
     const postgresUrl = `postgresql://postgres:owlauth_browser@127.0.0.1:${postgresPort}/postgres`;
-    const runtimeUpstreamBase = `http://127.0.0.1:${String(runtimePort)}/`;
+    const authUpstreamBase = `http://127.0.0.1:${String(authPort)}/`;
     const runtimeBase = services.faultProxyBase;
-    const clientBase = `http://127.0.0.1:${String(clientPort)}/`;
     const controlBase = `http://127.0.0.1:${String(controlPort)}/`;
 
     const inheritedEnvironment = Object.fromEntries(
@@ -153,15 +148,13 @@ export default async function globalSetup() {
       OWLAUTH_INSTANCE_ID: "browser-e2e",
       OWLAUTH_POSTGRES_URL: postgresUrl,
       OWLAUTH_SOFTWARE_CUSTODY_KEY: "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4",
-      OWLAUTH_RUNTIME_PROCESS_ID: "browser-runtime",
-      OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS: "browser-runtime",
+      OWLAUTH_AUTH_PROCESS_ID: "browser-auth",
+      OWLAUTH_REQUIRED_AUTH_PROCESS_IDS: "browser-auth",
       OWLAUTH_RUNTIME_KEY_VERSION: "1",
       OWLAUTH_RUNTIME_DIGEST_KEY: "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
       OWLAUTH_RUNTIME_PROTECTION_KEY: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
-      OWLAUTH_CLIENT_PROCESS_ID: "browser-client",
-      OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS: "browser-client",
-      OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION: "1",
-      OWLAUTH_CLIENT_KEY_DIGEST_KEY: "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo",
+      OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION: "1",
+      OWLAUTH_SERVER_KEY_DIGEST_KEY: "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo",
       OWLAUTH_MANAGED_REAUTHORIZATION_KEY_VERSION: "1",
       OWLAUTH_MANAGED_REAUTHORIZATION_DIGEST_KEY: "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo",
       OWLAUTH_MANAGED_REAUTHORIZATION_PROTECTION_KEY: "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws",
@@ -175,7 +168,7 @@ export default async function globalSetup() {
       OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK: "true",
       OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS: "127.0.0.1",
       OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE: smtpRootCertificateDerFile,
-      OWLAUTH_RUNTIME_BASE_URL: runtimeBase,
+      OWLAUTH_AUTH_BASE_URL: runtimeBase,
       OWLAUTH_KEY_PROPAGATION_DELAY_MS: "100",
       OWLAUTH_PUBLICATION_LEASE_TTL_MS: "5000",
     };
@@ -215,29 +208,19 @@ export default async function globalSetup() {
       OWLAUTH_DEPLOYMENT_SMTP_STATUS: "active",
       OWLAUTH_DEPLOYMENT_SMTP_SAFE_FINGERPRINT: deployment.safeFingerprint,
     };
-    runtimeServer = spawn("cargo", ["run", "--quiet", "--locked", "-p", "owlauth-server"], {
+    authServer = spawn("cargo", ["run", "--quiet", "--locked", "-p", "owlauth-server"], {
       cwd: repository,
       env: {
         ...commonEnvironment,
         ...durableEmailIdentityEnvironment,
         ...deploymentEnvironment,
         OWLAUTH_SMTP_EXTRA_ROOT_CERT_DER_FILE: smtpRootCertificateDerFile,
-        OWLAUTH_MODE: "runtime",
-        OWLAUTH_RUNTIME_ADDR: `127.0.0.1:${String(runtimePort)}`,
+        OWLAUTH_MODE: "auth",
+        OWLAUTH_AUTH_ADDR: `127.0.0.1:${String(authPort)}`,
         OWLAUTH_MANAGED_CREDENTIAL_KEY_VERSION: "1",
         OWLAUTH_MANAGED_CREDENTIAL_KEY: "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY",
       },
-      stdio: ["ignore", runtimeLog, runtimeLog],
-    });
-    clientServer = spawn("cargo", ["run", "--quiet", "--locked", "-p", "owlauth-server"], {
-      cwd: repository,
-      env: {
-        ...commonEnvironment,
-        OWLAUTH_MODE: "client",
-        OWLAUTH_CLIENT_ADDR: `127.0.0.1:${String(clientPort)}`,
-        OWLAUTH_CLIENT_BASE_URL: clientBase,
-      },
-      stdio: ["ignore", clientLog, clientLog],
+      stdio: ["ignore", authLog, authLog],
     });
     controlServer = spawn("cargo", ["run", "--quiet", "--locked", "-p", "owlauth-server"], {
       cwd: repository,
@@ -253,11 +236,9 @@ export default async function globalSetup() {
       },
       stdio: ["ignore", controlLog, controlLog],
     });
-    await waitForUrl(`${runtimeUpstreamBase}health`, runtimeServer);
-    await waitForUrl(`${clientBase}ready`, clientServer);
+    await waitForUrl(`${authUpstreamBase}health`, authServer);
     await waitForUrl(`${controlBase}health`, controlServer);
     process.env["OWLAUTH_E2E_RUNTIME_BASE"] = runtimeBase;
-    process.env["OWLAUTH_E2E_CLIENT_BASE"] = clientBase;
     process.env["OWLAUTH_E2E_CONTROL_BASE"] = controlBase;
     process.env["OWLAUTH_E2E_OPERATOR_KEY"] = operatorKey;
     process.env["OWLAUTH_E2E_PROVIDER_ORIGIN"] = services.providerOrigin;
@@ -290,42 +271,32 @@ export default async function globalSetup() {
     process.env["OWLAUTH_E2E_WEBHOOK_ENDPOINT_URL"] = services.webhookEndpointUrl;
     process.env["OWLAUTH_E2E_SMTP_PORT"] = String(smtpPort);
     process.env["OWLAUTH_E2E_POSTGRES_CONTAINER"] = container;
-    process.env["OWLAUTH_E2E_RUNTIME_LOG"] = runtimeLogFile;
+    process.env["OWLAUTH_E2E_AUTH_LOG"] = authLogFile;
     process.env["OWLAUTH_E2E_CONTROL_LOG"] = controlLogFile;
   } catch (error) {
-    runtimeServer?.kill("SIGTERM");
-    clientServer?.kill("SIGTERM");
+    authServer?.kill("SIGTERM");
     controlServer?.kill("SIGTERM");
     await services?.close();
     spawnSync("docker", ["rm", "-f", container], { stdio: "ignore" });
-    closeSync(runtimeLog);
-    closeSync(clientLog);
+    closeSync(authLog);
     closeSync(controlLog);
     const diagnostics = await Promise.all([
-      boundedLogTail(runtimeLogFile),
-      boundedLogTail(clientLogFile),
+      boundedLogTail(authLogFile),
       boundedLogTail(controlLogFile),
     ]);
     await rm(temporaryRoot, { recursive: true, force: true });
     throw new Error(
-      `${error instanceof Error ? error.message : String(error)}\nRuntime log tail:\n${diagnostics[0]}\nClient log tail:\n${diagnostics[1]}\nControl log tail:\n${diagnostics[2]}`,
+      `${error instanceof Error ? error.message : String(error)}\nAuth log tail:\n${diagnostics[0]}\nControl log tail:\n${diagnostics[1]}`,
       { cause: error },
     );
   }
 
   return async () => {
-    runtimeServer.kill("SIGTERM");
-    clientServer.kill("SIGTERM");
+    authServer.kill("SIGTERM");
     controlServer.kill("SIGTERM");
-    await Promise.all([
-      waitForExit(runtimeServer),
-      waitForExit(clientServer),
-      waitForExit(controlServer),
-      services.close(),
-    ]);
+    await Promise.all([waitForExit(authServer), waitForExit(controlServer), services.close()]);
     spawnSync("docker", ["rm", "-f", container], { stdio: "ignore" });
-    closeSync(runtimeLog);
-    closeSync(clientLog);
+    closeSync(authLog);
     closeSync(controlLog);
     await rm(temporaryRoot, { recursive: true, force: true });
   };
@@ -339,6 +310,10 @@ async function bootstrapDeploymentSmtp(controlBase: string): Promise<{ safeFinge
       authorization: `Bearer ${operatorKey}`,
       "content-type": "application/json",
       "idempotency-key": operationKey,
+      origin: new URL(controlBase).origin,
+      "sec-fetch-site": "same-origin",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-dest": "empty",
     },
     body: JSON.stringify({
       credential: JSON.stringify({ username: "capture-user", password: "capture-password" }),

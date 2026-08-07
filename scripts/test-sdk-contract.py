@@ -26,7 +26,7 @@ def policy(*, operations: tuple[str, ...] = ("claimed",)) -> Any:
         runtime_operations=operations,
         allowed_shared_operation_ids=frozenset({"get_liveness", "get_readiness"}),
         forbidden_security_schemes=frozenset(
-            {"operator_api_key", "project_client_key"}
+            {"operator_api_key", "project_server_key"}
         ),
     )
 
@@ -264,20 +264,20 @@ def test_allowed_shared_operation_identity_and_contract_must_match() -> None:
     )
 
 
-def test_claimed_client_overlap_and_client_security_fail() -> None:
+def test_claimed_server_overlap_and_server_security_fail() -> None:
     runtime = document(claimed=True)
-    client = document(claimed=False)
-    client["paths"]["/client-claimed"] = {"post": operation("claimed")}
+    server = document(claimed=False)
+    server["paths"]["/server-claimed"] = {"post": operation("claimed")}
     assert_contract_error(
         lambda: sdk_contract.normalized_surface(
-            runtime, document(claimed=False), policy(), client=client
+            runtime, document(claimed=False), policy(), server=server
         ),
-        "Runtime and Client unexpectedly share operation IDs",
+        "Runtime and Server unexpectedly share operation IDs",
     )
 
     runtime = document(claimed=True)
-    runtime["paths"]["/claimed"]["get"]["security"] = [{"project_client_key": []}]
-    runtime["components"]["securitySchemes"]["project_client_key"] = {
+    runtime["paths"]["/claimed"]["get"]["security"] = [{"project_server_key": []}]
+    runtime["components"]["securitySchemes"]["project_server_key"] = {
         "type": "http",
         "scheme": "bearer",
     }
@@ -286,7 +286,7 @@ def test_claimed_client_overlap_and_client_security_fail() -> None:
             runtime,
             document(claimed=False),
             policy(),
-            client=document(claimed=False),
+            server=document(claimed=False),
         ),
         "forbidden security schemes",
     )
@@ -305,7 +305,7 @@ def test_claimed_control_overlap_and_management_security_fail() -> None:
             {"get_liveness", "get_readiness", "claimed"}
         ),
         forbidden_security_schemes=frozenset(
-            {"operator_api_key", "project_client_key"}
+            {"operator_api_key", "project_server_key"}
         ),
     )
     assert_contract_error(
@@ -331,7 +331,7 @@ def test_policy_is_strict() -> None:
         "normalizerVersion": 1,
         "runtimeOperations": ["claimed"],
         "allowedSharedOperationIds": ["get_liveness", "get_readiness"],
-        "forbiddenSecuritySchemes": ["operator_api_key", "project_client_key"],
+        "forbiddenSecuritySchemes": ["operator_api_key", "project_server_key"],
     }
     with tempfile.TemporaryDirectory() as temporary_directory:
         path = Path(temporary_directory) / "policy.json"
@@ -352,7 +352,7 @@ def main() -> None:
     test_external_reference_and_unexpected_plane_overlap_fail()
     test_same_http_operation_with_different_ids_fails()
     test_allowed_shared_operation_identity_and_contract_must_match()
-    test_claimed_client_overlap_and_client_security_fail()
+    test_claimed_server_overlap_and_server_security_fail()
     test_claimed_control_overlap_and_management_security_fail()
     test_policy_is_strict()
     print("SDK contract tests passed")

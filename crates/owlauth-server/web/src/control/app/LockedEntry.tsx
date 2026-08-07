@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { SyntheticEvent } from "react";
 
+import { OwlAuthMark } from "../../shared/brand/OwlAuthMark";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert } from "../../shared/primitives/Feedback";
 import { Field, Input } from "../../shared/primitives/Field";
@@ -35,7 +36,7 @@ export function LockedEntry({ verifying, denied, onUnlock }: LockedEntryProps) {
         <h1 id="connect-title">Connect to this deployment</h1>
         <p>
           Enter the deployment operator API key. It remains only in this page's active memory and is
-          discarded when you lock or leave the console.
+          discarded when you exit or leave the console.
         </p>
         <form className={styles["lockedForm"]} onSubmit={submit}>
           {denied ? (
@@ -79,14 +80,14 @@ export function VerifiedBootstrapFailure({
         <h1 id="projects-unavailable-title">Projects are unavailable</h1>
         <InlineAlert tone="danger">
           The operator key was verified, but the Project directory could not be loaded. Retry the
-          safe read or lock the console.
+          safe read or exit the console.
         </InlineAlert>
         <div className={styles["lockedForm"]}>
           <Button type="button" variant="primary" fullWidth busy={retrying} onClick={onRetry}>
             {retrying ? "Retrying Project directory" : "Retry Project directory"}
           </Button>
           <Button type="button" variant="quiet" fullWidth disabled={retrying} onClick={onLock}>
-            Lock console
+            Exit console
           </Button>
         </div>
       </section>
@@ -97,9 +98,7 @@ export function VerifiedBootstrapFailure({
 export function OwlAuthWordmark() {
   return (
     <div className={styles["wordmark"]} aria-label="OwlAuth">
-      <span className={styles["mark"]} aria-hidden="true">
-        O
-      </span>
+      <OwlAuthMark className={styles["mark"]} />
       <span>OwlAuth</span>
     </div>
   );

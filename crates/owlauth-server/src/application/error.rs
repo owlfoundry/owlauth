@@ -18,10 +18,12 @@ pub(crate) enum ApplicationError {
     OperationInProgress,
     #[error("publication has not propagated to Runtime")]
     PublicationPending,
-    #[error("required Client verifier fleet is not ready")]
-    ClientVerifierUnavailable,
+    #[error("required Server verifier fleet is not ready")]
+    ServerVerifierUnavailable,
     #[error("state transition is not allowed")]
     InvalidTransition,
+    #[error("bounded resource capacity is exhausted")]
+    CapacityExceeded,
     #[error("authoritative state failed an integrity check")]
     Integrity,
     #[error("authoritative persistence is unavailable")]

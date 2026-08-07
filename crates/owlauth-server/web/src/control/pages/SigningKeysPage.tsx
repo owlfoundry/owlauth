@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 
-import { EmptyState, PageHeader } from "../../shared/layout/Layout";
+import { EmptyState, LoadingState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert } from "../../shared/primitives/Feedback";
 import { useControl, useProject } from "../app/ControlContext";
@@ -131,7 +131,7 @@ export function SigningKeysPage() {
         title="Signing keys"
         description="Review automatically managed Project signing authority and request rotations."
       />
-      {visibleLoadState === "loading" ? <p role="status">Loading signing keys</p> : null}
+      {visibleLoadState === "loading" ? <LoadingState>Loading signing keys</LoadingState> : null}
       {visibleLoadState === "failed" ? (
         <InlineAlert tone="danger" role="alert">
           <p>The signing-key inventory could not be loaded.</p>

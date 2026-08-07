@@ -1,4 +1,5 @@
-import type { Dispatch, SetStateAction } from "react";
+import { useEffect, useRef } from "react";
+import type { Dispatch, ReactNode, SetStateAction } from "react";
 
 import { HostedCard, MethodButton, MethodDivider, TerminalState } from "../../shared/hosted/Hosted";
 import { Button } from "../../shared/primitives/Button";
@@ -86,11 +87,14 @@ function MethodSelection({
   reuseSession,
 }: RuntimeScreenProps & { readonly state: Extract<ViewState, { status: "ready-interaction" }> }) {
   return (
-    <section className={styles["flow"]} aria-label="Choose a sign-in method">
-      <p className={styles["summary"]}>Choose one way to continue.</p>
+    <section className={styles["flow"]} aria-labelledby="method-selection-title">
+      <StepHeading id="method-selection-title">Choose a sign-in method</StepHeading>
       {state.bootstrap.presentation_hint === undefined ||
       state.bootstrap.presentation_hint === null ? null : (
-        <InlineAlert tone="info">{state.bootstrap.presentation_hint}</InlineAlert>
+        <p className={styles["summary"]} aria-label="Application-provided guidance">
+          <strong>From {state.bootstrap.application_display_name}:</strong>{" "}
+          <span>{state.bootstrap.presentation_hint}</span>
+        </p>
       )}
       <div className={styles["methods"]} role="group" aria-label="Sign-in methods">
         {state.bootstrap.email_available ? (
@@ -134,7 +138,7 @@ function EmailEntry({
 }: RuntimeScreenProps & { readonly state: Extract<ViewState, { status: "email-entry" }> }) {
   return (
     <section className={styles["flow"]} aria-labelledby="email-entry-title">
-      <h2 id="email-entry-title">Enter your email address</h2>
+      <StepHeading id="email-entry-title">Enter your email address</StepHeading>
       <p className={styles["summary"]}>
         We respond the same way whether or not an account already exists.
       </p>
@@ -186,7 +190,7 @@ function EmailProof({
         : "Open the newest sign-in link.";
   return (
     <section className={styles["flow"]} aria-labelledby="email-proof-title">
-      <h2 id="email-proof-title">Check your email</h2>
+      <StepHeading id="email-proof-title">Check your email</StepHeading>
       <p role="status">{instruction}</p>
       <p className={styles["expires"]}>
         This challenge expires at {new Date(state.expiresAt).toLocaleTimeString()}.
@@ -268,7 +272,7 @@ function MagicConfirmation({
     </TerminalState>
   ) : (
     <section className={styles["flow"]} aria-labelledby="magic-confirm-title">
-      <h2 id="magic-confirm-title">Continue email sign-in</h2>
+      <StepHeading id="magic-confirm-title">Continue email sign-in</StepHeading>
       <p>
         The proof was removed from browser history. Continue only if you requested this sign-in.
       </p>
@@ -287,7 +291,7 @@ function ManagedReauthorization({
 }) {
   return (
     <section className={styles["flow"]} aria-labelledby="managed-reauthorization">
-      <h2 id="managed-reauthorization">Replace a provider credential</h2>
+      <StepHeading id="managed-reauthorization">Replace a provider credential</StepHeading>
       <p>
         Continue only with {state.bootstrap.provider_display_name}. This replaces one managed
         credential and does not sign you in to an Application.
@@ -308,7 +312,7 @@ function LogoutConfirmation({
 }: RuntimeScreenProps & { readonly state: Extract<ViewState, { status: "ready-logout" }> }) {
   return (
     <section className={styles["flow"]} aria-labelledby="confirm-sign-out">
-      <h2 id="confirm-sign-out">Sign out of this Project?</h2>
+      <StepHeading id="confirm-sign-out">Sign out of this Project?</StepHeading>
       <p>This ends the Project browser session and sessions derived from it.</p>
       <div className={styles["actions"]}>
         <Button type="button" variant="danger" onClick={() => void confirmLogout()}>
@@ -319,6 +323,18 @@ function LogoutConfirmation({
         </Button>
       </div>
     </section>
+  );
+}
+
+function StepHeading({ id, children }: { readonly id: string; readonly children: ReactNode }) {
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    heading.current?.focus();
+  }, []);
+  return (
+    <h2 id={id} ref={heading} tabIndex={-1}>
+      {children}
+    </h2>
   );
 }
 

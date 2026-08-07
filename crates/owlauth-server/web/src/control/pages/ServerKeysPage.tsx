@@ -3,7 +3,7 @@ import type { SyntheticEvent } from "react";
 import { Link, useParams } from "react-router";
 
 import { CopyValue } from "../../shared/compositions/CopyValue";
-import { DataTable, EmptyState, PageHeader } from "../../shared/layout/Layout";
+import { DataTable, EmptyState, LoadingState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Checkbox, Field, Input } from "../../shared/primitives/Field";
@@ -12,9 +12,9 @@ import { useControlConfirmation } from "../app/Confirmation";
 import { useControl, useProject } from "../app/ControlContext";
 import {
   ControlRequestError,
-  type CreateProjectClientKeyResponse,
+  type CreateProjectServerKeyResponse,
   IdempotencyAttempt,
-  type ProjectClientKey,
+  type ProjectServerKey,
   isAmbiguousIdempotencyFailure,
   requireData,
 } from "../client";
@@ -24,21 +24,21 @@ const PAGE_SIZE = 100;
 
 type CopyState = "idle" | "copied" | "failed";
 
-interface ClientKeyInventoryPage {
-  readonly items: ProjectClientKey[];
+interface ServerKeyInventoryPage {
+  readonly items: ProjectServerKey[];
   readonly nextCursor: string | null;
-  readonly activeUnacknowledgedKey: ProjectClientKey | null;
+  readonly activeUnacknowledgedKey: ProjectServerKey | null;
 }
 
 interface DeliveryAcknowledgement {
-  readonly key: ProjectClientKey;
+  readonly key: ProjectServerKey;
   readonly outcome: "acknowledged" | "revoked";
 }
 
 function mergeAuthorityKey(
-  items: readonly ProjectClientKey[],
-  authority: ProjectClientKey | null,
-): ProjectClientKey[] {
+  items: readonly ProjectServerKey[],
+  authority: ProjectServerKey | null,
+): ProjectServerKey[] {
   if (authority === null) return [...items];
   const existing = items.findIndex((item) => item.id === authority.id);
   if (existing < 0) return [authority, ...items];
@@ -60,21 +60,21 @@ interface UnresolvedCreate {
   readonly inventoryState: "loading" | "ready" | "failed";
 }
 
-export function ClientKeysPage() {
+export function ServerKeysPage() {
   const { projectId } = useParams();
   const project = useProject(projectId);
   const { session, handleError, setMessage } = useControl();
   const confirm = useControlConfirmation();
-  const [keys, setKeys] = useState<ProjectClientKey[]>([]);
+  const [keys, setKeys] = useState<ProjectServerKey[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [activeUnacknowledgedKey, setActiveUnacknowledgedKey] = useState<ProjectClientKey | null>(
+  const [activeUnacknowledgedKey, setActiveUnacknowledgedKey] = useState<ProjectServerKey | null>(
     null,
   );
   const [inventoryState, setInventoryState] = useState<"loading" | "ready" | "failed">("loading");
   const [loadingMore, setLoadingMore] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [revealedKey, setRevealedKey] = useState<ProjectClientKey | null>(null);
+  const [revealedKey, setRevealedKey] = useState<ProjectServerKey | null>(null);
   const [revealAcknowledged, setRevealAcknowledged] = useState(false);
   const [copyState, setCopyState] = useState<CopyState>("idle");
   const [unresolvedCreate, setUnresolvedCreate] = useState<UnresolvedCreate | null>(null);
@@ -100,12 +100,12 @@ export function ClientKeysPage() {
   }
 
   const refresh = useCallback(
-    async (signal?: AbortSignal): Promise<ClientKeyInventoryPage> => {
+    async (signal?: AbortSignal): Promise<ServerKeyInventoryPage> => {
       if (project === null) return { items: [], nextCursor: null, activeUnacknowledgedKey: null };
       const ownerProjectId = project.id;
       setInventoryState("loading");
       try {
-        const result = await session.client.GET("/v1/projects/{project_id}/client-keys", {
+        const result = await session.client.GET("/v1/projects/{project_id}/server-keys", {
           params: {
             path: { project_id: project.id },
             query: { limit: PAGE_SIZE },
@@ -177,7 +177,7 @@ export function ClientKeysPage() {
     loadMoreController.current = controller;
     setLoadingMore(true);
     try {
-      const result = await session.client.GET("/v1/projects/{project_id}/client-keys", {
+      const result = await session.client.GET("/v1/projects/{project_id}/server-keys", {
         params: {
           path: { project_id: ownerProjectId },
           query: { cursor, limit: PAGE_SIZE },
@@ -211,7 +211,7 @@ export function ClientKeysPage() {
       return;
     if (activeUnacknowledgedKey !== null) {
       setMessage(
-        "A client key still has unconfirmed credential storage. Acknowledge its delivery or revoke it before creating another key.",
+        "A Project secret key still has unconfirmed credential storage. Acknowledge its delivery or revoke it before creating another key.",
         "warning",
       );
       return;
@@ -232,8 +232,8 @@ export function ClientKeysPage() {
     label: string,
     idempotencyKey: string,
     ownerProjectId: string,
-  ): Promise<CreateProjectClientKeyResponse> {
-    const result = await session.client.POST("/v1/projects/{project_id}/client-keys", {
+  ): Promise<CreateProjectServerKeyResponse> {
+    const result = await session.client.POST("/v1/projects/{project_id}/server-keys", {
       params: {
         path: { project_id: ownerProjectId },
         header: { "Idempotency-Key": idempotencyKey },
@@ -243,19 +243,19 @@ export function ClientKeysPage() {
     return requireData(result.data, result.error, result.response);
   }
 
-  async function getClientKey(
+  async function getServerKey(
     keyId: string,
     ownerProjectId = project?.id,
-  ): Promise<ProjectClientKey> {
+  ): Promise<ProjectServerKey> {
     if (ownerProjectId === undefined) throw new Error("Project context is unavailable");
-    const result = await session.client.GET("/v1/projects/{project_id}/client-keys/{key_id}", {
+    const result = await session.client.GET("/v1/projects/{project_id}/server-keys/{key_id}", {
       params: { path: { project_id: ownerProjectId, key_id: keyId } },
     });
     return requireData(result.data, result.error, result.response);
   }
 
   async function presentCreatedKey(
-    created: CreateProjectClientKeyResponse,
+    created: CreateProjectServerKeyResponse,
     ownerProjectId: string,
   ) {
     if (!ownsProject(ownerProjectId)) return;
@@ -266,7 +266,7 @@ export function ClientKeysPage() {
     setAcknowledgementError(null);
     setCreateOpen(false);
     setMessage(
-      "Client key created. Store the one-time credential before leaving this dialog.",
+      "Project secret key created. Store the one-time credential before leaving this dialog.",
       "success",
     );
     try {
@@ -300,7 +300,7 @@ export function ClientKeysPage() {
       const knownStillActive = knownImplicatedKeyIds.filter((id) => gate?.id === id);
       const knownObservations = await Promise.all(
         knownImplicatedKeyIds.map((id) =>
-          gate?.id === id ? Promise.resolve(gate) : getClientKey(id, ownerProjectId),
+          gate?.id === id ? Promise.resolve(gate) : getServerKey(id, ownerProjectId),
         ),
       );
       const knownAreAuthoritativelyResolved =
@@ -312,7 +312,7 @@ export function ClientKeysPage() {
       if (implicatedKeyIds.length === 0 && knownAreAuthoritativelyResolved) {
         commitUnresolvedCreate(null);
         setMessage(
-          "The implicated client-key delivery is resolved and replacement creation is unlocked.",
+          "The implicated Project secret key delivery is resolved and replacement creation is unlocked.",
           "success",
         );
         return true;
@@ -441,7 +441,7 @@ export function ClientKeysPage() {
     setAcknowledgementError(null);
   }
 
-  function commitObservedKey(observed: ProjectClientKey) {
+  function commitObservedKey(observed: ProjectServerKey) {
     setKeys((current) => mergeAuthorityKey(current, observed));
     setActiveUnacknowledgedKey((current) => {
       if (observed.status === "active" && observed.credential_acknowledged_at == null)
@@ -451,9 +451,9 @@ export function ClientKeysPage() {
     setRevealedKey((current) => (current?.id === observed.id ? observed : current));
   }
 
-  async function acknowledgeDelivery(key: ProjectClientKey): Promise<DeliveryAcknowledgement> {
+  async function acknowledgeDelivery(key: ProjectServerKey): Promise<DeliveryAcknowledgement> {
     if (project === null || key.status !== "active" || key.credential_acknowledged_at != null) {
-      throw new Error("Client-key delivery is not awaiting acknowledgement");
+      throw new Error("Project secret key delivery is not awaiting acknowledgement");
     }
     let attempt = acknowledgeAttempts.current.get(key.id);
     if (attempt === undefined) {
@@ -462,10 +462,10 @@ export function ClientKeysPage() {
     }
     const idempotencyKey = attempt.begin();
     if (idempotencyKey === null)
-      throw new Error("Client-key acknowledgement is already in progress");
+      throw new Error("Project secret key acknowledgement is already in progress");
     try {
       const result = await session.client.POST(
-        "/v1/projects/{project_id}/client-keys/{key_id}/acknowledge",
+        "/v1/projects/{project_id}/server-keys/{key_id}/acknowledge",
         {
           params: {
             path: { project_id: project.id, key_id: key.id },
@@ -483,7 +483,7 @@ export function ClientKeysPage() {
       attempt.settle(error);
       if (isAmbiguousIdempotencyFailure(error) || isLifecycleConflict(error)) {
         try {
-          const observed = await getClientKey(key.id);
+          const observed = await getServerKey(key.id);
           commitObservedKey(observed);
           if (observed.status === "revoked" || observed.credential_acknowledged_at != null) {
             attempt.abandon();
@@ -519,8 +519,8 @@ export function ClientKeysPage() {
       clearReveal();
       setMessage(
         resolution.outcome === "acknowledged"
-          ? "Client-key storage was acknowledged and the one-time credential was cleared from the Console page."
-          : "This client key was revoked by another operator. Its obsolete credential was cleared from the Console page.",
+          ? "Project secret key storage was acknowledged and the one-time credential was cleared from the Console page."
+          : "This Project secret key was revoked by another operator. Its obsolete credential was cleared from the Console page.",
         resolution.outcome === "acknowledged" ? "success" : "warning",
       );
     } catch (error) {
@@ -539,7 +539,7 @@ export function ClientKeysPage() {
     }
   }
 
-  async function acknowledgeRetainedCredential(key: ProjectClientKey) {
+  async function acknowledgeRetainedCredential(key: ProjectServerKey) {
     if (
       project === null ||
       key.credential_acknowledged_at != null ||
@@ -564,7 +564,7 @@ export function ClientKeysPage() {
       setMessage(
         resolution.outcome === "acknowledged"
           ? `Credential storage for ${key.label} was acknowledged.`
-          : `Client key ${key.label} was already revoked by another operator.`,
+          : `Project secret key ${key.label} was already revoked by another operator.`,
         resolution.outcome === "acknowledged" ? "success" : "warning",
       );
     } catch (error) {
@@ -576,17 +576,17 @@ export function ClientKeysPage() {
     }
   }
 
-  async function revokeKey(key: ProjectClientKey) {
+  async function revokeKey(key: ProjectServerKey) {
     if (project === null || key.status !== "active") return;
     const accepted = await confirm({
-      title: "Revoke client key",
+      title: "Revoke Project secret key",
       message: (
         <>
           Revoke <strong>{key.label}</strong> ({key.display_prefix}) immediately? Customer backends
           still using this credential will be denied. This action cannot be reversed.
         </>
       ),
-      actionLabel: "Revoke client key",
+      actionLabel: "Revoke Project secret key",
       destructive: true,
     });
     if (!accepted) return;
@@ -600,7 +600,7 @@ export function ClientKeysPage() {
     if (idempotencyKey === null) return;
     try {
       const result = await session.client.POST(
-        "/v1/projects/{project_id}/client-keys/{key_id}/revoke",
+        "/v1/projects/{project_id}/server-keys/{key_id}/revoke",
         {
           params: {
             path: { project_id: project.id, key_id: key.id },
@@ -626,8 +626,8 @@ export function ClientKeysPage() {
       await refresh();
       setMessage(
         resolvedImplicatedKey && unresolvedCreate.implicatedKeyIds.length === 1
-          ? `Client key ${key.label} was revoked. Replacement creation is unlocked.`
-          : `Client key ${key.label} was revoked.`,
+          ? `Project secret key ${key.label} was revoked. Replacement creation is unlocked.`
+          : `Project secret key ${key.label} was revoked.`,
         "success",
       );
     } catch (error) {
@@ -643,7 +643,7 @@ export function ClientKeysPage() {
       <EmptyState
         level={1}
         title="Project not found"
-        description="Select an existing Project before managing client keys."
+        description="Select an existing Project before managing Project secret keys."
         action={<Link to="/">Return to Projects</Link>}
       />
     );
@@ -652,8 +652,8 @@ export function ClientKeysPage() {
   return (
     <div className={styles["page"]}>
       <PageHeader
-        title="Client API keys"
-        description="Issue independently revocable credentials for customer backends that call this Project's Client API."
+        title="Project secret keys"
+        description="Create independently revocable, Project-scoped secret keys for trusted backends calling the OwlAuth Server API."
         actions={
           <Button
             type="button"
@@ -667,173 +667,182 @@ export function ClientKeysPage() {
             }
             onClick={openCreate}
           >
-            Create client key
+            Create secret key
           </Button>
         }
       />
-      <InlineAlert tone="info">
-        <strong>Rotate with overlap.</strong> Create a replacement, deploy it to the customer
-        backend, verify traffic, and only then revoke the predecessor. Client keys never unlock the
-        Console and are not browser credentials.
-      </InlineAlert>
+      <div className={styles["stack"]}>
+        <InlineAlert tone="info">
+          <strong>Rotate with overlap.</strong> Create a replacement, deploy it to the customer
+          backend, verify traffic, and only then revoke the predecessor. Project secret keys never
+          unlock the Console and are not browser credentials.
+        </InlineAlert>
 
-      {project.status === "active" ? null : (
-        <InlineAlert tone="warning">
-          Client keys cannot be created while this Project is {project.status}.
-        </InlineAlert>
-      )}
-      {unresolvedCreate === null ? null : (
-        <InlineAlert tone="warning" role="alert">
-          <p>
-            Replacement creation is blocked for the unresolved{" "}
-            <strong>{unresolvedCreate.label}</strong> request until its authoritative delivery gate
-            is loaded and every newly implicated active key is revoked.
-          </p>
-          {unresolvedCreate.inventoryState === "loading" ? (
-            <p role="status">Loading the client-key delivery gate</p>
-          ) : null}
-          {unresolvedCreate.inventoryState === "loading" ? null : (
-            <Button
-              type="button"
-              onClick={() =>
-                void loadUnresolvedInventory(
-                  unresolvedCreate.label,
-                  unresolvedCreate.baselineKeyIds,
-                )
-              }
-            >
-              Reconcile delivery gate
-            </Button>
-          )}
-          {unresolvedCreate.inventoryState === "ready" &&
-          unresolvedCreate.implicatedKeyIds.length === 0 ? (
+        {project.status === "active" ? null : (
+          <InlineAlert tone="warning">
+            Project secret keys cannot be created while this Project is {project.status}.
+          </InlineAlert>
+        )}
+        {unresolvedCreate === null ? null : (
+          <InlineAlert tone="warning" role="alert">
             <p>
-              No newly implicated active key is visible in the authoritative delivery gate. Creation
-              remains blocked; refresh the gate and investigate before issuing another credential.
+              Replacement creation is blocked for the unresolved{" "}
+              <strong>{unresolvedCreate.label}</strong> request until its authoritative delivery
+              gate is loaded and every newly implicated active key is revoked.
             </p>
-          ) : null}
-        </InlineAlert>
-      )}
-      {inventoryState === "loading" ? <p role="status">Loading client keys</p> : null}
-      {inventoryState === "failed" ? (
-        <InlineAlert tone="danger" role="alert">
-          <p>The client-key inventory could not be loaded.</p>
-          <Button type="button" onClick={() => void refresh().catch(handleError)}>
-            Retry inventory
-          </Button>
-        </InlineAlert>
-      ) : null}
-      {inventoryState === "ready" && keys.length === 0 ? (
-        <EmptyState
-          title="No client keys"
-          description="Create a key when a customer backend is ready to use the Project-scoped Client API."
-        />
-      ) : null}
-      {keys.length > 0 ? (
-        <>
-          <DataTable
-            caption="Project client keys"
-            headings={["Key", "Status", "Created", "Last used", "Actions"]}
-          >
-            {keys.map((key) => (
-              <tr key={key.id}>
-                <td>
-                  <strong>{key.label}</strong>
-                  <span className={styles["machineValue"]}>{key.display_prefix}</span>
-                  <CopyValue
-                    value={key.public_key_id}
-                    label="client key public ID"
-                    onCopied={(message) => {
-                      setMessage(message, "success");
-                    }}
-                  />
-                </td>
-                <td>
-                  <StatusBadge status={key.status} />
-                  {unresolvedCreate?.implicatedKeyIds.includes(key.id) === true ? (
-                    <span className={styles["muted"]}>
-                      Unresolved create — credential was never revealed; revoke this key
-                    </span>
-                  ) : key.status === "active" && key.credential_acknowledged_at == null ? (
-                    <span className={styles["muted"]}>Storage unconfirmed — creation blocked</span>
-                  ) : key.credential_acknowledged_at == null ? null : (
-                    <span className={styles["muted"]}>
-                      Storage confirmed {readableTime(key.credential_acknowledged_at)}
-                    </span>
-                  )}
-                  {key.revoked_at === null || key.revoked_at === undefined ? null : (
-                    <span className={styles["muted"]}>Revoked {readableTime(key.revoked_at)}</span>
-                  )}
-                </td>
-                <td>{readableTime(key.created_at)}</td>
-                <td>
-                  {key.last_used_at === null || key.last_used_at === undefined
-                    ? "Never recorded"
-                    : readableTime(key.last_used_at)}
-                </td>
-                <td>
-                  {key.status === "active" ? (
-                    <div className={styles["actions"]}>
-                      {key.credential_acknowledged_at == null &&
-                      unresolvedCreate?.implicatedKeyIds.includes(key.id) !== true ? (
-                        <Button
-                          type="button"
-                          busy={acknowledgingKeyId === key.id}
-                          onClick={() => void acknowledgeRetainedCredential(key)}
-                        >
-                          Confirm stored credential
-                        </Button>
-                      ) : null}
-                      <Button type="button" variant="danger" onClick={() => void revokeKey(key)}>
-                        {unresolvedCreate?.implicatedKeyIds.includes(key.id) === true
-                          ? "Revoke implicated key"
-                          : "Revoke"}
-                      </Button>
-                    </div>
-                  ) : (
-                    <span className={styles["muted"]}>No actions</span>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </DataTable>
-          {nextCursor === null ? null : (
-            <div className={styles["formActions"]}>
-              <Button type="button" busy={loadingMore} onClick={() => void loadMore()}>
-                Load more keys
+            {unresolvedCreate.inventoryState === "loading" ? (
+              <p role="status">Loading the Project secret key delivery gate</p>
+            ) : null}
+            {unresolvedCreate.inventoryState === "loading" ? null : (
+              <Button
+                type="button"
+                onClick={() =>
+                  void loadUnresolvedInventory(
+                    unresolvedCreate.label,
+                    unresolvedCreate.baselineKeyIds,
+                  )
+                }
+              >
+                Reconcile delivery gate
               </Button>
-            </div>
-          )}
-        </>
-      ) : null}
+            )}
+            {unresolvedCreate.inventoryState === "ready" &&
+            unresolvedCreate.implicatedKeyIds.length === 0 ? (
+              <p>
+                No newly implicated active key is visible in the authoritative delivery gate.
+                Creation remains blocked; refresh the gate and investigate before issuing another
+                credential.
+              </p>
+            ) : null}
+          </InlineAlert>
+        )}
+        {inventoryState === "loading" ? (
+          <LoadingState>Loading Project secret keys</LoadingState>
+        ) : null}
+        {inventoryState === "failed" ? (
+          <InlineAlert tone="danger" role="alert">
+            <p>The Project secret key inventory could not be loaded.</p>
+            <Button type="button" onClick={() => void refresh().catch(handleError)}>
+              Retry inventory
+            </Button>
+          </InlineAlert>
+        ) : null}
+        {inventoryState === "ready" && keys.length === 0 ? (
+          <EmptyState
+            title="No Project secret keys"
+            description="Create a secret key when a trusted backend is ready to use the Project-scoped Server API."
+          />
+        ) : null}
+        {keys.length > 0 ? (
+          <>
+            <DataTable
+              caption="Project secret keys"
+              headings={["Key", "Status", "Created", "Last used", "Actions"]}
+            >
+              {keys.map((key) => (
+                <tr key={key.id}>
+                  <td>
+                    <strong>{key.label}</strong>
+                    <span className={styles["machineValue"]}>{key.display_prefix}</span>
+                    <CopyValue
+                      value={key.public_key_id}
+                      label="Project secret key public ID"
+                      onCopied={(message) => {
+                        setMessage(message, "success");
+                      }}
+                    />
+                  </td>
+                  <td>
+                    <StatusBadge status={key.status} />
+                    {unresolvedCreate?.implicatedKeyIds.includes(key.id) === true ? (
+                      <span className={styles["muted"]}>
+                        Unresolved create — credential was never revealed; revoke this key
+                      </span>
+                    ) : key.status === "active" && key.credential_acknowledged_at == null ? (
+                      <span className={styles["muted"]}>
+                        Storage unconfirmed — creation blocked
+                      </span>
+                    ) : key.credential_acknowledged_at == null ? null : (
+                      <span className={styles["muted"]}>
+                        Storage confirmed {readableTime(key.credential_acknowledged_at)}
+                      </span>
+                    )}
+                    {key.revoked_at === null || key.revoked_at === undefined ? null : (
+                      <span className={styles["muted"]}>
+                        Revoked {readableTime(key.revoked_at)}
+                      </span>
+                    )}
+                  </td>
+                  <td>{readableTime(key.created_at)}</td>
+                  <td>
+                    {key.last_used_at === null || key.last_used_at === undefined
+                      ? "Never recorded"
+                      : readableTime(key.last_used_at)}
+                  </td>
+                  <td>
+                    {key.status === "active" ? (
+                      <div className={styles["actions"]}>
+                        {key.credential_acknowledged_at == null &&
+                        unresolvedCreate?.implicatedKeyIds.includes(key.id) !== true ? (
+                          <Button
+                            type="button"
+                            busy={acknowledgingKeyId === key.id}
+                            onClick={() => void acknowledgeRetainedCredential(key)}
+                          >
+                            Confirm stored credential
+                          </Button>
+                        ) : null}
+                        <Button type="button" variant="danger" onClick={() => void revokeKey(key)}>
+                          {unresolvedCreate?.implicatedKeyIds.includes(key.id) === true
+                            ? "Revoke implicated key"
+                            : "Revoke"}
+                        </Button>
+                      </div>
+                    ) : (
+                      <span className={styles["muted"]}>No actions</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </DataTable>
+            {nextCursor === null ? null : (
+              <div className={styles["formActions"]}>
+                <Button type="button" busy={loadingMore} onClick={() => void loadMore()}>
+                  Load more keys
+                </Button>
+              </div>
+            )}
+          </>
+        ) : null}
+      </div>
 
       <Dialog
         open={createOpen}
-        title="Create client key"
+        title="Create Project secret key"
         onClose={closeCreate}
         actions={
           <>
             <Button type="button" variant="quiet" disabled={creating} onClick={closeCreate}>
               Cancel
             </Button>
-            <Button type="submit" variant="primary" form="create-client-key-form" busy={creating}>
-              Create client key
+            <Button type="submit" variant="primary" form="create-server-key-form" busy={creating}>
+              Create secret key
             </Button>
           </>
         }
       >
         <form
-          id="create-client-key-form"
+          id="create-server-key-form"
           className={styles["form"]}
           onSubmit={(event) => void createKey(event)}
         >
           <Field
             label="Key label"
-            htmlFor="client-key-label"
+            htmlFor="server-key-label"
             description="Name the backend or deployment that will hold this credential."
           >
             <Input
-              id="client-key-label"
+              id="server-key-label"
               name="label"
               required
               minLength={1}
@@ -847,7 +856,7 @@ export function ClientKeysPage() {
 
       <Dialog
         open={revealedKey !== null}
-        title="Store this client key now"
+        title="Store this Project secret key now"
         dismissible={false}
         onClose={() => undefined}
         actions={
@@ -872,7 +881,7 @@ export function ClientKeysPage() {
             <code
               ref={credentialDisplay}
               className={styles["credential"]}
-              data-testid="one-time-client-credential"
+              data-testid="one-time-server-credential"
             />
           </div>
           <div className={styles["actions"]}>

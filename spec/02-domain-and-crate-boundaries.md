@@ -2,12 +2,12 @@
 
 ## Dependency rule
 
-Dependencies point inward. Runtime HTTP, Client HTTP, Control HTTP, PostgreSQL, Redis, key providers, upstream providers, the CLI's discovered Control client, remote HTTP MCP, and Runtime SDKs are adapters around Project-scoped application and domain policy. The public key-provider SPI is an outer composition boundary, not a second domain or application layer.
+Dependencies point inward. Runtime HTTP, Server API HTTP, Control HTTP, PostgreSQL, Redis, key providers, upstream providers, the CLI's discovered Control client, remote HTTP MCP, and Runtime SDKs are adapters around Project-scoped application and domain policy. The public key-provider SPI is an outer composition boundary, not a second domain or application layer.
 
 ```mermaid
 flowchart TB
     RHTTP[Runtime HTTP adapter] --> APP[Application services]
-    BHTTP[Client HTTP adapter] --> APP
+    BHTTP[Server API HTTP adapter] --> APP
     CHTTP[Control HTTP adapter] --> APP
     MCP[Remote HTTP MCP Control adapter] --> APP
     APP --> DOMAIN[Project-scoped domain model]
@@ -29,12 +29,12 @@ Domain and application modules MUST NOT import HTTP framework types, OpenAPI typ
 
 This is the single server package. It owns:
 
-- the `owlauth-server` executable and `all`, `runtime`, `client`, and `control` composition roots;
+- the `owlauth-server` executable and `all`, `auth`, and `control` composition roots;
 - internal Project/Application/identity/login/session/token/key domain modules;
 - application services, Project-bound invariants, and deployment-operator Control admission policy;
 - persistence, cache, upstream-provider, data-protection, clock, entropy, and audit ports plus consumption/composition of the public key-provider capabilities;
 - PostgreSQL and Redis adapters and embedded migrations;
-- Runtime HTTP and Hosted Authentication UI, Client HTTP, Control HTTP and Management Console, remote Streamable HTTP MCP, telemetry, health, and process-lifecycle adapters.
+- one Auth listener containing isolated Runtime HTTP/Hosted Authentication UI and Server API adapters, plus the Control listener/Management Console, remote Streamable HTTP MCP, telemetry, health, and process-lifecycle adapters.
 
 PostgreSQL implementation technology and migration behavior are owned by spec 04; hosted web surfaces, route/base separation, and browser credential behavior are owned by spec 09. Server-only concepts remain internal modules except for the deliberately independent `owlauth-key-provider` SPI and the narrow public server composition API needed by custom binaries. Logical plane separation does not create separate domain packages or duplicated service layers.
 
@@ -46,7 +46,7 @@ It MUST NOT depend on `owlauth-server`, `owlauth-types`, PostgreSQL/Redis/HTTP/c
 
 ### `crates/owlauth-types`
 
-This package owns stable public HTTP DTOs, wire enums, error serialization, endpoint metadata, and OpenAPI derivation. It separates Runtime Project Auth, customer-backend Client, and Control administrative contracts. It does not own domain entities, Project authorization, persistence rows, or provider payloads.
+This package owns stable public HTTP DTOs, wire enums, error serialization, endpoint metadata, and OpenAPI derivation. It separates Runtime Project Auth, customer-backend Server API, and Control administrative contracts. It does not own domain entities, Project authorization, persistence rows, or provider payloads.
 
 `owlauth-types` MUST NOT depend on the server, CLI, storage drivers, or client SDKs.
 
@@ -58,7 +58,7 @@ Default Runtime SDK surfaces do not gain administrative operations merely becaus
 
 ### `sdks/*`
 
-SDKs consume only public Runtime Project Auth contracts and language-neutral behavior. They initialize with public `project_id`, `application_id`, and publishable configuration; these values identify the Project/Application but never authorize Client or Control operations. Customer backends consume the separate Client OpenAPI directly and own generated clients; OwlAuth publishes no Client API SDK.
+SDKs consume only public Runtime Project Auth contracts and language-neutral behavior. They initialize with public `project_id`, `application_id`, and publishable configuration; these values identify the Project/Application but never authorize Server API or Control operations. Customer backends consume the separate Server OpenAPI directly and own generated clients; OwlAuth publishes no Server API SDK.
 
 SDKs have no privileged knowledge of rows or domain types. The Rust SDK receives no additional authority from sharing the implementation language. A Control client, if distributed, remains an explicitly separate module/feature and contract.
 
@@ -72,7 +72,7 @@ flowchart LR
     CUSTOMBIN[Custom server binary] --> SERVER
     CUSTOMBIN --> CUSTOM
     SDK[Runtime Project Auth SDKs] -. Runtime DTO vocabulary .-> TYPES
-    GENERATED[Customer-generated Client API code] -. Client OpenAPI .-> TYPES
+    GENERATED[Customer-generated Server API code] -. Server OpenAPI .-> TYPES
     CLI[owlauth-cli] --> DISCOVERY[Well-known descriptor client]
     DISCOVERY --> CCLIENT[Typed Control client]
     CCLIENT -. Control DTO vocabulary .-> TYPES
@@ -107,8 +107,8 @@ The SPI dependency does not make arbitrary server internals public. `owlauth-ser
 | `TokenApplicationService`         | issue Project access token, rotate refresh family, revoke family                                                     | Runtime                                                            |
 | `ProjectPolicyService`            | manage token claims, lifetimes, provider/app admission, and session policy                                           | Control writes; Runtime evaluates                                  |
 | `KeyLifecycleService`             | provision, publish, activate, retire, and revoke Project signing keys                                                | Control commands; Runtime signs and publishes Project JWKS         |
-| `ProjectClientAccessService`      | create/revoke Project client-key commitments and authenticate one exact Project Client actor                         | Control lifecycle; Client authentication                           |
-| `ProjectClientQueryService`       | bounded Project users/Application projections and authoritative access-token introspection                           | Client                                                             |
+| `ProjectServerAccessService`      | create/revoke Project server-key commitments and authenticate one exact Project server actor                         | Control lifecycle; Server API authentication                       |
+| `ProjectServerQueryService`       | bounded Project users/Application projections and authoritative access-token introspection                           | Server API                                                         |
 | `DeploymentOperatorAccessService` | authenticate the process-configured operator API key for the Control listener                                        | Control adapters                                                   |
 | `AuditApplicationService`         | append Project/deployment security events and query Control views                                                    | both append; Control queries as the deployment operator            |
 
@@ -134,7 +134,7 @@ Aggregate boundaries define transaction scope where one aggregate can enforce th
 
 Every Project-owned table has `project_id` directly or reaches it through a constraint that PostgreSQL can verify. Security-critical queries include Project qualification even when object IDs are globally unique. Composite foreign keys or equivalent constraints prevent a child row from referencing a parent in another Project.
 
-A Runtime request resolves Project and Application before provider, user, session, ticket, or token lookup. A Client request authenticates one Project client key, requires the route Project to match that exact Project, and invokes only the read-only Client query boundary. A Control request first authenticates the deployment operator API key and then invokes a Project-bound command. A valid key grants all Control commands; `belongs_to` does not replace Project qualification and is never an authorization check.
+A Runtime request resolves Project and Application before provider, user, session, ticket, or token lookup. A Server API request authenticates one Project server key, requires the route Project to match that exact Project, and invokes only the read-only Server query boundary. A Control request first authenticates the deployment operator API key and then invokes a Project-bound command. A valid key grants all Control commands; `belongs_to` does not replace Project qualification and is never an authorization check.
 
 Project disablement cannot transfer child resources to another Project. A disabled Project rejects new login, handoff, refresh, current-user, and signing operations while preserving identifiers and durable state for audit and controlled recovery. The Control model exposes no hard-delete transition for Projects, Applications, providers, or users.
 

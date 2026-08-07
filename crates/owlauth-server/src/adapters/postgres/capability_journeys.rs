@@ -38,13 +38,9 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     adapters::{
-        client_key_security::{ClientKeyDigestMaterial, SoftwareClientKeyRing},
         custody::SoftwareCustodyProvider,
         migrations::{SchemaError, prepare_schema, verify_url},
         postgres::{
-            client_api::RuntimeClientEmailLookupDigester,
-            client_key::PostgresClientKeyRepository,
-            client_readiness::PostgresClientDigestReadinessAdapter,
             custody::ProtectedMaterialRepository,
             email_control::PostgresEmailControlRepository,
             entity::{
@@ -56,30 +52,34 @@ use crate::{
             provider_egress::PostgresProviderEgressPolicyRepository,
             provisioning::PostgresProvisioningAdapter,
             readiness::PostgresReadinessAdapter,
+            server_api::RuntimeServerEmailLookupDigester,
+            server_key::PostgresServerKeyRepository,
+            server_readiness::PostgresServerDigestReadinessAdapter,
             unit_of_work::ProjectUnitOfWork,
         },
         protected_runtime::PostgresProtectedRuntimeCustody,
         runtime_security::{RuntimeKeyMaterial, SoftwareRuntimeProtector},
+        server_key_security::{ServerKeyDigestMaterial, SoftwareServerKeyRing},
         system::{Sha256RequestDigester, SystemClock},
     },
     application::{
-        AcknowledgeProjectClientKeyDelivery, ApplicationError, ApplicationProvisioningPort,
-        ClientDigestReadinessService, ClientEmailLookupDigester, ClientKeyLifecycleService,
+        AcknowledgeProjectServerKeyDelivery, ApplicationError, ApplicationProvisioningPort,
         CompleteIdempotency, ConfigurationSecretSealers, CreateApplication, CreateProject,
-        CreateProjectClientKey, CreateProjectClientKeyResult, CreateProvider,
-        CreateSmtpConfiguration, EmailControlService, NewProject, PreparedSigningKey,
-        ProjectProvisioningPort, ProjectRecord, ProviderEgressPolicyPort,
+        CreateProjectServerKey, CreateProjectServerKeyResult, CreateProvider,
+        CreateSmtpConfiguration, EmailControlService, EmailIdentityLookupDigester, NewProject,
+        PreparedSigningKey, ProjectProvisioningPort, ProjectRecord, ProviderEgressPolicyPort,
         ProvisionedProtectedSigningMaterial, ProvisioningInfrastructure,
         ProvisioningOperationState, ProvisioningService, ReadinessService,
         ReconcileDeploymentSmtpGeneration, ReplaceApplicationConfiguration, RequestDigester,
-        RevokeProjectClientKey, RuntimeProtector, SigningKeyProvisioningPort,
-        SigningProviderAction, SigningProviderCall, SigningProviderLease, SmtpControlTlsMode,
-        SmtpCredentialResolver, UpdateProject, UpdateProjectPolicy,
+        RevokeProjectServerKey, RuntimeProtector, ServerDigestReadinessService,
+        ServerKeyLifecycleService, SigningKeyProvisioningPort, SigningProviderAction,
+        SigningProviderCall, SigningProviderLease, SmtpControlTlsMode, SmtpCredentialResolver,
+        UpdateProject, UpdateProjectPolicy,
     },
     composition::build_http_capabilities,
-    config::{MigrationMode, PlaneMode, ServerConfig},
+    config::{MigrationMode, ProcessMode, ServerConfig},
     domain::{ApplicationType, ProviderEgressMode, ProviderEgressPolicy, ProviderKind},
-    http::{build_routers_with_capabilities, build_routers_with_runtime_incarnation},
+    http::{build_routers_with_auth_incarnation, build_routers_with_capabilities},
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -503,7 +503,7 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
         ),
         ("OWLAUTH_POSTGRES_URL".to_owned(), runtime_url.to_owned()),
         (
-            "OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
+            "OWLAUTH_AUTH_PROCESS_ID".to_owned(),
             "runtime-test-process".to_owned(),
         ),
         ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
@@ -572,19 +572,15 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
             "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY".to_owned(),
         ),
         (
-            "OWLAUTH_CLIENT_PROCESS_ID".to_owned(),
-            "capability-client".to_owned(),
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            "runtime-test-process".to_owned(),
         ),
         (
-            "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS".to_owned(),
-            "capability-client".to_owned(),
-        ),
-        (
-            "OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION".to_owned(),
+            "OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION".to_owned(),
             "1".to_owned(),
         ),
         (
-            "OWLAUTH_CLIENT_KEY_DIGEST_KEY".to_owned(),
+            "OWLAUTH_SERVER_KEY_DIGEST_KEY".to_owned(),
             "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo".to_owned(),
         ),
         (
@@ -592,7 +588,7 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
             runtime_url.to_owned(),
         ),
         (
-            "OWLAUTH_CLIENT_POSTGRES_URL".to_owned(),
+            "OWLAUTH_SERVER_POSTGRES_URL".to_owned(),
             runtime_url.to_owned(),
         ),
         (
@@ -629,12 +625,12 @@ async fn complete_once(database: DatabaseConnection, key: String) -> CompleteIde
 
 #[test]
 fn plane_modes_select_separate_pool_sets() {
-    assert!(PlaneMode::Runtime.has_runtime());
-    assert!(!PlaneMode::Runtime.has_control());
-    assert!(!PlaneMode::Control.has_runtime());
-    assert!(PlaneMode::Control.has_control());
-    assert!(PlaneMode::All.has_runtime());
-    assert!(PlaneMode::All.has_control());
+    assert!(ProcessMode::Auth.has_auth());
+    assert!(!ProcessMode::Auth.has_control());
+    assert!(!ProcessMode::Control.has_auth());
+    assert!(ProcessMode::Control.has_control());
+    assert!(ProcessMode::All.has_auth());
+    assert!(ProcessMode::All.has_control());
 }
 
 #[allow(
@@ -1002,7 +998,7 @@ async fn verify_application_and_publication_journeys(
         .await
         .expect("begin replacement-first transaction");
     sqlx::query(
-        "UPDATE runtime_process_incarnations SET process_incarnation=$2
+        "UPDATE auth_process_incarnations SET process_incarnation=$2
          WHERE process_id=$1",
     )
     .bind("runtime-test-process")
@@ -1090,7 +1086,7 @@ async fn verify_application_and_publication_journeys(
             .send(pid)
             .expect("publish replacement backend pid");
         sqlx::query(
-            "UPDATE runtime_process_incarnations SET process_incarnation=$2
+            "UPDATE auth_process_incarnations SET process_incarnation=$2
              WHERE process_id=$1",
         )
         .bind("runtime-test-process")
@@ -1147,7 +1143,7 @@ async fn verify_application_and_publication_journeys(
         .expect("published key should remain present");
     assert_eq!(key_after_stale_activation.state, "published");
     sqlx::query(
-        "UPDATE runtime_process_incarnations SET process_incarnation=$2
+        "UPDATE auth_process_incarnations SET process_incarnation=$2
          WHERE process_id=$1",
     )
     .bind("runtime-test-process")
@@ -1185,7 +1181,7 @@ async fn verify_application_and_publication_journeys(
     secondary_readiness
         .project_jwks(&created_project.public_id)
         .await
-        .expect("every required Runtime process should observe the revision");
+        .expect("every required Auth process should observe the revision");
     tokio::time::sleep(Duration::from_millis(15)).await;
     let active_key = provisioning
         .activate_signing_key(
@@ -1693,8 +1689,7 @@ async fn verify_application_and_publication_journeys(
     assert!(revoked_jwks.keys.is_empty());
     assert!(revoked_jwks.signing_epoch > published_jwks.signing_epoch);
 
-    let mut routers =
-        build_routers_with_runtime_incarnation(config, Some(pools), Uuid::from_u128(1));
+    let mut routers = build_routers_with_auth_incarnation(config, Some(pools), Uuid::from_u128(1));
     routers.mark_ready();
     let control_router = routers.control.take().expect("Control router should exist");
     let denied = control_router
@@ -2040,8 +2035,8 @@ async fn verify_capacity_and_replay_limits(control_url: &str) {
         capacity_adapter.create_project(right_project_command.clone(), Uuid::new_v4()),
     );
     let (capacity_project, replay_project_command) = match (left_project, right_project) {
-        (Ok(created), Err(ApplicationError::InvalidInput)) => (created, left_project_command),
-        (Err(ApplicationError::InvalidInput), Ok(created)) => (created, right_project_command),
+        (Ok(created), Err(ApplicationError::CapacityExceeded)) => (created, left_project_command),
+        (Err(ApplicationError::CapacityExceeded), Ok(created)) => (created, right_project_command),
         outcomes => panic!("exactly one concurrent capacity create must commit: {outcomes:?}"),
     };
     assert_eq!(
@@ -2062,7 +2057,7 @@ async fn verify_capacity_and_replay_limits(control_url: &str) {
                 Uuid::new_v4(),
             )
             .await,
-        Err(ApplicationError::InvalidInput)
+        Err(ApplicationError::CapacityExceeded)
     );
 
     let first_application_command = CreateApplication {
@@ -2118,10 +2113,10 @@ async fn verify_capacity_and_replay_limits(control_url: &str) {
     );
     let (capacity_application, replay_application_command) =
         match (left_application, right_application) {
-            (Ok(created), Err(ApplicationError::InvalidInput)) => {
+            (Ok(created), Err(ApplicationError::CapacityExceeded)) => {
                 (created, left_application_command)
             }
-            (Err(ApplicationError::InvalidInput), Ok(created)) => {
+            (Err(ApplicationError::CapacityExceeded), Ok(created)) => {
                 (created, right_application_command)
             }
             outcomes => {
@@ -2683,9 +2678,9 @@ async fn migrate_and_verify_main_database(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the PostgreSQL client-key and listener capability journey is intentionally end-to-end"
+    reason = "the PostgreSQL server-key and listener capability journey is intentionally end-to-end"
 )]
-async fn verify_client_key_and_listener_journeys(
+async fn verify_server_key_and_listener_journeys(
     project: &ProjectRecord,
     client_provider_id: Uuid,
     config: &ServerConfig,
@@ -2694,39 +2689,54 @@ async fn verify_client_key_and_listener_journeys(
 ) {
     const FIRST_INCARNATION: Uuid = Uuid::from_u128(0xc11e_0001);
     const SECOND_INCARNATION: Uuid = Uuid::from_u128(0xc11e_0002);
-    let client = pools.client.as_ref().expect("Client pool should exist");
-    let readiness_adapter = Arc::new(PostgresClientDigestReadinessAdapter::new(client.clone()));
-    let short_readiness = ClientDigestReadinessService::new(
+    let client = pools.server.as_ref().expect("Server pool should exist");
+    client
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO auth_process_incarnations(process_id,process_incarnation,started_at)
+             VALUES($1,$2,transaction_timestamp())
+             ON CONFLICT(process_id) DO UPDATE SET
+               process_incarnation=EXCLUDED.process_incarnation,
+               started_at=EXCLUDED.started_at",
+            [
+                config.auth_process_id.clone().into(),
+                FIRST_INCARNATION.into(),
+            ],
+        ))
+        .await
+        .expect("first Auth incarnation should be claimed before Server readiness");
+    let readiness_adapter = Arc::new(PostgresServerDigestReadinessAdapter::new(client.clone()));
+    let short_readiness = ServerDigestReadinessService::new(
         readiness_adapter.clone(),
-        config.client_process_id.clone(),
+        config.auth_process_id.clone(),
         FIRST_INCARNATION,
         [1],
-        config.required_client_process_ids.clone(),
+        config.required_auth_process_ids.clone(),
         Duration::from_millis(50),
     )
-    .expect("short Client readiness should compose");
+    .expect("short Server readiness should compose");
     short_readiness
         .claim()
         .await
-        .expect("first Client incarnation should claim readiness");
+        .expect("first Auth incarnation should claim Server readiness");
 
-    let ring = SoftwareClientKeyRing::new(
+    let ring = SoftwareServerKeyRing::new(
         config
             .instance_id
             .clone()
-            .expect("Client key digest deployment context"),
+            .expect("Server key digest deployment context"),
         1,
-        ClientKeyDigestMaterial::new([b'Z'; 32]),
+        ServerKeyDigestMaterial::new([b'Z'; 32]),
         BTreeMap::new(),
     )
-    .expect("test Client key ring should compose");
-    let lifecycle = ClientKeyLifecycleService::new(
+    .expect("test Server key ring should compose");
+    let lifecycle = ServerKeyLifecycleService::new(
         Arc::new(
-            PostgresClientKeyRepository::new(
+            PostgresServerKeyRepository::new(
                 pools.control.as_ref().expect("Control pool").clone(),
-                config.required_client_process_ids.clone(),
+                config.required_auth_process_ids.clone(),
             )
-            .expect("Client key repository should compose"),
+            .expect("Server key repository should compose"),
         ),
         Arc::new(ring.issuer()),
         Arc::new(Sha256RequestDigester),
@@ -2738,31 +2748,31 @@ async fn verify_client_key_and_listener_journeys(
     // the transaction's stale start time.
     let mut blocker = PgConnection::connect(admin_url)
         .await
-        .expect("Client readiness blocker should connect");
+        .expect("Server readiness blocker should connect");
     sqlx::query("BEGIN")
         .execute(&mut blocker)
         .await
-        .expect("Client readiness blocker should begin");
+        .expect("Server readiness blocker should begin");
     let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut blocker)
         .await
-        .expect("Client readiness blocker pid");
+        .expect("Server readiness blocker pid");
     sqlx::query(
-        "SELECT process_id FROM client_process_incarnations
+        "SELECT process_id FROM auth_process_incarnations
           WHERE process_id=$1 FOR UPDATE",
     )
-    .bind(&config.client_process_id)
+    .bind(&config.auth_process_id)
     .fetch_one(&mut blocker)
     .await
-    .expect("Client incarnation parent should lock");
+    .expect("Auth incarnation parent should lock");
     let lifecycle_for_expiry = lifecycle.clone();
     let project_id = project.id;
     let mut expired_create = tokio::spawn(async move {
         lifecycle_for_expiry
-            .create_project_client_key(CreateProjectClientKey {
+            .create_project_server_key(CreateProjectServerKey {
                 project_id,
                 label: "expires while waiting".to_owned(),
-                idempotency_key: "client-key-expired-wait-12345678".to_owned(),
+                idempotency_key: "server-key-expired-wait-12345678".to_owned(),
                 correlation_id: Uuid::new_v4(),
             })
             .await
@@ -2770,135 +2780,171 @@ async fn verify_client_key_and_listener_journeys(
     let mut observer = PgConnection::connect(admin_url)
         .await
         .expect("Client lock observer should connect");
-    wait_for_sqlx_backend_blocked_by(&mut observer, blocker_pid, "Client key create").await;
+    wait_for_sqlx_backend_blocked_by(&mut observer, blocker_pid, "Server key create").await;
     sqlx::query("SELECT pg_sleep(0.075)")
         .execute(&mut observer)
         .await
-        .expect("database wall clock should advance beyond the Client readiness lease");
+        .expect("database wall clock should advance beyond the Server readiness lease");
     let lease_expired: bool = sqlx::query_scalar(
         "SELECT lease_expires_at <= clock_timestamp()
-           FROM client_key_digest_readiness WHERE process_id=$1",
+           FROM server_key_digest_readiness WHERE process_id=$1",
     )
-    .bind(&config.client_process_id)
+    .bind(&config.auth_process_id)
     .fetch_one(&mut observer)
     .await
-    .expect("Client readiness lease expiry should be observable");
+    .expect("Server readiness lease expiry should be observable");
     assert!(
         lease_expired,
-        "Client readiness fixture lease must be expired"
+        "Server readiness fixture lease must be expired"
     );
     sqlx::query("COMMIT")
         .execute(&mut blocker)
         .await
-        .expect("Client readiness blocker should commit");
+        .expect("Server readiness blocker should commit");
     assert_eq!(
         timeout(Duration::from_secs(2), &mut expired_create)
             .await
-            .expect("expired Client create should complete")
-            .expect("expired Client create task should not panic")
+            .expect("expired server-key create should complete")
+            .expect("expired server-key create task should not panic")
             .expect_err("expired verifier evidence must fail closed"),
-        ApplicationError::ClientVerifierUnavailable
+        ApplicationError::ServerVerifierUnavailable
     );
-    blocker.close().await.expect("Client blocker should close");
+    blocker
+        .close()
+        .await
+        .expect("Server readiness blocker should close");
     observer
         .close()
         .await
-        .expect("Client observer should close");
+        .expect("Server readiness observer should close");
 
-    let first_readiness = ClientDigestReadinessService::new(
+    let first_readiness = ServerDigestReadinessService::new(
         readiness_adapter.clone(),
-        config.client_process_id.clone(),
+        config.auth_process_id.clone(),
         FIRST_INCARNATION,
         [1],
-        config.required_client_process_ids.clone(),
+        config.required_auth_process_ids.clone(),
         Duration::from_secs(5),
     )
-    .expect("first Client readiness should compose");
+    .expect("first Server readiness should compose");
     first_readiness
         .claim()
         .await
-        .expect("first Client readiness should recover");
+        .expect("first Server readiness should recover");
     let first_created = lifecycle
-        .create_project_client_key(CreateProjectClientKey {
+        .create_project_server_key(CreateProjectServerKey {
             project_id: project.id,
             label: "primary backend".to_owned(),
-            idempotency_key: "client-key-primary-12345678".to_owned(),
+            idempotency_key: "server-key-primary-12345678".to_owned(),
             correlation_id: Uuid::new_v4(),
         })
         .await
-        .expect("Project client key should be created");
-    let CreateProjectClientKeyResult::Created {
+        .expect("Project server key should be created");
+    let CreateProjectServerKeyResult::Created {
         metadata: primary_key,
         credential,
     } = first_created
     else {
-        panic!("first Project client key must reveal its credential once");
+        panic!("first Project server key must reveal its credential once");
     };
     let credential = credential.expose().to_owned();
     let replay = lifecycle
-        .create_project_client_key(CreateProjectClientKey {
+        .create_project_server_key(CreateProjectServerKey {
             project_id: project.id,
             label: "primary backend".to_owned(),
-            idempotency_key: "client-key-primary-12345678".to_owned(),
+            idempotency_key: "server-key-primary-12345678".to_owned(),
             correlation_id: Uuid::new_v4(),
         })
         .await
-        .expect("same Client create should replay");
+        .expect("same server-key create should replay");
     assert!(matches!(
         replay,
-        CreateProjectClientKeyResult::ReplayWithoutSecret { ref metadata }
+        CreateProjectServerKeyResult::ReplayWithoutSecret { ref metadata }
             if metadata.id == primary_key.id
     ));
     assert!(primary_key.credential_acknowledged_at.is_none());
     assert_eq!(
         lifecycle
-            .create_project_client_key(CreateProjectClientKey {
+            .create_project_server_key(CreateProjectServerKey {
                 project_id: project.id,
                 label: "blocked before delivery acknowledgement".to_owned(),
-                idempotency_key: "client-key-blocked-unacknowledged-12345678".to_owned(),
+                idempotency_key: "server-key-blocked-unacknowledged-12345678".to_owned(),
                 correlation_id: Uuid::new_v4(),
             })
             .await
             .expect_err("an active unacknowledged credential must block replacement"),
         ApplicationError::InvalidTransition
     );
-    let acknowledge_command = AcknowledgeProjectClientKeyDelivery {
+    let acknowledge_command = AcknowledgeProjectServerKeyDelivery {
         project_id: project.id,
         key_id: primary_key.id,
         expected_revision: primary_key.revision,
-        idempotency_key: "client-key-primary-acknowledge-12345678".to_owned(),
+        idempotency_key: "server-key-primary-acknowledge-12345678".to_owned(),
         correlation_id: Uuid::new_v4(),
     };
     let primary_key = lifecycle
-        .acknowledge_project_client_key_delivery(acknowledge_command.clone())
+        .acknowledge_project_server_key_delivery(acknowledge_command.clone())
         .await
-        .expect("primary Client credential delivery should be acknowledged");
+        .expect("primary Server credential delivery should be acknowledged");
     assert_eq!(primary_key.revision, 2);
     assert!(primary_key.credential_acknowledged_at.is_some());
     assert_eq!(
         lifecycle
-            .acknowledge_project_client_key_delivery(acknowledge_command)
+            .acknowledge_project_server_key_delivery(acknowledge_command)
             .await
             .expect("delivery acknowledgement replay should be idempotent"),
         primary_key
     );
 
-    let second_readiness = ClientDigestReadinessService::new(
+    client
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE auth_process_incarnations
+                SET process_incarnation=$2,started_at=transaction_timestamp()
+              WHERE process_id=$1",
+            [
+                config.auth_process_id.clone().into(),
+                SECOND_INCARNATION.into(),
+            ],
+        ))
+        .await
+        .expect("replacement Auth incarnation should fence its predecessor");
+    assert_eq!(
+        first_readiness
+            .claim()
+            .await
+            .expect_err("delayed predecessor readiness must not reclaim the Auth process ID"),
+        ApplicationError::Disabled
+    );
+    let current_incarnation = client
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT process_incarnation FROM auth_process_incarnations WHERE process_id=$1",
+            [config.auth_process_id.clone().into()],
+        ))
+        .await
+        .expect("current Auth incarnation query should complete")
+        .expect("current Auth incarnation should exist")
+        .try_get::<Uuid>("", "process_incarnation")
+        .expect("current Auth incarnation should be a UUID");
+    assert_eq!(current_incarnation, SECOND_INCARNATION);
+
+    let second_readiness = ServerDigestReadinessService::new(
         readiness_adapter,
-        config.client_process_id.clone(),
+        config.auth_process_id.clone(),
         SECOND_INCARNATION,
         [1],
-        config.required_client_process_ids.clone(),
+        config.required_auth_process_ids.clone(),
         Duration::from_secs(5),
     )
-    .expect("replacement Client readiness should compose");
+    .expect("replacement Server readiness should compose");
     let lifecycle_for_interleave = lifecycle.clone();
     let replacement_create = async move {
         lifecycle_for_interleave
-            .create_project_client_key(CreateProjectClientKey {
+            .create_project_server_key(CreateProjectServerKey {
                 project_id: project.id,
                 label: "replacement interleave".to_owned(),
-                idempotency_key: "client-key-replacement-12345678".to_owned(),
+                idempotency_key: "server-key-replacement-12345678".to_owned(),
                 correlation_id: Uuid::new_v4(),
             })
             .await
@@ -2910,13 +2956,13 @@ async fn verify_client_key_and_listener_journeys(
     .expect("claim/create interleaving must not deadlock");
     replacement_claim.expect("replacement incarnation should claim");
     match replacement_key {
-        Ok(CreateProjectClientKeyResult::Created { metadata, .. }) => {
+        Ok(CreateProjectServerKeyResult::Created { metadata, .. }) => {
             lifecycle
-                .acknowledge_project_client_key_delivery(AcknowledgeProjectClientKeyDelivery {
+                .acknowledge_project_server_key_delivery(AcknowledgeProjectServerKeyDelivery {
                     project_id: project.id,
                     key_id: metadata.id,
                     expected_revision: metadata.revision,
-                    idempotency_key: "client-key-replacement-acknowledge-12345678".to_owned(),
+                    idempotency_key: "server-key-replacement-acknowledge-12345678".to_owned(),
                     correlation_id: Uuid::new_v4(),
                 })
                 .await
@@ -2924,21 +2970,21 @@ async fn verify_client_key_and_listener_journeys(
                     "an interleaved successful create must be acknowledged before another create",
                 );
         }
-        Err(ApplicationError::ClientVerifierUnavailable) => {}
-        other => panic!("unexpected interleaved Client create result: {other:?}"),
+        Err(ApplicationError::ServerVerifierUnavailable) => {}
+        other => panic!("unexpected interleaved server-key create result: {other:?}"),
     }
     let post_replacement_key = match lifecycle
-        .create_project_client_key(CreateProjectClientKey {
+        .create_project_server_key(CreateProjectServerKey {
             project_id: project.id,
             label: "post-replacement verifier".to_owned(),
-            idempotency_key: "client-key-post-replacement-12345678".to_owned(),
+            idempotency_key: "server-key-post-replacement-12345678".to_owned(),
             correlation_id: Uuid::new_v4(),
         })
         .await
         .expect("create must succeed against the replacement incarnation")
     {
-        CreateProjectClientKeyResult::Created { metadata, .. } => metadata,
-        CreateProjectClientKeyResult::ReplayWithoutSecret { .. } => {
+        CreateProjectServerKeyResult::Created { metadata, .. } => metadata,
+        CreateProjectServerKeyResult::ReplayWithoutSecret { .. } => {
             panic!("fresh post-replacement create cannot replay")
         }
     };
@@ -2949,7 +2995,7 @@ async fn verify_client_key_and_listener_journeys(
     );
 
     // Seed one materialized directory graph through the same constraints used by Runtime. This
-    // gives the real Client listener positive user/projection reads while email/token misses prove
+    // gives the real Server API surface positive user/projection reads while email/token misses prove
     // the non-enumerating JSON shapes without introducing a second ad hoc projection path.
     let client_application_id = Uuid::new_v4();
     let client_user_id = Uuid::new_v4();
@@ -3046,7 +3092,7 @@ async fn verify_client_key_and_listener_journeys(
         )
         .expect("Client email digest protector should compose"),
     );
-    let email_digester = RuntimeClientEmailLookupDigester::new(
+    let email_digester = RuntimeServerEmailLookupDigester::new(
         email_protector,
         BTreeSet::from([email_config.active_version]),
     )
@@ -3123,6 +3169,7 @@ async fn verify_client_key_and_listener_journeys(
     .execute(&mut graph)
     .await
     .expect("Client directory projection should insert");
+
     graph
         .close()
         .await
@@ -3130,21 +3177,120 @@ async fn verify_client_key_and_listener_journeys(
 
     let providers = crate::composition::bundled_software_providers(config)
         .expect("validated bundled provider configuration");
-    let capabilities = build_http_capabilities(
-        config,
-        Some(pools),
-        Uuid::from_u128(1),
-        SECOND_INCARNATION,
-        &providers,
-    );
+    let capabilities = build_http_capabilities(config, Some(pools), SECOND_INCARNATION, &providers);
     let mut routers = build_routers_with_capabilities(config, capabilities);
     routers.mark_ready();
     let runtime = routers.runtime.take().expect("Runtime router");
-    let client_router = routers.client.take().expect("Client router");
+    let server_router = routers.server.take().expect("Server API router");
     let control = routers.control.take().expect("Control router");
     let client_path = format!("/v1/projects/{}/users", project.public_id);
     let client_authorization = format!("Bearer {credential}");
-    let successful = client_router
+    let control_authorization = format!("Bearer owl_ctrl_v1_{}", "A".repeat(43));
+    let control_user_path = format!("/v1/projects/{}/users", project.id);
+
+    let control_filtered = control
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "{control_user_path}?status=active&search=cLiEnT&identity_kind=provider&provider_key=client-directory&sort=created_oldest&limit=25"
+            ))
+            .header(header::AUTHORIZATION, &control_authorization)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .expect("filtered Control user directory should complete");
+    assert_eq!(control_filtered.status(), StatusCode::OK);
+    let control_filtered: serde_json::Value = serde_json::from_slice(
+        &to_bytes(control_filtered.into_body(), 8192)
+            .await
+            .expect("bounded filtered Control directory"),
+    )
+    .expect("filtered Control directory should be JSON");
+    assert_eq!(control_filtered["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        control_filtered["items"][0]["id"],
+        client_user_id.to_string()
+    );
+    assert_eq!(control_filtered["items"][0]["public_id"], "usr_client01");
+
+    let control_email_filtered = control
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "{control_user_path}?identity_kind=email&search=USR_CLIENT&limit=25"
+            ))
+            .header(header::AUTHORIZATION, &control_authorization)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .expect("email-filtered Control user directory should complete");
+    assert_eq!(control_email_filtered.status(), StatusCode::OK);
+    let control_email_filtered: serde_json::Value = serde_json::from_slice(
+        &to_bytes(control_email_filtered.into_body(), 8192)
+            .await
+            .expect("bounded email-filtered Control directory"),
+    )
+    .expect("email-filtered Control directory should be JSON");
+    assert_eq!(
+        control_email_filtered["items"][0]["id"],
+        client_user_id.to_string()
+    );
+
+    let control_unknown_provider = control
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "{control_user_path}?identity_kind=provider&provider_key=missing-provider"
+            ))
+            .header(header::AUTHORIZATION, &control_authorization)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .expect("unknown-provider Control user directory should complete");
+    assert_eq!(control_unknown_provider.status(), StatusCode::OK);
+    let control_unknown_provider: serde_json::Value = serde_json::from_slice(
+        &to_bytes(control_unknown_provider.into_body(), 8192)
+            .await
+            .expect("bounded unknown-provider Control directory"),
+    )
+    .expect("unknown-provider Control directory should be JSON");
+    assert_eq!(control_unknown_provider["items"], serde_json::json!([]));
+
+    for (email, expected_user) in [
+        ("known@EXAMPLE.TEST", Some(client_user_id)),
+        ("missing@example.test", None),
+    ] {
+        let response = control
+            .clone()
+            .oneshot(
+                Request::post(format!("{control_user_path}/lookup"))
+                    .header(header::AUTHORIZATION, &control_authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::json!({"email": email}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("exact Control email lookup should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 8192)
+                .await
+                .expect("bounded exact Control email lookup"),
+        )
+        .expect("exact Control email lookup should be JSON");
+        match expected_user {
+            Some(user_id) => {
+                assert_eq!(response["user"]["id"], user_id.to_string());
+                assert!(response["user"].get("email").is_none());
+            }
+            None => assert_eq!(response, serde_json::json!({"user": null})),
+        }
+    }
+
+    let successful = server_router
         .clone()
         .oneshot(
             Request::get(&client_path)
@@ -3153,7 +3299,7 @@ async fn verify_client_key_and_listener_journeys(
                 .unwrap(),
         )
         .await
-        .expect("real Client request should complete");
+        .expect("real Server API request should complete");
     assert_eq!(successful.status(), StatusCode::OK);
     let successful_json: serde_json::Value = serde_json::from_slice(
         &to_bytes(successful.into_body(), 4096)
@@ -3176,7 +3322,7 @@ async fn verify_client_key_and_listener_journeys(
     for _ in 0..120 {
         let row: (bool, bool) = sqlx::query_as(
             "SELECT last_used_at IS NOT NULL,COALESCE(last_used_at >= created_at,FALSE)
-               FROM project_client_keys WHERE id=$1",
+               FROM project_server_keys WHERE id=$1",
         )
         .bind(primary_key.id)
         .fetch_one(&mut telemetry)
@@ -3194,7 +3340,7 @@ async fn verify_client_key_and_listener_journeys(
         .await
         .expect("Client telemetry observer should close");
 
-    let exact_user = client_router
+    let exact_user = server_router
         .clone()
         .oneshot(
             Request::get(format!("{client_path}/usr_client01"))
@@ -3213,7 +3359,7 @@ async fn verify_client_key_and_listener_journeys(
     .expect("exact Client user should be JSON");
     assert_eq!(exact_user["user_revision"], 7);
 
-    let email_miss = client_router
+    let email_miss = server_router
         .clone()
         .oneshot(
             Request::post(format!("/v1/projects/{}/users/lookup", project.public_id))
@@ -3233,7 +3379,7 @@ async fn verify_client_key_and_listener_journeys(
     .expect("Client email miss should be JSON");
     assert_eq!(email_miss, serde_json::json!({"user": null}));
 
-    let email_hit = client_router
+    let email_hit = server_router
         .clone()
         .oneshot(
             Request::post(format!("/v1/projects/{}/users/lookup", project.public_id))
@@ -3255,7 +3401,63 @@ async fn verify_client_key_and_listener_journeys(
     assert_eq!(email_hit["user"]["user_revision"], 7);
     assert_eq!(email_hit["user"]["verified_email"], serde_json::Value::Null);
 
-    let projection = client_router
+    // The same lookup must remain email-free when the matched identity becomes primary. Its
+    // deliberately non-decryptable fixture ciphertext proves this read path never asks durable
+    // email custody for an address; ordinary user reads retain their separate email capability.
+    let mut primary_email_fixture = PgConnection::connect(admin_url)
+        .await
+        .expect("primary-email Server lookup fixture should connect");
+    sqlx::query(
+        "UPDATE project_users
+            SET primary_source_kind='email',primary_profile_identity_id=NULL,
+                primary_email_identity_id=$2
+          WHERE id=$1",
+    )
+    .bind(client_user_id)
+    .bind(client_email_identity_id)
+    .execute(&mut primary_email_fixture)
+    .await
+    .expect("Client email identity should become primary");
+    let primary_email_hit = server_router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/projects/{}/users/lookup", project.public_id))
+                .header(header::AUTHORIZATION, &client_authorization)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"email":"known@example.test"}"#))
+                .unwrap(),
+        )
+        .await
+        .expect("primary-email Server lookup should complete");
+    assert_eq!(primary_email_hit.status(), StatusCode::OK);
+    let primary_email_hit: serde_json::Value = serde_json::from_slice(
+        &to_bytes(primary_email_hit.into_body(), 4096)
+            .await
+            .expect("bounded primary-email Server lookup"),
+    )
+    .expect("primary-email Server lookup should be JSON");
+    assert_eq!(primary_email_hit["user"]["user_id"], "usr_client01");
+    assert_eq!(
+        primary_email_hit["user"]["verified_email"],
+        serde_json::Value::Null
+    );
+    sqlx::query(
+        "UPDATE project_users
+            SET primary_source_kind='provider',primary_profile_identity_id=$2,
+                primary_email_identity_id=NULL
+          WHERE id=$1",
+    )
+    .bind(client_user_id)
+    .bind(client_identity_id)
+    .execute(&mut primary_email_fixture)
+    .await
+    .expect("Client provider identity should be restored as primary");
+    primary_email_fixture
+        .close()
+        .await
+        .expect("primary-email Server lookup fixture should close");
+
+    let projection = server_router
         .clone()
         .oneshot(
             Request::get(format!(
@@ -3365,7 +3567,93 @@ async fn verify_client_key_and_listener_journeys(
         .await
         .expect("Client pagination fixture should close");
 
-    let first_page = client_router
+    let mut control_page_order = page_user_ids
+        .iter()
+        .copied()
+        .zip(page_user_public_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    control_page_order.sort_by_key(|(id, _)| *id);
+    for (sort, expected) in [
+        (
+            "created_oldest",
+            control_page_order
+                .iter()
+                .map(|(_, public_id)| public_id.clone())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "created_newest",
+            control_page_order
+                .iter()
+                .rev()
+                .map(|(_, public_id)| public_id.clone())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let first = control
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "{control_user_path}?search=usr_page_&sort={sort}&limit=2"
+                ))
+                .header(header::AUTHORIZATION, &control_authorization)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .expect("first sorted Control directory page should complete");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: serde_json::Value = serde_json::from_slice(
+            &to_bytes(first.into_body(), 8192)
+                .await
+                .expect("bounded first sorted Control directory page"),
+        )
+        .expect("first sorted Control directory page should be JSON");
+        let first_ids = first["items"]
+            .as_array()
+            .expect("first sorted Control items")
+            .iter()
+            .map(|user| user["public_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, expected[..2]);
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("full sorted Control page should provide a cursor");
+
+        let second = control
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "{control_user_path}?search=usr_page_&sort={sort}&cursor={cursor}&limit=2"
+                ))
+                .header(header::AUTHORIZATION, &control_authorization)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .expect("second sorted Control directory page should complete");
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: serde_json::Value = serde_json::from_slice(
+            &to_bytes(second.into_body(), 8192)
+                .await
+                .expect("bounded second sorted Control directory page"),
+        )
+        .expect("second sorted Control directory page should be JSON");
+        let second_ids = second["items"]
+            .as_array()
+            .expect("second sorted Control items")
+            .iter()
+            .map(|user| user["public_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(second_ids, expected[2..4]);
+        assert!(
+            first_ids
+                .iter()
+                .all(|public_id| !second_ids.contains(public_id))
+        );
+    }
+
+    let first_page = server_router
         .clone()
         .oneshot(
             Request::get(format!("{client_path}?limit=100"))
@@ -3385,7 +3673,7 @@ async fn verify_client_key_and_listener_journeys(
     let cursor = first_page["next_cursor"]
         .as_str()
         .expect("full Client page must provide a cursor");
-    let second_page = client_router
+    let second_page = server_router
         .clone()
         .oneshot(
             Request::get(format!("{client_path}?limit=100&cursor={cursor}"))
@@ -3421,7 +3709,7 @@ async fn verify_client_key_and_listener_journeys(
         "Client user keyset traversal must not overlap"
     );
 
-    let inactive = client_router
+    let inactive = server_router
         .clone()
         .oneshot(
             Request::post(format!(
@@ -3448,7 +3736,7 @@ async fn verify_client_key_and_listener_journeys(
         format!("Bearer owl_ctrl_v1_{}", "A".repeat(43)),
         format!("Bearer owl_pk_v1_{}", "A".repeat(43)),
     ] {
-        let response = client_router
+        let response = server_router
             .clone()
             .oneshot(
                 Request::get(&client_path)
@@ -3460,7 +3748,7 @@ async fn verify_client_key_and_listener_journeys(
             .expect("foreign credential on Client should complete");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
-    let wrong_project = client_router
+    let wrong_project = server_router
         .clone()
         .oneshot(
             Request::get("/v1/projects/not-the-owner/users")
@@ -3469,10 +3757,10 @@ async fn verify_client_key_and_listener_journeys(
                 .unwrap(),
         )
         .await
-        .expect("wrong-Project Client request should complete");
+        .expect("wrong-Project Server API request should complete");
     assert_eq!(wrong_project.status(), StatusCode::UNAUTHORIZED);
 
-    let control_with_client_key = control
+    let control_with_server_key = control
         .clone()
         .oneshot(
             Request::get("/v1/projects")
@@ -3481,8 +3769,8 @@ async fn verify_client_key_and_listener_journeys(
                 .unwrap(),
         )
         .await
-        .expect("Client key on Control should complete");
-    assert_eq!(control_with_client_key.status(), StatusCode::UNAUTHORIZED);
+        .expect("Server key on Control should complete");
+    assert_eq!(control_with_server_key.status(), StatusCode::UNAUTHORIZED);
     let control_with_operator = control
         .oneshot(
             Request::get("/v1/projects")
@@ -3518,7 +3806,7 @@ async fn verify_client_key_and_listener_journeys(
 
     // Race one final authenticated read against revocation. Either side may serialize first, but
     // revocation must be terminal and every later request must fail without lifecycle resurrection.
-    let client_for_race = client_router.clone();
+    let client_for_race = server_router.clone();
     let path_for_race = client_path.clone();
     let authorization_for_race = client_authorization.clone();
     let lifecycle_for_revoke = lifecycle.clone();
@@ -3530,11 +3818,11 @@ async fn verify_client_key_and_listener_journeys(
                 .body(Body::empty())
                 .unwrap(),
         ),
-        lifecycle_for_revoke.revoke_project_client_key(RevokeProjectClientKey {
+        lifecycle_for_revoke.revoke_project_server_key(RevokeProjectServerKey {
             project_id: project.id,
             key_id: primary_for_revoke.id,
             expected_revision: primary_for_revoke.revision,
-            idempotency_key: "client-key-revoke-12345678".to_owned(),
+            idempotency_key: "server-key-revoke-12345678".to_owned(),
             correlation_id: Uuid::new_v4(),
         })
     );
@@ -3544,9 +3832,9 @@ async fn verify_client_key_and_listener_journeys(
             .status(),
         StatusCode::OK | StatusCode::UNAUTHORIZED
     ));
-    let revoked = revoked.expect("Client key revocation should commit");
+    let revoked = revoked.expect("Server key revocation should commit");
     assert_eq!(revoked.revision, primary_key.revision + 1);
-    let denied_after_revoke = client_router
+    let denied_after_revoke = server_router
         .oneshot(
             Request::get(&client_path)
                 .header(header::AUTHORIZATION, client_authorization)
@@ -3554,11 +3842,11 @@ async fn verify_client_key_and_listener_journeys(
                 .unwrap(),
         )
         .await
-        .expect("revoked Client request should complete");
+        .expect("revoked Server API request should complete");
     assert_eq!(denied_after_revoke.status(), StatusCode::UNAUTHORIZED);
     tokio::time::sleep(Duration::from_millis(150)).await;
     let terminal: (String, i64) = sqlx::query_as(
-        "SELECT status,revision FROM project_client_keys WHERE project_id=$1 AND id=$2",
+        "SELECT status,revision FROM project_server_keys WHERE project_id=$1 AND id=$2",
     )
     .bind(project.id)
     .bind(primary_key.id)
@@ -3568,7 +3856,7 @@ async fn verify_client_key_and_listener_journeys(
             .expect("terminal query connection"),
     )
     .await
-    .expect("revoked Client key should remain queryable");
+    .expect("revoked Server key should remain queryable");
     assert_eq!(terminal, ("revoked".to_owned(), primary_key.revision + 1));
 
     // Inventory includes terminal history and uses immutable (created_at, id) keyset pagination.
@@ -3579,7 +3867,7 @@ async fn verify_client_key_and_listener_journeys(
         let id = Uuid::from_u128(0xc11e_1000 + index);
         let public_key_id = URL_SAFE_NO_PAD.encode(id.as_bytes());
         sqlx::query(
-            "INSERT INTO project_client_keys(
+            "INSERT INTO project_server_keys(
                  id,project_id,public_key_id,label,status,digest_key_version,
                  credential_digest,display_prefix,revision,created_at,revoked_at)
              VALUES($1,$2,$3,$4,'revoked',1,$5,$6,2,
@@ -3593,7 +3881,7 @@ async fn verify_client_key_and_listener_journeys(
             u8::try_from(index % 255).expect("bounded fixture byte");
             32
         ])
-        .bind(format!("owl_client_v1.{public_key_id}"))
+        .bind(format!("owl_server_v1.{public_key_id}"))
         .execute(&mut inventory_connection)
         .await
         .expect("terminal Client inventory row should insert");
@@ -3603,7 +3891,7 @@ async fn verify_client_key_and_listener_journeys(
         .await
         .expect("Client inventory fixture should close");
     let (first_page, cursor, active_unacknowledged_key) = lifecycle
-        .list_project_client_keys(project.id, None, Some(100))
+        .list_project_server_keys(project.id, None, Some(100))
         .await
         .expect("first Client inventory page");
     assert_eq!(first_page.len(), 100);
@@ -3614,9 +3902,9 @@ async fn verify_client_key_and_listener_journeys(
         Some((post_replacement_key.id, None)),
         "the bounded delivery gate must expose the unacknowledged key outside this history page"
     );
-    let cursor = cursor.expect("more than 100 Client keys require a cursor");
+    let cursor = cursor.expect("more than 100 Server keys require a cursor");
     let (second_page, final_cursor, active_unacknowledged_key) = lifecycle
-        .list_project_client_keys(project.id, Some(&cursor), Some(100))
+        .list_project_server_keys(project.id, Some(&cursor), Some(100))
         .await
         .expect("second Client inventory page");
     assert!(second_page.len() >= 3);
@@ -3628,6 +3916,21 @@ async fn verify_client_key_and_listener_journeys(
     assert!(final_cursor.is_none());
     let first_ids = first_page.iter().map(|key| key.id).collect::<BTreeSet<_>>();
     assert!(second_page.iter().all(|key| !first_ids.contains(&key.id)));
+
+    // This ordered container continues with Runtime operations created for the primary Auth
+    // incarnation. Restore that shared process identity after proving Server API replacement;
+    // the predecessor Server readiness lease remains stale and cannot authorize new work.
+    client
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Postgres,
+            "UPDATE auth_process_incarnations SET process_incarnation=$1 WHERE process_id=$2",
+            vec![
+                Uuid::from_u128(1).into(),
+                config.auth_process_id.clone().into(),
+            ],
+        ))
+        .await
+        .expect("restore the primary Auth incarnation for the remaining ordered journeys");
 }
 
 #[allow(
@@ -3771,7 +4074,7 @@ async fn postgres_capability_journeys_are_real() {
     runtime
         .execute_raw(sea_orm::Statement::from_string(
             sea_orm::DbBackend::Postgres,
-            "INSERT INTO runtime_process_incarnations (process_id,process_incarnation,started_at)
+            "INSERT INTO auth_process_incarnations (process_id,process_incarnation,started_at)
              VALUES ('runtime-test-process','00000000-0000-0000-0000-000000000001',transaction_timestamp()),
                     ('runtime-secondary-process','00000000-0000-0000-0000-000000000002',transaction_timestamp()),
                     ('runtime-unexpected-process','00000000-0000-0000-0000-000000000003',transaction_timestamp())"
@@ -5361,7 +5664,7 @@ async fn postgres_capability_journeys_are_real() {
         .get_project(created_project.id)
         .await
         .expect("Project should refresh after provider creation");
-    verify_client_key_and_listener_journeys(
+    verify_server_key_and_listener_journeys(
         &created_project,
         client_provider.id,
         &config,

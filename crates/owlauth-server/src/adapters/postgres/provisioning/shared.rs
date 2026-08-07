@@ -542,7 +542,7 @@ pub(in crate::adapters::postgres) async fn ensure_publishable_signing_key_capaci
         .all(transaction)
         .await
         .map_err(persistence)?;
-    ensure_capacity(keys.len(), LIST_LIMIT, ApplicationError::InvalidTransition)
+    ensure_capacity(keys.len(), LIST_LIMIT, ApplicationError::CapacityExceeded)
 }
 
 pub(in crate::adapters::postgres) async fn abandon_signing_key_operation(

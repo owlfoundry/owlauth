@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 
-import { DataTable, DescriptionList, EmptyState, Section } from "../../shared/layout/Layout";
+import { Timestamp } from "../../shared/compositions/Timestamp";
+import {
+  DataTable,
+  DescriptionList,
+  EmptyState,
+  LoadingState,
+  Section,
+} from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Checkbox, Field, Input } from "../../shared/primitives/Field";
@@ -246,6 +253,17 @@ export function ApplicationDelivery({
     endpoint: WebhookEndpoint,
     action: "test" | "activate" | "disable",
   ) {
+    if (
+      action === "disable" &&
+      !(await confirm({
+        title: "Disable webhook endpoint",
+        message: `Disable delivery to ${endpoint.url}? New events will no longer be sent to this endpoint.`,
+        actionLabel: "Disable endpoint",
+        destructive: true,
+      }))
+    ) {
+      return;
+    }
     setSubmitting(true);
     try {
       const params = { path: { ...path, endpoint_id: endpoint.id } };
@@ -424,9 +442,9 @@ export function ApplicationDelivery({
       >
         {!hasLoaded ? (
           loadState === "loading" ? (
-            <p role="status">Loading webhook endpoints</p>
+            <LoadingState>Loading webhook endpoints</LoadingState>
           ) : (
-            <p>Webhook endpoints are unavailable.</p>
+            <InlineAlert tone="warning">Webhook endpoints are unavailable.</InlineAlert>
           )
         ) : endpoints.length === 0 ? (
           <EmptyState
@@ -516,12 +534,23 @@ export function ApplicationDelivery({
                     {
                       term: "Overlap secret",
                       detail:
-                        endpoint.overlap_secret_generation === null
-                          ? "None"
-                          : `Generation ${String(endpoint.overlap_secret_generation)} until ${endpoint.overlap_expires_at ?? "unknown"}`,
+                        endpoint.overlap_secret_generation === null ? (
+                          "None"
+                        ) : (
+                          <>
+                            Generation {String(endpoint.overlap_secret_generation)} until{" "}
+                            <Timestamp value={endpoint.overlap_expires_at} empty="unknown" />
+                          </>
+                        ),
                     },
-                    { term: "Last destination test", detail: endpoint.last_tested_at ?? "Never" },
-                    { term: "Last delivery success", detail: endpoint.last_success_at ?? "Never" },
+                    {
+                      term: "Last destination test",
+                      detail: <Timestamp value={endpoint.last_tested_at} />,
+                    },
+                    {
+                      term: "Last delivery success",
+                      detail: <Timestamp value={endpoint.last_success_at} />,
+                    },
                     {
                       term: "Consecutive failures",
                       detail: String(endpoint.consecutive_failure_count),
@@ -536,13 +565,13 @@ export function ApplicationDelivery({
 
       <Section
         title="Immutable user events"
-        description="Signed durable-outbox source events and their safe bodies."
+        description="Signed durable-outbox source events with bounded lineage metadata."
       >
         {!hasLoaded ? (
           loadState === "loading" ? (
-            <p role="status">Loading Application user events</p>
+            <LoadingState>Loading application user events</LoadingState>
           ) : (
-            <p>Application user events are unavailable.</p>
+            <InlineAlert tone="warning">Application user events are unavailable.</InlineAlert>
           )
         ) : events.length === 0 ? (
           <EmptyState
@@ -551,10 +580,7 @@ export function ApplicationDelivery({
             description="Events appear after a user projection is created or changed."
           />
         ) : (
-          <DataTable
-            caption="Immutable Application user events"
-            headings={["Event", "User", "Body"]}
-          >
+          <DataTable caption="Immutable Application user events" headings={["Event", "User"]}>
             {events.map((item) => (
               <tr key={item.event_id}>
                 <td>
@@ -563,12 +589,6 @@ export function ApplicationDelivery({
                 </td>
                 <td>
                   <code>{item.user_id}</code>
-                </td>
-                <td>
-                  <details>
-                    <summary>Review safe body</summary>
-                    <pre>{JSON.stringify(item.safe_body, null, 2)}</pre>
-                  </details>
                 </td>
               </tr>
             ))}
@@ -592,9 +612,9 @@ export function ApplicationDelivery({
       >
         {!hasLoaded ? (
           loadState === "loading" ? (
-            <p role="status">Loading webhook deliveries</p>
+            <LoadingState>Loading webhook deliveries</LoadingState>
           ) : (
-            <p>Webhook deliveries are unavailable.</p>
+            <InlineAlert tone="warning">Webhook deliveries are unavailable.</InlineAlert>
           )
         ) : deliveries.length === 0 ? (
           <EmptyState

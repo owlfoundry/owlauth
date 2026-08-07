@@ -5,7 +5,7 @@
 .form {
   display: grid;
   gap: 1rem;
-  max-width: 48rem;
+  max-width: 36rem;
 }
 
 .formActions {
@@ -21,108 +21,96 @@
   gap: 1rem;
 }
 
-.grid {
+.projectIdentity {
+  min-width: 0;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.projectIdentityLabel {
+  color: var(--owl-text-subtle);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+.projectIdentity code {
+  overflow-wrap: anywhere;
+  font-size: 0.8125rem;
+}
+
+.dashboardGrid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
   gap: 1rem;
-}
-
-.summaryCard {
-  padding: 1rem;
-  background: var(--owl-surface);
-  border: 1px solid var(--owl-border);
-  border-radius: var(--owl-radius-surface);
-}
-
-.summaryCard h2,
-.summaryCard h3,
-.summaryCard p {
-  margin: 0;
-}
-
-.summaryCard p {
-  margin-top: 0.5rem;
-  color: var(--owl-text-muted);
-}
-
-.projectIdSection {
-  max-width: 42rem;
-}
-
-.setupList {
-  display: grid;
-  gap: 0.75rem;
   margin: 0;
   padding: 0;
   list-style: none;
-  counter-reset: setup-step;
 }
 
-.setupStep {
-  counter-increment: setup-step;
+.dashboardGrid > li {
+  min-width: 0;
+}
+
+.dashboardCard {
+  height: 100%;
   min-width: 0;
   display: grid;
-  grid-template-columns: 2.25rem minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 1rem;
-  padding: 1rem 1.1rem;
+  gap: 0.65rem;
+  padding: 1.1rem;
+  color: var(--owl-text);
   background: var(--owl-surface);
   border: 1px solid var(--owl-border);
   border-radius: var(--owl-radius-surface);
+  text-decoration: none;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease;
 }
 
-.setupStep::before {
-  width: 2.25rem;
-  height: 2.25rem;
-  display: grid;
-  place-items: center;
-  align-self: start;
-  color: var(--owl-accent);
-  background: var(--owl-accent-soft);
-  border-radius: 999px;
-  content: counter(setup-step);
-  font-size: 0.875rem;
-  font-weight: 700;
-}
-
-.setupStep[data-ready="false"] {
+.dashboardCard:hover {
+  background: var(--owl-surface-hover);
   border-color: var(--owl-border-strong);
   box-shadow: var(--owl-shadow-subtle);
 }
 
-.setupStepContent {
-  min-width: 0;
-  display: grid;
-  gap: 0.35rem;
+.dashboardCard:focus-visible {
+  outline: 3px solid var(--owl-focus);
+  outline-offset: 2px;
 }
 
-.setupStepHeading {
+.dashboardCardHeader {
   min-width: 0;
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 0.5rem;
+  justify-content: space-between;
+  gap: 0.75rem;
 }
 
-.setupStep h3,
-.setupStep p {
+.dashboardCardHeader h3 {
   margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.9375rem;
 }
 
-.setupStep h3 {
-  color: var(--owl-text);
-  font-size: 1rem;
-  line-height: 1.4rem;
+.dashboardCardHeader svg {
+  flex: none;
+  color: var(--owl-text-subtle);
 }
 
-.setupStep p {
+.dashboardValue {
+  font-size: 2rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.dashboardDetail {
+  min-width: 0;
+  overflow-wrap: anywhere;
   color: var(--owl-text-muted);
-  font-size: 0.875rem;
-}
-
-.setupStepAction {
-  justify-self: end;
-  white-space: nowrap;
+  font-size: 0.8125rem;
 }
 
 .projectDirectory {
@@ -215,15 +203,6 @@
   user-select: all;
 }
 
-.toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 1rem;
-}
-
 .detailSurface {
   padding: 1.25rem;
   background: var(--owl-surface);
@@ -242,56 +221,6 @@
 .dangerZone h2,
 .dangerZone p {
   margin-top: 0;
-}
-
-.split {
-  display: grid;
-  grid-template-columns: minmax(16rem, 20rem) minmax(0, 1fr);
-  gap: 1.5rem;
-}
-
-.selectionList {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  background: var(--owl-surface);
-  border: 1px solid var(--owl-border);
-  border-radius: var(--owl-radius-surface);
-}
-
-.selectionList a,
-.selectionList button {
-  width: 100%;
-  min-height: 2.75rem;
-  display: block;
-  padding: 0.65rem 0.75rem;
-  color: var(--owl-text);
-  background: transparent;
-  border: 0;
-  border-bottom: 1px solid var(--owl-border);
-  text-align: left;
-  text-decoration: none;
-}
-
-.selectionList li:last-child a,
-.selectionList li:last-child button {
-  border-bottom: 0;
-}
-
-.selectionList a:hover,
-.selectionList button:hover {
-  background: var(--owl-surface-hover);
-}
-
-.selectionList [aria-current="page"],
-.selectionList [aria-pressed="true"] {
-  background: var(--owl-accent-soft);
-}
-
-.inlineFields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1rem;
 }
 
 .actions {
@@ -342,23 +271,7 @@
   font-size: 0.8125rem;
 }
 
-@media (width <= 54rem) {
-  .split,
-  .inlineFields {
-    grid-template-columns: 1fr;
-  }
-}
-
 @media (width <= 48rem) {
-  .setupStep {
-    grid-template-columns: 2.25rem minmax(0, 1fr);
-  }
-
-  .setupStepAction {
-    grid-column: 2;
-    justify-self: start;
-  }
-
   .projectDirectoryItem {
     grid-template-columns: 1fr;
   }

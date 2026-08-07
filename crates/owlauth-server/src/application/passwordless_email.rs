@@ -30,6 +30,12 @@ pub(crate) struct AdmittedEmailMethod {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EmailMethodSelection {
+    pub status: crate::domain::LoginTransactionStatus,
+    pub transaction_revision: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SelectEmailMethod {
     pub project_id: Uuid,
     pub transaction_id: Uuid,
@@ -174,8 +180,10 @@ pub(crate) trait PasswordlessEmailRepository: Send + Sync {
         &self,
     ) -> Result<EmailIdentityAliasAuthority, ApplicationError>;
 
-    async fn select_email_method(&self, command: SelectEmailMethod)
-    -> Result<(), ApplicationError>;
+    async fn select_email_method(
+        &self,
+        command: SelectEmailMethod,
+    ) -> Result<EmailMethodSelection, ApplicationError>;
 
     async fn prepare_email_generation(
         &self,

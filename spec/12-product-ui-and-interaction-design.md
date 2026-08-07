@@ -15,7 +15,7 @@ The target is a focused self-hosted SaaS-quality product rather than an unstyled
 - [Auth0 Universal Login](https://auth0.com/docs/authenticate/login/auth0-universal-login) provides the reference for a centralized, bounded, accessible authentication flow with inline validation and one clear next action;
 - [Supabase's UI approach](https://supabase.com/blog/supabase-ui-library) provides the reference for a compact developer-facing product identity, responsive primitives, and a green-accented visual direction.
 
-These references are non-normative inspiration and are not build-time or runtime dependencies. OwlAuth remains its own product. It has Projects rather than Auth0 tenants or Supabase organizations, one deployment operator key rather than administrative identities, no billing or organization hierarchy, and only the capabilities admitted by its Runtime, Client, and Control contracts.
+These references are non-normative inspiration and are not build-time or runtime dependencies. OwlAuth remains its own product. It has Projects rather than Auth0 tenants or Supabase organizations, one deployment operator key rather than administrative identities, no billing or organization hierarchy, and only the capabilities admitted by its Runtime, Server API, and Control contracts.
 
 ## Product design principles
 
@@ -112,7 +112,7 @@ Sentence case is used for headings, buttons, tabs, and navigation. Uppercase is 
 
 Icons are small, locally authored and bundled SVG components with a consistent `1.5px` or `2px` stroke. Decorative icons are `aria-hidden`; interactive icon-only controls require an accessible name and visible tooltip on hover and keyboard focus. Provider visuals are selected only from the closed server-derived provider kind and bundled locally as required by spec 09. OwlAuth MUST NOT fetch remote logos, avatars, fonts, favicons, or provider art.
 
-V1 uses a compact OwlAuth text wordmark with a simple local mark if one is present in the repository. It MUST NOT delay the information architecture redesign on a custom illustration or logo project.
+V1 uses the compact OwlAuth text wordmark and the repository-owned owl SVG mark. Runtime and Console shell documents use that same local mark as their favicon; they do not introduce plane-specific or remotely fetched favicon assets. Brand work MUST NOT delay the information architecture redesign on a custom illustration or logo project.
 
 ## Management Console
 
@@ -132,7 +132,7 @@ After verification, the Console becomes a full-width SaaS workspace. It MUST NOT
 
 ```mermaid
 flowchart TB
-    Top[Top bar: menu, breadcrumb, Project context, Lock console]
+    Top[Top bar: menu, breadcrumb, Project context, Exit console]
     Side[Navigation: OwlAuth, Projects, Project sections]
     Main[Page header and bounded content]
     Side --- Main
@@ -142,15 +142,15 @@ flowchart TB
 
 At desktop widths:
 
-- a `15.5rem` persistent sidebar owns the OwlAuth wordmark, Project switcher, resource navigation, and a bottom placement for **Lock console**;
+- a `15.5rem` persistent sidebar owns the OwlAuth wordmark, compact current Project context, one explicit **Back to projects** action, resource navigation, and a bottom placement for **Exit console**; the context displays the Project name and offers an accessible compact **Copy ID** action for the exact internal Control Project UUID without replacing the visible name; V1 has no in-page Project switcher;
 - a `3.75rem` top bar owns the breadcrumb, narrow-page navigation control when applicable, and exact current context;
-- content uses fluid width with a `92rem` maximum, `2rem` desktop padding, and no single global card;
+- content uses fluid width with a `104rem` maximum, `2rem` desktop padding, and no single global card;
 - page headers contain title, one-line purpose text when needed, resource status, and at most one visually primary action;
 - successful and low-risk informational outcomes appear in a route-scoped top-right toast stack; errors, conflicts, and uncertain mutations remain persistent beside the affected form or section and move focus only when required by the initiating workflow.
 
 Content width follows the task rather than one universal narrow column:
 
-- inventories, operational tables, and overview grids may use the full bounded `92rem` workspace;
+- inventories, operational tables, and overview grids may use the full bounded `104rem` workspace;
 - ordinary read/edit forms and prose use a `44–48rem` measure so labels, help, and errors remain scannable;
 - list/detail work such as user selection and exact resource inspection may use an `18–22rem` selection pane plus the remaining detail width;
 - exact plans, multi-party identity operations, and other comparison-heavy ceremonies may use a wider dedicated section, but unrelated fields are not stretched to fill it; and
@@ -160,7 +160,7 @@ The shell MUST NOT imitate multi-user SaaS chrome that OwlAuth does not have. It
 
 ### Information architecture
 
-The Console is Project-first. The deployment-level Projects directory is the entry route. Selecting a Project reveals its resource navigation and persists only in the current URL and active page state, never browser storage.
+The Console is Project-first. The deployment-level Projects directory is the entry route. Selecting a Project reveals its resource navigation and persists only in the current URL and active page state, never browser storage. Switching Projects requires returning to that directory; V1 does not retain a cross-Project cache or provide an in-page selector. Stale responses from the previous route cannot replace the new Project context, and meaningful unsaved edits remain guarded.
 
 ```mermaid
 flowchart LR
@@ -178,7 +178,7 @@ flowchart LR
     UserDetail --> Sessions[Sessions and connections]
     UserDetail --> Identity[Identity operations]
     Security --> Keys[Signing keys]
-    Security --> ClientKeys[Client API keys]
+    Security --> ServerKeys[Project secret keys]
 ```
 
 The target client routes are relative to the configured `console/` base:
@@ -186,15 +186,15 @@ The target client routes are relative to the configured `console/` base:
 | Route                                                  | Page responsibility                                                                                                                         |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/`                                                    | Project directory, empty state, and create-Project action                                                                                   |
-| `/projects/{project_id}`                               | readiness-oriented Project overview and safe resource summaries                                                                             |
+| `/projects/{project_id}`                               | compact operational dashboard with safe Project resource summaries                                                                          |
 | `/projects/{project_id}/applications`                  | Application inventory and create action                                                                                                     |
 | `/projects/{project_id}/applications/{application_id}` | metadata, exact browser configuration, user projection, webhook endpoints, delivery state, and replay actions grouped into tabs or sections |
 | `/projects/{project_id}/authentication/providers`      | provider inventory, onboarding, configuration state, Application assignments, provisioning reconciliation, and disablement                  |
 | `/projects/{project_id}/authentication/email`          | email method policy, Application assignments, and SMTP generations                                                                          |
-| `/projects/{project_id}/users`                         | bounded Project-user inventory                                                                                                              |
+| `/projects/{project_id}/users`                         | authoritative Project-user search, status/identity/provider filters, creation-time sort, and cursor-bounded inventory                       |
 | `/projects/{project_id}/users/{user_id}`               | user provenance, identities, sessions, exact managed-connection synchronization/reauthorization/revoke/disconnect, and link/unlink/merge    |
 | `/projects/{project_id}/security/signing-keys`         | signing-key inventory, provisioning, activation, rotation state, and recovery                                                               |
-| `/projects/{project_id}/security/client-keys`          | Project client-key safe inventory, create-once reveal, overlap rotation guidance, and revisioned revocation                                 |
+| `/projects/{project_id}/security/server-keys`          | Project server-key safe inventory, create-once reveal, overlap rotation guidance, and revisioned revocation                                 |
 | `/projects/{project_id}/settings`                      | Project metadata, policy, projection defaults, egress policy when supported, and a separated danger zone                                    |
 
 These routes organize existing or contract-backed workflows; they do not require a second API. A route whose Control capability does not exist MUST remain absent rather than showing a disabled future-product placeholder. Direct navigation returns the Console shell only within the route partition allowed by spec 09 and TS-002.
@@ -205,12 +205,13 @@ The Project directory is a navigation collection with one primary action per ite
 
 Project creation opens a focused dialog or narrow side sheet instead of placing a permanent create form above the inventory. The surface contains only the display name, preserves idempotency, and moves to the created Project overview after success.
 
-The Project overview is an operational starting point, not an analytics dashboard. It MAY show:
+The Project overview is a compact operational dashboard, not an analytics or onboarding surface. It MAY show:
 
-- a readiness checklist backed by real capability and resource state;
 - Applications, active authentication methods, signing-key state, and email-delivery configuration summaries when returned by reviewed Control queries;
-- direct links to incomplete configuration steps; and
-- public identifiers or callback guidance safe for the operator to copy.
+- direct links from each resource summary to its authoritative management surface; and
+- public identifiers or callback guidance safe for the operator to copy inline with the Project context.
+
+It MUST NOT turn current resource counts into an implied readiness or deployment-certification judgment.
 
 It MUST NOT infer health from browser-visible heuristics or claim that a deployment is production-ready.
 
@@ -220,9 +221,13 @@ It MUST NOT infer health from browser-visible heuristics or claim that a deploym
 - Table headers remain visible when a bounded page region scrolls. Horizontal overflow, when unavoidable for exact identifiers, is contained to the table region rather than the document.
 - Default rows expose the primary identifier, safe status, and one or two high-frequency actions. Secondary actions use an overflow menu with full keyboard behavior.
 - Selecting a resource navigates to a stable detail route. Large editable detail forms do not expand inline inside inventory rows.
+- Every route has one page header and one non-repeated description. A section heading names a distinct subset of the page; it does not restate the page title or repeat the page description.
 - Detail pages use a summary header followed by tabs only when there are at least two durable conceptual sections. Tabs update the URL or a stable fragment, have correct tab semantics, and do not hide unsaved changes silently.
+- Inventory filters and refresh actions use a compact local toolbar adjacent to the collection. Filters do not occupy a distant page-header or section-header action slot.
 - Exact IDs, origins, callback URLs, timestamps, and revisions are selectable monospace text. A copy action MAY be supplied only for non-secret values and must announce success without replacing the visible value.
 - Empty states explain why the collection is empty and offer one permitted next action. They do not use decorative illustrations as a substitute for guidance.
+
+The Users route uses one coherent inventory measure and a full-width local toolbar rather than a small filter card beside a wider empty state or list. Search is explicit-submit: ordinary text is an authoritative case-insensitive prefix over safe display name/public ID, while a value containing `@` invokes the exact-email body lookup. Status, active identity kind, configured provider provenance, and newest/oldest creation order are server criteria; changing or clearing criteria resets pagination. The toolbar is four fields on wide screens, two columns at intermediate widths, and one column on narrow screens. Empty copy distinguishes a Project with no users from a valid query with no matches.
 
 ### Forms and editing
 
@@ -264,11 +269,11 @@ Toast-only error reporting is forbidden. Time-limited notifications MAY suppleme
 
 Write-only provider, SMTP, webhook, and other submitted secrets render only in the active native password control and short-lived request object permitted by spec 09. The UI does not provide reveal, copy, recovery, or retained masked-value affordances. A committed submitted secret is represented only by safe metadata such as configured/not configured, generation, or last safe outcome.
 
-The generated Project client key is the one explicit exception: its non-dismissible create dialog renders the original response credential exactly once with a copy action and an external-storage assertion. The Console commits the revision-fenced server acknowledgement before disposing the credential or closing; failure keeps both reveal and retry visible. Later inventory shows only label, public key ID/display prefix, status, revision, created/acknowledged/last-used/revoked time. Any active unacknowledged key blocks another create across reload and offers truthful retained-credential acknowledgement or revocation. No marker or credential is persisted in browser storage. The page offers overlap guidance—create, store, deploy, then revoke—without a fake rotate/reveal action. An ambiguous create outcome never claims the secret can be recovered.
+The generated Project server key is the one explicit exception: its non-dismissible create dialog renders the original response credential exactly once with a copy action and an external-storage assertion. The Console commits the revision-fenced server acknowledgement before disposing the credential or closing; failure keeps both reveal and retry visible. Later inventory shows only label, public key ID/display prefix, status, revision, created/acknowledged/last-used/revoked time. Any active unacknowledged key blocks another create across reload and offers truthful retained-credential acknowledgement or revocation. No marker or credential is persisted in browser storage. The page offers overlap guidance—create, store, deploy, then revoke—without a fake rotate/reveal action. An ambiguous create outcome never claims the secret can be recovered.
 
 High-impact actions use an OwlAuth-owned accessible confirmation dialog rather than `window.confirm`. The dialog displays the exact safe target name and consequence. Routine reversible actions require one clear confirmation; irreversible or broad actions MAY require typing a bounded display name when the owning behavior calls for stronger intent. Confirmation text never asks the operator to paste a secret or internal identifier.
 
-Destructive controls are not styled as the page's primary teal action. Project and Application disablement, Project client-key revocation, provider disconnect, session revocation, identity mutation, key retirement, and webhook replay retain their existing expected-revision, idempotency, exact-plan, and audit semantics. The Project settings page places irreversible or deployment-affecting actions in a visually separated **Danger zone** after ordinary settings.
+Destructive controls are not styled as the page's primary teal action. Project and Application disablement, Project server-key revocation, provider disconnect, session revocation, identity mutation, key retirement, and webhook replay retain their existing expected-revision, idempotency, exact-plan, and audit semantics. The Project settings page places irreversible or deployment-affecting actions in a visually separated **Danger zone** after ordinary settings.
 
 ## Hosted Authentication UI
 
@@ -291,7 +296,8 @@ The initial method picker presents a short instruction and one vertically stacke
 - Provider buttons are neutral surface buttons with the local kind-selected visual, operator-controlled display name rendered as text, and the label **Continue with {provider}**.
 - Email uses the same hierarchy as providers; its canonical first position is a deterministic presentation rule, not preselection or greater authority.
 - No method is preselected by color, query input, or focus. Hover and focus are distinct from selection.
-- Explicit current-session reuse is separated by an **or** divider and a clearly worded confirmation block. It never appears as an already-selected account or silent shortcut.
+- `presentation_hint` is neutral secondary text labeled as Application-provided guidance. It never uses OwlAuth security-alert styling and cannot alter method authority, ordering, selection, or navigation.
+- Explicit current-session reuse is separated by an **or** divider and uses the generic **Continue with current session** label. V1 shows no account, email, avatar, or user hint and never presents reuse as an already-selected account or silent shortcut.
 - When there are many admitted methods, the card remains a bounded document with ordinary page scrolling. V1 does not add client-side search, categorization, or provider reordering.
 
 ### Email steps
@@ -328,14 +334,14 @@ The initial redesign SHOULD implement a small OwlAuth-owned primitive set rather
 - `Field`, `FieldError`, `FormErrorSummary`, `Input`, `Select`, and `Textarea` wrappers over semantic native controls;
 - `StatusBadge`, `InlineAlert`, and notification region;
 - `Dialog`, `SideSheet`, and `Menu` only where their complete keyboard/focus behavior is implemented and tested;
-- `PageHeader`, `Breadcrumbs`, `Tabs`, `DataTable`, `EmptyState`, and `DescriptionList` for the Console;
+- `PageHeader`, `Breadcrumbs`, `Tabs`, `DataTable`, `LoadingState`, `EmptyState`, and `DescriptionList` for the Console;
 - `HostedCard`, `MethodButton`, and `TerminalState` for Runtime.
 
 Shared UI primitives contain presentation and accessibility behavior only. `src/shared` MAY also retain authority-free infrastructure such as configured-base parsing and same-origin URL confinement. Shared source MUST NOT import either generated contract, create a plane client, interpret server state into authority, retain credentials, perform plane-specific navigation, or cause shared emitted chunks. CSS Modules and semantic custom properties remain the styling mechanism; this spec does not select Tailwind, CSS-in-JS, a component package, a form library, or a global state library.
 
 ## Responsive and reflow behavior
 
-Canonical review widths are `1440px`, `1024px`, `768px`, and `320px` at 100% zoom, plus 200% browser zoom on an ordinary desktop viewport.
+Canonical visual review uses a `1920×1080` desktop viewport and a `390×844` phone viewport. Review also uses `320px` width for the minimum supported reflow boundary and 200% browser zoom on an ordinary desktop viewport when shared layout, navigation, table, dialog, or Hosted composition changes. Intermediate widths such as `1024px` and `768px` are sampled when the changed component crosses their breakpoints; they are not an unconditional all-route test matrix.
 
 - At `64rem` and above, the Console sidebar is persistent.
 - Below `64rem`, navigation becomes a modal side sheet opened from the top bar. It closes after route selection, on Escape, and when focus is restored to the trigger.
@@ -389,6 +395,28 @@ The redesign MUST NOT:
 - hide security-significant state behind hover-only tooltips, icon-only controls, or transient toasts;
 - silently select a Project, Application, user, provider, session, or identity target after a conflict;
 - make Runtime resemble the administrative Console or expose Control links and terminology.
+
+## Risk-based UI quality review
+
+UI quality is maintained through a small normative checklist and change-proportional review, not an exhaustive automated screenshot or state matrix. Review evidence MAY be code inspection, a focused component test, a real-browser journey, a desktop/phone screenshot pair, or an accessibility-tool result according to the risk being changed. Pull requests record the evidence actually inspected; they do not claim unreviewed routes or browsers.
+
+Every UI change is classified before review:
+
+- **Authority or critical-journey changes** include credentials, proof, identity ownership, email delivery, provider destinations, signing keys, sessions, destructive actions, revision conflicts, safe navigation, and cross-window completion. They require review of the server-side invariant where one exists, the visible recovery path, and one focused end-to-end or real-browser journey when browser behavior is material. A reviewer independent from the implementation should inspect the authority boundary and failure behavior.
+- **Shared interaction or layout changes** include primitives, navigation, focus, dialogs, tables, notifications, responsive rules, and global tokens. They require the affected route families to be sampled at `1920×1080` and `390×844`; `320px`, 200% zoom, keyboard operation, forced colors, or reduced motion are added only when the changed primitive can affect that boundary.
+- **Local presentation or copy changes** require the changed state and its nearest loading, empty, error, or long-value boundary to be reviewed. They do not require unrelated routes, browsers, or full end-to-end suites.
+
+The reviewer uses this checklist for the changed surface:
+
+1. **Authority:** the UI cannot authorize a transition that the server rejects by invariant, and stale or optimistic presentation cannot become authority.
+2. **Target:** high-impact actions name the exact safe target, explain the consequence, retain revision fencing, and distinguish pending from completed outcomes.
+3. **Recovery:** uncertain, failed, `401`, and `409` outcomes have one honest recovery path without blind mutation replay.
+4. **Secrets and untrusted values:** credentials and proof material never enter read views; event bodies are not rendered in general inventory views; remote error bodies are not reflected; operator-controlled text remains text and long values stay contained.
+5. **Semantics and focus:** navigation uses links, actions use buttons, current state uses the applicable ARIA semantics, step/route/dialog transitions place focus predictably, and async state is announced without relying on a toast.
+6. **Reflow:** the changed surface has no document-level horizontal overflow; bounded scroll regions are focusable and discoverable; primary actions remain reachable on desktop and phone.
+7. **Visual hierarchy:** primary, quiet, and danger variants remain distinguishable in computed presentation, not only by class name; notifications do not cover the current task's primary control.
+
+Regression tests are required at the narrowest deterministic layer for a repaired security invariant or a bug likely to recur silently. Real-browser tests are reserved for behavior whose correctness depends on browser boundaries such as credential disposal, history/cookie placement, popup or cross-window completion, focus, navigation, or actual reflow. A change MUST NOT introduce a mandatory all-route × all-state × all-viewport screenshot suite merely to satisfy this review strategy. Existing broad gates remain useful release evidence, but limited review capacity is spent first on changed authority and critical journeys.
 
 ## Rewrite and test migration strategy
 

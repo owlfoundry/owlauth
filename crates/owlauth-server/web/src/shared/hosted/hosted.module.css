@@ -21,25 +21,32 @@
 }
 
 .header {
+  min-width: 0;
   margin-bottom: 1.5rem;
   text-align: center;
 }
 
 .context {
+  min-width: 0;
   margin: 0 0 0.4rem;
+  overflow-wrap: anywhere;
   color: var(--owl-text-muted);
   font-size: 0.875rem;
 }
 
 .header h1 {
+  min-width: 0;
   margin: 0;
+  overflow-wrap: anywhere;
   font-size: 1.75rem;
   font-weight: 650;
   line-height: 2.25rem;
 }
 
 .description {
+  min-width: 0;
   margin: 0.65rem auto 0;
+  overflow-wrap: anywhere;
   color: var(--owl-text-muted);
 }
 
@@ -53,6 +60,10 @@
 }
 
 .attribution {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
   margin: 1.5rem 0 0;
   color: var(--owl-text-subtle);
   font-size: 0.75rem;
@@ -61,6 +72,7 @@
 
 .method {
   width: 100%;
+  min-width: 0;
   min-height: 2.75rem;
   display: grid;
   grid-template-columns: 1.5rem 1fr;
@@ -74,6 +86,11 @@
   cursor: pointer;
   font-weight: 600;
   text-align: left;
+}
+
+.method > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .method:hover:not(:disabled) {
@@ -128,14 +145,14 @@
 @media (width <= 32rem) {
   .canvas {
     min-height: 100dvh;
-    align-items: stretch;
+    align-items: start;
     padding: 0.75rem;
   }
 
   .card,
   .wide {
     width: 100%;
-    min-height: calc(100dvh - 1.5rem);
+    min-height: auto;
     border-radius: 0.65rem;
   }
 }

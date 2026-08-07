@@ -70,7 +70,11 @@ impl PostgresProvisioningAdapter {
             .all(&transaction)
             .await
             .map_err(persistence)?;
-        ensure_capacity(providers.len(), LIST_LIMIT, ApplicationError::InvalidInput)?;
+        ensure_capacity(
+            providers.len(),
+            LIST_LIMIT,
+            ApplicationError::CapacityExceeded,
+        )?;
         let egress_policy_revision = if command.kind == crate::domain::ProviderKind::Oidc {
             let expected = command
                 .egress_policy_revision
@@ -389,7 +393,7 @@ impl PostgresProvisioningAdapter {
         ensure_capacity(
             application_assignments.len(),
             CONFIGURATION_VALUE_LIMIT as u64,
-            ApplicationError::InvalidTransition,
+            ApplicationError::CapacityExceeded,
         )?;
         let provider_assignments = application_provider_assignment::Entity::find()
             .filter(application_provider_assignment::Column::ProjectId.eq(project_id))
@@ -402,7 +406,7 @@ impl PostgresProvisioningAdapter {
         ensure_capacity(
             provider_assignments.len(),
             LIST_LIMIT,
-            ApplicationError::InvalidTransition,
+            ApplicationError::CapacityExceeded,
         )?;
         match existing {
             Some(existing) => {

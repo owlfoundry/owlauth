@@ -20,16 +20,16 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: enforce_project_client_key_lifecycle(); Type: FUNCTION; Schema: public; Owner: -
+-- Name: enforce_project_server_key_lifecycle(); Type: FUNCTION; Schema: public; Owner: -
 --
 
-CREATE FUNCTION public.enforce_project_client_key_lifecycle() RETURNS trigger
+CREATE FUNCTION public.enforce_project_server_key_lifecycle() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.credential_acknowledged_at IS NOT NULL THEN
-            RAISE EXCEPTION 'new project client key delivery cannot start acknowledged'
+            RAISE EXCEPTION 'new project server key delivery cannot start acknowledged'
                 USING ERRCODE = '23514';
         END IF;
         RETURN NEW;
@@ -43,12 +43,12 @@ BEGIN
         OR NEW.display_prefix IS DISTINCT FROM OLD.display_prefix
         OR NEW.created_at IS DISTINCT FROM OLD.created_at
     THEN
-        RAISE EXCEPTION 'project client key immutable authority changed'
+        RAISE EXCEPTION 'project server key immutable authority changed'
             USING ERRCODE = '23514';
     END IF;
 
     IF OLD.status = 'revoked' THEN
-        RAISE EXCEPTION 'revoked project client key is immutable'
+        RAISE EXCEPTION 'revoked project server key is immutable'
             USING ERRCODE = '23514';
     END IF;
 
@@ -59,7 +59,7 @@ BEGIN
             OR NEW.last_used_at IS DISTINCT FROM OLD.last_used_at
             OR NEW.credential_acknowledged_at IS DISTINCT FROM OLD.credential_acknowledged_at
         THEN
-            RAISE EXCEPTION 'invalid project client key revocation transition'
+            RAISE EXCEPTION 'invalid project server key revocation transition'
                 USING ERRCODE = '23514';
         END IF;
         RETURN NEW;
@@ -74,7 +74,7 @@ BEGIN
             OR NEW.label IS DISTINCT FROM OLD.label
             OR NEW.last_used_at IS DISTINCT FROM OLD.last_used_at
         THEN
-            RAISE EXCEPTION 'invalid project client key delivery acknowledgement'
+            RAISE EXCEPTION 'invalid project server key delivery acknowledgement'
                 USING ERRCODE = '23514';
         END IF;
         RETURN NEW;
@@ -92,7 +92,7 @@ BEGIN
             AND NEW.last_used_at < OLD.last_used_at
         )
     THEN
-        RAISE EXCEPTION 'invalid project client key usage update'
+        RAISE EXCEPTION 'invalid project server key usage update'
             USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
@@ -2735,10 +2735,10 @@ CREATE TABLE public.audit_events (
 
 
 --
--- Name: client_key_digest_readiness; Type: TABLE; Schema: public; Owner: -
+-- Name: server_key_digest_readiness; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.client_key_digest_readiness (
+CREATE TABLE public.server_key_digest_readiness (
     process_id text NOT NULL,
     process_incarnation uuid NOT NULL,
     state text NOT NULL,
@@ -2746,22 +2746,10 @@ CREATE TABLE public.client_key_digest_readiness (
     failure_class text,
     checked_at timestamp with time zone NOT NULL,
     lease_expires_at timestamp with time zone NOT NULL,
-    CONSTRAINT client_key_digest_readiness_check CHECK ((((state = 'ready'::text) AND ((cardinality(supported_digest_versions) >= 1) AND (cardinality(supported_digest_versions) <= 32)) AND (failure_class IS NULL)) OR ((state = 'failed'::text) AND (cardinality(supported_digest_versions) = 0) AND (failure_class IS NOT NULL) AND ((char_length(failure_class) >= 1) AND (char_length(failure_class) <= 64))))),
-    CONSTRAINT client_key_digest_readiness_check1 CHECK (((lease_expires_at > checked_at) AND (lease_expires_at <= (checked_at + '00:05:00'::interval)))),
-    CONSTRAINT client_key_digest_readiness_state_check CHECK ((state = ANY (ARRAY['ready'::text, 'failed'::text]))),
-    CONSTRAINT client_key_digest_readiness_supported_digest_versions_check CHECK (((cardinality(supported_digest_versions) <= 32) AND (array_position(supported_digest_versions, NULL::integer) IS NULL) AND (0 < ALL (supported_digest_versions))))
-);
-
-
---
--- Name: client_process_incarnations; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.client_process_incarnations (
-    process_id text NOT NULL,
-    process_incarnation uuid NOT NULL,
-    started_at timestamp with time zone NOT NULL,
-    CONSTRAINT client_process_incarnations_process_id_check CHECK (((process_id COLLATE "C") ~ '^[A-Za-z0-9._:-]{1,128}$'::text))
+    CONSTRAINT server_key_digest_readiness_check CHECK ((((state = 'ready'::text) AND ((cardinality(supported_digest_versions) >= 1) AND (cardinality(supported_digest_versions) <= 32)) AND (failure_class IS NULL)) OR ((state = 'failed'::text) AND (cardinality(supported_digest_versions) = 0) AND (failure_class IS NOT NULL) AND ((char_length(failure_class) >= 1) AND (char_length(failure_class) <= 64))))),
+    CONSTRAINT server_key_digest_readiness_check1 CHECK (((lease_expires_at > checked_at) AND (lease_expires_at <= (checked_at + '00:05:00'::interval)))),
+    CONSTRAINT server_key_digest_readiness_state_check CHECK ((state = ANY (ARRAY['ready'::text, 'failed'::text]))),
+    CONSTRAINT server_key_digest_readiness_supported_digest_versions_check CHECK (((cardinality(supported_digest_versions) <= 32) AND (array_position(supported_digest_versions, NULL::integer) IS NULL) AND (0 < ALL (supported_digest_versions))))
 );
 
 
@@ -4030,10 +4018,10 @@ CREATE TABLE public.project_browser_sessions (
 
 
 --
--- Name: project_client_keys; Type: TABLE; Schema: public; Owner: -
+-- Name: project_server_keys; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.project_client_keys (
+CREATE TABLE public.project_server_keys (
     id uuid NOT NULL,
     project_id uuid NOT NULL,
     public_key_id text NOT NULL,
@@ -4047,17 +4035,17 @@ CREATE TABLE public.project_client_keys (
     last_used_at timestamp with time zone,
     revoked_at timestamp with time zone,
     credential_acknowledged_at timestamp with time zone,
-    CONSTRAINT project_client_keys_acknowledged_after_create CHECK (((credential_acknowledged_at IS NULL) OR (credential_acknowledged_at >= created_at))),
-    CONSTRAINT project_client_keys_check CHECK ((display_prefix = ('owl_client_v1.'::text || public_key_id))),
-    CONSTRAINT project_client_keys_check1 CHECK ((((status = 'active'::text) AND (revoked_at IS NULL)) OR ((status = 'revoked'::text) AND (revoked_at IS NOT NULL)))),
-    CONSTRAINT project_client_keys_check2 CHECK (((last_used_at IS NULL) OR (last_used_at >= created_at))),
-    CONSTRAINT project_client_keys_check3 CHECK (((revoked_at IS NULL) OR (revoked_at >= created_at))),
-    CONSTRAINT project_client_keys_credential_digest_check CHECK ((octet_length(credential_digest) = 32)),
-    CONSTRAINT project_client_keys_digest_key_version_check CHECK ((digest_key_version > 0)),
-    CONSTRAINT project_client_keys_label_check CHECK ((((char_length(label) >= 1) AND (char_length(label) <= 64)) AND (label = btrim(label)) AND (label !~ '[[:cntrl:]]'::text))),
-    CONSTRAINT project_client_keys_public_key_id_check CHECK (((public_key_id COLLATE "C") ~ '^[A-Za-z0-9_-]{22}$'::text)),
-    CONSTRAINT project_client_keys_revision_check CHECK ((revision > 0)),
-    CONSTRAINT project_client_keys_status_check CHECK ((status = ANY (ARRAY['active'::text, 'revoked'::text])))
+    CONSTRAINT project_server_keys_acknowledged_after_create CHECK (((credential_acknowledged_at IS NULL) OR (credential_acknowledged_at >= created_at))),
+    CONSTRAINT project_server_keys_check CHECK ((display_prefix = ('owl_server_v1.'::text || public_key_id))),
+    CONSTRAINT project_server_keys_check1 CHECK ((((status = 'active'::text) AND (revoked_at IS NULL)) OR ((status = 'revoked'::text) AND (revoked_at IS NOT NULL)))),
+    CONSTRAINT project_server_keys_check2 CHECK (((last_used_at IS NULL) OR (last_used_at >= created_at))),
+    CONSTRAINT project_server_keys_check3 CHECK (((revoked_at IS NULL) OR (revoked_at >= created_at))),
+    CONSTRAINT project_server_keys_credential_digest_check CHECK ((octet_length(credential_digest) = 32)),
+    CONSTRAINT project_server_keys_digest_key_version_check CHECK ((digest_key_version > 0)),
+    CONSTRAINT project_server_keys_label_check CHECK ((((char_length(label) >= 1) AND (char_length(label) <= 64)) AND (label = btrim(label)) AND (label !~ '[[:cntrl:]]'::text))),
+    CONSTRAINT project_server_keys_public_key_id_check CHECK (((public_key_id COLLATE "C") ~ '^[A-Za-z0-9_-]{22}$'::text)),
+    CONSTRAINT project_server_keys_revision_check CHECK ((revision > 0)),
+    CONSTRAINT project_server_keys_status_check CHECK ((status = ANY (ARRAY['active'::text, 'revoked'::text])))
 );
 
 
@@ -4670,14 +4658,14 @@ CREATE TABLE public.refresh_token_generations (
 
 
 --
--- Name: runtime_process_incarnations; Type: TABLE; Schema: public; Owner: -
+-- Name: auth_process_incarnations; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.runtime_process_incarnations (
+CREATE TABLE public.auth_process_incarnations (
     process_id text NOT NULL,
     process_incarnation uuid NOT NULL,
     started_at timestamp with time zone NOT NULL,
-    CONSTRAINT runtime_process_incarnations_process_id_check CHECK ((process_id ~ '^[a-zA-Z0-9._:-]{1,128}$'::text))
+    CONSTRAINT auth_process_incarnations_process_id_check CHECK ((process_id ~ '^[a-zA-Z0-9._:-]{1,128}$'::text))
 );
 
 

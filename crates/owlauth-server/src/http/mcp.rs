@@ -25,15 +25,21 @@ use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer};
 use url::{Host, Url};
 use uuid::Uuid;
 
-use super::{ControlState, control_problem, timestamp, valid_control_authorization};
+use super::{
+    ControlState, bearer_challenge, control_problem, timestamp, valid_control_authorization,
+};
 use crate::{
-    application::{ApplicationError, ProvisioningService, WebhookControlService},
+    application::{
+        ApplicationError, ControlLifecycleService, ProjectUserIdentityKind, ProjectUserSort,
+        ProjectUserStatus, ProvisioningService, WebhookControlService,
+    },
     config::{ListenerConfig, McpHttpConfig, OperatorApiKey},
 };
 
 #[derive(Clone)]
 struct McpApplicationServices {
     provisioning: Option<Arc<ProvisioningService>>,
+    lifecycle: Option<Arc<ControlLifecycleService>>,
     webhooks: Option<Arc<WebhookControlService>>,
 }
 
@@ -41,6 +47,7 @@ impl From<&ControlState> for McpApplicationServices {
     fn from(state: &ControlState) -> Self {
         Self {
             provisioning: state.provisioning.clone(),
+            lifecycle: state.lifecycle.clone(),
             webhooks: state.webhooks.clone(),
         }
     }
@@ -136,6 +143,13 @@ impl OwlAuthMcpServer {
     fn provisioning(&self) -> Result<&ProvisioningService, ApplicationError> {
         self.services
             .provisioning
+            .as_deref()
+            .ok_or(ApplicationError::Persistence)
+    }
+
+    fn lifecycle(&self) -> Result<&ControlLifecycleService, ApplicationError> {
+        self.services
+            .lifecycle
             .as_deref()
             .ok_or(ApplicationError::Persistence)
     }
@@ -270,6 +284,55 @@ struct McpApplicationListOutput {
     items: Vec<McpApplicationOutput>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum McpProjectUserStatus {
+    Active,
+    Disabled,
+    Merged,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum McpProjectUserIdentityFilter {
+    Provider,
+    Email,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum McpProjectUserSort {
+    CreatedNewest,
+    CreatedOldest,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpProjectUserOutput {
+    id: String,
+    project_id: String,
+    public_id: String,
+    status: McpProjectUserStatus,
+    user_revision: i64,
+    security_revision: i64,
+    display_name: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpProjectUserListOutput {
+    items: Vec<McpProjectUserOutput>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpProjectUserLookupOutput {
+    user: Option<McpProjectUserOutput>,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct McpWebhookEndpointOutput {
@@ -342,6 +405,36 @@ struct ApplicationInput {
     project_id: String,
     /// Exact Application UUID owned by the Project.
     application_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ListProjectUsersInput {
+    /// Exact Project UUID returned by `OwlAuth` Control.
+    project_id: String,
+    /// Optional Project user lifecycle status.
+    status: Option<McpProjectUserStatus>,
+    /// Optional case-insensitive display-name or public-ID prefix.
+    search: Option<String>,
+    /// Optional active identity kind filter.
+    identity_kind: Option<McpProjectUserIdentityFilter>,
+    /// Exact provider creation-provenance key; valid only with `identity_kind=provider`.
+    provider_key: Option<String>,
+    /// Deterministic creation order; defaults to newest first.
+    sort: Option<McpProjectUserSort>,
+    /// Cursor returned by the previous call with the same criteria.
+    cursor: Option<String>,
+    /// Page size from 1 through 100; defaults to 50.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LookupProjectUserEmailInput {
+    /// Exact Project UUID returned by `OwlAuth` Control.
+    project_id: String,
+    /// Exact email to canonicalize and resolve without returning the address.
+    email: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -441,6 +534,25 @@ fn mcp_application(
         metadata_revision: record.metadata_revision,
         security_revision: record.security_revision,
     })
+}
+
+fn mcp_project_user(record: crate::application::ProjectUserRecord) -> McpProjectUserOutput {
+    let status = match record.status {
+        ProjectUserStatus::Active => McpProjectUserStatus::Active,
+        ProjectUserStatus::Disabled => McpProjectUserStatus::Disabled,
+        ProjectUserStatus::Merged => McpProjectUserStatus::Merged,
+    };
+    McpProjectUserOutput {
+        id: record.id.to_string(),
+        project_id: record.project_id.to_string(),
+        public_id: record.public_id,
+        status,
+        user_revision: record.user_revision,
+        security_revision: record.security_revision,
+        display_name: record.display_name,
+        created_at: timestamp(record.created_at),
+        updated_at: timestamp(record.updated_at),
+    }
 }
 
 fn mcp_webhook_endpoint(
@@ -638,6 +750,92 @@ impl OwlAuthMcpServer {
         self.result(result)
     }
 
+    /// Search, filter, sort, and page one Project's authoritative user directory.
+    #[tool(
+        name = "owlauth_project_users_list",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<McpProjectUserListOutput>(),
+        annotations(
+            title = "List OwlAuth Project users",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_users_list(
+        &self,
+        Parameters(input): Parameters<ListProjectUsersInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project_id = parse_uuid("project_id", &input.project_id)?;
+        let cursor = input
+            .cursor
+            .as_deref()
+            .map(|value| parse_uuid("cursor", value))
+            .transpose()?;
+        let status = input.status.map(|status| match status {
+            McpProjectUserStatus::Active => ProjectUserStatus::Active,
+            McpProjectUserStatus::Disabled => ProjectUserStatus::Disabled,
+            McpProjectUserStatus::Merged => ProjectUserStatus::Merged,
+        });
+        let identity_kind = input.identity_kind.map(|kind| match kind {
+            McpProjectUserIdentityFilter::Provider => ProjectUserIdentityKind::Provider,
+            McpProjectUserIdentityFilter::Email => ProjectUserIdentityKind::Email,
+        });
+        let sort = input.sort.map(|sort| match sort {
+            McpProjectUserSort::CreatedNewest => ProjectUserSort::CreatedNewest,
+            McpProjectUserSort::CreatedOldest => ProjectUserSort::CreatedOldest,
+        });
+        let result = match self.lifecycle() {
+            Ok(service) => service
+                .list_project_users(
+                    project_id,
+                    status,
+                    input.search.as_deref(),
+                    identity_kind,
+                    input.provider_key.as_deref(),
+                    sort,
+                    cursor,
+                    input.limit,
+                )
+                .await
+                .map(|page| McpProjectUserListOutput {
+                    items: page.items.into_iter().map(mcp_project_user).collect(),
+                    next_cursor: page.next_cursor.map(|value| value.to_string()),
+                }),
+            Err(error) => Err(error),
+        };
+        self.result(result)
+    }
+
+    /// Resolve zero or one Project user from one exact canonical email.
+    #[tool(
+        name = "owlauth_project_user_lookup_email",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<McpProjectUserLookupOutput>(),
+        annotations(
+            title = "Look up an OwlAuth Project user by email",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn project_user_lookup_email(
+        &self,
+        Parameters(input): Parameters<LookupProjectUserEmailInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let project_id = parse_uuid("project_id", &input.project_id)?;
+        let result = match self.lifecycle() {
+            Ok(service) => service
+                .lookup_project_user_by_email(project_id, &input.email)
+                .await
+                .map(|user| McpProjectUserLookupOutput {
+                    user: user.map(mcp_project_user),
+                }),
+            Err(error) => Err(error),
+        };
+        self.result(result)
+    }
+
     /// List safe webhook endpoint lifecycle and secret-generation metadata.
     #[tool(
         name = "owlauth_webhook_endpoints_list",
@@ -770,9 +968,13 @@ fn application_error_result(error: ApplicationError) -> CallToolResult {
             "invalid_transition",
             "The requested state transition is not allowed.",
         ),
+        ApplicationError::CapacityExceeded => (
+            "capacity_exceeded",
+            "The bounded resource capacity has been reached.",
+        ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
-        | ApplicationError::ClientVerifierUnavailable
+        | ApplicationError::ServerVerifierUnavailable
         | ApplicationError::ProviderPreflightRejected
         | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
@@ -830,13 +1032,13 @@ async fn require_mcp_operator(
             .get::<String>()
             .cloned()
             .unwrap_or_else(|| "unavailable".to_owned());
-        return control_problem(
+        return bearer_challenge(control_problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "Authentication required",
             "A single valid deployment operator Bearer credential is required.",
             &request_id,
-        );
+        ));
     }
     if !has_exact_external_authority(request.headers(), request.uri(), &admission.external_origin) {
         let request_id = request
@@ -1052,12 +1254,13 @@ mod tests {
         let server = OwlAuthMcpServer::new(
             McpApplicationServices {
                 provisioning: None,
+                lifecycle: None,
                 webhooks: None,
             },
             1024,
         );
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
         for tool in tools {
             let schema = tool
                 .output_schema
@@ -1068,6 +1271,77 @@ mod tests {
                 Some(&serde_json::json!(false))
             );
         }
+    }
+
+    #[test]
+    fn project_user_directory_tools_publish_closed_inputs() {
+        let server = OwlAuthMcpServer::new(
+            McpApplicationServices {
+                provisioning: None,
+                lifecycle: None,
+                webhooks: None,
+            },
+            1024,
+        );
+        let tools = server.tool_router.list_all();
+        for (name, expected_properties) in [
+            (
+                "owlauth_project_users_list",
+                [
+                    "project_id",
+                    "status",
+                    "search",
+                    "identity_kind",
+                    "provider_key",
+                    "sort",
+                    "cursor",
+                    "limit",
+                ]
+                .as_slice(),
+            ),
+            (
+                "owlauth_project_user_lookup_email",
+                ["project_id", "email"].as_slice(),
+            ),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing MCP tool {name}"));
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                Some(&serde_json::json!(false))
+            );
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            assert_eq!(properties.len(), expected_properties.len());
+            for property in expected_properties {
+                assert!(properties.contains_key(*property));
+            }
+        }
+    }
+
+    #[test]
+    fn project_user_output_is_a_safe_allowlist() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let output = mcp_project_user(crate::application::ProjectUserRecord {
+            id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            public_id: "usr_public".to_owned(),
+            status: ProjectUserStatus::Active,
+            user_revision: 3,
+            security_revision: 4,
+            display_name: Some("Ada Lovelace".to_owned()),
+            picture_url: Some("https://profile.example/private-picture".to_owned()),
+            created_at: now,
+            updated_at: now,
+        });
+        let serialized = serde_json::to_value(output).unwrap();
+        assert_eq!(serialized["public_id"], "usr_public");
+        assert_eq!(serialized["display_name"], "Ada Lovelace");
+        assert!(serialized.get("picture_url").is_none());
+        assert!(serialized.get("email").is_none());
+        assert!(serialized.get("provider_subject").is_none());
+        assert!(!serialized.to_string().contains("private-picture"));
     }
 
     #[test]

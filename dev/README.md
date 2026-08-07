@@ -17,9 +17,9 @@ make dev
 
 `make dev-check` validates the current local environment, required tools, Docker daemon, and Compose
 v2 without starting services. `make dev` runs that preflight, rebuilds the embedded web assets,
-starts this infrastructure, and runs the combined Runtime, Client, and Control process in the
-foreground using PostgreSQL-resident protected material. Startup logs print the Runtime Hosted Auth,
-Client readiness, and Control Console URLs.
+starts this infrastructure, and runs the combined Auth and Control process in the foreground using
+PostgreSQL-resident protected material. Startup logs print the Auth Hosted UI, Auth readiness, and
+Control Console URLs.
 
 Application configuration lives in the ignored root `.env`; the committed root `.env.example`
 contains public disposable development values only. The preflight detects when an older `.env` is

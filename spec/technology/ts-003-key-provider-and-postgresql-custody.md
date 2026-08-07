@@ -63,7 +63,7 @@ Signing provisioners declare one of two closed lifecycle semantics. `StableOpera
 
 `owlauth-server` exposes a narrow builder or equivalent `run_with_providers` entry point. It accepts capability registrations and server configuration without making private repositories, Axum routers, application errors, or database rows public. The existing `run` entry point remains the official composition and delegates to the same path with the bundled software provider. Core configuration has no vendor-shaped `kms` map, dynamic type name, or arbitrary provider payload: a custom binary parses its own bounded vendor configuration, constructs the independent provider objects, assigns reviewed provider IDs, and hands only capabilities to the server builder.
 
-Custom binaries must explicitly provide every capability required by their selected `all`, `runtime`, or `control` mode. Missing, duplicated, provider-ID-mismatched, or algorithm-incompatible capabilities fail during composition/readiness rather than falling back to the bundled provider or another key generation.
+Custom binaries must explicitly provide every capability required by their selected `all`, `auth`, or `control` mode. Missing, duplicated, provider-ID-mismatched, or algorithm-incompatible capabilities fail during composition/readiness rather than falling back to the bundled provider or another key generation.
 
 ### SemVer and compatibility rules
 
@@ -95,12 +95,12 @@ Before declaring this decision implemented, tests MUST prove:
 
 01. the SPI crate has no server, database, HTTP, configuration, or vendor SDK dependency and all capability traits are object-safe;
 02. compile fixtures can implement a third-party provider and compose a custom server without importing private server modules;
-03. `all`, `runtime`, `client`, and `control` composition receive only their required capabilities and fail closed for missing, mismatched, oversized, unknown-version, or unsupported-algorithm values; Client receives no signer, sealer, opener, or generic custody capability;
+03. `all`, `auth`, and `control` composition receive only their required capabilities and fail closed for missing, mismatched, oversized, unknown-version, or unsupported-algorithm values; the Server API adapter inside Auth receives only the server-key verifier and no signer, sealer, opener, or generic custody interface;
 04. the software provider has fixed HKDF-SHA-256/HMAC-SHA-256/XChaCha20-Poly1305 vectors, uses fresh 24-byte nonces and canonical length-delimited exact context, produces stable safe fingerprints independently of ciphertext randomness, and rejects context/provider/version substitution;
 05. signing provisioning commits the protected-material row, normalized public key, key metadata, and operation outcome consistently, and Runtime verifies that signatures match the committed public key;
 06. provider/SMTP/webhook secret creation, rotation, activation, overlap, disablement, compromise, cleanup, idempotent replay, crash, and stale-writer races preserve one authoritative PostgreSQL lifecycle without filesystem state;
 07. opaque values and plaintext never enter DTOs, logs, telemetry, audit safe context, Redis, or error text, and transient plaintext/key material is bounded and zeroized where supported;
-08. split Runtime processes using the same root can open/sign exact committed generations, while a wrong root or restored database without the root makes only the affected capabilities fail closed;
+08. split Auth process replicas using the same root can open/sign exact committed generations, while a wrong root or restored database without the root makes only the affected capabilities fail closed;
 09. stable-operation remote signer test providers prove create/reconcile ambiguity, byte-identical inspection, public-key consistency, exact algorithm handling, JWS-ready signature normalization, and safe destruction classification;
 10. the stateless software signer proves fresh same-operation handles, `NotFound + ExactInputSafe` inspection, crash recovery through fresh provisioning, and cleanup by PostgreSQL opaque-value erasure without `cleanup_blocked`;
 11. Cargo publication verifies `owlauth-key-provider` is available before `owlauth-server`, downstream SemVer checks run, and the official binary still uses the same public composition path.

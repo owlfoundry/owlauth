@@ -2,6 +2,7 @@ mod mcp;
 
 use std::{
     collections::{HashMap, VecDeque},
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,31 +13,30 @@ use std::{
 #[cfg(test)]
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::FutureExt as _;
 use sha2::{Digest, Sha256};
 
 use axum::{
     Extension, Json, Router,
     extract::{
-        ConnectInfo, DefaultBodyLimit, FromRequest, OriginalUri, Path, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, OriginalUri, Path, Query,
+        Request, State,
     },
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
-    response::{IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post, put},
 };
 use owlauth_types::{
-    FEDERATED_PROJECT_AUTH_AVAILABLE, HealthResponse, client as client_types,
+    FEDERATED_PROJECT_AUTH_AVAILABLE, HealthResponse,
     control::{self as control_types, ServiceDescriptor, SystemCapabilities},
-    runtime as runtime_types,
+    runtime as runtime_types, server as server_types,
 };
 #[cfg(test)]
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tower::limit::ConcurrencyLimitLayer;
-use tower_http::{
-    catch_panic::CatchPanicLayer, compression::CompressionLayer, timeout::TimeoutLayer,
-};
+use tower_http::compression::CompressionLayer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -57,8 +57,10 @@ use crate::{
         SubmitEmailProof, UpdateApplication, UpdateProject, UpdateProjectPolicy,
         UpdateProviderEgressPolicy, WebhookControlService, WebhookWorker,
     },
-    config::{DeploymentSmtpConfig, ListenerConfig, OperatorApiKey, ServerConfig},
-    domain::{ApplicationType, ProviderEgressMode},
+    config::{
+        DeploymentSmtpConfig, HttpBudgetConfig, ListenerConfig, OperatorApiKey, ServerConfig,
+    },
+    domain::{ApplicationType, LoginTransactionStatus, ProviderEgressMode},
     web_assets::{self, WebPlane},
 };
 
@@ -76,7 +78,7 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 enum HttpPlane {
     Runtime,
-    Client,
+    Server,
     Control,
 }
 
@@ -84,7 +86,7 @@ impl HttpPlane {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Runtime => "runtime",
-            Self::Client => "client",
+            Self::Server => "server",
             Self::Control => "control",
         }
     }
@@ -111,11 +113,16 @@ struct RuntimeState {
 }
 
 #[derive(Clone)]
-struct ClientState {
-    probe: ProbeState,
+struct ServerState {
     admission: Arc<AdmissionService>,
-    api: Option<Arc<application::ClientApiService>>,
-    readiness: Option<Arc<application::ClientDigestReadinessService>>,
+    api: Option<Arc<application::ServerApiService>>,
+}
+
+#[derive(Clone)]
+struct AuthProbeState {
+    ready: Arc<AtomicBool>,
+    runtime_readiness: Option<Arc<application::ReadinessService>>,
+    server_readiness: Option<Arc<application::ServerDigestReadinessService>>,
 }
 
 #[derive(Clone)]
@@ -123,6 +130,8 @@ struct ControlState {
     probe: ProbeState,
     clock: Arc<dyn Clock>,
     operator_key: Arc<OperatorApiKey>,
+    external_origin: Arc<str>,
+    credential_failures: ControlCredentialFailures,
     descriptor: Arc<ServiceDescriptor>,
     provisioning: Option<Arc<ProvisioningService>>,
     lifecycle: Option<Arc<ControlLifecycleService>>,
@@ -133,13 +142,16 @@ struct ControlState {
     identity_mutations: Option<Arc<IdentityMutationControlService>>,
     webhooks: Option<Arc<WebhookControlService>>,
     provider_onboarding: Option<Arc<ProviderOnboardingService>>,
-    client_keys: Option<Arc<application::ClientKeyLifecycleService>>,
+    server_keys: Option<Arc<application::ServerKeyLifecycleService>>,
 }
 
 pub(crate) struct PlaneRouters {
-    pub runtime: Option<Router>,
-    pub client: Option<Router>,
+    pub auth: Option<Router>,
     pub control: Option<Router>,
+    #[cfg(test)]
+    pub(crate) runtime: Option<Router>,
+    #[cfg(test)]
+    pub(crate) server: Option<Router>,
     pub runtime_auth: Option<Arc<RuntimeAuthService>>,
     pub managed_sync: Option<Arc<ManagedConnectionService>>,
     pub webhook_delivery: Option<Arc<WebhookWorker>>,
@@ -147,18 +159,14 @@ pub(crate) struct PlaneRouters {
     pub(crate) runtime_identity_mutations: Option<Arc<IdentityMutationRuntimeService>>,
     #[cfg(test)]
     pub(crate) control_identity_mutations: Option<Arc<IdentityMutationControlService>>,
-    runtime_ready: Arc<AtomicBool>,
-    client_ready: Arc<AtomicBool>,
+    auth_ready: Arc<AtomicBool>,
     control_ready: Arc<AtomicBool>,
 }
 
 impl PlaneRouters {
     pub fn mark_ready(&self) {
-        if self.runtime.is_some() {
-            self.runtime_ready.store(true, Ordering::Release);
-        }
-        if self.client.is_some() {
-            self.client_ready.store(true, Ordering::Release);
+        if self.auth.is_some() {
+            self.auth_ready.store(true, Ordering::Release);
         }
         if self.control.is_some() {
             self.control_ready.store(true, Ordering::Release);
@@ -166,32 +174,26 @@ impl PlaneRouters {
     }
 
     pub fn mark_unready(&self) {
-        self.runtime_ready.store(false, Ordering::Release);
-        self.client_ready.store(false, Ordering::Release);
+        self.auth_ready.store(false, Ordering::Release);
         self.control_ready.store(false, Ordering::Release);
     }
 }
 
 #[cfg(test)]
 pub(crate) fn build_routers(config: &ServerConfig, pools: Option<&DatabasePools>) -> PlaneRouters {
-    build_routers_with_runtime_incarnation(config, pools, Uuid::nil())
+    build_routers_with_auth_incarnation(config, pools, Uuid::nil())
 }
 
 #[cfg(test)]
-pub(crate) fn build_routers_with_runtime_incarnation(
+pub(crate) fn build_routers_with_auth_incarnation(
     config: &ServerConfig,
     pools: Option<&DatabasePools>,
-    runtime_incarnation: Uuid,
+    auth_incarnation: Uuid,
 ) -> PlaneRouters {
     let providers = crate::composition::bundled_software_providers(config)
         .expect("validated bundled provider configuration");
-    let capabilities = crate::composition::build_http_capabilities(
-        config,
-        pools,
-        runtime_incarnation,
-        runtime_incarnation,
-        &providers,
-    );
+    let capabilities =
+        crate::composition::build_http_capabilities(config, pools, auth_incarnation, &providers);
     build_routers_with_capabilities(config, capabilities)
 }
 
@@ -199,8 +201,7 @@ pub(crate) fn build_routers_with_capabilities(
     config: &ServerConfig,
     capabilities: crate::composition::HttpCapabilities,
 ) -> PlaneRouters {
-    let runtime_ready = Arc::new(AtomicBool::new(false));
-    let client_ready = Arc::new(AtomicBool::new(false));
+    let auth_ready = Arc::new(AtomicBool::new(false));
     let control_ready = Arc::new(AtomicBool::new(false));
 
     let runtime_auth = capabilities
@@ -226,20 +227,54 @@ pub(crate) fn build_routers_with_capabilities(
         .as_ref()
         .and_then(|control| control.identity_mutations.clone());
 
-    let runtime = capabilities
+    let runtime_readiness = capabilities
         .runtime
-        .map(|capabilities| build_runtime_plane(config, capabilities, Arc::clone(&runtime_ready)));
-    let client = capabilities
-        .client
-        .map(|capabilities| build_client_plane(config, capabilities, Arc::clone(&client_ready)));
+        .as_ref()
+        .and_then(|runtime| runtime.readiness.clone());
+    let server_readiness = capabilities
+        .server
+        .as_ref()
+        .and_then(|server| server.readiness.clone());
+    let auth_concurrency = Arc::new(tokio::sync::Semaphore::new(
+        config.auth.http.max_in_flight_requests,
+    ));
+    let runtime = capabilities.runtime.map(|capabilities| {
+        build_runtime_surface(
+            config,
+            capabilities,
+            Arc::clone(&auth_ready),
+            Arc::clone(&auth_concurrency),
+        )
+    });
+    let server = capabilities.server.map(|capabilities| {
+        build_server_surface(config, capabilities, Arc::clone(&auth_concurrency))
+    });
+    let auth = match (runtime.as_ref(), server.as_ref()) {
+        (Some(runtime), Some(server)) => Some(runtime.clone().merge(server.clone()).merge(
+            auth_probe_router(
+                &config.auth,
+                AuthProbeState {
+                    ready: Arc::clone(&auth_ready),
+                    runtime_readiness,
+                    server_readiness,
+                },
+                auth_concurrency,
+            ),
+        )),
+        (None, None) => None,
+        _ => panic!("Auth composition must contain both Runtime and Server API surfaces"),
+    };
     let control = capabilities
         .control
         .map(|capabilities| build_control_plane(config, capabilities, Arc::clone(&control_ready)));
 
     PlaneRouters {
-        runtime,
-        client,
+        auth,
         control,
+        #[cfg(test)]
+        runtime,
+        #[cfg(test)]
+        server,
         runtime_auth,
         managed_sync,
         webhook_delivery,
@@ -247,23 +282,23 @@ pub(crate) fn build_routers_with_capabilities(
         runtime_identity_mutations,
         #[cfg(test)]
         control_identity_mutations,
-        runtime_ready,
-        client_ready,
+        auth_ready,
         control_ready,
     }
 }
 
-fn build_runtime_plane(
+fn build_runtime_surface(
     config: &ServerConfig,
     capabilities: crate::composition::RuntimeHttpCapabilities,
     ready: Arc<AtomicBool>,
+    concurrency: Arc<tokio::sync::Semaphore>,
 ) -> Router {
     runtime_router(
-        &config.runtime,
+        &config.auth,
         RuntimeState {
             probe: ProbeState {
                 ready,
-                base_path: Arc::from(config.runtime.external_base.path()),
+                base_path: Arc::from(config.auth.external_base.path()),
             },
             readiness: capabilities.readiness,
             admission: capabilities.admission,
@@ -271,33 +306,28 @@ fn build_runtime_plane(
             auth: capabilities.auth,
             callback_owners: capabilities.callback_owners,
             managed_reauthorization: capabilities.managed_reauthorization,
-            cookie_path: Arc::from(config.runtime.external_base.path()),
-            external_origin: Arc::from(config.runtime.external_base.origin().ascii_serialization()),
+            cookie_path: Arc::from(config.auth.external_base.path()),
+            external_origin: Arc::from(config.auth.external_base.origin().ascii_serialization()),
             identity_mutations: capabilities
                 .identity_mutations
                 .map(|service| service as Arc<dyn IdentityMutationRuntimePort>),
         },
-        config,
+        concurrency,
     )
 }
 
-fn build_client_plane(
+fn build_server_surface(
     config: &ServerConfig,
-    capabilities: crate::composition::ClientHttpCapabilities,
-    ready: Arc<AtomicBool>,
+    capabilities: crate::composition::ServerHttpCapabilities,
+    concurrency: Arc<tokio::sync::Semaphore>,
 ) -> Router {
-    client_router(
-        &config.client,
-        ClientState {
-            probe: ProbeState {
-                ready,
-                base_path: Arc::from(config.client.external_base.path()),
-            },
+    server_router(
+        &config.auth,
+        ServerState {
             admission: capabilities.admission,
             api: capabilities.api,
-            readiness: capabilities.readiness,
         },
-        config,
+        concurrency,
     )
 }
 
@@ -320,6 +350,8 @@ fn build_control_plane(
                     .clone()
                     .expect("validated Control configuration has an operator key"),
             ),
+            external_origin: Arc::from(config.control.external_base.origin().ascii_serialization()),
+            credential_failures: ControlCredentialFailures::default(),
             descriptor: Arc::new(ServiceDescriptor {
                 schema_version: "1".to_owned(),
                 product: "owlauth-server".to_owned(),
@@ -353,13 +385,17 @@ fn build_control_plane(
             identity_mutations: capabilities.identity_mutations,
             webhooks: capabilities.webhooks,
             provider_onboarding: capabilities.provider_onboarding,
-            client_keys: capabilities.client_keys,
+            server_keys: capabilities.server_keys,
         },
         config,
     )
 }
 
-fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &ServerConfig) -> Router {
+fn runtime_router(
+    listener: &ListenerConfig,
+    state: RuntimeState,
+    concurrency: Arc<tokio::sync::Semaphore>,
+) -> Router {
     let public = Router::new()
         .route("/", get(runtime_root))
         .route("/auth", get(runtime_not_found))
@@ -369,8 +405,6 @@ fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &Serve
             get(runtime_asset).layer(CompressionLayer::new().br(true).gzip(true)),
         )
         .route("/auth/{*path}", get(runtime_not_found))
-        .route("/health", get(liveness))
-        .route("/ready", get(runtime_readiness))
         .route(
             "/v1/projects/{project_public_id}/auth/config",
             get(public_application_config),
@@ -389,51 +423,54 @@ fn runtime_router(listener: &ListenerConfig, state: RuntimeState, config: &Serve
         listener,
         router.with_state(state),
         HttpPlane::Runtime,
-        config.request_timeout,
-        config.max_request_bytes,
-        256,
+        concurrency,
     )
 }
 
-fn client_router(listener: &ListenerConfig, state: ClientState, config: &ServerConfig) -> Router {
+fn server_router(
+    listener: &ListenerConfig,
+    state: ServerState,
+    concurrency: Arc<tokio::sync::Semaphore>,
+) -> Router {
     let protected = Router::new()
         .route(
             "/projects/{project_id}/users",
-            get(client_list_project_users),
+            get(server_list_project_users),
         )
         .route(
             "/projects/{project_id}/users/lookup",
-            post(client_lookup_project_user),
+            post(server_lookup_project_user),
         )
         .route(
             "/projects/{project_id}/users/{user_id}",
-            get(client_get_project_user),
+            get(server_get_project_user),
         )
         .route(
             "/projects/{project_id}/applications/{application_id}/users/{user_id}",
-            get(client_get_application_user_projection),
+            get(server_get_application_user_projection),
         )
         .route(
             "/projects/{project_id}/tokens/introspect",
-            post(client_introspect_project_token),
+            post(server_introspect_project_token),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            require_client_key,
+            require_server_key,
         ));
+    let router = Router::new().nest("/v1", protected).with_state(state);
+    mount_and_bound(listener, router, HttpPlane::Server, concurrency)
+}
+
+fn auth_probe_router(
+    listener: &ListenerConfig,
+    state: AuthProbeState,
+    concurrency: Arc<tokio::sync::Semaphore>,
+) -> Router {
     let router = Router::new()
         .route("/health", get(liveness))
-        .route("/ready", get(client_readiness))
-        .nest("/v1", protected)
+        .route("/ready", get(auth_readiness))
         .with_state(state);
-    mount_and_bound(
-        listener,
-        router,
-        HttpPlane::Client,
-        config.request_timeout,
-        config.max_request_bytes,
-        256,
-    )
+    mount_and_bound(listener, router, HttpPlane::Runtime, concurrency)
 }
 
 #[allow(
@@ -469,7 +506,7 @@ fn federated_project_auth_router() -> Router<RuntimeState> {
             get(managed_reauthorization_shell),
         )
         .route(
-            "/auth/identity-mutations/{interaction}",
+            "/auth/identity-mutations/{intent}",
             get(identity_mutation_shell),
         )
         .route(
@@ -481,23 +518,23 @@ fn federated_project_auth_router() -> Router<RuntimeState> {
             post(start_managed_reauthorization),
         )
         .route(
-            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/method",
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/method",
             post(select_identity_mutation_method),
         )
         .route(
-            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/email/challenges",
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/email/challenges",
             post(begin_identity_mutation_email_challenge),
         )
         .route(
-            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/email/otp/verify",
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/email/otp/verify",
             post(verify_identity_mutation_email_otp),
         )
         .route(
-            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/proofs/{proof_slot}/email/link/verify",
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/proofs/{proof_slot}/email/link/verify",
             post(verify_identity_mutation_email_link),
         )
         .route(
-            "/v1/projects/{project_public_id}/auth/identity-mutations/{interaction}/confirm",
+            "/v1/projects/{project_public_id}/auth/identity-mutations/{intent}/confirm",
             post(confirm_identity_mutation_ready),
         )
         .route(
@@ -627,6 +664,10 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             get(list_webhook_deliveries),
         )
         .route(
+            "/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}",
+            get(get_webhook_delivery),
+        )
+        .route(
             "/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}/replay",
             post(replay_webhook_delivery),
         )
@@ -668,7 +709,11 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         )
         .route(
             "/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
-            put(assign_provider).delete(unassign_provider),
+            put(assign_provider),
+        )
+        .route(
+            "/projects/{project_id}/providers/{provider_id}/assignments/{application_id}/unassign",
+            post(unassign_provider),
         )
         .route(
             "/projects/{project_id}/email-method",
@@ -757,7 +802,7 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             &state,
             listener,
             &config.control_mcp,
-            config.max_request_bytes,
+            listener.http.max_request_bytes,
         ));
     }
     let descriptor = Router::new()
@@ -773,34 +818,40 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             )
             .merge(descriptor)
     };
-    bound(
+    bound_at(
         router,
         HttpPlane::Control,
-        config.request_timeout,
-        config.max_request_bytes,
-        64,
+        &listener.http,
+        listener.external_base.path(),
+        Arc::new(tokio::sync::Semaphore::new(
+            listener.http.max_in_flight_requests,
+        )),
     )
 }
 
 fn control_lifecycle_router() -> Router<ControlState> {
     Router::new()
         .route(
-            "/projects/{project_id}/client-keys",
-            get(list_project_client_keys).post(create_project_client_key),
+            "/projects/{project_id}/server-keys",
+            get(list_project_server_keys).post(create_project_server_key),
         )
         .route(
-            "/projects/{project_id}/client-keys/{key_id}",
-            get(get_project_client_key),
+            "/projects/{project_id}/server-keys/{key_id}",
+            get(get_project_server_key),
         )
         .route(
-            "/projects/{project_id}/client-keys/{key_id}/acknowledge",
-            post(acknowledge_project_client_key_delivery),
+            "/projects/{project_id}/server-keys/{key_id}/acknowledge",
+            post(acknowledge_project_server_key_delivery),
         )
         .route(
-            "/projects/{project_id}/client-keys/{key_id}/revoke",
-            post(revoke_project_client_key),
+            "/projects/{project_id}/server-keys/{key_id}/revoke",
+            post(revoke_project_server_key),
         )
         .route("/projects/{project_id}/users", get(list_project_users))
+        .route(
+            "/projects/{project_id}/users/lookup",
+            post(lookup_project_user_by_email),
+        )
         .route(
             "/projects/{project_id}/users/{user_id}",
             get(get_project_user),
@@ -859,14 +910,53 @@ fn control_lifecycle_router() -> Router<ControlState> {
         )
 }
 
+const CONTROL_CREDENTIAL_FAILURE_LIMIT: usize = 12;
+const CONTROL_CREDENTIAL_FAILURE_WINDOW: Duration = Duration::from_mins(1);
+const CONTROL_CREDENTIAL_SOURCE_CAPACITY: usize = 8192;
+
+#[derive(Clone, Default)]
+struct ControlCredentialFailures {
+    sources: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+}
+
+impl ControlCredentialFailures {
+    fn record(&self, source: &str, now: Instant) -> Option<u64> {
+        let Ok(mut sources) = self.sources.lock() else {
+            return Some(1);
+        };
+        if !sources.contains_key(source)
+            && sources.len() >= CONTROL_CREDENTIAL_SOURCE_CAPACITY
+            && let Some(candidate) = sources.keys().next().cloned()
+        {
+            sources.remove(&candidate);
+        }
+        let failures = sources.entry(source.to_owned()).or_default();
+        while failures.front().is_some_and(|failure| {
+            now.duration_since(*failure) >= CONTROL_CREDENTIAL_FAILURE_WINDOW
+        }) {
+            failures.pop_front();
+        }
+        failures.push_back(now);
+        (failures.len() >= CONTROL_CREDENTIAL_FAILURE_LIMIT).then_some(1)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct DirectPeer(pub(crate) std::net::SocketAddr);
+
 #[derive(Clone)]
 struct ClientAddress(String);
 
 async fn attach_client_address(mut request: Request, next: Next) -> Response {
     let address = request
         .extensions()
-        .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map_or_else(|| "127.0.0.1".to_owned(), |peer| peer.0.ip().to_string());
+        .get::<ConnectInfo<DirectPeer>>()
+        .map(|peer| peer.0.0.ip().to_string());
+    #[cfg(test)]
+    let address = address.or_else(|| Some("test-direct-peer".to_owned()));
+    let Some(address) = address else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     request.extensions_mut().insert(ClientAddress(address));
     next.run(request).await
 }
@@ -875,9 +965,7 @@ fn mount_and_bound(
     listener: &ListenerConfig,
     router: Router,
     plane: HttpPlane,
-    request_timeout: std::time::Duration,
-    max_request_bytes: usize,
-    concurrency: usize,
+    concurrency: Arc<tokio::sync::Semaphore>,
 ) -> Router {
     let router = if listener.external_base.path() == "/" {
         router
@@ -885,34 +973,251 @@ fn mount_and_bound(
         Router::new().nest(listener.external_base.path().trim_end_matches('/'), router)
     };
 
-    bound(
+    bound_at(
         router,
         plane,
-        request_timeout,
-        max_request_bytes,
+        &listener.http,
+        listener.external_base.path(),
         concurrency,
     )
 }
 
-fn bound(
+#[cfg(test)]
+fn bound(router: Router, plane: HttpPlane, budget: &HttpBudgetConfig) -> Router {
+    bound_with_concurrency(
+        router,
+        plane,
+        budget,
+        Arc::new(tokio::sync::Semaphore::new(budget.max_in_flight_requests)),
+    )
+}
+
+#[cfg(test)]
+fn bound_with_concurrency(
     router: Router,
     plane: HttpPlane,
-    request_timeout: std::time::Duration,
-    max_request_bytes: usize,
-    concurrency: usize,
+    budget: &HttpBudgetConfig,
+    concurrency: Arc<tokio::sync::Semaphore>,
 ) -> Router {
+    bound_at(router, plane, budget, "/", concurrency)
+}
+
+fn bound_at(
+    router: Router,
+    plane: HttpPlane,
+    budget: &HttpBudgetConfig,
+    listener_base_path: &str,
+    concurrency: Arc<tokio::sync::Semaphore>,
+) -> Router {
+    let timeout = budget.request_timeout;
+    let listener_base_path: Arc<str> = Arc::from(listener_base_path);
+    let max_header_count = budget.max_header_count;
+    let max_header_bytes = budget.max_header_bytes;
+    let max_uri_bytes = budget.max_uri_bytes;
     router
+        .layer(DefaultBodyLimit::max(budget.max_request_bytes))
+        .layer(middleware::from_fn(move |request, next| {
+            request_shape_boundary(
+                plane,
+                max_header_count,
+                max_header_bytes,
+                max_uri_bytes,
+                request,
+                next,
+            )
+        }))
+        .layer(middleware::from_fn(move |request, next| {
+            concurrency_boundary(plane, Arc::clone(&concurrency), request, next)
+        }))
+        .layer(middleware::from_fn(move |request, next| {
+            exceptional_boundary(
+                plane,
+                timeout,
+                Arc::clone(&listener_base_path),
+                request,
+                next,
+            )
+        }))
+        .layer(middleware::from_fn(attach_client_address))
         .layer(middleware::from_fn(move |request, next| {
             response_policy(plane, request, next)
         }))
-        .layer(DefaultBodyLimit::max(max_request_bytes))
-        .layer(TimeoutLayer::with_status_code(
+}
+
+async fn request_shape_boundary(
+    plane: HttpPlane,
+    max_header_count: usize,
+    max_header_bytes: usize,
+    max_uri_bytes: usize,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<String>()
+        .cloned()
+        .unwrap_or_else(|| "unavailable".to_owned());
+    if request.uri().to_string().len() > max_uri_bytes {
+        return plane_exception_response(
+            plane,
+            StatusCode::URI_TOO_LONG,
+            "request_uri_too_long",
+            "The request URI exceeds this listener's bound.",
+            &request_id,
+            false,
+        );
+    }
+    let header_bytes = request
+        .headers()
+        .iter()
+        .fold(0_usize, |total, (name, value)| {
+            total
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+        });
+    if request.headers().len() > max_header_count || header_bytes > max_header_bytes {
+        return plane_exception_response(
+            plane,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "request_headers_too_large",
+            "The request headers exceed this listener's bound.",
+            &request_id,
+            false,
+        );
+    }
+    next.run(request).await
+}
+
+async fn concurrency_boundary(
+    plane: HttpPlane,
+    permits: Arc<tokio::sync::Semaphore>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<String>()
+        .cloned()
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let Ok(_permit) = permits.try_acquire_owned() else {
+        let mut response = plane_exception_response(
+            plane,
+            StatusCode::TOO_MANY_REQUESTS,
+            "listener_capacity_exceeded",
+            "This listener's in-flight request capacity is exhausted.",
+            &request_id,
+            false,
+        );
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    };
+    next.run(request).await
+}
+
+async fn exceptional_boundary(
+    plane: HttpPlane,
+    timeout: Duration,
+    listener_base_path: Arc<str>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<String>()
+        .cloned()
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let document = is_document_request(
+        plane,
+        request.method(),
+        request.uri().path(),
+        &listener_base_path,
+    );
+    match tokio::time::timeout(timeout, AssertUnwindSafe(next.run(request)).catch_unwind()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => plane_exception_response(
+            plane,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "The request could not be completed safely.",
+            &request_id,
+            document,
+        ),
+        Err(_) => plane_exception_response(
+            plane,
             StatusCode::REQUEST_TIMEOUT,
-            request_timeout,
-        ))
-        .layer(ConcurrencyLimitLayer::new(concurrency))
-        .layer(CatchPanicLayer::new())
-        .layer(middleware::from_fn(attach_client_address))
+            "request_timeout",
+            "The request exceeded this listener's time budget.",
+            &request_id,
+            document,
+        ),
+    }
+}
+
+fn is_document_request(
+    plane: HttpPlane,
+    method: &Method,
+    path: &str,
+    listener_base_path: &str,
+) -> bool {
+    if method != Method::GET {
+        return false;
+    }
+    let base = listener_base_path.trim_end_matches('/');
+    let Some(relative_path) = path.strip_prefix(base) else {
+        return false;
+    };
+    if !relative_path.is_empty() && !relative_path.starts_with('/') {
+        return false;
+    }
+    match plane {
+        HttpPlane::Runtime => {
+            (relative_path == "/auth" || relative_path.starts_with("/auth/"))
+                && !relative_path.starts_with("/auth/assets/")
+        }
+        HttpPlane::Control => {
+            (relative_path == "/console" || relative_path.starts_with("/console/"))
+                && !relative_path.starts_with("/console/assets/")
+        }
+        HttpPlane::Server => false,
+    }
+}
+
+fn plane_exception_response(
+    plane: HttpPlane,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    request_id: &str,
+    document: bool,
+) -> Response {
+    if document {
+        let title = if status == StatusCode::REQUEST_TIMEOUT {
+            "Request timed out"
+        } else {
+            "Page unavailable"
+        };
+        return (
+            status,
+            Html(format!(
+                "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title></head><body><main><h1>{title}</h1><p>Return to the Application and try again safely.</p><p>Request ID: {request_id}</p></main></body></html>"
+            )),
+        )
+            .into_response();
+    }
+    match plane {
+        HttpPlane::Runtime => runtime_error_response(status, code, message, request_id),
+        HttpPlane::Server => server_error_response(
+            status,
+            server_types::ServerErrorCode::TemporarilyUnavailable,
+            message,
+            request_id,
+        ),
+        HttpPlane::Control => {
+            control_problem(status, code, "Request unavailable", message, request_id)
+        }
+    }
 }
 
 async fn runtime_root(State(state): State<RuntimeState>) -> Redirect {
@@ -940,7 +1245,7 @@ fn runtime_document_error(state: &RuntimeState, title: &str, message: &str) -> R
         &state.probe.base_path,
         &[
             ("owlauth-runtime-flow", "error"),
-            ("owlauth-runtime-bootstrap", &serialized),
+            (web_assets::RUNTIME_BOOTSTRAP_META_NAME, &serialized),
         ],
     )
 }
@@ -1331,7 +1636,7 @@ async fn hosted_interaction_shell(
         &state.probe.base_path,
         &[
             ("owlauth-runtime-flow", "interaction"),
-            ("owlauth-runtime-bootstrap", &serialized),
+            (web_assets::RUNTIME_BOOTSTRAP_META_NAME, &serialized),
         ],
     );
     append_cookie(
@@ -1477,7 +1782,7 @@ async fn identity_mutation_shell(
         &state.probe.base_path,
         &[
             ("owlauth-runtime-flow", "identity_mutation"),
-            ("owlauth-runtime-bootstrap", &serialized),
+            (web_assets::RUNTIME_BOOTSTRAP_META_NAME, &serialized),
         ],
     );
     append_cookie(
@@ -2106,7 +2411,7 @@ async fn managed_reauthorization_shell(
         &state.probe.base_path,
         &[
             ("owlauth-runtime-flow", "managed_reauthorization"),
-            ("owlauth-runtime-bootstrap", &serialized),
+            (web_assets::RUNTIME_BOOTSTRAP_META_NAME, &serialized),
         ],
     );
     append_cookie(
@@ -2249,7 +2554,15 @@ async fn select_email_method(
                 expected_revision: request.expected_revision,
             })
             .await
-            .map(|()| runtime_types::CompletionResponse { completed: true }),
+            .and_then(|selection| {
+                if selection.status != LoginTransactionStatus::EmailAddressEntry {
+                    return Err(ApplicationError::Integrity);
+                }
+                Ok(runtime_types::SelectEmailResponse {
+                    status: runtime_types::HostedInteractionStatus::EmailAddressEntry,
+                    revision: selection.transaction_revision,
+                })
+            }),
         Err(error) => Err(error),
     };
     runtime_json(result, &request_id)
@@ -3109,7 +3422,7 @@ async fn provider_callback(
                     &state.probe.base_path,
                     &[
                         ("owlauth-runtime-flow", "managed_reauthorization"),
-                        ("owlauth-runtime-bootstrap", &serialized),
+                        (web_assets::RUNTIME_BOOTSTRAP_META_NAME, &serialized),
                     ],
                 );
                 if interaction.status.terminal() {
@@ -3614,7 +3927,7 @@ async fn browser_logout_shell(
         &state.probe.base_path,
         &[
             ("owlauth-runtime-flow", "browser-logout"),
-            ("owlauth-runtime-bootstrap", &serialized),
+            (web_assets::RUNTIME_BOOTSTRAP_META_NAME, &serialized),
         ],
     )
 }
@@ -3684,22 +3997,25 @@ async fn liveness() -> Json<HealthResponse> {
     Json(HealthResponse::ok())
 }
 
-async fn runtime_readiness(State(state): State<RuntimeState>) -> Response {
-    readiness_response(state.probe.ready.load(Ordering::Acquire))
-}
-
-async fn client_readiness(State(state): State<ClientState>) -> Response {
-    if !state.probe.ready.load(Ordering::Acquire) {
+async fn auth_readiness(State(state): State<AuthProbeState>) -> Response {
+    if !state.ready.load(Ordering::Acquire) {
         return readiness_response(false);
     }
-    let ready = match state.readiness.as_deref() {
+    let runtime_ready = match state.runtime_readiness.as_deref() {
+        Some(readiness) => readiness.readiness().await.is_ok(),
+        None => true,
+    };
+    if !runtime_ready {
+        return readiness_response(false);
+    }
+    let server_ready = match state.server_readiness.as_deref() {
         Some(readiness) => readiness
             .readiness()
             .await
             .is_ok_and(|snapshot| snapshot.is_ready()),
         None => true,
     };
-    readiness_response(ready)
+    readiness_response(server_ready)
 }
 
 async fn control_readiness(State(state): State<ControlState>) -> Response {
@@ -3722,83 +4038,83 @@ fn readiness_response(ready: bool) -> Response {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ClientUserListQuery {
+struct ServerUserListQuery {
     cursor: Option<String>,
     limit: Option<usize>,
 }
 
-async fn client_list_project_users(
-    State(state): State<ClientState>,
+async fn server_list_project_users(
+    State(state): State<ServerState>,
     Extension(request_id): Extension<String>,
-    Extension(principal): Extension<application::ClientPrincipal>,
+    Extension(principal): Extension<application::ServerPrincipal>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
-    let Ok(Query(query)) = Query::<ClientUserListQuery>::try_from_uri(&uri) else {
-        return client_problem(ApplicationError::InvalidInput, &request_id);
+    let Ok(Query(query)) = Query::<ServerUserListQuery>::try_from_uri(&uri) else {
+        return server_problem(ApplicationError::InvalidInput, &request_id);
     };
-    let result = client_api(&state)
+    let result = server_api(&state)
         .map(|service| service.list_users(&principal, query.cursor.as_deref(), query.limit));
     let result = match result {
-        Ok(future) => future.await.and_then(client_user_list),
+        Ok(future) => future.await.and_then(server_user_list),
         Err(error) => Err(error),
     };
-    client_json(result, &request_id)
+    server_json(result, &request_id)
 }
 
-async fn client_get_project_user(
-    State(state): State<ClientState>,
+async fn server_get_project_user(
+    State(state): State<ServerState>,
     Extension(request_id): Extension<String>,
-    Extension(principal): Extension<application::ClientPrincipal>,
+    Extension(principal): Extension<application::ServerPrincipal>,
     Path((_project_id, user_id)): Path<(String, String)>,
 ) -> Response {
-    let result = match client_api(&state) {
-        Ok(service) => service.user(&principal, &user_id).await.map(client_user),
+    let result = match server_api(&state) {
+        Ok(service) => service.user(&principal, &user_id).await.map(server_user),
         Err(error) => Err(error),
     };
-    client_json(result, &request_id)
+    server_json(result, &request_id)
 }
 
-async fn client_lookup_project_user(
-    State(state): State<ClientState>,
+async fn server_lookup_project_user(
+    State(state): State<ServerState>,
     Extension(request_id): Extension<String>,
-    Extension(principal): Extension<application::ClientPrincipal>,
-    ClientJson(request): ClientJson<client_types::LookupClientUserRequest>,
+    Extension(principal): Extension<application::ServerPrincipal>,
+    ServerJson(request): ServerJson<server_types::LookupServerUserRequest>,
 ) -> Response {
-    let result = match client_api(&state) {
+    let result = match server_api(&state) {
         Ok(service) => service
             .lookup_user_by_email(&principal, &request.email)
             .await
-            .map(|user| client_types::LookupClientUserResponse {
-                user: user.map(client_user),
+            .map(|user| server_types::LookupServerUserResponse {
+                user: user.map(server_lookup_user),
             }),
         Err(error) => Err(error),
     };
-    client_json(result, &request_id)
+    server_json(result, &request_id)
 }
 
-async fn client_get_application_user_projection(
-    State(state): State<ClientState>,
+async fn server_get_application_user_projection(
+    State(state): State<ServerState>,
     Extension(request_id): Extension<String>,
-    Extension(principal): Extension<application::ClientPrincipal>,
+    Extension(principal): Extension<application::ServerPrincipal>,
     Path((_project_id, application_id, user_id)): Path<(String, String, String)>,
 ) -> Response {
-    let result = match client_api(&state) {
+    let result = match server_api(&state) {
         Ok(service) => service
             .application_projection(&principal, &application_id, &user_id)
             .await
-            .and_then(client_application_projection),
+            .and_then(server_application_projection),
         Err(error) => Err(error),
     };
-    client_json(result, &request_id)
+    server_json(result, &request_id)
 }
 
-async fn client_introspect_project_token(
-    State(state): State<ClientState>,
+async fn server_introspect_project_token(
+    State(state): State<ServerState>,
     Extension(request_id): Extension<String>,
-    Extension(principal): Extension<application::ClientPrincipal>,
-    ClientJson(request): ClientJson<client_types::IntrospectProjectTokenRequest>,
+    Extension(principal): Extension<application::ServerPrincipal>,
+    ServerJson(request): ServerJson<server_types::IntrospectProjectTokenRequest>,
 ) -> Response {
-    let result = match client_api(&state) {
+    let result = match server_api(&state) {
         Ok(service) => service
             .introspect(
                 &principal,
@@ -3806,24 +4122,32 @@ async fn client_introspect_project_token(
                 request.expected_application_id.as_deref(),
             )
             .await
-            .and_then(client_token_introspection),
+            .and_then(server_token_introspection),
         Err(error) => Err(error),
     };
-    client_json(result, &request_id)
+    server_json(result, &request_id)
 }
 
-fn client_api(state: &ClientState) -> Result<&application::ClientApiService, ApplicationError> {
+fn server_api(state: &ServerState) -> Result<&application::ServerApiService, ApplicationError> {
     state.api.as_deref().ok_or(ApplicationError::Persistence)
 }
 
-fn client_user(user: application::ClientUser) -> client_types::ClientUser {
-    client_types::ClientUser {
+fn server_lookup_user(user: application::ServerUser) -> server_types::ServerUser {
+    let mut user = server_user(user);
+    // Exact-email lookup identifies a user but never returns an address, even if a repository
+    // implementation accidentally supplies one.
+    user.verified_email = None;
+    user
+}
+
+fn server_user(user: application::ServerUser) -> server_types::ServerUser {
+    server_types::ServerUser {
         user_id: user.user_public_id,
         project_id: user.project_public_id,
         status: match user.status {
-            application::ClientUserStatus::Active => client_types::ClientUserStatus::Active,
-            application::ClientUserStatus::Disabled => client_types::ClientUserStatus::Disabled,
-            application::ClientUserStatus::Merged => client_types::ClientUserStatus::Merged,
+            application::ServerUserStatus::Active => server_types::ServerUserStatus::Active,
+            application::ServerUserStatus::Disabled => server_types::ServerUserStatus::Disabled,
+            application::ServerUserStatus::Merged => server_types::ServerUserStatus::Merged,
         },
         display_name: user.display_name,
         picture_url: user.picture_url,
@@ -3834,25 +4158,25 @@ fn client_user(user: application::ClientUser) -> client_types::ClientUser {
     }
 }
 
-fn client_user_list(
-    page: application::ClientUserPage,
-) -> Result<client_types::ClientUserList, ApplicationError> {
-    if page.users.len() > application::MAX_CLIENT_USER_PAGE_LIMIT {
+fn server_user_list(
+    page: application::ServerUserPage,
+) -> Result<server_types::ServerUserList, ApplicationError> {
+    if page.users.len() > application::MAX_SERVER_USER_PAGE_LIMIT {
         return Err(ApplicationError::Integrity);
     }
-    Ok(client_types::ClientUserList {
-        items: page.users.into_iter().map(client_user).collect(),
+    Ok(server_types::ServerUserList {
+        items: page.users.into_iter().map(server_user).collect(),
         next_cursor: page.next_cursor,
     })
 }
 
-fn client_application_projection(
-    projection: application::ClientApplicationProjection,
-) -> Result<client_types::ClientApplicationUserProjection, ApplicationError> {
+fn server_application_projection(
+    projection: application::ServerApplicationProjection,
+) -> Result<server_types::ServerApplicationUserProjection, ApplicationError> {
     // The document's updated_at is the projected Project-user timestamp. The projection row's
     // updated_at is storage/materialization metadata and may legitimately be later after first
     // materialization or repair, so it must not redefine or invalidate the public document field.
-    client_projection_document(
+    server_projection_document(
         projection.project_public_id,
         projection.application_public_id,
         projection.user_public_id,
@@ -3861,18 +4185,18 @@ fn client_application_projection(
     )
 }
 
-fn client_projection_document(
+fn server_projection_document(
     project_public_id: String,
     application_public_id: String,
     user_public_id: String,
     projection_revision: i64,
     document: serde_json::Value,
-) -> Result<client_types::ClientApplicationUserProjection, ApplicationError> {
+) -> Result<server_types::ServerApplicationUserProjection, ApplicationError> {
     let document = user_projection(document)?;
     if document.user_id != user_public_id || document.projection_revision != projection_revision {
         return Err(ApplicationError::Integrity);
     }
-    Ok(client_types::ClientApplicationUserProjection {
+    Ok(server_types::ServerApplicationUserProjection {
         project_id: project_public_id,
         application_id: application_public_id,
         user_id: user_public_id,
@@ -3889,25 +4213,25 @@ fn client_projection_document(
     })
 }
 
-fn client_token_introspection(
-    result: application::ClientTokenIntrospection,
-) -> Result<client_types::ProjectTokenIntrospectionResponse, ApplicationError> {
+fn server_token_introspection(
+    result: application::ServerTokenIntrospection,
+) -> Result<server_types::ProjectTokenIntrospectionResponse, ApplicationError> {
     match result {
-        application::ClientTokenIntrospection::Inactive => {
-            Ok(client_types::ProjectTokenIntrospectionResponse::Inactive(
-                client_types::InactiveProjectToken { active: false },
+        application::ServerTokenIntrospection::Inactive => {
+            Ok(server_types::ProjectTokenIntrospectionResponse::Inactive(
+                server_types::InactiveProjectToken { active: false },
             ))
         }
-        application::ClientTokenIntrospection::Active(active) => {
-            let projection = client_projection_document(
+        application::ServerTokenIntrospection::Active(active) => {
+            let projection = server_projection_document(
                 active.project_public_id.clone(),
                 active.application_public_id.clone(),
                 active.user_public_id.clone(),
                 active.projection_revision,
                 active.projection_document,
             )?;
-            Ok(client_types::ProjectTokenIntrospectionResponse::Active(
-                client_types::ActiveProjectToken {
+            Ok(server_types::ProjectTokenIntrospectionResponse::Active(
+                server_types::ActiveProjectToken {
                     active: true,
                     project_id: active.project_public_id,
                     application_id: active.application_public_id,
@@ -3983,9 +4307,9 @@ where
     }
 }
 
-struct ClientJson<T>(T);
+struct ServerJson<T>(T);
 
-impl<S, T> FromRequest<S> for ClientJson<T>
+impl<S, T> FromRequest<S> for ServerJson<T>
 where
     S: Send + Sync,
     T: DeserializeOwned,
@@ -4002,10 +4326,40 @@ where
             .await
             .map(|Json(value)| Self(value))
             .map_err(|_| {
-                client_error_response(
+                server_error_response(
                     StatusCode::BAD_REQUEST,
-                    client_types::ClientErrorCode::InvalidRequest,
-                    "The Client request body must be bounded JSON matching the operation schema.",
+                    server_types::ServerErrorCode::InvalidRequest,
+                    "The Server API request body must be bounded JSON matching the operation schema.",
+                    &request_id,
+                )
+            })
+    }
+}
+
+struct ControlQuery<T>(T);
+
+impl<S, T> FromRequestParts<S> for ControlQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = parts
+            .extensions
+            .get::<String>()
+            .cloned()
+            .unwrap_or_else(|| "unavailable".to_owned());
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(value)| Self(value))
+            .map_err(|_| {
+                control_problem(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Invalid query request",
+                    "The query string must match the closed operation schema.",
                     &request_id,
                 )
             })
@@ -4042,8 +4396,8 @@ where
     }
 }
 
-async fn require_client_key(
-    State(state): State<ClientState>,
+async fn require_server_key(
+    State(state): State<ServerState>,
     Extension(client): Extension<ClientAddress>,
     Path(parameters): Path<HashMap<String, String>>,
     mut request: Request,
@@ -4057,19 +4411,19 @@ async fn require_client_key(
     if let AdmissionDecision::Rejected {
         retry_after_seconds,
         ..
-    } = state.admission.admit_client_pre_authority(&client.0).await
+    } = state.admission.admit_server_pre_authority(&client.0).await
     {
-        return client_rate_limited_response(retry_after_seconds, &request_id);
+        return server_rate_limited_response(retry_after_seconds, &request_id);
     }
     let Some(project_public_id) = parameters.get("project_id") else {
-        return client_problem(ApplicationError::InvalidInput, &request_id);
+        return server_problem(ApplicationError::InvalidInput, &request_id);
     };
-    let Some(credential) = client_bearer_credential(request.headers()) else {
-        return client_credential_denial(&state, &client, &request_id).await;
+    let Some(credential) = server_bearer_credential(request.headers()) else {
+        return server_credential_denial(&state, &client, &request_id).await;
     };
-    let service = match client_api(&state) {
+    let service = match server_api(&state) {
         Ok(service) => service,
-        Err(error) => return client_problem(error, &request_id),
+        Err(error) => return server_problem(error, &request_id),
     };
     let principal = service.authenticate(project_public_id, credential).await;
     match principal {
@@ -4081,12 +4435,12 @@ async fn require_client_key(
                 ..
             } = state
                 .admission
-                .admit_client_authoritative(&client.0, &project_id, &key_id)
+                .admit_server_authoritative(&client.0, &project_id, &key_id)
                 .await
             {
-                return client_rate_limited_response(retry_after_seconds, &request_id);
+                return server_rate_limited_response(retry_after_seconds, &request_id);
             }
-            service.observe_client_key_usage(&principal);
+            service.observe_server_key_usage(&principal);
             request.headers_mut().remove(header::AUTHORIZATION);
             request.extensions_mut().insert(principal);
             next.run(request).await
@@ -4095,30 +4449,30 @@ async fn require_client_key(
             ApplicationError::Integrity
             | ApplicationError::Persistence
             | ApplicationError::ExternalStore,
-        ) => client_problem(ApplicationError::Persistence, &request_id),
-        Err(_) => client_credential_denial(&state, &client, &request_id).await,
+        ) => server_problem(ApplicationError::Persistence, &request_id),
+        Err(_) => server_credential_denial(&state, &client, &request_id).await,
     }
 }
 
-async fn client_credential_denial(
-    state: &ClientState,
+async fn server_credential_denial(
+    state: &ServerState,
     client: &ClientAddress,
     request_id: &str,
 ) -> Response {
     match state
         .admission
-        .admit_client_credential_failure(&client.0)
+        .admit_server_credential_failure(&client.0)
         .await
     {
-        AdmissionDecision::Allowed => unauthorized_client(request_id),
+        AdmissionDecision::Allowed => unauthorized_server(request_id),
         AdmissionDecision::Rejected {
             retry_after_seconds,
             ..
-        } => client_rate_limited_response(retry_after_seconds, request_id),
+        } => server_rate_limited_response(retry_after_seconds, request_id),
     }
 }
 
-fn client_bearer_credential(headers: &HeaderMap) -> Option<&str> {
+fn server_bearer_credential(headers: &HeaderMap) -> Option<&str> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let value = values.next()?;
     if values.next().is_some() {
@@ -4135,21 +4489,72 @@ async fn require_operator(
     request: Request,
     next: Next,
 ) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<String>()
+        .cloned()
+        .unwrap_or_else(|| "unavailable".to_owned());
     if !valid_control_authorization(request.headers(), &state.operator_key) {
-        let request_id = request
+        let source = request
             .extensions()
-            .get::<String>()
-            .cloned()
-            .unwrap_or_else(|| "unavailable".to_owned());
-        return control_problem(
+            .get::<ClientAddress>()
+            .map_or("unknown", |client| client.0.as_str());
+        if let Some(retry_after) = state.credential_failures.record(source, Instant::now()) {
+            let mut response = control_problem(
+                StatusCode::TOO_MANY_REQUESTS,
+                "credential_rate_limited",
+                "Authentication rate limited",
+                "Too many invalid operator credentials were presented from this source.",
+                &request_id,
+            );
+            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return response;
+        }
+        return bearer_challenge(control_problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "Authentication required",
             "A single valid deployment operator Bearer credential is required.",
             &request_id,
+        ));
+    }
+    if is_control_mutation(request.method())
+        && !control_browser_metadata_allowed(request.headers(), &state.external_origin)
+    {
+        return control_problem(
+            StatusCode::FORBIDDEN,
+            "forbidden_browser_request",
+            "Browser request forbidden",
+            "Browser Control mutations require exact same-origin request metadata.",
+            &request_id,
         );
     }
     next.run(request).await
+}
+
+fn is_control_mutation(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+fn control_browser_metadata_allowed(headers: &HeaderMap, expected_origin: &str) -> bool {
+    const BROWSER_METADATA: [&str; 4] = [
+        "origin",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-dest",
+    ];
+    if !BROWSER_METADATA
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return true;
+    }
+    is_same_origin_mutation(headers, expected_origin)
 }
 
 fn provisioning(state: &ControlState) -> Result<&ProvisioningService, ApplicationError> {
@@ -4350,7 +4755,7 @@ async fn create_managed_reauthorization(
     let Some(service) = state.managed_reauthorization.as_deref() else {
         return application_problem(ApplicationError::Persistence, &request_id);
     };
-    let result = service
+    match service
         .create_for_adapter_key(
             CreateManagedReauthorization {
                 project_id,
@@ -4366,13 +4771,40 @@ async fn create_managed_reauthorization(
             &metadata.capability_key,
         )
         .await
-        .map(
-            |created| control_types::CreateManagedReauthorizationResponse {
-                interaction: managed_reauthorization_response(created.interaction),
-                hosted_target: created.hosted_target,
-            },
-        );
-    control_json(result, &request_id)
+    {
+        Ok(outcome) => {
+            let (status, interaction, hosted_target) = match outcome {
+                application::ManagedReauthorizationCreateOutcome::Created {
+                    interaction,
+                    hosted_target,
+                } => (StatusCode::CREATED, interaction, hosted_target),
+                application::ManagedReauthorizationCreateOutcome::Replayed {
+                    interaction,
+                    hosted_target,
+                } => (StatusCode::OK, interaction, hosted_target),
+            };
+            let interaction_id = interaction.id;
+            let mut response = (
+                status,
+                Json(control_types::CreateManagedReauthorizationResponse {
+                    interaction: managed_reauthorization_response(interaction),
+                    hosted_target,
+                }),
+            )
+                .into_response();
+            if status == StatusCode::CREATED {
+                insert_location(
+                    &mut response,
+                    &format!(
+                        "{}v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations/{interaction_id}",
+                        state.probe.base_path
+                    ),
+                );
+            }
+            response
+        }
+        Err(error) => application_problem(error, &request_id),
+    }
 }
 
 async fn get_managed_reauthorization(
@@ -4562,11 +4994,11 @@ fn control_lifecycle(state: &ControlState) -> Result<&ControlLifecycleService, A
         .ok_or(ApplicationError::Persistence)
 }
 
-fn client_key_lifecycle(
+fn server_key_lifecycle(
     state: &ControlState,
-) -> Result<&application::ClientKeyLifecycleService, ApplicationError> {
+) -> Result<&application::ServerKeyLifecycleService, ApplicationError> {
     state
-        .client_keys
+        .server_keys
         .as_deref()
         .ok_or(ApplicationError::Persistence)
 }
@@ -4590,6 +5022,7 @@ fn runtime_auth(state: &RuntimeState) -> Result<&RuntimeAuthService, Application
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListProjectsQuery {
     belongs_to: Option<String>,
 }
@@ -4597,7 +5030,7 @@ struct ListProjectsQuery {
 async fn list_projects(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
-    Query(query): Query<ListProjectsQuery>,
+    ControlQuery(query): ControlQuery<ListProjectsQuery>,
 ) -> Response {
     match provisioning(&state) {
         Ok(service) => match service.list_projects(query.belongs_to).await {
@@ -5090,11 +5523,13 @@ async fn test_smtp_configuration(
     let mut response = control_json(result, &request_id);
     if let Some(operation_id) = operation_id {
         *response.status_mut() = StatusCode::ACCEPTED;
-        if let Ok(value) = HeaderValue::from_str(&format!(
-            "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/tests/{operation_id}"
-        )) {
-            response.headers_mut().insert(header::LOCATION, value);
-        }
+        insert_location(
+            &mut response,
+            &format!(
+                "{}v1/projects/{project_id}/smtp-configurations/{smtp_id}/tests/{operation_id}",
+                state.probe.base_path
+            ),
+        );
     }
     response
 }
@@ -5588,14 +6023,37 @@ async fn create_identity_mutation_intent(
         })
         .await
     {
-        Ok(created) => (
-            StatusCode::CREATED,
-            Json(control_types::CreateIdentityMutationIntentResponse {
-                intent: control_identity_mutation_view(created.intent),
-                hosted_target: created.hosted_target,
-            }),
-        )
-            .into_response(),
+        Ok(outcome) => {
+            let (status, intent, hosted_target) = match outcome {
+                application::IdentityMutationCreateOutcome::Created {
+                    intent,
+                    hosted_target,
+                } => (StatusCode::CREATED, intent, hosted_target),
+                application::IdentityMutationCreateOutcome::Replayed {
+                    intent,
+                    hosted_target,
+                } => (StatusCode::OK, intent, hosted_target),
+            };
+            let intent_id = intent.id;
+            let mut response = (
+                status,
+                Json(control_types::CreateIdentityMutationIntentResponse {
+                    intent: control_identity_mutation_view(intent),
+                    hosted_target,
+                }),
+            )
+                .into_response();
+            if status == StatusCode::CREATED {
+                insert_location(
+                    &mut response,
+                    &format!(
+                        "{}v1/projects/{project_id}/identity-mutation-intents/{intent_id}",
+                        state.probe.base_path
+                    ),
+                );
+            }
+            response
+        }
         Err(error) => application_problem(error, &request_id),
     }
 }
@@ -5771,35 +6229,32 @@ fn control_identity_mutation_view(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ListProjectClientKeysQuery {
+struct ListProjectServerKeysQuery {
     cursor: Option<String>,
     limit: Option<usize>,
 }
 
-async fn list_project_client_keys(
+async fn list_project_server_keys(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path(project_id): Path<String>,
-    query: Result<Query<ListProjectClientKeysQuery>, axum::extract::rejection::QueryRejection>,
+    ControlQuery(query): ControlQuery<ListProjectServerKeysQuery>,
 ) -> Response {
     let project_id = match resource_uuid(&project_id, &request_id) {
         Ok(id) => id,
         Err(response) => return response,
     };
-    let Ok(Query(query)) = query else {
-        return application_problem(ApplicationError::InvalidInput, &request_id);
-    };
-    match client_key_lifecycle(&state) {
+    match server_key_lifecycle(&state) {
         Ok(service) => match service
-            .list_project_client_keys(project_id, query.cursor.as_deref(), query.limit)
+            .list_project_server_keys(project_id, query.cursor.as_deref(), query.limit)
             .await
         {
             Ok((keys, next_cursor, active_unacknowledged_key)) => {
-                Json(control_types::ProjectClientKeyList {
-                    items: keys.into_iter().map(control_project_client_key).collect(),
+                Json(control_types::ProjectServerKeyList {
+                    items: keys.into_iter().map(control_project_server_key).collect(),
                     next_cursor,
                     active_unacknowledged_key: active_unacknowledged_key
-                        .map(control_project_client_key),
+                        .map(control_project_server_key),
                 })
                 .into_response()
             }
@@ -5809,7 +6264,7 @@ async fn list_project_client_keys(
     }
 }
 
-async fn get_project_client_key(
+async fn get_project_server_key(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path((project_id, key_id)): Path<(String, String)>,
@@ -5822,21 +6277,21 @@ async fn get_project_client_key(
         Ok(id) => id,
         Err(response) => return response,
     };
-    match client_key_lifecycle(&state) {
-        Ok(service) => match service.get_project_client_key(project_id, key_id).await {
-            Ok(key) => Json(control_project_client_key(key)).into_response(),
+    match server_key_lifecycle(&state) {
+        Ok(service) => match service.get_project_server_key(project_id, key_id).await {
+            Ok(key) => Json(control_project_server_key(key)).into_response(),
             Err(error) => application_problem(error, &request_id),
         },
         Err(error) => application_problem(error, &request_id),
     }
 }
 
-async fn create_project_client_key(
+async fn create_project_server_key(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path(project_id): Path<String>,
     headers: HeaderMap,
-    ControlJson(body): ControlJson<control_types::CreateProjectClientKeyRequest>,
+    ControlJson(body): ControlJson<control_types::CreateProjectServerKeyRequest>,
 ) -> Response {
     let project_id = match resource_uuid(&project_id, &request_id) {
         Ok(id) => id,
@@ -5845,10 +6300,10 @@ async fn create_project_client_key(
     let Ok(idempotency_key) = idempotency_key(&headers) else {
         return invalid_idempotency(&request_id);
     };
-    let result = match client_key_lifecycle(&state) {
+    let result = match server_key_lifecycle(&state) {
         Ok(service) => {
             service
-                .create_project_client_key(application::CreateProjectClientKey {
+                .create_project_server_key(application::CreateProjectServerKey {
                     project_id,
                     label: body.label,
                     idempotency_key,
@@ -5859,18 +6314,29 @@ async fn create_project_client_key(
         Err(error) => Err(error),
     };
     match result {
-        Ok(application::CreateProjectClientKeyResult::Created {
+        Ok(application::CreateProjectServerKeyResult::Created {
             metadata,
             credential,
-        }) => (
-            StatusCode::CREATED,
-            Json(control_types::CreateProjectClientKeyResponse {
-                key: control_project_client_key(metadata),
-                credential: credential.expose().to_owned(),
-            }),
-        )
-            .into_response(),
-        Ok(application::CreateProjectClientKeyResult::ReplayWithoutSecret { metadata }) => {
+        }) => {
+            let key_id = metadata.id;
+            let mut response = (
+                StatusCode::CREATED,
+                Json(control_types::CreateProjectServerKeyResponse {
+                    key: control_project_server_key(metadata),
+                    credential: credential.expose().to_owned(),
+                }),
+            )
+                .into_response();
+            insert_location(
+                &mut response,
+                &format!(
+                    "{}v1/projects/{project_id}/server-keys/{key_id}",
+                    state.probe.base_path
+                ),
+            );
+            response
+        }
+        Ok(application::CreateProjectServerKeyResult::ReplayWithoutSecret { metadata }) => {
             let detail = format!(
                 "This idempotent create already completed for public key ID {}; its one-time credential cannot be shown again. Revoke that key and create another.",
                 metadata.public_key_id
@@ -5887,12 +6353,12 @@ async fn create_project_client_key(
     }
 }
 
-async fn acknowledge_project_client_key_delivery(
+async fn acknowledge_project_server_key_delivery(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path((project_id, key_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ControlJson(body): ControlJson<control_types::AcknowledgeProjectClientKeyDeliveryRequest>,
+    ControlJson(body): ControlJson<control_types::AcknowledgeProjectServerKeyDeliveryRequest>,
 ) -> Response {
     if !body.confirm_stored {
         return application_problem(ApplicationError::InvalidInput, &request_id);
@@ -5904,10 +6370,10 @@ async fn acknowledge_project_client_key_delivery(
     let Ok(idempotency_key) = idempotency_key(&headers) else {
         return invalid_idempotency(&request_id);
     };
-    match client_key_lifecycle(&state) {
+    match server_key_lifecycle(&state) {
         Ok(service) => match service
-            .acknowledge_project_client_key_delivery(
-                application::AcknowledgeProjectClientKeyDelivery {
+            .acknowledge_project_server_key_delivery(
+                application::AcknowledgeProjectServerKeyDelivery {
                     project_id,
                     key_id,
                     expected_revision: body.expected_revision,
@@ -5917,19 +6383,19 @@ async fn acknowledge_project_client_key_delivery(
             )
             .await
         {
-            Ok(key) => Json(control_project_client_key(key)).into_response(),
+            Ok(key) => Json(control_project_server_key(key)).into_response(),
             Err(error) => application_problem(error, &request_id),
         },
         Err(error) => application_problem(error, &request_id),
     }
 }
 
-async fn revoke_project_client_key(
+async fn revoke_project_server_key(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path((project_id, key_id)): Path<(String, String)>,
     headers: HeaderMap,
-    ControlJson(body): ControlJson<control_types::RevokeProjectClientKeyRequest>,
+    ControlJson(body): ControlJson<control_types::RevokeProjectServerKeyRequest>,
 ) -> Response {
     if !body.confirm {
         return application_problem(ApplicationError::InvalidInput, &request_id);
@@ -5941,9 +6407,9 @@ async fn revoke_project_client_key(
     let Ok(idempotency_key) = idempotency_key(&headers) else {
         return invalid_idempotency(&request_id);
     };
-    match client_key_lifecycle(&state) {
+    match server_key_lifecycle(&state) {
         Ok(service) => match service
-            .revoke_project_client_key(application::RevokeProjectClientKey {
+            .revoke_project_server_key(application::RevokeProjectServerKey {
                 project_id,
                 key_id,
                 expected_revision: body.expected_revision,
@@ -5952,7 +6418,7 @@ async fn revoke_project_client_key(
             })
             .await
         {
-            Ok(key) => Json(control_project_client_key(key)).into_response(),
+            Ok(key) => Json(control_project_server_key(key)).into_response(),
             Err(error) => application_problem(error, &request_id),
         },
         Err(error) => application_problem(error, &request_id),
@@ -5960,8 +6426,13 @@ async fn revoke_project_client_key(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListProjectUsersQuery {
     status: Option<control_types::ProjectUserStatus>,
+    search: Option<String>,
+    identity_kind: Option<control_types::ProjectUserIdentityFilter>,
+    provider_key: Option<String>,
+    sort: Option<control_types::ProjectUserSort>,
     cursor: Option<String>,
     limit: Option<usize>,
 }
@@ -5970,7 +6441,7 @@ async fn list_project_users(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path(project_id): Path<String>,
-    Query(query): Query<ListProjectUsersQuery>,
+    ControlQuery(query): ControlQuery<ListProjectUsersQuery>,
 ) -> Response {
     let project_id = match resource_uuid(&project_id, &request_id) {
         Ok(id) => id,
@@ -5984,14 +6455,64 @@ async fn list_project_users(
         None => None,
     };
     let status = query.status.map(application_project_user_status);
+    let identity_kind = query.identity_kind.map(|kind| match kind {
+        control_types::ProjectUserIdentityFilter::Provider => {
+            application::ProjectUserIdentityKind::Provider
+        }
+        control_types::ProjectUserIdentityFilter::Email => {
+            application::ProjectUserIdentityKind::Email
+        }
+    });
+    let sort = query.sort.map(|sort| match sort {
+        control_types::ProjectUserSort::CreatedNewest => {
+            application::ProjectUserSort::CreatedNewest
+        }
+        control_types::ProjectUserSort::CreatedOldest => {
+            application::ProjectUserSort::CreatedOldest
+        }
+    });
     match control_lifecycle(&state) {
         Ok(service) => match service
-            .list_project_users(project_id, status, cursor, query.limit)
+            .list_project_users(
+                project_id,
+                status,
+                query.search.as_deref(),
+                identity_kind,
+                query.provider_key.as_deref(),
+                sort,
+                cursor,
+                query.limit,
+            )
             .await
         {
             Ok(page) => Json(control_types::ProjectUserList {
                 items: page.items.into_iter().map(control_project_user).collect(),
                 next_cursor: page.next_cursor.map(|cursor| cursor.to_string()),
+            })
+            .into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn lookup_project_user_by_email(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::ProjectUserEmailLookupRequest>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_lifecycle(&state) {
+        Ok(service) => match service
+            .lookup_project_user_by_email(project_id, &body.email)
+            .await
+        {
+            Ok(user) => Json(control_types::ProjectUserLookup {
+                user: user.map(control_project_user),
             })
             .into_response(),
             Err(error) => application_problem(error, &request_id),
@@ -6216,20 +6737,20 @@ async fn revoke_browser_session(
     }
 }
 
-fn control_project_client_key(
-    key: application::ProjectClientKeyRecord,
-) -> control_types::ProjectClientKey {
-    control_types::ProjectClientKey {
+fn control_project_server_key(
+    key: application::ProjectServerKeyRecord,
+) -> control_types::ProjectServerKey {
+    control_types::ProjectServerKey {
         id: key.id.to_string(),
         project_id: key.project_id.to_string(),
         public_key_id: key.public_key_id,
         label: key.label,
         status: match key.status {
-            application::ProjectClientKeyStatus::Active => {
-                control_types::ProjectClientKeyStatus::Active
+            application::ProjectServerKeyStatus::Active => {
+                control_types::ProjectServerKeyStatus::Active
             }
-            application::ProjectClientKeyStatus::Revoked => {
-                control_types::ProjectClientKeyStatus::Revoked
+            application::ProjectServerKeyStatus::Revoked => {
+                control_types::ProjectServerKeyStatus::Revoked
             }
         },
         digest_key_version: key.digest_key_version,
@@ -6960,6 +7481,7 @@ async fn activate_webhook_secret_rotation(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListHistoryQuery {
     cursor: Option<String>,
     limit: Option<usize>,
@@ -6969,7 +7491,7 @@ async fn list_application_user_events(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path((project_id, application_id)): Path<(String, String)>,
-    Query(query): Query<ListHistoryQuery>,
+    ControlQuery(query): ControlQuery<ListHistoryQuery>,
 ) -> Response {
     let (project_id, application_id) =
         match resource_pair(&project_id, &application_id, &request_id) {
@@ -7001,6 +7523,7 @@ async fn list_application_user_events(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListWebhookDeliveriesQuery {
     endpoint_id: Option<String>,
     cursor: Option<String>,
@@ -7011,7 +7534,7 @@ async fn list_webhook_deliveries(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
     Path((project_id, application_id)): Path<(String, String)>,
-    Query(query): Query<ListWebhookDeliveriesQuery>,
+    ControlQuery(query): ControlQuery<ListWebhookDeliveriesQuery>,
 ) -> Response {
     let (project_id, application_id) =
         match resource_pair(&project_id, &application_id, &request_id) {
@@ -7050,6 +7573,26 @@ async fn list_webhook_deliveries(
     control_json(result, &request_id)
 }
 
+async fn get_webhook_delivery(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, application_id, delivery_id)): Path<(String, String, String)>,
+) -> Response {
+    let (project_id, application_id, delivery_id) =
+        match three_resource_ids(&project_id, &application_id, &delivery_id, &request_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let result = match webhook_control(&state) {
+        Ok(service) => service
+            .get_delivery(project_id, application_id, delivery_id)
+            .await
+            .and_then(control_webhook_delivery),
+        Err(error) => Err(error),
+    };
+    control_json(result, &request_id)
+}
+
 async fn replay_webhook_delivery(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -7064,8 +7607,8 @@ async fn replay_webhook_delivery(
             Ok(value) => value,
             Err(response) => return response,
         };
-    let result = match webhook_control(&state) {
-        Ok(service) => service
+    match webhook_control(&state) {
+        Ok(service) => match service
             .replay_delivery(
                 project_id,
                 application_id,
@@ -7073,10 +7616,24 @@ async fn replay_webhook_delivery(
                 request_uuid(&request_id),
             )
             .await
-            .and_then(control_webhook_delivery),
-        Err(error) => Err(error),
-    };
-    control_json(result, &request_id)
+            .and_then(control_webhook_delivery)
+        {
+            Ok(delivery) => {
+                let created_id = delivery.id.clone();
+                let mut response = (StatusCode::CREATED, Json(delivery)).into_response();
+                insert_location(
+                    &mut response,
+                    &format!(
+                        "{}v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{created_id}",
+                        state.probe.base_path
+                    ),
+                );
+                response
+            }
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
 }
 
 async fn list_signing_keys(
@@ -7891,6 +8448,17 @@ fn hosted_interaction_response(
             bootstrap.interaction.email_otp_enabled,
             bootstrap.interaction.email_magic_link_enabled,
         ),
+        pending_email_challenge: bootstrap.interaction.pending_email_challenge.as_ref().map(
+            |challenge| runtime_types::HostedPendingEmailChallenge {
+                challenge_id: challenge.challenge_id.to_string(),
+                generation: challenge.generation,
+                proof_modes: email_proof_modes(
+                    challenge.otp_available,
+                    challenge.magic_link_available,
+                ),
+                expires_at: timestamp(challenge.expires_at),
+            },
+        ),
         csrf: bootstrap.csrf.to_string(),
         expires_at: timestamp(bootstrap.interaction.expires_at),
     })
@@ -8275,12 +8843,19 @@ fn forbidden_hosted_request(request_id: &str) -> Response {
 }
 
 fn unauthorized_runtime(request_id: &str) -> Response {
-    runtime_error_response(
+    bearer_challenge(runtime_error_response(
         StatusCode::UNAUTHORIZED,
         "unauthorized",
         "A single valid Project Bearer token is required.",
         request_id,
-    )
+    ))
+}
+
+fn bearer_challenge(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
 }
 
 fn control_project_policy(
@@ -8448,6 +9023,14 @@ fn control_provider(
     })
 }
 
+fn insert_location(response: &mut Response, location: &str) {
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(location)
+            .expect("a server-generated resource path is a valid header"),
+    );
+}
+
 fn control_json<T>(result: Result<T, ApplicationError>, request_id: &str) -> Response
 where
     T: Serialize,
@@ -8502,17 +9085,23 @@ fn application_problem(error: ApplicationError, request_id: &str) -> Response {
             "Publication pending",
             "Runtime has not observed this key revision for the propagation interval.",
         ),
-        ApplicationError::ClientVerifierUnavailable => (
+        ApplicationError::ServerVerifierUnavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "client_verifier_unavailable",
-            "Client verifier fleet unavailable",
-            "The required Client verifier fleet is not ready for this credential version.",
+            "server_verifier_unavailable",
+            "Server verifier fleet unavailable",
+            "The required Server verifier fleet is not ready for this credential version.",
         ),
         ApplicationError::InvalidTransition => (
             StatusCode::CONFLICT,
             "invalid_transition",
             "Invalid state transition",
             "The requested lifecycle transition is not allowed.",
+        ),
+        ApplicationError::CapacityExceeded => (
+            StatusCode::CONFLICT,
+            "capacity_exceeded",
+            "Resource capacity exceeded",
+            "The bounded resource capacity has been reached.",
         ),
         ApplicationError::ProviderPreflightRejected => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -8549,7 +9138,7 @@ fn control_problem(
     detail: &str,
     request_id: &str,
 ) -> Response {
-    (
+    let mut response = (
         status,
         Json(control_types::ProblemDetails {
             type_uri: format!("https://owlauth.dev/problems/{code}"),
@@ -8560,60 +9149,66 @@ fn control_problem(
             request_id: request_id.to_owned(),
         }),
     )
-        .into_response()
+        .into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/problem+json"),
+    );
+    response
 }
 
-fn client_json<T>(result: Result<T, ApplicationError>, request_id: &str) -> Response
+fn server_json<T>(result: Result<T, ApplicationError>, request_id: &str) -> Response
 where
     T: Serialize,
 {
     match result {
         Ok(value) => Json(value).into_response(),
-        Err(error) => client_problem(error, request_id),
+        Err(error) => server_problem(error, request_id),
     }
 }
 
-fn client_problem(error: ApplicationError, request_id: &str) -> Response {
+fn server_problem(error: ApplicationError, request_id: &str) -> Response {
     let (status, code, message) = match error {
         ApplicationError::InvalidInput => (
             StatusCode::BAD_REQUEST,
-            client_types::ClientErrorCode::InvalidRequest,
-            "The Client request is invalid.",
+            server_types::ServerErrorCode::InvalidRequest,
+            "The Server API request is invalid.",
         ),
         ApplicationError::NotFound | ApplicationError::Disabled => (
             StatusCode::NOT_FOUND,
-            client_types::ClientErrorCode::NotFound,
-            "The requested Client resource was not found or is no longer available.",
+            server_types::ServerErrorCode::NotFound,
+            "The requested Server API resource was not found or is no longer available.",
         ),
         ApplicationError::RevisionConflict
         | ApplicationError::InvalidTransition
+        | ApplicationError::CapacityExceeded
         | ApplicationError::IdempotencyConflict
         | ApplicationError::OperationInProgress
         | ApplicationError::PublicationPending => (
             StatusCode::CONFLICT,
-            client_types::ClientErrorCode::Conflict,
-            "The Client request is no longer valid in the current state.",
+            server_types::ServerErrorCode::Conflict,
+            "The Server API request is no longer valid in the current state.",
         ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
-        | ApplicationError::ClientVerifierUnavailable
+        | ApplicationError::ServerVerifierUnavailable
         | ApplicationError::ProviderPreflightRejected
         | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
             StatusCode::SERVICE_UNAVAILABLE,
-            client_types::ClientErrorCode::TemporarilyUnavailable,
-            "The Client authority is temporarily unavailable.",
+            server_types::ServerErrorCode::TemporarilyUnavailable,
+            "The Server API authority is temporarily unavailable.",
         ),
     };
-    client_error_response(status, code, message, request_id)
+    server_error_response(status, code, message, request_id)
 }
 
-fn client_rate_limited_response(retry_after_seconds: u64, request_id: &str) -> Response {
+fn server_rate_limited_response(retry_after_seconds: u64, request_id: &str) -> Response {
     let retry_after_seconds = retry_after_seconds.clamp(1, 60);
-    let mut response = client_error_response(
+    let mut response = server_error_response(
         StatusCode::TOO_MANY_REQUESTS,
-        client_types::ClientErrorCode::RateLimited,
-        "The Client request rate limit was exceeded.",
+        server_types::ServerErrorCode::RateLimited,
+        "The Server API request rate limit was exceeded.",
         request_id,
     );
     if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
@@ -8622,11 +9217,11 @@ fn client_rate_limited_response(retry_after_seconds: u64, request_id: &str) -> R
     response
 }
 
-fn unauthorized_client(request_id: &str) -> Response {
-    let mut response = client_error_response(
+fn unauthorized_server(request_id: &str) -> Response {
+    let mut response = server_error_response(
         StatusCode::UNAUTHORIZED,
-        client_types::ClientErrorCode::InvalidCredential,
-        "A single valid Project client Bearer credential is required.",
+        server_types::ServerErrorCode::InvalidCredential,
+        "A single valid Project server-key Bearer credential is required.",
         request_id,
     );
     response
@@ -8635,15 +9230,15 @@ fn unauthorized_client(request_id: &str) -> Response {
     response
 }
 
-fn client_error_response(
+fn server_error_response(
     status: StatusCode,
-    code: client_types::ClientErrorCode,
+    code: server_types::ServerErrorCode,
     message: &str,
     request_id: &str,
 ) -> Response {
     (
         status,
-        Json(client_types::ClientError {
+        Json(server_types::ServerError {
             code,
             message: message.to_owned(),
             request_id: request_id.to_owned(),
@@ -8666,6 +9261,7 @@ fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
         ),
         ApplicationError::RevisionConflict
         | ApplicationError::InvalidTransition
+        | ApplicationError::CapacityExceeded
         | ApplicationError::IdempotencyConflict
         | ApplicationError::OperationInProgress
         | ApplicationError::PublicationPending => (
@@ -8675,7 +9271,7 @@ fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
         ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
-        | ApplicationError::ClientVerifierUnavailable
+        | ApplicationError::ServerVerifierUnavailable
         | ApplicationError::ProviderPreflightRejected
         | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
@@ -8851,11 +9447,58 @@ pub(crate) mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::config::PlaneMode;
+    use crate::config::ProcessMode;
 
     const TEST_PROJECT: &str = "prj_http_identity";
     const TEST_BINDING: &str = "browser-binding";
     const TEST_CSRF: &str = "csrf-value";
+
+    struct TestRuntimeReadinessPort {
+        ready: bool,
+    }
+
+    #[async_trait]
+    impl application::ReadinessPort for TestRuntimeReadinessPort {
+        async fn readiness(&self) -> Result<(), ApplicationError> {
+            self.ready
+                .then_some(())
+                .ok_or(ApplicationError::Persistence)
+        }
+
+        async fn public_application_config(
+            &self,
+            _project_public_id: &str,
+            _application_public_id: &str,
+        ) -> Result<application::PublicApplicationConfig, ApplicationError> {
+            panic!("readiness probe must not load public Application configuration")
+        }
+
+        async fn project_jwks(
+            &self,
+            _project_public_id: &str,
+        ) -> Result<application::JwksDocument, ApplicationError> {
+            panic!("readiness probe must not load Project JWKS")
+        }
+
+        async fn observe_signing_revisions(
+            &self,
+            _limit: usize,
+        ) -> Result<usize, ApplicationError> {
+            panic!("readiness probe must not mutate signing observations")
+        }
+    }
+
+    fn test_http_budget() -> HttpBudgetConfig {
+        HttpBudgetConfig {
+            request_timeout: Duration::from_secs(1),
+            max_request_bytes: 1024,
+            max_in_flight_requests: 8,
+            max_connections: 8,
+            max_header_count: 16,
+            max_header_bytes: 1024,
+            max_uri_bytes: 1024,
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum CallbackBehavior {
@@ -9459,7 +10102,7 @@ pub(crate) mod tests {
 
     #[test]
     fn managed_target_composition_uses_distinct_control_and_runtime_facades() {
-        let config = test_config(PlaneMode::All);
+        let config = test_config(ProcessMode::All);
         let issuer = build_managed_reauthorization_target_issuer(&config);
         let verifier = build_managed_reauthorization_target_verifier(&config);
         let interaction_id = Uuid::new_v4();
@@ -9798,11 +10441,424 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn document_exception_classification_is_base_scoped_and_excludes_json_and_assets() {
+        assert!(is_document_request(
+            HttpPlane::Runtime,
+            &Method::GET,
+            "/runtime/auth/interactions/interaction",
+            "/runtime/",
+        ));
+        assert!(!is_document_request(
+            HttpPlane::Runtime,
+            &Method::GET,
+            "/runtime/v1/projects/example/auth/users/me",
+            "/runtime/",
+        ));
+        assert!(!is_document_request(
+            HttpPlane::Runtime,
+            &Method::GET,
+            "/runtime/auth/assets/runtime.js",
+            "/runtime/",
+        ));
+        assert!(is_document_request(
+            HttpPlane::Control,
+            &Method::GET,
+            "/control/console/projects",
+            "/control/",
+        ));
+        assert!(!is_document_request(
+            HttpPlane::Control,
+            &Method::GET,
+            "/control/console/assets/control.js",
+            "/control/",
+        ));
+        assert!(!is_document_request(
+            HttpPlane::Control,
+            &Method::GET,
+            "/.well-known/owlauth",
+            "/control/",
+        ));
+    }
+
+    #[tokio::test]
+    async fn exceptional_boundary_maps_timeout_and_panic_to_plane_envelopes() {
+        async fn panic_handler() -> StatusCode {
+            panic!("injected boundary panic must not escape")
+        }
+
+        let mut budget = test_http_budget();
+        budget.request_timeout = Duration::from_millis(10);
+        let runtime = bound(
+            Router::new()
+                .route(
+                    "/slow",
+                    axum::routing::get(|| async { std::future::pending::<Response>().await }),
+                )
+                .route("/panic", axum::routing::get(panic_handler)),
+            HttpPlane::Runtime,
+            &budget,
+        );
+
+        let timeout_response = runtime
+            .clone()
+            .oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(timeout_response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            timeout_response.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(
+            timeout_response.headers()[header::CACHE_CONTROL],
+            "no-store"
+        );
+        assert!(timeout_response.headers().contains_key("x-request-id"));
+        let timeout: runtime_types::RuntimeError =
+            serde_json::from_slice(&to_bytes(timeout_response.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(timeout.code, "request_timeout");
+
+        let panic_response = runtime
+            .oneshot(Request::get("/panic").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(panic_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let panic_body = to_bytes(panic_response.into_body(), 4096).await.unwrap();
+        assert!(!String::from_utf8_lossy(&panic_body).contains("injected boundary panic"));
+        let panic_problem: runtime_types::RuntimeError =
+            serde_json::from_slice(&panic_body).unwrap();
+        assert_eq!(panic_problem.code, "internal_error");
+
+        let control = bound(
+            Router::new().route(
+                "/slow",
+                axum::routing::get(|| async { std::future::pending::<Response>().await }),
+            ),
+            HttpPlane::Control,
+            &budget,
+        );
+        let response = control
+            .oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_concurrency_is_plane_local_and_releases_its_permit() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_for_handler = Arc::clone(&entered);
+        let release_for_handler = Arc::clone(&release);
+        let router = Router::new()
+            .route(
+                "/hold",
+                axum::routing::get(move || {
+                    let entered = Arc::clone(&entered_for_handler);
+                    let release = Arc::clone(&release_for_handler);
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route("/ready", axum::routing::get(|| async { StatusCode::OK }));
+        let mut budget = test_http_budget();
+        budget.max_in_flight_requests = 1;
+        let router = bound(router, HttpPlane::Runtime, &budget);
+
+        let entered_signal = entered.notified();
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            first_router
+                .oneshot(Request::get("/hold").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+        entered_signal.await;
+
+        let rejected = router
+            .clone()
+            .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
+        let problem: runtime_types::RuntimeError =
+            serde_json::from_slice(&to_bytes(rejected.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(problem.code, "listener_capacity_exceeded");
+
+        release.notify_one();
+        assert_eq!(first.await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            router
+                .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_readiness_fails_when_runtime_authority_is_unavailable() {
+        let response = auth_readiness(State(AuthProbeState {
+            ready: Arc::new(AtomicBool::new(true)),
+            runtime_readiness: Some(Arc::new(application::ReadinessService::new(Arc::new(
+                TestRuntimeReadinessPort { ready: false },
+            )))),
+            server_readiness: None,
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({ "status": "unavailable" }));
+    }
+
+    #[tokio::test]
+    async fn auth_surfaces_share_one_listener_concurrency_budget() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_for_handler = Arc::clone(&entered);
+        let release_for_handler = Arc::clone(&release);
+        let runtime = Router::new().route(
+            "/runtime-hold",
+            axum::routing::get(move || {
+                let entered = Arc::clone(&entered_for_handler);
+                let release = Arc::clone(&release_for_handler);
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let server = Router::new().route(
+            "/server-ready",
+            axum::routing::get(|| async { StatusCode::OK }),
+        );
+        let mut budget = test_http_budget();
+        budget.max_in_flight_requests = 1;
+        let concurrency = Arc::new(tokio::sync::Semaphore::new(1));
+        let router = bound_with_concurrency(
+            runtime,
+            HttpPlane::Runtime,
+            &budget,
+            Arc::clone(&concurrency),
+        )
+        .merge(bound_with_concurrency(
+            server,
+            HttpPlane::Server,
+            &budget,
+            concurrency,
+        ));
+
+        let entered_signal = entered.notified();
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            first_router
+                .oneshot(Request::get("/runtime-hold").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+        entered_signal.await;
+
+        let rejected = router
+            .clone()
+            .oneshot(Request::get("/server-ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
+        let problem: server_types::ServerError =
+            serde_json::from_slice(&to_bytes(rejected.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            problem.code,
+            server_types::ServerErrorCode::TemporarilyUnavailable
+        );
+
+        release.notify_one();
+        assert_eq!(first.await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            router
+                .oneshot(Request::get("/server-ready").body(Body::empty()).unwrap(),)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn request_shape_boundary_rejects_uri_and_header_bounds() {
+        let base = Router::new().fallback(|| async { StatusCode::NO_CONTENT });
+
+        let mut uri_budget = test_http_budget();
+        uri_budget.max_uri_bytes = 8;
+        let response = bound(base.clone(), HttpPlane::Runtime, &uri_budget)
+            .oneshot(Request::get("/too-long?x=1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+
+        let mut count_budget = test_http_budget();
+        count_budget.max_header_count = 1;
+        let response = bound(base.clone(), HttpPlane::Server, &count_budget)
+            .oneshot(
+                Request::get("/")
+                    .header("x-first", "1")
+                    .header("x-second", "2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+
+        let mut bytes_budget = test_http_budget();
+        bytes_budget.max_header_bytes = 8;
+        let response = bound(base, HttpPlane::Control, &bytes_budget)
+            .oneshot(
+                Request::get("/")
+                    .header("x-long", "123456789")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_json_uses_each_plane_invalid_request_envelope() {
+        async fn runtime_body(RuntimeJson(_): RuntimeJson<serde_json::Value>) -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+        async fn server_body(ServerJson(_): ServerJson<serde_json::Value>) -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+        async fn control_body(ControlJson(_): ControlJson<serde_json::Value>) -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+
+        let mut budget = test_http_budget();
+        budget.max_request_bytes = 8;
+        for (plane, router) in [
+            (
+                HttpPlane::Runtime,
+                Router::new().route("/body", axum::routing::post(runtime_body)),
+            ),
+            (
+                HttpPlane::Server,
+                Router::new().route("/body", axum::routing::post(server_body)),
+            ),
+            (
+                HttpPlane::Control,
+                Router::new().route("/body", axum::routing::post(control_body)),
+            ),
+        ] {
+            let response = bound(router, plane, &budget)
+                .oneshot(
+                    Request::post("/body")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"value":"too large"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let content_type = response.headers()[header::CONTENT_TYPE].to_str().unwrap();
+            match plane {
+                HttpPlane::Runtime | HttpPlane::Server => {
+                    assert!(content_type.starts_with("application/json"));
+                }
+                HttpPlane::Control => assert_eq!(content_type, "application/problem+json"),
+            }
+        }
+    }
+
+    #[test]
+    fn control_browser_metadata_is_absent_or_complete_and_exact() {
+        let origin = "https://control.example";
+        assert!(control_browser_metadata_allowed(&HeaderMap::new(), origin));
+
+        let exact = HeaderMap::from_iter([
+            (header::ORIGIN, HeaderValue::from_static(origin)),
+            (
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-mode"),
+                HeaderValue::from_static("cors"),
+            ),
+            (
+                HeaderName::from_static("sec-fetch-dest"),
+                HeaderValue::from_static("empty"),
+            ),
+        ]);
+        assert!(control_browser_metadata_allowed(&exact, origin));
+
+        let changed = |name: &'static str, value: &'static str| {
+            let mut headers = exact.clone();
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+            headers
+        };
+        for rejected in [
+            HeaderMap::from_iter([(header::ORIGIN, HeaderValue::from_static(origin))]),
+            changed("origin", "https://other.example"),
+            changed("sec-fetch-site", "cross-site"),
+            changed("sec-fetch-mode", "navigate"),
+            changed("sec-fetch-dest", "document"),
+        ] {
+            assert!(!control_browser_metadata_allowed(&rejected, origin));
+        }
+        let mut duplicate_origin = exact;
+        duplicate_origin.append(header::ORIGIN, HeaderValue::from_static(origin));
+        assert!(!control_browser_metadata_allowed(&duplicate_origin, origin));
+    }
+
+    #[test]
+    fn control_credential_failures_are_source_keyed_and_bounded() {
+        let failures = ControlCredentialFailures::default();
+        let now = Instant::now();
+        for _ in 1..CONTROL_CREDENTIAL_FAILURE_LIMIT {
+            assert_eq!(failures.record("source-a", now), None);
+        }
+        assert_eq!(failures.record("source-a", now), Some(1));
+        assert_eq!(failures.record("source-b", now), None);
+        assert_eq!(
+            failures.record("source-a", now + CONTROL_CREDENTIAL_FAILURE_WINDOW),
+            None
+        );
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "HTTP fixture enumerates complete Runtime and Control security configuration"
     )]
-    pub(crate) fn test_config(mode: PlaneMode) -> ServerConfig {
+    pub(crate) fn test_config(mode: ProcessMode) -> ServerConfig {
         test_config_with_identity_material(
             mode,
             "http-test-runtime",
@@ -9813,7 +10869,7 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn identity_mutation_composition_config(mode: PlaneMode) -> ServerConfig {
+    pub(crate) fn identity_mutation_composition_config(mode: ProcessMode) -> ServerConfig {
         test_config_with_identity_material(
             mode,
             "identity-mutation-test",
@@ -9830,8 +10886,8 @@ pub(crate) mod tests {
         reason = "the real-composition fixture injects the complete physically distinct identity key configuration"
     )]
     fn test_config_with_identity_material(
-        mode: PlaneMode,
-        runtime_process_id: &str,
+        mode: ProcessMode,
+        auth_process_id: &str,
         instance_id: &str,
         email_digest_key: &str,
         email_protection_key: &str,
@@ -9844,14 +10900,14 @@ pub(crate) mod tests {
                 "postgres://owlauth:test@127.0.0.1/owlauth".to_owned(),
             ),
             (
-                "OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
-                runtime_process_id.to_owned(),
+                "OWLAUTH_AUTH_PROCESS_ID".to_owned(),
+                auth_process_id.to_owned(),
             ),
             (
-                "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-                runtime_process_id.to_owned(),
+                "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+                auth_process_id.to_owned(),
             ),
-            ("OWLAUTH_RUNTIME_MAX_PROCESSES".to_owned(), "64".to_owned()),
+            ("OWLAUTH_AUTH_MAX_PROCESSES".to_owned(), "64".to_owned()),
             ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
             (
                 "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
@@ -9912,19 +10968,11 @@ pub(crate) mod tests {
             ("OWLAUTH_CONTROL_API_KEY".to_owned(), key),
             ("OWLAUTH_INSTANCE_ID".to_owned(), instance_id.to_owned()),
             (
-                "OWLAUTH_CLIENT_PROCESS_ID".to_owned(),
-                "client-1".to_owned(),
-            ),
-            (
-                "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS".to_owned(),
-                "client-1".to_owned(),
-            ),
-            (
-                "OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION".to_owned(),
+                "OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION".to_owned(),
                 "1".to_owned(),
             ),
             (
-                "OWLAUTH_CLIENT_KEY_DIGEST_KEY".to_owned(),
+                "OWLAUTH_SERVER_KEY_DIGEST_KEY".to_owned(),
                 "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo".to_owned(),
             ),
             (
@@ -9934,15 +10982,14 @@ pub(crate) mod tests {
             (
                 "OWLAUTH_MODE".to_owned(),
                 match mode {
-                    PlaneMode::All => "all",
-                    PlaneMode::Runtime => "runtime",
-                    PlaneMode::Client => "client",
-                    PlaneMode::Control => "control",
+                    ProcessMode::All => "all",
+                    ProcessMode::Auth => "auth",
+                    ProcessMode::Control => "control",
                 }
                 .to_owned(),
             ),
         ]);
-        if mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE {
+        if mode.has_auth() && FEDERATED_PROJECT_AUTH_AVAILABLE {
             values.extend([
                 (
                     "OWLAUTH_MANAGED_CREDENTIAL_KEY_VERSION".to_owned(),
@@ -9954,9 +11001,9 @@ pub(crate) mod tests {
                 ),
             ]);
         }
-        if mode == PlaneMode::All {
+        if mode == ProcessMode::All {
             values.insert(
-                "OWLAUTH_RUNTIME_BASE_URL".to_owned(),
+                "OWLAUTH_AUTH_BASE_URL".to_owned(),
                 "https://identity.example/runtime/".to_owned(),
             );
             values.insert(
@@ -9969,7 +11016,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn runtime_admission_returns_bounded_429_before_downstream_authority() {
-        let config = test_config(PlaneMode::Runtime);
+        let config = test_config(ProcessMode::Auth);
         let mut routers = build_routers(&config, None);
         let router = routers.runtime.take().expect("Runtime router exists");
         let uri = "/v1/projects/project/auth/config?application_id=application";
@@ -10037,20 +11084,20 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn managed_reauthorization_start_rejects_concurrency_before_runtime_services() {
-        let config = test_config(PlaneMode::Runtime);
-        let origin = config.runtime.external_base.origin().ascii_serialization();
+        let config = test_config(ProcessMode::Auth);
+        let origin = config.auth.external_base.origin().ascii_serialization();
         // Compose the real PostgreSQL repository and OIDC discovery client around a disconnected
         // database sentinel. Touching either downstream path would fail instead of yielding 429.
         let pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
-            client: None,
+            server: None,
             control: None,
         };
         let mut routers = build_routers(&config, Some(&pools));
         assert!(routers.runtime_auth.is_some());
         let router = routers.runtime.take().expect("Runtime router exists");
         let interaction = "opaque-interaction".to_owned();
-        let base_path = config.runtime.external_base.path().trim_end_matches('/');
+        let base_path = config.auth.external_base.path().trim_end_matches('/');
         let uri = format!(
             "{base_path}/v1/projects/project/auth/managed-reauthorizations/{interaction}/start"
         );
@@ -10214,12 +11261,12 @@ pub(crate) mod tests {
 
     #[test]
     fn identity_mutation_facades_and_key_custody_follow_plane_mode() {
-        let control_config = test_config(PlaneMode::Control);
+        let control_config = test_config(ProcessMode::Control);
         assert!(control_config.runtime_protection.is_none());
         assert!(control_config.email_identity_protection.is_some());
         let control_pools = DatabasePools {
             runtime: None,
-            client: None,
+            server: None,
             control: Some(DatabaseConnection::default()),
         };
         let control = build_routers(&control_config, Some(&control_pools));
@@ -10227,22 +11274,22 @@ pub(crate) mod tests {
         assert!(control.runtime_identity_mutations.is_none());
         assert!(control.runtime_auth.is_none());
 
-        let runtime_config = test_config(PlaneMode::Runtime);
+        let runtime_config = test_config(ProcessMode::Auth);
         assert!(runtime_config.runtime_protection.is_some());
         assert!(runtime_config.control_api_key.is_none());
         let runtime_pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
-            client: None,
+            server: None,
             control: None,
         };
         let runtime = build_routers(&runtime_config, Some(&runtime_pools));
         assert!(runtime.runtime_identity_mutations.is_some());
         assert!(runtime.control_identity_mutations.is_none());
 
-        let all_config = test_config(PlaneMode::All);
+        let all_config = test_config(ProcessMode::All);
         let all_pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
-            client: None,
+            server: None,
             control: Some(DatabaseConnection::default()),
         };
         let all = build_routers(&all_config, Some(&all_pools));
@@ -10251,19 +11298,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_composes_federated_auth_without_control_plane() {
+    async fn auth_composes_federated_runtime_without_control_plane() {
         const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
-        let config = test_config(PlaneMode::Runtime);
+        let config = test_config(ProcessMode::Auth);
         assert!(config.provisioning.is_some());
         let pools = DatabasePools {
             runtime: Some(DatabaseConnection::default()),
-            client: None,
+            server: None,
             control: None,
         };
         let mut routers = build_routers(&config, Some(&pools));
         assert!(
             routers.runtime_auth.is_some(),
-            "Runtime mode must compose the federated authentication service"
+            "Auth mode must compose the federated authentication service"
         );
         assert!(routers.control.is_none());
         assert!(
@@ -10276,15 +11323,19 @@ pub(crate) mod tests {
         );
 
         routers.mark_ready();
-        let runtime = routers.runtime.take().expect("Runtime router should exist");
-        let ready = runtime
+        let auth = routers.auth.take().expect("Auth router should exist");
+        let ready = auth
             .clone()
             .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(
+            ready.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Auth readiness must query Runtime authority after the startup flag is set"
+        );
 
-        let jwks = runtime
+        let jwks = auth
             .oneshot(
                 Request::get("/projects/example/.well-known/jwks.json")
                     .body(Body::empty())
@@ -10300,13 +11351,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_router_never_routes_control() {
-        let config = test_config(PlaneMode::Runtime);
+    async fn auth_router_never_routes_control() {
+        let config = test_config(ProcessMode::Auth);
         let mut routers = build_routers(&config, None);
         let unready = routers
-            .runtime
+            .auth
             .as_ref()
-            .expect("Runtime router should exist")
+            .expect("Auth router should exist")
             .clone()
             .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
             .await
@@ -10318,9 +11369,9 @@ pub(crate) mod tests {
         );
 
         routers.mark_ready();
-        let runtime = routers.runtime.take().expect("Runtime router should exist");
+        let auth = routers.auth.take().expect("Auth router should exist");
 
-        let health = runtime
+        let health = auth
             .clone()
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
@@ -10328,7 +11379,7 @@ pub(crate) mod tests {
         assert_eq!(health.status(), StatusCode::OK);
         assert!(health.headers().contains_key("x-request-id"));
 
-        let malformed_query = runtime
+        let malformed_query = auth
             .clone()
             .oneshot(
                 Request::get("/v1/projects/example/auth/config")
@@ -10343,7 +11394,7 @@ pub(crate) mod tests {
                 .unwrap();
         assert_eq!(malformed_body.code, "invalid_request");
 
-        let control = runtime
+        let control = auth
             .oneshot(Request::get("/v1/system").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -10353,7 +11404,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn federated_auth_routes_are_mounted() {
         const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
-        let config = test_config(PlaneMode::Runtime);
+        let config = test_config(ProcessMode::Auth);
         let mut routers = build_routers(&config, None);
         routers.mark_ready();
         let runtime = routers.runtime.take().expect("Runtime router should exist");
@@ -10402,7 +11453,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn control_authentication_is_strict_and_base_scoped() {
-        let config = test_config(PlaneMode::All);
+        let config = test_config(ProcessMode::All);
         let mut routers = build_routers(&config, None);
         routers.mark_ready();
         let control = routers.control.take().expect("Control router should exist");
@@ -10445,6 +11496,26 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(denied.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        assert_eq!(
+            denied.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        for _ in 1..(CONTROL_CREDENTIAL_FAILURE_LIMIT - 1) {
+            let response = control
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let throttled = control
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(throttled.headers()[header::RETRY_AFTER], "1");
 
         let accepted = control
             .clone()
@@ -10465,7 +11536,14 @@ pub(crate) mod tests {
             &body[..],
             br#"{"product":"owlauth-server","provisioning":true,"login_readiness":true,"federated_project_auth":true}"#
         );
+    }
 
+    #[tokio::test]
+    async fn control_rejects_noncanonical_ids_and_runtime_paths() {
+        let config = test_config(ProcessMode::All);
+        let mut routers = build_routers(&config, None);
+        routers.mark_ready();
+        let control = routers.control.take().expect("Control router should exist");
         let noncanonical_id = control
             .clone()
             .oneshot(
@@ -10493,14 +11571,60 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn control_mutations_distinguish_cli_and_browser_metadata() {
+        let config = test_config(ProcessMode::All);
+        let mut routers = build_routers(&config, None);
+        routers.mark_ready();
+        let control = routers.control.take().expect("Control router should exist");
+        let uri = "/control/v1/projects/550e8400-e29b-41d4-a716-446655440000/disable";
+        let authorization = format!("Bearer owl_ctrl_v1_{}", "A".repeat(43));
+        let mutation = |browser_headers: Option<(&'static str, &'static str, &'static str)>| {
+            let mut request = Request::post(uri)
+                .header(header::AUTHORIZATION, &authorization)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some((site, mode, destination)) = browser_headers {
+                request = request
+                    .header(header::ORIGIN, "https://identity.example")
+                    .header("sec-fetch-site", site)
+                    .header("sec-fetch-mode", mode)
+                    .header("sec-fetch-dest", destination);
+            }
+            request
+                .body(Body::from(r#"{"expected_security_revision":1}"#))
+                .unwrap()
+        };
+
+        let cli_mutation = control.clone().oneshot(mutation(None)).await.unwrap();
+        assert_ne!(cli_mutation.status(), StatusCode::FORBIDDEN);
+        let browser_mutation = control
+            .clone()
+            .oneshot(mutation(Some(("same-origin", "cors", "empty"))))
+            .await
+            .unwrap();
+        assert_ne!(browser_mutation.status(), StatusCode::FORBIDDEN);
+        let partial_browser_mutation = control
+            .oneshot(
+                Request::post(uri)
+                    .header(header::AUTHORIZATION, &authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, "https://identity.example")
+                    .body(Body::from(r#"{"expected_security_revision":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial_browser_mutation.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     #[allow(
         clippy::too_many_lines,
         reason = "one protocol journey proves MCP discovery, admission, negotiation, catalog, dispatch, and plane isolation"
     )]
     async fn mcp_is_explicit_control_only_authenticated_and_tools_only() {
-        let mut config = test_config(PlaneMode::All);
+        let mut config = test_config(ProcessMode::All);
         config.control_mcp.enabled = true;
-        config.max_request_bytes = 1024;
+        config.control.http.max_request_bytes = 1024;
         let mut routers = build_routers(&config, None);
         routers.mark_ready();
         let control = routers.control.take().expect("Control router should exist");
@@ -10718,12 +11842,14 @@ pub(crate) mod tests {
         let tools = tools["result"]["tools"]
             .as_array()
             .expect("tools/list returns a bounded catalog");
-        assert_eq!(tools.len(), 7);
-        assert!(
-            tools
-                .iter()
-                .any(|tool| tool["name"] == "owlauth_system_get")
-        );
+        assert_eq!(tools.len(), 9);
+        for expected in [
+            "owlauth_system_get",
+            "owlauth_project_users_list",
+            "owlauth_project_user_lookup_email",
+        ] {
+            assert!(tools.iter().any(|tool| tool["name"] == expected));
+        }
         assert!(tools.iter().all(|tool| {
             tool["inputSchema"]["additionalProperties"] == false
                 && tool["outputSchema"]["type"] == "object"
@@ -10818,6 +11944,13 @@ pub(crate) mod tests {
         document[start..end].to_owned()
     }
 
+    fn favicon_href(document: &str) -> String {
+        let favicon = document
+            .find("<link rel=\"icon\"")
+            .expect("shell favicon should exist");
+        attribute(&document[favicon..], "href")
+    }
+
     #[test]
     fn hosted_mutations_require_standard_same_origin_fetch_metadata() {
         let headers = HeaderMap::from_iter([
@@ -10857,7 +11990,7 @@ pub(crate) mod tests {
         reason = "one end-to-end asset test must compare both planes, encodings, HEAD semantics, and cross-plane isolation"
     )]
     async fn embedded_assets_are_plane_local_and_representation_correct() {
-        let config = test_config(PlaneMode::All);
+        let config = test_config(ProcessMode::All);
         let mut routers = build_routers(&config, None);
         routers.mark_ready();
         let runtime = routers.runtime.take().expect("Runtime router should exist");
@@ -10873,6 +12006,10 @@ pub(crate) mod tests {
             runtime_shell.headers()[header::CACHE_CONTROL],
             HeaderValue::from_static("no-store")
         );
+        assert_eq!(
+            runtime_shell.headers()[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; worker-src 'none'; manifest-src 'none'"
+        );
         let runtime_document = String::from_utf8(
             to_bytes(runtime_shell.into_body(), 1_000_000)
                 .await
@@ -10881,6 +12018,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(runtime_document.contains("name=\"owlauth-runtime-base\" content=\"/runtime/\""));
+        assert!(!runtime_document.contains("owlauth-auth-base"));
         assert!(!runtime_document.contains("<script>"));
 
         for path in ["/runtime/auth", "/runtime/auth/unknown"] {
@@ -10904,6 +12042,27 @@ pub(crate) mod tests {
             assert!(not_found_document.contains("Page not found"));
             assert!(not_found_document.contains("owlauth-runtime-flow\" content=\"error"));
         }
+
+        let runtime_favicon_path = favicon_href(&runtime_document);
+        assert_eq!(
+            runtime_favicon_path,
+            "/runtime/auth/assets/owlauth-favicon.svg"
+        );
+        let runtime_favicon = runtime
+            .clone()
+            .oneshot(
+                Request::get(&runtime_favicon_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_favicon.status(), StatusCode::OK);
+        assert_eq!(
+            runtime_favicon.headers()[header::CONTENT_TYPE],
+            "image/svg+xml"
+        );
+        let runtime_favicon = to_bytes(runtime_favicon.into_body(), 4096).await.unwrap();
 
         let runtime_asset_path = attribute(&runtime_document, "src");
         assert!(runtime_asset_path.starts_with("/runtime/auth/assets/runtime-"));
@@ -10997,6 +12156,28 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(control_document.contains("name=\"owlauth-control-base\" content=\"/control/\""));
+        let control_favicon_path = favicon_href(&control_document);
+        assert_eq!(
+            control_favicon_path,
+            "/control/console/assets/owlauth-favicon.svg"
+        );
+        let control_favicon = control
+            .clone()
+            .oneshot(
+                Request::get(&control_favicon_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_favicon.status(), StatusCode::OK);
+        assert_eq!(
+            control_favicon.headers()[header::CONTENT_TYPE],
+            "image/svg+xml"
+        );
+        let control_favicon = to_bytes(control_favicon.into_body(), 4096).await.unwrap();
+        assert_eq!(control_favicon, runtime_favicon);
+
         let control_asset_path = attribute(&control_document, "src");
         assert!(control_asset_path.starts_with("/control/console/assets/control-"));
 
@@ -11076,7 +12257,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn identity_public_routes_are_plane_local_authenticated_and_hosted_guarded() {
-        let config = test_config(PlaneMode::All);
+        let config = test_config(ProcessMode::All);
         let routers = build_routers(&config, None);
         let control = routers.control.expect("Control router");
         let runtime = routers.runtime.expect("Runtime router");
@@ -11104,11 +12285,11 @@ pub(crate) mod tests {
             .unwrap();
         assert_ne!(authenticated.status(), StatusCode::NOT_FOUND);
 
-        let interaction = format!("{}.{}", Uuid::new_v4(), "A".repeat(43));
+        let intent = format!("{}.{}", Uuid::new_v4(), "A".repeat(43));
         let shell = runtime
             .clone()
             .oneshot(
-                Request::get(format!("/runtime/auth/identity-mutations/{interaction}"))
+                Request::get(format!("/runtime/auth/identity-mutations/{intent}"))
                     .header("sec-fetch-site", "same-origin")
                     .header("sec-fetch-mode", "navigate")
                     .header("sec-fetch-dest", "document")
@@ -11120,7 +12301,7 @@ pub(crate) mod tests {
         assert_eq!(shell.status(), StatusCode::OK);
 
         let mutation_path =
-            format!("/runtime/v1/projects/project/auth/identity-mutations/{interaction}/confirm");
+            format!("/runtime/v1/projects/project/auth/identity-mutations/{intent}/confirm");
         let authorization_rejected = runtime
             .clone()
             .oneshot(
@@ -11148,12 +12329,28 @@ pub(crate) mod tests {
         assert_eq!(cross_site_rejected.status(), StatusCode::FORBIDDEN);
     }
 
-    const CLIENT_TEST_PROJECT: &str = "project-a";
-    const CLIENT_TEST_PUBLIC_KEY_ID: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+    const SERVER_TEST_PROJECT: &str = "project-a";
+    const SERVER_TEST_PUBLIC_KEY_ID: &str = "AAAAAAAAAAAAAAAAAAAAAA";
 
     #[test]
-    fn client_projection_preserves_materialized_user_and_projection_revisions() {
-        let converted = client_projection_document(
+    fn server_email_lookup_mapper_never_exposes_a_verified_email() {
+        let mapped = server_lookup_user(application::ServerUser {
+            project_public_id: SERVER_TEST_PROJECT.to_owned(),
+            user_public_id: "user-a".to_owned(),
+            status: application::ServerUserStatus::Active,
+            display_name: None,
+            picture_url: None,
+            primary_verified_email: Some("private@example.test".to_owned()),
+            user_revision: 1,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        });
+        assert_eq!(mapped.verified_email, None);
+    }
+
+    #[test]
+    fn server_projection_preserves_materialized_user_and_projection_revisions() {
+        let converted = server_projection_document(
             "project-a".to_owned(),
             "application-a".to_owned(),
             "user-a".to_owned(),
@@ -11177,25 +12374,25 @@ pub(crate) mod tests {
         assert_eq!(converted.projection_revision, 13);
     }
 
-    struct TestClientRepository {
+    struct TestServerRepository {
         authority_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl application::ClientApiRepository for TestClientRepository {
-        async fn client_key_authority(
+    impl application::ServerApiRepository for TestServerRepository {
+        async fn server_key_authority(
             &self,
             public_key_id: &str,
-        ) -> Result<application::ClientKeyAuthority, ApplicationError> {
+        ) -> Result<application::ServerKeyAuthority, ApplicationError> {
             self.authority_calls.fetch_add(1, Ordering::SeqCst);
-            if public_key_id != CLIENT_TEST_PUBLIC_KEY_ID {
+            if public_key_id != SERVER_TEST_PUBLIC_KEY_ID {
                 return Err(ApplicationError::NotFound);
             }
-            Ok(application::ClientKeyAuthority {
+            Ok(application::ServerKeyAuthority {
                 key_id: Uuid::from_u128(0xc11e_0002),
                 project_id: Uuid::from_u128(0xc11e_0001),
-                project_public_id: CLIENT_TEST_PROJECT.to_owned(),
-                public_key_id: CLIENT_TEST_PUBLIC_KEY_ID.to_owned(),
+                project_public_id: SERVER_TEST_PROJECT.to_owned(),
+                public_key_id: SERVER_TEST_PUBLIC_KEY_ID.to_owned(),
                 digest_key_version: 1,
                 credential_digest: [7; 32],
             })
@@ -11226,12 +12423,12 @@ pub(crate) mod tests {
             &self,
             project_id: Uuid,
             project_public_id: &str,
-            after: Option<application::ClientUserCursor>,
+            after: Option<application::ServerUserCursor>,
             limit_plus_one: usize,
-        ) -> Result<Vec<(application::ClientUserCursor, application::ClientUser)>, ApplicationError>
+        ) -> Result<Vec<(application::ServerUserCursor, application::ServerUser)>, ApplicationError>
         {
             assert_eq!(project_id, Uuid::from_u128(0xc11e_0001));
-            assert_eq!(project_public_id, CLIENT_TEST_PROJECT);
+            assert_eq!(project_public_id, SERVER_TEST_PROJECT);
             assert!(after.is_none());
             assert_eq!(limit_plus_one, 51);
             Ok(Vec::new())
@@ -11242,7 +12439,7 @@ pub(crate) mod tests {
             _project_id: Uuid,
             _project_public_id: &str,
             _user_public_id: &str,
-        ) -> Result<application::ClientUser, ApplicationError> {
+        ) -> Result<application::ServerUser, ApplicationError> {
             Err(ApplicationError::NotFound)
         }
 
@@ -11251,7 +12448,7 @@ pub(crate) mod tests {
             _project_id: Uuid,
             _project_public_id: &str,
             _candidates: &[application::VersionedDigest],
-        ) -> Result<Option<application::ClientUser>, ApplicationError> {
+        ) -> Result<Option<application::ServerUser>, ApplicationError> {
             Ok(None)
         }
 
@@ -11261,7 +12458,7 @@ pub(crate) mod tests {
             _project_public_id: &str,
             _application_public_id: &str,
             _user_public_id: &str,
-        ) -> Result<application::ClientApplicationProjection, ApplicationError> {
+        ) -> Result<application::ServerApplicationProjection, ApplicationError> {
             Err(ApplicationError::NotFound)
         }
 
@@ -11270,21 +12467,21 @@ pub(crate) mod tests {
             _project_id: Uuid,
             _kid: &str,
             _now: OffsetDateTime,
-        ) -> Result<application::ClientVerificationKey, ApplicationError> {
+        ) -> Result<application::ServerVerificationKey, ApplicationError> {
             Err(ApplicationError::NotFound)
         }
 
         async fn introspect_session(
             &self,
-            _lookup: application::ClientTokenSessionLookup,
-        ) -> Result<application::ActiveClientToken, ApplicationError> {
+            _lookup: application::ServerTokenSessionLookup,
+        ) -> Result<application::ActiveServerToken, ApplicationError> {
             Err(ApplicationError::Disabled)
         }
     }
 
-    struct TestClientKeyVerifier;
+    struct TestServerKeyVerifier;
 
-    impl application::ClientKeyVerifier for TestClientKeyVerifier {
+    impl application::ServerKeyVerifier for TestServerKeyVerifier {
         fn readable_versions(&self) -> std::collections::BTreeSet<i32> {
             std::collections::BTreeSet::from([1])
         }
@@ -11294,21 +12491,21 @@ pub(crate) mod tests {
             project_id: Uuid,
             key_id: Uuid,
             public_key_id: &str,
-            secret: &[u8; application::CLIENT_KEY_SECRET_BYTES],
+            secret: &[u8; application::SERVER_KEY_SECRET_BYTES],
             digest_key_version: i32,
         ) -> Result<[u8; 32], ApplicationError> {
             let expected = project_id == Uuid::from_u128(0xc11e_0001)
                 && key_id == Uuid::from_u128(0xc11e_0002)
-                && public_key_id == CLIENT_TEST_PUBLIC_KEY_ID
+                && public_key_id == SERVER_TEST_PUBLIC_KEY_ID
                 && digest_key_version == 1
-                && secret == &[0; application::CLIENT_KEY_SECRET_BYTES];
+                && secret == &[0; application::SERVER_KEY_SECRET_BYTES];
             Ok(if expected { [7; 32] } else { [8; 32] })
         }
     }
 
-    struct TestClientEmailDigester;
+    struct TestServerEmailDigester;
 
-    impl application::ClientEmailLookupDigester for TestClientEmailDigester {
+    impl application::EmailIdentityLookupDigester for TestServerEmailDigester {
         fn digest_candidates(
             &self,
             _project_id: Uuid,
@@ -11321,9 +12518,9 @@ pub(crate) mod tests {
         }
     }
 
-    struct TestClientTokenVerifier;
+    struct TestServerTokenVerifier;
 
-    impl application::ClientTokenSignatureVerifier for TestClientTokenVerifier {
+    impl application::ServerTokenSignatureVerifier for TestServerTokenVerifier {
         fn verify(
             &self,
             _public_jwk: &serde_json::Value,
@@ -11334,69 +12531,64 @@ pub(crate) mod tests {
         }
     }
 
-    struct TestClientClock;
+    struct TestServerClock;
 
-    impl application::Clock for TestClientClock {
+    impl application::Clock for TestServerClock {
         fn now(&self) -> OffsetDateTime {
             OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("test timestamp")
         }
     }
 
-    fn canonical_test_client_credential() -> String {
+    fn canonical_test_server_credential() -> String {
         format!(
-            "owl_client_v1.{CLIENT_TEST_PUBLIC_KEY_ID}.{}",
+            "owl_server_v1.{SERVER_TEST_PUBLIC_KEY_ID}.{}",
             "A".repeat(43)
         )
     }
 
-    fn isolated_test_client_router_with_authority_calls() -> (Router, Arc<AtomicUsize>) {
-        let config = test_config(PlaneMode::Client);
+    fn isolated_test_server_router_with_authority_calls() -> (Router, Arc<AtomicUsize>) {
+        let config = test_config(ProcessMode::Auth);
         let authority_calls = Arc::new(AtomicUsize::new(0));
-        let api = Arc::new(application::ClientApiService::new(
-            Arc::new(TestClientRepository {
+        let api = Arc::new(application::ServerApiService::new(
+            Arc::new(TestServerRepository {
                 authority_calls: Arc::clone(&authority_calls),
             }),
-            Arc::new(TestClientKeyVerifier),
-            Arc::new(TestClientEmailDigester),
-            Arc::new(TestClientTokenVerifier),
-            Arc::new(TestClientClock),
+            Arc::new(TestServerKeyVerifier),
+            Arc::new(TestServerEmailDigester),
+            Arc::new(TestServerTokenVerifier),
+            Arc::new(TestServerClock),
         ));
-        let mut routers = build_routers_with_capabilities(
+        let router = build_server_surface(
             &config,
-            crate::composition::HttpCapabilities {
-                runtime: None,
-                client: Some(crate::composition::ClientHttpCapabilities {
-                    admission: Arc::new(AdmissionService::new(
-                        format!("client-http-{}", Uuid::new_v4()),
-                        [83; 32],
-                        1,
-                        None,
-                    )),
-                    api: Some(api),
-                    readiness: None,
-                }),
-                control: None,
+            crate::composition::ServerHttpCapabilities {
+                admission: Arc::new(AdmissionService::new(
+                    format!("server-http-{}", Uuid::new_v4()),
+                    [83; 32],
+                    1,
+                    None,
+                )),
+                api: Some(api),
+                readiness: None,
             },
+            Arc::new(tokio::sync::Semaphore::new(
+                config.auth.http.max_in_flight_requests,
+            )),
         );
-        routers.mark_ready();
-        (
-            routers.client.take().expect("Client router"),
-            authority_calls,
-        )
+        (router, authority_calls)
     }
 
-    fn isolated_test_client_router() -> Router {
-        isolated_test_client_router_with_authority_calls().0
+    fn isolated_test_server_router() -> Router {
+        isolated_test_server_router_with_authority_calls().0
     }
 
-    async fn assert_client_error(
+    async fn assert_server_error(
         response: Response,
         expected_status: StatusCode,
-        expected_code: client_types::ClientErrorCode,
+        expected_code: server_types::ServerErrorCode,
     ) {
         assert_eq!(response.status(), expected_status);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-        let error: client_types::ClientError = serde_json::from_slice(
+        let error: server_types::ServerError = serde_json::from_slice(
             &to_bytes(response.into_body(), 4096)
                 .await
                 .expect("bounded Client error body"),
@@ -11424,10 +12616,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn client_authentication_failures_collapse_to_one_bearer_error() {
-        let router = isolated_test_client_router();
+    async fn server_authentication_failures_collapse_to_one_bearer_error() {
+        let router = isolated_test_server_router();
         let path = "/v1/projects/project-a/users";
-        let valid = canonical_test_client_credential();
+        let valid = canonical_test_server_credential();
         let requests = [
             Request::get(path).body(Body::empty()).unwrap(),
             Request::get(path)
@@ -11436,7 +12628,7 @@ pub(crate) mod tests {
                 .body(Body::empty())
                 .unwrap(),
             Request::get(path)
-                .header(header::AUTHORIZATION, "Bearer owl_client_v1.not-canonical")
+                .header(header::AUTHORIZATION, "Bearer owl_server_v1.not-canonical")
                 .body(Body::empty())
                 .unwrap(),
             Request::get(path)
@@ -11451,18 +12643,18 @@ pub(crate) mod tests {
             let response = router.clone().oneshot(request).await.unwrap();
             assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
             assert_no_browser_authority_headers(&response);
-            assert_client_error(
+            assert_server_error(
                 response,
                 StatusCode::UNAUTHORIZED,
-                client_types::ClientErrorCode::InvalidCredential,
+                server_types::ServerErrorCode::InvalidCredential,
             )
             .await;
         }
     }
 
     #[tokio::test]
-    async fn client_pre_authority_admission_stops_unknown_credentials_before_authority() {
-        let router = isolated_test_client_router();
+    async fn server_pre_authority_admission_stops_unknown_credentials_before_authority() {
+        let router = isolated_test_server_router();
         let path = "/v1/projects/project-a/users";
         for _ in 0..120 {
             let response = router
@@ -11494,20 +12686,20 @@ pub(crate) mod tests {
             .expect("numeric Retry-After");
         assert!((1..=60).contains(&retry_after));
         assert_no_browser_authority_headers(&response);
-        assert_client_error(
+        assert_server_error(
             response,
             StatusCode::TOO_MANY_REQUESTS,
-            client_types::ClientErrorCode::RateLimited,
+            server_types::ServerErrorCode::RateLimited,
         )
         .await;
     }
 
     #[tokio::test]
     async fn failure_block_stops_canonical_unknown_credentials_before_another_repository_lookup() {
-        let (router, authority_calls) = isolated_test_client_router_with_authority_calls();
+        let (router, authority_calls) = isolated_test_server_router_with_authority_calls();
         let unknown = format!(
-            "Bearer owl_client_v1.{}.{}",
-            URL_SAFE_NO_PAD.encode([1_u8; application::CLIENT_KEY_PUBLIC_ID_BYTES]),
+            "Bearer owl_server_v1.{}.{}",
+            URL_SAFE_NO_PAD.encode([1_u8; application::SERVER_KEY_PUBLIC_ID_BYTES]),
             "A".repeat(43)
         );
         let request = || {
@@ -11541,9 +12733,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn valid_client_traffic_does_not_consume_the_strict_failure_budget() {
-        let router = isolated_test_client_router();
-        let authorization = format!("Bearer {}", canonical_test_client_credential());
+    async fn valid_server_traffic_does_not_consume_the_strict_failure_budget() {
+        let router = isolated_test_server_router();
+        let authorization = format!("Bearer {}", canonical_test_server_credential());
         for request_number in 1..=130 {
             let response = router
                 .clone()
@@ -11564,9 +12756,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_client_key_is_project_bound_and_reads_the_directory() {
-        let router = isolated_test_client_router();
-        let authorization = format!("Bearer {}", canonical_test_client_credential());
+    async fn canonical_server_key_is_project_bound_and_reads_the_directory() {
+        let router = isolated_test_server_router();
+        let authorization = format!("Bearer {}", canonical_test_server_credential());
         let response = router
             .clone()
             .oneshot(
@@ -11586,7 +12778,7 @@ pub(crate) mod tests {
             HeaderValue::from_static("application/json")
         );
         assert_no_browser_authority_headers(&response);
-        let page: client_types::ClientUserList = serde_json::from_slice(
+        let page: server_types::ServerUserList = serde_json::from_slice(
             &to_bytes(response.into_body(), 4096)
                 .await
                 .expect("bounded list body"),
@@ -11605,18 +12797,18 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(wrong_project.headers()[header::WWW_AUTHENTICATE], "Bearer");
-        assert_client_error(
+        assert_server_error(
             wrong_project,
             StatusCode::UNAUTHORIZED,
-            client_types::ClientErrorCode::InvalidCredential,
+            server_types::ServerErrorCode::InvalidCredential,
         )
         .await;
     }
 
     #[tokio::test]
-    async fn authenticated_client_parse_failures_use_the_client_json_envelope() {
-        let router = isolated_test_client_router();
-        let authorization = format!("Bearer {}", canonical_test_client_credential());
+    async fn authenticated_server_parse_failures_use_the_server_json_envelope() {
+        let router = isolated_test_server_router();
+        let authorization = format!("Bearer {}", canonical_test_server_credential());
         let malformed_query = router
             .clone()
             .oneshot(
@@ -11627,10 +12819,10 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_client_error(
+        assert_server_error(
             malformed_query,
             StatusCode::BAD_REQUEST,
-            client_types::ClientErrorCode::InvalidRequest,
+            server_types::ServerErrorCode::InvalidRequest,
         )
         .await;
 
@@ -11644,24 +12836,24 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_client_error(
+        assert_server_error(
             malformed_body,
             StatusCode::BAD_REQUEST,
-            client_types::ClientErrorCode::InvalidRequest,
+            server_types::ServerErrorCode::InvalidRequest,
         )
         .await;
     }
 
     #[tokio::test]
-    async fn client_router_exposes_only_json_client_and_probe_routes() {
-        let router = isolated_test_client_router();
+    async fn server_router_exposes_only_json_server_api_and_probe_routes() {
+        let router = isolated_test_server_router();
         for path in [
             "/",
             "/auth/",
             "/console",
             "/mcp",
             "/v1/projects/project-a/auth/config",
-            "/v1/projects/project-a/client-keys",
+            "/v1/projects/project-a/server-keys",
             "/.well-known/owlauth",
         ] {
             let response = router
@@ -11686,10 +12878,10 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(preflight.headers()[header::WWW_AUTHENTICATE], "Bearer");
         assert_no_browser_authority_headers(&preflight);
-        assert_client_error(
+        assert_server_error(
             preflight,
             StatusCode::UNAUTHORIZED,
-            client_types::ClientErrorCode::InvalidCredential,
+            server_types::ServerErrorCode::InvalidCredential,
         )
         .await;
     }
@@ -11709,7 +12901,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn application_sync_routes_are_control_authenticated_and_runtime_absent() {
-        let config = test_config(PlaneMode::All);
+        let config = test_config(ProcessMode::All);
         let routers = build_routers(&config, None);
         let control = routers.control.expect("Control router");
         let runtime = routers.runtime.expect("Runtime router");

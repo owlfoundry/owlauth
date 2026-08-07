@@ -643,6 +643,14 @@
                   "$ref": "#/components/schemas/RuntimeError"
                 }
               }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
             }
           },
           "429": {
@@ -862,6 +870,14 @@
                   "$ref": "#/components/schemas/RuntimeError"
                 }
               }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
             }
           },
           "429": {
@@ -930,6 +946,14 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "required": true,
+                "schema": {
+                  "type": "string"
                 }
               }
             }

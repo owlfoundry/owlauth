@@ -42,11 +42,11 @@ Every authenticated command repeats discovery validation before reading the refe
 
 The self-hosted client supports typed commands for:
 
-- Project list/get/create/disable, token/session policy get/set, and Project-user list/get/identity/session inspection, disable, and exact session revoke;
+- Project list/get/create/disable, token/session policy get/set, and Project-user authoritative search/filter/sort/page, exact-email lookup, get/identity/session inspection, disable, and exact session revoke;
 - Application list/get/create/disable and cursor-bounded immutable user-event history;
 - provider Project-egress get/set, Custom OIDC preflight, and list/create/disable/assign/unassign for the closed `oidc`, `google`, and `github` kinds;
 - signing-key list/rotate/revoke, with provisioning, publication, activation, and retirement handled by the automatic lifecycle;
-- Project client-key list/create/acknowledge/revoke, with the credential emitted only by the original successful create;
+- Project server-key list/create/acknowledge/revoke, with the credential emitted only by the original successful create;
 - webhook endpoint list/get/create/subscription update/test/activate/disable, write-only secret rotation prepare/activate, cursor-bounded delivery inspection, and explicit replay.
 
 Examples:
@@ -60,17 +60,28 @@ owlauth --profile local project create \
   --idempotency-key project_create_20260803
 owlauth --profile local application list \
   11111111-1111-4111-8111-111111111111
+owlauth --profile local project user list \
+  11111111-1111-4111-8111-111111111111 \
+  --status active \
+  --search 'Ada' \
+  --identity provider \
+  --provider-key workforce \
+  --sort created-newest \
+  --limit 50
+owlauth --profile local project user lookup-email \
+  11111111-1111-4111-8111-111111111111 \
+  --email 'User@EXAMPLE.COM'
 owlauth --profile local signing-key list \
   11111111-1111-4111-8111-111111111111
-owlauth --profile local client-key acknowledge \
+owlauth --profile local server-key acknowledge \
   11111111-1111-4111-8111-111111111111 \
   22222222-2222-4222-8222-222222222222 \
   --expected-revision 1 \
-  --idempotency-key client_key_acknowledge_20260805 \
+  --idempotency-key server_key_acknowledge_20260805 \
   --yes
 ```
 
-All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. `client-key create` leaves replacement creation blocked until the emitted credential is durably stored and the exact returned key revision is passed to `client-key acknowledge`, or the key is revoked. Acknowledgement is an explicit assertion about external secret-manager storage; successful stdout delivery alone does not make that assertion. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` require an explicit `true` or `false` value.
+All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. `server-key create` leaves replacement creation blocked until the emitted credential is durably stored and the exact returned key revision is passed to `server-key acknowledge`, or the key is revoked. Acknowledgement is an explicit assertion about external secret-manager storage; successful stdout delivery alone does not make that assertion. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` require an explicit `true` or `false` value.
 
 Provider client secrets and webhook signing secrets, including candidate rotation generations, are accepted only through named environment-variable references:
 

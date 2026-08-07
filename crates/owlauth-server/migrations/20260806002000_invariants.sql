@@ -243,27 +243,11 @@ ALTER TABLE ONLY public.audit_events
 
 
 --
--- Name: client_key_digest_readiness client_key_digest_readiness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: server_key_digest_readiness server_key_digest_readiness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.client_key_digest_readiness
-    ADD CONSTRAINT client_key_digest_readiness_pkey PRIMARY KEY (process_id);
-
-
---
--- Name: client_process_incarnations client_process_incarnations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.client_process_incarnations
-    ADD CONSTRAINT client_process_incarnations_pkey PRIMARY KEY (process_id);
-
-
---
--- Name: client_process_incarnations client_process_incarnations_process_id_process_incarnation_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.client_process_incarnations
-    ADD CONSTRAINT client_process_incarnations_process_id_process_incarnation_key UNIQUE (process_id, process_incarnation);
+ALTER TABLE ONLY public.server_key_digest_readiness
+    ADD CONSTRAINT server_key_digest_readiness_pkey PRIMARY KEY (process_id);
 
 
 --
@@ -955,27 +939,27 @@ ALTER TABLE ONLY public.project_browser_sessions
 
 
 --
--- Name: project_client_keys project_client_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: project_server_keys project_server_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.project_client_keys
-    ADD CONSTRAINT project_client_keys_pkey PRIMARY KEY (id);
-
-
---
--- Name: project_client_keys project_client_keys_project_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.project_client_keys
-    ADD CONSTRAINT project_client_keys_project_id_id_key UNIQUE (project_id, id);
+ALTER TABLE ONLY public.project_server_keys
+    ADD CONSTRAINT project_server_keys_pkey PRIMARY KEY (id);
 
 
 --
--- Name: project_client_keys project_client_keys_public_key_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: project_server_keys project_server_keys_project_id_id_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.project_client_keys
-    ADD CONSTRAINT project_client_keys_public_key_id_key UNIQUE (public_key_id);
+ALTER TABLE ONLY public.project_server_keys
+    ADD CONSTRAINT project_server_keys_project_id_id_key UNIQUE (project_id, id);
+
+
+--
+-- Name: project_server_keys project_server_keys_public_key_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_server_keys
+    ADD CONSTRAINT project_server_keys_public_key_id_key UNIQUE (public_key_id);
 
 
 --
@@ -1435,19 +1419,19 @@ ALTER TABLE ONLY public.refresh_token_generations
 
 
 --
--- Name: runtime_process_incarnations runtime_process_incarnations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: auth_process_incarnations auth_process_incarnations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.runtime_process_incarnations
-    ADD CONSTRAINT runtime_process_incarnations_pkey PRIMARY KEY (process_id);
+ALTER TABLE ONLY public.auth_process_incarnations
+    ADD CONSTRAINT auth_process_incarnations_pkey PRIMARY KEY (process_id);
 
 
 --
--- Name: runtime_process_incarnations runtime_process_incarnations_process_id_process_incarnation_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: auth_process_incarnations auth_process_incarnations_process_id_process_incarnation_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.runtime_process_incarnations
-    ADD CONSTRAINT runtime_process_incarnations_process_id_process_incarnation_key UNIQUE (process_id, process_incarnation);
+ALTER TABLE ONLY public.auth_process_incarnations
+    ADD CONSTRAINT auth_process_incarnations_process_id_process_incarnation_key UNIQUE (process_id, process_incarnation);
 
 
 --
@@ -1678,10 +1662,10 @@ CREATE INDEX browser_sessions_user_status_idx ON public.project_browser_sessions
 
 
 --
--- Name: client_key_digest_readiness_lease_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: server_key_digest_readiness_lease_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX client_key_digest_readiness_lease_idx ON public.client_key_digest_readiness USING btree (lease_expires_at, process_id);
+CREATE INDEX server_key_digest_readiness_lease_idx ON public.server_key_digest_readiness USING btree (lease_expires_at, process_id);
 
 
 --
@@ -1731,6 +1715,13 @@ CREATE UNIQUE INDEX email_challenges_mutation_one_pending_idx ON public.email_ch
 --
 
 CREATE INDEX email_challenges_payload_retention_idx ON public.email_challenges USING btree (terminal_at, expires_at, id) WHERE (address_ciphertext IS NOT NULL);
+
+
+--
+-- Name: email_identities_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX email_identities_user_idx ON public.email_identities USING btree (project_id, user_id, status);
 
 
 --
@@ -1808,6 +1799,13 @@ CREATE INDEX key_state_events_key_revision_idx ON public.key_state_events USING 
 --
 
 CREATE INDEX linked_identities_user_idx ON public.linked_identities USING btree (project_id, user_id, status);
+
+
+--
+-- Name: linked_identities_provider_user_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX linked_identities_provider_user_idx ON public.linked_identities USING btree (project_id, created_via_provider_configuration_id, user_id, status);
 
 
 --
@@ -1916,24 +1914,24 @@ CREATE INDEX managed_reauthorization_state_idx ON public.managed_provider_reauth
 
 
 --
--- Name: project_client_keys_active_project_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: project_server_keys_active_project_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX project_client_keys_active_project_idx ON public.project_client_keys USING btree (project_id, id) WHERE (status = 'active'::text);
-
-
---
--- Name: project_client_keys_one_unacknowledged_active_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX project_client_keys_one_unacknowledged_active_idx ON public.project_client_keys USING btree (project_id) WHERE ((status = 'active'::text) AND (credential_acknowledged_at IS NULL));
+CREATE INDEX project_server_keys_active_project_idx ON public.project_server_keys USING btree (project_id, id) WHERE (status = 'active'::text);
 
 
 --
--- Name: project_client_keys_project_created_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: project_server_keys_one_unacknowledged_active_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX project_client_keys_project_created_idx ON public.project_client_keys USING btree (project_id, created_at, id);
+CREATE UNIQUE INDEX project_server_keys_one_unacknowledged_active_idx ON public.project_server_keys USING btree (project_id) WHERE ((status = 'active'::text) AND (credential_acknowledged_at IS NULL));
+
+
+--
+-- Name: project_server_keys_project_created_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX project_server_keys_project_created_idx ON public.project_server_keys USING btree (project_id, created_at, id);
 
 
 --
@@ -1972,6 +1970,13 @@ CREATE INDEX project_smtp_test_claim_idx ON public.project_smtp_test_operations 
 
 
 --
+-- Name: project_smtp_test_delivered_evidence_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX project_smtp_test_delivered_evidence_idx ON public.project_smtp_test_operations USING btree (project_id, configuration_id, configuration_generation, configuration_revision, configuration_security_eligibility_revision) WHERE ((state = 'delivered'::text) AND (safe_outcome = 'delivered'::text) AND (completed_at IS NOT NULL));
+
+
+--
 -- Name: project_user_merge_winner_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1983,6 +1988,20 @@ CREATE INDEX project_user_merge_winner_idx ON public.project_user_merge_tombston
 --
 
 CREATE INDEX project_users_client_list_idx ON public.project_users USING btree (project_id, created_at, id);
+
+
+--
+-- Name: project_users_display_name_search_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX project_users_display_name_search_idx ON public.project_users USING btree (project_id, lower(display_name) text_pattern_ops) WHERE (display_name IS NOT NULL);
+
+
+--
+-- Name: project_users_public_id_search_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX project_users_public_id_search_idx ON public.project_users USING btree (project_id, lower(public_id) text_pattern_ops);
 
 
 --
@@ -2567,10 +2586,10 @@ CREATE CONSTRAINT TRIGGER managed_reauthorizations_callback_owner AFTER INSERT O
 
 
 --
--- Name: project_client_keys project_client_keys_lifecycle; Type: TRIGGER; Schema: public; Owner: -
+-- Name: project_server_keys project_server_keys_lifecycle; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER project_client_keys_lifecycle BEFORE INSERT OR UPDATE ON public.project_client_keys FOR EACH ROW EXECUTE FUNCTION public.enforce_project_client_key_lifecycle();
+CREATE TRIGGER project_server_keys_lifecycle BEFORE INSERT OR UPDATE ON public.project_server_keys FOR EACH ROW EXECUTE FUNCTION public.enforce_project_server_key_lifecycle();
 
 
 --
@@ -2898,14 +2917,6 @@ ALTER TABLE ONLY public.applications
 
 ALTER TABLE ONLY public.audit_events
     ADD CONSTRAINT audit_events_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id);
-
-
---
--- Name: client_key_digest_readiness client_key_digest_readiness_process_id_process_incarnation_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.client_key_digest_readiness
-    ADD CONSTRAINT client_key_digest_readiness_process_id_process_incarnation_fkey FOREIGN KEY (process_id, process_incarnation) REFERENCES public.client_process_incarnations(process_id, process_incarnation) ON DELETE CASCADE;
 
 
 --
@@ -3493,11 +3504,11 @@ ALTER TABLE ONLY public.project_browser_sessions
 
 
 --
--- Name: project_client_keys project_client_keys_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: project_server_keys project_server_keys_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.project_client_keys
-    ADD CONSTRAINT project_client_keys_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT;
+ALTER TABLE ONLY public.project_server_keys
+    ADD CONSTRAINT project_server_keys_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT;
 
 
 --

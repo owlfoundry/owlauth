@@ -3,18 +3,21 @@ import { Link, useParams } from "react-router";
 
 import { CopyValue } from "../../shared/compositions/CopyValue";
 import { ArrowRightIcon } from "../../shared/icons/Icons";
-import { EmptyState, PageHeader, Section } from "../../shared/layout/Layout";
-import { Button, buttonClassName, classes } from "../../shared/primitives/Button";
-import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
+import { EmptyState, LoadingState, PageHeader, Section } from "../../shared/layout/Layout";
+import { Button } from "../../shared/primitives/Button";
+import { InlineAlert } from "../../shared/primitives/Feedback";
 import { useControl, useProject } from "../app/ControlContext";
 import { requireData } from "../client";
 import styles from "./pages.module.css";
 
 interface Summary {
   readonly applications: number;
+  readonly activeApplications: number;
   readonly configuredApplications: number;
   readonly providers: number;
-  readonly assignedMethods: number;
+  readonly activeProviders: number;
+  readonly providerAssignments: number;
+  readonly emailAssignments: number;
   readonly activeSigningKeys: number;
 }
 
@@ -75,28 +78,27 @@ export function ProjectOverviewPage() {
         const activeApplicationIds = new Set(
           activeApplications.map((application) => application.id),
         );
+        const activeProviders = providerItems.filter((provider) => provider.status === "active");
         const next = {
-          applications: activeApplications.length,
+          applications: applicationItems.length,
+          activeApplications: activeApplications.length,
           configuredApplications: activeApplications.filter(
             (application) => application.configuration.redirect_uris.length > 0,
           ).length,
-          providers: providerItems.filter((provider) => provider.status === "active").length,
-          assignedMethods:
-            providerItems
-              .filter((provider) => provider.status === "active")
-              .reduce(
-                (total, provider) =>
-                  total +
-                  provider.assigned_application_ids.filter((id) => activeApplicationIds.has(id))
-                    .length,
-                0,
-              ) +
-            (email.enabled
-              ? emailAssignmentItems.filter(
-                  (assignment) =>
-                    assignment.enabled && activeApplicationIds.has(assignment.application_id),
-                ).length
-              : 0),
+          providers: providerItems.length,
+          activeProviders: activeProviders.length,
+          providerAssignments: activeProviders.reduce(
+            (total, provider) =>
+              total +
+              provider.assigned_application_ids.filter((id) => activeApplicationIds.has(id)).length,
+            0,
+          ),
+          emailAssignments: email.enabled
+            ? emailAssignmentItems.filter(
+                (assignment) =>
+                  assignment.enabled && activeApplicationIds.has(assignment.application_id),
+              ).length
+            : 0,
           activeSigningKeys: keyItems.filter((key) => key.state === "active").length,
         };
         if (signal?.aborted !== true) {
@@ -139,34 +141,26 @@ export function ProjectOverviewPage() {
     <div className={styles["page"]}>
       <PageHeader
         title={project.display_name}
-        description="Configure the resources required to authenticate users securely."
-        status={<StatusBadge status={project.status} />}
+        description={
+          <span className={styles["projectIdentity"]}>
+            <span className={styles["projectIdentityLabel"]}>Project ID</span>
+            <CopyValue
+              value={project.public_id}
+              label="Project public ID"
+              onCopied={(message) => {
+                setMessage(message, "success");
+              }}
+            />
+          </span>
+        }
       />
       {project.status !== "active" ? (
         <InlineAlert tone="warning">
           This Project is disabled. Configuration actions are unavailable.
         </InlineAlert>
       ) : null}
-      <div className={styles["projectIdSection"]}>
-        <Section
-          title="Project ID"
-          description="Use this public identifier in trusted integrations."
-        >
-          <CopyValue
-            value={project.public_id}
-            label="Project public ID"
-            block
-            onCopied={(message) => {
-              setMessage(message, "success");
-            }}
-          />
-        </Section>
-      </div>
-      <Section
-        title="Set up sign-in"
-        description="Complete every requirement before enabling sign-in for users."
-      >
-        {loadState === "loading" ? <p role="status">Loading Project resources</p> : null}
+      <Section title="Resources" description="Current Project configuration at a glance.">
+        {loadState === "loading" ? <LoadingState>Loading project resources</LoadingState> : null}
         {loadState === "failed" ? (
           <InlineAlert tone="danger" role="alert">
             <p>Project resource summaries could not be loaded.</p>
@@ -176,95 +170,69 @@ export function ProjectOverviewPage() {
           </InlineAlert>
         ) : null}
         {loadState === "ready" && summary !== null ? (
-          <ol className={styles["setupList"]} aria-label="Sign-in setup">
-            <SetupStep
-              title="Create an Application"
-              ready={summary.applications > 0}
-              detail={
-                summary.applications > 0
-                  ? `${String(summary.applications)} active Application${summary.applications === 1 ? "" : "s"}`
-                  : "Add the app that will send users to OwlAuth."
-              }
-              href={`/projects/${project.id}/applications`}
-              action={summary.applications > 0 ? "Review Applications" : "Create Application"}
-            />
-            <SetupStep
-              title="Add login URLs"
-              ready={summary.configuredApplications > 0}
-              detail={
-                summary.configuredApplications > 0
-                  ? `${String(summary.configuredApplications)} Application${summary.configuredApplications === 1 ? "" : "s"} with redirect URLs`
-                  : "Add exact redirect URLs before starting browser sign-in."
-              }
-              href={`/projects/${project.id}/applications`}
-              action="Configure login URLs"
-            />
-            <SetupStep
-              title="Choose how users sign in"
-              ready={summary.assignedMethods > 0}
-              detail={
-                summary.assignedMethods > 0
-                  ? `${String(summary.assignedMethods)} method assignment${summary.assignedMethods === 1 ? "" : "s"}`
-                  : summary.providers > 0
-                    ? "Assign an existing provider to an Application."
-                    : "Add a provider or configure passwordless email."
-              }
-              href={`/projects/${project.id}/authentication/providers`}
-              action={summary.providers > 0 ? "Assign provider" : "Add sign-in method"}
-            />
-            <SetupStep
-              title="Activate a signing key"
-              ready={summary.activeSigningKeys > 0}
-              detail={
-                summary.activeSigningKeys > 0
-                  ? "An active key can issue tokens."
-                  : "OwlAuth needs an active signing key before sign-in can complete."
-              }
-              href={`/projects/${project.id}/security/signing-keys`}
-              action="Review signing keys"
-            />
-          </ol>
+          <ul className={styles["dashboardGrid"]} aria-label="Project resource summary">
+            <li>
+              <DashboardCard
+                title="Applications"
+                value={summary.applications}
+                detail={`${String(summary.activeApplications)} active · ${String(summary.configuredApplications)} with login URLs`}
+                href={`/projects/${project.id}/applications`}
+              />
+            </li>
+            <li>
+              <DashboardCard
+                title="Identity providers"
+                value={summary.providers}
+                detail={`${String(summary.activeProviders)} active · ${String(summary.providerAssignments)} Application assignments`}
+                href={`/projects/${project.id}/authentication/providers`}
+              />
+            </li>
+            <li>
+              <DashboardCard
+                title="Passwordless email"
+                value={summary.emailAssignments}
+                detail="Active Application assignments"
+                href={`/projects/${project.id}/authentication/email`}
+              />
+            </li>
+            <li>
+              <DashboardCard
+                title="Signing keys"
+                value={summary.activeSigningKeys}
+                detail="Active keys available for token issuance"
+                href={`/projects/${project.id}/security/signing-keys`}
+              />
+            </li>
+          </ul>
         ) : null}
       </Section>
     </div>
   );
 }
 
-function SetupStep({
+function DashboardCard({
   title,
-  ready,
+  value,
   detail,
   href,
-  action,
 }: {
   readonly title: string;
-  readonly ready: boolean;
+  readonly value: number;
   readonly detail: string;
   readonly href: string;
-  readonly action: string;
 }) {
   return (
-    <li className={styles["setupStep"]} data-ready={ready ? "true" : "false"}>
-      <div className={styles["setupStepContent"]}>
-        <div className={styles["setupStepHeading"]}>
-          <h3>{title}</h3>
-          <StatusBadge
-            status={ready ? "Ready" : "Not configured"}
-            family={ready ? "active" : "disabled"}
-          />
-        </div>
-        <p>{detail}</p>
-      </div>
-      <Link
-        className={classes(
-          buttonClassName(ready ? "quiet" : "secondary"),
-          styles["setupStepAction"],
-        )}
-        to={href}
-      >
-        {action}
+    <Link
+      className={styles["dashboardCard"]}
+      to={href}
+      aria-label={`${title}: ${String(value)}. ${detail}`}
+    >
+      <span className={styles["dashboardCardHeader"]}>
+        <h3>{title}</h3>
         <ArrowRightIcon />
-      </Link>
-    </li>
+      </span>
+      <strong className={styles["dashboardValue"]}>{value}</strong>
+      <span className={styles["dashboardDetail"]}>{detail}</span>
+    </Link>
   );
 }

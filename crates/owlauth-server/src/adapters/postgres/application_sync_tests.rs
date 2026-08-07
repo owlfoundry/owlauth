@@ -1276,7 +1276,7 @@ async fn webhook_history_retention_and_secret_cleanup_are_durable() {
     let process_id = "runtime-key-retirement";
     let process_incarnation = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO runtime_process_incarnations (process_id,process_incarnation,started_at)
+        "INSERT INTO auth_process_incarnations (process_id,process_incarnation,started_at)
          VALUES ($1,$2,transaction_timestamp())",
     )
     .bind(process_id)
@@ -1938,7 +1938,7 @@ async fn projection_email_rewrap_converges_storage_without_public_or_event_mutat
     let process_id = "projection-rewrap-retirement";
     let process_incarnation = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO runtime_process_incarnations (process_id,process_incarnation,started_at)
+        "INSERT INTO auth_process_incarnations (process_id,process_incarnation,started_at)
          VALUES ($1,$2,clock_timestamp())",
     )
     .bind(process_id)

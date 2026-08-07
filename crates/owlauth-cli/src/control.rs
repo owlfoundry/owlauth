@@ -3,21 +3,22 @@ use std::io::Write as _;
 use clap::{Args, Subcommand, ValueEnum};
 use owlauth_types::{
     control::{
-        AcknowledgeProjectClientKeyDeliveryRequest, ActivateWebhookSecretRotationRequest,
+        AcknowledgeProjectServerKeyDeliveryRequest, ActivateWebhookSecretRotationRequest,
         Application, ApplicationList, ApplicationSession, ApplicationType, ApplicationUserEvent,
         ApplicationUserEventList, ApplicationUserEventType, BrowserSession,
-        CreateApplicationRequest, CreateProjectClientKeyRequest, CreateProjectClientKeyResponse,
-        CreateProjectRequest, CreateProviderRequest, CreateWebhookEndpointRequest,
+        CreateApplicationRequest, CreateProjectRequest, CreateProjectServerKeyRequest,
+        CreateProjectServerKeyResponse, CreateProviderRequest, CreateWebhookEndpointRequest,
         ExpectedSecurityRevision, ExpectedSessionRevision, ExpectedWebhookEndpointRevision,
         KeyTransitionRequest, OidcPreflightRequest, OidcPreflightResult,
-        PrepareWebhookSecretRotationRequest, PreparedWebhookSecretRotation, Project,
-        ProjectClientKey, ProjectClientKeyList, ProjectList, ProjectPolicy, ProjectUser,
-        ProjectUserIdentityList, ProjectUserList, ProjectUserSessions, ProjectUserStatus, Provider,
-        ProviderAssignmentRequest, ProviderEgressMode, ProviderEgressPolicy, ProviderList,
-        ProviderRevisionRequest, ReplayWebhookDeliveryRequest, RevokeProjectClientKeyRequest,
-        RotateSigningKeyRequest, SigningKey, SigningKeyList, UpdateProjectPolicyRequest,
-        UpdateProviderEgressPolicyRequest, UpdateWebhookEndpointRequest, WebhookDelivery,
-        WebhookDeliveryList, WebhookEndpoint, WebhookEndpointList,
+        PrepareWebhookSecretRotationRequest, PreparedWebhookSecretRotation, Project, ProjectList,
+        ProjectPolicy, ProjectServerKey, ProjectServerKeyList, ProjectUser,
+        ProjectUserEmailLookupRequest, ProjectUserIdentityList, ProjectUserList, ProjectUserLookup,
+        ProjectUserSessions, ProjectUserStatus, Provider, ProviderAssignmentRequest,
+        ProviderEgressMode, ProviderEgressPolicy, ProviderList, ProviderRevisionRequest,
+        ReplayWebhookDeliveryRequest, RevokeProjectServerKeyRequest, RotateSigningKeyRequest,
+        SigningKey, SigningKeyList, UpdateProjectPolicyRequest, UpdateProviderEgressPolicyRequest,
+        UpdateWebhookEndpointRequest, WebhookDelivery, WebhookDeliveryList, WebhookEndpoint,
+        WebhookEndpointList,
     },
     runtime::ProviderKind,
 };
@@ -163,8 +164,29 @@ struct ProjectUserArgs {
 
 #[derive(Debug, Subcommand)]
 enum ProjectUserCommand {
+    /// Search, filter, sort, and page the authoritative Project user directory.
     List {
         project_id: String,
+        #[arg(long)]
+        status: Option<ProjectUserStatusArg>,
+        #[arg(long)]
+        search: Option<String>,
+        #[arg(long)]
+        identity: Option<ProjectUserIdentityFilterArg>,
+        #[arg(long, requires = "identity")]
+        provider_key: Option<String>,
+        #[arg(long)]
+        sort: Option<ProjectUserSortArg>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Resolve zero or one Project user by exact canonical email.
+    LookupEmail {
+        project_id: String,
+        #[arg(long)]
+        email: String,
     },
     Get {
         project_id: String,
@@ -214,6 +236,53 @@ enum ProjectUserCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProjectUserStatusArg {
+    Active,
+    Disabled,
+    Merged,
+}
+
+impl ProjectUserStatusArg {
+    const fn query_value(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Disabled => "disabled",
+            Self::Merged => "merged",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProjectUserIdentityFilterArg {
+    Provider,
+    Email,
+}
+
+impl ProjectUserIdentityFilterArg {
+    const fn query_value(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Email => "email",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProjectUserSortArg {
+    CreatedNewest,
+    CreatedOldest,
+}
+
+impl ProjectUserSortArg {
+    const fn query_value(self) -> &'static str {
+        match self {
+            Self::CreatedNewest => "created_newest",
+            Self::CreatedOldest => "created_oldest",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct ProjectPolicyArgs {
     #[command(subcommand)]
@@ -256,16 +325,16 @@ impl From<ApplicationTypeArg> for ApplicationType {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct ClientKeyArgs {
+pub(crate) struct ServerKeyArgs {
     #[command(subcommand)]
-    command: ClientKeyCommand,
+    command: ServerKeyCommand,
 }
 
 #[derive(Debug, Subcommand)]
-enum ClientKeyCommand {
-    /// List secret-free Project client-key metadata.
+enum ServerKeyCommand {
+    /// List secret-free Project server-key metadata.
     List { project_id: String },
-    /// Create a Project client key and reveal its credential exactly once.
+    /// Create a Project server key and reveal its credential exactly once.
     Create {
         project_id: String,
         #[arg(long)]
@@ -284,7 +353,7 @@ enum ClientKeyCommand {
         #[arg(long)]
         yes: bool,
     },
-    /// Immediately and irreversibly revoke one Project client key.
+    /// Immediately and irreversibly revoke one Project server key.
     Revoke {
         project_id: String,
         key_id: String,
@@ -703,37 +772,37 @@ pub(crate) fn run_project(profile: Option<&str>, args: ProjectArgs) -> Result<()
     }
 }
 
-pub(crate) fn run_client_key(
+pub(crate) fn run_server_key(
     profile: Option<&str>,
-    args: ClientKeyArgs,
+    args: ServerKeyArgs,
 ) -> Result<(), RemoteError> {
     match args.command {
-        ClientKeyCommand::List { project_id } => {
+        ServerKeyCommand::List { project_id } => {
             resource(&project_id)?;
-            let value: ProjectClientKeyList = authenticated_server(profile)?
-                .get(&format!("projects/{project_id}/client-keys"))?;
+            let value: ProjectServerKeyList = authenticated_server(profile)?
+                .get(&format!("projects/{project_id}/server-keys"))?;
             print_json(&value)
         }
-        ClientKeyCommand::Create {
+        ServerKeyCommand::Create {
             project_id,
             label,
             idempotency_key,
         } => {
             resource(&project_id)?;
             idem(&idempotency_key)?;
-            let mut value: CreateProjectClientKeyResponse = authenticated_server(profile)?.send(
+            let mut value: CreateProjectServerKeyResponse = authenticated_server(profile)?.send(
                 Method::POST,
-                &format!("projects/{project_id}/client-keys"),
-                &CreateProjectClientKeyRequest { label },
+                &format!("projects/{project_id}/server-keys"),
+                &CreateProjectServerKeyRequest { label },
                 Some(&idempotency_key),
             )?;
             // Stream directly to stdout so no additional heap String retains the one-time secret.
             // Zeroize the deserialized response on both successful and failed output.
-            let result = print_one_time_client_key(&value);
+            let result = print_one_time_server_key(&value);
             value.credential.zeroize();
             result
         }
-        ClientKeyCommand::Acknowledge {
+        ServerKeyCommand::Acknowledge {
             project_id,
             key_id,
             expected_revision,
@@ -742,11 +811,11 @@ pub(crate) fn run_client_key(
         } => {
             resources(&[&project_id, &key_id])?;
             idem(&idempotency_key)?;
-            let target = format!("projects/{project_id}/client-keys/{key_id}/acknowledge");
+            let target = format!("projects/{project_id}/server-keys/{key_id}/acknowledge");
             let stored = require_confirmation(
                 yes,
                 profile,
-                "project-client-key.acknowledge-delivery",
+                "project-server-key.acknowledge-delivery",
                 &target,
                 &serde_json::json!({
                     "effect": "assert that the one-time credential is durably stored outside OwlAuth and unblock replacement creation",
@@ -754,10 +823,10 @@ pub(crate) fn run_client_key(
                     "confirm_stored": true,
                 }),
             )?;
-            let value: ProjectClientKey = authenticated_server_snapshot(stored)?.send(
+            let value: ProjectServerKey = authenticated_server_snapshot(stored)?.send(
                 Method::POST,
                 &target,
-                &AcknowledgeProjectClientKeyDeliveryRequest {
+                &AcknowledgeProjectServerKeyDeliveryRequest {
                     expected_revision,
                     confirm_stored: true,
                 },
@@ -765,7 +834,7 @@ pub(crate) fn run_client_key(
             )?;
             print_json(&value)
         }
-        ClientKeyCommand::Revoke {
+        ServerKeyCommand::Revoke {
             project_id,
             key_id,
             expected_revision,
@@ -774,22 +843,22 @@ pub(crate) fn run_client_key(
         } => {
             resources(&[&project_id, &key_id])?;
             idem(&idempotency_key)?;
-            let target = format!("projects/{project_id}/client-keys/{key_id}/revoke");
+            let target = format!("projects/{project_id}/server-keys/{key_id}/revoke");
             let stored = require_confirmation(
                 yes,
                 profile,
-                "project-client-key.revoke",
+                "project-server-key.revoke",
                 &target,
                 &serde_json::json!({
-                    "effect": "immediately and irreversibly revoke the Project client key",
+                    "effect": "immediately and irreversibly revoke the Project server key",
                     "expected_revision": expected_revision,
                     "confirm": true,
                 }),
             )?;
-            let value: ProjectClientKey = authenticated_server_snapshot(stored)?.send(
+            let value: ProjectServerKey = authenticated_server_snapshot(stored)?.send(
                 Method::POST,
                 &target,
-                &RevokeProjectClientKeyRequest {
+                &RevokeProjectServerKeyRequest {
                     expected_revision,
                     confirm: true,
                 },
@@ -800,7 +869,7 @@ pub(crate) fn run_client_key(
     }
 }
 
-fn print_one_time_client_key(value: &CreateProjectClientKeyResponse) -> Result<(), RemoteError> {
+fn print_one_time_server_key(value: &CreateProjectServerKeyResponse) -> Result<(), RemoteError> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     serde_json::to_writer_pretty(&mut output, value).map_err(|_| RemoteError::ProfileStorage)?;
@@ -816,11 +885,52 @@ fn print_one_time_client_key(value: &CreateProjectClientKeyResponse) -> Result<(
 )]
 fn run_project_user(profile: Option<&str>, args: ProjectUserArgs) -> Result<(), RemoteError> {
     match args.command {
-        ProjectUserCommand::List { project_id } => {
+        ProjectUserCommand::List {
+            project_id,
+            status,
+            search,
+            identity,
+            provider_key,
+            sort,
+            cursor,
+            limit,
+        } => {
             resource(&project_id)?;
-            let value: ProjectUserList =
-                authenticated_server(profile)?.get(&format!("projects/{project_id}/users"))?;
+            let mut query = Vec::new();
+            if let Some(status) = status {
+                query.push(("status", status.query_value().to_owned()));
+            }
+            if let Some(search) = search {
+                query.push(("search", search));
+            }
+            if let Some(identity) = identity {
+                query.push(("identity_kind", identity.query_value().to_owned()));
+            }
+            if let Some(provider_key) = provider_key {
+                query.push(("provider_key", provider_key));
+            }
+            if let Some(sort) = sort {
+                query.push(("sort", sort.query_value().to_owned()));
+            }
+            if let Some(cursor) = cursor {
+                query.push(("cursor", cursor));
+            }
+            if let Some(limit) = limit {
+                query.push(("limit", limit.to_string()));
+            }
+            let value: ProjectUserList = authenticated_server(profile)?
+                .get_with_query(&format!("projects/{project_id}/users"), &query)?;
             print_json(&ProjectUserListOutput::from(value))
+        }
+        ProjectUserCommand::LookupEmail { project_id, email } => {
+            resource(&project_id)?;
+            let value: ProjectUserLookup = authenticated_server(profile)?.send(
+                Method::POST,
+                &format!("projects/{project_id}/users/lookup"),
+                &ProjectUserEmailLookupRequest { email },
+                None,
+            )?;
+            print_json(&value.user.map(ProjectUserOutput::from))
         }
         ProjectUserCommand::Get {
             project_id,
@@ -1305,7 +1415,7 @@ pub(crate) fn run_provider(profile: Option<&str>, args: ProviderArgs) -> Result<
         } => {
             resources(&[&project_id, &provider_id, &application_id])?;
             let target = format!(
-                "projects/{project_id}/providers/{provider_id}/assignments/{application_id}"
+                "projects/{project_id}/providers/{provider_id}/assignments/{application_id}/unassign"
             );
             let stored = require_confirmation(
                 yes,
@@ -1320,7 +1430,7 @@ pub(crate) fn run_provider(profile: Option<&str>, args: ProviderArgs) -> Result<
             let client = authenticated_server_snapshot(stored)?;
             provider_assignment(
                 &client,
-                Method::DELETE,
+                Method::POST,
                 &project_id,
                 &provider_id,
                 &application_id,
@@ -1339,9 +1449,16 @@ fn provider_assignment(
     expected_application_revision: i64,
 ) -> Result<(), RemoteError> {
     resources(&[project_id, provider_id, application_id])?;
+    let suffix = if method == Method::POST {
+        "/unassign"
+    } else {
+        ""
+    };
     let value: Provider = client.send(
         method,
-        &format!("projects/{project_id}/providers/{provider_id}/assignments/{application_id}"),
+        &format!(
+            "projects/{project_id}/providers/{provider_id}/assignments/{application_id}{suffix}"
+        ),
         &ProviderAssignmentRequest {
             expected_application_revision,
         },
@@ -2080,37 +2197,37 @@ mod tests {
             &format!("projects/{PROJECT}/users/{USER}/sessions"),
             json!({"application_sessions":[],"browser_sessions":[]}),
         );
-        assert_get::<ProjectClientKeyList>(
-            &format!("projects/{PROJECT}/client-keys"),
+        assert_get::<ProjectServerKeyList>(
+            &format!("projects/{PROJECT}/server-keys"),
             json!({"items":[],"active_unacknowledged_key":null}),
         );
         assert_send(
             Method::POST,
-            &format!("projects/{PROJECT}/client-keys"),
-            &CreateProjectClientKeyRequest {
+            &format!("projects/{PROJECT}/server-keys"),
+            &CreateProjectServerKeyRequest {
                 label: "customer-backend".to_owned(),
             },
-            Some("client_key_create_1"),
+            Some("server_key_create_1"),
             json!({"label":"customer-backend"}),
         );
         assert_send(
             Method::POST,
-            &format!("projects/{PROJECT}/client-keys/{KEY}/acknowledge"),
-            &AcknowledgeProjectClientKeyDeliveryRequest {
+            &format!("projects/{PROJECT}/server-keys/{KEY}/acknowledge"),
+            &AcknowledgeProjectServerKeyDeliveryRequest {
                 expected_revision: 1,
                 confirm_stored: true,
             },
-            Some("client_key_acknowledge_1"),
+            Some("server_key_acknowledge_1"),
             json!({"expected_revision":1,"confirm_stored":true}),
         );
         assert_send(
             Method::POST,
-            &format!("projects/{PROJECT}/client-keys/{KEY}/revoke"),
-            &RevokeProjectClientKeyRequest {
+            &format!("projects/{PROJECT}/server-keys/{KEY}/revoke"),
+            &RevokeProjectServerKeyRequest {
                 expected_revision: 2,
                 confirm: true,
             },
-            Some("client_key_revoke_1"),
+            Some("server_key_revoke_1"),
             json!({"expected_revision":2,"confirm":true}),
         );
 
@@ -2268,15 +2385,20 @@ mod tests {
         };
         let assignment_path =
             format!("projects/{PROJECT}/providers/{PROVIDER}/assignments/{APPLICATION}");
-        for method in [Method::PUT, Method::DELETE] {
-            assert_send(
-                method,
-                &assignment_path,
-                &assignment,
-                None,
-                json!({"expected_application_revision":6}),
-            );
-        }
+        assert_send(
+            Method::PUT,
+            &assignment_path,
+            &assignment,
+            None,
+            json!({"expected_application_revision":6}),
+        );
+        assert_send(
+            Method::POST,
+            &format!("{assignment_path}/unassign"),
+            &assignment,
+            None,
+            json!({"expected_application_revision":6}),
+        );
         assert_send(
             Method::POST,
             &format!("projects/{PROJECT}/providers/{PROVIDER}/disable"),
@@ -2376,7 +2498,33 @@ mod tests {
             json!({"expected_revision":14,"overlap_seconds":600}),
         );
 
-        let user_base = format!("projects/{PROJECT}/users/{USER}");
+        let user_collection = format!("projects/{PROJECT}/users");
+        assert_get_query(
+            &user_collection,
+            &[
+                ("status", "disabled"),
+                ("search", "Ada Lovelace"),
+                ("identity_kind", "provider"),
+                ("provider_key", "workforce"),
+                ("sort", "created_oldest"),
+                ("cursor", USER),
+                ("limit", "25"),
+            ],
+            &format!(
+                "/v1/{user_collection}?status=disabled&search=Ada+Lovelace&identity_kind=provider&provider_key=workforce&sort=created_oldest&cursor={USER}&limit=25"
+            ),
+        );
+        assert_send(
+            Method::POST,
+            &format!("{user_collection}/lookup"),
+            &ProjectUserEmailLookupRequest {
+                email: "Ada@Example.Test".to_owned(),
+            },
+            None,
+            json!({"email":"Ada@Example.Test"}),
+        );
+
+        let user_base = format!("{user_collection}/{USER}");
         assert_send(
             Method::POST,
             &format!("{user_base}/disable"),

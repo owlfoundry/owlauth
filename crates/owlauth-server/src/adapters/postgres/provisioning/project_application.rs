@@ -53,7 +53,11 @@ impl PostgresProvisioningAdapter {
             .all(&transaction)
             .await
             .map_err(persistence)?;
-        ensure_capacity(projects.len(), LIST_LIMIT, ApplicationError::InvalidInput)?;
+        ensure_capacity(
+            projects.len(),
+            LIST_LIMIT,
+            ApplicationError::CapacityExceeded,
+        )?;
         let id = Uuid::new_v4();
         let public_id = generated_id("prj");
         project::ActiveModel {
@@ -385,7 +389,7 @@ impl PostgresProvisioningAdapter {
             transaction.commit().await.map_err(persistence)?;
             return Ok(replayed);
         }
-        ensure_application_capacity(&transaction, project_id, ApplicationError::InvalidInput)
+        ensure_application_capacity(&transaction, project_id, ApplicationError::CapacityExceeded)
             .await?;
         let id = Uuid::new_v4();
         let public_id = generated_id("app");

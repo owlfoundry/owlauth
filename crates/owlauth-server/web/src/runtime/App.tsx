@@ -125,6 +125,23 @@ function validProofModes(value: unknown, allowEmpty: boolean): value is EmailPro
   return new Set(value).size === value.length;
 }
 
+function validPendingEmailChallenge(
+  value: unknown,
+): value is NonNullable<HostedInteraction["pending_email_challenge"]> {
+  if (typeof value !== "object" || value === null) return false;
+  const challenge = value as Record<string, unknown>;
+  return (
+    boundedString(challenge["challenge_id"], 96) &&
+    typeof challenge["generation"] === "number" &&
+    Number.isSafeInteger(challenge["generation"]) &&
+    challenge["generation"] > 0 &&
+    challenge["generation"] <= 5 &&
+    validProofModes(challenge["proof_modes"], false) &&
+    boundedString(challenge["expires_at"], 64) &&
+    !Number.isNaN(Date.parse(challenge["expires_at"]))
+  );
+}
+
 function validProvider(value: unknown): value is HostedProvider {
   if (typeof value !== "object" || value === null) return false;
   const provider = value as Record<string, unknown>;
@@ -145,6 +162,23 @@ function validInteraction(value: unknown): value is HostedInteraction {
   if (!validProofModes(interaction["email_proof_modes"], !emailAvailable)) return false;
   if (emailAvailable !== interaction["email_proof_modes"].length > 0) return false;
   if (!providers.every(validProvider)) return false;
+  const pendingChallenge = interaction["pending_email_challenge"];
+  if (
+    pendingChallenge !== null &&
+    pendingChallenge !== undefined &&
+    !validPendingEmailChallenge(pendingChallenge)
+  ) {
+    return false;
+  }
+  if ((interaction["status"] === "email_challenge_pending") !== (pendingChallenge != null)) {
+    return false;
+  }
+  if (
+    pendingChallenge != null &&
+    Date.parse(pendingChallenge.expires_at) > Date.parse(String(interaction["expires_at"]))
+  ) {
+    return false;
+  }
   const keys = providers.map((provider) => provider.key);
   return (
     new Set(keys).size === keys.length &&
@@ -454,12 +488,25 @@ function initialView(flow: RuntimeFlow | null): ViewState {
       return { status: "ready-interaction", handle: flow.handle, bootstrap: flow.bootstrap };
     case "email_address_entry":
       return { status: "email-entry", handle: flow.handle, bootstrap: flow.bootstrap };
-    case "email_challenge_pending":
+    case "email_challenge_pending": {
+      const challenge = flow.bootstrap.pending_email_challenge;
+      if (challenge === null || challenge === undefined) {
+        return {
+          status: "error",
+          title: "Sign-in could not be displayed",
+          message: "Return to your Application and start sign-in again.",
+        };
+      }
       return {
-        status: "error",
-        title: "Check your email",
-        message: "Use the newest code or link. If this page was reloaded, restart sign-in safely.",
+        status: "email-proof",
+        handle: flow.handle,
+        bootstrap: flow.bootstrap,
+        challengeId: challenge.challenge_id,
+        generation: challenge.generation,
+        proofModes: challenge.proof_modes,
+        expiresAt: challenge.expires_at,
       };
+    }
     case "provider_authorization_started":
     case "provider_exchange_in_progress":
     case "authenticated":
@@ -511,12 +558,21 @@ export function RuntimeApp() {
     [],
   );
 
+  function beginRequest(): AbortController {
+    activeRequest.current?.abort();
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    return controller;
+  }
+
+  function finishRequest(controller: AbortController) {
+    if (activeRequest.current === controller) activeRequest.current = null;
+  }
+
   async function selectProvider(provider: HostedProvider) {
     if (state.status !== "ready-interaction") return;
     const { bootstrap, handle } = state;
-    const controller = new AbortController();
-    activeRequest.current?.abort();
-    activeRequest.current = controller;
+    const controller = beginRequest();
     setState({
       status: "submitting",
       title: "Connecting to your identity provider",
@@ -556,13 +612,14 @@ export function RuntimeApp() {
         });
       }
     } finally {
-      if (activeRequest.current === controller) activeRequest.current = null;
+      finishRequest(controller);
     }
   }
 
   async function selectEmail() {
     if (state.status !== "ready-interaction") return;
     const { bootstrap, handle } = state;
+    const controller = beginRequest();
     setState({ status: "submitting", title: "Preparing email sign-in", message: "Please wait." });
     try {
       const { data, response } = await createRuntimeClient(readConfiguredBase("runtime")).POST(
@@ -570,30 +627,44 @@ export function RuntimeApp() {
         {
           params: { path: { project_public_id: bootstrap.project_id, interaction: handle } },
           body: { csrf: bootstrap.csrf, expected_revision: bootstrap.revision },
+          signal: controller.signal,
         },
       );
-      if (!response.ok || data?.completed !== true) throw new Error("selection rejected");
+      if (controller.signal.aborted) return;
+      if (
+        !response.ok ||
+        data?.status !== "email_address_entry" ||
+        !Number.isSafeInteger(data.revision) ||
+        data.revision <= bootstrap.revision
+      ) {
+        throw new Error("selection rejected");
+      }
       setState({
         status: "email-entry",
         handle,
         bootstrap: {
           ...bootstrap,
-          revision: bootstrap.revision + 1,
-          status: "email_address_entry",
+          revision: data.revision,
+          status: data.status,
         },
       });
     } catch {
-      setState({
-        status: "error",
-        title: "Email sign-in unavailable",
-        message: "Return to your Application and start again.",
-      });
+      if (!controller.signal.aborted) {
+        setState({
+          status: "error",
+          title: "Email sign-in unavailable",
+          message: "Return to your Application and start again.",
+        });
+      }
+    } finally {
+      finishRequest(controller);
     }
   }
 
   async function sendEmailChallenge(resend = false) {
     if (state.status !== "email-entry" && state.status !== "email-proof") return;
     const { bootstrap, handle } = state;
+    const controller = beginRequest();
     const address = emailAddress;
     if (!/^\S{1,64}@\S{3,253}$/u.test(address) || address.length > 254) return;
     setState({
@@ -611,8 +682,10 @@ export function RuntimeApp() {
         {
           params: { path: { project_public_id: bootstrap.project_id, interaction: handle } },
           body: { csrf: bootstrap.csrf, expected_revision: bootstrap.revision, email: address },
+          signal: controller.signal,
         },
       );
+      if (controller.signal.aborted) return;
       if (!response.ok || data?.accepted !== true || !validProofModes(data.proof_modes, false)) {
         throw new Error("challenge rejected");
       }
@@ -627,11 +700,15 @@ export function RuntimeApp() {
         expiresAt: data.expires_at,
       });
     } catch {
-      setState({
-        status: "error",
-        title: "Email could not be sent",
-        message: "Return to your Application and start again.",
-      });
+      if (!controller.signal.aborted) {
+        setState({
+          status: "error",
+          title: "Email could not be sent",
+          message: "Return to your Application and start again.",
+        });
+      }
+    } finally {
+      finishRequest(controller);
     }
   }
 
@@ -645,6 +722,7 @@ export function RuntimeApp() {
     }
     const proofState = state;
     const { bootstrap, handle, challengeId, generation } = proofState;
+    const controller = beginRequest();
     const submittedOtp = otp;
     setOtp("");
     setOtpError(null);
@@ -661,8 +739,10 @@ export function RuntimeApp() {
             generation,
             otp: submittedOtp,
           },
+          signal: controller.signal,
         },
       );
+      if (controller.signal.aborted) return;
       if (
         !response.ok ||
         data?.completed !== true ||
@@ -678,17 +758,22 @@ export function RuntimeApp() {
       if (target === null) throw new Error("unsafe navigation");
       hostedNavigation.replace(target);
     } catch {
-      setState({
-        status: "error",
-        title: "Sign-in status is uncertain",
-        message: "Return to your Application before trying again.",
-      });
+      if (!controller.signal.aborted) {
+        setState({
+          status: "error",
+          title: "Sign-in status is uncertain",
+          message: "Return to your Application before trying again.",
+        });
+      }
+    } finally {
+      finishRequest(controller);
     }
   }
 
   async function confirmMagic() {
     if (state.status !== "ready-magic" || state.context === null) return;
     const { challengeId, context } = state;
+    const controller = beginRequest();
     setState({ status: "submitting", title: "Confirming email sign-in", message: "Please wait." });
     try {
       const { data, response } = await createRuntimeClient(readConfiguredBase("runtime")).POST(
@@ -705,8 +790,10 @@ export function RuntimeApp() {
             generation: context.generation,
             proof: context.proof,
           },
+          signal: controller.signal,
         },
       );
+      if (controller.signal.aborted) return;
       if (
         !response.ok ||
         data?.completed !== true ||
@@ -725,11 +812,15 @@ export function RuntimeApp() {
       if (target === null) throw new Error("unsafe navigation");
       hostedNavigation.replace(target);
     } catch {
-      setState({
-        status: "error",
-        title: "Sign-in status is uncertain",
-        message: "Return to your Application before trying again.",
-      });
+      if (!controller.signal.aborted) {
+        setState({
+          status: "error",
+          title: "Sign-in status is uncertain",
+          message: "Return to your Application before trying again.",
+        });
+      }
+    } finally {
+      finishRequest(controller);
     }
   }
 
@@ -739,9 +830,7 @@ export function RuntimeApp() {
     }
     const csrf = state.bootstrap.csrf;
     const { bootstrap, handle } = state;
-    const controller = new AbortController();
-    activeRequest.current?.abort();
-    activeRequest.current = controller;
+    const controller = beginRequest();
     setState({
       status: "submitting",
       title: "Connecting to your identity provider",
@@ -778,16 +867,14 @@ export function RuntimeApp() {
         });
       }
     } finally {
-      if (activeRequest.current === controller) activeRequest.current = null;
+      finishRequest(controller);
     }
   }
 
   async function reuseSession() {
     if (state.status !== "ready-interaction") return;
     const { bootstrap, handle } = state;
-    const controller = new AbortController();
-    activeRequest.current?.abort();
-    activeRequest.current = controller;
+    const controller = beginRequest();
     setState({ status: "submitting", title: "Confirming your session", message: "Please wait." });
     try {
       const { data, response } = await createRuntimeClient(readConfiguredBase("runtime")).POST(
@@ -820,16 +907,14 @@ export function RuntimeApp() {
         });
       }
     } finally {
-      if (activeRequest.current === controller) activeRequest.current = null;
+      finishRequest(controller);
     }
   }
 
   async function confirmLogout() {
     if (state.status !== "ready-logout") return;
     const { bootstrap, handle } = state;
-    const controller = new AbortController();
-    activeRequest.current?.abort();
-    activeRequest.current = controller;
+    const controller = beginRequest();
     setState({ status: "submitting", title: "Signing out", message: "Please wait." });
     try {
       const { data, response } = await createRuntimeClient(readConfiguredBase("runtime")).POST(
@@ -863,7 +948,7 @@ export function RuntimeApp() {
         });
       }
     } finally {
-      if (activeRequest.current === controller) activeRequest.current = null;
+      finishRequest(controller);
     }
   }
 

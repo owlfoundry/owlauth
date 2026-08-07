@@ -4,13 +4,13 @@ Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) for repository boundaries, devel
 
 ## Design and documentation
 
-- [`spec/`](spec/README.md) is the normative authority for the target server, Runtime, Client, Control, CLI, MCP, storage, security, and hosted-web design. Accepted technology decisions are under [`spec/technology/`](spec/technology/README.md).
+- [`spec/`](spec/README.md) is the normative authority for the target server, Runtime, Server API, Control, CLI, MCP, storage, security, and hosted-web design. Accepted technology decisions are under [`spec/technology/`](spec/technology/README.md).
 - [`sdks/spec/`](sdks/spec/README.md) is the language-neutral authority for official SDK behavior and conformance.
 - [`docs/`](docs/index.md) is public user guidance. It describes only capabilities that have been implemented and released; it must not present target specifications as shipped behavior.
 
 ## Source map
 
-- [`crates/owlauth-server/`](crates/owlauth-server/) — server library and executable, migrations, Runtime/Client/Control surfaces, and embedded hosted web
+- [`crates/owlauth-server/`](crates/owlauth-server/) — server library and executable, migrations, Auth Runtime/Server API surfaces, Control surface, and embedded hosted web
 - [`crates/owlauth-server/web/`](crates/owlauth-server/web/) — Runtime Hosted Authentication UI and Control Management Console
 - [`crates/owlauth-types/`](crates/owlauth-types/) — reviewed public HTTP DTO and OpenAPI authority
 - [`crates/owlauth-key-provider/`](crates/owlauth-key-provider/) — provider-neutral key-provider SPI
@@ -20,9 +20,9 @@ Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) for repository boundaries, devel
 
 ## Non-negotiable boundaries
 
-- Runtime is the browser-facing Project Auth plane; its public SDK configuration contains no Client or Control secret. Client is the customer-backend plane and accepts only Project client keys. Control is the operator plane used by the Console, CLI, and MCP and accepts only the Control operator key.
-- Official TypeScript, Python, and Rust SDKs cover Runtime Project Auth only. Client has a generated OpenAPI document but no official SDK and must never be imported into hosted-web code.
-- Keep Runtime, Client, and Control listeners, routers, readiness, admission, credentials, roles, serving pools, and pool bounds independently configurable, while all three planes remain bound to one PostgreSQL server/database authority. The Runtime Hosted Authentication UI and Control Management Console are the only browser surfaces.
+- Auth is the Project Auth endpoint. Its browser-facing Runtime surface and backend-only Server API surface share one listener and process identity but retain separate routers, credentials, CORS/response policy, admission, readiness, roles, serving pools, and pool bounds. Runtime public SDK configuration contains no Server or Control secret; Server API accepts only Project server keys. Control is the separate operator endpoint used by the Console, CLI, and MCP and accepts only the Control operator key.
+- Official TypeScript, Python, and Rust SDKs cover Runtime Project Auth only. Server API has a generated OpenAPI document but no official SDK and must never be imported into hosted-web code.
+- Keep Auth and Control listeners independently configurable. Keep Runtime, Server API, and Control internal authority boundaries independently configurable while all three surfaces remain bound to one PostgreSQL server/database authority. The Runtime Hosted Authentication UI and Control Management Console are the only browser surfaces.
 - PostgreSQL is the durable authority. Do not add browser credential persistence, file-store fallbacks, unreviewed secret delivery, or dependencies from CLI/SDKs into the server implementation.
 - Edit Rust DTOs in `owlauth-types`; regenerate derived OpenAPI/hosted-web contracts rather than hand-editing generated files. Until the first deployed schema is declared, rebuild clean module baselines instead of preserving pre-release migration history; after deployment, freeze those baselines and add ordered migrations only.
 
@@ -35,7 +35,7 @@ cp .env.example .env
 make dev
 ```
 
-`make dev-check` performs a non-mutating `.env`, toolchain, Docker, and Compose preflight. `make dev` runs that check, rebuilds embedded Runtime and Control assets, starts PostgreSQL and Redis, runs all three HTTP planes, and logs directly openable plane URLs. Use `make dev-status`, `make dev-logs`, `make dev-postgres`, or `make dev-redis` while debugging and `make dev-down` when finished. `make dev-reset` deletes all local PostgreSQL and Redis data and is intentionally destructive.
+`make dev-check` performs a non-mutating `.env`, toolchain, Docker, and Compose preflight. `make dev` runs that check, rebuilds embedded Runtime and Control assets, starts PostgreSQL and Redis, runs Auth and Control, and logs directly openable endpoint URLs. Use `make dev-status`, `make dev-logs`, `make dev-postgres`, or `make dev-redis` while debugging and `make dev-down` when finished. `make dev-reset` deletes all local PostgreSQL and Redis data and is intentionally destructive.
 
 Common targets:
 
@@ -44,7 +44,7 @@ Common targets:
 - `make test` — workspace Rust, Python, hosted-web, and TypeScript SDK tests.
 - `make build` — release server/CLI binaries, SDK distributions, embedded web assets, and docs.
 - `make package-check` — inspect registry candidates and compile packaged Rust products offline.
-- `make openapi` — export `target/openapi/{runtime,client,control}.json`.
+- `make openapi` — export `target/openapi/{runtime,server,control}.json`.
 - `make web-contracts` / `make web-build` / `make web-verify` — regenerate types, rebuild deterministic assets, and reject drift.
 - `make web-e2e` — qualify the exact SDK artifacts against real PostgreSQL, Rust, Chromium, and Firefox. It requires a clean committed `HEAD` so candidate bytes are attributable.
 - `make test-containers` / `make docker-build` — focused Docker-backed infrastructure or image smoke tests.

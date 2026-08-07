@@ -39,9 +39,9 @@ CSS-in-JS, inline style attributes, Tailwind as the base system, raw HTML sinks,
 
 ### Plane-specific contracts and clients
 
-`owlauth-types` owns a deterministic export utility that produces complete, separate Runtime, Client, and Control OpenAPI 3.1 documents without compiling `owlauth-server`. This avoids a cycle in which compiling the server needs web assets while building the web assets needs server-generated OpenAPI. The documents remain derived build artifacts; exact Runtime/Client/Control JSON files are attached to each server release.
+`owlauth-types` owns a deterministic export utility that produces complete, separate Runtime, Server API, and Control OpenAPI 3.1 documents without compiling `owlauth-server`. This avoids a cycle in which compiling the server needs web assets while building the web assets needs server-generated OpenAPI. The documents remain derived build artifacts; exact Runtime/Server API/Control JSON files are attached to each server release.
 
-`openapi-typescript` consumes only the Runtime and Control documents for Hosted Web and emits two committed internal type-only files so review and clean source type-checks do not depend on an already built server. Client types are never generated into or imported by Hosted Web. A clean regeneration plus diff is the drift gate; the generated files never become contract authority. CI validates that each OpenAPI document and generated import graph contains only its plane.
+`openapi-typescript` consumes only the Runtime and Control documents for Hosted Web and emits two committed internal type-only files so review and clean source type-checks do not depend on an already built server. Server API types are never generated into or imported by Hosted Web. A clean regeneration plus diff is the drift gate; the generated files never become contract authority. CI validates that each OpenAPI document and generated import graph contains only its plane.
 
 Each application constructs its own `openapi-fetch` client from the immutable configured same-origin plane base. The Control client is created only after key verification. Its request middleware closes over the page-memory operator key, permits only URLs below the configured Control base, adds exactly the Bearer header, and supports explicit disposal on lock or authentication failure. It does not put the key in React props/state, a module singleton, DOM, storage, URL, telemetry, or errors. Runtime source has no Control contract import or operator-key client constructor.
 
@@ -83,7 +83,7 @@ Rust renders one fixed executable shell and asset closure from validated manifes
 The one valid server-web build order is:
 
 ```text
-export Runtime, Client, and Control OpenAPI
+export Runtime, Server API, and Control OpenAPI
 -> regenerate/check only the Runtime and Control internal TS type files; reject Client imports
 -> lint, type-check, and component-test
 -> build the two Vite graphs

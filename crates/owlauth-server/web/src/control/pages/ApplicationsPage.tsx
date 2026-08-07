@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 
-import { DataTable, EmptyState, PageHeader } from "../../shared/layout/Layout";
+import { DataTable, EmptyState, LoadingState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Field, Input, Select } from "../../shared/primitives/Field";
@@ -165,7 +165,7 @@ export function ApplicationsPage() {
           ) : undefined
         }
       />
-      {loadState === "loading" ? <p role="status">Loading Applications</p> : null}
+      {loadState === "loading" ? <LoadingState>Loading applications</LoadingState> : null}
       {loadState === "failed" ? (
         <InlineAlert tone="danger" role="alert">
           <p>The Application inventory could not be loaded.</p>

@@ -61,9 +61,9 @@ SQLx's own `_sqlx_migrations` history and checksum behavior is library infrastru
 Before broad repository implementation, one disposable-PostgreSQL spike MUST prove concurrent migration locking/timeout behavior and one representative Unit-of-Work plus one-use conditional mutation. The remaining items are ordinary adapter, integration, and release-history tests rather than separate PoCs. Together, validation MUST prove:
 
 1. concurrent startup serializes SQLx migrations and bounded `lock_timeout` failure releases the dedicated connection/session lock;
-2. configuration admits only one PostgreSQL server/database authority per deployment; migration configuration may replace only the login credential/owner role and cannot redirect DDL, while every Runtime/Client/Control pool against the same target detects pending, missing, modified, dirty, and database-ahead migration history in `auto` or DDL-free `verify` flow;
+2. configuration admits only one PostgreSQL server/database authority per deployment; migration configuration may replace only the login credential/owner role and cannot redirect DDL, while every Runtime/Server API/Control pool against the same target detects pending, missing, modified, dirty, and database-ahead migration history in `auto` or DDL-free `verify` flow;
 3. the migration session activates the configured non-login owner role and resulting schema/table/history ownership and serving grants are correct;
-4. Runtime, Client, and Control SeaORM pools remain separately bounded under exhaustion;
+4. Runtime, Server API, and Control SeaORM pools remain separately bounded under exhaustion;
 5. one application-owned Unit of Work atomically spans representative cross-repository mutation and durable audit append, including rollback and error mapping;
 6. one-use conditional mutation/row-lock behavior is expressible without leaking ORM types;
 7. the predeployment baseline applies from an empty PostgreSQL database, records the exact three-file SQLx history, verifies unchanged in DDL-free mode, and round-trips to the same final schema; after first deployment, modified, missing, dirty, reordered, or unexpected history fails closed.

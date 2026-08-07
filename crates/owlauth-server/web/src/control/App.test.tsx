@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { ControlApp } from "./App";
-import type { ProjectClientKey } from "./client";
+import type { ProjectServerKey } from "./client";
 
 function requestUrl(input: RequestInfo | URL): string {
   return input instanceof Request ? input.url : String(input);
@@ -97,7 +97,7 @@ describe("Control application shell", () => {
       ),
     ).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: "Lock console" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exit console" }));
     expect(screen.getByRole("heading", { name: "Connect to this deployment" })).toBeVisible();
     expect(requests.every((request) => request.signal.aborted)).toBe(true);
   });
@@ -136,7 +136,7 @@ describe("Control application shell", () => {
     expect(projectReads).toBe(2);
   });
 
-  it("presents Project context and sign-in requirements with explicit hierarchy", async () => {
+  it("presents compact Project context and a resource dashboard", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>((input) => {
@@ -146,10 +146,46 @@ describe("Control application shell", () => {
           return Promise.resolve(Response.json({ items: [project] }));
         }
         if (url.pathname.endsWith(`/v1/projects/${project.id}/applications`)) {
-          return Promise.resolve(Response.json({ items: [application] }));
+          return Promise.resolve(
+            Response.json({
+              items: [
+                application,
+                { ...application, id: "application-disabled", status: "disabled" },
+              ],
+            }),
+          );
         }
         if (url.pathname.endsWith(`/v1/projects/${project.id}/providers`)) {
-          return Promise.resolve(Response.json({ items: [] }));
+          return Promise.resolve(
+            Response.json({
+              items: [
+                {
+                  id: "provider-disabled",
+                  project_id: project.id,
+                  provider_key: "disabled-provider",
+                  display_name: "Disabled provider",
+                  kind: "oidc",
+                  issuer: "https://disabled.example/",
+                  client_id: "disabled-client",
+                  callback_url: "https://identity.example/runtime/callback",
+                  status: "disabled",
+                  revision: 1,
+                  assigned_application_ids: [],
+                  login_supported: true,
+                  identity_proof_supported: true,
+                  managed_profile: {
+                    supported: true,
+                    enabled: false,
+                    exact_scopes: [],
+                    profile_schema: "oidc.v1",
+                    read_retry_safe: true,
+                    renewal_idempotent_replay: true,
+                    supports_revocation: true,
+                  },
+                },
+              ],
+            }),
+          );
         }
         if (url.pathname.endsWith(`/v1/projects/${project.id}/signing-keys`)) {
           return Promise.resolve(
@@ -184,27 +220,53 @@ describe("Control application shell", () => {
     await unlock("owl_ctrl_v1_test", project.display_name);
 
     const navigation = screen.getByRole("navigation", { name: "Resources" });
-    expect(within(navigation).getByText("Current project")).toBeVisible();
-    expect(within(navigation).getByText(project.display_name)).toBeVisible();
-    expect(within(navigation).getByRole("link", { name: "Switch project" })).toBeVisible();
+    const currentProject = within(navigation).getByRole("group", { name: "Current project" });
+    expect(within(currentProject).getByText(project.display_name)).toBeVisible();
+    expect(within(currentProject).getByRole("button", { name: "Copy Project ID" })).toBeVisible();
+    expect(within(navigation).getByRole("link", { name: "Back to projects" })).toBeVisible();
+    expect(within(navigation).queryByText("Workspace")).toBeNull();
+    expect(within(navigation).queryByText("Current project")).toBeNull();
+    expect(within(navigation).queryByRole("link", { name: "Switch project" })).toBeNull();
+    const navigationLabels = within(navigation)
+      .getAllByRole("link")
+      .map((link) => link.textContent);
+    expect(navigationLabels.indexOf("Settings")).toBeGreaterThan(
+      navigationLabels.indexOf("Project secret keys"),
+    );
+    expect(screen.getByRole("button", { name: "Exit console" })).toBeVisible();
+    expect(screen.queryByText("Clear operator access from this console page.")).toBeNull();
     expect(screen.queryByText("Directory")).toBeNull();
+    expect(screen.getByRole("button", { name: "Copy Project public ID" })).toBeVisible();
+    expect(screen.queryByText("Set up sign-in")).toBeNull();
 
-    const setupHeading = screen.getByRole("heading", { name: "Set up sign-in" });
-    const setupSection = setupHeading.closest("section");
-    if (setupSection === null) throw new Error("Sign-in setup section is missing");
-    expect(await within(setupSection).findAllByRole("listitem")).toHaveLength(4);
+    const resourcesHeading = screen.getByRole("heading", { name: "Resources" });
+    const resourcesSection = resourcesHeading.closest("section");
+    if (resourcesSection === null) throw new Error("Project resource dashboard is missing");
+    expect(await within(resourcesSection).findAllByRole("link")).toHaveLength(4);
     expect(
-      within(setupSection).getByRole("heading", { name: "Create an Application" }),
-    ).toBeVisible();
-    expect(within(setupSection).getByRole("link", { name: "Review Applications" })).toBeVisible();
-    expect(within(setupSection).getByRole("link", { name: "Configure login URLs" })).toBeVisible();
-    expect(within(setupSection).getByRole("link", { name: "Add sign-in method" })).toBeVisible();
-    expect(within(setupSection).getByRole("link", { name: "Review signing keys" })).toBeVisible();
+      within(resourcesSection).getByRole("link", { name: /^Applications/u }),
+    ).toHaveTextContent("2");
+    expect(
+      within(resourcesSection).getByRole("link", { name: /^Applications/u }),
+    ).toHaveTextContent("1 active");
+    expect(
+      within(resourcesSection).getByRole("link", { name: /^Identity providers/u }),
+    ).toHaveTextContent("1");
+    expect(
+      within(resourcesSection).getByRole("link", { name: /^Identity providers/u }),
+    ).toHaveTextContent("0 active");
+    expect(
+      within(resourcesSection).getByRole("link", { name: /^Passwordless email/u }),
+    ).toHaveTextContent("0");
+    expect(
+      within(resourcesSection).getByRole("link", { name: /^Signing keys/u }),
+    ).toHaveTextContent("1");
     expect(within(navigation).getByRole("group", { name: "Project" })).toBeVisible();
     expect(within(navigation).getByRole("group", { name: "Authentication" })).toBeVisible();
     expect(within(navigation).getByRole("group", { name: "Security" })).toBeVisible();
+    expect(within(navigation).getByRole("group", { name: "Project settings" })).toBeVisible();
 
-    fireEvent.click(within(navigation).getByRole("link", { name: "Switch project" }));
+    fireEvent.click(within(navigation).getByRole("link", { name: "Back to projects" }));
     const projectLink = await screen.findByRole("link", { name: project.display_name });
     expect(projectLink).toHaveAccessibleDescription(/project_public_1.*active/u);
   });
@@ -363,7 +425,7 @@ describe("Control application shell", () => {
     await waitFor(() => {
       expect(staleRequest).toBeDefined();
     });
-    fireEvent.click(screen.getByRole("link", { name: "Switch project" }));
+    fireEvent.click(screen.getByRole("link", { name: "Back to projects" }));
     fireEvent.click(await screen.findByRole("link", { name: "Second Project" }));
     fireEvent.click(
       within(screen.getByRole("navigation", { name: "Resources" })).getByRole("link", {
@@ -480,7 +542,7 @@ describe("Control application shell", () => {
       expect(resolveRotation).toBeDefined();
     });
 
-    fireEvent.click(screen.getByRole("link", { name: "Switch project" }));
+    fireEvent.click(screen.getByRole("link", { name: "Back to projects" }));
     fireEvent.click(await screen.findByRole("link", { name: "Second Project" }));
     fireEvent.click(
       within(screen.getByRole("navigation", { name: "Resources" })).getByRole("link", {
@@ -541,7 +603,7 @@ describe("Control application shell", () => {
             exact_scopes: ["openid", "profile", "email"],
             managed_profile_supported: true,
             pkce_s256_supported: true,
-            policy_mode: "allow_all",
+            policy_mode: "exact_origins",
             policy_revision: 1,
             rs256_id_tokens_supported: true,
           });
@@ -553,14 +615,14 @@ describe("Control application shell", () => {
             return Response.json({
               project_id: project.id,
               mode: "exact_origins",
-              exact_origins: ["https://issuer.example"],
+              exact_origins: ["https://existing.example", "https://issuer.example"],
               revision: 2,
             });
           }
           return Response.json({
             project_id: project.id,
-            mode: "allow_all",
-            exact_origins: [],
+            mode: "exact_origins",
+            exact_origins: ["https://existing.example"],
             revision: 1,
           });
         }
@@ -617,7 +679,9 @@ describe("Control application shell", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Review registration settings" }));
     expect(secretInput).toHaveValue("");
     await within(dialog).findByRole("heading", { name: "Preflight result" });
-    expect(within(dialog).getByText("Safe discovered origins are allowed")).toBeVisible();
+    expect(
+      within(dialog).getByText("Allowed origins match the Project destination policy"),
+    ).toBeVisible();
     expect(within(dialog).getByText("https://issuer.example")).toBeVisible();
     expect(
       within(dialog).getByText(
@@ -630,11 +694,15 @@ describe("Control application shell", () => {
     fireEvent.change(secretInput, { target: { value: "discard-before-policy-change" } });
 
     fireEvent.click(
-      within(dialog).getByRole("button", { name: "Adopt reviewed origins as exact policy" }),
+      within(dialog).getByRole("button", { name: "Add reviewed origins to exact policy" }),
     );
     await waitFor(() => {
       expect(policyUpdates).toEqual([
-        { mode: "exact_origins", exact_origins: ["https://issuer.example"], expected_revision: 1 },
+        {
+          mode: "exact_origins",
+          exact_origins: ["https://existing.example", "https://issuer.example"],
+          expected_revision: 1,
+        },
       ]);
     });
     expect(within(dialog).queryByRole("heading", { name: "Preflight result" })).toBeNull();
@@ -643,6 +711,10 @@ describe("Control application shell", () => {
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Review registration settings" }));
     await within(dialog).findByRole("heading", { name: "Preflight result" });
+    expect(preflightBodies).toEqual([
+      { issuer: "https://issuer.example", provider_key: "custom-provider" },
+      { issuer: "https://issuer.example", provider_key: "custom-provider" },
+    ]);
     dialog = screen.getByRole("dialog", { name: "Add Custom OIDC" });
     fireEvent.change(within(dialog).getByLabelText("Display name"), {
       target: { value: "Custom provider" },
@@ -872,13 +944,13 @@ describe("Control application shell", () => {
     expect(policyReads).toBe(2);
   });
 
-  it("routes client keys through one-time reveal, explicit disposal, and revisioned revoke", async () => {
-    const oneTimeCredential = `owl_client_v1.${"A".repeat(22)}.${"B".repeat(43)}`;
-    const firstKey: ProjectClientKey = {
-      id: "client-key-1",
+  it("routes server keys through one-time reveal, explicit disposal, and revisioned revoke", async () => {
+    const oneTimeCredential = `owl_server_v1.${"A".repeat(22)}.${"B".repeat(43)}`;
+    const firstKey: ProjectServerKey = {
+      id: "server-key-1",
       project_id: project.id,
       public_key_id: "AAAAAAAAAAAAAAAAAAAAAA",
-      display_prefix: "owl_client_v1.AAAAAA",
+      display_prefix: "owl_server_v1.AAAAAA",
       label: "production backend",
       status: "active",
       revision: 3,
@@ -888,16 +960,16 @@ describe("Control application shell", () => {
       last_used_at: null,
       revoked_at: null,
     };
-    let createdKey: ProjectClientKey = {
+    let createdKey: ProjectServerKey = {
       ...firstKey,
-      id: "client-key-2",
+      id: "server-key-2",
       public_key_id: "BBBBBBBBBBBBBBBBBBBBBB",
-      display_prefix: "owl_client_v1.BBBBBB",
+      display_prefix: "owl_server_v1.BBBBBB",
       label: "replacement backend",
       revision: 1,
       credential_acknowledged_at: null,
     };
-    let inventory: ProjectClientKey[] = [firstKey];
+    let inventory: ProjectServerKey[] = [firstKey];
     const mutationBodies: unknown[] = [];
     const createIdempotencyKeys: string[] = [];
     let createRequests = 0;
@@ -919,7 +991,7 @@ describe("Control application shell", () => {
         if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
           return Response.json({ items: [project] });
         }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/client-keys`)) {
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/server-keys`)) {
           if (request.method === "POST") {
             mutationBodies.push(await request.clone().json());
             createIdempotencyKeys.push(request.headers.get("idempotency-key") ?? "");
@@ -947,7 +1019,7 @@ describe("Control application shell", () => {
         }
         if (
           url.pathname.endsWith(
-            `/v1/projects/${project.id}/client-keys/${createdKey.id}/acknowledge`,
+            `/v1/projects/${project.id}/server-keys/${createdKey.id}/acknowledge`,
           )
         ) {
           mutationBodies.push(await request.clone().json());
@@ -967,7 +1039,7 @@ describe("Control application shell", () => {
           inventory = [firstKey, createdKey];
           return Response.json(createdKey);
         }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/client-keys/${firstKey.id}/revoke`)) {
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/server-keys/${firstKey.id}/revoke`)) {
           mutationBodies.push(await request.clone().json());
           inventory = [{ ...firstKey, status: "revoked", revision: 4 }, createdKey];
           return Response.json(inventory[0]);
@@ -976,22 +1048,22 @@ describe("Control application shell", () => {
       }),
     );
 
-    renderConsole(`/projects/${project.id}/security/client-keys`);
-    await unlock("owl_ctrl_v1_test", "Client API keys");
-    expect(screen.getByRole("link", { name: "Client API keys" })).toHaveAttribute(
+    renderConsole(`/projects/${project.id}/security/server-keys`);
+    await unlock("owl_ctrl_v1_test", "Project secret keys");
+    expect(screen.getByRole("link", { name: "Project secret keys" })).toHaveAttribute(
       "aria-current",
       "page",
     );
     expect(await screen.findByText("production backend")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Create client key" }));
-    const createDialog = screen.getByRole("dialog", { name: "Create client key" });
+    fireEvent.click(screen.getByRole("button", { name: "Create secret key" }));
+    const createDialog = screen.getByRole("dialog", { name: "Create Project secret key" });
     fireEvent.change(within(createDialog).getByLabelText("Key label"), {
       target: { value: "replacement backend" },
     });
-    fireEvent.click(within(createDialog).getByRole("button", { name: "Create client key" }));
+    fireEvent.click(within(createDialog).getByRole("button", { name: "Create secret key" }));
 
-    const reveal = await screen.findByRole("dialog", { name: "Store this client key now" });
+    const reveal = await screen.findByRole("dialog", { name: "Store this Project secret key now" });
     expect(within(reveal).getByText(oneTimeCredential)).toBeVisible();
     expect(createIdempotencyKeys).toHaveLength(2);
     expect(createIdempotencyKeys[0]).not.toBe("");
@@ -1000,7 +1072,7 @@ describe("Control application shell", () => {
     const acknowledge = within(reveal).getByRole("button", { name: "I saved this key" });
     expect(acknowledge).toBeDisabled();
     fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.getByRole("dialog", { name: "Store this client key now" })).toBeVisible();
+    expect(screen.getByRole("dialog", { name: "Store this Project secret key now" })).toBeVisible();
     fireEvent.click(within(reveal).getByRole("button", { name: "Copy credential" }));
     await waitFor(() => {
       expect(clipboardWrite).toHaveBeenCalledWith(oneTimeCredential);
@@ -1025,9 +1097,11 @@ describe("Control application shell", () => {
     const revoke = screen.getAllByRole("button", { name: "Revoke" })[0];
     if (revoke === undefined) throw new Error("Revoke action is missing");
     fireEvent.click(revoke);
-    const confirmation = await screen.findByRole("dialog", { name: "Revoke client key" });
+    const confirmation = await screen.findByRole("dialog", { name: "Revoke Project secret key" });
     expect(confirmation).toHaveTextContent("production backend");
-    fireEvent.click(within(confirmation).getByRole("button", { name: "Revoke client key" }));
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Revoke Project secret key" }),
+    );
     await waitFor(() => {
       expect(mutationBodies).toContainEqual({ confirm: true, expected_revision: 3 });
     });
@@ -1037,14 +1111,14 @@ describe("Control application shell", () => {
   it.each(["unauthorized", "acknowledged", "revoked"] as const)(
     "clears a revealed credential when acknowledgement resolves as %s",
     async (resolution) => {
-      const oneTimeCredential = `owl_client_v1.${"D".repeat(22)}.${"E".repeat(43)}`;
+      const oneTimeCredential = `owl_server_v1.${"D".repeat(22)}.${"E".repeat(43)}`;
       let issued = false;
       let exactReads = 0;
-      let serverKey: ProjectClientKey = {
-        id: "client-key-concurrent",
+      let serverKey: ProjectServerKey = {
+        id: "server-key-concurrent",
         project_id: project.id,
         public_key_id: "DDDDDDDDDDDDDDDDDDDDDD",
-        display_prefix: "owl_client_v1.DDDDDD",
+        display_prefix: "owl_server_v1.DDDDDD",
         label: "concurrent backend",
         status: "active",
         revision: 1,
@@ -1064,7 +1138,7 @@ describe("Control application shell", () => {
           if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
             return Response.json({ items: [project] });
           }
-          if (url.pathname.endsWith(`/v1/projects/${project.id}/client-keys`)) {
+          if (url.pathname.endsWith(`/v1/projects/${project.id}/server-keys`)) {
             if (request.method === "POST") {
               issued = true;
               return Response.json(
@@ -1085,7 +1159,7 @@ describe("Control application shell", () => {
           }
           if (
             url.pathname.endsWith(
-              `/v1/projects/${project.id}/client-keys/${serverKey.id}/acknowledge`,
+              `/v1/projects/${project.id}/server-keys/${serverKey.id}/acknowledge`,
             )
           ) {
             if (resolution === "unauthorized") {
@@ -1113,7 +1187,7 @@ describe("Control application shell", () => {
             );
           }
           if (
-            url.pathname.endsWith(`/v1/projects/${project.id}/client-keys/${serverKey.id}`) &&
+            url.pathname.endsWith(`/v1/projects/${project.id}/server-keys/${serverKey.id}`) &&
             request.method === "GET"
           ) {
             exactReads += 1;
@@ -1123,25 +1197,27 @@ describe("Control application shell", () => {
         }),
       );
 
-      renderConsole(`/projects/${project.id}/security/client-keys`);
-      await unlock("owl_ctrl_v1_test", "Client API keys");
+      renderConsole(`/projects/${project.id}/security/server-keys`);
+      await unlock("owl_ctrl_v1_test", "Project secret keys");
       await waitFor(() => {
         expect(
           screen
-            .getAllByRole("button", { name: "Create client key" })
+            .getAllByRole("button", { name: "Create secret key" })
             .every((button) => !button.hasAttribute("disabled")),
         ).toBe(true);
       });
-      const createButtons = screen.getAllByRole("button", { name: "Create client key" });
+      const createButtons = screen.getAllByRole("button", { name: "Create secret key" });
       const openCreate = createButtons[0];
-      if (openCreate === undefined) throw new Error("Create client-key action is missing");
+      if (openCreate === undefined) throw new Error("Create server-key action is missing");
       fireEvent.click(openCreate);
-      const createDialog = screen.getByRole("dialog", { name: "Create client key" });
+      const createDialog = screen.getByRole("dialog", { name: "Create Project secret key" });
       fireEvent.change(within(createDialog).getByLabelText("Key label"), {
         target: { value: "concurrent backend" },
       });
-      fireEvent.click(within(createDialog).getByRole("button", { name: "Create client key" }));
-      const reveal = await screen.findByRole("dialog", { name: "Store this client key now" });
+      fireEvent.click(within(createDialog).getByRole("button", { name: "Create secret key" }));
+      const reveal = await screen.findByRole("dialog", {
+        name: "Store this Project secret key now",
+      });
       expect(within(reveal).getByText(oneTimeCredential)).toBeVisible();
       fireEvent.click(
         within(reveal).getByLabelText(
@@ -1155,7 +1231,7 @@ describe("Control application shell", () => {
       });
       if (resolution === "unauthorized") {
         expect(screen.getByRole("heading", { name: "Connect to this deployment" })).toBeVisible();
-        expect(screen.queryByRole("heading", { name: "Client API keys" })).toBeNull();
+        expect(screen.queryByRole("heading", { name: "Project secret keys" })).toBeNull();
         expect(exactReads).toBe(0);
       } else if (resolution === "acknowledged") {
         expect(screen.getByText(/storage was acknowledged/u)).toBeVisible();
@@ -1167,12 +1243,12 @@ describe("Control application shell", () => {
     },
   );
 
-  it("blocks replacement after unresolved client-key creation until the implicated key is revoked", async () => {
-    const existingKey: ProjectClientKey = {
-      id: "client-key-existing",
+  it("blocks replacement after unresolved server-key creation until the implicated key is revoked", async () => {
+    const existingKey: ProjectServerKey = {
+      id: "server-key-existing",
       project_id: project.id,
       public_key_id: "AAAAAAAAAAAAAAAAAAAAAA",
-      display_prefix: "owl_client_v1.AAAAAA",
+      display_prefix: "owl_server_v1.AAAAAA",
       label: "existing backend",
       status: "active",
       revision: 1,
@@ -1182,15 +1258,15 @@ describe("Control application shell", () => {
       last_used_at: null,
       revoked_at: null,
     };
-    const implicatedKey: ProjectClientKey = {
+    const implicatedKey: ProjectServerKey = {
       ...existingKey,
-      id: "client-key-implicated",
+      id: "server-key-implicated",
       public_key_id: "CCCCCCCCCCCCCCCCCCCCCC",
-      display_prefix: "owl_client_v1.CCCCCC",
+      display_prefix: "owl_server_v1.CCCCCC",
       label: "uncertain backend",
       credential_acknowledged_at: null,
     };
-    let inventory: ProjectClientKey[] = [existingKey];
+    let inventory: ProjectServerKey[] = [existingKey];
     let inventoryReads = 0;
     let createRequests = 0;
     let reconciliationPagination = false;
@@ -1207,7 +1283,7 @@ describe("Control application shell", () => {
         if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
           return Response.json({ items: [project] });
         }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/client-keys`)) {
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/server-keys`)) {
           if (request.method === "GET") {
             inventoryReads += 1;
             if (inventoryReads === 2 || failNextPostRevokeInventory) {
@@ -1268,7 +1344,7 @@ describe("Control application shell", () => {
           );
         }
         if (
-          url.pathname.endsWith(`/v1/projects/${project.id}/client-keys/${implicatedKey.id}/revoke`)
+          url.pathname.endsWith(`/v1/projects/${project.id}/server-keys/${implicatedKey.id}/revoke`)
         ) {
           inventory = [{ ...implicatedKey, status: "revoked", revision: 2 }, existingKey];
           failNextPostRevokeInventory = true;
@@ -1278,21 +1354,21 @@ describe("Control application shell", () => {
       }),
     );
 
-    renderConsole(`/projects/${project.id}/security/client-keys`);
-    await unlock("owl_ctrl_v1_test", "Client API keys");
+    renderConsole(`/projects/${project.id}/security/server-keys`);
+    await unlock("owl_ctrl_v1_test", "Project secret keys");
     expect(await screen.findByText("existing backend")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Create client key" }));
-    const createDialog = screen.getByRole("dialog", { name: "Create client key" });
+    fireEvent.click(screen.getByRole("button", { name: "Create secret key" }));
+    const createDialog = screen.getByRole("dialog", { name: "Create Project secret key" });
     fireEvent.change(within(createDialog).getByLabelText("Key label"), {
       target: { value: "uncertain backend" },
     });
-    fireEvent.click(within(createDialog).getByRole("button", { name: "Create client key" }));
+    fireEvent.click(within(createDialog).getByRole("button", { name: "Create secret key" }));
 
     expect(
       await screen.findByText(/Replacement creation is blocked for the unresolved/u),
     ).toBeVisible();
-    expect(screen.getByRole("button", { name: "Create client key" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create secret key" })).toBeDisabled();
     expect(screen.getByText(/authoritative delivery gate could not be refreshed/u)).toBeVisible();
     expect(document.body.textContent).not.toContain("The safe inventory was refreshed");
     expect(idempotencyKeys).toHaveLength(2);
@@ -1306,7 +1382,7 @@ describe("Control application shell", () => {
       .map((node) => node.closest("tr"))
       .find((row): row is HTMLTableRowElement => row !== null);
     if (sameMountImplicatedRow === undefined)
-      throw new Error("Implicated client-key row is missing");
+      throw new Error("Implicated server-key row is missing");
     expect(
       within(sameMountImplicatedRow).queryByRole("button", {
         name: "Confirm stored credential",
@@ -1318,33 +1394,35 @@ describe("Control application shell", () => {
 
     reconciliationPagination = true;
     paginatedReconciliationReads = 0;
-    fireEvent.click(screen.getByRole("button", { name: "Lock console" }));
+    fireEvent.click(screen.getByRole("button", { name: "Exit console" }));
     await unlock("owl_ctrl_v1_test", "Projects");
     fireEvent.click(screen.getByRole("link", { name: "Provider Project" }));
-    fireEvent.click(await screen.findByRole("link", { name: "Client API keys" }));
-    expect(await screen.findByRole("heading", { name: "Client API keys" })).toBeVisible();
+    fireEvent.click(await screen.findByRole("link", { name: "Project secret keys" }));
+    expect(await screen.findByRole("heading", { name: "Project secret keys" })).toBeVisible();
     expect(await screen.findByText("existing backend")).toBeVisible();
 
     // The local uncertain-create marker is intentionally gone after remount. One bounded server
     // response reconstructs the durable unacknowledged gate even though the implicated key is not
     // in the historical page, and no replacement mutation is sent.
-    fireEvent.click(screen.getByRole("button", { name: "Create client key" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create secret key" }));
     expect(await screen.findByText("Storage unconfirmed — creation blocked")).toBeVisible();
     expect(paginatedReconciliationReads).toBe(1);
-    expect(screen.getByRole("button", { name: "Create client key" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create secret key" })).toBeDisabled();
     expect(createRequests).toBe(2);
     const implicatedRow = screen.getByText("uncertain backend").closest("tr");
-    if (implicatedRow === null) throw new Error("Implicated client-key row is missing");
+    if (implicatedRow === null) throw new Error("Implicated server-key row is missing");
     fireEvent.click(within(implicatedRow).getByRole("button", { name: "Revoke" }));
-    const confirmation = await screen.findByRole("dialog", { name: "Revoke client key" });
-    fireEvent.click(within(confirmation).getByRole("button", { name: "Revoke client key" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Revoke Project secret key" });
+    fireEvent.click(
+      within(confirmation).getByRole("button", { name: "Revoke Project secret key" }),
+    );
     await waitFor(() => {
       expect(screen.queryByText(/Replacement creation is blocked for the unresolved/u)).toBeNull();
     });
-    expect(screen.getByRole("button", { name: "Create client key" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create secret key" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Retry inventory" }));
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Create client key" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Create secret key" })).toBeEnabled();
     });
   });
 

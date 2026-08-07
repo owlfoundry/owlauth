@@ -28,7 +28,7 @@ use owlauth_key_provider::{MaterialKind, ProviderFormatVersion, ProviderId};
 #[derive(Clone)]
 pub(crate) struct PostgresEmailControlRepository {
     database: DatabaseConnection,
-    required_runtime_process_ids: Vec<String>,
+    required_auth_process_ids: Vec<String>,
     custody: EmailControlCustody,
 }
 
@@ -42,7 +42,7 @@ struct EmailControlCustody {
 impl PostgresEmailControlRepository {
     pub(crate) fn new_protected(
         database: DatabaseConnection,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
         deployment_id: &str,
         provider_id: ProviderId,
         provider_format_version: ProviderFormatVersion,
@@ -54,27 +54,27 @@ impl PostgresEmailControlRepository {
         };
         Ok(Self {
             database,
-            required_runtime_process_ids,
+            required_auth_process_ids,
             custody,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self::new_with_runtime_roster(database, vec!["runtime-1".to_owned()])
+        Self::new_with_runtime_roster(database, vec!["auth-1".to_owned()])
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_runtime_roster(
         database: DatabaseConnection,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
     ) -> Self {
         let provider_id = ProviderId::new("software").expect("test provider ID is valid");
         let provider_format_version =
             ProviderFormatVersion::new(1).expect("test provider format is valid");
         Self::new_protected(
             database,
-            required_runtime_process_ids,
+            required_auth_process_ids,
             "test-deployment",
             provider_id,
             provider_format_version,
@@ -415,7 +415,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
             .try_get::<i64>("", "count")
             .map_err(persistence)?;
         if live_generations >= MAX_LIVE_PROJECT_SMTP_GENERATIONS {
-            return Err(ApplicationError::InvalidTransition);
+            return Err(ApplicationError::CapacityExceeded);
         }
         let generation = transaction.query_one_raw(statement(
             "SELECT COALESCE(MAX(generation), 0) + 1 AS generation FROM project_smtp_configurations WHERE project_id = $1",
@@ -955,19 +955,31 @@ impl EmailControlPort for PostgresEmailControlRepository {
         let incarnations = transaction
             .query_all_raw(statement(
                 "SELECT current.process_id
-             FROM runtime_process_incarnations current
+             FROM auth_process_incarnations current
              JOIN jsonb_array_elements_text($1::jsonb) required(process_id)
                ON required.process_id=current.process_id
              ORDER BY current.process_id FOR SHARE OF current",
-                vec![serde_json::json!(self.required_runtime_process_ids).into()],
+                vec![serde_json::json!(self.required_auth_process_ids).into()],
             ))
             .await
             .map_err(persistence)?;
-        if incarnations.len() != self.required_runtime_process_ids.len() {
+        if incarnations.len() != self.required_auth_process_ids.len() {
             return Err(ApplicationError::InvalidTransition);
         }
         let candidate = transaction.query_one_raw(statement(
-            "SELECT status, revision FROM project_smtp_configurations WHERE project_id = $1 AND id = $2 FOR UPDATE",
+            "SELECT smtp.status, smtp.revision,
+                    EXISTS (
+                      SELECT 1 FROM project_smtp_test_operations test
+                      WHERE test.project_id=smtp.project_id
+                        AND test.configuration_id=smtp.id
+                        AND test.configuration_generation=smtp.generation
+                        AND test.configuration_revision=smtp.revision
+                        AND test.configuration_security_eligibility_revision=smtp.security_eligibility_revision
+                        AND test.state='delivered' AND test.safe_outcome='delivered'
+                        AND test.completed_at IS NOT NULL
+                    ) AS delivered_test
+             FROM project_smtp_configurations smtp
+             WHERE smtp.project_id=$1 AND smtp.id=$2 FOR UPDATE OF smtp",
             vec![project_id.into(), configuration_id.into()],
         )).await.map_err(persistence)?.ok_or(ApplicationError::NotFound)?;
         let status: String = candidate.try_get("", "status").map_err(persistence)?;
@@ -986,7 +998,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
                        AND readiness.process_id=required.process_id
                        AND readiness.state='ready' AND readiness.lease_expires_at>$3
                        AND EXISTS (
-                         SELECT 1 FROM runtime_process_incarnations current
+                         SELECT 1 FROM auth_process_incarnations current
                          WHERE current.process_id=readiness.process_id
                            AND current.process_incarnation=readiness.process_incarnation)
                        AND smtp.status='pending')) AS ready",
@@ -994,7 +1006,7 @@ impl EmailControlPort for PostgresEmailControlRepository {
                     project_id.into(),
                     configuration_id.into(),
                     now.into(),
-                    serde_json::json!(self.required_runtime_process_ids).into(),
+                    serde_json::json!(self.required_auth_process_ids).into(),
                 ],
             ))
             .await
@@ -1010,7 +1022,11 @@ impl EmailControlPort for PostgresEmailControlRepository {
         {
             return Err(ApplicationError::RevisionConflict);
         }
-        if !runtime_ready {
+        if !candidate
+            .try_get::<bool>("", "delivered_test")
+            .map_err(persistence)?
+            || !runtime_ready
+        {
             return Err(ApplicationError::InvalidTransition);
         }
         transaction

@@ -17,10 +17,10 @@ The plugin does not bundle a server, launch a local MCP process, expose Project 
 
 The shared source under [`plugins/owlauth`](https://github.com/owlfoundry/owlauth/tree/main/plugins/owlauth) is packaged for Codex and Claude. Its integration skill should help an agent:
 
-- recognize the implemented Beta Runtime, backend Client, Control, and Runtime SDK boundaries and avoid inventing deferred routes or commands;
+- recognize the implemented Beta Runtime, Server API, Control, and Runtime SDK boundaries and avoid inventing deferred routes or commands;
 - select the TypeScript, Python, or Rust SDK and preserve its explicit Application-owned navigation, storage, and refresh-coordination boundary;
 - distinguish downstream Project Auth from upstream OAuth/OIDC federation;
-- understand that Project/Application IDs and publishable keys are public identifiers, Project client keys are backend-only Client credentials, and neither is a Control credential;
+- understand that Project/Application IDs and publishable keys are public identifiers, Project server keys are backend-only Server credentials, and neither is a Control credential;
 - inspect generated OpenAPI as an ephemeral contract view;
 - require the component's candidate-bound final evidence manifest before describing an SDK operation as release-qualified; exported methods, package versions, workspace tests, generated OpenAPI, and fixtures alone are insufficient, and current manifests prove one exact Runtime/source coordinate rather than a range;
 - direct security reports to the private disclosure path.
@@ -73,14 +73,14 @@ owlauth --profile production project disable PROJECT_ID \
   --yes
 ```
 
-Use `owlauth COMMAND --help` at each command level for the complete typed surface. Client-key creation reveals credential material once; capture that JSON directly into approved backend secret custody and do not paste it into shell arguments, logs, tickets, or agent context. Rotate a client key by creating and acknowledging a replacement, deploying it, and then revoking the predecessor. Resource secrets accepted by provider or webhook commands are also read from explicitly named environment variables and may not reuse the operator credential.
+Use `owlauth COMMAND --help` at each command level for the complete typed surface. Server-key creation reveals credential material once; capture that JSON directly into approved backend secret custody and do not paste it into shell arguments, logs, tickets, or agent context. Rotate a server key by creating and acknowledging a replacement, deploying it, and then revoking the predecessor. Resource secrets accepted by provider or webhook commands are also read from explicitly named environment variables and may not reuse the operator credential.
 
 ```bash
 owlauth update --dry-run
 owlauth update
 ```
 
-The CLI must not access PostgreSQL/Redis, load server modules, run migrations, or host Runtime/Client/Control listeners. Audit export remains deferred.
+The CLI must not access PostgreSQL/Redis, load server modules, run migrations, or host Auth or Control listeners. Audit export remains deferred.
 
 ## Remote CLI trust model
 
@@ -159,17 +159,19 @@ curl --fail --silent --show-error --config "$OWLAUTH_MCP_CURL_CONFIG" \
   }' | jq
 ```
 
-The catalog exposes exactly these seven read-only tools with closed inputs:
+The catalog exposes exactly these nine read-only tools with closed inputs:
 
-| Tool                              | Arguments                                                                                                     |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `owlauth_system_get`              | `{}`                                                                                                          |
-| `owlauth_projects_list`           | `belongs_to` (optional exact ownership metadata)                                                              |
-| `owlauth_project_get`             | `project_id`                                                                                                  |
-| `owlauth_applications_list`       | `project_id`                                                                                                  |
-| `owlauth_application_get`         | `project_id`, `application_id`                                                                                |
-| `owlauth_webhook_endpoints_list`  | `project_id`, `application_id`                                                                                |
-| `owlauth_webhook_deliveries_list` | `project_id`, `application_id`, optional `endpoint_id`, optional opaque `cursor`, optional `limit` from 1–100 |
+| Tool                                | Arguments                                                                                                                                                            |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `owlauth_system_get`                | `{}`                                                                                                                                                                 |
+| `owlauth_projects_list`             | `belongs_to` (optional exact ownership metadata)                                                                                                                     |
+| `owlauth_project_get`               | `project_id`                                                                                                                                                         |
+| `owlauth_applications_list`         | `project_id`                                                                                                                                                         |
+| `owlauth_application_get`           | `project_id`, `application_id`                                                                                                                                       |
+| `owlauth_webhook_endpoints_list`    | `project_id`, `application_id`                                                                                                                                       |
+| `owlauth_webhook_deliveries_list`   | `project_id`, `application_id`, optional `endpoint_id`, optional opaque `cursor`, optional `limit` from 1–100                                                        |
+| `owlauth_project_users_list`        | `project_id`, optional `status`, safe-prefix `search`, `identity_kind`, provider-provenance `provider_key`, `sort`, criteria-stable `cursor`, and `limit` from 1–100 |
+| `owlauth_project_user_lookup_email` | `project_id`, exact canonical `email`; returns zero or one safe Project user without the email                                                                       |
 
 Resource IDs are exact canonical UUIDs. Omit optional arguments or send JSON `null` according to the MCP host's typed tool-call API. For example, the delivery-list arguments are:
 

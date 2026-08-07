@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, useLocation } from "react-router";
 
 import {
   type Application,
@@ -6,6 +7,7 @@ import {
   type ManagedProviderConnection,
   type Project,
   type ProjectUser,
+  type Provider,
   type ProjectUserSessions,
   ControlRequestError,
 } from "../client";
@@ -88,6 +90,31 @@ const reauthorizationApplication: Application = {
   },
 };
 
+const provider: Provider = {
+  id: "77777777-7777-4777-8777-777777777777",
+  project_id: project.id,
+  provider_key: "workforce",
+  display_name: "Workforce SSO",
+  kind: "oidc",
+  issuer: "https://issuer.example",
+  client_id: "public-client-label",
+  callback_url: "https://runtime.example/callback",
+  status: "active",
+  revision: 5,
+  login_supported: true,
+  identity_proof_supported: true,
+  assigned_application_ids: [reauthorizationApplication.id],
+  managed_profile: {
+    enabled: false,
+    exact_scopes: [],
+    profile_schema: "unsupported",
+    read_retry_safe: false,
+    renewal_idempotent_replay: false,
+    supported: false,
+    supports_revocation: false,
+  },
+};
+
 const connection: ManagedProviderConnection = {
   id: "66666666-6666-4666-8666-666666666666",
   project_id: project.id,
@@ -113,11 +140,26 @@ function successful<T>(data: T) {
   return { data, error: undefined, response: Response.json(data) };
 }
 
+function requestedSearch(call: readonly unknown[]): unknown {
+  const options = call[1];
+  if (typeof options !== "object" || options === null) return undefined;
+  const params = (options as Record<string, unknown>)["params"];
+  if (typeof params !== "object" || params === null) return undefined;
+  const query = (params as Record<string, unknown>)["query"];
+  if (typeof query !== "object" || query === null) return undefined;
+  return (query as Record<string, unknown>)["search"];
+}
+
 function renderPanel(options?: {
   get?: (...args: unknown[]) => Promise<unknown>;
   post?: (...args: unknown[]) => Promise<unknown>;
   onError?: (error: unknown) => Promise<void>;
   connections?: ManagedProviderConnection[];
+  detailOnly?: boolean;
+  initialUserId?: string;
+  listUsers?: ProjectUser[];
+  providers?: Provider[];
+  routedInventory?: boolean;
 }) {
   const get = vi.fn((...args: unknown[]) => {
     if (options?.get !== undefined) return options.get(...args);
@@ -135,7 +177,10 @@ function renderPanel(options?: {
     }
     return Promise.resolve(
       successful({
-        items: [{ ...user, source_payload: "never-render-source-payload" }],
+        items: (options?.listUsers ?? [user]).map((item) => ({
+          ...item,
+          source_payload: "never-render-source-payload",
+        })),
       }),
     );
   });
@@ -170,17 +215,30 @@ function renderPanel(options?: {
     dispose: vi.fn(),
   } as unknown as DisposableControlClient;
   render(
-    <ControlConfirmationProvider>
-      <UserManagement
-        session={session}
-        project={project}
-        applications={[reauthorizationApplication]}
-        onError={onError}
-        setMessage={setMessage}
-      />
-    </ControlConfirmationProvider>,
+    <MemoryRouter>
+      <ControlConfirmationProvider>
+        <UserManagement
+          session={session}
+          project={project}
+          applications={[reauthorizationApplication]}
+          providers={options?.providers ?? []}
+          {...(options?.detailOnly === undefined ? {} : { detailOnly: options.detailOnly })}
+          {...(options?.initialUserId === undefined
+            ? {}
+            : { initialUserId: options.initialUserId })}
+          {...(options?.routedInventory === true ? { onUserSelected: vi.fn() } : {})}
+          onError={onError}
+          setMessage={setMessage}
+        />
+        <LocationProbe />
+      </ControlConfirmationProvider>
+    </MemoryRouter>,
   );
   return { get, post, setMessage };
+}
+
+function LocationProbe() {
+  return <output data-testid="location-pathname">{useLocation().pathname}</output>;
 }
 
 async function loadUserPanel() {
@@ -206,6 +264,112 @@ describe("Project user and session lifecycle", () => {
     vi.restoreAllMocks();
   });
 
+  it("loads bounded merge candidates on a routed user detail", async () => {
+    const losingUser: ProjectUser = {
+      ...user,
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      public_id: "usr_losing123",
+      display_name: "Grace Hopper",
+    };
+    const get = vi.fn((path: unknown) => {
+      if (typeof path !== "string") throw new Error("GET path is not a string");
+      if (path.endsWith("/users")) {
+        return Promise.resolve(successful({ items: [losingUser], next_cursor: null }));
+      }
+      if (path.endsWith("/{user_id}")) return Promise.resolve(successful(user));
+      if (path.endsWith("/sessions")) return Promise.resolve(successful(sessions));
+      if (path.endsWith("/managed-provider-connections")) {
+        return Promise.resolve(successful({ items: [] }));
+      }
+      if (path.endsWith("/identities")) return Promise.resolve(successful({ items: [] }));
+      throw new Error(`Unexpected GET path: ${path}`);
+    });
+    renderPanel({ get, detailOnly: true, initialUserId: user.id });
+
+    expect(await screen.findByRole("heading", { name: "Ada Lovelace" })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Operation"), { target: { value: "merge" } });
+    expect(screen.getByRole("option", { name: /Grace Hopper/u })).toBeVisible();
+    expect(screen.queryByRole("option", { name: /Ada Lovelace/u })).toBeNull();
+  });
+
+  it("keeps routed user actions available while merge candidates stall or fail", async () => {
+    const onError = vi.fn(() => Promise.resolve());
+    let rejectCandidates: ((reason: Error) => void) | undefined;
+    const get = vi.fn((path: unknown) => {
+      if (typeof path !== "string") throw new Error("GET path is not a string");
+      if (path.endsWith("/users")) {
+        return new Promise((_resolve, reject) => {
+          rejectCandidates = reject;
+        });
+      }
+      if (path.endsWith("/{user_id}")) return Promise.resolve(successful(user));
+      if (path.endsWith("/sessions")) return Promise.resolve(successful(sessions));
+      if (path.endsWith("/managed-provider-connections")) {
+        return Promise.resolve(successful({ items: [] }));
+      }
+      if (path.endsWith("/identities")) return Promise.resolve(successful({ items: [] }));
+      throw new Error(`Unexpected GET path: ${path}`);
+    });
+    renderPanel({ get, onError, detailOnly: true, initialUserId: user.id });
+
+    expect(await screen.findByRole("heading", { name: "Ada Lovelace" })).toBeVisible();
+    expect(screen.getByLabelText("Operation")).toBeEnabled();
+    expect(screen.getByText("Loading merge candidate inventory…")).toBeVisible();
+    await act(async () => {
+      rejectCandidates?.(new Error("candidate inventory failed"));
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole("button", { name: "Retry merge candidates" })).toBeEnabled();
+    expect(screen.getByText(/other identity or session actions remain available/u)).toBeVisible();
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "candidate inventory failed" }),
+    );
+  });
+
+  it("ignores a superseded merge-candidate failure after refresh", async () => {
+    const losingUser: ProjectUser = {
+      ...user,
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      public_id: "usr_replacement",
+      display_name: "Replacement candidate",
+    };
+    let candidateCalls = 0;
+    let rejectFirstCandidates: ((reason: Error) => void) | undefined;
+    const get = vi.fn((path: unknown) => {
+      if (typeof path !== "string") throw new Error("GET path is not a string");
+      if (path.endsWith("/users")) {
+        candidateCalls += 1;
+        if (candidateCalls === 1) {
+          return new Promise((_resolve, reject) => {
+            rejectFirstCandidates = reject;
+          });
+        }
+        return Promise.resolve(successful({ items: [losingUser], next_cursor: null }));
+      }
+      if (path.endsWith("/{user_id}")) return Promise.resolve(successful(user));
+      if (path.endsWith("/sessions")) return Promise.resolve(successful(sessions));
+      if (path.endsWith("/managed-provider-connections")) {
+        return Promise.resolve(successful({ items: [] }));
+      }
+      if (path.endsWith("/identities")) return Promise.resolve(successful({ items: [] }));
+      throw new Error(`Unexpected GET path: ${path}`);
+    });
+    renderPanel({ get, detailOnly: true, initialUserId: user.id });
+
+    expect(await screen.findByRole("heading", { name: "Ada Lovelace" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh user" }));
+    expect(await screen.findByRole("heading", { name: "Ada Lovelace" })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Operation"), { target: { value: "merge" } });
+    expect(await screen.findByRole("option", { name: /Replacement candidate/u })).toBeVisible();
+
+    await act(async () => {
+      rejectFirstCandidates?.(new Error("superseded candidate failure"));
+      await Promise.resolve();
+    });
+    expect(screen.queryByRole("button", { name: "Retry merge candidates" })).toBeNull();
+    expect(screen.getByRole("option", { name: /Replacement candidate/u })).toBeVisible();
+  });
+
   it("loads bounded user/session views without rendering private source fields", async () => {
     const { get } = renderPanel();
 
@@ -223,6 +387,186 @@ describe("Project user and session lifecycle", () => {
         params: { path: { project_id: project.id, user_id: user.id } },
       }),
     );
+  });
+
+  it("sends search, status, provider provenance, sort, and reset pagination to Control", async () => {
+    const get = vi.fn(() =>
+      Promise.resolve(successful({ items: [user], next_cursor: "next-page" })),
+    );
+    renderPanel({ get, providers: [provider] });
+
+    expect(await screen.findByRole("button", { name: /Ada Lovelace/u })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Status"), { target: { value: "disabled" } });
+    fireEvent.change(screen.getByLabelText("Identity"), {
+      target: { value: "provider:workforce" },
+    });
+    fireEvent.change(screen.getByLabelText("Sort"), { target: { value: "created_oldest" } });
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "  Ada  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      expect(get).toHaveBeenCalledWith(
+        "/v1/projects/{project_id}/users",
+        expect.objectContaining({
+          params: {
+            path: { project_id: project.id },
+            query: {
+              status: "disabled",
+              search: "Ada",
+              identity_kind: "provider",
+              provider_key: "workforce",
+              sort: "created_oldest",
+              limit: 50,
+            },
+          },
+        }),
+      );
+    });
+  });
+
+  it("routes a user inventory link to the dedicated authority page", async () => {
+    renderPanel({ routedInventory: true });
+
+    const userLink = await screen.findByRole("link", { name: /Ada Lovelace/u });
+    expect(userLink).toHaveAttribute("href", `/projects/${project.id}/users/${user.id}`);
+    fireEvent.click(userLink);
+    expect(screen.getByTestId("location-pathname")).toHaveTextContent(
+      `/projects/${project.id}/users/${user.id}`,
+    );
+  });
+
+  it("enforces prefix search bounds by Unicode code point before dispatch", async () => {
+    const get = vi.fn((...args: unknown[]) => {
+      void args;
+      return Promise.resolve(successful({ items: [user], next_cursor: null }));
+    });
+    renderPanel({ get });
+
+    expect(await screen.findByRole("button", { name: /Ada Lovelace/u })).toBeVisible();
+    const search = screen.getByLabelText("Search");
+    const submit = screen.getByRole("button", { name: "Search" });
+
+    const bmpBoundary = "界".repeat(128);
+    fireEvent.change(search, { target: { value: bmpBoundary } });
+    fireEvent.click(submit);
+    await waitFor(() => {
+      expect(get.mock.calls.map(requestedSearch)).toContain(bmpBoundary);
+    });
+
+    const requestsAfterBmpBoundary = get.mock.calls.length;
+    fireEvent.change(search, { target: { value: "界".repeat(129) } });
+    fireEvent.click(submit);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "User prefix search is limited to 128 characters.",
+    );
+    expect(get).toHaveBeenCalledTimes(requestsAfterBmpBoundary);
+
+    const astralBoundary = "𐐀".repeat(128);
+    fireEvent.change(search, { target: { value: astralBoundary } });
+    fireEvent.click(submit);
+    await waitFor(() => {
+      expect(get.mock.calls.map(requestedSearch)).toContain(astralBoundary);
+    });
+
+    const requestsAfterAstralBoundary = get.mock.calls.length;
+    fireEvent.change(search, { target: { value: "𐐀".repeat(129) } });
+    fireEvent.click(submit);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "User prefix search is limited to 128 characters.",
+    );
+    expect(get).toHaveBeenCalledTimes(requestsAfterAstralBoundary);
+  });
+
+  it("uses exact email lookup and authoritative identity inventory for combined filters", async () => {
+    const get = vi.fn((path: unknown) => {
+      if (typeof path !== "string") throw new Error("GET path is not a string");
+      if (path.endsWith("/identities")) {
+        return Promise.resolve(
+          successful({
+            items: [
+              {
+                id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                project_id: project.id,
+                user_id: user.id,
+                identity_kind: "provider",
+                provider_key: provider.provider_key,
+                status: "active",
+                identity_revision: 2,
+                is_primary_source: true,
+                verified_or_observed_at: "2026-07-30T00:00:00Z",
+                created_at: "2026-07-30T00:00:00Z",
+                updated_at: "2026-07-30T00:00:00Z",
+              },
+            ],
+          }),
+        );
+      }
+      return Promise.resolve(successful({ items: [user], next_cursor: null }));
+    });
+    const post = vi.fn((...args: unknown[]) => {
+      const path = args[0];
+      if (typeof path !== "string") throw new Error("POST path is not a string");
+      if (path.endsWith("/users/lookup")) {
+        return Promise.resolve(successful({ user }));
+      }
+      throw new Error(`Unexpected POST path: ${path}`);
+    });
+    renderPanel({ get, post, providers: [provider] });
+
+    expect(await screen.findByRole("button", { name: /Ada Lovelace/u })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Identity"), {
+      target: { value: "provider:workforce" },
+    });
+    fireEvent.change(screen.getByLabelText("Search"), {
+      target: { value: "ADA@Example.Test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+
+    await waitFor(() => {
+      expect(post).toHaveBeenCalledWith(
+        "/v1/projects/{project_id}/users/lookup",
+        expect.objectContaining({
+          params: { path: { project_id: project.id } },
+          body: { email: "ADA@Example.Test" },
+        }),
+      );
+    });
+    expect(get).toHaveBeenCalledWith(
+      "/v1/projects/{project_id}/users/{user_id}/identities",
+      expect.objectContaining({
+        params: { path: { project_id: project.id, user_id: user.id } },
+      }),
+    );
+    expect(screen.getByRole("button", { name: /Ada Lovelace/u })).toBeVisible();
+  });
+
+  it("clears applied directory filters and restores the unfiltered query", async () => {
+    const get = vi.fn(() => Promise.resolve(successful({ items: [], next_cursor: null })));
+    renderPanel({ get, providers: [provider] });
+
+    expect(await screen.findByText("No users yet")).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Status"), { target: { value: "merged" } });
+    fireEvent.change(screen.getByLabelText("Identity"), { target: { value: "email" } });
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "missing" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    expect(await screen.findByText("No matching users")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("No users yet")).toBeVisible();
+      expect(get).toHaveBeenLastCalledWith(
+        "/v1/projects/{project_id}/users",
+        expect.objectContaining({
+          params: {
+            path: { project_id: project.id },
+            query: { sort: "created_newest", limit: 50 },
+          },
+        }),
+      );
+    });
+    expect(screen.getByLabelText("Search")).toHaveValue("");
+    expect(screen.getByLabelText("Status")).toHaveValue("all");
+    expect(screen.getByLabelText("Identity")).toHaveValue("all");
   });
 
   it("serializes pagination and deduplicates repeated users", async () => {
@@ -541,8 +885,14 @@ describe("Project user and session lifecycle", () => {
     );
     const post = vi.fn(() => Promise.reject(conflict));
     const onError = vi.fn(() => Promise.resolve());
-    const { get } = renderPanel({ post, onError });
-    await loadUserPanel();
+    const { get } = renderPanel({
+      post,
+      onError,
+      detailOnly: true,
+      initialUserId: user.id,
+      listUsers: [],
+    });
+    expect(await screen.findByRole("heading", { name: "Ada Lovelace" })).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Disable Project user" }));
     confirmDialog("Disable user");
@@ -551,8 +901,11 @@ describe("Project user and session lifecycle", () => {
       expect(onError).toHaveBeenCalledWith(conflict);
     });
     expect(
-      get.mock.calls.filter(([path]) => typeof path === "string" && path.endsWith("/users")).length,
+      get.mock.calls.filter(
+        ([path]) => typeof path === "string" && path.endsWith("/users/{user_id}"),
+      ).length,
     ).toBeGreaterThanOrEqual(2);
+    expect(screen.getByRole("heading", { name: "Ada Lovelace" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Disable Project user" })).toBeEnabled();
   });
 });

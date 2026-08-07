@@ -48,7 +48,10 @@ interface DataTableProps {
 
 export function DataTable({ caption, headings, children }: DataTableProps) {
   return (
-    <div className={styles["tableRegion"]} role="region" aria-label={caption}>
+    // Scroll regions must be keyboard-focusable when their overflow is not otherwise reachable.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+    <div className={styles["tableRegion"]} role="region" aria-label={caption} tabIndex={0}>
+      <p className={styles["tableScrollHint"]}>Scroll horizontally to review all columns.</p>
       <table className={styles["table"]}>
         <caption className="visually-hidden">{caption}</caption>
         <thead>
@@ -62,6 +65,19 @@ export function DataTable({ caption, headings, children }: DataTableProps) {
         </thead>
         <tbody>{children}</tbody>
       </table>
+    </div>
+  );
+}
+
+interface LoadingStateProps {
+  readonly children: ReactNode;
+}
+
+export function LoadingState({ children }: LoadingStateProps) {
+  return (
+    <div className={styles["loading"]} role="status">
+      <span className={styles["loadingIndicator"]} aria-hidden="true" />
+      <span>{children}</span>
     </div>
   );
 }

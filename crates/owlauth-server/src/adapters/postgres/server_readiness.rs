@@ -3,22 +3,22 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, Transac
 use serde_json::json;
 
 use crate::application::{
-    ApplicationError, ClientDigestReadinessClaim, ClientDigestReadinessPort,
-    ClientDigestReadinessSnapshot, ClientDigestReadinessState, MAX_REQUIRED_CLIENT_PROCESSES,
-    valid_client_process_id,
+    ApplicationError, MAX_REQUIRED_SERVER_PROCESSES, ServerDigestReadinessClaim,
+    ServerDigestReadinessPort, ServerDigestReadinessSnapshot, ServerDigestReadinessState,
+    valid_server_process_id,
 };
 
 #[derive(Clone)]
-pub(crate) struct PostgresClientDigestReadinessAdapter {
+pub(crate) struct PostgresServerDigestReadinessAdapter {
     database: DatabaseConnection,
 }
 
-impl PostgresClientDigestReadinessAdapter {
+impl PostgresServerDigestReadinessAdapter {
     pub(crate) fn new(database: DatabaseConnection) -> Self {
         Self { database }
     }
 
-    async fn claim(&self, claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
+    async fn claim(&self, claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
         claim.validate()?;
         let lease_micros = lease_micros(claim)?;
         let versions = json!(&claim.readable_digest_versions);
@@ -26,49 +26,41 @@ impl PostgresClientDigestReadinessAdapter {
         lock_process(&transaction, &claim.process_id).await?;
 
         // Match the Control create lock order: parent incarnation first, readiness child second.
-        // Without this explicit parent-first lock, create can hold the parent FOR SHARE while a
-        // replacement claim holds the child for DELETE, producing a deterministic deadlock.
-        transaction
+        // The unique Auth startup claim owns the parent identity. A delayed Server readiness phase
+        // may publish only while that exact incarnation is still current; it must never reclaim a
+        // process ID that a replacement Auth process already fenced.
+        let current = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT process_id FROM client_process_incarnations
-                  WHERE process_id=$1 FOR UPDATE",
-                [claim.process_id.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?;
-
-        // The readiness child references the exact composite parent incarnation without ON UPDATE
-        // CASCADE. Remove it first inside the same transaction, then replace the authoritative
-        // parent and publish the new exact observation before commit.
-        transaction
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "DELETE FROM client_key_digest_readiness WHERE process_id=$1",
-                [claim.process_id.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?;
-        transaction
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "INSERT INTO client_process_incarnations(
-                       process_id,process_incarnation,started_at)
-                 VALUES($1,$2,transaction_timestamp())
-                 ON CONFLICT(process_id) DO UPDATE SET
-                       process_incarnation=EXCLUDED.process_incarnation,
-                       started_at=EXCLUDED.started_at",
+                "SELECT process_id FROM auth_process_incarnations
+                  WHERE process_id=$1 AND process_incarnation=$2 FOR UPDATE",
                 [
                     claim.process_id.clone().into(),
                     claim.process_incarnation.into(),
                 ],
             ))
             .await
+            .map_err(persistence)?
+            .is_some();
+        if !current {
+            return Err(ApplicationError::Disabled);
+        }
+
+        // A predecessor observation may remain after the parent incarnation changes because it is
+        // deliberately not foreign-key authority. Once this exact current parent is locked, replace
+        // that stale child without changing the parent claim.
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "DELETE FROM server_key_digest_readiness WHERE process_id=$1",
+                [claim.process_id.clone().into()],
+            ))
+            .await
             .map_err(persistence)?;
         transaction
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "INSERT INTO client_key_digest_readiness(
+                "INSERT INTO server_key_digest_readiness(
                        process_id,process_incarnation,state,supported_digest_versions,
                        failure_class,checked_at,lease_expires_at)
                  VALUES(
@@ -89,7 +81,7 @@ impl PostgresClientDigestReadinessAdapter {
         transaction.commit().await.map_err(persistence)
     }
 
-    async fn renew(&self, claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
+    async fn renew(&self, claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
         claim.validate()?;
         let lease_micros = lease_micros(claim)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
@@ -97,7 +89,7 @@ impl PostgresClientDigestReadinessAdapter {
         let renewed = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "UPDATE client_key_digest_readiness readiness
+                "UPDATE server_key_digest_readiness readiness
                     SET checked_at=transaction_timestamp(),
                         lease_expires_at=transaction_timestamp()
                             +($4::BIGINT*INTERVAL '1 microsecond')
@@ -109,7 +101,7 @@ impl PostgresClientDigestReadinessAdapter {
                         ARRAY(SELECT value::INTEGER
                                 FROM jsonb_array_elements_text($3::jsonb) version(value))
                     AND EXISTS (
-                        SELECT 1 FROM client_process_incarnations current
+                        SELECT 1 FROM auth_process_incarnations current
                          WHERE current.process_id=readiness.process_id
                            AND current.process_incarnation=readiness.process_incarnation)
               RETURNING readiness.process_incarnation",
@@ -138,15 +130,15 @@ impl PostgresClientDigestReadinessAdapter {
     )]
     async fn authoritative_snapshot(
         &self,
-        claim: &ClientDigestReadinessClaim,
+        claim: &ServerDigestReadinessClaim,
         required_process_ids: &[String],
-    ) -> Result<ClientDigestReadinessSnapshot, ApplicationError> {
+    ) -> Result<ServerDigestReadinessSnapshot, ApplicationError> {
         claim.validate()?;
         if required_process_ids.is_empty()
-            || required_process_ids.len() > MAX_REQUIRED_CLIENT_PROCESSES
+            || required_process_ids.len() > MAX_REQUIRED_SERVER_PROCESSES
             || required_process_ids
                 .iter()
-                .any(|process_id| !valid_client_process_id(process_id))
+                .any(|process_id| !valid_server_process_id(process_id))
             || !required_process_ids
                 .windows(2)
                 .all(|processes| processes[0] < processes[1])
@@ -169,7 +161,7 @@ impl PostgresClientDigestReadinessAdapter {
             .query_all_raw(Statement::from_string(
                 DbBackend::Postgres,
                 "SELECT DISTINCT digest_key_version
-                   FROM project_client_keys
+                   FROM project_server_keys
                   WHERE status='active' AND revoked_at IS NULL
                   ORDER BY digest_key_version
                   LIMIT 33"
@@ -194,8 +186,8 @@ impl PostgresClientDigestReadinessAdapter {
                 DbBackend::Postgres,
                 "SELECT EXISTS(
                      SELECT 1
-                       FROM client_key_digest_readiness readiness
-                       JOIN client_process_incarnations current
+                       FROM server_key_digest_readiness readiness
+                       JOIN auth_process_incarnations current
                          ON current.process_id=readiness.process_id
                         AND current.process_incarnation=readiness.process_incarnation
                       WHERE readiness.process_id=$1
@@ -228,8 +220,8 @@ impl PostgresClientDigestReadinessAdapter {
                        FROM jsonb_array_elements_text($1::jsonb) required(process_id)
                       WHERE NOT EXISTS(
                         SELECT 1
-                          FROM client_key_digest_readiness readiness
-                          JOIN client_process_incarnations current
+                          FROM server_key_digest_readiness readiness
+                          JOIN auth_process_incarnations current
                             ON current.process_id=readiness.process_id
                            AND current.process_incarnation=readiness.process_incarnation
                          WHERE readiness.process_id=required.process_id
@@ -242,8 +234,8 @@ impl PostgresClientDigestReadinessAdapter {
                        FROM jsonb_array_elements_text($1::jsonb) required(process_id)
                       WHERE NOT EXISTS(
                         SELECT 1
-                          FROM client_key_digest_readiness readiness
-                          JOIN client_process_incarnations current
+                          FROM server_key_digest_readiness readiness
+                          JOIN auth_process_incarnations current
                             ON current.process_id=readiness.process_id
                            AND current.process_incarnation=readiness.process_incarnation
                          WHERE readiness.process_id=required.process_id
@@ -272,16 +264,16 @@ impl PostgresClientDigestReadinessAdapter {
             .map_err(persistence)?;
 
         let state = if !local_ready {
-            ClientDigestReadinessState::LocalObservationUnavailable
+            ServerDigestReadinessState::LocalObservationUnavailable
         } else if !roster_ready {
-            ClientDigestReadinessState::RequiredRosterUnavailable
+            ServerDigestReadinessState::RequiredRosterUnavailable
         } else if !inventory_ready {
-            ClientDigestReadinessState::ActiveDigestVersionUnavailable
+            ServerDigestReadinessState::ActiveDigestVersionUnavailable
         } else {
-            ClientDigestReadinessState::Ready
+            ServerDigestReadinessState::Ready
         };
         transaction.commit().await.map_err(persistence)?;
-        Ok(ClientDigestReadinessSnapshot {
+        Ok(ServerDigestReadinessSnapshot {
             state,
             active_digest_versions,
         })
@@ -289,21 +281,21 @@ impl PostgresClientDigestReadinessAdapter {
 }
 
 #[async_trait]
-impl ClientDigestReadinessPort for PostgresClientDigestReadinessAdapter {
-    async fn claim(&self, claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
-        PostgresClientDigestReadinessAdapter::claim(self, claim).await
+impl ServerDigestReadinessPort for PostgresServerDigestReadinessAdapter {
+    async fn claim(&self, claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
+        PostgresServerDigestReadinessAdapter::claim(self, claim).await
     }
 
-    async fn renew(&self, claim: &ClientDigestReadinessClaim) -> Result<(), ApplicationError> {
-        PostgresClientDigestReadinessAdapter::renew(self, claim).await
+    async fn renew(&self, claim: &ServerDigestReadinessClaim) -> Result<(), ApplicationError> {
+        PostgresServerDigestReadinessAdapter::renew(self, claim).await
     }
 
     async fn authoritative_snapshot(
         &self,
-        claim: &ClientDigestReadinessClaim,
+        claim: &ServerDigestReadinessClaim,
         required_process_ids: &[String],
-    ) -> Result<ClientDigestReadinessSnapshot, ApplicationError> {
-        PostgresClientDigestReadinessAdapter::authoritative_snapshot(
+    ) -> Result<ServerDigestReadinessSnapshot, ApplicationError> {
+        PostgresServerDigestReadinessAdapter::authoritative_snapshot(
             self,
             claim,
             required_process_ids,
@@ -320,7 +312,7 @@ async fn lock_process<C: ConnectionTrait>(
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT pg_advisory_xact_lock(
-                 hashtextextended('owlauth:client-digest-readiness:' || $1,0))",
+                 hashtextextended('owlauth:server-digest-readiness:' || $1,0))",
             [process_id.to_owned().into()],
         ))
         .await
@@ -328,7 +320,7 @@ async fn lock_process<C: ConnectionTrait>(
     Ok(())
 }
 
-fn lease_micros(claim: &ClientDigestReadinessClaim) -> Result<i64, ApplicationError> {
+fn lease_micros(claim: &ServerDigestReadinessClaim) -> Result<i64, ApplicationError> {
     let nanos = claim.lease_ttl.as_nanos();
     let micros = nanos
         .checked_add(999)
@@ -353,9 +345,9 @@ mod tests {
 
     use super::*;
 
-    fn claim(ttl: Duration) -> ClientDigestReadinessClaim {
-        ClientDigestReadinessClaim {
-            process_id: "client-a".to_owned(),
+    fn claim(ttl: Duration) -> ServerDigestReadinessClaim {
+        ServerDigestReadinessClaim {
+            process_id: "server-a".to_owned(),
             process_incarnation: Uuid::new_v4(),
             readable_digest_versions: vec![1],
             lease_ttl: ttl,

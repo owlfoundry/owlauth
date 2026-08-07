@@ -11,13 +11,22 @@ where
     Option::<String>::deserialize(deserializer)
 }
 
-fn deserialize_required_nullable_project_client_key<'de, D>(
+fn deserialize_required_nullable_project_server_key<'de, D>(
     deserializer: D,
-) -> Result<Option<ProjectClientKey>, D::Error>
+) -> Result<Option<ProjectServerKey>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Option::<ProjectClientKey>::deserialize(deserializer)
+    Option::<ProjectServerKey>::deserialize(deserializer)
+}
+
+fn deserialize_required_nullable_project_user<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProjectUser>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<ProjectUser>::deserialize(deserializer)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -92,6 +101,7 @@ pub struct ProjectList {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProjectRequest {
     #[schema(min_length = 1, max_length = 128)]
     pub display_name: String,
@@ -100,6 +110,7 @@ pub struct CreateProjectRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProjectRequest {
     #[schema(min_length = 1, max_length = 128)]
     pub display_name: String,
@@ -122,6 +133,7 @@ pub struct ProjectPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProjectPolicyRequest {
     #[schema(minimum = 60, maximum = 3600)]
     pub access_token_lifetime_seconds: i32,
@@ -133,6 +145,7 @@ pub struct UpdateProjectPolicyRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectedSecurityRevision {
     #[schema(minimum = 1)]
     pub expected_security_revision: i64,
@@ -169,6 +182,7 @@ pub struct ApplicationList {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateApplicationRequest {
     #[schema(min_length = 1, max_length = 128)]
     pub display_name: String,
@@ -176,6 +190,7 @@ pub struct CreateApplicationRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateApplicationRequest {
     #[schema(min_length = 1, max_length = 128)]
     pub display_name: String,
@@ -184,6 +199,7 @@ pub struct UpdateApplicationRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceApplicationConfigurationRequest {
     #[schema(max_items = 50)]
     pub redirect_uris: Vec<String>,
@@ -262,6 +278,7 @@ pub struct WebhookEndpointList {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateWebhookEndpointRequest {
     pub url: String,
     #[schema(min_items = 1, max_items = 3)]
@@ -271,6 +288,7 @@ pub struct CreateWebhookEndpointRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateWebhookEndpointRequest {
     #[schema(min_items = 1, max_items = 3)]
     pub subscribed_event_types: Vec<ApplicationUserEventType>,
@@ -279,12 +297,14 @@ pub struct UpdateWebhookEndpointRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectedWebhookEndpointRevision {
     #[schema(minimum = 1)]
     pub expected_revision: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareWebhookSecretRotationRequest {
     #[schema(min_length = 32, max_length = 128, write_only)]
     pub secret: String,
@@ -310,6 +330,7 @@ pub struct PreparedWebhookSecretRotation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ActivateWebhookSecretRotationRequest {
     #[schema(minimum = 1)]
     pub expected_revision: i64,
@@ -363,6 +384,7 @@ pub struct WebhookDeliveryList {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayWebhookDeliveryRequest {
     pub confirm: bool,
 }
@@ -390,7 +412,7 @@ pub struct SigningKeyList {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ProjectClientKeyStatus {
+pub enum ProjectServerKeyStatus {
     Active,
     Revoked,
 }
@@ -398,7 +420,7 @@ pub enum ProjectClientKeyStatus {
 /// Safe Control inventory metadata. No credential digest or secret component is exposed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectClientKey {
+pub struct ProjectServerKey {
     #[schema(max_length = 36)]
     pub id: String,
     #[schema(max_length = 36)]
@@ -407,13 +429,13 @@ pub struct ProjectClientKey {
     pub public_key_id: String,
     #[schema(min_length = 1, max_length = 64)]
     pub label: String,
-    pub status: ProjectClientKeyStatus,
+    pub status: ProjectServerKeyStatus,
     #[schema(minimum = 1)]
     pub digest_key_version: i32,
     #[schema(
         min_length = 36,
         max_length = 36,
-        pattern = "^owl_client_v1\\.[A-Za-z0-9_-]{22}$"
+        pattern = "^owl_server_v1\\.[A-Za-z0-9_-]{22}$"
     )]
     pub display_prefix: String,
     #[schema(minimum = 1)]
@@ -432,21 +454,21 @@ pub struct ProjectClientKey {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectClientKeyList {
+pub struct ProjectServerKeyList {
     #[schema(max_items = 100)]
-    pub items: Vec<ProjectClientKey>,
+    pub items: Vec<ProjectServerKey>,
     #[serde(default)]
     #[schema(max_length = 64)]
     pub next_cursor: Option<String>,
     /// Bounded, secret-free creation gate authority independent of paginated history size.
-    #[serde(deserialize_with = "deserialize_required_nullable_project_client_key")]
+    #[serde(deserialize_with = "deserialize_required_nullable_project_server_key")]
     #[schema(required = true)]
-    pub active_unacknowledged_key: Option<ProjectClientKey>,
+    pub active_unacknowledged_key: Option<ProjectServerKey>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CreateProjectClientKeyRequest {
+pub struct CreateProjectServerKeyRequest {
     #[schema(min_length = 1, max_length = 64)]
     pub label: String,
 }
@@ -454,28 +476,28 @@ pub struct CreateProjectClientKeyRequest {
 /// Original successful create response. The credential is never durable and is redacted in Debug.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CreateProjectClientKeyResponse {
-    pub key: ProjectClientKey,
+pub struct CreateProjectServerKeyResponse {
+    pub key: ProjectServerKey,
     #[schema(
         min_length = 80,
         max_length = 80,
-        pattern = "^owl_client_v1\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$",
+        pattern = "^owl_server_v1\\.[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$",
         read_only
     )]
     pub credential: String,
 }
 
-impl std::fmt::Debug for CreateProjectClientKeyResponse {
+impl std::fmt::Debug for CreateProjectServerKeyResponse {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("CreateProjectClientKeyResponse")
+            .debug_struct("CreateProjectServerKeyResponse")
             .field("key", &self.key)
             .field("credential", &"[REDACTED]")
             .finish()
     }
 }
 
-impl Drop for CreateProjectClientKeyResponse {
+impl Drop for CreateProjectServerKeyResponse {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.credential);
     }
@@ -483,7 +505,7 @@ impl Drop for CreateProjectClientKeyResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct AcknowledgeProjectClientKeyDeliveryRequest {
+pub struct AcknowledgeProjectServerKeyDeliveryRequest {
     #[schema(minimum = 1)]
     pub expected_revision: i64,
     /// Explicit assertion that the one-time credential is stored outside `OwlAuth`.
@@ -492,7 +514,7 @@ pub struct AcknowledgeProjectClientKeyDeliveryRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RevokeProjectClientKeyRequest {
+pub struct RevokeProjectServerKeyRequest {
     #[schema(minimum = 1)]
     pub expected_revision: i64,
     /// Explicit acknowledgement that revocation is immediate and irreversible.
@@ -500,12 +522,14 @@ pub struct RevokeProjectClientKeyRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RotateSigningKeyRequest {
     #[schema(minimum = 1)]
     pub expected_project_revision: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct KeyTransitionRequest {
     #[schema(minimum = 1)]
     pub expected_ring_revision: i64,
@@ -574,6 +598,7 @@ pub struct ProviderEgressPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProviderEgressPolicyRequest {
     pub mode: ProviderEgressMode,
     #[schema(max_items = 1024)]
@@ -653,6 +678,7 @@ pub struct NamedProviderPreflightResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProviderRequest {
     /// Closed server-owned adapter profile.
     pub kind: ProviderKind,
@@ -675,6 +701,7 @@ pub struct CreateProviderRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReconcileProviderRequest {
     #[schema(write_only, min_length = 1, max_length = 4096)]
     pub client_secret: String,
@@ -683,12 +710,14 @@ pub struct ReconcileProviderRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderRevisionRequest {
     #[schema(minimum = 1)]
     pub expected_provider_revision: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderAssignmentRequest {
     #[schema(minimum = 1)]
     pub expected_application_revision: i64,
@@ -934,6 +963,7 @@ pub struct ManagedProviderConnectionList {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedProviderConnectionActionRequest {
     #[schema(minimum = 1)]
     pub expected_revision: i64,
@@ -972,6 +1002,7 @@ pub struct ManagedReauthorization {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateManagedReauthorizationRequest {
     pub application_id: String,
     #[schema(minimum = 1)]
@@ -991,6 +1022,7 @@ pub struct CreateManagedReauthorizationResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CancelManagedReauthorizationRequest {
     #[schema(minimum = 1)]
     pub expected_revision: i64,
@@ -1223,6 +1255,20 @@ pub enum ProjectUserStatus {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum ProjectUserSort {
+    CreatedNewest,
+    CreatedOldest,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectUserIdentityFilter {
+    Provider,
+    Email,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ManagedSessionStatus {
     Active,
     Revoked,
@@ -1256,6 +1302,21 @@ pub struct ProjectUserList {
     pub items: Vec<ProjectUser>,
     #[schema(max_length = 36)]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectUserEmailLookupRequest {
+    #[schema(min_length = 3, max_length = 320)]
+    pub email: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectUserLookup {
+    #[serde(deserialize_with = "deserialize_required_nullable_project_user")]
+    #[schema(required = true)]
+    pub user: Option<ProjectUser>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -1369,6 +1430,7 @@ pub struct ProjectUserSessions {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExpectedSessionRevision {
     /// Exact current revision. A terminal session with this revision is returned unchanged;
     /// a stale revision conflicts.
@@ -1384,12 +1446,12 @@ macro_rules! control_path {
             $(request_body = $body,)?
             responses(
                 (status = 200, description = $summary, body = $response),
-                (status = 400, description = "Invalid request", body = ProblemDetails),
-                (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails),
-                (status = 404, description = "Resource not found", body = ProblemDetails),
-                (status = 409, description = "Revision, state, or idempotency conflict", body = ProblemDetails),
-                (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails),
-                (status = 503, description = "Required authority unavailable", body = ProblemDetails)
+                (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+                (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 409, description = "Revision, state, idempotency, or capacity conflict", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 503, description = "Required authority unavailable", body = ProblemDetails, content_type = "application/problem+json")
             ),
             $(params($($params)*),)?
             security(("operator_api_key" = []))
@@ -1398,6 +1460,58 @@ macro_rules! control_path {
         pub fn $name() {}
     };
 }
+
+macro_rules! control_preflight_path {
+    ($name:ident, $path:literal, $response:ty, $summary:literal, $body:ty) => {
+        #[utoipa::path(
+            post,
+            path = $path,
+            request_body = $body,
+            responses(
+                (status = 200, description = $summary, body = $response),
+                (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+                (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 409, description = "Revision, state, idempotency, or capacity conflict", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 422, description = "Provider metadata or policy rejected", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+                (status = 503, description = "Required authority unavailable", body = ProblemDetails, content_type = "application/problem+json")
+            ),
+            params(("project_id" = String, Path)),
+            security(("operator_api_key" = []))
+        )]
+        #[doc(hidden)]
+        pub fn $name() {}
+    };
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/test",
+    request_body = TestSmtpConfigurationRequest,
+    responses(
+        (
+            status = 202,
+            description = "Enqueued bounded SMTP test",
+            body = SmtpTestOperation,
+            headers(("Location" = String, description = "Exact Control path for the SMTP test operation"))
+        ),
+        (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+        (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Revision, state, idempotency, or capacity conflict", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "Required authority unavailable", body = ProblemDetails, content_type = "application/problem+json")
+    ),
+    params(
+        ("project_id" = String, Path),
+        ("smtp_id" = String, Path),
+        ("Idempotency-Key" = String, Header)
+    ),
+    security(("operator_api_key" = []))
+)]
+#[doc(hidden)]
+pub fn test_smtp_configuration() {}
 
 control_path!(
     list_projects,
@@ -1412,7 +1526,7 @@ control_path!(
     post,
     "/v1/projects",
     Project,
-    "Created project",
+    "Created or authoritatively replayed project",
     body = CreateProjectRequest,
     params(("Idempotency-Key" = String, Header))
 );
@@ -1460,11 +1574,11 @@ control_path!(
     params(("project_id" = String, Path))
 );
 control_path!(
-    list_project_client_keys,
+    list_project_server_keys,
     get,
-    "/v1/projects/{project_id}/client-keys",
-    ProjectClientKeyList,
-    "Safe Project client-key metadata",
+    "/v1/projects/{project_id}/server-keys",
+    ProjectServerKeyList,
+    "Safe Project server-key metadata",
     params(
         ("project_id" = String, Path),
         ("cursor" = Option<String>, Query),
@@ -1472,26 +1586,26 @@ control_path!(
     )
 );
 control_path!(
-    get_project_client_key,
+    get_project_server_key,
     get,
-    "/v1/projects/{project_id}/client-keys/{key_id}",
-    ProjectClientKey,
-    "Safe metadata for one Project client key",
+    "/v1/projects/{project_id}/server-keys/{key_id}",
+    ProjectServerKey,
+    "Safe metadata for one Project server key",
     params(("project_id" = String, Path), ("key_id" = String, Path))
 );
 
 #[utoipa::path(
     post,
-    path = "/v1/projects/{project_id}/client-keys",
-    request_body = CreateProjectClientKeyRequest,
+    path = "/v1/projects/{project_id}/server-keys",
+    request_body = CreateProjectServerKeyRequest,
     responses(
-        (status = 201, description = "Created Project client key with one-time credential reveal", body = CreateProjectClientKeyResponse),
-        (status = 400, description = "Invalid request", body = ProblemDetails),
-        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails),
-        (status = 404, description = "Resource not found", body = ProblemDetails),
+        (status = 201, description = "Created Project server key with one-time credential reveal", body = CreateProjectServerKeyResponse, headers(("Location" = String, description = "Exact Control path for the created Project server key"))),
+        (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+        (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
         (status = 409, description = "Unacknowledged delivery, key limit, idempotency conflict, or secret unavailable on replay", body = ProblemDetails),
-        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails),
-        (status = 503, description = "Required Client verifier fleet is not ready", body = ProblemDetails)
+        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "Required Server verifier fleet is not ready", body = ProblemDetails)
     ),
     params(
         ("project_id" = String, Path),
@@ -1500,15 +1614,15 @@ control_path!(
     security(("operator_api_key" = []))
 )]
 #[doc(hidden)]
-pub fn create_project_client_key() {}
+pub fn create_project_server_key() {}
 
 control_path!(
-    acknowledge_project_client_key_delivery,
+    acknowledge_project_server_key_delivery,
     post,
-    "/v1/projects/{project_id}/client-keys/{key_id}/acknowledge",
-    ProjectClientKey,
-    "Project client-key delivery acknowledged",
-    body = AcknowledgeProjectClientKeyDeliveryRequest,
+    "/v1/projects/{project_id}/server-keys/{key_id}/acknowledge",
+    ProjectServerKey,
+    "Project server-key delivery acknowledged",
+    body = AcknowledgeProjectServerKeyDeliveryRequest,
     params(
         ("project_id" = String, Path),
         ("key_id" = String, Path),
@@ -1516,12 +1630,12 @@ control_path!(
     )
 );
 control_path!(
-    revoke_project_client_key,
+    revoke_project_server_key,
     post,
-    "/v1/projects/{project_id}/client-keys/{key_id}/revoke",
-    ProjectClientKey,
-    "Revoked Project client key",
-    body = RevokeProjectClientKeyRequest,
+    "/v1/projects/{project_id}/server-keys/{key_id}/revoke",
+    ProjectServerKey,
+    "Revoked Project server key",
+    body = RevokeProjectServerKeyRequest,
     params(
         ("project_id" = String, Path),
         ("key_id" = String, Path),
@@ -1541,7 +1655,7 @@ control_path!(
     post,
     "/v1/projects/{project_id}/applications",
     Application,
-    "Created application",
+    "Created or authoritatively replayed application",
     body = CreateApplicationRequest,
     params(
         ("project_id" = String, Path),
@@ -1611,7 +1725,7 @@ control_path!(
     post,
     "/v1/projects/{project_id}/applications/{application_id}/webhook-endpoints",
     WebhookEndpoint,
-    "Created pending webhook endpoint",
+    "Created or authoritatively replayed pending webhook endpoint",
     body = CreateWebhookEndpointRequest,
     params(
         ("project_id" = String, Path),
@@ -1739,18 +1853,39 @@ control_path!(
     )
 );
 control_path!(
-    replay_webhook_delivery,
-    post,
-    "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}/replay",
+    get_webhook_delivery,
+    get,
+    "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}",
     WebhookDelivery,
-    "Created a new delivery for the same immutable event and endpoint",
-    body = ReplayWebhookDeliveryRequest,
+    "One retained webhook delivery",
     params(
         ("project_id" = String, Path),
         ("application_id" = String, Path),
         ("delivery_id" = String, Path)
     )
 );
+#[utoipa::path(
+    post,
+    path = "/v1/projects/{project_id}/applications/{application_id}/webhook-deliveries/{delivery_id}/replay",
+    request_body = ReplayWebhookDeliveryRequest,
+    responses(
+        (status = 201, description = "Created a new delivery for the same immutable event and endpoint", body = WebhookDelivery, headers(("Location" = String, description = "Exact Control path for the created webhook delivery"))),
+        (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+        (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Revision, state, idempotency, or capacity conflict", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "Required authority unavailable", body = ProblemDetails, content_type = "application/problem+json")
+    ),
+    params(
+        ("project_id" = String, Path),
+        ("application_id" = String, Path),
+        ("delivery_id" = String, Path)
+    ),
+    security(("operator_api_key" = []))
+)]
+#[doc(hidden)]
+pub fn replay_webhook_delivery() {}
 control_path!(
     list_signing_keys,
     get,
@@ -1797,23 +1932,19 @@ control_path!(
     body = UpdateProviderEgressPolicyRequest,
     params(("project_id" = String, Path))
 );
-control_path!(
+control_preflight_path!(
     preflight_oidc_provider,
-    post,
     "/v1/projects/{project_id}/providers/oidc/preflight",
     OidcPreflightResult,
     "Advisory Custom OIDC discovery preflight",
-    body = OidcPreflightRequest,
-    params(("project_id" = String, Path))
+    OidcPreflightRequest
 );
-control_path!(
+control_preflight_path!(
     preflight_named_provider,
-    post,
     "/v1/projects/{project_id}/providers/named/preflight",
     NamedProviderPreflightResult,
     "Advisory named-provider registration preflight",
-    body = NamedProviderPreflightRequest,
-    params(("project_id" = String, Path))
+    NamedProviderPreflightRequest
 );
 control_path!(
     list_providers,
@@ -1828,7 +1959,7 @@ control_path!(
     post,
     "/v1/projects/{project_id}/providers",
     Provider,
-    "Configured provider",
+    "Configured or authoritatively replayed provider",
     body = CreateProviderRequest,
     params(
         ("project_id" = String, Path),
@@ -1874,8 +2005,8 @@ control_path!(
 );
 control_path!(
     unassign_provider,
-    delete,
-    "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
+    post,
+    "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}/unassign",
     Provider,
     "Unassigned provider",
     body = ProviderAssignmentRequest,
@@ -1970,23 +2101,10 @@ control_path!(
     post,
     "/v1/projects/{project_id}/smtp-configurations",
     SmtpConfiguration,
-    "Created pending SMTP generation",
+    "Created or authoritatively replayed pending SMTP generation",
     body = CreateSmtpConfigurationRequest,
     params(
         ("project_id" = String, Path),
-        ("Idempotency-Key" = String, Header)
-    )
-);
-control_path!(
-    test_smtp_configuration,
-    post,
-    "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/test",
-    SmtpTestOperation,
-    "Enqueued bounded SMTP test",
-    body = TestSmtpConfigurationRequest,
-    params(
-        ("project_id" = String, Path),
-        ("smtp_id" = String, Path),
         ("Idempotency-Key" = String, Header)
     )
 );
@@ -2039,9 +2157,22 @@ control_path!(
     params(
         ("project_id" = String, Path),
         ("status" = Option<ProjectUserStatus>, Query),
-        ("cursor" = Option<String>, Query),
-        ("limit" = Option<usize>, Query)
+        ("search" = Option<String>, Query, min_length = 1, max_length = 128),
+        ("identity_kind" = Option<ProjectUserIdentityFilter>, Query),
+        ("provider_key" = Option<String>, Query, min_length = 1, max_length = 64),
+        ("sort" = Option<ProjectUserSort>, Query),
+        ("cursor" = Option<String>, Query, max_length = 36, description = "Cursor returned by a previous page with the same status, search, identity, provider, and sort criteria"),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 100)
     )
+);
+control_path!(
+    lookup_project_user_by_email,
+    post,
+    "/v1/projects/{project_id}/users/lookup",
+    ProjectUserLookup,
+    "Exact canonical email Project user lookup",
+    body = ProjectUserEmailLookupRequest,
+    params(("project_id" = String, Path))
 );
 control_path!(
     get_project_user,
@@ -2221,7 +2352,7 @@ mod tests {
             document["paths"]["/v1/projects/{project_id}/identity-mutation-intents"]
                 ["post"]["responses"]
                 .get("200")
-                .is_none()
+                .is_some()
         );
         assert!(
             variants
@@ -2290,20 +2421,30 @@ control_path!(
         ("connection_id" = String, Path)
     )
 );
-control_path!(
-    create_managed_reauthorization,
+#[utoipa::path(
     post,
-    "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations",
-    CreateManagedReauthorizationResponse,
-    "Created one exact managed reauthorization interaction",
-    body = CreateManagedReauthorizationRequest,
+    path = "/v1/projects/{project_id}/users/{user_id}/managed-provider-connections/{connection_id}/reauthorizations",
+    request_body = CreateManagedReauthorizationRequest,
+    responses(
+        (status = 201, description = "Created one exact managed reauthorization interaction", body = CreateManagedReauthorizationResponse, headers(("Location" = String, description = "Exact Control path for the created managed reauthorization"))),
+        (status = 200, description = "Authoritative idempotent replay of the managed reauthorization", body = CreateManagedReauthorizationResponse),
+        (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+        (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Revision, state, idempotency, or capacity conflict", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "Required authority unavailable", body = ProblemDetails, content_type = "application/problem+json")
+    ),
     params(
         ("project_id" = String, Path),
         ("user_id" = String, Path),
         ("connection_id" = String, Path),
         ("Idempotency-Key" = String, Header)
-    )
-);
+    ),
+    security(("operator_api_key" = []))
+)]
+#[doc(hidden)]
+pub fn create_managed_reauthorization() {}
 control_path!(
     get_managed_reauthorization,
     get,
@@ -2363,13 +2504,14 @@ control_path!(
     path = "/v1/projects/{project_id}/identity-mutation-intents",
     request_body = CreateIdentityMutationIntentRequest,
     responses(
-        (status = 201, description = "Created one typed identity mutation intent", body = CreateIdentityMutationIntentResponse),
-        (status = 400, description = "Invalid request", body = ProblemDetails),
-        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails),
-        (status = 404, description = "Resource not found", body = ProblemDetails),
-        (status = 409, description = "Revision, state, or idempotency conflict", body = ProblemDetails),
-        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails),
-        (status = 503, description = "Required authority unavailable", body = ProblemDetails)
+        (status = 201, description = "Created one typed identity mutation intent", body = CreateIdentityMutationIntentResponse, headers(("Location" = String, description = "Exact Control path for the created identity mutation intent"))),
+        (status = 200, description = "Authoritative idempotent replay of the identity mutation intent", body = CreateIdentityMutationIntentResponse),
+        (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+        (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Revision, state, idempotency, or capacity conflict", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "Required authority unavailable", body = ProblemDetails, content_type = "application/problem+json")
     ),
     params(
         ("project_id" = String, Path),
@@ -2407,18 +2549,18 @@ control_path!(
 );
 
 #[cfg(test)]
-mod project_client_key_contract_tests {
+mod project_server_key_contract_tests {
     use super::*;
 
-    fn metadata() -> ProjectClientKey {
-        ProjectClientKey {
+    fn metadata() -> ProjectServerKey {
+        ProjectServerKey {
             id: "00000000-0000-0000-0000-000000000001".to_owned(),
             project_id: "00000000-0000-0000-0000-000000000002".to_owned(),
             public_key_id: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             label: "production backend".to_owned(),
-            status: ProjectClientKeyStatus::Active,
+            status: ProjectServerKeyStatus::Active,
             digest_key_version: 1,
-            display_prefix: "owl_client_v1.AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            display_prefix: "owl_server_v1.AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             revision: 1,
             created_at: "2026-08-05T00:00:00Z".to_owned(),
             credential_acknowledged_at: None,
@@ -2429,9 +2571,9 @@ mod project_client_key_contract_tests {
 
     #[test]
     fn one_time_credential_is_redacted_from_debug() {
-        let response = CreateProjectClientKeyResponse {
+        let response = CreateProjectServerKeyResponse {
             key: metadata(),
-            credential: format!("owl_client_v1.AAAAAAAAAAAAAAAAAAAAAA.{}", "B".repeat(43)),
+            credential: format!("owl_server_v1.AAAAAAAAAAAAAAAAAAAAAA.{}", "B".repeat(43)),
         };
         let debug = format!("{response:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -2440,22 +2582,22 @@ mod project_client_key_contract_tests {
 
     #[test]
     fn acknowledgement_status_is_explicit_and_required_in_inventory() {
-        let mut encoded = serde_json::to_value(metadata()).expect("client-key metadata");
+        let mut encoded = serde_json::to_value(metadata()).expect("server-key metadata");
         encoded
             .as_object_mut()
-            .expect("client-key metadata object")
+            .expect("server-key metadata object")
             .remove("credential_acknowledged_at");
-        assert!(serde_json::from_value::<ProjectClientKey>(encoded).is_err());
+        assert!(serde_json::from_value::<ProjectServerKey>(encoded).is_err());
 
         assert!(
-            serde_json::from_value::<ProjectClientKeyList>(serde_json::json!({
+            serde_json::from_value::<ProjectServerKeyList>(serde_json::json!({
                 "items": [],
                 "next_cursor": null
             }))
             .is_err()
         );
         assert!(
-            serde_json::from_value::<ProjectClientKeyList>(serde_json::json!({
+            serde_json::from_value::<ProjectServerKeyList>(serde_json::json!({
                 "items": [],
                 "next_cursor": null,
                 "active_unacknowledged_key": null
@@ -2467,14 +2609,14 @@ mod project_client_key_contract_tests {
     #[test]
     fn lifecycle_commands_reject_unknown_authority_fields() {
         assert!(
-            serde_json::from_value::<CreateProjectClientKeyRequest>(serde_json::json!({
+            serde_json::from_value::<CreateProjectServerKeyRequest>(serde_json::json!({
                 "label": "backend",
                 "scopes": ["users:read"]
             }))
             .is_err()
         );
         assert!(
-            serde_json::from_value::<RevokeProjectClientKeyRequest>(serde_json::json!({
+            serde_json::from_value::<RevokeProjectServerKeyRequest>(serde_json::json!({
                 "expected_revision": 1,
                 "confirm": true,
                 "enable": false
@@ -2482,7 +2624,7 @@ mod project_client_key_contract_tests {
             .is_err()
         );
         assert!(
-            serde_json::from_value::<AcknowledgeProjectClientKeyDeliveryRequest>(
+            serde_json::from_value::<AcknowledgeProjectServerKeyDeliveryRequest>(
                 serde_json::json!({
                     "expected_revision": 1,
                     "confirm_stored": true,

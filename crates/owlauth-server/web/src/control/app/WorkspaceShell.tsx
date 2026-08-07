@@ -1,7 +1,8 @@
 import { useEffect, useId, useLayoutEffect, useState, type ReactNode } from "react";
 import { NavLink, Outlet, useLocation, useParams } from "react-router";
 
-import { LockIcon } from "../../shared/icons/Icons";
+import { CopyButton } from "../../shared/compositions/CopyValue";
+import { ArrowLeftIcon } from "../../shared/icons/Icons";
 import { Breadcrumbs } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { NotificationRegion, ToastRegion } from "../../shared/primitives/Feedback";
@@ -83,8 +84,7 @@ export function WorkspaceShell() {
         </Breadcrumbs>
         <span className={styles["mobileOnly"]}>
           <Button type="button" variant="quiet" onClick={lock}>
-            <LockIcon />
-            Lock
+            Exit
           </Button>
         </span>
       </header>
@@ -118,31 +118,24 @@ function Navigation({
   const navigationId = useId();
   return (
     <nav className={styles["navigation"]} aria-label="Resources">
-      <div
-        className={styles["workspaceNavigation"]}
-        role="group"
-        aria-labelledby={`${navigationId}-workspace`}
-      >
-        <span id={`${navigationId}-workspace`} className={styles["navigationLabel"]}>
-          Workspace
-        </span>
-        <ConsoleNavLink to="/" end onNavigate={onNavigate}>
-          Projects
-        </ConsoleNavLink>
+      <div className={styles["workspaceNavigation"]} role="group" aria-label="Workspace">
+        {project === null ? null : (
+          <ConsoleNavLink to="/" end onNavigate={onNavigate}>
+            <ArrowLeftIcon />
+            Back to projects
+          </ConsoleNavLink>
+        )}
+        {project === null ? null : (
+          <div className={styles["currentProject"]} role="group" aria-label="Current project">
+            <strong title={project.display_name}>{project.display_name}</strong>
+            <CopyButton value={project.id} label="Project ID">
+              Copy ID
+            </CopyButton>
+          </div>
+        )}
       </div>
       {base === null || project === null ? null : (
         <>
-          <div
-            className={styles["currentProject"]}
-            role="group"
-            aria-labelledby={`${navigationId}-current-project`}
-          >
-            <span id={`${navigationId}-current-project`}>Current project</span>
-            <strong title={project.display_name}>{project.display_name}</strong>
-            <NavLink to="/" onClick={onNavigate}>
-              Switch project
-            </NavLink>
-          </div>
           <div
             className={styles["navigationGroup"]}
             role="group"
@@ -156,9 +149,6 @@ function Navigation({
             </ConsoleNavLink>
             <ConsoleNavLink to={`${base}/applications`} onNavigate={onNavigate}>
               Applications
-            </ConsoleNavLink>
-            <ConsoleNavLink to={`${base}/settings`} onNavigate={onNavigate}>
-              Settings
             </ConsoleNavLink>
           </div>
           <div
@@ -199,8 +189,13 @@ function Navigation({
             <ConsoleNavLink to={`${base}/security/signing-keys`} onNavigate={onNavigate}>
               Signing keys
             </ConsoleNavLink>
-            <ConsoleNavLink to={`${base}/security/client-keys`} onNavigate={onNavigate}>
-              Client API keys
+            <ConsoleNavLink to={`${base}/security/server-keys`} onNavigate={onNavigate}>
+              Project secret keys
+            </ConsoleNavLink>
+          </div>
+          <div className={styles["settingsNavigation"]} role="group" aria-label="Project settings">
+            <ConsoleNavLink to={`${base}/settings`} onNavigate={onNavigate}>
+              Settings
             </ConsoleNavLink>
           </div>
         </>
@@ -212,17 +207,9 @@ function Navigation({
 function ConsoleLockAction({ onLock }: { readonly onLock: () => void }) {
   return (
     <div className={styles["sidebarFooter"]}>
-      <Button
-        type="button"
-        variant="secondary"
-        fullWidth
-        className={styles["lockButton"]}
-        onClick={onLock}
-      >
-        <LockIcon />
-        Lock console
+      <Button type="button" variant="secondary" fullWidth onClick={onLock}>
+        Exit console
       </Button>
-      <p>Clear operator access from this console page.</p>
     </div>
   );
 }
@@ -253,7 +240,7 @@ function currentSection(pathname: string, projectId: string | undefined): string
   if (pathname.includes("/users/")) return "User detail";
   if (pathname.endsWith("/users")) return "Users";
   if (pathname.endsWith("/security/signing-keys")) return "Signing keys";
-  if (pathname.endsWith("/security/client-keys")) return "Client API keys";
+  if (pathname.endsWith("/security/server-keys")) return "Project secret keys";
   if (pathname.endsWith("/settings")) return "Settings";
   return "Overview";
 }

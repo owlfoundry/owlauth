@@ -264,15 +264,15 @@ def normalized_surface(
     control: Mapping[str, Any],
     policy: SurfacePolicy,
     *,
-    client: Mapping[str, Any] | None = None,
+    server: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_operations = document_operations(runtime, "Runtime")
     control_operations = document_operations(control, "Control")
     non_runtime_planes: list[tuple[str, dict[str, Operation]]] = [
         ("Control", control_operations)
     ]
-    if client is not None:
-        non_runtime_planes.append(("Client", document_operations(client, "Client")))
+    if server is not None:
+        non_runtime_planes.append(("Server", document_operations(server, "Server")))
 
     runtime_identities = {
         (operation.method, operation.path): operation for operation in runtime_operations.values()
@@ -415,7 +415,7 @@ def export_documents(
     with tempfile.TemporaryDirectory(prefix="owlauth-sdk-contract-") as temporary_directory:
         temporary = Path(temporary_directory)
         documents: list[dict[str, Any]] = []
-        for plane in ("runtime", "client", "control"):
+        for plane in ("runtime", "server", "control"):
             output = temporary / f"{plane}.json"
             command = [
                 "cargo",
@@ -523,7 +523,7 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
     parser.add_argument("--provenance", type=Path)
     parser.add_argument("--runtime-openapi", type=Path)
-    parser.add_argument("--client-openapi", type=Path)
+    parser.add_argument("--server-openapi", type=Path)
     parser.add_argument("--control-openapi", type=Path)
     return parser.parse_args(arguments)
 
@@ -532,31 +532,31 @@ def run(arguments: list[str]) -> None:
     options = parse_arguments(arguments)
     provided_openapi = [
         options.runtime_openapi,
-        options.client_openapi,
+        options.server_openapi,
         options.control_openapi,
     ]
     if any(path is not None for path in provided_openapi) and not all(
         path is not None for path in provided_openapi
     ):
         raise ContractError(
-            "--runtime-openapi, --client-openapi, and --control-openapi must be provided together"
+            "--runtime-openapi, --server-openapi, and --control-openapi must be provided together"
         )
     policy_path = options.policy.resolve()
     snapshot_path = options.snapshot.resolve()
     policy = load_policy(policy_path)
     if options.runtime_openapi is None:
-        runtime, client, control = export_documents(REPOSITORY_ROOT)
+        runtime, server, control = export_documents(REPOSITORY_ROOT)
     else:
         runtime_value = load_json(options.runtime_openapi)
-        client_value = load_json(options.client_openapi)
+        server_value = load_json(options.server_openapi)
         control_value = load_json(options.control_openapi)
         if not all(
             isinstance(value, dict)
-            for value in (runtime_value, client_value, control_value)
+            for value in (runtime_value, server_value, control_value)
         ):
             raise ContractError("OpenAPI inputs must be JSON objects")
-        runtime, client, control = runtime_value, client_value, control_value
-    normalized = normalized_surface(runtime, control, policy, client=client)
+        runtime, server, control = runtime_value, server_value, control_value
+    normalized = normalized_surface(runtime, control, policy, server=server)
     rendered = canonical_json(normalized, pretty=True)
     if options.action == "update":
         write_bytes(snapshot_path, rendered)

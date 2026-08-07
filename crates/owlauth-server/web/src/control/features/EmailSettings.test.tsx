@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
@@ -9,6 +9,8 @@ import {
   type EmailAssignment,
   type EmailMethodPolicy,
   type Project,
+  type SmtpConfiguration,
+  type SmtpTestOperation,
 } from "../client";
 import { ControlConfirmationProvider } from "../app/Confirmation";
 import { EmailSettings } from "./EmailSettings";
@@ -37,6 +39,22 @@ const initialApplication: Application = {
   status: "active",
   metadata_revision: 1,
   security_revision: 11,
+};
+
+const smtpConfiguration: SmtpConfiguration = {
+  id: "33333333-3333-4333-8333-333333333333",
+  project_id: initialProject.id,
+  generation: 1,
+  host: "smtp.example.com",
+  port: 465,
+  tls_mode: "implicit_tls",
+  sender_address: "sender@example.com",
+  sender_name: null,
+  reply_to: null,
+  status: "pending",
+  safe_fingerprint: "sha256:test",
+  revision: 1,
+  security_eligibility_revision: 1,
 };
 
 const policy: EmailMethodPolicy = {
@@ -81,7 +99,11 @@ function fillSmtpForm(suffix: string) {
   });
 }
 
-function renderHarness(options?: { failSmtp?: boolean; conflictPolicy?: boolean }) {
+function renderHarness(options?: {
+  failSmtp?: boolean;
+  conflictPolicy?: boolean;
+  smtp?: SmtpConfiguration;
+}) {
   let authoritativeApplication = initialApplication;
   let authoritativeProject = initialProject;
   let authoritativePolicy = policy;
@@ -114,22 +136,33 @@ function renderHarness(options?: { failSmtp?: boolean; conflictPolicy?: boolean 
     }
     throw new Error(`unexpected PUT ${path} ${String(request.body.enabled)}`);
   });
-  const post = vi.fn(
-    (path: string, request: { body: { expected_project_security_revision?: number } }) => {
-      if (!path.endsWith("/smtp-configurations")) throw new Error(`unexpected POST ${path}`);
-      if (options?.failSmtp === true) return Promise.reject(new Error("dispatch failed"));
-      if (
-        request.body.expected_project_security_revision !== authoritativeProject.security_revision
-      ) {
-        return Promise.reject(new Error("stale Project revision"));
-      }
-      authoritativeProject = {
-        ...authoritativeProject,
-        security_revision: authoritativeProject.security_revision + 1,
+  const post = vi.fn((path: string, request: { body: Record<string, unknown> }) => {
+    if (path.endsWith("/test")) {
+      const operation: SmtpTestOperation = {
+        id: "44444444-4444-4444-8444-444444444444",
+        project_id: initialProject.id,
+        smtp_configuration_id: smtpConfiguration.id,
+        status: "pending",
+        outcome: null,
+        created_at: "2026-08-07T00:00:00Z",
+        completed_at: null,
       };
-      return Promise.resolve(successful({ id: crypto.randomUUID() }));
-    },
-  );
+      return Promise.resolve(successful(operation));
+    }
+    if (!path.endsWith("/smtp-configurations")) throw new Error(`unexpected POST ${path}`);
+    if (options?.failSmtp === true) return Promise.reject(new Error("dispatch failed"));
+    if (
+      request.body["expected_project_security_revision"] !== authoritativeProject.security_revision
+    ) {
+      return Promise.reject(new Error("stale Project revision"));
+    }
+    authoritativeProject = {
+      ...authoritativeProject,
+      security_revision: authoritativeProject.security_revision + 1,
+    };
+    return Promise.resolve(successful({ id: crypto.randomUUID() }));
+  });
+  let smtpTestReads = 0;
   const get = vi.fn((path: string) => {
     if (path.endsWith("/email-method")) {
       return Promise.resolve(successful(authoritativePolicy));
@@ -138,7 +171,22 @@ function renderHarness(options?: { failSmtp?: boolean; conflictPolicy?: boolean 
       return Promise.resolve(successful({ items: authoritativeAssignments }));
     }
     if (path.endsWith("/smtp-configurations")) {
-      return Promise.resolve(successful({ items: [] }));
+      return Promise.resolve(
+        successful({ items: options?.smtp === undefined ? [] : [options.smtp] }),
+      );
+    }
+    if (path.includes("/tests/")) {
+      smtpTestReads += 1;
+      const operation: SmtpTestOperation = {
+        id: "44444444-4444-4444-8444-444444444444",
+        project_id: initialProject.id,
+        smtp_configuration_id: smtpConfiguration.id,
+        status: smtpTestReads > 1 ? "delivered" : "submitting",
+        outcome: smtpTestReads > 1 ? "delivered" : null,
+        created_at: "2026-08-07T00:00:00Z",
+        completed_at: smtpTestReads > 1 ? "2026-08-07T00:00:01Z" : null,
+      };
+      return Promise.resolve(successful(operation));
     }
     throw new Error(`unexpected GET ${path}`);
   });
@@ -202,6 +250,12 @@ describe("Email Console owner revisions", () => {
       expect(setMessage).toHaveBeenCalledWith("Email method assigned to Native client.");
     });
     fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(
+      within(screen.getByRole("dialog", { name: "Remove passwordless email" })).getByRole(
+        "button",
+        { name: "Remove email method" },
+      ),
+    );
     await waitFor(() => {
       expect(put).toHaveBeenCalledTimes(2);
     });
@@ -233,9 +287,43 @@ describe("Email Console owner revisions", () => {
     expect(post.mock.calls[0]?.[1]).toMatchObject({
       body: { expected_project_security_revision: 7 },
     });
+    expect(post.mock.calls[0]?.[1].body).not.toHaveProperty("explicitly_allowed_private_ips");
     expect(post.mock.calls[1]?.[1]).toMatchObject({
       body: { expected_project_security_revision: 8 },
     });
+    expect(post.mock.calls[1]?.[1].body).not.toHaveProperty("explicitly_allowed_private_ips");
+  });
+
+  it("reports observed SMTP evidence without overriding the durable server gate", async () => {
+    const { post, setMessage } = renderHarness({ smtp: smtpConfiguration });
+
+    expect(await screen.findByRole("button", { name: "Activate" })).toBeEnabled();
+    expect(screen.getByText(/server validates durable evidence/u)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Send test" }));
+    fireEvent.change(screen.getByLabelText("Test recipient"), {
+      target: { value: "recipient@example.com" },
+    });
+    const dialog = screen.getByRole("dialog", { name: "Send SMTP test" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Send test" }));
+
+    await waitFor(() => {
+      expect(setMessage).toHaveBeenCalledWith(
+        "SMTP test accepted. Its delivery result is being checked.",
+      );
+    });
+    expect(post).toHaveBeenCalledWith(
+      "/v1/projects/{project_id}/smtp-configurations/{smtp_id}/test",
+      expect.objectContaining({
+        body: { recipient: "recipient@example.com", expected_revision: 1 },
+      }),
+    );
+    expect(await screen.findByText("SMTP test status: pending")).toBeVisible();
+    expect(
+      await screen.findByText("SMTP test status: delivered", {}, { timeout: 3000 }),
+    ).toBeVisible();
+    expect(screen.getByText(/Activation remains a separate explicit action/u)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Activate" })).toBeEnabled();
+    expect(screen.getByText(/Delivered test observed for this revision/u)).toBeVisible();
   });
 
   it("closes a stale policy draft and remounts committed state after a conflict", async () => {

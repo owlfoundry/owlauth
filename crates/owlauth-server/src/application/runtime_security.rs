@@ -349,6 +349,15 @@ pub(crate) struct HostedProviderMethod {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostedPendingEmailChallenge {
+    pub challenge_id: Uuid,
+    pub generation: i16,
+    pub otp_available: bool,
+    pub magic_link_available: bool,
+    pub expires_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostedInteraction {
     pub transaction_id: Uuid,
     pub project_id: Uuid,
@@ -366,6 +375,7 @@ pub(crate) struct HostedInteraction {
     pub email_available: bool,
     pub email_otp_enabled: bool,
     pub email_magic_link_enabled: bool,
+    pub pending_email_challenge: Option<HostedPendingEmailChallenge>,
     pub expires_at: OffsetDateTime,
 }
 

@@ -593,6 +593,8 @@ async function verifyMcpReadCatalog(
     "owlauth_application_get",
     "owlauth_applications_list",
     "owlauth_project_get",
+    "owlauth_project_user_lookup_email",
+    "owlauth_project_users_list",
     "owlauth_projects_list",
     "owlauth_system_get",
     "owlauth_webhook_deliveries_list",

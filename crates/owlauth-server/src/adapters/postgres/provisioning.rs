@@ -72,7 +72,7 @@ pub(crate) struct PostgresProvisioningAdapter {
     clock: Arc<dyn Clock>,
     digester: Arc<dyn RequestDigester>,
     runtime_base: Arc<Url>,
-    required_runtime_process_ids: Arc<BTreeSet<String>>,
+    required_auth_process_ids: Arc<BTreeSet<String>>,
     propagation_delay: Duration,
     verification_retention: Duration,
     custody: ProvisioningCustody,
@@ -99,7 +99,7 @@ impl PostgresProvisioningAdapter {
     pub(crate) fn new_protected(
         database: DatabaseConnection,
         runtime_base: Url,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
         propagation_delay: Duration,
         verification_retention: Duration,
         deployment_id: &str,
@@ -124,9 +124,7 @@ impl PostgresProvisioningAdapter {
             clock: Arc::new(SystemClock),
             digester: Arc::new(Sha256RequestDigester),
             runtime_base: Arc::new(runtime_base),
-            required_runtime_process_ids: Arc::new(
-                required_runtime_process_ids.into_iter().collect(),
-            ),
+            required_auth_process_ids: Arc::new(required_auth_process_ids.into_iter().collect()),
             propagation_delay,
             verification_retention,
             custody,
@@ -137,7 +135,7 @@ impl PostgresProvisioningAdapter {
     pub(crate) fn new(
         database: DatabaseConnection,
         runtime_base: Url,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
         propagation_delay: Duration,
         verification_retention: Duration,
     ) -> Self {
@@ -147,7 +145,7 @@ impl PostgresProvisioningAdapter {
         Self::new_protected(
             database,
             runtime_base,
-            required_runtime_process_ids,
+            required_auth_process_ids,
             propagation_delay,
             verification_retention,
             "test-deployment",

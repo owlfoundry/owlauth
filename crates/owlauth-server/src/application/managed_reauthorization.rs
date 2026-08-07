@@ -162,9 +162,15 @@ pub(crate) struct CreateManagedReauthorization {
     pub correlation_id: Uuid,
 }
 
-pub(crate) struct CreatedManagedReauthorization {
-    pub interaction: ManagedReauthorizationView,
-    pub hosted_target: Option<String>,
+pub(crate) enum ManagedReauthorizationCreateOutcome {
+    Created {
+        interaction: ManagedReauthorizationView,
+        hosted_target: Option<String>,
+    },
+    Replayed {
+        interaction: ManagedReauthorizationView,
+        hosted_target: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -452,7 +458,7 @@ impl ManagedReauthorizationControlService {
         &self,
         command: CreateManagedReauthorization,
         adapter_key: &str,
-    ) -> Result<CreatedManagedReauthorization, ApplicationError> {
+    ) -> Result<ManagedReauthorizationCreateOutcome, ApplicationError> {
         validate_create(&command)?;
         let capability = self
             .capabilities
@@ -485,7 +491,7 @@ impl ManagedReauthorizationControlService {
             .await?;
         match result {
             CreateManagedReauthorizationResult::Created(interaction) => {
-                Ok(CreatedManagedReauthorization {
+                Ok(ManagedReauthorizationCreateOutcome::Created {
                     interaction: (&interaction).into(),
                     hosted_target: Some(hosted_target),
                 })
@@ -504,7 +510,7 @@ impl ManagedReauthorizationControlService {
                         String::from_utf8(value.to_vec()).map_err(|_| ApplicationError::Integrity)
                     })
                     .transpose()?;
-                Ok(CreatedManagedReauthorization {
+                Ok(ManagedReauthorizationCreateOutcome::Replayed {
                     interaction: (&interaction).into(),
                     hosted_target: target,
                 })

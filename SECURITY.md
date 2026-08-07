@@ -1,6 +1,6 @@
 # Security policy
 
-OwlAuth is Beta security-sensitive software and does not yet provide a stable security-support window or production support commitment. The delivered self-hosted scope includes Project login, persistence, sessions and token issuance, isolated Runtime, Client, and Control APIs, hosted web surfaces, an optional remote Control MCP endpoint, and first-party protocol SDKs. Pre-1.0 interfaces, configuration, and operational requirements may change. Operators must independently harden and validate the complete deployment, including TLS/proxy policy, secrets, database roles, egress, observability, upgrades, and a tested PostgreSQL/external-store/key backup, PITR, and restore program.
+OwlAuth is Beta security-sensitive software and does not yet provide a stable security-support window or production support commitment. The delivered self-hosted scope includes Project login, persistence, sessions and token issuance, an Auth endpoint with isolated Runtime and Server API surfaces plus an independent Control API, hosted web surfaces, an optional remote Control MCP endpoint, and first-party protocol SDKs. Pre-1.0 interfaces, configuration, and operational requirements may change. Operators must independently harden and validate the complete deployment, including TLS/proxy policy, secrets, database roles, egress, observability, upgrades, and a tested PostgreSQL/external-store/key backup, PITR, and restore program.
 
 ## Reporting a vulnerability
 
@@ -12,10 +12,10 @@ Include when possible:
 - reproduction steps or a minimal proof of concept;
 - the expected and observed behavior;
 - confidentiality, integrity, or availability impact;
-- whether credentials, Project boundaries, Runtime/Client/Control separation, token handling, update verification, or release artifacts are involved;
+- whether credentials, Project boundaries, Auth/Control endpoint and Runtime/Server API surface separation, token handling, update verification, or release artifacts are involved;
 - any suggested mitigation or disclosure constraints.
 
-Do not include real provider secrets, Project tokens, refresh tokens, Project client keys, management credentials, signing keys, user data, or other third-party secrets. Use synthetic values and redact logs before attaching them.
+Do not include real provider secrets, Project tokens, refresh tokens, Project server keys, management credentials, signing keys, user data, or other third-party secrets. Use synthetic values and redact logs before attaching them.
 
 ## Security model
 

@@ -29,11 +29,7 @@
 .mark {
   width: 1.8rem;
   height: 1.8rem;
-  display: grid;
-  place-items: center;
-  color: var(--owl-accent);
-  border: 1px solid var(--owl-border-strong);
-  border-radius: 0.5rem;
+  flex: none;
 }
 
 .lockedPanel h1 {
@@ -82,12 +78,22 @@
 }
 
 .workspaceNavigation,
-.navigationGroup {
+.navigationGroup,
+.settingsNavigation {
   display: grid;
   gap: 0.2rem;
 }
 
-.navigationGroup {
+.workspaceNavigation {
+  gap: 0.35rem;
+}
+
+.workspaceNavigation a svg {
+  flex: none;
+}
+
+.navigationGroup,
+.settingsNavigation {
   padding-top: 0.8rem;
   border-top: 1px solid var(--owl-border);
 }
@@ -102,38 +108,26 @@
 .currentProject {
   min-width: 0;
   display: grid;
-  gap: 0.2rem;
-  padding: 0.8rem 0.75rem;
-  background: var(--owl-surface);
-  border: 1px solid var(--owl-border);
-  border-radius: var(--owl-radius-control);
-}
-
-.currentProject span {
-  color: var(--owl-text-subtle);
-  font-size: 0.6875rem;
-  font-weight: 650;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.2rem 0.5rem 0.35rem 0.75rem;
 }
 
 .currentProject strong {
+  display: block;
   overflow: hidden;
   color: var(--owl-text);
   font-size: 0.9375rem;
+  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.currentProject a {
-  min-height: auto;
-  display: inline;
-  justify-self: start;
-  padding: 0;
-  color: var(--owl-accent);
-  border-radius: 0;
+.currentProject button {
+  min-height: 2rem;
+  padding: 0.25rem 0.45rem;
   font-size: 0.75rem;
-  font-weight: 600;
-  text-decoration: underline;
-  text-underline-offset: 0.16em;
 }
 
 .navigation > :not(.currentProject) a {
@@ -167,18 +161,6 @@
   border-top: 1px solid var(--owl-border);
 }
 
-.lockButton {
-  justify-content: flex-start;
-}
-
-.sidebarFooter p {
-  margin: 0.4rem 0 0;
-  padding-inline: 0.2rem;
-  color: var(--owl-text-subtle);
-  font-size: 0.6875rem;
-  line-height: 1rem;
-}
-
 .topbar {
   grid-area: topbar;
   position: sticky;
@@ -201,12 +183,9 @@
   grid-area: main;
   width: 100%;
   min-width: 0;
-  max-width: 80rem;
+  max-width: 104rem;
+  margin-inline: auto;
   padding: 2rem;
-}
-
-.mainNarrow {
-  max-width: 52rem;
 }
 
 .skipLink {

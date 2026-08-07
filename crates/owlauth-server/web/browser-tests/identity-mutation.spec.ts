@@ -16,7 +16,7 @@ const providerClientSecret = required("OWLAUTH_E2E_PROVIDER_CLIENT_SECRET");
 const applicationOrigin = required("OWLAUTH_E2E_APPLICATION_ORIGIN");
 const mailCaptureUrl = required("OWLAUTH_E2E_MAIL_CAPTURE_URL");
 const postgresContainer = required("OWLAUTH_E2E_POSTGRES_CONTAINER");
-const runtimeLog = required("OWLAUTH_E2E_RUNTIME_LOG");
+const authLog = required("OWLAUTH_E2E_AUTH_LOG");
 const controlLog = required("OWLAUTH_E2E_CONTROL_LOG");
 
 interface Project {
@@ -433,7 +433,7 @@ test("public identity Link, Email Link, Unlink, and Merge preserve exact authori
 test("identity Runtime and Console flows are keyboard and accessibility safe", async ({
   browser,
   browserName,
-}) => {
+}, testInfo) => {
   test.setTimeout(360_000);
   expect(["chromium", "firefox"]).toContain(browserName);
   const suffix = `identity-a11y-${browserName}-${Date.now().toString(36)}`;
@@ -454,7 +454,7 @@ test("identity Runtime and Console flows are keyboard and accessibility safe", a
       primary_source_disposition: { disposition: "clear" },
     });
     await page.goto(mutation.hosted_target ?? "");
-    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+    await auditIdentitySurface(page, testInfo, "runtime-identity-proof");
     await page.keyboard.press("Tab");
     await expect(page.getByRole("button", { name: "Start email proof" })).toBeFocused();
     await page.getByRole("button", { name: "Start email proof" }).press("Enter");
@@ -476,11 +476,14 @@ test("identity Runtime and Console flows are keyboard and accessibility safe", a
       .getByRole("link", { name: new RegExp(`Identity ${suffix}`, "u") })
       .press("Enter");
     await consolePage.getByRole("link", { name: "Users", exact: true }).press("Enter");
-    await consolePage.getByRole("button", { name: new RegExp(user.public_id, "u") }).press("Enter");
+    await consolePage.getByRole("link", { name: new RegExp(user.public_id, "u") }).press("Enter");
+    await expect(consolePage).toHaveURL((url) =>
+      url.pathname.endsWith(`/projects/${authority.project.id}/users/${user.id}`),
+    );
     await expect(
       consolePage.getByRole("heading", { name: "Identity link, unlink, and merge" }),
     ).toBeVisible({ timeout: 15_000 });
-    expect((await new AxeBuilder({ page: consolePage }).analyze()).violations).toEqual([]);
+    await auditIdentitySurface(consolePage, testInfo, "control-user-detail");
     await consolePage.getByLabel("Operation").focus();
     await consolePage.getByLabel("Operation").selectOption("unlink");
     await expect(consolePage.getByLabel("Operation")).toBeFocused();
@@ -495,6 +498,33 @@ test("identity Runtime and Console flows are keyboard and accessibility safe", a
     await context.close();
   }
 });
+
+async function auditIdentitySurface(
+  page: Page,
+  testInfo: import("@playwright/test").TestInfo,
+  name: string,
+): Promise<void> {
+  for (const viewport of [
+    { width: 1440, height: 900 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(() => {
+      window.scrollTo(0, 0);
+    });
+    const dimensions = await page.evaluate(() => ({
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+    }));
+    expect(dimensions.scrollWidth).toBe(dimensions.clientWidth);
+    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+    await page.screenshot({
+      path: testInfo.outputPath(`${name}-${String(viewport.width)}x${String(viewport.height)}.png`),
+      fullPage: true,
+    });
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+}
 
 async function provision(request: APIRequestContext, suffix: string): Promise<Authority> {
   const project = await control<Project>(
@@ -798,7 +828,7 @@ async function completeEmailMagicSlot(
     await replayContext.close();
   }
 
-  await page.reload();
+  await page.getByRole("button", { name: "Refresh proof status" }).click();
   await expect(page.getByRole("listitem").filter({ hasText: roleLabel(role) })).toContainText(
     "Status: Proof complete.",
   );
@@ -1049,7 +1079,7 @@ async function assertEvidenceAndLogs(
     const consoleDocument = snapshot.consoleMessages.join("\n");
     for (const email of emails) expect(consoleDocument).not.toContain(email);
   }
-  const logs = `${await readFile(runtimeLog, "utf8")}\n${await readFile(controlLog, "utf8")}`;
+  const logs = `${await readFile(authLog, "utf8")}\n${await readFile(controlLog, "utf8")}`;
   for (const email of emails) expect(logs).not.toContain(email);
   expect(logs).not.toMatch(/managed-(?:access|refresh)-[A-Za-z0-9_-]+/u);
   expect(logs).not.toMatch(/One-time code:\s*\d{6,10}/u);
@@ -1116,7 +1146,7 @@ async function control<T = unknown>(
   if (!response.ok()) {
     const [problem, runtime, control] = await Promise.all([
       response.text(),
-      readFile(runtimeLog, "utf8"),
+      readFile(authLog, "utf8"),
       readFile(controlLog, "utf8"),
     ]);
     throw new Error(

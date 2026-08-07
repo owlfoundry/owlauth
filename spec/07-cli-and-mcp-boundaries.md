@@ -70,7 +70,7 @@ The gateway MUST:
 - map only allowlisted external operations to fixed Control commands;
 - prevent generic Control forwarding, arbitrary Project selection, key export, and policy bypass.
 
-OwlAuth provides indexed metadata, revision conditions, Project isolation, and domain validation. It does not provide server-enforced tenant isolation for callers sharing the operator key. Organization membership, arbitrary customer business API keys, tenant RBAC, plans, billing, and hosted multi-tenant orchestration are outside the OwlAuth product. The fixed read-only Project client keys from spec 13 are a separate admitted Client credential class, not tenant-management or business API keys.
+OwlAuth provides indexed metadata, revision conditions, Project isolation, and domain validation. It does not provide server-enforced tenant isolation for callers sharing the operator key. Organization membership, arbitrary customer business API keys, tenant RBAC, plans, billing, and hosted multi-tenant orchestration are outside the OwlAuth product. The fixed read-only Project server keys from spec 13 are a separate admitted Server credential class, not tenant-management or business API keys.
 
 ## One CLI, endpoint-discovered deployment
 
@@ -124,12 +124,13 @@ The self-hosted adapter:
 - requires a validated/pinned self-hosted descriptor, exact Control endpoint, and TLS verification;
 - treats every invocation as the fixed deployment operator;
 - sends explicit Project/target identifiers and expected revisions for destructive commands;
-- emits a Project client credential only from the original successful create response and exposes a separate revision-fenced, idempotent `client-key acknowledge` command that requires explicit confirmation after automation has durably stored it;
+- emits a Project server credential only from the original successful create response and exposes a separate revision-fenced, idempotent `server-key acknowledge` command that requires explicit confirmation after automation has durably stored it;
 - uses deployment-operator-scoped idempotency for eligible retries;
 - shows the selected profile/endpoint and a safe summary before destructive commands;
 - treats deliberate non-interactive confirmation as intent UX, not extra authority;
 - separates stable machine output from human diagnostics;
-- redacts operator/Runtime credentials, provider values, tickets, cookies, user profile data, and private-key references.
+- exposes Project-user directory list criteria as typed status, safe prefix search, identity/provider-provenance, sort, cursor, and limit arguments, and exposes exact canonical email only through the dedicated body-based lookup command;
+- redacts operator/Runtime credentials, provider values, tickets, cookies, email lookup input, user profile data, and private-key references.
 
 ## Self-hosted HTTP MCP placement
 
@@ -170,7 +171,7 @@ Tools MUST NOT provide raw SQL, repository access, generic HTTP/OpenAPI forwardi
 
 Prompt text, model output, UI approval, tool discovery, and tool arguments are untrusted input. They cannot establish authority; only successful operator-key authentication admits a self-hosted request.
 
-The initial self-hosted catalog contains exactly seven read-only tools: `owlauth_system_get`, Project list/get, Application list/get, webhook endpoint list, and webhook delivery list. There is no projection-policy tool, mutation tool, preview/commit capability, durable confirmation table, or alternate direct-commit alias. Adding a mutation requires implementing and testing its reviewed design before it enters the catalog.
+The initial self-hosted catalog contains exactly nine read-only tools: `owlauth_system_get`, Project list/get, Application list/get, webhook endpoint list, webhook delivery list, `owlauth_project_users_list`, and `owlauth_project_user_lookup_email`. The Project-user list tool exposes the same authoritative safe criteria and cursor discipline as Control REST; the exact-email tool accepts email only as a bounded argument and returns zero or one safe user without email, identity subject, picture URL, digest, or credential material. There is no projection-policy tool, mutation tool, preview/commit capability, durable confirmation table, or alternate direct-commit alias. Adding a mutation requires implementing and testing its reviewed design before it enters the catalog.
 
 ## Surface and recovery boundaries
 

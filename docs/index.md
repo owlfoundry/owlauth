@@ -30,8 +30,8 @@ features:
     details: Projects can host OTP and magic-link authentication through Project-selected SMTP, with one-use proofs and no silent email linking.
   - title: Application user synchronization
     details: Applications receive bounded revisioned user projections and optional signed durable webhooks only for users already bound to them.
-  - title: Runtime, Client, and Control separation
-    details: Public authentication, customer-backend APIs, and privileged administration use isolated listeners, credentials, and policies over one shared application and domain core.
+  - title: Auth and Control separation
+    details: Auth hosts isolated Runtime and Server API routers, while privileged administration uses an independent Control listener over the same application and domain core.
   - title: Hosted web surfaces
     details: Runtime provides hosted end-user authentication pages, while Control provides an API-key-driven Management Console in the same server artifact.
   - title: First-party SDK design
@@ -72,7 +72,8 @@ A Project access token is an OwlAuth application-session JWT. It is not an upstr
 
 ## Read next
 
-- [Architecture](/guide/architecture) — Projects, Applications, authentication flow, logical planes, storage, and deployment.
+- [Deployment](/guide/deployment) — released artifacts, production configuration, TLS ingress, PostgreSQL, scaling, probes, upgrades, and tested recovery.
+- [Architecture](/guide/architecture) — Projects, Applications, authentication flow, logical planes, storage, and deployment modes.
 - [Getting started](/guide/getting-started) — build, validate, and inspect the current Beta implementation.
 - [SDKs](/guide/sdks) — implemented protocol operations and the explicit Application-owned state boundary.
 - [Building a SaaS](/guide/building-saas) — compose external tenant authorization, managed cells, reconciliation, and billing around self-hosted OwlAuth.

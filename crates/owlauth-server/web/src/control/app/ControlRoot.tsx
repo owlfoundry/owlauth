@@ -15,7 +15,7 @@ import {
 } from "../client";
 import { ApplicationDetailPage } from "../pages/ApplicationDetailPage";
 import { ApplicationsPage } from "../pages/ApplicationsPage";
-import { ClientKeysPage } from "../pages/ClientKeysPage";
+import { ServerKeysPage } from "../pages/ServerKeysPage";
 import { EmailPage } from "../pages/EmailPage";
 import { ProjectOverviewPage } from "../pages/ProjectOverviewPage";
 import { ProjectsPage } from "../pages/ProjectsPage";
@@ -197,8 +197,8 @@ export function ControlRoot() {
             <Route path="projects/:projectId/users/:userId" element={<UserDetailPage />} />
             <Route path="projects/:projectId/security/signing-keys" element={<SigningKeysPage />} />
             <Route
-              path="projects/:projectId/security/client-keys"
-              element={<ProjectScopedClientKeysPage />}
+              path="projects/:projectId/security/server-keys"
+              element={<ProjectScopedServerKeysPage />}
             />
             <Route path="projects/:projectId/settings" element={<ProjectSettingsPage />} />
             <Route
@@ -219,7 +219,7 @@ export function ControlRoot() {
   );
 }
 
-function ProjectScopedClientKeysPage() {
+function ProjectScopedServerKeysPage() {
   const { projectId } = useParams();
-  return <ClientKeysPage key={projectId} />;
+  return <ServerKeysPage key={projectId} />;
 }

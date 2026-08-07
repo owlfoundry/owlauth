@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 
+import { OwlAuthMark } from "../brand/OwlAuthMark";
 import { classes } from "../primitives/Button";
 import styles from "./hosted.module.css";
 
@@ -30,7 +31,10 @@ export function HostedCard({
           )}
         </header>
         <div className={styles["content"]}>{children}</div>
-        <p className={styles["attribution"]}>Secured by OwlAuth</p>
+        <p className={styles["attribution"]}>
+          <OwlAuthMark size={18} />
+          <span>Secured by OwlAuth</span>
+        </p>
       </section>
     </main>
   );

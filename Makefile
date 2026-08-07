@@ -78,10 +78,10 @@ package-check: web-build ## Build once and inspect local registry package candid
 	@scripts/test-server-package.sh
 
 .PHONY: openapi
-openapi: ## Export complete Runtime, Client, and Control OpenAPI documents
+openapi: ## Export complete Runtime, Server, and Control OpenAPI documents
 	@mkdir -p target/openapi
 	@cargo run --quiet --locked --package owlauth-types --bin export-openapi -- runtime target/openapi/runtime.json
-	@cargo run --quiet --locked --package owlauth-types --bin export-openapi -- client target/openapi/client.json
+	@cargo run --quiet --locked --package owlauth-types --bin export-openapi -- server target/openapi/server.json
 	@cargo run --quiet --locked --package owlauth-types --bin export-openapi -- control target/openapi/control.json
 
 .PHONY: web-contracts
@@ -121,7 +121,7 @@ docs-deploy: ## Deploy documentation to Cloudflare Workers
 	@pnpm --filter @owlauth/docs run deploy
 
 .PHONY: dev
-dev: dev-check ## Build web assets, start local infrastructure, and run all three planes
+dev: dev-check ## Build web assets, start local infrastructure, and run Auth plus Control
 	@set -e; \
 		for key in $$(env | sed -n 's/^\(OWLAUTH_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$$key"; done; \
 		set -a; . ./.env; set +a; \

@@ -14,11 +14,11 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::application::{
-    ActiveClientToken, ApplicationError, ClientApiRepository, ClientApplicationProjection,
-    ClientEmailLookupDigester, ClientKeyAuthority, ClientTokenSessionLookup,
-    ClientTokenSignatureVerifier, ClientUser, ClientUserCursor, ClientUserStatus,
-    ClientVerificationKey, DurableEmailAddressReader, OpaquePurpose,
-    ProjectionVerifiedEmailProtector, ProtectedValue, RuntimeProtector, VersionedDigest,
+    ActiveServerToken, ApplicationError, DurableEmailAddressReader, EmailIdentityLookupDigester,
+    OpaquePurpose, ProjectionVerifiedEmailProtector, ProtectedValue, RuntimeProtector,
+    ServerApiRepository, ServerApplicationProjection, ServerKeyAuthority, ServerTokenSessionLookup,
+    ServerTokenSignatureVerifier, ServerUser, ServerUserCursor, ServerUserStatus,
+    ServerVerificationKey, VersionedDigest,
 };
 
 use super::{
@@ -31,12 +31,12 @@ use super::{
 };
 
 #[derive(Clone)]
-pub(crate) struct RuntimeClientEmailLookupDigester {
+pub(crate) struct RuntimeServerEmailLookupDigester {
     protector: Arc<dyn RuntimeProtector>,
     readable_versions: BTreeSet<i32>,
 }
 
-impl RuntimeClientEmailLookupDigester {
+impl RuntimeServerEmailLookupDigester {
     pub(crate) fn new(
         protector: Arc<dyn RuntimeProtector>,
         readable_versions: BTreeSet<i32>,
@@ -55,7 +55,7 @@ impl RuntimeClientEmailLookupDigester {
     }
 }
 
-impl ClientEmailLookupDigester for RuntimeClientEmailLookupDigester {
+impl EmailIdentityLookupDigester for RuntimeServerEmailLookupDigester {
     fn digest_candidates(
         &self,
         project_id: Uuid,
@@ -77,9 +77,9 @@ impl ClientEmailLookupDigester for RuntimeClientEmailLookupDigester {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Ed25519ClientTokenVerifier;
+pub(crate) struct Ed25519ServerTokenVerifier;
 
-impl ClientTokenSignatureVerifier for Ed25519ClientTokenVerifier {
+impl ServerTokenSignatureVerifier for Ed25519ServerTokenVerifier {
     fn verify(
         &self,
         public_jwk: &serde_json::Value,
@@ -90,12 +90,12 @@ impl ClientTokenSignatureVerifier for Ed25519ClientTokenVerifier {
     }
 }
 
-struct ClientProjectionReader {
+struct ServerProjectionReader {
     source_reader: Arc<dyn DurableEmailAddressReader>,
     projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
 }
 
-impl ProjectionCryptography for ClientProjectionReader {
+impl ProjectionCryptography for ServerProjectionReader {
     fn projection_write_version(&self) -> i32 {
         self.projection_protector.write_version()
     }
@@ -144,26 +144,26 @@ impl ProjectionCryptography for ClientProjectionReader {
 }
 
 #[derive(Clone)]
-pub(crate) struct PostgresClientApiRepository {
+pub(crate) struct PostgresServerApiRepository {
     database: DatabaseConnection,
-    client_process_id: String,
-    client_process_incarnation: Uuid,
+    server_process_id: String,
+    auth_process_incarnation: Uuid,
     source_reader: Arc<dyn DurableEmailAddressReader>,
     projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
 }
 
-impl PostgresClientApiRepository {
+impl PostgresServerApiRepository {
     pub(crate) fn new(
         database: DatabaseConnection,
-        client_process_id: String,
-        client_process_incarnation: Uuid,
+        server_process_id: String,
+        auth_process_incarnation: Uuid,
         source_reader: Arc<dyn DurableEmailAddressReader>,
         projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
     ) -> Result<Self, ApplicationError> {
-        if client_process_incarnation.is_nil()
-            || client_process_id.is_empty()
-            || client_process_id.len() > 128
-            || !client_process_id.bytes().all(|byte| {
+        if auth_process_incarnation.is_nil()
+            || server_process_id.is_empty()
+            || server_process_id.len() > 128
+            || !server_process_id.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
             })
         {
@@ -171,8 +171,8 @@ impl PostgresClientApiRepository {
         }
         Ok(Self {
             database,
-            client_process_id,
-            client_process_incarnation,
+            server_process_id,
+            auth_process_incarnation,
             source_reader,
             projection_protector,
         })
@@ -199,11 +199,11 @@ impl PostgresClientApiRepository {
         let observed = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT process_incarnation FROM client_process_incarnations
+                "SELECT process_incarnation FROM auth_process_incarnations
                   WHERE process_id=$1 AND process_incarnation=$2 FOR SHARE",
                 [
-                    self.client_process_id.clone().into(),
-                    self.client_process_incarnation.into(),
+                    self.server_process_id.clone().into(),
+                    self.auth_process_incarnation.into(),
                 ],
             ))
             .await
@@ -212,14 +212,14 @@ impl PostgresClientApiRepository {
         let incarnation: Uuid = observed
             .try_get("", "process_incarnation")
             .map_err(persistence)?;
-        if incarnation != self.client_process_incarnation {
+        if incarnation != self.auth_process_incarnation {
             return Err(ApplicationError::Integrity);
         }
         Ok(transaction)
     }
 
-    fn projection_reader(&self) -> ClientProjectionReader {
-        ClientProjectionReader {
+    fn projection_reader(&self) -> ServerProjectionReader {
+        ServerProjectionReader {
             source_reader: Arc::clone(&self.source_reader),
             projection_protector: Arc::clone(&self.projection_protector),
         }
@@ -253,14 +253,14 @@ impl PostgresClientApiRepository {
         database: &C,
         project_public_id: &str,
         users: Vec<project_user::Model>,
-    ) -> Result<Vec<ClientUser>, ApplicationError> {
+    ) -> Result<Vec<ServerUser>, ApplicationError> {
         let statuses = users
             .iter()
             .map(user_status)
             .collect::<Result<Vec<_>, _>>()?;
         let mut identity_ids = Vec::new();
         for (user, status) in users.iter().zip(&statuses) {
-            if *status == ClientUserStatus::Active && user.primary_source_kind == "email" {
+            if *status == ServerUserStatus::Active && user.primary_source_kind == "email" {
                 identity_ids.push(
                     user.primary_email_identity_id
                         .ok_or(ApplicationError::Integrity)?,
@@ -312,7 +312,7 @@ impl PostgresClientApiRepository {
             .zip(statuses)
             .map(|(user, status)| {
                 let primary_verified_email =
-                    if status == ClientUserStatus::Active && user.primary_source_kind == "email" {
+                    if status == ServerUserStatus::Active && user.primary_source_kind == "email" {
                         let identity_id = user
                             .primary_email_identity_id
                             .ok_or(ApplicationError::Integrity)?;
@@ -344,17 +344,12 @@ impl PostgresClientApiRepository {
                     } else {
                         None
                     };
-                Ok(ClientUser {
-                    project_public_id: project_public_id.to_owned(),
-                    user_public_id: user.public_id,
+                Ok(map_server_user(
+                    project_public_id,
+                    user,
                     status,
-                    display_name: user.display_name,
-                    picture_url: user.picture_url,
                     primary_verified_email,
-                    user_revision: user.user_revision,
-                    created_at: user.created_at,
-                    updated_at: user.updated_at,
-                })
+                ))
             })
             .collect()
     }
@@ -365,18 +360,18 @@ impl PostgresClientApiRepository {
     reason = "the async-trait expansion includes fenced email-authority resolution that must remain in one snapshot"
 )]
 #[async_trait]
-impl ClientApiRepository for PostgresClientApiRepository {
-    async fn client_key_authority(
+impl ServerApiRepository for PostgresServerApiRepository {
+    async fn server_key_authority(
         &self,
         public_key_id: &str,
-    ) -> Result<ClientKeyAuthority, ApplicationError> {
+    ) -> Result<ServerKeyAuthority, ApplicationError> {
         let transaction = self.fenced_transaction(true).await?;
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "SELECT key.id AS key_id,key.project_id,owner.public_id AS project_public_id,
                         key.public_key_id,key.digest_key_version,key.credential_digest
-                   FROM project_client_keys key
+                   FROM project_server_keys key
                    JOIN projects owner ON owner.id=key.project_id
                   WHERE key.public_key_id=$1 AND key.status='active'
                     AND key.revoked_at IS NULL AND owner.status='active'",
@@ -395,7 +390,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
         if version <= 0 {
             return Err(ApplicationError::Integrity);
         }
-        let authority = ClientKeyAuthority {
+        let authority = ServerKeyAuthority {
             key_id: row.try_get("", "key_id").map_err(persistence)?,
             project_id: row.try_get("", "project_id").map_err(persistence)?,
             project_public_id: row.try_get("", "project_public_id").map_err(persistence)?,
@@ -413,7 +408,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "SELECT key.id
-                   FROM project_client_keys key
+                   FROM project_server_keys key
                    JOIN projects owner ON owner.id=key.project_id
                   WHERE key.project_id=$1 AND key.id=$2 AND key.status='active'
                     AND key.revoked_at IS NULL AND owner.status='active'",
@@ -441,7 +436,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
         self.database
             .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "UPDATE project_client_keys key
+                "UPDATE project_server_keys key
                     SET last_used_at=GREATEST($3::timestamptz,key.created_at)
                   WHERE key.project_id=$1 AND key.id=$2 AND key.status='active'
                     AND key.revoked_at IS NULL
@@ -460,9 +455,9 @@ impl ClientApiRepository for PostgresClientApiRepository {
         &self,
         project_id: Uuid,
         project_public_id: &str,
-        after: Option<ClientUserCursor>,
+        after: Option<ServerUserCursor>,
         limit_plus_one: usize,
-    ) -> Result<Vec<(ClientUserCursor, ClientUser)>, ApplicationError> {
+    ) -> Result<Vec<(ServerUserCursor, ServerUser)>, ApplicationError> {
         if !(2..=101).contains(&limit_plus_one) {
             return Err(ApplicationError::InvalidInput);
         }
@@ -491,7 +486,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
             .map_err(persistence)?;
         let cursors = users
             .iter()
-            .map(|user| ClientUserCursor {
+            .map(|user| ServerUserCursor {
                 created_at: user.created_at,
                 user_id: user.id,
             })
@@ -509,7 +504,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
         project_id: Uuid,
         project_public_id: &str,
         user_public_id: &str,
-    ) -> Result<ClientUser, ApplicationError> {
+    ) -> Result<ServerUser, ApplicationError> {
         let transaction = self.fenced_transaction(true).await?;
         self.active_project(&transaction, project_id, project_public_id)
             .await?;
@@ -538,79 +533,20 @@ impl ClientApiRepository for PostgresClientApiRepository {
         project_id: Uuid,
         project_public_id: &str,
         candidates: &[VersionedDigest],
-    ) -> Result<Option<ClientUser>, ApplicationError> {
+    ) -> Result<Option<ServerUser>, ApplicationError> {
         if candidates.is_empty() || candidates.len() > 32 {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.fenced_transaction(true).await?;
         self.active_project(&transaction, project_id, project_public_id)
             .await?;
-        // Alias acceptance is a durable rollout authority, not the process key-ring inventory.
-        // Filter the precomputed readable candidates by the accepted versions observed in this
-        // same repeatable-read snapshot so a retained-but-retired alias cannot authenticate a
-        // lookup and a newly accepted version missing locally fails closed.
-        let authority = transaction
-            .query_one_raw(Statement::from_string(
-                DbBackend::Postgres,
-                "SELECT accepted_versions FROM email_identity_alias_authority WHERE singleton=TRUE"
-                    .to_owned(),
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let accepted: serde_json::Value = authority
-            .try_get("", "accepted_versions")
-            .map_err(persistence)?;
-        let accepted = serde_json::from_value::<Vec<i32>>(accepted)
-            .map_err(|_| ApplicationError::Integrity)?;
-        let accepted_set = accepted.iter().copied().collect::<BTreeSet<_>>();
-        if accepted.is_empty()
-            || accepted.len() > 16
-            || accepted_set.len() != accepted.len()
-            || accepted_set.iter().any(|version| *version <= 0)
-            || accepted_set.iter().any(|version| {
-                !candidates
-                    .iter()
-                    .any(|candidate| candidate.key_version == *version)
-            })
-        {
-            return Err(ApplicationError::Integrity);
-        }
-        let mut user_ids = BTreeSet::new();
-        for candidate in candidates
-            .iter()
-            .filter(|candidate| accepted_set.contains(&candidate.key_version))
-        {
-            if candidate.key_version <= 0 {
-                return Err(ApplicationError::InvalidInput);
-            }
-            let row = transaction
-                .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "SELECT identity.user_id
-                       FROM email_identity_aliases alias
-                       JOIN email_identities identity
-                         ON identity.project_id=alias.project_id
-                        AND identity.id=alias.identity_id
-                      WHERE alias.project_id=$1 AND alias.canonicalization_version=1
-                        AND alias.digest_key_version=$2 AND alias.lookup_digest=$3
-                        AND identity.status='active'",
-                    [
-                        project_id.into(),
-                        candidate.key_version.into(),
-                        candidate.value.to_vec().into(),
-                    ],
-                ))
-                .await
-                .map_err(persistence)?;
-            if let Some(row) = row {
-                user_ids.insert(row.try_get::<Uuid>("", "user_id").map_err(persistence)?);
-            }
-        }
-        if user_ids.len() > 1 {
-            return Err(ApplicationError::Integrity);
-        }
-        let Some(user_id) = user_ids.into_iter().next() else {
+        let Some(user_id) = super::email_identity_lookup::resolve_active_email_user_id(
+            &transaction,
+            project_id,
+            candidates,
+        )
+        .await?
+        else {
             transaction.commit().await.map_err(persistence)?;
             return Ok(None);
         };
@@ -620,11 +556,11 @@ impl ClientApiRepository for PostgresClientApiRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let user = self
-            .map_users(&transaction, project_public_id, vec![user])
-            .await?
-            .pop()
-            .ok_or(ApplicationError::Integrity)?;
+        // Exact-email lookup is an existence-and-identity capability, not an email-read
+        // capability. Map only safe Project-user fields so a primary email address and a
+        // secondary alias both resolve the user without reading durable address ciphertext.
+        let status = user_status(&user)?;
+        let user = map_server_user(project_public_id, user, status, None);
         transaction.commit().await.map_err(persistence)?;
         Ok(Some(user))
     }
@@ -635,7 +571,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
         project_public_id: &str,
         application_public_id: &str,
         user_public_id: &str,
-    ) -> Result<ClientApplicationProjection, ApplicationError> {
+    ) -> Result<ServerApplicationProjection, ApplicationError> {
         let transaction = self.fenced_transaction(true).await?;
         self.active_project(&transaction, project_id, project_public_id)
             .await?;
@@ -674,7 +610,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
             .ok_or(ApplicationError::NotFound)?;
         let document =
             super::projection::wire_projection_document(&projection, &self.projection_reader())?;
-        let result = ClientApplicationProjection {
+        let result = ServerApplicationProjection {
             project_public_id: project_public_id.to_owned(),
             application_public_id: application.public_id,
             user_public_id: user.public_id,
@@ -690,7 +626,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
         project_id: Uuid,
         kid: &str,
         now: OffsetDateTime,
-    ) -> Result<ClientVerificationKey, ApplicationError> {
+    ) -> Result<ServerVerificationKey, ApplicationError> {
         let transaction = self.fenced_transaction(true).await?;
         let owner = project::Entity::find_by_id(project_id)
             .filter(project::Column::Status.eq("active"))
@@ -719,7 +655,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
         {
             return Err(ApplicationError::Disabled);
         }
-        let result = ClientVerificationKey {
+        let result = ServerVerificationKey {
             project_id,
             project_public_id: owner.public_id,
             issuer: ring.issuer,
@@ -731,8 +667,8 @@ impl ClientApiRepository for PostgresClientApiRepository {
 
     async fn introspect_session(
         &self,
-        lookup: ClientTokenSessionLookup,
-    ) -> Result<ActiveClientToken, ApplicationError> {
+        lookup: ServerTokenSessionLookup,
+    ) -> Result<ActiveServerToken, ApplicationError> {
         let transaction = self.fenced_transaction(true).await?;
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
@@ -818,7 +754,7 @@ impl ClientApiRepository for PostgresClientApiRepository {
         }
         let document =
             super::projection::wire_projection_document(&projection, &self.projection_reader())?;
-        let active = ActiveClientToken {
+        let active = ActiveServerToken {
             project_public_id,
             application_public_id,
             user_public_id,
@@ -840,14 +776,33 @@ impl ClientApiRepository for PostgresClientApiRepository {
     }
 }
 
-fn user_status(user: &project_user::Model) -> Result<ClientUserStatus, ApplicationError> {
+fn map_server_user(
+    project_public_id: &str,
+    user: project_user::Model,
+    status: ServerUserStatus,
+    primary_verified_email: Option<String>,
+) -> ServerUser {
+    ServerUser {
+        project_public_id: project_public_id.to_owned(),
+        user_public_id: user.public_id,
+        status,
+        display_name: user.display_name,
+        picture_url: user.picture_url,
+        primary_verified_email,
+        user_revision: user.user_revision,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+    }
+}
+
+fn user_status(user: &project_user::Model) -> Result<ServerUserStatus, ApplicationError> {
     if user.user_revision <= 0 {
         return Err(ApplicationError::Integrity);
     }
     match user.status.as_str() {
-        "active" if user.merged_into_user_id.is_none() => Ok(ClientUserStatus::Active),
-        "disabled" if user.merged_into_user_id.is_none() => Ok(ClientUserStatus::Disabled),
-        "merged" if user.merged_into_user_id.is_some() => Ok(ClientUserStatus::Merged),
+        "active" if user.merged_into_user_id.is_none() => Ok(ServerUserStatus::Active),
+        "disabled" if user.merged_into_user_id.is_none() => Ok(ServerUserStatus::Disabled),
+        "merged" if user.merged_into_user_id.is_some() => Ok(ServerUserStatus::Merged),
         _ => Err(ApplicationError::Integrity),
     }
 }
@@ -882,11 +837,11 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
-        assert_eq!(user_status(&user), Ok(ClientUserStatus::Active));
+        assert_eq!(user_status(&user), Ok(ServerUserStatus::Active));
         user.status = "merged".to_owned();
         assert_eq!(user_status(&user), Err(ApplicationError::Integrity));
         user.merged_into_user_id = Some(Uuid::new_v4());
-        assert_eq!(user_status(&user), Ok(ClientUserStatus::Merged));
+        assert_eq!(user_status(&user), Ok(ServerUserStatus::Merged));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
-use sea_orm::sea_query::LockType;
+use sea_orm::sea_query::{Expr, LockType};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, DbBackend,
     EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QueryResult, QuerySelect, Set,
@@ -11,17 +11,26 @@ use uuid::Uuid;
 
 use crate::application::{
     ApplicationError, ApplicationSessionRecord, BrowserSessionRecord, ControlLifecyclePort,
-    DisableProjectUser, EnableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind,
-    ProjectUserIdentityRecord, ProjectUserIdentityStatus, ProjectUserPage, ProjectUserRecord,
-    ProjectUserSessions, ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
+    DisableProjectUser, EnableProjectUser, ManagedSessionStatus, ProjectUserIdentityFilter,
+    ProjectUserIdentityKind, ProjectUserIdentityRecord, ProjectUserIdentityStatus,
+    ProjectUserListCriteria, ProjectUserPage, ProjectUserRecord, ProjectUserSessions,
+    ProjectUserSort, ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
+    VersionedDigest,
 };
 
 use super::{
     audit::append_runtime_audit,
     authentication::persistence,
-    entity::{application, application_session, project, project_browser_session, project_user},
+    entity::{
+        application, application_session, project, project_browser_session, project_user,
+        provider_configuration,
+    },
     projection::IdentityProjectionMaterializer,
 };
+
+const PROJECT_USER_PREFIX_FILTER: &str =
+    "starts_with(lower(\"project_users\".\"public_id\"), lower($1))
+     OR starts_with(lower(\"project_users\".\"display_name\"), lower($2))";
 
 #[derive(Clone)]
 pub(crate) struct PostgresControlLifecycleRepository {
@@ -37,6 +46,62 @@ impl PostgresControlLifecycleRepository {
         Self {
             database,
             projection_materializer,
+        }
+    }
+
+    async fn filter_user_identity(
+        &self,
+        query: sea_orm::Select<project_user::Entity>,
+        project_id: Uuid,
+        identity: Option<&ProjectUserIdentityFilter>,
+    ) -> Result<sea_orm::Select<project_user::Entity>, ApplicationError> {
+        let Some(identity) = identity else {
+            return Ok(query);
+        };
+        match identity {
+            ProjectUserIdentityFilter::Email => Ok(query.filter(Expr::cust(
+                "EXISTS (
+                   SELECT 1 FROM email_identities identity
+                    WHERE identity.project_id=\"project_users\".\"project_id\"
+                      AND identity.user_id=\"project_users\".\"id\"
+                      AND identity.status='active'
+                 )",
+            ))),
+            ProjectUserIdentityFilter::Provider(provider_key) => {
+                let provider_id = match provider_key {
+                    Some(provider_key) => provider_configuration::Entity::find()
+                        .filter(provider_configuration::Column::ProjectId.eq(project_id))
+                        .filter(provider_configuration::Column::ProviderKey.eq(provider_key))
+                        .one(&self.database)
+                        .await
+                        .map_err(persistence)?
+                        .map(|provider| provider.id),
+                    None => None,
+                };
+                if provider_key.is_some() && provider_id.is_none() {
+                    return Ok(query.filter(Expr::cust("FALSE")));
+                }
+                match provider_id {
+                    Some(provider_id) => Ok(query.filter(Expr::cust_with_values(
+                        "EXISTS (
+                           SELECT 1 FROM linked_identities identity
+                            WHERE identity.project_id=\"project_users\".\"project_id\"
+                              AND identity.user_id=\"project_users\".\"id\"
+                              AND identity.status='active'
+                              AND identity.created_via_provider_configuration_id=$1
+                         )",
+                        [provider_id],
+                    ))),
+                    None => Ok(query.filter(Expr::cust(
+                        "EXISTS (
+                           SELECT 1 FROM linked_identities identity
+                            WHERE identity.project_id=\"project_users\".\"project_id\"
+                              AND identity.user_id=\"project_users\".\"id\"
+                              AND identity.status='active'
+                         )",
+                    ))),
+                }
+            }
         }
     }
 
@@ -57,7 +122,7 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
     async fn list_project_users(
         &self,
         project_id: Uuid,
-        status: Option<ProjectUserStatus>,
+        criteria: &ProjectUserListCriteria,
         cursor: Option<Uuid>,
         limit: usize,
     ) -> Result<ProjectUserPage, ApplicationError> {
@@ -76,23 +141,46 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
         };
         let mut query =
             project_user::Entity::find().filter(project_user::Column::ProjectId.eq(project_id));
-        if let Some(status) = status {
+        if let Some(status) = criteria.status {
             query = query.filter(project_user::Column::Status.eq(project_user_status(status)));
         }
+        if let Some(search) = criteria.search.as_ref() {
+            query = query.filter(Expr::cust_with_values(
+                PROJECT_USER_PREFIX_FILTER,
+                [search.clone(), search.clone()],
+            ));
+        }
+        query = self
+            .filter_user_identity(query, project_id, criteria.identity.as_ref())
+            .await?;
         if let Some(cursor) = cursor {
-            query = query.filter(
-                Condition::any()
+            let after_cursor = match criteria.sort {
+                ProjectUserSort::CreatedNewest => Condition::any()
+                    .add(project_user::Column::CreatedAt.lt(cursor.created_at))
+                    .add(
+                        Condition::all()
+                            .add(project_user::Column::CreatedAt.eq(cursor.created_at))
+                            .add(project_user::Column::Id.lt(cursor.id)),
+                    ),
+                ProjectUserSort::CreatedOldest => Condition::any()
                     .add(project_user::Column::CreatedAt.gt(cursor.created_at))
                     .add(
                         Condition::all()
                             .add(project_user::Column::CreatedAt.eq(cursor.created_at))
                             .add(project_user::Column::Id.gt(cursor.id)),
                     ),
-            );
+            };
+            query = query.filter(after_cursor);
         }
+        query = match criteria.sort {
+            ProjectUserSort::CreatedNewest => query
+                .order_by_desc(project_user::Column::CreatedAt)
+                .order_by_desc(project_user::Column::Id),
+            ProjectUserSort::CreatedOldest => query
+                .order_by_asc(project_user::Column::CreatedAt)
+                .order_by_asc(project_user::Column::Id),
+        };
         let mut users = query
-            .order_by_asc(project_user::Column::CreatedAt)
-            .order_by_asc(project_user::Column::Id)
             .limit((limit + 1) as u64)
             .all(&self.database)
             .await
@@ -107,6 +195,42 @@ impl ControlLifecyclePort for PostgresControlLifecycleRepository {
                 .collect::<Result<_, _>>()?,
             next_cursor,
         })
+    }
+
+    async fn lookup_project_user_by_email_digests(
+        &self,
+        project_id: Uuid,
+        candidates: &[VersionedDigest],
+    ) -> Result<Option<ProjectUserRecord>, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_owned(),
+            ))
+            .await
+            .map_err(persistence)?;
+        require_project(&transaction, project_id).await?;
+        let user_id = super::email_identity_lookup::resolve_active_email_user_id(
+            &transaction,
+            project_id,
+            candidates,
+        )
+        .await?;
+        let user = match user_id {
+            Some(user_id) => Some(
+                project_user::Entity::find_by_id(user_id)
+                    .filter(project_user::Column::ProjectId.eq(project_id))
+                    .one(&transaction)
+                    .await
+                    .map_err(persistence)?
+                    .ok_or(ApplicationError::Integrity)
+                    .and_then(project_user_record)?,
+            ),
+            None => None,
+        };
+        transaction.commit().await.map_err(persistence)?;
+        Ok(user)
     }
 
     async fn get_project_user(
@@ -704,5 +828,22 @@ mod tests {
             next_revision(Some(i64::MAX)),
             Err(ApplicationError::Integrity)
         );
+    }
+
+    #[test]
+    fn project_user_prefix_filter_matches_search_index_expressions() {
+        assert_eq!(
+            PROJECT_USER_PREFIX_FILTER,
+            "starts_with(lower(\"project_users\".\"public_id\"), lower($1))\n     OR starts_with(lower(\"project_users\".\"display_name\"), lower($2))"
+        );
+        assert!(!PROJECT_USER_PREFIX_FILTER.contains("coalesce"));
+
+        let migration = include_str!("../../../migrations/20260806002000_invariants.sql");
+        assert!(migration.contains(
+            "project_users_public_id_search_idx ON public.project_users USING btree (project_id, lower(public_id) text_pattern_ops)"
+        ));
+        assert!(migration.contains(
+            "project_users_display_name_search_idx ON public.project_users USING btree (project_id, lower(display_name) text_pattern_ops) WHERE (display_name IS NOT NULL)"
+        ));
     }
 }

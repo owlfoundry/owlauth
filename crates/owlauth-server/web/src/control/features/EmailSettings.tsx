@@ -2,7 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 
 import { formatDuration } from "../../shared/compositions/CopyValue";
-import { DataTable, DescriptionList, EmptyState, Section } from "../../shared/layout/Layout";
+import {
+  DataTable,
+  DescriptionList,
+  EmptyState,
+  LoadingState,
+  Section,
+} from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Checkbox, Field, Input, Select } from "../../shared/primitives/Field";
@@ -11,12 +17,14 @@ import { useControlConfirmation } from "../app/Confirmation";
 import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
 import {
   type Application,
+  type CreateSmtpConfigurationRequest,
   type DisposableControlClient,
   type EmailAssignment,
   type EmailMethodPolicy,
   IdempotencyAttempt,
   type Project,
   type SmtpConfiguration,
+  type SmtpTestOperation,
   requireData,
 } from "../client";
 import styles from "./features.module.css";
@@ -48,10 +56,15 @@ export function EmailSettings({
   const [editingPolicy, setEditingPolicy] = useState(false);
   const [creatingSmtp, setCreatingSmtp] = useState(false);
   const [testingSmtp, setTestingSmtp] = useState<SmtpConfiguration | null>(null);
+  const [smtpTestOperation, setSmtpTestOperation] = useState<SmtpTestOperation | null>(null);
+  const [smtpTestRevision, setSmtpTestRevision] = useState<number | null>(null);
+  const [deliveredSmtpTests, setDeliveredSmtpTests] = useState<Record<string, number>>({});
+  const [smtpTestPolling, setSmtpTestPolling] = useState(false);
   const [editorError, setEditorError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const createAttempt = useRef(new IdempotencyAttempt());
   const smtpTestAttempts = useRef(new Map<string, IdempotencyAttempt>());
+  const smtpTestPollAttempts = useRef(0);
 
   const refresh = useCallback(
     async (signal?: AbortSignal) => {
@@ -110,6 +123,53 @@ export function EmailSettings({
     };
   }, [load, onError]);
 
+  useEffect(() => {
+    if (smtpTestOperation === null || isTerminalSmtpTest(smtpTestOperation) || !smtpTestPolling) {
+      return;
+    }
+    if (smtpTestPollAttempts.current >= 20) {
+      setSmtpTestPolling(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      smtpTestPollAttempts.current += 1;
+      void session.client
+        .GET("/v1/projects/{project_id}/smtp-configurations/{smtp_id}/tests/{operation_id}", {
+          params: {
+            path: {
+              project_id: project.id,
+              smtp_id: smtpTestOperation.smtp_configuration_id,
+              operation_id: smtpTestOperation.id,
+            },
+          },
+          signal: controller.signal,
+        })
+        .then((result) => {
+          if (controller.signal.aborted) return;
+          const operation = requireData(result.data, result.error, result.response);
+          setSmtpTestOperation(operation);
+          if (operation.status === "delivered" && smtpTestRevision !== null) {
+            setDeliveredSmtpTests((current) => ({
+              ...current,
+              [operation.smtp_configuration_id]: smtpTestRevision,
+            }));
+          }
+          if (isTerminalSmtpTest(operation)) setSmtpTestPolling(false);
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) {
+            setSmtpTestPolling(false);
+            void onError(error);
+          }
+        });
+    }, 500);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [onError, project.id, session, smtpTestOperation, smtpTestPolling, smtpTestRevision]);
+
   const assignmentByApplication = useMemo(
     () => new Map(assignments.map((assignment) => [assignment.application_id, assignment])),
     [assignments],
@@ -156,6 +216,17 @@ export function EmailSettings({
   }
 
   async function assign(application: Application, enabled: boolean) {
+    if (
+      !enabled &&
+      !(await confirm({
+        title: "Remove passwordless email",
+        message: `Remove passwordless email from ${application.display_name} (${application.public_id})? Users will no longer be able to choose this method for this exact Application.`,
+        actionLabel: "Remove email method",
+        destructive: true,
+      }))
+    ) {
+      return;
+    }
     setSubmitting(true);
     try {
       const result = await session.client.PUT(
@@ -190,7 +261,7 @@ export function EmailSettings({
     if (idempotencyKey === null) return;
     let username = field(fields, "username");
     let password = field(fields, "password");
-    const body = {
+    const body: CreateSmtpConfigurationRequest = {
       host: field(fields, "host"),
       port: Number(field(fields, "port")),
       tls_mode:
@@ -201,7 +272,6 @@ export function EmailSettings({
       sender_name: optional(fields, "sender_name"),
       reply_to: optional(fields, "reply_to"),
       credential: JSON.stringify({ username, password }),
-      explicitly_allowed_private_ips: [],
       expected_project_security_revision: project.security_revision,
     };
     form.reset();
@@ -262,10 +332,20 @@ export function EmailSettings({
           body: { recipient, expected_revision: configuration.revision },
         },
       );
-      requireData(result.data, result.error, result.response);
+      const operation = requireData(result.data, result.error, result.response);
       attempt.settle();
+      smtpTestPollAttempts.current = 0;
+      setSmtpTestOperation(operation);
+      setSmtpTestRevision(configuration.revision);
+      if (operation.status === "delivered") {
+        setDeliveredSmtpTests((current) => ({
+          ...current,
+          [configuration.id]: configuration.revision,
+        }));
+      }
+      setSmtpTestPolling(!isTerminalSmtpTest(operation));
       setTestingSmtp(null);
-      setMessage("Bounded SMTP test accepted.");
+      setMessage("SMTP test accepted. Its delivery result is being checked.");
     } catch (error) {
       attempt.settle(error);
       setEditorError("The SMTP test could not be confirmed. Review the recipient and retry.");
@@ -323,7 +403,7 @@ export function EmailSettings({
     }
   }
 
-  if (loadState === "loading") return <p role="status">Loading email configuration</p>;
+  if (loadState === "loading") return <LoadingState>Loading email configuration</LoadingState>;
   if (loadState === "failed" || policy === null) {
     return (
       <InlineAlert tone="danger" role="alert">
@@ -346,6 +426,9 @@ export function EmailSettings({
           setEditingPolicy(false);
           setCreatingSmtp(false);
           setTestingSmtp(null);
+          setSmtpTestOperation(null);
+          setSmtpTestRevision(null);
+          setSmtpTestPolling(false);
           setEditorError(null);
         }}
       />
@@ -462,6 +545,22 @@ export function EmailSettings({
         )}
       </Section>
 
+      {smtpTestOperation === null ? null : (
+        <SmtpTestStatus
+          operation={smtpTestOperation}
+          polling={smtpTestPolling}
+          onDismiss={() => {
+            setSmtpTestPolling(false);
+            setSmtpTestOperation(null);
+            setSmtpTestRevision(null);
+          }}
+          onRefresh={() => {
+            smtpTestPollAttempts.current = 0;
+            setSmtpTestPolling(true);
+          }}
+        />
+      )}
+
       <Section
         title="SMTP generations"
         description="Credentials are write-only. Create, test, and activate one reviewed generation at a time."
@@ -520,13 +619,20 @@ export function EmailSettings({
                       Send test
                     </Button>
                     {configuration.status === "pending" ? (
-                      <Button
-                        type="button"
-                        disabled={submitting}
-                        onClick={() => void transition(configuration, "activate")}
-                      >
-                        Activate
-                      </Button>
+                      <>
+                        <Button
+                          type="button"
+                          disabled={submitting}
+                          onClick={() => void transition(configuration, "activate")}
+                        >
+                          Activate
+                        </Button>
+                        <span>
+                          {deliveredSmtpTests[configuration.id] === configuration.revision
+                            ? "Delivered test observed for this revision; the server revalidates it on activation."
+                            : "A delivered test for this exact revision is required. The server validates durable evidence, including tests completed in another Console session."}
+                        </span>
+                      </>
                     ) : null}
                     {!(["disabled", "compromised", "retired"] as string[]).includes(
                       configuration.status,
@@ -780,6 +886,60 @@ export function EmailSettings({
       />
     </>
   );
+}
+
+function SmtpTestStatus({
+  operation,
+  polling,
+  onDismiss,
+  onRefresh,
+}: {
+  readonly operation: SmtpTestOperation;
+  readonly polling: boolean;
+  readonly onDismiss: () => void;
+  readonly onRefresh: () => void;
+}) {
+  const terminal = isTerminalSmtpTest(operation);
+  const tone =
+    operation.status === "delivered"
+      ? ("success" as const)
+      : operation.status === "failed"
+        ? ("danger" as const)
+        : operation.status === "ambiguous"
+          ? ("warning" as const)
+          : ("info" as const);
+  return (
+    <InlineAlert tone={tone} role={operation.status === "failed" ? "alert" : "status"}>
+      <p>
+        <strong>SMTP test status: {operation.status}</strong>
+      </p>
+      <p>
+        {operation.status === "delivered"
+          ? "The advisory test message was delivered. Activation remains a separate explicit action."
+          : operation.status === "failed"
+            ? "The advisory test failed. Review the SMTP configuration before retrying."
+            : operation.status === "ambiguous"
+              ? "Delivery could not be confirmed. Review the SMTP configuration before activation."
+              : polling
+                ? "The bounded test is still running. OwlAuth is checking its safe status."
+                : "The test is still pending. Refresh its exact operation when ready."}
+      </p>
+      <div className={styles["actions"]}>
+        {!terminal && !polling ? (
+          <Button type="button" variant="secondary" onClick={onRefresh}>
+            Refresh test status
+          </Button>
+        ) : null}
+        <Button type="button" variant="quiet" onClick={onDismiss}>
+          Dismiss test status
+        </Button>
+      </div>
+    </InlineAlert>
+  );
+}
+
+function isTerminalSmtpTest(operation: SmtpTestOperation): boolean {
+  return ["delivered", "failed", "ambiguous"].includes(operation.status);
 }
 
 function SmtpTestDialog({

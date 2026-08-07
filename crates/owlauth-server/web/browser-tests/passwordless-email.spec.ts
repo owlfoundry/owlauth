@@ -16,6 +16,7 @@ const smtpPort = Number(required("OWLAUTH_E2E_SMTP_PORT"));
 interface Project {
   id: string;
   public_id: string;
+  display_name: string;
   metadata_revision: number;
   security_revision: number;
 }
@@ -33,16 +34,6 @@ interface SigningKey {
   id: string;
   kid: string;
   state: string;
-}
-interface SmtpConfiguration {
-  id: string;
-  revision: number;
-  status: string;
-}
-interface SmtpTestOperation {
-  id: string;
-  status: string;
-  outcome: string | null;
 }
 interface EmailChallengeAccepted {
   accepted: boolean;
@@ -97,8 +88,8 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
   const first = await waitForMail(page.request, 1);
   const firstOtp = otp(first.at(-1) ?? "");
 
-  // Generate a newer sibling. The active page alone owns the opaque challenge handle: a fresh
-  // GET must not reconstruct it from the URL or cookie.
+  // Generate a newer sibling. A fresh document may recover only the newest opaque challenge
+  // metadata after the exact browser binding is verified; no address or proof material is exposed.
   await page.waitForTimeout(31_000);
   await page.getByRole("textbox", { name: "Email address", exact: true }).fill(email);
   await page.getByRole("button", { name: "Send a new message" }).click();
@@ -108,15 +99,15 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
   const reloaded = await page.context().newPage();
   await reloaded.goto(firstHosted);
   await expect(reloaded.getByRole("heading", { name: "Check your email" })).toBeVisible();
-  await expect(reloaded.getByRole("button", { name: "Verify code" })).toHaveCount(0);
+  await expect(reloaded.getByRole("button", { name: "Verify code" })).toBeVisible();
+  await reloaded.getByLabel("One-time code").fill(firstOtp);
+  await reloaded.getByRole("button", { name: "Verify code" }).click();
+  await expect(reloaded.getByRole("alert")).toContainText("Code invalid or expired.");
+  await reloaded.getByLabel("One-time code").fill(secondOtp);
+  await reloaded.getByRole("button", { name: "Verify code" }).click();
+  await reloaded.waitForURL((url) => url.origin === applicationOrigin, { timeout: 30_000 });
   await reloaded.close();
 
-  await page.getByLabel("One-time code").fill(firstOtp);
-  await page.getByRole("button", { name: "Verify code" }).click();
-  await expect(page.getByRole("alert")).toContainText("Code invalid or expired.");
-  await page.getByLabel("One-time code").fill(secondOtp);
-  await page.getByRole("button", { name: "Verify code" }).click();
-  await page.waitForURL((url) => url.origin === applicationOrigin, { timeout: 30_000 });
   await page.goto(firstHosted);
   await expect(page.getByRole("heading", { name: "Sign-in completed" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Verify code" })).toHaveCount(0);
@@ -126,7 +117,7 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
 
   // OTP above used the deployment-default generation. Activate a tested Project generation on
   // the same real implicit-TLS capture before magic so both selection and worker paths are proven.
-  await activateProjectSmtp(page.request, project, suffix, email);
+  await activateProjectSmtp(page, project, email);
   await page.request.delete(mailCaptureUrl);
   const magicHosted = await startLogin(page.request, project, application, `magic-${suffix}`);
   await page.goto(magicHosted);
@@ -461,12 +452,13 @@ test("scoped address suppression is API and Hosted-state indistinguishable", asy
   await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Verify code" })).toBeVisible();
 
-  // A fresh Hosted document derives the same durable pending state, while opaque proof handles
-  // remain page-memory-only exactly as for an admitted generation.
+  // A fresh Hosted document recovers the same non-secret pending challenge metadata as an
+  // admitted generation. Keeping the OTP entry available avoids revealing delivery suppression;
+  // the actual proof remains delivery-only and the suppressed challenge cannot authenticate.
   const refreshed = await page.context().newPage();
   await refreshed.goto(suppressed.hostedUrl);
   await expect(refreshed.getByRole("heading", { name: "Check your email" })).toBeVisible();
-  await expect(refreshed.getByRole("button", { name: "Verify code" })).toHaveCount(0);
+  await expect(refreshed.getByRole("button", { name: "Verify code" })).toBeVisible();
   await refreshed.close();
 
   // Saturate the independent resend address lane after one shared cooldown. Each interaction
@@ -626,56 +618,39 @@ async function provisionEmail(
   return { project, application };
 }
 
-async function activateProjectSmtp(
-  request: APIRequestContext,
-  project: Project,
-  suffix: string,
-  recipient: string,
-): Promise<void> {
-  const configuration = await control<SmtpConfiguration>(
-    request,
-    "POST",
-    `projects/${project.id}/smtp-configurations`,
-    {
-      host: "localhost",
-      port: smtpPort,
-      tls_mode: "implicit_tls",
-      sender_address: "project-login@owlauth.test",
-      sender_name: "OwlAuth Project E2E",
-      reply_to: null,
-      credential: JSON.stringify({ username: "capture-user", password: "capture-password" }),
-      expected_project_security_revision: project.security_revision,
-    },
-    `project-smtp-${suffix}`,
-  );
-  const operation = await control<SmtpTestOperation>(
-    request,
-    "POST",
-    `projects/${project.id}/smtp-configurations/${configuration.id}/test`,
-    { recipient, expected_revision: configuration.revision },
-    `project-smtp-test-${suffix}`,
-  );
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    const current = await get<SmtpTestOperation>(
-      request,
-      `projects/${project.id}/smtp-configurations/${configuration.id}/tests/${operation.id}`,
-    );
-    if (current.status === "delivered") {
-      expect(current.outcome).toBe("delivered");
-      await control(
-        request,
-        "POST",
-        `projects/${project.id}/smtp-configurations/${configuration.id}/activate`,
-        { expected_revision: configuration.revision },
-      );
-      return;
-    }
-    if (current.status === "failed") {
-      throw new Error(`Project SMTP test failed with ${String(current.outcome)}`);
-    }
-    await pageDelay(250);
-  }
-  throw new Error("timed out waiting for Project SMTP test delivery");
+async function activateProjectSmtp(page: Page, project: Project, recipient: string): Promise<void> {
+  await page.goto(`${controlBase}console/`);
+  await page.getByLabel("Operator API key").fill(operatorKey);
+  await page.getByRole("button", { name: "Unlock console" }).click();
+  await page.getByRole("link", { name: project.display_name, exact: true }).click();
+  await page.getByRole("link", { name: "Passwordless email", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Passwordless email" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Create SMTP generation" }).click();
+  const createDialog = page.getByRole("dialog", { name: "Create SMTP generation" });
+  await createDialog.getByLabel("Hostname").fill("localhost");
+  await createDialog.getByLabel("Port").fill(String(smtpPort));
+  await createDialog.getByLabel("TLS mode").selectOption("implicit_tls");
+  await createDialog.getByLabel("Sender address").fill("project-login@owlauth.test");
+  await createDialog.getByLabel("Sender name").fill("OwlAuth Project E2E");
+  await createDialog.getByLabel("SMTP username").fill("capture-user");
+  await createDialog.getByLabel("SMTP password").fill("capture-password");
+  await createDialog.getByRole("button", { name: "Create pending generation" }).click();
+
+  const configurationRow = page.getByRole("row").filter({ hasText: "localhost" });
+  await expect(configurationRow.getByText("Status: pending", { exact: true })).toBeVisible();
+  await configurationRow.getByRole("button", { name: "Send test" }).click();
+  const testDialog = page.getByRole("dialog", { name: "Send SMTP test" });
+  await testDialog.getByLabel("Test recipient").fill(recipient);
+  await testDialog.getByRole("button", { name: "Send test" }).click();
+
+  await expect(page.getByText("SMTP test status: delivered", { exact: true })).toBeVisible({
+    timeout: 60_000,
+  });
+  await expect(configurationRow.getByText("Status: pending", { exact: true })).toBeVisible();
+  await configurationRow.getByRole("button", { name: "Activate", exact: true }).click();
+  await expect(configurationRow.getByText("Status: active", { exact: true })).toBeVisible();
+  expect(page.url()).not.toContain(operatorKey);
 }
 
 async function startLogin(

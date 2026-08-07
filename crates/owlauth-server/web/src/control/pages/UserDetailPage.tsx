@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
 
+import { ArrowLeftIcon } from "../../shared/icons/Icons";
 import { EmptyState, PageHeader } from "../../shared/layout/Layout";
+import { buttonClassName } from "../../shared/primitives/Button";
 import { useControl, useProject } from "../app/ControlContext";
 import { type Application, type Provider, requireData } from "../client";
 import { UserManagement } from "../features/UserManagement";
@@ -71,7 +73,12 @@ export function UserDetailPage() {
       <PageHeader
         title="User detail"
         description="Review this user's provenance, sessions, managed connections, and exact identity operations."
-        actions={<Link to={`/projects/${project.id}/users`}>Back to users</Link>}
+        actions={
+          <Link className={buttonClassName("secondary")} to={`/projects/${project.id}/users`}>
+            <ArrowLeftIcon />
+            Back to users
+          </Link>
+        }
       />
       <UserManagement
         session={session}

@@ -475,11 +475,11 @@ pub(crate) mod control_idempotency_record {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-pub(crate) mod project_client_key {
+pub(crate) mod project_server_key {
     use sea_orm::entity::prelude::*;
 
     #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "project_client_keys")]
+    #[sea_orm(table_name = "project_server_keys")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
@@ -507,11 +507,11 @@ pub(crate) mod project_client_key {
     dead_code,
     reason = "readiness uses fenced raw SQL for this compact authority"
 )]
-pub(crate) mod client_process_incarnation {
+pub(crate) mod auth_process_incarnation {
     use sea_orm::entity::prelude::*;
 
     #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "client_process_incarnations")]
+    #[sea_orm(table_name = "auth_process_incarnations")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub process_id: String,
@@ -529,11 +529,11 @@ pub(crate) mod client_process_incarnation {
     dead_code,
     reason = "readiness uses bounded aggregate raw SQL for this authority"
 )]
-pub(crate) mod client_key_digest_readiness {
+pub(crate) mod server_key_digest_readiness {
     use sea_orm::entity::prelude::*;
 
     #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "client_key_digest_readiness")]
+    #[sea_orm(table_name = "server_key_digest_readiness")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub process_id: String,

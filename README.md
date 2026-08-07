@@ -32,7 +32,7 @@ The default development URLs are:
 
 - Hosted authentication: <http://127.0.0.1:8080/auth/>
 - Management console: <http://127.0.0.1:8081/console/>
-- Client API readiness: <http://127.0.0.1:8082/ready>
+- Auth readiness: <http://127.0.0.1:8080/ready>
 
 The development Control key is the `OWLAUTH_CONTROL_API_KEY` value in `.env`. The example keys are public test values and must not be used outside disposable local environments.
 
@@ -46,6 +46,7 @@ make dev-down
 
 - [User and deployment documentation](https://owlauth-docs.owlfoundry.org)
 - [Getting started](docs/guide/getting-started.md)
+- [Deployment](docs/guide/deployment.md)
 - [Architecture](docs/guide/architecture.md)
 - [Security](docs/guide/security.md)
 - [SDKs](docs/guide/sdks.md)

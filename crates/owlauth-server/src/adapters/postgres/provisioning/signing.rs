@@ -153,7 +153,7 @@ impl PostgresProvisioningAdapter {
             .all(&transaction)
             .await
             .map_err(persistence)?;
-        ensure_capacity(keys.len(), LIST_LIMIT, ApplicationError::InvalidInput)?;
+        ensure_capacity(keys.len(), LIST_LIMIT, ApplicationError::CapacityExceeded)?;
         let ring = self
             .find_or_create_signing_ring(&transaction, &project)
             .await?;
@@ -1006,7 +1006,7 @@ impl PostgresProvisioningAdapter {
             .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "SELECT current.process_id,current.process_incarnation
-                 FROM runtime_process_incarnations current
+                 FROM auth_process_incarnations current
                  WHERE current.process_id IN (
                    SELECT required.process_id
                    FROM jsonb_array_elements_text($1::jsonb) required(process_id)
@@ -1016,7 +1016,7 @@ impl PostgresProvisioningAdapter {
                      AND lease.expires_at>transaction_timestamp())
                  ORDER BY current.process_id LIMIT 65 FOR SHARE OF current",
                 vec![
-                    serde_json::json!(self.required_runtime_process_ids).into(),
+                    serde_json::json!(self.required_auth_process_ids).into(),
                     project_id.into(),
                     candidate.ring_id.into(),
                 ],
@@ -1061,7 +1061,7 @@ impl PostgresProvisioningAdapter {
             return Err(ApplicationError::InvalidTransition);
         }
         let now = database_now(&transaction).await?;
-        if self.required_runtime_process_ids.is_empty() {
+        if self.required_auth_process_ids.is_empty() {
             return Err(ApplicationError::PublicationPending);
         }
         let minimum_observation = now - self.propagation_delay;
@@ -1073,7 +1073,7 @@ impl PostgresProvisioningAdapter {
             .all(&transaction)
             .await
             .map_err(persistence)?;
-        let required_roster_present = self.required_runtime_process_ids.iter().all(|process_id| {
+        let required_roster_present = self.required_auth_process_ids.iter().all(|process_id| {
             current_incarnations
                 .iter()
                 .find(|(current_id, _)| current_id == process_id)

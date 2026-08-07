@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { readConfiguredBase } from "../../shared/configured-base";
+import { Button } from "../../shared/primitives/Button";
 import styles from "./identity.module.css";
 import { createRuntimeClient } from "../client";
 
@@ -192,9 +193,9 @@ export function IdentityMutationMagicFlow({
             The proof fragment has been removed from browser history. Continue only if you requested
             this identity verification.
           </p>
-          <button className={styles["method"]} type="button" onClick={() => void transferProof()}>
+          <Button variant="primary" type="button" onClick={() => void transferProof()}>
             Transfer proof to the identity request
-          </button>
+          </Button>
         </>
       ) : state === "submitting" ? (
         <p role="status">Transferring the one-use proof…</p>

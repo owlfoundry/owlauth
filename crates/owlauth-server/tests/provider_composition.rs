@@ -9,7 +9,7 @@ use owlauth_key_provider::{
     SigningAlgorithm, SigningKeyProvisioner, SigningProviderCapabilities,
 };
 use owlauth_server::{
-    ActiveProvider, ProviderCompositionError, ProviderRegistrations, config::PlaneMode,
+    ActiveProvider, ProviderCompositionError, ProviderRegistrations, config::ProcessMode,
     run_with_providers,
 };
 
@@ -136,7 +136,7 @@ fn full_registrations() -> ProviderRegistrations {
 fn downstream_provider_composes_without_private_server_types() {
     let registrations = full_registrations();
     registrations
-        .validate_for_mode(PlaneMode::All)
+        .validate_for_mode(ProcessMode::All)
         .expect("complete all-plane composition");
 
     // Type-check the public custom entry point without starting a server or importing private
@@ -155,10 +155,10 @@ fn role_requirements_and_duplicate_or_mismatched_ids_fail_closed() {
         .register_secret_opener(provider_id.clone(), provider.clone())
         .expect("secret opener");
     runtime_only
-        .validate_for_mode(PlaneMode::Runtime)
+        .validate_for_mode(ProcessMode::Auth)
         .expect("Runtime receives only Runtime capabilities");
     assert_eq!(
-        runtime_only.validate_for_mode(PlaneMode::Control),
+        runtime_only.validate_for_mode(ProcessMode::Control),
         Err(ProviderCompositionError::MissingActiveProvider)
     );
     assert_eq!(
@@ -203,7 +203,7 @@ fn independent_active_selections_validate_exact_formats() {
             ProviderFormatVersion::new(9).expect("format version"),
         ));
     registrations
-        .validate_for_mode(PlaneMode::All)
+        .validate_for_mode(ProcessMode::All)
         .expect("independent active providers");
 
     registrations.select_active_secret_provider(ActiveProvider::new(
@@ -211,7 +211,7 @@ fn independent_active_selections_validate_exact_formats() {
         ProviderFormatVersion::new(10).expect("format version"),
     ));
     assert_eq!(
-        registrations.validate_for_mode(PlaneMode::All),
+        registrations.validate_for_mode(ProcessMode::All),
         Err(ProviderCompositionError::UnsupportedSelection)
     );
 }

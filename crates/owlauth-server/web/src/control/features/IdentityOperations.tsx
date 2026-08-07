@@ -1,6 +1,9 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 
+import { Timestamp } from "../../shared/compositions/Timestamp";
+import { Button } from "../../shared/primitives/Button";
+import { Input, Select } from "../../shared/primitives/Field";
 import { useControlConfirmation } from "../app/Confirmation";
 import { safeHostedTarget } from "../safe-target";
 import styles from "./features.module.css";
@@ -28,6 +31,9 @@ interface IdentityOperationsProps {
   readonly identities: ProjectUserIdentity[];
   readonly applications: Application[];
   readonly providers: Provider[];
+  readonly hasMoreUsers: boolean;
+  readonly loadingMoreUsers: boolean;
+  readonly loadMoreUsers: () => Promise<void>;
   readonly reloadSelectedUser: () => Promise<void>;
   readonly onError: (error: unknown) => Promise<void>;
   readonly setMessage: (message: string | null) => void;
@@ -230,6 +236,9 @@ export function IdentityOperations({
   identities,
   applications,
   providers,
+  hasMoreUsers,
+  loadingMoreUsers,
+  loadMoreUsers,
   reloadSelectedUser,
   onError,
   setMessage,
@@ -241,6 +250,7 @@ export function IdentityOperations({
   const [counterpartUserId, setCounterpartUserId] = useState("");
   const [counterpartIdentities, setCounterpartIdentities] = useState<ProjectUserIdentity[]>([]);
   const [counterpartIdentityId, setCounterpartIdentityId] = useState("");
+  const [loadingCounterpart, setLoadingCounterpart] = useState(false);
   const [primaryDisposition, setPrimaryDisposition] = useState<PrimaryDisposition | "">("");
   const [primaryIdentityId, setPrimaryIdentityId] = useState("");
   const [authorities, setAuthorities] =
@@ -253,6 +263,15 @@ export function IdentityOperations({
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   const createAttempt = useRef(new IdempotencyAttempt());
   const createOwner = useRef<string | null>(null);
+  const counterpartInventoryRequest = useRef<AbortController | null>(null);
+  const counterpartUserIdRef = useRef("");
+
+  useEffect(
+    () => () => {
+      counterpartInventoryRequest.current?.abort();
+    },
+    [],
+  );
 
   const activeIdentities = useMemo(
     () => identities.filter((identity) => identity.status === "active"),
@@ -266,25 +285,37 @@ export function IdentityOperations({
 
   async function loadCounterpartInventory() {
     if (counterpartUser === null) return;
-    setPending(true);
+    counterpartInventoryRequest.current?.abort();
+    const controller = new AbortController();
+    counterpartInventoryRequest.current = controller;
+    const requestedUserId = counterpartUser.id;
+    setLoadingCounterpart(true);
     setLocalNotice(null);
     try {
       const result = await session.client.GET(
         "/v1/projects/{project_id}/users/{user_id}/identities",
-        { params: { path: { project_id: project.id, user_id: counterpartUser.id } } },
+        {
+          params: { path: { project_id: project.id, user_id: requestedUserId } },
+          signal: controller.signal,
+        },
       );
+      if (controller.signal.aborted || counterpartUserIdRef.current !== requestedUserId) return;
       const loaded = requireData(result.data, result.error, result.response).items;
-      if (!validateSafeIdentityInventory(loaded))
+      if (!validateSafeIdentityInventory(loaded)) {
         throw new Error("Unsafe identity inventory response");
+      }
       setCounterpartIdentities(loaded.filter((identity) => identity.status === "active"));
       setCounterpartIdentityId("");
       setPrimaryIdentityId("");
       clearAuthority("loser");
       setLocalNotice("Loaded the bounded, redacted identity inventory for the losing user.");
     } catch (error) {
-      await onError(error);
+      if (!controller.signal.aborted) await onError(error);
     } finally {
-      setPending(false);
+      if (counterpartInventoryRequest.current === controller) {
+        counterpartInventoryRequest.current = null;
+        setLoadingCounterpart(false);
+      }
     }
   }
 
@@ -592,18 +623,24 @@ export function IdentityOperations({
           </li>
         ))}
       </ul>
-      {identities.length === 0 ? <p>No identities are available for this user.</p> : null}
+      {identities.length === 0 ? (
+        <p className={styles["emptyNote"]}>No identities are available for this user.</p>
+      ) : null}
 
       <form className={styles["form"]} onSubmit={(event) => void createIntent(event)}>
         <h5>Create an immutable proof plan</h5>
         <label htmlFor="identity-operation">Operation</label>
-        <select
+        <Select
           id="identity-operation"
           value={operation}
           onChange={(event) => {
             setOperation(event.target.value as Operation | "");
             setSelectedIdentityId("");
             setCandidateKind("");
+            counterpartInventoryRequest.current?.abort();
+            counterpartInventoryRequest.current = null;
+            counterpartUserIdRef.current = "";
+            setLoadingCounterpart(false);
             setCounterpartUserId("");
             setCounterpartIdentities([]);
             setCounterpartIdentityId("");
@@ -616,7 +653,7 @@ export function IdentityOperations({
           <option value="link">Link a new identity</option>
           <option value="unlink">Unlink an existing identity</option>
           <option value="merge">Merge another user into this winning user</option>
-        </select>
+        </Select>
 
         {operation === "" ? null : (
           <IdentitySelect
@@ -649,7 +686,7 @@ export function IdentityOperations({
               onChange={setAuthority}
             />
             <label htmlFor="identity-candidate-kind">New candidate identity kind</label>
-            <select
+            <Select
               id="identity-candidate-kind"
               value={candidateKind}
               onChange={(event) => {
@@ -660,7 +697,7 @@ export function IdentityOperations({
               <option value="">Choose candidate identity kind…</option>
               <option value="provider">Provider identity</option>
               <option value="email">Email identity</option>
-            </select>
+            </Select>
             <AuthorityFields
               fieldKey="candidate"
               label="Candidate proof authority"
@@ -683,7 +720,7 @@ export function IdentityOperations({
               onChange={setAuthority}
             />
             <label htmlFor="unlink-primary-disposition">Primary-source disposition</label>
-            <select
+            <Select
               id="unlink-primary-disposition"
               value={primaryDisposition}
               onChange={(event) => {
@@ -698,7 +735,7 @@ export function IdentityOperations({
               <option value="clear">Clear primary source</option>
               <option value="provider">Replace with exact provider identity</option>
               <option value="email">Replace with exact email identity</option>
-            </select>
+            </Select>
             {primaryDisposition === "provider" || primaryDisposition === "email" ? (
               <IdentitySelect
                 id="unlink-primary-identity"
@@ -725,10 +762,15 @@ export function IdentityOperations({
               onChange={setAuthority}
             />
             <label htmlFor="merge-loser-user">Exact losing user</label>
-            <select
+            <Select
               id="merge-loser-user"
               value={counterpartUserId}
+              disabled={pending}
               onChange={(event) => {
+                counterpartInventoryRequest.current?.abort();
+                counterpartInventoryRequest.current = null;
+                counterpartUserIdRef.current = event.target.value;
+                setLoadingCounterpart(false);
                 setCounterpartUserId(event.target.value);
                 setCounterpartIdentities([]);
                 setCounterpartIdentityId("");
@@ -744,14 +786,25 @@ export function IdentityOperations({
                     {user.display_name ?? user.public_id} ({user.public_id})
                   </option>
                 ))}
-            </select>
-            <button
+            </Select>
+            {hasMoreUsers ? (
+              <Button
+                type="button"
+                disabled={pending || loadingCounterpart || loadingMoreUsers}
+                onClick={() => void loadMoreUsers()}
+              >
+                {loadingMoreUsers ? "Loading more merge candidates" : "Load more merge candidates"}
+              </Button>
+            ) : null}
+            <Button
               type="button"
-              disabled={counterpartUser === null || pending}
+              disabled={counterpartUser === null || pending || loadingCounterpart}
               onClick={() => void loadCounterpartInventory()}
             >
-              Load losing user’s redacted identities
-            </button>
+              {loadingCounterpart
+                ? "Loading losing user’s identities"
+                : "Load losing user’s redacted identities"}
+            </Button>
             <IdentitySelect
               id="merge-loser-identity"
               label="Exact losing-user proof identity"
@@ -785,9 +838,13 @@ export function IdentityOperations({
             </p>
           </>
         ) : null}
-        <button type="submit" disabled={pending || selectedUser.status !== "active"}>
+        <Button
+          type="submit"
+          variant="primary"
+          disabled={pending || selectedUser.status !== "active"}
+        >
           Create proof intent and open Hosted verification
-        </button>
+        </Button>
       </form>
 
       {popupFallback === null ? null : (
@@ -808,7 +865,7 @@ export function IdentityOperations({
         }}
       >
         <label htmlFor="identity-intent-id">Read an existing intent by ID</label>
-        <input
+        <Input
           id="identity-intent-id"
           value={readIntentId}
           onChange={(event) => {
@@ -816,9 +873,9 @@ export function IdentityOperations({
           }}
           placeholder="UUID"
         />
-        <button type="submit" disabled={pending}>
+        <Button type="submit" disabled={pending}>
           Read intent
-        </button>
+        </Button>
       </form>
 
       {active === null ? null : (
@@ -828,7 +885,9 @@ export function IdentityOperations({
             Operation: {active.intent.operation_kind}; status:{" "}
             <strong>{active.intent.status}</strong>; revision {String(active.intent.revision)}.
           </p>
-          <p>Effective expiry: {active.intent.effective_expires_at}</p>
+          <p>
+            Effective expiry: <Timestamp value={active.intent.effective_expires_at} />
+          </p>
           {active.plan === null ? (
             <p role="status">
               Original immutable plan unavailable after reload. This orphan view intentionally
@@ -853,22 +912,22 @@ export function IdentityOperations({
             ))}
           </ul>
           <div className={styles["actions"]}>
-            <button
+            <Button
               type="button"
               disabled={pending}
               onClick={() => void readIntent(active.intent.id)}
             >
               Refresh status
-            </button>
+            </Button>
             {active.intent.status === "pending_proof" || active.intent.status === "ready" ? (
-              <button
-                className={styles["danger"]}
+              <Button
+                variant="danger"
                 type="button"
                 disabled={pending}
                 onClick={() => void cancelIntent()}
               >
                 Cancel intent
-              </button>
+              </Button>
             ) : null}
           </div>
           {active.intent.status === "ready" &&
@@ -884,7 +943,7 @@ export function IdentityOperations({
                 <strong>{CONFIRMATION[active.plan.operation_kind].phrase}</strong> exactly.
               </p>
               <label htmlFor="identity-confirmation-phrase">Typed confirmation phrase</label>
-              <input
+              <Input
                 id="identity-confirmation-phrase"
                 autoComplete="off"
                 value={confirmation}
@@ -892,8 +951,8 @@ export function IdentityOperations({
                   setConfirmation(event.target.value);
                 }}
               />
-              <button
-                className={styles["danger"]}
+              <Button
+                variant="danger"
                 type="button"
                 disabled={
                   pending || confirmation !== CONFIRMATION[active.plan.operation_kind].phrase
@@ -902,7 +961,7 @@ export function IdentityOperations({
               >
                 Confirm exact {active.plan.operation_kind} at revision{" "}
                 {String(active.intent.revision)}
-              </button>
+              </Button>
             </section>
           ) : null}
         </article>
@@ -1078,7 +1137,7 @@ function IdentitySelect({
   return (
     <>
       <label htmlFor={id}>{label}</label>
-      <select
+      <Select
         id={id}
         value={value}
         onChange={(event) => {
@@ -1091,7 +1150,7 @@ function IdentitySelect({
             {identityLabel(identity)}
           </option>
         ))}
-      </select>
+      </Select>
     </>
   );
 }
@@ -1132,7 +1191,7 @@ function AuthorityFields({
             revalidated by the server.
           </p>
           <label htmlFor={`${fieldKey}-application`}>Proof-policy Application</label>
-          <select
+          <Select
             id={`${fieldKey}-application`}
             value={draft.applicationId}
             onChange={(event) => {
@@ -1147,11 +1206,11 @@ function AuthorityFields({
                   {application.display_name}
                 </option>
               ))}
-          </select>
+          </Select>
           {kind === "provider" ? (
             <>
               <label htmlFor={`${fieldKey}-provider`}>Current assigned provider authority</label>
-              <select
+              <Select
                 id={`${fieldKey}-provider`}
                 value={draft.providerId}
                 onChange={(event) => {
@@ -1164,7 +1223,7 @@ function AuthorityFields({
                     {provider.display_name} ({provider.provider_key})
                   </option>
                 ))}
-              </select>
+              </Select>
               <p>Provider creation provenance is never used to preselect this authority.</p>
             </>
           ) : (

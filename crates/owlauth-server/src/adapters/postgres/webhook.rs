@@ -412,7 +412,7 @@ impl WebhookControlPort for PostgresWebhookRepository {
             .map_err(persistence)?
             .len();
         if count >= MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION {
-            return Err(ApplicationError::InvalidTransition);
+            return Err(ApplicationError::CapacityExceeded);
         }
         let endpoint_id = Uuid::new_v4();
         let public_id = format!("wh_{}", endpoint_id.simple());
@@ -1233,6 +1233,34 @@ impl WebhookControlPort for PostgresWebhookRepository {
             .await
             .map_err(persistence)?;
         rows.iter().map(delivery_record_from_row).collect()
+    }
+
+    async fn get_delivery(
+        &self,
+        project_id: Uuid,
+        application_id: Uuid,
+        delivery_id: Uuid,
+    ) -> Result<WebhookDeliveryRecord, ApplicationError> {
+        ensure_application(&self.database, project_id, application_id).await?;
+        let row = self
+            .database
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT delivery.id,delivery.endpoint_id,event.event_id,
+                        delivery.replay_sequence,delivery.replay_of_delivery_id,delivery.state,
+                        delivery.attempt_count,delivery.next_attempt_at,
+                        delivery.last_outcome_class,delivery.last_http_status,
+                        delivery.delivered_at,delivery.terminal_at,delivery.created_at
+                   FROM webhook_deliveries delivery
+                   JOIN application_user_events event ON event.id=delivery.event_id
+                  WHERE delivery.project_id=$1 AND delivery.application_id=$2
+                    AND delivery.id=$3 AND event.retain_until > transaction_timestamp()",
+                [project_id.into(), application_id.into(), delivery_id.into()],
+            ))
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::NotFound)?;
+        delivery_record_from_row(&row)
     }
 
     async fn replay_delivery(

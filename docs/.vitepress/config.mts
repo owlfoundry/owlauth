@@ -37,6 +37,7 @@ export default defineConfig({
     logo: "/favicon.svg",
     nav: [
       { text: "Guide", link: "/guide/getting-started" },
+      { text: "Deployment", link: "/guide/deployment" },
       { text: "Architecture", link: "/guide/architecture" },
       { text: "SDKs", link: "/guide/sdks" },
       { text: "CLI & agents", link: "/guide/agent-integrations" },
@@ -46,6 +47,7 @@ export default defineConfig({
         text: "OwlAuth guide",
         items: [
           { text: "Getting started", link: "/guide/getting-started" },
+          { text: "Deployment", link: "/guide/deployment" },
           { text: "Architecture", link: "/guide/architecture" },
           { text: "SDKs", link: "/guide/sdks" },
           { text: "Building a SaaS", link: "/guide/building-saas" },

@@ -30,19 +30,19 @@ impl PostgresIdentityMutationRepository {
         process_id: String,
         incarnation: Uuid,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
     ) -> Self {
         Self {
             runtime: PostgresRuntimeIdentityMutationRepository::new(
                 database.clone(),
                 process_id,
                 incarnation,
-                required_runtime_process_ids.clone(),
+                required_auth_process_ids.clone(),
             ),
             control: PostgresControlIdentityMutationRepository::new(
                 database,
                 projection_materializer,
-                required_runtime_process_ids,
+                required_auth_process_ids,
             ),
         }
     }

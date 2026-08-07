@@ -19,7 +19,29 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   const providerName = `E2E Provider ${injectionMarker}`;
   const providerSecret = `secret-${suffix}`;
 
+  await installCspViolationRecorder(page);
   await page.goto(`${controlBase}console/`);
+  const controlFavicon = await page.locator('link[rel="icon"]').getAttribute("href");
+  expect(controlFavicon).toMatch(/\/console\/assets\/owlauth-favicon\.svg$/u);
+  if (controlFavicon === null) throw new Error("Control favicon URL is absent");
+  const controlFaviconSvg = await assertSameOriginSvgLoads(page, controlFavicon);
+  expect(await cspViolations(page)).toEqual([]);
+  for (const viewport of [
+    { width: 1920, height: 1080 },
+    { width: 390, height: 844 },
+    { width: 320, height: 900 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await assertNoDocumentOverflow(page);
+    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+    await page.screenshot({
+      path: testInfo.outputPath(
+        `control-locked-${browserName}-${String(viewport.width)}x${String(viewport.height)}.png`,
+      ),
+      fullPage: true,
+    });
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
   await page.getByLabel("Operator API key").fill(operatorKey);
   await page.getByRole("button", { name: "Unlock console" }).click();
   await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
@@ -30,19 +52,47 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
   const projectId = new URL(page.url()).pathname.split("/").at(-1);
   if (projectId === undefined || projectId === "") throw new Error("Project route ID is absent");
-  await expect(page.getByRole("list", { name: "Sign-in setup" }).getByRole("listitem")).toHaveCount(
-    4,
+  const projectContext = page.getByRole("group", { name: "Current project" });
+  await expect(projectContext.getByText(projectName, { exact: true })).toBeVisible();
+  await expect(projectContext.getByRole("button", { name: "Copy Project ID" })).toBeVisible();
+  await expect(projectContext.getByRole("button", { name: "Copy Project ID" })).toHaveAttribute(
+    "title",
+    "Copy Project ID",
   );
-  await expect(page.getByRole("link", { name: "Switch project" })).toBeVisible();
-  for (const width of [1440, 320]) {
-    await page.setViewportSize({ width, height: 900 });
+  await expect(
+    page.getByRole("list", { name: "Project resource summary" }).getByRole("listitem"),
+  ).toHaveCount(4);
+  await expect(page.getByRole("link", { name: "Back to projects" })).toBeVisible();
+  for (const viewport of [
+    { width: 1920, height: 1080 },
+    { width: 390, height: 844 },
+    { width: 320, height: 900 },
+  ]) {
+    await page.setViewportSize(viewport);
     await assertNoDocumentOverflow(page);
-    await assertOverviewLayout(page, width);
+    await assertOverviewLayout(page, viewport.width);
     await page.screenshot({
-      path: testInfo.outputPath(`project-overview-${browserName}-${String(width)}.png`),
+      path: testInfo.outputPath(
+        `project-overview-${browserName}-${String(viewport.width)}x${String(viewport.height)}.png`,
+      ),
       fullPage: true,
     });
   }
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: "Open navigation" }).click();
+  const mobileNavigationSheet = page.getByRole("dialog", { name: "Console navigation" });
+  const mobileProjectContext = mobileNavigationSheet.getByRole("group", {
+    name: "Current project",
+  });
+  await expect(mobileProjectContext.getByText(projectName, { exact: true })).toBeVisible();
+  await expect(mobileProjectContext.getByRole("button", { name: "Copy Project ID" })).toBeVisible();
+  await assertNoDocumentOverflow(page);
+  await page.screenshot({
+    path: testInfo.outputPath(`project-navigation-${browserName}-390x844.png`),
+    fullPage: true,
+  });
+  await mobileNavigationSheet.getByRole("button", { name: "Close panel" }).click();
+
   await page.setViewportSize({ width: 1440, height: 900 });
   await page
     .getByRole("navigation", { name: "Breadcrumb" })
@@ -51,9 +101,10 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
   const projectDirectoryLink = page.getByRole("link", { name: projectName, exact: true });
   await expect(projectDirectoryLink).toBeVisible();
-  for (const width of [1440, 320]) {
+  for (const width of [1440, 390, 320]) {
     await page.setViewportSize({ width, height: 900 });
     await assertNoDocumentOverflow(page);
+    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
     await page.screenshot({
       path: testInfo.outputPath(`project-directory-${browserName}-${String(width)}.png`),
       fullPage: true,
@@ -208,6 +259,125 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.getByRole("button", { name: "Assign provider" }).click();
   await expect(page.getByRole("status").filter({ hasText: "assigned" })).toBeVisible();
 
+  await auditControlRoute(page, testInfo, browserName, "providers");
+
+  await navigateControl(page, "Passwordless email", "Passwordless email");
+  await expect(page.getByRole("heading", { name: "Passwordless policy" })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "passwordless-email");
+
+  await navigateControl(page, "Users", "Users");
+  await expect(page.getByRole("heading", { name: "No users yet" })).toBeVisible();
+  const userFilters = page.getByRole("form", { name: "Filter Project users" });
+  await expect(userFilters.getByLabel("Search")).toHaveAttribute(
+    "placeholder",
+    "Name, user ID, or exact email",
+  );
+  await expect(userFilters.getByLabel("Status")).toHaveValue("all");
+  await expect(userFilters.getByLabel("Identity")).toHaveValue("all");
+  await expect(
+    userFilters.getByLabel("Identity").getByRole("option", { name: providerName }),
+  ).toHaveCount(1);
+  await expect(userFilters.getByLabel("Sort")).toHaveValue("created_newest");
+
+  const providerResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      url.pathname.endsWith(`/v1/projects/${projectId}/users`) &&
+      url.searchParams.get("identity_kind") === "provider" &&
+      url.searchParams.get("provider_key") === customProviderKey
+    );
+  });
+  await userFilters.getByLabel("Identity").selectOption(`provider:${customProviderKey}`);
+  expect((await providerResponse).ok()).toBe(true);
+
+  const sortResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      url.pathname.endsWith(`/v1/projects/${projectId}/users`) &&
+      url.searchParams.get("sort") === "created_oldest"
+    );
+  });
+  await userFilters.getByLabel("Sort").selectOption("created_oldest");
+  expect((await sortResponse).ok()).toBe(true);
+
+  await userFilters.getByLabel("Search").fill("Client");
+  const searchResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      url.pathname.endsWith(`/v1/projects/${projectId}/users`) &&
+      url.searchParams.get("search") === "Client"
+    );
+  });
+  await userFilters.getByRole("button", { name: "Search", exact: true }).click();
+  expect((await searchResponse).ok()).toBe(true);
+  await expect(page.getByRole("heading", { name: "No matching users" })).toBeVisible();
+
+  await userFilters.getByRole("button", { name: "Clear filters" }).click();
+  await expect(page.getByRole("heading", { name: "No users yet" })).toBeVisible();
+  await userFilters.getByLabel("Search").fill("User@EXAMPLE.COM");
+  const emailResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname.endsWith(`/v1/projects/${projectId}/users/lookup`),
+  );
+  await userFilters.getByRole("button", { name: "Search", exact: true }).click();
+  const exactLookup = await emailResponse;
+  expect(exactLookup.request().method()).toBe("POST");
+  expect(exactLookup.request().postDataJSON()).toEqual({ email: "User@EXAMPLE.COM" });
+  expect(exactLookup.ok()).toBe(true);
+  await expect(page.getByRole("heading", { name: "No matching users" })).toBeVisible();
+  await userFilters.getByRole("button", { name: "Clear filters" }).click();
+  await expect(page.getByRole("heading", { name: "No users yet" })).toBeVisible();
+  const newestResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return (
+      url.pathname.endsWith(`/v1/projects/${projectId}/users`) &&
+      url.searchParams.get("sort") === "created_newest"
+    );
+  });
+  await userFilters.getByLabel("Sort").selectOption("created_newest");
+  expect((await newestResponse).ok()).toBe(true);
+  for (const width of [2560, 1920, 1440, 1024, 720, 390, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    await assertUserInventoryAlignment(page, width);
+  }
+  await auditControlRoute(page, testInfo, browserName, "users-empty");
+
+  const missingUserPath = new URL(
+    `console/projects/${projectId}/users/00000000-0000-0000-0000-000000000000`,
+    controlBase,
+  ).pathname;
+  await navigateInPlace(page, missingUserPath);
+  await expect(page.getByRole("heading", { name: "User detail", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "User not found", exact: true })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "user-detail-missing");
+  await page.getByRole("link", { name: "Back to users", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Users", exact: true })).toBeVisible();
+
+  await navigateControl(page, "Signing keys", "Signing keys");
+  await expect(page.getByText("Status: active", { exact: true }).first()).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "signing-keys");
+
+  await navigateControl(page, "Project secret keys", "Project secret keys");
+  await expect(page.getByRole("heading", { name: "No Project secret keys" })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "server-keys-empty");
+
+  await navigateControl(page, "Settings", "Project settings");
+  await expect(page.locator("dt", { hasText: /^Session reuse$/u })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "project-settings");
+
+  await navigateControl(page, "Applications", "Applications");
+  await expect(page.getByRole("link", { name: applicationName, exact: true })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "applications");
+  await page.getByRole("link", { name: applicationName, exact: true }).click();
+  await expect(page.getByRole("heading", { name: applicationName, exact: true })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "application-detail");
+  await page.getByRole("link", { name: "Webhooks", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Webhook endpoints", exact: true })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "application-webhooks");
+
+  await navigateControl(page, "Overview", updatedProjectName);
+  await expect(page.getByRole("list", { name: "Project resource summary" })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "project-overview-final");
+
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
   await expect(page.locator("img[src='x']")).toHaveCount(0);
@@ -235,6 +405,7 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   });
 
   const runtimePage = await page.context().newPage();
+  await installCspViolationRecorder(runtimePage);
   const runtimeAuthorizations: string[] = [];
   runtimePage.on("request", (request) => {
     if (request.url().startsWith(runtimeBase)) {
@@ -243,6 +414,13 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
     }
   });
   await runtimePage.goto(`${runtimeBase}auth/`);
+  const runtimeFavicon = await runtimePage.locator('link[rel="icon"]').getAttribute("href");
+  expect(runtimeFavicon).toMatch(/\/auth\/assets\/owlauth-favicon\.svg$/u);
+  if (runtimeFavicon === null) throw new Error("Runtime favicon URL is absent");
+  await expect(assertSameOriginSvgLoads(runtimePage, runtimeFavicon)).resolves.toBe(
+    controlFaviconSvg,
+  );
+  expect(await cspViolations(runtimePage)).toEqual([]);
   await expect(runtimePage.getByRole("heading", { name: "Hosted authentication" })).toBeVisible();
   await expect(runtimePage.getByRole("heading", { name: "No sign-in is active" })).toBeVisible();
   await expect(runtimePage.getByRole("button")).toHaveCount(0);
@@ -275,9 +453,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.getByRole("button", { name: "Open navigation" }).click();
   const navigationSheet = page.getByRole("dialog", { name: "Console navigation" });
   await expect(navigationSheet).toBeVisible();
-  const switchProjectLink = navigationSheet.getByRole("link", { name: "Switch project" });
-  await switchProjectLink.focus();
-  await expect(switchProjectLink).toBeFocused();
+  const allProjectsLink = navigationSheet.getByRole("link", { name: "Back to projects" });
+  await allProjectsLink.focus();
+  await expect(allProjectsLink).toBeFocused();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
   const mobileApplicationsLink = navigationSheet.getByRole("link", {
     name: "Applications",
@@ -320,7 +498,7 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.setViewportSize({ width: 1440, height: 900 });
   await page
     .getByRole("navigation", { name: "Resources" })
-    .getByRole("link", { name: "Projects", exact: true })
+    .getByRole("link", { name: "Back to projects", exact: true })
     .click();
   await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Create Project" }).first().click();
@@ -338,70 +516,256 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.setViewportSize({ width: 320, height: 900 });
   await expect(page.getByRole("link", { name: longProjectName, exact: true })).toBeVisible();
   await assertNoDocumentOverflow(page);
+
+  await navigateInPlace(page, new URL("console/not-a-route", controlBase).pathname);
+  await expect(page.getByRole("heading", { name: "Page not found", exact: true })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "not-found");
 });
+
+async function navigateInPlace(
+  page: import("@playwright/test").Page,
+  pathname: string,
+): Promise<void> {
+  await page.evaluate((nextPathname) => {
+    window.history.pushState(null, "", nextPathname);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, pathname);
+}
+
+async function navigateControl(
+  page: import("@playwright/test").Page,
+  linkName: string,
+  headingName: string,
+): Promise<void> {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page
+    .getByRole("navigation", { name: "Resources" })
+    .getByRole("link", { name: linkName, exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name: headingName, exact: true }).first()).toBeVisible();
+}
+
+async function auditControlRoute(
+  page: import("@playwright/test").Page,
+  testInfo: import("@playwright/test").TestInfo,
+  browserName: string,
+  routeName: string,
+): Promise<void> {
+  for (const viewport of [
+    { width: 1920, height: 1080 },
+    { width: 1440, height: 900 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.evaluate(() => {
+      window.scrollTo(0, 0);
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    });
+    await assertNoDocumentOverflow(page);
+    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+    await page.screenshot({
+      path: testInfo.outputPath(
+        `${routeName}-${browserName}-${String(viewport.width)}x${String(viewport.height)}.png`,
+      ),
+      fullPage: true,
+    });
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+}
+
+async function assertUserInventoryAlignment(
+  page: import("@playwright/test").Page,
+  viewportWidth: number,
+): Promise<void> {
+  const toolbar = page.getByRole("form", { name: "Filter Project users" });
+  const empty = page.getByRole("heading", { name: "No users yet" }).locator("..");
+  const [toolbarBounds, emptyBounds, mainBounds] = await Promise.all([
+    measure(toolbar, "Users toolbar"),
+    measure(empty, "Users empty state"),
+    measure(page.locator("#console-main"), "Console canvas"),
+  ]);
+  expect(Math.abs(toolbarBounds.x - emptyBounds.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(toolbarBounds.width - emptyBounds.width)).toBeLessThanOrEqual(1);
+  expect(toolbarBounds.width).toBeGreaterThanOrEqual(mainBounds.width - 65);
+
+  if (viewportWidth === 1920) {
+    expect(mainBounds.width).toBeGreaterThanOrEqual(viewportWidth * 0.8);
+    expect(Math.abs(mainBounds.x + mainBounds.width - viewportWidth)).toBeLessThanOrEqual(1);
+  }
+  if (viewportWidth === 2560) {
+    const sidebarBounds = await measure(
+      page.locator("aside[aria-label='Console navigation']"),
+      "Console sidebar",
+    );
+    expect(Math.abs(mainBounds.width - 104 * 16)).toBeLessThanOrEqual(1);
+    const leftGap = mainBounds.x - (sidebarBounds.x + sidebarBounds.width);
+    const rightGap = viewportWidth - (mainBounds.x + mainBounds.width);
+    expect(Math.abs(leftGap - rightGap)).toBeLessThanOrEqual(1);
+  }
+
+  const [search, status, identity, sort, submit, refresh] = await Promise.all([
+    measure(toolbar.getByLabel("Search"), "Search field"),
+    measure(toolbar.getByLabel("Status"), "Status filter"),
+    measure(toolbar.getByLabel("Identity"), "Identity filter"),
+    measure(toolbar.getByLabel("Sort"), "Sort filter"),
+    measure(toolbar.getByRole("button", { name: "Search", exact: true }), "Search action"),
+    measure(toolbar.getByRole("button", { name: "Refresh", exact: true }), "Refresh action"),
+  ]);
+  const sameRow = (...bounds: { readonly y: number; readonly height: number }[]) => {
+    const bottoms = bounds.map((box) => box.y + box.height);
+    expect(Math.max(...bottoms) - Math.min(...bottoms)).toBeLessThanOrEqual(1);
+  };
+  const precedes = (
+    first: { readonly y: number; readonly height: number },
+    second: { readonly y: number },
+  ) => {
+    expect(second.y - (first.y + first.height)).toBeGreaterThanOrEqual(8);
+  };
+
+  if (viewportWidth > 1152) {
+    sameRow(search, status, identity, sort, submit, refresh);
+  } else if (viewportWidth > 768) {
+    precedes(search, status);
+    sameRow(status, identity, sort);
+    precedes(sort, submit);
+    sameRow(submit, refresh);
+  } else if (viewportWidth > 480) {
+    precedes(search, status);
+    sameRow(status, identity);
+    precedes(identity, sort);
+    precedes(sort, submit);
+    sameRow(submit, refresh);
+  } else {
+    precedes(search, status);
+    precedes(status, identity);
+    precedes(identity, sort);
+    precedes(sort, submit);
+    precedes(submit, refresh);
+  }
+}
+
+async function measure(
+  locator: import("@playwright/test").Locator,
+  label: string,
+): Promise<{ x: number; y: number; width: number; height: number }> {
+  const bounds = await locator.boundingBox();
+  if (bounds === null) throw new Error(`${label} is not measurable`);
+  return bounds;
+}
 
 async function assertOverviewLayout(
   page: import("@playwright/test").Page,
   width: number,
 ): Promise<void> {
   const layout = await page
-    .getByRole("list", { name: "Sign-in setup" })
+    .getByRole("list", { name: "Project resource summary" })
     .getByRole("listitem")
-    .evaluateAll((steps) =>
-      steps.map((step) => {
-        const content = step.querySelector<HTMLElement>(":scope > div");
-        const heading = step.querySelector<HTMLElement>("h3");
-        const badge = heading?.nextElementSibling;
-        const action = step.querySelector<HTMLElement>(":scope > a");
+    .evaluateAll((items) =>
+      items.map((item) => {
+        const card = item.querySelector<HTMLElement>(":scope > a");
+        const heading = card?.querySelector<HTMLElement>("h3");
+        const value = card?.querySelector<HTMLElement>("strong");
         if (
-          content === null ||
+          card === null ||
           heading === null ||
-          !(badge instanceof HTMLElement) ||
-          action === null
+          heading === undefined ||
+          value === null ||
+          value === undefined
         ) {
-          throw new Error("Setup step layout elements are missing");
+          throw new Error("Dashboard card layout elements are missing");
         }
-        const contentBounds = content.getBoundingClientRect();
-        const badgeBounds = badge.getBoundingClientRect();
-        const actionBounds = action.getBoundingClientRect();
-        const stepBounds = step.getBoundingClientRect();
+        const bounds = card.getBoundingClientRect();
         return {
-          action: {
-            bottom: actionBounds.bottom,
-            left: actionBounds.left,
-            right: actionBounds.right,
-            top: actionBounds.top,
-          },
-          badgeWidth: badgeBounds.width,
-          content: {
-            bottom: contentBounds.bottom,
-            left: contentBounds.left,
-            right: contentBounds.right,
-            top: contentBounds.top,
-          },
-          step: { left: stepBounds.left, right: stepBounds.right },
+          bottom: bounds.bottom,
+          heading: heading.textContent,
+          left: bounds.left,
+          right: bounds.right,
+          top: bounds.top,
+          value: value.textContent,
         };
       }),
     );
 
   expect(layout).toHaveLength(4);
-  for (const step of layout) {
-    expect(step.badgeWidth).toBeLessThan(180);
-    expect(step.step.left).toBeGreaterThanOrEqual(0);
-    expect(step.step.right).toBeLessThanOrEqual(width + 0.5);
+  for (const card of layout) {
+    expect(card.heading).not.toBe("");
+    expect(card.value).toMatch(/^\d+$/u);
+    expect(card.left).toBeGreaterThanOrEqual(0);
+    expect(card.right).toBeLessThanOrEqual(width + 0.5);
   }
   if (width > 768) {
-    const actionRights = layout.map((step) => step.action.right);
-    expect(Math.max(...actionRights) - Math.min(...actionRights)).toBeLessThanOrEqual(1);
-    for (const step of layout) {
-      expect(step.action.left - step.content.right).toBeGreaterThanOrEqual(8);
-    }
+    const tops = layout.map((card) => card.top);
+    expect(Math.max(...tops) - Math.min(...tops)).toBeLessThanOrEqual(1);
   } else {
-    for (const step of layout) {
-      expect(Math.abs(step.action.left - step.content.left)).toBeLessThanOrEqual(1);
-      expect(step.action.top - step.content.bottom).toBeGreaterThanOrEqual(8);
+    const lefts = layout.map((card) => card.left);
+    expect(Math.max(...lefts) - Math.min(...lefts)).toBeLessThanOrEqual(1);
+    for (let index = 1; index < layout.length; index += 1) {
+      const previous = layout[index - 1];
+      const current = layout[index];
+      if (previous === undefined || current === undefined)
+        throw new Error("Dashboard card missing");
+      expect(current.top - previous.bottom).toBeGreaterThanOrEqual(8);
     }
   }
+}
+
+async function installCspViolationRecorder(page: import("@playwright/test").Page): Promise<void> {
+  await page.addInitScript(() => {
+    const violations: string[] = [];
+    const testWindow = window as Window & { __owlauthE2ECspViolations?: unknown };
+    testWindow.__owlauthE2ECspViolations = violations;
+    document.addEventListener("securitypolicyviolation", (event) => {
+      violations.push(`${event.violatedDirective}:${event.blockedURI}`);
+    });
+  });
+}
+
+async function cspViolations(page: import("@playwright/test").Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const testWindow = window as Window & { __owlauthE2ECspViolations?: unknown };
+    const violations = testWindow.__owlauthE2ECspViolations;
+    return Array.isArray(violations)
+      ? violations.filter((value): value is string => typeof value === "string")
+      : ["CSP violation recorder was not installed"];
+  });
+}
+
+async function assertSameOriginSvgLoads(
+  page: import("@playwright/test").Page,
+  href: string,
+): Promise<string> {
+  const result = await page.evaluate(async (faviconHref) => {
+    const url = new URL(faviconHref, location.href);
+    if (url.origin !== location.origin) throw new Error("Favicon is not same-origin");
+    await new Promise<void>((resolve, reject) => {
+      const image = new Image();
+      image.addEventListener(
+        "load",
+        () => {
+          resolve();
+        },
+        { once: true },
+      );
+      image.addEventListener(
+        "error",
+        () => {
+          reject(new Error("Favicon image failed to load"));
+        },
+        { once: true },
+      );
+      image.src = url.href;
+    });
+    const response = await fetch(url.href, { credentials: "omit" });
+    return {
+      body: await response.text(),
+      contentType: response.headers.get("content-type"),
+      ok: response.ok,
+    };
+  }, href);
+  expect(result.ok).toBe(true);
+  expect(result.contentType).toMatch(/^image\/svg\+xml(?:;|$)/u);
+  expect(result.body).toContain("<svg");
+  return result.body;
 }
 
 async function assertNoDocumentOverflow(page: import("@playwright/test").Page): Promise<void> {

@@ -17,18 +17,18 @@ use crate::{
 
 use super::{
     audit::append_runtime_audit,
+    auth_incarnation::AuthIncarnationFence,
     entity::{
         application, application_provider_assignment, application_redirect, login_transaction,
         login_transaction_method, project, project_policy, project_provider_egress_policy,
         provider_configuration,
     },
-    runtime_incarnation::RuntimeIncarnationFence,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresAuthenticationRepository {
     database: DatabaseConnection,
-    runtime_incarnation: RuntimeIncarnationFence,
+    auth_incarnation: AuthIncarnationFence,
 }
 
 impl PostgresAuthenticationRepository {
@@ -36,21 +36,18 @@ impl PostgresAuthenticationRepository {
     pub(crate) fn new(database: DatabaseConnection) -> Self {
         Self {
             database,
-            runtime_incarnation: RuntimeIncarnationFence::test_default(),
+            auth_incarnation: AuthIncarnationFence::test_default(),
         }
     }
 
     pub(crate) fn new_with_runtime_identity(
         database: DatabaseConnection,
-        runtime_process_id: String,
-        runtime_incarnation: uuid::Uuid,
+        auth_process_id: String,
+        auth_incarnation: uuid::Uuid,
     ) -> Self {
         Self {
             database,
-            runtime_incarnation: RuntimeIncarnationFence::new(
-                runtime_process_id,
-                runtime_incarnation,
-            ),
+            auth_incarnation: AuthIncarnationFence::new(auth_process_id, auth_incarnation),
         }
     }
 }
@@ -67,7 +64,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
     ) -> Result<LoginTransactionRecord, ApplicationError> {
         validate_login_command(&command)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.runtime_incarnation.lock(&transaction).await?;
+        self.auth_incarnation.lock(&transaction).await?;
 
         let project = project::Entity::find_by_id(command.project_id)
             .lock_shared()
@@ -346,7 +343,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         validate_digest(&command.browser_binding)?;
         validate_digest(&command.csrf)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.runtime_incarnation.lock(&transaction).await?;
+        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find()
             .filter(
                 login_transaction::Column::InteractionDigest.eq(command.interaction.value.to_vec()),
@@ -405,7 +402,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         validate_digest(&command.oidc_nonce)?;
         validate_protected(&command.provider_pkce)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.runtime_incarnation.lock(&transaction).await?;
+        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -533,7 +530,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
             .ok_or(ApplicationError::NotFound)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.runtime_incarnation.lock(&transaction).await?;
+        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(project.id))
             .filter(login_transaction::Column::ProviderConfigurationId.eq(provider.id))
@@ -753,7 +750,7 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         command: FailProviderExchange,
     ) -> Result<LoginTransactionRecord, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.runtime_incarnation.lock(&transaction).await?;
+        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -1265,8 +1262,8 @@ mod tests {
         .expect("seed assignment");
 
         sqlx::query(
-            "INSERT INTO runtime_process_incarnations
-             (process_id, process_incarnation, started_at) VALUES ('runtime-1', $1, NOW())",
+            "INSERT INTO auth_process_incarnations
+             (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, NOW())",
         )
         .bind(Uuid::nil())
         .execute(&pool)
@@ -1480,8 +1477,8 @@ mod tests {
         let replacement_incarnation = Uuid::new_v4();
         let replacement = tokio::spawn(async move {
             sqlx::query(
-                "INSERT INTO runtime_process_incarnations
-                 (process_id, process_incarnation, started_at) VALUES ('runtime-1', $1, NOW())
+                "INSERT INTO auth_process_incarnations
+                 (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, NOW())
                  ON CONFLICT (process_id) DO UPDATE SET
                    process_incarnation=EXCLUDED.process_incarnation,
                    started_at=EXCLUDED.started_at",
@@ -1512,7 +1509,7 @@ mod tests {
 
         let current_repository = PostgresAuthenticationRepository::new_with_runtime_identity(
             database.clone(),
-            "runtime-1".to_owned(),
+            "auth-1".to_owned(),
             replacement_incarnation,
         );
         let login_count_before_stale: i64 =
@@ -1526,8 +1523,8 @@ mod tests {
             .await
             .expect("load replacement backend pid");
         sqlx::query(
-            "UPDATE runtime_process_incarnations
-             SET process_incarnation=$1, started_at=NOW() WHERE process_id='runtime-1'",
+            "UPDATE auth_process_incarnations
+             SET process_incarnation=$1, started_at=NOW() WHERE process_id='auth-1'",
         )
         .bind(Uuid::new_v4())
         .execute(&mut *replacement_blocker)

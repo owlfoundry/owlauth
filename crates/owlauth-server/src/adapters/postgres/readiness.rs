@@ -25,7 +25,7 @@ pub(crate) struct PostgresReadinessAdapter {
     database: DatabaseConnection,
     process_id: Arc<str>,
     process_incarnation: Uuid,
-    required_runtime_process_ids: Arc<[String]>,
+    required_auth_process_ids: Arc<[String]>,
     lease_ttl: Duration,
 }
 
@@ -34,14 +34,14 @@ impl PostgresReadinessAdapter {
         database: DatabaseConnection,
         process_id: String,
         process_incarnation: Uuid,
-        required_runtime_process_ids: Vec<String>,
+        required_auth_process_ids: Vec<String>,
         lease_ttl: Duration,
     ) -> Self {
         Self {
             database,
             process_id: Arc::from(process_id),
             process_incarnation,
-            required_runtime_process_ids: required_runtime_process_ids.into(),
+            required_auth_process_ids: required_auth_process_ids.into(),
             lease_ttl,
         }
     }
@@ -56,7 +56,7 @@ impl PostgresReadinessAdapter {
         application_public_id: &str,
     ) -> Result<PublicApplicationConfig, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         // Every Control mutation takes the same Project row exclusively before touching
         // child aggregates. This shared guard therefore linearizes the complete public
         // snapshot and prevents a child disable/unassignment from committing mid-read.
@@ -249,7 +249,7 @@ impl PostgresReadinessAdapter {
                                AND readiness.state='ready'
                                AND readiness.lease_expires_at>transaction_timestamp()
                                AND EXISTS (
-                                 SELECT 1 FROM runtime_process_incarnations current
+                                 SELECT 1 FROM auth_process_incarnations current
                                  WHERE current.process_id=readiness.process_id
                                    AND current.process_incarnation=readiness.process_incarnation)))
                          AS roster_ready",
@@ -257,7 +257,7 @@ impl PostgresReadinessAdapter {
                             project.id.into(),
                             configuration_id.into(),
                             generation.into(),
-                            serde_json::json!(&*self.required_runtime_process_ids).into(),
+                            serde_json::json!(&*self.required_auth_process_ids).into(),
                         ],
                     ))
                     .await
@@ -265,7 +265,7 @@ impl PostgresReadinessAdapter {
                     .ok_or(ApplicationError::Persistence)?
                     .try_get("", "roster_ready")
                     .map_err(persistence)?;
-                smtp_ready = !self.required_runtime_process_ids.is_empty() && roster_ready;
+                smtp_ready = !self.required_auth_process_ids.is_empty() && roster_ready;
             } else if policy
                 .try_get::<bool>("", "allow_deployment_default")
                 .map_err(persistence)?
@@ -286,7 +286,7 @@ impl PostgresReadinessAdapter {
             .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DbBackend::Postgres,
                 "SELECT 1 FROM email_protection_runtime_readiness protection
-                 JOIN runtime_process_incarnations current
+                 JOIN auth_process_incarnations current
                    ON current.process_id=protection.process_id
                   AND current.process_incarnation=protection.process_incarnation
                  WHERE protection.process_id=$1 AND protection.process_incarnation=$2
@@ -358,7 +358,7 @@ impl PostgresReadinessAdapter {
         project_public_id: &str,
     ) -> Result<JwksDocument, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_runtime_incarnation(&transaction).await?;
+        self.lock_local_auth_incarnation(&transaction).await?;
         // Control mutations serialize on the Project row exclusively. Keep the
         // corresponding shared guard through lease observation so disablement and
         // publication have one database ordering point, with no post-disable lease.
@@ -498,14 +498,14 @@ impl PostgresReadinessAdapter {
         Ok(observed)
     }
 
-    async fn lock_local_runtime_incarnation<C: ConnectionTrait>(
+    async fn lock_local_auth_incarnation<C: ConnectionTrait>(
         &self,
         connection: &C,
     ) -> Result<(), ApplicationError> {
         let current = connection
             .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DbBackend::Postgres,
-                "SELECT 1 FROM runtime_process_incarnations
+                "SELECT 1 FROM auth_process_incarnations
                  WHERE process_id=$1 AND process_incarnation=$2 FOR SHARE",
                 vec![
                     self.process_id.to_string().into(),
@@ -545,6 +545,10 @@ fn persistence(_: impl std::fmt::Debug) -> ApplicationError {
 
 #[async_trait]
 impl ReadinessPort for PostgresReadinessAdapter {
+    async fn readiness(&self) -> Result<(), ApplicationError> {
+        self.lock_local_auth_incarnation(&self.database).await
+    }
+
     async fn public_application_config(
         &self,
         project_public_id: &str,

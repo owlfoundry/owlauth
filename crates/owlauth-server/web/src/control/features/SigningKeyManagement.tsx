@@ -1,5 +1,6 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 
+import { EmptyState } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { StatusBadge } from "../../shared/primitives/Feedback";
 import { useControlConfirmation } from "../app/Confirmation";
@@ -31,11 +32,13 @@ export function SigningKeyManagement({
 }: SigningKeyManagementProps) {
   const confirm = useControlConfirmation();
   const rotationAttempt = useRef(new IdempotencyAttempt());
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
   const rotationPending = keys.some((key) => ["provisioning", "published"].includes(key.state));
 
   async function rotate() {
     const idempotencyKey = rotationAttempt.current.begin();
     if (idempotencyKey === null) return;
+    setPendingAction("rotate");
     try {
       const result = await session.client.POST("/v1/projects/{project_id}/signing-keys/rotate", {
         params: {
@@ -51,6 +54,8 @@ export function SigningKeyManagement({
     } catch (error) {
       rotationAttempt.current.settle(error);
       await onError(error);
+    } finally {
+      setPendingAction(null);
     }
   }
 
@@ -65,8 +70,10 @@ export function SigningKeyManagement({
         actionLabel: incomplete ? "Cancel rotation" : "Revoke key",
         destructive: true,
       }))
-    )
+    ) {
       return;
+    }
+    setPendingAction(`revoke:${key.id}`);
     try {
       const result = await session.client.POST(
         "/v1/projects/{project_id}/signing-keys/{key_id}/revoke",
@@ -82,27 +89,42 @@ export function SigningKeyManagement({
       );
     } catch (error) {
       await onError(error);
+    } finally {
+      setPendingAction(null);
     }
   }
+
+  const statusMessage =
+    pendingAction === "rotate"
+      ? "Requesting signing key rotation…"
+      : pendingAction?.startsWith("revoke:") === true
+        ? "Revoking the selected signing key…"
+        : null;
 
   return (
     <section aria-labelledby="signing-keys-heading">
       <div className={styles["sectionHeader"]}>
         <div>
-          <h2 id="signing-keys-heading">Signing keys</h2>
-          <p>OwlAuth provisions, publishes, activates, and retires keys automatically.</p>
+          <h2 id="signing-keys-heading">Key inventory</h2>
+          <p>Current public keys and their managed lifecycle state.</p>
         </div>
         <Button
           type="button"
           variant="primary"
           onClick={() => void rotate()}
-          disabled={project.status !== "active" || rotationPending}
+          busy={pendingAction === "rotate"}
+          disabled={project.status !== "active" || rotationPending || pendingAction !== null}
         >
           Rotate signing key
         </Button>
       </div>
+      {statusMessage === null ? null : <p role="status">{statusMessage}</p>}
       {keys.length === 0 ? (
-        <p>Initial signing key setup is pending.</p>
+        <EmptyState
+          level={3}
+          title="Signing key setup pending"
+          description="OwlAuth is provisioning the initial signing key. This inventory refreshes automatically."
+        />
       ) : (
         <ul className={styles["cards"]}>
           {keys.map((key) => (
@@ -110,7 +132,13 @@ export function SigningKeyManagement({
               <strong>{key.kid}</strong> — {key.algorithm} <StatusBadge status={key.state} />
               <div className={styles["actions"]}>
                 {!["retired", "revoked", "abandoned"].includes(key.state) ? (
-                  <Button variant="danger" type="button" onClick={() => void revoke(key)}>
+                  <Button
+                    variant="danger"
+                    type="button"
+                    busy={pendingAction === `revoke:${key.id}`}
+                    disabled={pendingAction !== null}
+                    onClick={() => void revoke(key)}
+                  >
                     {key.state === "provisioning" && key.public_jwk === null
                       ? "Cancel incomplete rotation"
                       : "Emergency revoke"}

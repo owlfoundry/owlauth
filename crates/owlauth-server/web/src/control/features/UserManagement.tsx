@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router";
 
+import { Timestamp } from "../../shared/compositions/Timestamp";
+import { EmptyState, LoadingState } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
-import { InlineAlert } from "../../shared/primitives/Feedback";
+import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
+import { Field, Input, Select } from "../../shared/primitives/Field";
 import { useControlConfirmation } from "../app/Confirmation";
 import { safeHostedTarget } from "../safe-target";
 import styles from "./features.module.css";
@@ -36,11 +40,21 @@ interface UserManagementProps {
 
 type LoadState = "idle" | "loading" | "ready" | "failed";
 type UserStatusFilter = "all" | "active" | "disabled" | "merged";
+type UserIdentityFilter = "all" | "email" | `provider:${string}`;
+type UserSort = "created_newest" | "created_oldest";
 
 const EMPTY_SESSIONS: ProjectUserSessions = {
   application_sessions: [],
   browser_sessions: [],
 };
+
+function validateUserSearch(value: string): string | null {
+  const maximum = value.includes("@") ? 320 : 128;
+  if (Array.from(value).length <= maximum) return null;
+  return value.includes("@")
+    ? "Exact email lookup is limited to 320 characters."
+    : "User prefix search is limited to 128 characters.";
+}
 
 export function UserManagement({
   session,
@@ -56,7 +70,16 @@ export function UserManagement({
   const confirm = useControlConfirmation();
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [users, setUsers] = useState<ProjectUser[]>([]);
+  const [mergeCandidates, setMergeCandidates] = useState<ProjectUser[]>([]);
+  const [mergeNextCursor, setMergeNextCursor] = useState<string | null>(null);
+  const [loadingMergeCandidates, setLoadingMergeCandidates] = useState(false);
+  const [mergeCandidateError, setMergeCandidateError] = useState(false);
   const [statusFilter, setStatusFilter] = useState<UserStatusFilter>("all");
+  const [identityFilter, setIdentityFilter] = useState<UserIdentityFilter>("all");
+  const [sort, setSort] = useState<UserSort>("created_newest");
+  const [searchDraft, setSearchDraft] = useState("");
+  const [search, setSearch] = useState("");
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [selectedUser, setSelectedUser] = useState<ProjectUser | null>(null);
@@ -69,7 +92,9 @@ export function UserManagement({
   const reauthorizationAttemptOwner = useRef<string | null>(null);
   const userListGeneration = useRef(0);
   const userDetailGeneration = useRef(0);
+  const mergeCandidateGeneration = useRef(0);
   const loadMoreController = useRef<AbortController | null>(null);
+  const mergeLoadMoreController = useRef<AbortController | null>(null);
 
   const loadUsers = useCallback(
     async (
@@ -79,19 +104,74 @@ export function UserManagement({
       signal?: AbortSignal,
       requestGeneration = ++userListGeneration.current,
     ): Promise<ProjectUser | null> => {
-      const result = await session.client.GET("/v1/projects/{project_id}/users", {
-        params: {
-          path: { project_id: project.id },
-          query: {
-            ...(statusFilter === "all" ? {} : { status: statusFilter }),
-            ...(cursor === undefined ? {} : { cursor }),
-            limit: 50,
+      const providerKey = identityFilter.startsWith("provider:")
+        ? identityFilter.slice("provider:".length)
+        : undefined;
+      let page: { items: ProjectUser[]; next_cursor?: string | null };
+      if (search.includes("@")) {
+        if (append) return null;
+        const lookupResult = await session.client.POST("/v1/projects/{project_id}/users/lookup", {
+          params: { path: { project_id: project.id } },
+          body: { email: search },
+          signal: signal ?? null,
+        });
+        const lookup = requireData(lookupResult.data, lookupResult.error, lookupResult.response);
+        const exactUser = lookup.user ?? null;
+        let items: ProjectUser[] = exactUser === null ? [] : [exactUser];
+        if (statusFilter !== "all") {
+          items = items.filter((user) => user.status === statusFilter);
+        }
+        if (items.length === 1 && identityFilter !== "all") {
+          const user = items[0];
+          if (user !== undefined) {
+            const identityResult = await session.client.GET(
+              "/v1/projects/{project_id}/users/{user_id}/identities",
+              {
+                params: { path: { project_id: project.id, user_id: user.id } },
+                signal: signal ?? null,
+              },
+            );
+            const identityPage = requireData(
+              identityResult.data,
+              identityResult.error,
+              identityResult.response,
+            );
+            const matches = identityPage.items.some(
+              (identity) =>
+                identity.status === "active" &&
+                (identityFilter === "email"
+                  ? identity.identity_kind === "email"
+                  : identity.identity_kind === "provider" && identity.provider_key === providerKey),
+            );
+            if (!matches) items = [];
+          }
+        }
+        page = { items, next_cursor: null };
+      } else {
+        const result = await session.client.GET("/v1/projects/{project_id}/users", {
+          params: {
+            path: { project_id: project.id },
+            query: {
+              ...(statusFilter === "all" ? {} : { status: statusFilter }),
+              ...(search === "" ? {} : { search }),
+              ...(identityFilter === "all"
+                ? {}
+                : identityFilter === "email"
+                  ? { identity_kind: "email" as const }
+                  : {
+                      identity_kind: "provider" as const,
+                      ...(providerKey === undefined ? {} : { provider_key: providerKey }),
+                    }),
+              sort,
+              ...(cursor === undefined ? {} : { cursor }),
+              limit: 50,
+            },
           },
-        },
-        signal: signal ?? null,
-      });
+          signal: signal ?? null,
+        });
+        page = requireData(result.data, result.error, result.response);
+      }
       if (signal?.aborted === true || requestGeneration !== userListGeneration.current) return null;
-      const page = requireData(result.data, result.error, result.response);
       setNextCursor(page.next_cursor ?? null);
       setLoadState("ready");
       if (append) {
@@ -111,7 +191,39 @@ export function UserManagement({
       if (preferred === null) setSessions(EMPTY_SESSIONS);
       return preferred;
     },
-    [project.id, session, statusFilter],
+    [identityFilter, project.id, search, session, sort, statusFilter],
+  );
+
+  const loadMergeCandidates = useCallback(
+    async (
+      cursor?: string,
+      append = false,
+      signal?: AbortSignal,
+      requestGeneration = ++mergeCandidateGeneration.current,
+    ) => {
+      const result = await session.client.GET("/v1/projects/{project_id}/users", {
+        params: {
+          path: { project_id: project.id },
+          query: { status: "active", ...(cursor === undefined ? {} : { cursor }), limit: 50 },
+        },
+        signal: signal ?? null,
+      });
+      if (signal?.aborted === true || requestGeneration !== mergeCandidateGeneration.current)
+        return;
+      const page = requireData(result.data, result.error, result.response);
+      setMergeCandidateError(false);
+      setMergeNextCursor(page.next_cursor ?? null);
+      if (append) {
+        setMergeCandidates((current) => {
+          const merged = new Map(current.map((candidate) => [candidate.id, candidate]));
+          for (const candidate of page.items) merged.set(candidate.id, candidate);
+          return [...merged.values()];
+        });
+      } else {
+        setMergeCandidates(page.items);
+      }
+    },
+    [project.id, session],
   );
 
   const loadUser = useCallback(
@@ -196,7 +308,13 @@ export function UserManagement({
     async (signal?: AbortSignal) => {
       loadMoreController.current?.abort();
       loadMoreController.current = null;
+      mergeLoadMoreController.current?.abort();
+      mergeLoadMoreController.current = null;
+      mergeCandidateGeneration.current += 1;
+      setMergeCandidates([]);
+      setMergeNextCursor(null);
       setLoadingMore(false);
+      setLoadingMergeCandidates(false);
       const requestGeneration = ++userListGeneration.current;
       userDetailGeneration.current += 1;
       setPendingAction(null);
@@ -204,8 +322,42 @@ export function UserManagement({
       setMessage(null);
       try {
         if (detailOnly && initialUserId !== undefined) {
-          setUsers([]);
-          setNextCursor(null);
+          const candidateController = new AbortController();
+          const candidateGeneration = mergeCandidateGeneration.current;
+          const abortCandidates = () => {
+            candidateController.abort();
+          };
+          mergeLoadMoreController.current = candidateController;
+          if (signal?.aborted === true) candidateController.abort();
+          else signal?.addEventListener("abort", abortCandidates, { once: true });
+          setMergeCandidateError(false);
+          setLoadingMergeCandidates(true);
+          void loadMergeCandidates(
+            undefined,
+            false,
+            candidateController.signal,
+            candidateGeneration,
+          )
+            .catch(async (error: unknown) => {
+              if (
+                !candidateController.signal.aborted &&
+                mergeLoadMoreController.current === candidateController &&
+                mergeCandidateGeneration.current === candidateGeneration
+              ) {
+                setMergeCandidateError(true);
+                await onError(error);
+              }
+            })
+            .finally(() => {
+              signal?.removeEventListener("abort", abortCandidates);
+              if (
+                mergeLoadMoreController.current === candidateController &&
+                mergeCandidateGeneration.current === candidateGeneration
+              ) {
+                mergeLoadMoreController.current = null;
+                setLoadingMergeCandidates(false);
+              }
+            });
           const loaded = await loadUser(initialUserId, signal);
           if (signal?.aborted !== true) setLoadState(loaded ? "ready" : "failed");
           return;
@@ -225,7 +377,7 @@ export function UserManagement({
         }
       }
     },
-    [detailOnly, initialUserId, loadUser, loadUsers, onError, setMessage],
+    [detailOnly, initialUserId, loadMergeCandidates, loadUser, loadUsers, onError, setMessage],
   );
 
   useEffect(() => {
@@ -242,6 +394,7 @@ export function UserManagement({
   useEffect(
     () => () => {
       loadMoreController.current?.abort();
+      mergeLoadMoreController.current?.abort();
     },
     [],
   );
@@ -265,11 +418,56 @@ export function UserManagement({
     }
   }
 
+  async function retryMergeCandidates() {
+    if (loadingMergeCandidates) return;
+    const controller = new AbortController();
+    mergeLoadMoreController.current?.abort();
+    mergeLoadMoreController.current = controller;
+    setMergeCandidates([]);
+    setMergeNextCursor(null);
+    setLoadingMergeCandidates(true);
+    setMergeCandidateError(false);
+    try {
+      await loadMergeCandidates(undefined, false, controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setMergeCandidateError(true);
+        await onError(error);
+      }
+    } finally {
+      if (mergeLoadMoreController.current === controller) {
+        mergeLoadMoreController.current = null;
+        setLoadingMergeCandidates(false);
+      }
+    }
+  }
+
+  async function loadMoreMergeCandidates() {
+    if (mergeNextCursor === null || loadingMergeCandidates) return;
+    const controller = new AbortController();
+    mergeLoadMoreController.current?.abort();
+    mergeLoadMoreController.current = controller;
+    const requestGeneration = mergeCandidateGeneration.current;
+    setLoadingMergeCandidates(true);
+    try {
+      await loadMergeCandidates(mergeNextCursor, true, controller.signal, requestGeneration);
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setMergeCandidateError(true);
+        await onError(error);
+      }
+    } finally {
+      if (mergeLoadMoreController.current === controller) {
+        mergeLoadMoreController.current = null;
+        setLoadingMergeCandidates(false);
+      }
+    }
+  }
+
   async function refreshAfterConflict(error: unknown) {
     if (error instanceof ControlRequestError && error.status === 409 && selectedUser !== null) {
       try {
-        const current = await loadUsers(selectedUser.id);
-        if (current !== null) await loadUser(current.id);
+        await loadUser(selectedUser.id);
       } catch (refreshError) {
         await onError(refreshError);
         return;
@@ -558,49 +756,148 @@ export function UserManagement({
   }
 
   return (
-    <section aria-labelledby="project-users-heading">
-      <div className={styles["sectionHeader"]}>
-        <div>
-          <h2 id="project-users-heading">
-            {detailOnly ? "User authority and sessions" : "Project users"}
-          </h2>
-          <p>
-            {detailOnly
-              ? "Inspect bounded user provenance and perform exact session, connection, and identity operations."
-              : "Select one bounded Project user to review its authority on a dedicated detail page."}
-          </p>
-        </div>
-        <div className={styles["actions"]}>
-          {detailOnly ? null : (
-            <label>
-              Status{" "}
-              <select
-                value={statusFilter}
-                onChange={(event) => {
-                  setStatusFilter(event.currentTarget.value as UserStatusFilter);
-                }}
-                disabled={loadState === "loading" || loadingMore || pendingAction !== null}
-              >
-                <option value="all">All</option>
-                <option value="active">Active</option>
-                <option value="disabled">Disabled</option>
-                <option value="merged">Merged</option>
-              </select>
-            </label>
-          )}
+    <section
+      className={detailOnly ? undefined : styles["userInventory"]}
+      {...(detailOnly
+        ? { "aria-labelledby": "project-users-heading" }
+        : { "aria-label": "Project users" })}
+    >
+      {detailOnly ? (
+        <div className={styles["sectionHeader"]}>
+          <div>
+            <h2 id="project-users-heading">Authority inventory</h2>
+            <p>Current user state, sessions, managed connections, and identity provenance.</p>
+          </div>
           <Button
             type="button"
             variant="secondary"
             onClick={() => void beginLoad()}
             disabled={loadState === "loading" || loadingMore || pendingAction !== null}
           >
-            {loadState === "loading" ? "Loading users" : "Refresh users"}
+            {loadState === "loading" ? "Loading user" : "Refresh user"}
           </Button>
         </div>
-      </div>
+      ) : (
+        <form
+          className={styles["filterToolbar"]}
+          aria-label="Filter Project users"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const candidate = searchDraft.trim();
+            const validationError = validateUserSearch(candidate);
+            setSearchError(validationError);
+            if (validationError === null) setSearch(candidate);
+          }}
+        >
+          <div className={styles["filterFields"]}>
+            <div className={styles["searchField"]}>
+              <label htmlFor="user-search">Search</label>
+              <Input
+                id="user-search"
+                type="search"
+                value={searchDraft}
+                placeholder="Name, user ID, or exact email"
+                aria-invalid={searchError === null ? undefined : true}
+                aria-errormessage={searchError === null ? undefined : "user-search-error"}
+                onChange={(event) => {
+                  setSearchDraft(event.currentTarget.value);
+                  setSearchError(null);
+                }}
+                disabled={loadState === "loading" || loadingMore || pendingAction !== null}
+              />
+              {searchError === null ? null : (
+                <span id="user-search-error" className={styles["filterError"]} role="alert">
+                  {searchError}
+                </span>
+              )}
+            </div>
+            <label className={styles["filterField"]} htmlFor="user-status-filter">
+              <span>Status</span>
+              <Select
+                id="user-status-filter"
+                value={statusFilter}
+                onChange={(event) => {
+                  setStatusFilter(event.currentTarget.value as UserStatusFilter);
+                }}
+                disabled={loadState === "loading" || loadingMore || pendingAction !== null}
+              >
+                <option value="all">Any status</option>
+                <option value="active">Active</option>
+                <option value="disabled">Disabled</option>
+                <option value="merged">Merged</option>
+              </Select>
+            </label>
+            <label className={styles["filterField"]} htmlFor="user-identity-filter">
+              <span>Identity</span>
+              <Select
+                id="user-identity-filter"
+                value={identityFilter}
+                onChange={(event) => {
+                  setIdentityFilter(event.currentTarget.value as UserIdentityFilter);
+                }}
+                disabled={loadState === "loading" || loadingMore || pendingAction !== null}
+              >
+                <option value="all">Any identity</option>
+                <option value="email">Email</option>
+                {providers.map((provider) => (
+                  <option key={provider.id} value={`provider:${provider.provider_key}`}>
+                    {provider.display_name}
+                  </option>
+                ))}
+              </Select>
+            </label>
+            <label className={styles["filterField"]} htmlFor="user-sort">
+              <span>Sort</span>
+              <Select
+                id="user-sort"
+                value={sort}
+                onChange={(event) => {
+                  setSort(event.currentTarget.value as UserSort);
+                }}
+                disabled={loadState === "loading" || loadingMore || pendingAction !== null}
+              >
+                <option value="created_newest">Newest first</option>
+                <option value="created_oldest">Oldest first</option>
+              </Select>
+            </label>
+          </div>
+          <div className={styles["filterActions"]}>
+            <Button
+              type="submit"
+              disabled={loadState === "loading" || loadingMore || pendingAction !== null}
+            >
+              Search
+            </Button>
+            {search === "" && statusFilter === "all" && identityFilter === "all" ? null : (
+              <Button
+                type="button"
+                variant="quiet"
+                onClick={() => {
+                  setSearchDraft("");
+                  setSearch("");
+                  setSearchError(null);
+                  setStatusFilter("all");
+                  setIdentityFilter("all");
+                }}
+                disabled={loadState === "loading" || loadingMore || pendingAction !== null}
+              >
+                Clear filters
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => void beginLoad()}
+              disabled={loadState === "loading" || loadingMore || pendingAction !== null}
+            >
+              {loadState === "loading" ? "Loading users" : "Refresh"}
+            </Button>
+          </div>
+        </form>
+      )}
 
       {loadState === "idle" || loadState === "loading" ? (
-        <p role="status">Loading Project users…</p>
+        <LoadingState>{detailOnly ? "Loading user authority" : "Loading users"}</LoadingState>
       ) : loadState === "failed" ? (
         <InlineAlert tone="danger" role="alert">
           <p>Project users could not be loaded.</p>
@@ -609,26 +906,58 @@ export function UserManagement({
           </Button>
         </InlineAlert>
       ) : users.length === 0 && !detailOnly ? (
-        <p>No Project users match this status.</p>
+        <EmptyState
+          title={
+            search === "" && statusFilter === "all" && identityFilter === "all"
+              ? "No users yet"
+              : "No matching users"
+          }
+          description={
+            search === "" && statusFilter === "all" && identityFilter === "all"
+              ? "Users will appear here after they first authenticate with this Project."
+              : "No users match the current search and filters. Clear or change the criteria to review the directory."
+          }
+        />
       ) : detailOnly && selectedUser === null ? (
-        <p>The requested Project user was not found.</p>
+        <EmptyState
+          level={3}
+          title="User not found"
+          description="The requested user is not available in this Project. Return to the user inventory and select another user."
+        />
       ) : (
-        <div className={detailOnly ? styles["workspace"] : styles["userGrid"]}>
+        <div
+          className={
+            detailOnly
+              ? styles["workspace"]
+              : onUserSelected === undefined
+                ? styles["userGrid"]
+                : styles["userInventory"]
+          }
+        >
           {detailOnly ? null : (
             <ul className={styles["list"]} aria-label="Project users">
               {users.map((user) => (
                 <li key={user.id}>
-                  <button
-                    type="button"
-                    aria-pressed={selectedUser?.id === user.id}
-                    onClick={() => {
-                      if (onUserSelected === undefined) void loadUser(user.id);
-                      else onUserSelected(user.id);
-                    }}
-                    disabled={pendingAction !== null}
-                  >
-                    {user.display_name ?? user.public_id} <span>{user.status}</span>
-                  </button>
+                  {onUserSelected === undefined ? (
+                    <button
+                      type="button"
+                      aria-pressed={selectedUser?.id === user.id}
+                      onClick={() => void loadUser(user.id)}
+                      disabled={pendingAction !== null}
+                    >
+                      <span className={styles["userName"]}>
+                        {user.display_name ?? user.public_id}
+                      </span>
+                      <StatusBadge status={user.status} />
+                    </button>
+                  ) : (
+                    <Link to={`/projects/${project.id}/users/${user.id}`}>
+                      <span className={styles["userName"]}>
+                        {user.display_name ?? user.public_id}
+                      </span>
+                      <StatusBadge status={user.status} />
+                    </Link>
+                  )}
                 </li>
               ))}
               {nextCursor === null ? null : (
@@ -682,6 +1011,9 @@ export function UserManagement({
                   Enabling this user permits only fresh sign-in.
                 </p>
               ) : null}
+              {pendingAction !== null && !pendingAction.startsWith("load:") ? (
+                <p role="status">Applying the requested user authority change…</p>
+              ) : null}
               {pendingAction === `load:${selectedUser.id}` || sessions === null ? (
                 <p role="status">Loading user sessions…</p>
               ) : (
@@ -708,16 +1040,40 @@ export function UserManagement({
                   runAction={runConnectionAction}
                 />
               )}
+              {loadingMergeCandidates && !mergeCandidateError ? (
+                <p role="status">Loading merge candidate inventory…</p>
+              ) : null}
+              {mergeCandidateError ? (
+                <InlineAlert tone="danger" role="alert">
+                  <p>
+                    The merge candidate inventory could not be refreshed. User details and other
+                    identity or session actions remain available.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={loadingMergeCandidates}
+                    onClick={() => void retryMergeCandidates()}
+                  >
+                    {loadingMergeCandidates
+                      ? "Retrying merge candidates"
+                      : "Retry merge candidates"}
+                  </Button>
+                </InlineAlert>
+              ) : null}
               {identities === null ? null : (
                 <IdentityOperations
                   key={selectedUser.id}
                   session={session}
                   project={project}
                   selectedUser={selectedUser}
-                  users={users}
+                  users={detailOnly ? [selectedUser, ...mergeCandidates] : users}
                   identities={identities}
                   applications={applications}
                   providers={providers}
+                  hasMoreUsers={detailOnly ? mergeNextCursor !== null : nextCursor !== null}
+                  loadingMoreUsers={detailOnly ? loadingMergeCandidates : loadingMore}
+                  loadMoreUsers={detailOnly ? loadMoreMergeCandidates : loadMoreUsers}
                   reloadSelectedUser={async () => {
                     await loadUser(selectedUser.id);
                   }}
@@ -751,14 +1107,16 @@ function SessionLists({
       <section aria-labelledby="application-sessions-heading">
         <h4 id="application-sessions-heading">Application sessions</h4>
         {sessions.application_sessions.length === 0 ? (
-          <p>No Application sessions.</p>
+          <p className={styles["emptyNote"]}>No Application sessions.</p>
         ) : (
           <ul className={styles["cards"]}>
             {sessions.application_sessions.map((session) => (
               <li key={session.id}>
                 <strong>{session.application_display_name}</strong>
                 <span>Status: {session.status}</span>
-                <span>Expires {session.absolute_expires_at}</span>
+                <span>
+                  Expires <Timestamp value={session.absolute_expires_at} />
+                </span>
                 {session.status === "active" ? (
                   <Button
                     variant="danger"
@@ -777,14 +1135,18 @@ function SessionLists({
       <section aria-labelledby="browser-sessions-heading">
         <h4 id="browser-sessions-heading">Project browser sessions</h4>
         {sessions.browser_sessions.length === 0 ? (
-          <p>No Project browser sessions.</p>
+          <p className={styles["emptyNote"]}>No Project browser sessions.</p>
         ) : (
           <ul className={styles["cards"]}>
             {sessions.browser_sessions.map((session) => (
               <li key={session.id}>
                 <span>Status: {session.status}</span>
-                <span>Last activity {session.last_activity_at}</span>
-                <span>Expires {session.absolute_expires_at}</span>
+                <span>
+                  Last activity <Timestamp value={session.last_activity_at} />
+                </span>
+                <span>
+                  Expires <Timestamp value={session.absolute_expires_at} />
+                </span>
                 {session.status === "active" ? (
                   <Button
                     variant="danger"
@@ -829,7 +1191,7 @@ function ManagedConnectionList({
       <h4 id="managed-connections-heading">Managed provider connections</h4>
       <p>Credentials are never displayed. Actions always use the latest loaded connection state.</p>
       {connections.length === 0 ? (
-        <p>No managed provider connections.</p>
+        <p className={styles["emptyNote"]}>No managed provider connections.</p>
       ) : (
         <ul className={styles["cards"]}>
           {connections.map((connection) => (
@@ -840,48 +1202,53 @@ function ManagedConnectionList({
               <span>Required scopes: {connection.required_scopes.join(" ")}</span>
               <span>Last safe outcome: {connection.last_safe_outcome}</span>
               <span>
-                Last synchronized: {connection.last_synchronized_at ?? "never"}; next sync:{" "}
-                {connection.next_synchronize_at ?? "not scheduled"}; next renewal:{" "}
-                {connection.next_renewal_at ?? "not scheduled"}; failures:{" "}
-                {String(connection.consecutive_failures)}
+                Last synchronized:{" "}
+                <Timestamp value={connection.last_synchronized_at} empty="never" />; next sync:{" "}
+                <Timestamp value={connection.next_synchronize_at} empty="not scheduled" />; next
+                renewal: <Timestamp value={connection.next_renewal_at} empty="not scheduled" />;
+                failures: {String(connection.consecutive_failures)}
               </span>
               {connection.state === "active" ? (
-                <button
+                <Button
                   type="button"
+                  variant="secondary"
                   onClick={() => void runAction(connection, "synchronize")}
                   disabled={pendingAction !== null}
                 >
                   Synchronize profile
-                </button>
+                </Button>
               ) : null}
               {connection.reauthorization_application_ids.length > 0 ? (
                 <>
-                  <label htmlFor={`reauthorization-application-${connection.id}`}>
-                    Reauthorization Application
-                  </label>
-                  <select
-                    id={`reauthorization-application-${connection.id}`}
-                    value={reauthorizationApplications[connection.id] ?? ""}
-                    onChange={(event) => {
-                      setReauthorizationApplications((current) => ({
-                        ...current,
-                        [connection.id]: event.target.value,
-                      }));
-                    }}
+                  <Field
+                    label="Reauthorization Application"
+                    htmlFor={`reauthorization-application-${connection.id}`}
                   >
-                    <option value="">Select an eligible Application</option>
-                    {applications
-                      .filter((application) =>
-                        connection.reauthorization_application_ids.includes(application.id),
-                      )
-                      .map((application) => (
-                        <option key={application.id} value={application.id}>
-                          {application.display_name}
-                        </option>
-                      ))}
-                  </select>
-                  <button
+                    <Select
+                      id={`reauthorization-application-${connection.id}`}
+                      value={reauthorizationApplications[connection.id] ?? ""}
+                      onChange={(event) => {
+                        setReauthorizationApplications((current) => ({
+                          ...current,
+                          [connection.id]: event.target.value,
+                        }));
+                      }}
+                    >
+                      <option value="">Select an eligible Application</option>
+                      {applications
+                        .filter((application) =>
+                          connection.reauthorization_application_ids.includes(application.id),
+                        )
+                        .map((application) => (
+                          <option key={application.id} value={application.id}>
+                            {application.display_name}
+                          </option>
+                        ))}
+                    </Select>
+                  </Field>
+                  <Button
                     type="button"
+                    variant="secondary"
                     onClick={() =>
                       void runAction(
                         connection,
@@ -895,30 +1262,30 @@ function ManagedConnectionList({
                     }
                   >
                     Reauthorize with selected Application
-                  </button>
+                  </Button>
                 </>
               ) : null}
               {connection.supports_revocation &&
               connection.state !== "revoked" &&
               connection.state !== "disconnected" ? (
-                <button
-                  className={styles["danger"]}
+                <Button
+                  variant="danger"
                   type="button"
                   onClick={() => void runAction(connection, "revoke")}
                   disabled={pendingAction !== null}
                 >
                   Revoke at provider
-                </button>
+                </Button>
               ) : null}
               {connection.state !== "disconnected" ? (
-                <button
-                  className={styles["danger"]}
+                <Button
+                  variant="danger"
                   type="button"
                   onClick={() => void runAction(connection, "disconnect")}
                   disabled={pendingAction !== null}
                 >
                   Disconnect locally
-                </button>
+                </Button>
               ) : null}
             </li>
           ))}

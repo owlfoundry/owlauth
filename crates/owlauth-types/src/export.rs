@@ -5,8 +5,8 @@ use std::{fmt, str::FromStr};
 pub enum OpenApiPlane {
     /// Project Auth Runtime API.
     Runtime,
-    /// Project-scoped customer backend Client API.
-    Client,
+    /// Project-scoped customer backend Server API.
+    Server,
     /// Deployment Control API.
     Control,
 }
@@ -15,7 +15,7 @@ impl fmt::Display for OpenApiPlane {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Runtime => "runtime",
-            Self::Client => "client",
+            Self::Server => "server",
             Self::Control => "control",
         })
     }
@@ -27,7 +27,7 @@ impl FromStr for OpenApiPlane {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "runtime" => Ok(Self::Runtime),
-            "client" => Ok(Self::Client),
+            "server" => Ok(Self::Server),
             "control" => Ok(Self::Control),
             _ => Err(ParseOpenApiPlaneError),
         }
@@ -40,7 +40,7 @@ pub struct ParseOpenApiPlaneError;
 
 impl fmt::Display for ParseOpenApiPlaneError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("plane must be `runtime`, `client`, or `control`")
+        formatter.write_str("plane must be `runtime`, `server`, or `control`")
     }
 }
 
@@ -58,10 +58,10 @@ pub fn to_pretty_json(plane: OpenApiPlane) -> Result<String, serde_json::Error> 
             require_contract_headers(&mut document);
             serde_json::to_string_pretty(&document)
         }
-        OpenApiPlane::Client => {
-            let mut document = serde_json::to_value(crate::client::openapi())?;
+        OpenApiPlane::Server => {
+            let mut document = serde_json::to_value(crate::server::openapi())?;
             require_contract_headers(&mut document);
-            require_client_literal_discriminator(&mut document);
+            require_server_literal_discriminator(&mut document);
             serde_json::to_string_pretty(&document)
         }
         OpenApiPlane::Control => crate::control::openapi().to_pretty_json(),
@@ -99,7 +99,7 @@ fn require_contract_headers(document: &mut serde_json::Value) {
     }
 }
 
-fn require_client_literal_discriminator(document: &mut serde_json::Value) {
+fn require_server_literal_discriminator(document: &mut serde_json::Value) {
     for (schema, expected) in [
         ("InactiveProjectToken", false),
         ("ActiveProjectToken", true),

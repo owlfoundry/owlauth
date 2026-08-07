@@ -3,7 +3,7 @@ import type { SyntheticEvent } from "react";
 import { Link, useNavigate } from "react-router";
 
 import { ArrowRightIcon, PlusIcon } from "../../shared/icons/Icons";
-import { EmptyState, PageHeader } from "../../shared/layout/Layout";
+import { EmptyState, LoadingState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Field, Input } from "../../shared/primitives/Field";
@@ -107,7 +107,7 @@ export function ProjectsPage() {
           </Button>
         }
       />
-      {loadingProjects ? <p role="status">Loading Projects</p> : null}
+      {loadingProjects ? <LoadingState>Loading projects</LoadingState> : null}
       {projects.length === 0 && !loadingProjects ? (
         <EmptyState
           title="No Projects yet"

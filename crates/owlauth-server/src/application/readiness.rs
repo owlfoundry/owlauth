@@ -41,6 +41,8 @@ pub(crate) struct JwksDocument {
 
 #[async_trait]
 pub(crate) trait ReadinessPort: Send + Sync {
+    async fn readiness(&self) -> Result<(), ApplicationError>;
+
     async fn public_application_config(
         &self,
         project_public_id: &str,
@@ -61,6 +63,10 @@ pub(crate) struct ReadinessService {
 impl ReadinessService {
     pub(crate) fn new(port: Arc<dyn ReadinessPort>) -> Self {
         Self { port }
+    }
+
+    pub(crate) async fn readiness(&self) -> Result<(), ApplicationError> {
+        self.port.readiness().await
     }
 
     pub(crate) async fn public_application_config(

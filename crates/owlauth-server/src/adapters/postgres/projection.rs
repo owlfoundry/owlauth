@@ -990,7 +990,7 @@ impl PostgresProjectionEmailKeyAuthority {
         let incarnation = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT process_incarnation FROM runtime_process_incarnations \
+                "SELECT process_incarnation FROM auth_process_incarnations \
                  WHERE process_id=$1 FOR SHARE",
                 [process_id.into()],
             ))
@@ -1216,7 +1216,7 @@ async fn assert_required_projection_observations(
                 DbBackend::Postgres,
                 "SELECT observation.authority_revision,observation.readable_versions, \
                  observation.lease_expires_at > clock_timestamp() AS lease_is_live \
-                 FROM runtime_process_incarnations incarnation \
+                 FROM auth_process_incarnations incarnation \
                  JOIN projection_email_runtime_observations observation \
                    ON observation.process_id=incarnation.process_id \
                   AND observation.process_incarnation=incarnation.process_incarnation \

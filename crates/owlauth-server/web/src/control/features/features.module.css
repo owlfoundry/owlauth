@@ -1,7 +1,10 @@
 .form {
   display: grid;
   gap: 0.85rem;
-  max-width: 48rem;
+  max-width: 36rem;
+}
+
+.identityMutation > .form {
   margin-block: 1rem;
   padding: 1rem;
   background: var(--owl-surface);
@@ -9,66 +12,12 @@
   border-radius: var(--owl-radius-surface);
 }
 
-.form label,
-.inlineForm label {
+.form > label,
+.inlineForm > label,
+.confirmation > label {
   color: var(--owl-text);
   font-size: 0.875rem;
   font-weight: 600;
-}
-
-.form input,
-.form select,
-.form textarea,
-.inlineForm select,
-.inlineForm input,
-.confirmation input {
-  min-height: 2.5rem;
-  padding: 0.55rem 0.7rem;
-  color: var(--owl-text);
-  background: var(--owl-surface-raised);
-  border: 1px solid var(--owl-border-strong);
-  border-radius: var(--owl-radius-control);
-  font: inherit;
-}
-
-.form textarea {
-  min-height: 6rem;
-  resize: vertical;
-}
-
-.form button,
-.actions button,
-.inlineForm button,
-.list button,
-.cards button,
-.identityMutation button {
-  min-height: 2.5rem;
-  padding: 0.5rem 0.875rem;
-  color: var(--owl-text);
-  background: var(--owl-surface-raised);
-  border: 1px solid var(--owl-border-strong);
-  border-radius: var(--owl-radius-control);
-  cursor: pointer;
-  font: inherit;
-  font-weight: 600;
-}
-
-.form button:hover,
-.actions button:hover,
-.inlineForm button:hover,
-.list button:hover,
-.cards button:hover,
-.identityMutation button:hover {
-  background: var(--owl-surface-hover);
-}
-
-.form button:disabled,
-.actions button:disabled,
-.inlineForm button:disabled,
-.cards button:disabled,
-.identityMutation button:disabled {
-  cursor: not-allowed;
-  opacity: 0.58;
 }
 
 .form button {
@@ -80,7 +29,6 @@
   gap: 2rem;
 }
 
-.toolbar,
 .sectionHeader,
 .actions,
 .inlineForm {
@@ -91,20 +39,69 @@
   gap: 0.75rem;
 }
 
-.toolbar p,
+.sectionHeader h2,
+.sectionHeader h3,
 .sectionHeader p {
   margin: 0;
 }
 
-.detail {
+.sectionHeader > div {
+  min-width: 0;
   display: grid;
-  gap: 2rem;
-  padding-top: 1.5rem;
-  border-top: 1px solid var(--owl-border);
+  gap: 0.25rem;
+}
+
+.filterToolbar {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  align-items: end;
+  gap: 0.75rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--owl-border);
+}
+
+.filterFields {
+  display: contents;
+}
+
+.filterField,
+.searchField {
+  min-width: 0;
+  display: grid;
+  grid-column: span 2;
+  gap: 0.35rem;
+  color: var(--owl-text);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.searchField {
+  grid-column: span 4;
+}
+
+.filterError {
+  color: var(--owl-danger);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.filterActions {
+  min-width: 0;
+  display: grid;
+  grid-column: span 2;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.filterActions > button {
+  width: 100%;
 }
 
 .panel,
 .cards > li {
+  min-width: 0;
   padding: 1rem;
   background: var(--owl-surface);
   border: 1px solid var(--owl-border);
@@ -120,9 +117,34 @@
   list-style: none;
 }
 
-.list button {
+.list button,
+.list a {
   width: 100%;
+  min-height: 3rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.6rem 0.75rem;
+  color: var(--owl-text);
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-control);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
   text-align: left;
+  text-decoration: none;
+}
+
+.list a:hover,
+.list button:not(:disabled):hover {
+  background: var(--owl-surface-hover);
+}
+
+.list button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .list button[aria-pressed="true"] {
@@ -130,8 +152,9 @@
   box-shadow: inset 3px 0 var(--owl-accent);
 }
 
-.list span {
-  float: right;
+.userName {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .cards > li {
@@ -139,9 +162,54 @@
   gap: 0.75rem;
 }
 
+.cards > li > * {
+  min-width: 0;
+}
+
+.emptyNote {
+  margin: 0;
+  padding: 0.75rem;
+  color: var(--owl-text-muted);
+  background: var(--owl-surface-raised);
+  border: 1px dashed var(--owl-border);
+  border-radius: var(--owl-radius-control);
+}
+
+.panel > .sectionHeader {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.panel h3,
+.cards strong,
+.cards span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .actions,
 .inlineForm {
   justify-content: flex-start;
+}
+
+.inlineForm {
+  max-width: 36rem;
+}
+
+.inlineForm > label {
+  flex-basis: 100%;
+}
+
+.inlineForm > input {
+  width: auto;
+  flex: 1 1 16rem;
+}
+
+.userInventory {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  gap: 1rem;
 }
 
 .userGrid,
@@ -153,14 +221,6 @@
 
 .sessionColumns {
   grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-}
-
-.danger,
-.form .danger,
-.cards .danger {
-  color: var(--owl-danger);
-  background: var(--owl-danger-surface);
-  border-color: var(--owl-danger-border);
 }
 
 .identityMutation {
@@ -218,14 +278,57 @@ code {
   overflow-wrap: anywhere;
 }
 
+@media (width <= 72rem) {
+  .filterToolbar {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .searchField,
+  .filterActions {
+    grid-column: 1 / -1;
+  }
+
+  .filterField {
+    grid-column: span 1;
+  }
+}
+
 @media (width <= 48rem) {
   .userGrid {
     grid-template-columns: 1fr;
   }
 
-  .toolbar,
+  .filterToolbar {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .searchField,
+  .filterActions {
+    grid-column: 1 / -1;
+  }
+
   .sectionHeader {
     align-items: stretch;
     flex-direction: column;
+  }
+}
+
+@media (width <= 30rem) {
+  .filterToolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .filterField,
+  .searchField,
+  .filterActions {
+    grid-column: 1;
+  }
+
+  .filterActions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .actions > * {
+    flex: 1 1 100%;
   }
 }

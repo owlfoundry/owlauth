@@ -390,8 +390,8 @@ async fn start_postgres() -> Option<(testcontainers::ContainerAsync<GenericImage
 )]
 async fn seed_authority(pool: &PgPool, now: OffsetDateTime, namespace: &str) -> SeededAuthority {
     sqlx::query(
-        "INSERT INTO runtime_process_incarnations
-         (process_id, process_incarnation, started_at) VALUES ('runtime-1', $1, $2)
+        "INSERT INTO auth_process_incarnations
+         (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, $2)
          ON CONFLICT (process_id) DO UPDATE SET
            process_incarnation=EXCLUDED.process_incarnation, started_at=EXCLUDED.started_at",
     )
@@ -3545,14 +3545,14 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
             .expect("active sibling authorizes shared origin")
     );
 
-    let replacement_runtime_incarnation = Uuid::new_v4();
+    let replacement_auth_incarnation = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO runtime_process_incarnations
-         (process_id, process_incarnation, started_at) VALUES ('runtime-1', $1, $2)
+        "INSERT INTO auth_process_incarnations
+         (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, $2)
          ON CONFLICT (process_id) DO UPDATE SET
            process_incarnation=EXCLUDED.process_incarnation, started_at=EXCLUDED.started_at",
     )
-    .bind(replacement_runtime_incarnation)
+    .bind(replacement_auth_incarnation)
     .bind(refresh_at + Duration::seconds(4))
     .execute(&pool)
     .await
@@ -8523,7 +8523,7 @@ async fn project_graph_lock_serializes_merge_against_handoff_and_refresh_writers
         PostgresSessionAuthorityRepository::new(database.clone(), test_projection_materializer());
     let mutations = PostgresIdentityMutationRepository::new(
         database.clone(),
-        "runtime-1".to_owned(),
+        "auth-1".to_owned(),
         Uuid::nil(),
         test_projection_materializer(),
         Vec::new(),

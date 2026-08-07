@@ -46,10 +46,11 @@ pnpm --filter @owlauth/server-web test:e2e
 two committed generated type files. `check` runs boundary validation, ESLint, Prettier, TypeScript
 project references, Vitest, and build-script tests. `build` rejects contract drift, rebuilds both
 planes independently, then creates deterministic gzip/Brotli representations and server manifests.
-`test:e2e` starts an isolated PostgreSQL 17 container and the real Rust Runtime/Client/Control
-listeners, then runs the fresh-database provisioning-readiness journey with Playwright and axe.
-Install the selected Playwright browsers first with
-`pnpm --filter @owlauth/server-web exec playwright install`.
+`test:e2e` starts an isolated PostgreSQL 17 container and the real Rust Auth and Control listeners,
+then runs the fresh-database provisioning-readiness journey with Playwright and axe. The current
+real-browser qualification baseline is Chromium and Firefox. WebKit and Safari are not declared
+supported until an equivalent real Rust-server security gate exists. Install the selected Playwright
+browsers first with `pnpm --filter @owlauth/server-web exec playwright install`.
 
 Prepared `dist/` trees are tracked so an ordinary Cargo source build and a crates.io package build
 remain deterministic and offline. `owlauth-server/build.rs` rejects missing, stale, extra,

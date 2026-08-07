@@ -8,6 +8,10 @@ use axum::{
 use rust_embed::Embed;
 use serde::Deserialize;
 
+pub(crate) const RUNTIME_BOOTSTRAP_META_NAME: &str = "owlauth-runtime-bootstrap";
+const OWLAUTH_FAVICON_PATH: &str = "assets/owlauth-favicon.svg";
+const OWLAUTH_FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#101211"/><path fill="#f7f7f5" d="M13 14.5 24.3 20A21.7 21.7 0 0 1 32 18.6c2.7 0 5.3.5 7.7 1.4L51 14.5v17.3C51 44.1 42.5 52 32 52s-19-7.9-19-20.2V14.5Z"/><circle cx="23.5" cy="31" r="7.5" fill="#101211"/><circle cx="40.5" cy="31" r="7.5" fill="#101211"/><circle cx="23.5" cy="31" r="2.5" fill="#f7f7f5"/><circle cx="40.5" cy="31" r="2.5" fill="#f7f7f5"/><path fill="#101211" d="m32 35 4.5 5.5h-9L32 35Z"/></svg>"##;
+
 #[derive(Embed)]
 #[folder = "web/dist/runtime"]
 #[exclude = ".vite/*"]
@@ -118,8 +122,9 @@ pub(crate) fn shell_with_context(
         .expect("writing to a String cannot fail");
     }
     let document = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"{configured_base_name}\" content=\"{}\"><title>{title}</title>{head}</head><body><div id=\"owlauth-root\"></div><script type=\"module\" src=\"{}\"></script></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"{configured_base_name}\" content=\"{}\"><link rel=\"icon\" type=\"image/svg+xml\" href=\"{}\"><title>{title}</title>{head}</head><body><div id=\"owlauth-root\"></div><script type=\"module\" src=\"{}\"></script></body></html>",
         html_escape(base_path),
+        html_escape(&format!("{prefix}{OWLAUTH_FAVICON_PATH}")),
         html_escape(&format!("{prefix}{}", manifest.entry)),
     );
     let mut response = Response::new(Body::from(document));
@@ -131,6 +136,25 @@ pub(crate) fn shell_with_context(
 }
 
 pub(crate) fn asset(plane: WebPlane, requested_path: &str) -> Response {
+    if requested_path == OWLAUTH_FAVICON_PATH {
+        let mut response = Response::new(Body::from(OWLAUTH_FAVICON));
+        let headers = response.headers_mut();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml"),
+        );
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&OWLAUTH_FAVICON.len().to_string())
+                .expect("favicon length should be a header value"),
+        );
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        return response;
+    }
+
     let manifest = manifest(plane);
     let Some(file) = manifest
         .files
@@ -201,7 +225,7 @@ mod tests {
         let response = shell_with_context(
             WebPlane::Runtime,
             "/runtime/",
-            &[("owlauth-runtime-bootstrap", hostile)],
+            &[(RUNTIME_BOOTSTRAP_META_NAME, hostile)],
         );
         let document = String::from_utf8(
             axum::body::to_bytes(response.into_body(), 1_000_000)
@@ -214,5 +238,27 @@ mod tests {
         assert!(document.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(document.contains("&quot;"));
         assert!(document.contains("&amp;"));
+        assert!(document.contains("<meta name=\"owlauth-runtime-bootstrap\""));
+        assert!(!document.contains("owlauth-auth-bootstrap"));
+        assert!(document.contains("<link rel=\"icon\" type=\"image/svg+xml\""));
+        assert!(document.contains("href=\"/runtime/auth/assets/owlauth-favicon.svg\""));
+        assert!(!document.contains("data:image"));
+    }
+
+    #[tokio::test]
+    async fn favicon_is_a_same_origin_immutable_svg_on_both_planes() {
+        for plane in [WebPlane::Runtime, WebPlane::Control] {
+            let response = asset(plane, OWLAUTH_FAVICON_PATH);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "public, max-age=31536000, immutable"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .expect("favicon should be bounded");
+            assert_eq!(body.as_ref(), OWLAUTH_FAVICON.as_bytes());
+        }
     }
 }

@@ -13,44 +13,44 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::application::{
-    AcknowledgeProjectClientKeyDelivery, ApplicationError, ClientKeyCreateAttemptError,
-    ClientKeyLifecyclePort, MAX_ACTIVE_CLIENT_KEYS_PER_PROJECT, PreparedProjectClientKey,
-    ProjectClientKeyCursor, ProjectClientKeyRecord, ProjectClientKeyStatus, RevokeProjectClientKey,
-    StoredProjectClientKeyCreate,
+    AcknowledgeProjectServerKeyDelivery, ApplicationError, MAX_ACTIVE_SERVER_KEYS_PER_PROJECT,
+    PreparedProjectServerKey, ProjectServerKeyCursor, ProjectServerKeyRecord,
+    ProjectServerKeyStatus, RevokeProjectServerKey, ServerKeyCreateAttemptError,
+    ServerKeyLifecyclePort, StoredProjectServerKeyCreate,
 };
 
-use super::entity::{audit_event, control_idempotency_record, project, project_client_key};
+use super::entity::{audit_event, control_idempotency_record, project, project_server_key};
 
-const CREATE_OPERATION_KIND: &str = "project_client_key.create";
-const ACKNOWLEDGE_OPERATION_KIND: &str = "project_client_key.acknowledge_delivery";
-const REVOKE_OPERATION_KIND: &str = "project_client_key.revoke";
+const CREATE_OPERATION_KIND: &str = "project_server_key.create";
+const ACKNOWLEDGE_OPERATION_KIND: &str = "project_server_key.acknowledge_delivery";
+const REVOKE_OPERATION_KIND: &str = "project_server_key.revoke";
 
 #[derive(Clone)]
-pub(crate) struct PostgresClientKeyRepository {
+pub(crate) struct PostgresServerKeyRepository {
     database: DatabaseConnection,
-    required_client_process_ids: Vec<String>,
+    required_server_process_ids: Vec<String>,
 }
 
-impl PostgresClientKeyRepository {
+impl PostgresServerKeyRepository {
     pub(crate) fn new(
         database: DatabaseConnection,
-        required_client_process_ids: Vec<String>,
+        required_server_process_ids: Vec<String>,
     ) -> Result<Self, ApplicationError> {
-        let unique = required_client_process_ids.iter().collect::<BTreeSet<_>>();
-        if required_client_process_ids.is_empty()
-            || required_client_process_ids.len() > 64
-            || unique.len() != required_client_process_ids.len()
-            || required_client_process_ids
+        let unique = required_server_process_ids.iter().collect::<BTreeSet<_>>();
+        if required_server_process_ids.is_empty()
+            || required_server_process_ids.len() > 64
+            || unique.len() != required_server_process_ids.len()
+            || required_server_process_ids
                 .iter()
                 .any(|process_id| !valid_process_id(process_id))
         {
             return Err(ApplicationError::InvalidInput);
         }
-        let mut required_client_process_ids = required_client_process_ids;
-        required_client_process_ids.sort_unstable();
+        let mut required_server_process_ids = required_server_process_ids;
+        required_server_process_ids.sort_unstable();
         Ok(Self {
             database,
-            required_client_process_ids,
+            required_server_process_ids,
         })
     }
 
@@ -69,22 +69,22 @@ impl PostgresClientKeyRepository {
             .query_all_raw(Statement::from_sql_and_values(
                 transaction.get_database_backend(),
                 "SELECT current.process_id
-                   FROM client_process_incarnations current
-                   JOIN client_key_digest_readiness readiness
+                   FROM auth_process_incarnations current
+                   JOIN server_key_digest_readiness readiness
                      ON readiness.process_id=current.process_id
                     AND readiness.process_incarnation=current.process_incarnation
                   WHERE current.process_id IN (
                         SELECT jsonb_array_elements_text($1::jsonb))
                   ORDER BY current.process_id
                   FOR SHARE OF current,readiness",
-                [json!(&self.required_client_process_ids).into()],
+                [json!(&self.required_server_process_ids).into()],
             ))
             .await
             .map_err(persistence)?;
-        if roster.len() != self.required_client_process_ids.len() {
+        if roster.len() != self.required_server_process_ids.len() {
             return Ok(false);
         }
-        for (row, expected_process_id) in roster.iter().zip(&self.required_client_process_ids) {
+        for (row, expected_process_id) in roster.iter().zip(&self.required_server_process_ids) {
             let process_id = row
                 .try_get::<String>("", "process_id")
                 .map_err(persistence)?;
@@ -105,24 +105,24 @@ impl PostgresClientKeyRepository {
                           AND readiness.failure_class IS NULL
                           AND readiness.lease_expires_at > clock_timestamp()
                           AND $2 = ANY(readiness.supported_digest_versions) AS ready
-                   FROM client_process_incarnations current
-                   JOIN client_key_digest_readiness readiness
+                   FROM auth_process_incarnations current
+                   JOIN server_key_digest_readiness readiness
                      ON readiness.process_id=current.process_id
                     AND readiness.process_incarnation=current.process_incarnation
                   WHERE current.process_id IN (
                         SELECT jsonb_array_elements_text($1::jsonb))
                   ORDER BY current.process_id",
                 [
-                    json!(&self.required_client_process_ids).into(),
+                    json!(&self.required_server_process_ids).into(),
                     digest_key_version.into(),
                 ],
             ))
             .await
             .map_err(persistence)?;
-        if rows.len() != self.required_client_process_ids.len() {
+        if rows.len() != self.required_server_process_ids.len() {
             return Err(ApplicationError::Integrity);
         }
-        for (row, expected_process_id) in rows.iter().zip(&self.required_client_process_ids) {
+        for (row, expected_process_id) in rows.iter().zip(&self.required_server_process_ids) {
             let process_id = row
                 .try_get::<String>("", "process_id")
                 .map_err(persistence)?;
@@ -143,84 +143,84 @@ impl PostgresClientKeyRepository {
     reason = "the lifecycle port keeps each transaction boundary and secret-free replay visible"
 )]
 #[async_trait]
-impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
-    async fn list_project_client_keys(
+impl ServerKeyLifecyclePort for PostgresServerKeyRepository {
+    async fn list_project_server_keys(
         &self,
         project_id: Uuid,
-        after: Option<ProjectClientKeyCursor>,
+        after: Option<ProjectServerKeyCursor>,
         limit_plus_one: usize,
-    ) -> Result<Vec<ProjectClientKeyRecord>, ApplicationError> {
+    ) -> Result<Vec<ProjectServerKeyRecord>, ApplicationError> {
         if !(2..=101).contains(&limit_plus_one) {
             return Err(ApplicationError::InvalidInput);
         }
         ensure_project(&self.database, project_id).await?;
-        let mut query = project_client_key::Entity::find()
-            .filter(project_client_key::Column::ProjectId.eq(project_id));
+        let mut query = project_server_key::Entity::find()
+            .filter(project_server_key::Column::ProjectId.eq(project_id));
         if let Some(after) = after {
             query = query.filter(
                 Condition::any()
-                    .add(project_client_key::Column::CreatedAt.gt(after.created_at))
+                    .add(project_server_key::Column::CreatedAt.gt(after.created_at))
                     .add(
                         Condition::all()
-                            .add(project_client_key::Column::CreatedAt.eq(after.created_at))
-                            .add(project_client_key::Column::Id.gt(after.key_id)),
+                            .add(project_server_key::Column::CreatedAt.eq(after.created_at))
+                            .add(project_server_key::Column::Id.gt(after.key_id)),
                     ),
             );
         }
         query
-            .order_by_asc(project_client_key::Column::CreatedAt)
-            .order_by_asc(project_client_key::Column::Id)
+            .order_by_asc(project_server_key::Column::CreatedAt)
+            .order_by_asc(project_server_key::Column::Id)
             .limit(u64::try_from(limit_plus_one).map_err(|_| ApplicationError::InvalidInput)?)
             .all(&self.database)
             .await
             .map_err(persistence)?
             .into_iter()
-            .map(client_key_record)
+            .map(server_key_record)
             .collect()
     }
 
-    async fn active_unacknowledged_project_client_key(
+    async fn active_unacknowledged_project_server_key(
         &self,
         project_id: Uuid,
-    ) -> Result<Option<ProjectClientKeyRecord>, ApplicationError> {
+    ) -> Result<Option<ProjectServerKeyRecord>, ApplicationError> {
         ensure_project(&self.database, project_id).await?;
-        project_client_key::Entity::find()
-            .filter(project_client_key::Column::ProjectId.eq(project_id))
-            .filter(project_client_key::Column::Status.eq("active"))
-            .filter(project_client_key::Column::CredentialAcknowledgedAt.is_null())
+        project_server_key::Entity::find()
+            .filter(project_server_key::Column::ProjectId.eq(project_id))
+            .filter(project_server_key::Column::Status.eq("active"))
+            .filter(project_server_key::Column::CredentialAcknowledgedAt.is_null())
             .one(&self.database)
             .await
             .map_err(persistence)?
-            .map(client_key_record)
+            .map(server_key_record)
             .transpose()
     }
 
-    async fn get_project_client_key(
+    async fn get_project_server_key(
         &self,
         project_id: Uuid,
         key_id: Uuid,
-    ) -> Result<ProjectClientKeyRecord, ApplicationError> {
-        project_client_key::Entity::find_by_id(key_id)
-            .filter(project_client_key::Column::ProjectId.eq(project_id))
+    ) -> Result<ProjectServerKeyRecord, ApplicationError> {
+        project_server_key::Entity::find_by_id(key_id)
+            .filter(project_server_key::Column::ProjectId.eq(project_id))
             .one(&self.database)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)
-            .and_then(client_key_record)
+            .and_then(server_key_record)
     }
 
-    async fn replay_project_client_key_create(
+    async fn replay_project_server_key_create(
         &self,
         project_id: Uuid,
         idempotency_key: &str,
         request_digest: &[u8],
-    ) -> Result<Option<ProjectClientKeyRecord>, ApplicationError> {
+    ) -> Result<Option<ProjectServerKeyRecord>, ApplicationError> {
         if request_digest.len() != 32 {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
         lock_advisory(&transaction, idempotency_key).await?;
-        let result = replay::<ProjectClientKeyRecord>(
+        let result = replay::<ProjectServerKeyRecord>(
             &transaction,
             idempotency_key,
             project_id,
@@ -239,16 +239,16 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         Ok(result)
     }
 
-    async fn create_project_client_key_attempt(
+    async fn create_project_server_key_attempt(
         &self,
-        prepared: PreparedProjectClientKey,
-    ) -> Result<StoredProjectClientKeyCreate, ClientKeyCreateAttemptError> {
+        prepared: PreparedProjectServerKey,
+    ) -> Result<StoredProjectServerKeyCreate, ServerKeyCreateAttemptError> {
         if prepared.request_digest.len() != 32 || prepared.digest_key_version <= 0 {
             return Err(ApplicationError::InvalidInput.into());
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
         lock_advisory(&transaction, &prepared.idempotency_key).await?;
-        if let Some(replayed) = replay::<ProjectClientKeyRecord>(
+        if let Some(replayed) = replay::<ProjectServerKeyRecord>(
             &transaction,
             &prepared.idempotency_key,
             prepared.project_id,
@@ -262,7 +262,7 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
                 return Err(ApplicationError::Integrity.into());
             }
             transaction.commit().await.map_err(persistence)?;
-            return Ok(StoredProjectClientKeyCreate::ReplayWithoutSecret(replayed));
+            return Ok(StoredProjectServerKeyCreate::ReplayWithoutSecret(replayed));
         }
 
         let owner = project::Entity::find_by_id(prepared.project_id)
@@ -274,10 +274,10 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         if owner.status != "active" {
             return Err(ApplicationError::Disabled.into());
         }
-        if project_client_key::Entity::find()
-            .filter(project_client_key::Column::ProjectId.eq(prepared.project_id))
-            .filter(project_client_key::Column::Status.eq("active"))
-            .filter(project_client_key::Column::CredentialAcknowledgedAt.is_null())
+        if project_server_key::Entity::find()
+            .filter(project_server_key::Column::ProjectId.eq(prepared.project_id))
+            .filter(project_server_key::Column::Status.eq("active"))
+            .filter(project_server_key::Column::CredentialAcknowledgedAt.is_null())
             .one(&transaction)
             .await
             .map_err(persistence)?
@@ -289,38 +289,38 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
             .digest_version_ready(&transaction, prepared.digest_key_version)
             .await?
         {
-            return Err(ApplicationError::ClientVerifierUnavailable.into());
+            return Err(ApplicationError::ServerVerifierUnavailable.into());
         }
-        let active_count = project_client_key::Entity::find()
-            .filter(project_client_key::Column::ProjectId.eq(prepared.project_id))
-            .filter(project_client_key::Column::Status.eq("active"))
+        let active_count = project_server_key::Entity::find()
+            .filter(project_server_key::Column::ProjectId.eq(prepared.project_id))
+            .filter(project_server_key::Column::Status.eq("active"))
             .count(&transaction)
             .await
             .map_err(persistence)?;
         if active_count
-            >= u64::try_from(MAX_ACTIVE_CLIENT_KEYS_PER_PROJECT)
+            >= u64::try_from(MAX_ACTIVE_SERVER_KEYS_PER_PROJECT)
                 .map_err(|_| ApplicationError::Integrity)?
         {
-            return Err(ApplicationError::InvalidTransition.into());
+            return Err(ApplicationError::CapacityExceeded.into());
         }
 
         lock_advisory(
             &transaction,
-            &format!("project-client-key-public-id:{}", prepared.public_key_id),
+            &format!("project-server-key-public-id:{}", prepared.public_key_id),
         )
         .await?;
-        if project_client_key::Entity::find()
-            .filter(project_client_key::Column::PublicKeyId.eq(prepared.public_key_id.clone()))
+        if project_server_key::Entity::find()
+            .filter(project_server_key::Column::PublicKeyId.eq(prepared.public_key_id.clone()))
             .one(&transaction)
             .await
             .map_err(persistence)?
             .is_some()
         {
             transaction.rollback().await.map_err(persistence)?;
-            return Err(ClientKeyCreateAttemptError::PublicIdCollision);
+            return Err(ServerKeyCreateAttemptError::PublicIdCollision);
         }
 
-        let model = project_client_key::ActiveModel {
+        let model = project_server_key::ActiveModel {
             id: Set(prepared.id),
             project_id: Set(prepared.project_id),
             public_key_id: Set(prepared.public_key_id),
@@ -338,11 +338,11 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         .insert(&transaction)
         .await
         .map_err(persistence)?;
-        let record = client_key_record(model)?;
-        insert_client_key_audit(
+        let record = server_key_record(model)?;
+        insert_server_key_audit(
             &transaction,
             &record,
-            "project_client_key.created",
+            "project_server_key.created",
             prepared.correlation_id,
             &prepared.idempotency_key,
         )
@@ -359,21 +359,21 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         )
         .await?;
         transaction.commit().await.map_err(persistence)?;
-        Ok(StoredProjectClientKeyCreate::Created(record))
+        Ok(StoredProjectServerKeyCreate::Created(record))
     }
 
-    async fn acknowledge_project_client_key_delivery(
+    async fn acknowledge_project_server_key_delivery(
         &self,
-        command: AcknowledgeProjectClientKeyDelivery,
+        command: AcknowledgeProjectServerKeyDelivery,
         request_digest: Vec<u8>,
         acknowledged_at: OffsetDateTime,
-    ) -> Result<ProjectClientKeyRecord, ApplicationError> {
+    ) -> Result<ProjectServerKeyRecord, ApplicationError> {
         if request_digest.len() != 32 {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
         lock_advisory(&transaction, &command.idempotency_key).await?;
-        if let Some(replayed) = replay::<ProjectClientKeyRecord>(
+        if let Some(replayed) = replay::<ProjectServerKeyRecord>(
             &transaction,
             &command.idempotency_key,
             command.project_id,
@@ -385,7 +385,7 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         {
             if replayed.project_id != command.project_id
                 || replayed.id != command.key_id
-                || replayed.status != ProjectClientKeyStatus::Active
+                || replayed.status != ProjectServerKeyStatus::Active
                 || replayed.credential_acknowledged_at.is_none()
             {
                 return Err(ApplicationError::Integrity);
@@ -399,8 +399,8 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        let model = project_client_key::Entity::find_by_id(command.key_id)
-            .filter(project_client_key::Column::ProjectId.eq(command.project_id))
+        let model = project_server_key::Entity::find_by_id(command.key_id)
+            .filter(project_server_key::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
             .one(&transaction)
             .await
@@ -422,11 +422,11 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         let mut active = model.into_active_model();
         active.revision = Set(next_revision);
         active.credential_acknowledged_at = Set(Some(acknowledged_at));
-        let record = client_key_record(active.update(&transaction).await.map_err(persistence)?)?;
-        insert_client_key_audit(
+        let record = server_key_record(active.update(&transaction).await.map_err(persistence)?)?;
+        insert_server_key_audit(
             &transaction,
             &record,
-            "project_client_key.delivery_acknowledged",
+            "project_server_key.delivery_acknowledged",
             command.correlation_id,
             &command.idempotency_key,
         )
@@ -446,18 +446,18 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         Ok(record)
     }
 
-    async fn revoke_project_client_key(
+    async fn revoke_project_server_key(
         &self,
-        command: RevokeProjectClientKey,
+        command: RevokeProjectServerKey,
         request_digest: Vec<u8>,
         revoked_at: OffsetDateTime,
-    ) -> Result<ProjectClientKeyRecord, ApplicationError> {
+    ) -> Result<ProjectServerKeyRecord, ApplicationError> {
         if request_digest.len() != 32 {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
         lock_advisory(&transaction, &command.idempotency_key).await?;
-        if let Some(replayed) = replay::<ProjectClientKeyRecord>(
+        if let Some(replayed) = replay::<ProjectServerKeyRecord>(
             &transaction,
             &command.idempotency_key,
             command.project_id,
@@ -469,7 +469,7 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         {
             if replayed.project_id != command.project_id
                 || replayed.id != command.key_id
-                || replayed.status != ProjectClientKeyStatus::Revoked
+                || replayed.status != ProjectServerKeyStatus::Revoked
             {
                 return Err(ApplicationError::Integrity);
             }
@@ -482,8 +482,8 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        let model = project_client_key::Entity::find_by_id(command.key_id)
-            .filter(project_client_key::Column::ProjectId.eq(command.project_id))
+        let model = project_server_key::Entity::find_by_id(command.key_id)
+            .filter(project_server_key::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
             .one(&transaction)
             .await
@@ -503,11 +503,11 @@ impl ClientKeyLifecyclePort for PostgresClientKeyRepository {
         active.status = Set("revoked".to_owned());
         active.revision = Set(next_revision);
         active.revoked_at = Set(Some(revoked_at));
-        let record = client_key_record(active.update(&transaction).await.map_err(persistence)?)?;
-        insert_client_key_audit(
+        let record = server_key_record(active.update(&transaction).await.map_err(persistence)?)?;
+        insert_server_key_audit(
             &transaction,
             &record,
-            "project_client_key.revoked",
+            "project_server_key.revoked",
             command.correlation_id,
             &command.idempotency_key,
         )
@@ -540,12 +540,12 @@ where
     Ok(())
 }
 
-fn client_key_record(
-    model: project_client_key::Model,
-) -> Result<ProjectClientKeyRecord, ApplicationError> {
+fn server_key_record(
+    model: project_server_key::Model,
+) -> Result<ProjectServerKeyRecord, ApplicationError> {
     let status = match model.status.as_str() {
-        "active" if model.revoked_at.is_none() => ProjectClientKeyStatus::Active,
-        "revoked" if model.revoked_at.is_some() => ProjectClientKeyStatus::Revoked,
+        "active" if model.revoked_at.is_none() => ProjectServerKeyStatus::Active,
+        "revoked" if model.revoked_at.is_some() => ProjectServerKeyStatus::Revoked,
         _ => return Err(ApplicationError::Integrity),
     };
     if model.revision <= 0
@@ -557,7 +557,7 @@ fn client_key_record(
     {
         return Err(ApplicationError::Integrity);
     }
-    Ok(ProjectClientKeyRecord {
+    Ok(ProjectServerKeyRecord {
         id: model.id,
         project_id: model.project_id,
         public_key_id: model.public_key_id,
@@ -658,9 +658,9 @@ where
     Ok(())
 }
 
-async fn insert_client_key_audit(
+async fn insert_server_key_audit(
     transaction: &DatabaseTransaction,
-    record: &ProjectClientKeyRecord,
+    record: &ProjectServerKeyRecord,
     action: &str,
     correlation_id: Uuid,
     idempotency_key: &str,
@@ -670,7 +670,7 @@ async fn insert_client_key_audit(
         project_id: Set(Some(record.project_id)),
         actor_kind: Set("deployment_operator".to_owned()),
         action: Set(action.to_owned()),
-        target_kind: Set("project_client_key".to_owned()),
+        target_kind: Set("project_server_key".to_owned()),
         target_id: Set(Some(record.id)),
         outcome: Set("succeeded".to_owned()),
         correlation_id: Set(correlation_id),
@@ -712,9 +712,9 @@ fn persistence(_: sea_orm::DbErr) -> ApplicationError {
 mod tests {
     use super::*;
 
-    fn model() -> project_client_key::Model {
+    fn model() -> project_server_key::Model {
         let public_key_id = "AAAAAAAAAAAAAAAAAAAAAA".to_owned();
-        project_client_key::Model {
+        project_server_key::Model {
             id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
             public_key_id: public_key_id.clone(),
@@ -722,7 +722,7 @@ mod tests {
             status: "active".to_owned(),
             digest_key_version: 1,
             credential_digest: vec![7_u8; 32],
-            display_prefix: format!("owl_client_v1.{public_key_id}"),
+            display_prefix: format!("owl_server_v1.{public_key_id}"),
             revision: 1,
             created_at: OffsetDateTime::UNIX_EPOCH,
             credential_acknowledged_at: None,
@@ -732,22 +732,22 @@ mod tests {
     }
 
     #[test]
-    fn required_client_roster_is_non_empty_unique_and_canonical() {
+    fn required_server_roster_is_non_empty_unique_and_canonical() {
         assert!(
-            PostgresClientKeyRepository::new(
+            PostgresServerKeyRepository::new(
                 DatabaseConnection::default(),
-                vec!["client-1".to_owned(), "region.example:2".to_owned()],
+                vec!["server-1".to_owned(), "region.example:2".to_owned()],
             )
             .is_ok()
         );
         for invalid in [
             Vec::new(),
-            vec!["client-1".to_owned(), "client-1".to_owned()],
+            vec!["server-1".to_owned(), "server-1".to_owned()],
             vec!["contains space".to_owned()],
             vec!["x".repeat(129)],
         ] {
             assert_eq!(
-                PostgresClientKeyRepository::new(DatabaseConnection::default(), invalid).err(),
+                PostgresServerKeyRepository::new(DatabaseConnection::default(), invalid).err(),
                 Some(ApplicationError::InvalidInput)
             );
         }
@@ -755,26 +755,26 @@ mod tests {
 
     #[test]
     fn row_mapping_rejects_incoherent_or_secret_length_state() {
-        let record = client_key_record(model()).expect("valid active record");
-        assert_eq!(record.status, ProjectClientKeyStatus::Active);
+        let record = server_key_record(model()).expect("valid active record");
+        assert_eq!(record.status, ProjectServerKeyStatus::Active);
 
         let mut invalid = model();
         invalid.credential_digest.pop();
-        assert_eq!(client_key_record(invalid), Err(ApplicationError::Integrity));
+        assert_eq!(server_key_record(invalid), Err(ApplicationError::Integrity));
 
         let mut invalid = model();
         invalid.status = "revoked".to_owned();
-        assert_eq!(client_key_record(invalid), Err(ApplicationError::Integrity));
+        assert_eq!(server_key_record(invalid), Err(ApplicationError::Integrity));
 
         let mut invalid = model();
         invalid.credential_acknowledged_at =
             Some(OffsetDateTime::UNIX_EPOCH - time::Duration::SECOND);
-        assert_eq!(client_key_record(invalid), Err(ApplicationError::Integrity));
+        assert_eq!(server_key_record(invalid), Err(ApplicationError::Integrity));
     }
 
     #[test]
     fn audit_idempotency_fingerprint_is_bounded_and_not_plaintext() {
-        let plaintext = b"client-key-create-sensitive-label";
+        let plaintext = b"server-key-create-sensitive-label";
         let fingerprint = hex_digest(plaintext);
         assert_eq!(fingerprint.len(), 64);
         assert!(!fingerprint.contains("sensitive"));

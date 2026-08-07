@@ -29,6 +29,7 @@ function interactionBootstrap(overrides: Record<string, unknown> = {}) {
     session_reuse_available: true,
     email_available: false,
     email_proof_modes: [],
+    pending_email_challenge: null,
     presentation_hint: "Use your company account",
     providers: [
       { key: "workforce", display_name: "Workforce SSO", kind: "oidc" },
@@ -144,7 +145,7 @@ describe("Runtime Hosted Authentication", () => {
     const fetchMock = vi.fn<typeof fetch>(async (input) => {
       const request = input as Request;
       if (request.url.endsWith("/email/select")) {
-        return Response.json({ completed: true });
+        return Response.json({ status: "email_address_entry", revision: 5 });
       }
       expect(request.url).toContain("/email/challenges");
       expect(await request.clone().json()).toEqual({
@@ -196,7 +197,9 @@ describe("Runtime Hosted Authentication", () => {
       vi.fn<typeof fetch>(async (input) => {
         await Promise.resolve();
         const request = input as Request;
-        if (request.url.endsWith("/email/select")) return Response.json({ completed: true });
+        if (request.url.endsWith("/email/select")) {
+          return Response.json({ status: "email_address_entry", revision: 5 });
+        }
         return Response.json(
           {
             accepted: true,
@@ -221,6 +224,43 @@ describe("Runtime Hosted Authentication", () => {
     expect(screen.queryByLabelText("One-time code")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Verify code" })).not.toBeInTheDocument();
   });
+
+  it.each([
+    { modes: ["otp"], verifiesOtp: true },
+    { modes: ["magic_link"], verifiesOtp: false },
+    { modes: ["otp", "magic_link"], verifiesOtp: true },
+  ])(
+    "restores the newest pending email challenge after reload for $modes",
+    ({ modes, verifiesOtp }) => {
+      window.history.replaceState({}, "", "/runtime/auth/interactions/restored_email");
+      installFlow(
+        "interaction",
+        interactionBootstrap({
+          status: "email_challenge_pending",
+          revision: 8,
+          email_available: true,
+          email_proof_modes: modes,
+          providers: [],
+          pending_email_challenge: {
+            challenge_id: "01912345-6789-7abc-8def-0123456789ab",
+            generation: 2,
+            proof_modes: modes,
+            expires_at: future,
+          },
+        }),
+      );
+
+      render(<RuntimeApp />);
+
+      expect(screen.getByRole("heading", { name: "Check your email" })).toBeVisible();
+      if (verifiesOtp) {
+        expect(screen.getByRole("button", { name: "Verify code" })).toBeVisible();
+      } else {
+        expect(screen.queryByRole("button", { name: "Verify code" })).not.toBeInTheDocument();
+      }
+      expect(screen.getByRole("button", { name: "Send a new message" })).toBeVisible();
+    },
+  );
 
   it("scrubs a fragment-only magic proof before rendering explicit confirmation", () => {
     window.history.replaceState(

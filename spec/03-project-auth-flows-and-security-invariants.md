@@ -118,7 +118,7 @@ sequenceDiagram
 
 ### Project browser-session reuse
 
-When Project policy permits reuse and the Hosted request presents a currently valid Project browser-session cookie, the UI may offer a bounded “continue as” action separate from provider/email method selection. The display is not authority. An explicit same-origin `ConfirmBrowserSessionReuse` command carries CSRF and expected login-transaction revision; Runtime derives the browser credential from the hardened cookie rather than a page-supplied session/user ID.
+When Project policy permits reuse and the Hosted request presents a currently valid Project browser-session cookie, the UI may offer a bounded generic **Continue with current session** action separate from provider/email method selection. V1 exposes no account, email, avatar, or user hint. The display is not authority. An explicit same-origin `ConfirmBrowserSessionReuse` command carries CSRF and expected login-transaction revision; Runtime derives the browser credential from the hardened cookie rather than a page-supplied session/user ID.
 
 One PostgreSQL transaction compare-and-swaps `awaiting_method_selection` directly to `handoff_issued`, while revalidating the exact Project/Application/redirect/PKCE transaction, current Project/user/browser-session status and security revisions, session authentication age/reuse policy, and browser binding. It creates exactly one ordinary handoff ticket and audit event. A concurrent provider/email selection or reuse confirmation loses the same transaction-revision/status guard. A terminated, expired, wrong-Project, stale-revision, or otherwise ineligible browser session fails generically and cannot fall back to a caller-selected identity; the user may restart and choose an admitted provider/email method.
 
@@ -262,7 +262,7 @@ Application logout and Project browser logout use different credential and DTO c
 - Application disablement invalidates only that Application's Runtime credentials and pending handoffs.
 - Revocation responses do not reveal whether an unrelated Project, user, session, or token exists.
 
-Already issued self-contained Project access tokens remain cryptographically valid until short expiry under local verification. A customer backend that requires current revocation/session authority uses the Project-client-key-authenticated Client introspection operation defined by spec 13. New handoff, refresh, current-user, and introspection operations observe authoritative status immediately after PostgreSQL commit.
+Already issued self-contained Project access tokens remain cryptographically valid until short expiry under local verification. A customer backend that requires current revocation/session authority uses the Project-server-key-authenticated Client introspection operation defined by spec 13. New handoff, refresh, current-user, and introspection operations observe authoritative status immediately after PostgreSQL commit.
 
 ## Browser, native, and request safety
 
@@ -276,4 +276,4 @@ Request bodies, headers, parameter counts, and string lengths have endpoint-spec
 
 Random values come from the operating-system CSPRNG. Raw tickets, refresh tokens, cookies, and provider credentials cross the smallest possible interface and are stored only as digests or encrypted provider-specific material where recovery is necessary.
 
-Logs, traces, metrics, errors, audit events, OpenAPI examples, and agent context never contain provider tokens, provider codes, handoff tickets, Project access tokens, refresh tokens, PKCE verifiers, cookies, provider secrets, Project client keys, the deployment operator API key, private keys, full callback URLs, or complete user profiles. Audit events record Project, Application, stable user/target references where authorized, action, outcome, reason class, and correlation without recoverable credentials.
+Logs, traces, metrics, errors, audit events, OpenAPI examples, and agent context never contain provider tokens, provider codes, handoff tickets, Project access tokens, refresh tokens, PKCE verifiers, cookies, provider secrets, Project server keys, the deployment operator API key, private keys, full callback URLs, or complete user profiles. Audit events record Project, Application, stable user/target references where authorized, action, outcome, reason class, and correlation without recoverable credentials.

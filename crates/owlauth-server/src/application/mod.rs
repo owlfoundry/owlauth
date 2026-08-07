@@ -1,10 +1,8 @@
 mod admission;
 mod authentication;
-mod client_api;
-mod client_key;
-mod client_readiness;
 mod control_lifecycle;
 mod email_control;
+mod email_identity_lookup;
 mod error;
 mod identity_mutation;
 mod infrastructure;
@@ -18,6 +16,9 @@ mod provisioning;
 mod readiness;
 mod runtime_auth;
 mod runtime_security;
+mod server_api;
+mod server_key;
+mod server_readiness;
 mod session_authority;
 #[cfg(test)]
 mod unit_of_work;
@@ -36,31 +37,12 @@ pub(crate) use authentication::{
     LoginRevisionSnapshot, LoginTransactionRecord, ProtectedValue, SelectProviderMethod,
     VersionedDigest,
 };
-pub(crate) use client_api::{
-    ActiveClientToken, ClientApiRepository, ClientApiService, ClientApplicationProjection,
-    ClientEmailLookupDigester, ClientKeyAuthority, ClientPrincipal, ClientTokenIntrospection,
-    ClientTokenSessionLookup, ClientTokenSignatureVerifier, ClientUser, ClientUserCursor,
-    ClientUserPage, ClientUserStatus, ClientVerificationKey, MAX_CLIENT_USER_PAGE_LIMIT,
-};
-pub(crate) use client_key::{
-    AcknowledgeProjectClientKeyDelivery, CLIENT_KEY_CREDENTIAL_PREFIX, CLIENT_KEY_PUBLIC_ID_BYTES,
-    CLIENT_KEY_SECRET_BYTES, ClientKeyCreateAttemptError, ClientKeyIssuer, ClientKeyLifecyclePort,
-    ClientKeyLifecycleService, ClientKeyVerifier, CreateProjectClientKey,
-    CreateProjectClientKeyResult, IssuedClientCredential, MAX_ACTIVE_CLIENT_KEYS_PER_PROJECT,
-    OneTimeClientCredential, ParsedClientCredential, PreparedProjectClientKey,
-    ProjectClientKeyCursor, ProjectClientKeyRecord, ProjectClientKeyStatus, RevokeProjectClientKey,
-    StoredProjectClientKeyCreate, client_key_display_prefix,
-};
-pub(crate) use client_readiness::{
-    ClientDigestReadinessClaim, ClientDigestReadinessPort, ClientDigestReadinessService,
-    ClientDigestReadinessSnapshot, ClientDigestReadinessState, MAX_REQUIRED_CLIENT_PROCESSES,
-    valid_client_process_id,
-};
 pub(crate) use control_lifecycle::{
     ApplicationSessionRecord, BrowserSessionRecord, ControlLifecyclePort, ControlLifecycleService,
-    DisableProjectUser, EnableProjectUser, ManagedSessionStatus, ProjectUserIdentityKind,
-    ProjectUserIdentityRecord, ProjectUserIdentityStatus, ProjectUserPage, ProjectUserRecord,
-    ProjectUserSessions, ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
+    DisableProjectUser, EnableProjectUser, ManagedSessionStatus, ProjectUserIdentityFilter,
+    ProjectUserIdentityKind, ProjectUserIdentityRecord, ProjectUserIdentityStatus,
+    ProjectUserListCriteria, ProjectUserPage, ProjectUserRecord, ProjectUserSessions,
+    ProjectUserSort, ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
 };
 pub(crate) use email_control::{
     CreateSmtpConfiguration, DeploymentSmtpGenerationRecord, EmailAssignmentRecord,
@@ -69,6 +51,7 @@ pub(crate) use email_control::{
     ReconcileDeploymentSmtpGeneration, SmtpConfigurationRecord, SmtpControlStatus,
     SmtpControlTlsMode, SmtpTestOperationRecord, SmtpTestState, UpdateEmailPolicy,
 };
+pub(crate) use email_identity_lookup::EmailIdentityLookupDigester;
 pub(crate) use error::ApplicationError;
 #[allow(
     unused_imports,
@@ -78,15 +61,15 @@ pub(crate) use identity_mutation::{
     BeginIdentityMutationEmailChallenge, CandidateEvidenceMaterial, ClaimIdentityMutationProvider,
     CommitIdentityMutationEmailGeneration, CompleteIdentityMutationEmailProof,
     ConfirmIdentityMutationReady, ControlIdentityMutationRepository, CreateIdentityMutation,
-    CreateIdentityMutationResult, CreatedIdentityMutation,
-    EstablishIdentityMutationMagicTransferContext, EstablishedIdentityMutationMagicTransferContext,
-    ExpectedIdentity, ExpectedUser, FailIdentityMutationProvider,
-    IdentityMutationAdmittedProviderProfile, IdentityMutationBindingsDisposition,
-    IdentityMutationBootstrap, IdentityMutationCallbackOutcome, IdentityMutationCandidate,
+    CreateIdentityMutationResult, EstablishIdentityMutationMagicTransferContext,
+    EstablishedIdentityMutationMagicTransferContext, ExpectedIdentity, ExpectedUser,
+    FailIdentityMutationProvider, IdentityMutationAdmittedProviderProfile,
+    IdentityMutationBindingsDisposition, IdentityMutationBootstrap,
+    IdentityMutationCallbackOutcome, IdentityMutationCandidate,
     IdentityMutationCandidateEvidenceContext, IdentityMutationCandidateEvidenceEnvelope,
     IdentityMutationCandidateKind, IdentityMutationCandidateVerifier,
     IdentityMutationControlConfirmationPreparation, IdentityMutationControlService,
-    IdentityMutationCreateOperation, IdentityMutationDigestVersions,
+    IdentityMutationCreateOperation, IdentityMutationCreateOutcome, IdentityMutationDigestVersions,
     IdentityMutationDurableEmailProtector, IdentityMutationEmailCandidate,
     IdentityMutationEmailChallengeAccepted, IdentityMutationEmailCompletionDecision,
     IdentityMutationEmailGenerationPreparation, IdentityMutationEmailProofDecision,
@@ -140,18 +123,19 @@ pub(crate) use managed_reauthorization::{
     ClaimManagedReauthorization, CompletedManagedReauthorization, CreateManagedReauthorization,
     CreateManagedReauthorizationResult, FailManagedReauthorization, ManagedReauthorizationCallback,
     ManagedReauthorizationCallbackOutcome, ManagedReauthorizationControlService,
-    ManagedReauthorizationDenial, ManagedReauthorizationDigestVersions,
-    ManagedReauthorizationRecord, ManagedReauthorizationRepository,
-    ManagedReauthorizationRuntimeService, ManagedReauthorizationStatus,
-    ManagedReauthorizationTargetIssuer, ManagedReauthorizationTargetVerifier,
-    ManagedReauthorizationView, PreparedManagedReauthorizationCreate, StartManagedReauthorization,
+    ManagedReauthorizationCreateOutcome, ManagedReauthorizationDenial,
+    ManagedReauthorizationDigestVersions, ManagedReauthorizationRecord,
+    ManagedReauthorizationRepository, ManagedReauthorizationRuntimeService,
+    ManagedReauthorizationStatus, ManagedReauthorizationTargetIssuer,
+    ManagedReauthorizationTargetVerifier, ManagedReauthorizationView,
+    PreparedManagedReauthorizationCreate, StartManagedReauthorization,
 };
 #[allow(unused_imports, reason = "passwordless email integration is additive")]
 pub(crate) use passwordless_email::{
     AdmittedEmailMethod, CommitEmailGeneration, CompleteEmailProof, EmailGenerationPreparation,
-    EmailIdentityAliasAuthority, EmailProofDecision, EmailProofKind, EstablishMagicTransferContext,
-    PasswordlessEmailRepository, ResolveMagicTransferContext, ResolvedMagicTransferContext,
-    SelectEmailMethod, VerifiedEmailChallenge, VerifyEmailProof,
+    EmailIdentityAliasAuthority, EmailMethodSelection, EmailProofDecision, EmailProofKind,
+    EstablishMagicTransferContext, PasswordlessEmailRepository, ResolveMagicTransferContext,
+    ResolvedMagicTransferContext, SelectEmailMethod, VerifiedEmailChallenge, VerifyEmailProof,
 };
 pub(crate) use provider_callback::{ProviderCallbackOwner, ProviderCallbackOwnerResolver};
 pub(crate) use provider_onboarding::{
@@ -180,12 +164,33 @@ pub(crate) use runtime_auth::{
 };
 pub(crate) use runtime_security::{
     AccessTokenSessionLookup, BrowserLogoutContext, CurrentSession, DurableEmailAddressReader,
-    HostedInteraction, HostedProviderMethod, LoginStartContext, OpaquePurpose,
-    ProjectionVerifiedEmailProtector, ProtectedPurpose, ProviderAuthorization,
+    HostedInteraction, HostedPendingEmailChallenge, HostedProviderMethod, LoginStartContext,
+    OpaquePurpose, ProjectionVerifiedEmailProtector, ProtectedPurpose, ProviderAuthorization,
     ProviderAuthorizationRequest, ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity,
     ProviderRequestProfile, ProviderRuntimeContext, ProviderSecretResolver,
     RenewableProviderCredential, RuntimeAuthorityRepository, RuntimeProtector, RuntimeSigner,
     UpstreamProviderClient, VerificationKey,
+};
+pub(crate) use server_api::{
+    ActiveServerToken, MAX_SERVER_USER_PAGE_LIMIT, ServerApiRepository, ServerApiService,
+    ServerApplicationProjection, ServerKeyAuthority, ServerPrincipal, ServerTokenIntrospection,
+    ServerTokenSessionLookup, ServerTokenSignatureVerifier, ServerUser, ServerUserCursor,
+    ServerUserPage, ServerUserStatus, ServerVerificationKey,
+};
+pub(crate) use server_key::{
+    AcknowledgeProjectServerKeyDelivery, CreateProjectServerKey, CreateProjectServerKeyResult,
+    IssuedServerCredential, MAX_ACTIVE_SERVER_KEYS_PER_PROJECT, OneTimeServerCredential,
+    ParsedServerCredential, PreparedProjectServerKey, ProjectServerKeyCursor,
+    ProjectServerKeyRecord, ProjectServerKeyStatus, RevokeProjectServerKey,
+    SERVER_KEY_CREDENTIAL_PREFIX, SERVER_KEY_PUBLIC_ID_BYTES, SERVER_KEY_SECRET_BYTES,
+    ServerKeyCreateAttemptError, ServerKeyIssuer, ServerKeyLifecyclePort,
+    ServerKeyLifecycleService, ServerKeyVerifier, StoredProjectServerKeyCreate,
+    server_key_display_prefix,
+};
+pub(crate) use server_readiness::{
+    MAX_REQUIRED_SERVER_PROCESSES, ServerDigestReadinessClaim, ServerDigestReadinessPort,
+    ServerDigestReadinessService, ServerDigestReadinessSnapshot, ServerDigestReadinessState,
+    valid_server_process_id,
 };
 #[allow(
     unused_imports,

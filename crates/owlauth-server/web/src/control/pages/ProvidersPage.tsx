@@ -13,6 +13,7 @@ import {
   DataTable,
   DescriptionList,
   EmptyState,
+  LoadingState,
   PageHeader,
   Section,
 } from "../../shared/layout/Layout";
@@ -254,27 +255,38 @@ export function ProvidersPage() {
   }
 
   async function adoptPreflightOrigins() {
-    if (project === null || policy === null || preflight === null) return;
+    if (project === null || policy?.mode !== "exact_origins" || preflight === null) {
+      return;
+    }
     clearOnboardingSecret();
     setOverlayError(null);
     setSubmitting(true);
+    const proposedOrigins = [
+      ...new Set([...policy.exact_origins, ...preflight.admitted_endpoint_origins]),
+    ].sort();
     try {
       const result = await session.client.PUT("/v1/projects/{project_id}/provider-egress-policy", {
         params: { path: { project_id: project.id } },
         body: {
           mode: "exact_origins",
-          exact_origins: preflight.admitted_endpoint_origins,
+          exact_origins: proposedOrigins,
           expected_revision: policy.revision,
         },
       });
       setPolicy(requireData(result.data, result.error, result.response));
       setPreflight(null);
       setPreflightIssuer("");
-      setMessage("Reviewed preflight origins adopted as the exact egress policy.", "success");
+      setMessage(
+        "Reviewed origins added without removing existing destinations. Run preflight again against the updated policy.",
+        "success",
+      );
     } catch (error) {
+      clearOnboardingSecret();
       setPreflight(null);
       setPreflightIssuer("");
-      setOverlayError(errorMessage(error, "The reviewed origins could not be adopted."));
+      setOverlayError(
+        errorMessage(error, "The reviewed origins could not be added. Run preflight again."),
+      );
       await handleError(error, refresh);
     } finally {
       setSubmitting(false);
@@ -449,8 +461,8 @@ export function ProvidersPage() {
         requireData(result.data, result.error, result.response);
         setMessage("Provider disabled.", "success");
       } else {
-        const result = await session.client.DELETE(
-          "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
+        const result = await session.client.POST(
+          "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}/unassign",
           {
             params: {
               path: {
@@ -499,7 +511,9 @@ export function ProvidersPage() {
           title="Authentication providers"
           description="Choose how users sign in and assign each provider to an Application."
         />
-        {loadState === "loading" ? <p role="status">Loading authentication providers</p> : null}
+        {loadState === "loading" ? (
+          <LoadingState>Loading authentication providers</LoadingState>
+        ) : null}
         {loadState === "failed" ? (
           <InlineAlert tone="danger" role="alert">
             <p>Provider configuration could not be loaded.</p>
@@ -572,7 +586,7 @@ export function ProvidersPage() {
         }
       >
         {policy === null ? (
-          <p role="status">Loading allowed destinations</p>
+          <LoadingState>Loading allowed destinations</LoadingState>
         ) : (
           <DescriptionList
             items={[
@@ -580,8 +594,8 @@ export function ProvidersPage() {
                 term: "Mode",
                 detail:
                   policy.mode === "allow_all"
-                    ? "Allow all safe discovered origins"
-                    : "Allow exact origins only",
+                    ? "Trust operator-selected provider origins"
+                    : "Allow exact reviewed origins only",
               },
               ...(policy.mode === "exact_origins"
                 ? [
@@ -620,15 +634,7 @@ export function ProvidersPage() {
             {providers.map((provider) => (
               <tr key={provider.id}>
                 <td>
-                  <button
-                    className={styles["resourceLink"]}
-                    type="button"
-                    onClick={() => {
-                      setSelectedProviderId(provider.id);
-                    }}
-                  >
-                    {provider.display_name}
-                  </button>
+                  <strong title={provider.display_name}>{provider.display_name}</strong>
                   <span className={styles["machineValue"]}>{provider.provider_key}</span>
                 </td>
                 <td>{provider.kind}</td>
@@ -1160,7 +1166,7 @@ function ProviderOnboardingDialog({
                 detail:
                   preflight.policy_mode === "exact_origins"
                     ? "Allowed origins match the Project destination policy"
-                    : "Safe discovered origins are allowed",
+                    : "Operator-selected discovered origins are trusted",
               },
               {
                 term: "PKCE S256",
@@ -1189,13 +1195,12 @@ function ProviderOnboardingDialog({
               },
             ]}
           />
-          {policy !== null &&
-          (policy.mode !== "exact_origins" ||
-            preflight.admitted_endpoint_origins.some(
-              (origin) => !policy.exact_origins.includes(origin),
-            )) ? (
+          {policy?.mode === "exact_origins" &&
+          preflight.admitted_endpoint_origins.some(
+            (origin) => !policy.exact_origins.includes(origin),
+          ) ? (
             <Button type="button" variant="secondary" onClick={onAdoptOrigins}>
-              Adopt reviewed origins as exact policy
+              Add reviewed origins to exact policy
             </Button>
           ) : null}
         </div>

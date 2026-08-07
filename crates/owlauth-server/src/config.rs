@@ -27,6 +27,7 @@ const CONTROL_KEY_SECRET_LENGTH: usize = 43;
 const MAX_PUBLICATION_LEASE_TTL: Duration = Duration::from_millis(43_200_999);
 const MAX_KEY_PROPAGATION_DELAY: Duration = Duration::from_hours(24);
 const MAX_SIGNING_VERIFICATION_RETENTION: Duration = Duration::from_hours(24);
+const MAX_AUTH_PROCESSES: usize = 64;
 const MIN_DATABASE_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_DATABASE_LOCK_TIMEOUT: Duration = Duration::from_mins(1);
 const MIN_MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
@@ -39,19 +40,17 @@ const MAX_MIGRATION_DEADLINE: Duration = Duration::from_hours(24);
 const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_MODE",
     "OWLAUTH_INSTANCE_ID",
-    "OWLAUTH_RUNTIME_ADDR",
-    "OWLAUTH_RUNTIME_BASE_URL",
-    "OWLAUTH_CLIENT_ADDR",
-    "OWLAUTH_CLIENT_BASE_URL",
+    "OWLAUTH_AUTH_ADDR",
+    "OWLAUTH_AUTH_BASE_URL",
     "OWLAUTH_CONTROL_ADDR",
     "OWLAUTH_CONTROL_BASE_URL",
     "OWLAUTH_CONTROL_API_KEY",
-    "OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION",
-    "OWLAUTH_CLIENT_KEY_DIGEST_KEY",
-    "OWLAUTH_CLIENT_KEY_DIGEST_RETAINED_KEYS",
-    "OWLAUTH_CLIENT_PROCESS_ID",
-    "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS",
-    "OWLAUTH_CLIENT_DIGEST_READINESS_LEASE_TTL_MS",
+    "OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION",
+    "OWLAUTH_SERVER_KEY_DIGEST_KEY",
+    "OWLAUTH_SERVER_KEY_DIGEST_RETAINED_KEYS",
+    "OWLAUTH_AUTH_PROCESS_ID",
+    "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS",
+    "OWLAUTH_SERVER_DIGEST_READINESS_LEASE_TTL_MS",
     "OWLAUTH_CONTROL_MCP_ENABLED",
     "OWLAUTH_CONTROL_MCP_MAX_REQUEST_BYTES",
     "OWLAUTH_CONTROL_MCP_REQUEST_TIMEOUT_MS",
@@ -88,14 +87,12 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_MANAGED_CREDENTIAL_KEY",
     "OWLAUTH_MANAGED_CREDENTIAL_RETAINED_KEYS",
     "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK",
-    "OWLAUTH_RUNTIME_PROCESS_ID",
     "OWLAUTH_ADMISSION_REDIS_URL",
     "OWLAUTH_ADMISSION_DIGEST_KEY",
     "OWLAUTH_ADMISSION_NAMESPACE",
     "OWLAUTH_ADMISSION_REDIS_TIMEOUT_MS",
-    "OWLAUTH_RUNTIME_MAX_PROCESSES",
-    "OWLAUTH_CLIENT_MAX_PROCESSES",
-    "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
+    "OWLAUTH_AUTH_MAX_PROCESSES",
+    "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS",
     "OWLAUTH_DEPLOYMENT_SMTP_GENERATION",
     "OWLAUTH_DEPLOYMENT_SMTP_STATUS",
     "OWLAUTH_DEPLOYMENT_SMTP_HOST",
@@ -110,7 +107,7 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS",
     "OWLAUTH_POSTGRES_URL",
     "OWLAUTH_RUNTIME_POSTGRES_URL",
-    "OWLAUTH_CLIENT_POSTGRES_URL",
+    "OWLAUTH_SERVER_POSTGRES_URL",
     "OWLAUTH_CONTROL_POSTGRES_URL",
     "OWLAUTH_MIGRATION_POSTGRES_URL",
     "OWLAUTH_MIGRATION_MODE",
@@ -121,36 +118,41 @@ const KNOWN_ENVIRONMENT_KEYS: &[&str] = &[
     "OWLAUTH_MIGRATION_STATEMENT_TIMEOUT_MS",
     "OWLAUTH_MIGRATION_DEADLINE_MS",
     "OWLAUTH_RUNTIME_DATABASE_MAX_CONNECTIONS",
-    "OWLAUTH_CLIENT_DATABASE_MAX_CONNECTIONS",
+    "OWLAUTH_SERVER_DATABASE_MAX_CONNECTIONS",
     "OWLAUTH_CONTROL_DATABASE_MAX_CONNECTIONS",
-    "OWLAUTH_REQUEST_TIMEOUT_MS",
-    "OWLAUTH_MAX_REQUEST_BYTES",
+    "OWLAUTH_AUTH_REQUEST_TIMEOUT_MS",
+    "OWLAUTH_AUTH_MAX_REQUEST_BYTES",
+    "OWLAUTH_AUTH_MAX_IN_FLIGHT_REQUESTS",
+    "OWLAUTH_AUTH_MAX_CONNECTIONS",
+    "OWLAUTH_AUTH_MAX_HEADER_COUNT",
+    "OWLAUTH_AUTH_MAX_HEADER_BYTES",
+    "OWLAUTH_AUTH_MAX_URI_BYTES",
+    "OWLAUTH_CONTROL_REQUEST_TIMEOUT_MS",
+    "OWLAUTH_CONTROL_MAX_REQUEST_BYTES",
+    "OWLAUTH_CONTROL_MAX_IN_FLIGHT_REQUESTS",
+    "OWLAUTH_CONTROL_MAX_CONNECTIONS",
+    "OWLAUTH_CONTROL_MAX_HEADER_COUNT",
+    "OWLAUTH_CONTROL_MAX_HEADER_BYTES",
+    "OWLAUTH_CONTROL_MAX_URI_BYTES",
     "OWLAUTH_SHUTDOWN_TIMEOUT_MS",
 ];
 
 /// Process composition mode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PlaneMode {
-    /// Compose all three isolated listeners.
+pub enum ProcessMode {
+    /// Compose both the Auth and Control endpoints.
     All,
-    /// Compose only the Runtime listener.
+    /// Compose the Auth endpoint, including its isolated Runtime and Server API surfaces.
     #[default]
-    Runtime,
-    /// Compose only the Client listener.
-    Client,
-    /// Compose only the Control listener.
+    Auth,
+    /// Compose only the Control endpoint.
     Control,
 }
 
-impl PlaneMode {
+impl ProcessMode {
     #[must_use]
-    pub const fn has_runtime(self) -> bool {
-        matches!(self, Self::All | Self::Runtime)
-    }
-
-    #[must_use]
-    pub const fn has_client(self) -> bool {
-        matches!(self, Self::All | Self::Client)
+    pub const fn has_auth(self) -> bool {
+        matches!(self, Self::All | Self::Auth)
     }
 
     #[must_use]
@@ -159,18 +161,17 @@ impl PlaneMode {
     }
 }
 
-impl FromStr for PlaneMode {
+impl FromStr for ProcessMode {
     type Err = ConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "all" => Ok(Self::All),
-            "runtime" => Ok(Self::Runtime),
-            "client" => Ok(Self::Client),
+            "auth" => Ok(Self::Auth),
             "control" => Ok(Self::Control),
             _ => Err(ConfigError::InvalidValue {
                 key: "OWLAUTH_MODE",
-                reason: "must be `all`, `runtime`, `client`, or `control`".to_owned(),
+                reason: "must be `all`, `auth`, or `control`".to_owned(),
             }),
         }
     }
@@ -255,11 +256,22 @@ impl fmt::Debug for OperatorApiKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpBudgetConfig {
+    pub request_timeout: Duration,
+    pub max_request_bytes: usize,
+    pub max_in_flight_requests: usize,
+    pub max_connections: usize,
+    pub max_header_count: usize,
+    pub max_header_bytes: usize,
+    pub max_uri_bytes: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct ListenerConfig {
     pub bind: SocketAddr,
     pub external_base: Url,
-    pub database_max_connections: NonZeroU32,
+    pub http: HttpBudgetConfig,
 }
 
 /// Bounded, explicitly enabled remote Streamable HTTP MCP configuration.
@@ -277,7 +289,7 @@ pub struct McpHttpConfig {
 pub struct PostgresConfig {
     pub serving_url: SecretString,
     pub runtime_url: SecretString,
-    pub client_url: SecretString,
+    pub server_url: SecretString,
     pub control_url: SecretString,
     pub migration_url: SecretString,
     pub migration_mode: MigrationMode,
@@ -362,7 +374,7 @@ pub struct ManagedCredentialProtectionConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct ClientKeyDigestConfig {
+pub struct ServerKeyDigestConfig {
     pub active_version: i32,
     pub active_key: StoreMasterKey,
     pub retained: BTreeMap<i32, StoreMasterKey>,
@@ -374,8 +386,7 @@ pub struct AdmissionConfig {
     pub digest_key: StoreMasterKey,
     pub namespace: String,
     pub redis_timeout: Duration,
-    pub runtime_maximum_processes: Option<NonZeroU32>,
-    pub client_maximum_processes: Option<NonZeroU32>,
+    pub auth_maximum_processes: Option<NonZeroU32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -400,11 +411,13 @@ pub struct DeploymentSmtpConfig {
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    pub mode: PlaneMode,
+    pub mode: ProcessMode,
     pub instance_id: Option<String>,
-    pub runtime: ListenerConfig,
-    pub client: ListenerConfig,
+    pub auth: ListenerConfig,
     pub control: ListenerConfig,
+    pub runtime_database_max_connections: NonZeroU32,
+    pub server_database_max_connections: NonZeroU32,
+    pub control_database_max_connections: NonZeroU32,
     pub control_api_key: Option<OperatorApiKey>,
     pub control_mcp: McpHttpConfig,
     pub provisioning: Option<ProvisioningConfig>,
@@ -418,13 +431,11 @@ pub struct ServerConfig {
     /// Control never loads the generic Runtime protection ring.
     pub identity_mutation_evidence_protection: RuntimeProtectionConfig,
     pub managed_credential_protection: Option<ManagedCredentialProtectionConfig>,
-    pub client_key_digest: Option<ClientKeyDigestConfig>,
+    pub server_key_digest: Option<ServerKeyDigestConfig>,
     pub provider_allow_http_loopback: bool,
-    pub runtime_process_id: String,
-    pub required_runtime_process_ids: Vec<String>,
-    pub client_process_id: String,
-    pub required_client_process_ids: Vec<String>,
-    pub client_digest_readiness_lease_ttl: Duration,
+    pub auth_process_id: String,
+    pub required_auth_process_ids: Vec<String>,
+    pub server_digest_readiness_lease_ttl: Duration,
     pub admission: Option<AdmissionConfig>,
     pub deployment_smtp: Option<DeploymentSmtpConfig>,
     pub webhook_allowed_private_ips: Vec<IpAddr>,
@@ -432,17 +443,15 @@ pub struct ServerConfig {
     pub key_propagation_delay: Duration,
     pub signing_verification_retention: Duration,
     pub postgres: PostgresConfig,
-    pub request_timeout: Duration,
-    pub max_request_bytes: usize,
     pub shutdown_timeout: Duration,
 }
 
 impl ServerConfig {
     /// Reads and validates the complete `OwlAuth` environment configuration.
     ///
-    /// Unknown `OWLAUTH_*` variables are rejected. Runtime-only mode loads the configured
-    /// `PostgreSQL` custody provider authority required for federated Project authentication, but it
-    /// deliberately does not load the Control operator credential.
+    /// Unknown `OWLAUTH_*` variables are rejected. Auth-only mode loads the configured
+    /// `PostgreSQL` custody provider authority required for Project authentication, but deliberately
+    /// does not load the Control operator credential.
     ///
     /// # Errors
     ///
@@ -503,42 +512,19 @@ impl ServerConfig {
     ) -> Result<Self, ConfigError> {
         reject_unknown_keys(values)?;
 
-        let mode = optional(values, "OWLAUTH_MODE")
-            .unwrap_or("runtime")
-            .parse()?;
-        let runtime = ListenerConfig {
+        let mode = optional(values, "OWLAUTH_MODE").unwrap_or("auth").parse()?;
+        let auth = ListenerConfig {
             bind: parse_value(
                 values,
-                "OWLAUTH_RUNTIME_ADDR",
+                "OWLAUTH_AUTH_ADDR",
                 "127.0.0.1:8080",
                 "must be an IP socket address",
             )?,
             external_base: parse_external_base(
-                "OWLAUTH_RUNTIME_BASE_URL",
-                optional(values, "OWLAUTH_RUNTIME_BASE_URL").unwrap_or("http://127.0.0.1:8080/"),
+                "OWLAUTH_AUTH_BASE_URL",
+                optional(values, "OWLAUTH_AUTH_BASE_URL").unwrap_or("http://127.0.0.1:8080/"),
             )?,
-            database_max_connections: parse_nonzero_u32(
-                values,
-                "OWLAUTH_RUNTIME_DATABASE_MAX_CONNECTIONS",
-                20,
-            )?,
-        };
-        let client = ListenerConfig {
-            bind: parse_value(
-                values,
-                "OWLAUTH_CLIENT_ADDR",
-                "127.0.0.1:8082",
-                "must be an IP socket address",
-            )?,
-            external_base: parse_external_base(
-                "OWLAUTH_CLIENT_BASE_URL",
-                optional(values, "OWLAUTH_CLIENT_BASE_URL").unwrap_or("http://127.0.0.1:8082/"),
-            )?,
-            database_max_connections: parse_nonzero_u32(
-                values,
-                "OWLAUTH_CLIENT_DATABASE_MAX_CONNECTIONS",
-                10,
-            )?,
+            http: parse_http_budget(values, HttpBudgetPlane::Auth)?,
         };
         let control = ListenerConfig {
             bind: parse_value(
@@ -551,17 +537,15 @@ impl ServerConfig {
                 "OWLAUTH_CONTROL_BASE_URL",
                 optional(values, "OWLAUTH_CONTROL_BASE_URL").unwrap_or("http://127.0.0.1:8081/"),
             )?,
-            database_max_connections: parse_nonzero_u32(
-                values,
-                "OWLAUTH_CONTROL_DATABASE_MAX_CONNECTIONS",
-                5,
-            )?,
+            http: parse_http_budget(values, HttpBudgetPlane::Control)?,
         };
-        validate_external_bases(
-            &runtime.external_base,
-            &client.external_base,
-            &control.external_base,
-        )?;
+        let runtime_database_max_connections =
+            parse_nonzero_u32(values, "OWLAUTH_RUNTIME_DATABASE_MAX_CONNECTIONS", 20)?;
+        let server_database_max_connections =
+            parse_nonzero_u32(values, "OWLAUTH_SERVER_DATABASE_MAX_CONNECTIONS", 10)?;
+        let control_database_max_connections =
+            parse_nonzero_u32(values, "OWLAUTH_CONTROL_DATABASE_MAX_CONNECTIONS", 5)?;
+        validate_external_bases(&auth.external_base, &control.external_base)?;
 
         let (instance_id, control_api_key) = parse_control_identity(mode, values)?;
         let control_mcp = parse_control_mcp(mode, values)?;
@@ -570,7 +554,7 @@ impl ServerConfig {
         let runtime_protection = parse_runtime_protection(mode, values)?;
         let email_identity_protection = parse_email_identity_protection(mode, values)?;
         let projection_email_protection = parse_projection_email_protection(values)?;
-        let smtp_extra_root_cert_der = if mode.has_runtime() {
+        let smtp_extra_root_cert_der = if mode.has_auth() {
             optional(values, "OWLAUTH_SMTP_EXTRA_ROOT_CERT_DER_FILE")
                 .map(PathBuf::from)
                 .map(|path| {
@@ -603,7 +587,7 @@ impl ServerConfig {
         } else {
             None
         };
-        let webhook_extra_root_cert_der = if mode.has_runtime() {
+        let webhook_extra_root_cert_der = if mode.has_auth() {
             optional(values, "OWLAUTH_WEBHOOK_EXTRA_ROOT_CERT_DER_FILE")
                 .map(PathBuf::from)
                 .map(|path| {
@@ -641,98 +625,66 @@ impl ServerConfig {
         let identity_mutation_evidence_protection =
             parse_identity_mutation_evidence_protection(values)?;
         let managed_credential_protection = parse_managed_credential_protection(mode, values)?;
-        let client_key_digest = parse_client_key_digest(mode, values)?;
+        let server_key_digest = parse_server_key_digest(mode, values)?;
         let provider_allow_http_loopback =
             parse_boolean(values, "OWLAUTH_PROVIDER_ALLOW_HTTP_LOOPBACK", false)?;
-        let configured_runtime_process_id = optional(values, "OWLAUTH_RUNTIME_PROCESS_ID")
+        let configured_auth_process_id = optional(values, "OWLAUTH_AUTH_PROCESS_ID")
             .map(validate_process_id)
             .transpose()?;
-        if mode.has_runtime() && configured_runtime_process_id.is_none() {
-            return Err(ConfigError::Missing("OWLAUTH_RUNTIME_PROCESS_ID"));
+        if mode.has_auth() && configured_auth_process_id.is_none() {
+            return Err(ConfigError::Missing("OWLAUTH_AUTH_PROCESS_ID"));
         }
-        let runtime_process_id = configured_runtime_process_id.unwrap_or_default();
-        let required_runtime_process_ids =
-            match optional(values, "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS") {
-                Some(configured) => {
-                    let ids = configured
-                        .split(',')
-                        .map(validate_process_id)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if ids.is_empty()
-                        || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
-                    {
-                        return Err(ConfigError::InvalidValue {
-                            key: "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
-                            reason: "must contain unique comma-separated process IDs".to_owned(),
-                        });
-                    }
-                    ids
-                }
-                None if mode == PlaneMode::Control => {
-                    return Err(ConfigError::Missing("OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS"));
-                }
-                None if mode.has_runtime() => vec![runtime_process_id.clone()],
-                None => Vec::new(),
-            };
-        if mode.has_runtime()
-            && !required_runtime_process_ids
-                .iter()
-                .any(|process_id| process_id == &runtime_process_id)
+        let auth_process_id = configured_auth_process_id.unwrap_or_default();
+        let required_auth_process_ids = match optional(values, "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS")
         {
+            Some(configured) => {
+                let ids = configured
+                    .split(',')
+                    .map(validate_process_id)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if ids.is_empty()
+                    || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
+                {
+                    return Err(ConfigError::InvalidValue {
+                        key: "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS",
+                        reason: "must contain unique comma-separated process IDs".to_owned(),
+                    });
+                }
+                ids
+            }
+            None if mode == ProcessMode::Control => {
+                return Err(ConfigError::Missing("OWLAUTH_REQUIRED_AUTH_PROCESS_IDS"));
+            }
+            None if mode.has_auth() => vec![auth_process_id.clone()],
+            None => Vec::new(),
+        };
+        if required_auth_process_ids.len() > MAX_AUTH_PROCESSES {
             return Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
-                reason: "must include this Runtime process's OWLAUTH_RUNTIME_PROCESS_ID".to_owned(),
+                key: "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS",
+                reason: format!("must contain at most {MAX_AUTH_PROCESSES} process IDs"),
             });
         }
-        let configured_client_process_id = optional(values, "OWLAUTH_CLIENT_PROCESS_ID")
-            .map(validate_process_id)
-            .transpose()?;
-        if mode.has_client() && configured_client_process_id.is_none() {
-            return Err(ConfigError::Missing("OWLAUTH_CLIENT_PROCESS_ID"));
-        }
-        let client_process_id = configured_client_process_id.unwrap_or_default();
-        let required_client_process_ids =
-            match optional(values, "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS") {
-                Some(configured) => {
-                    let ids = configured
-                        .split(',')
-                        .map(validate_process_id)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if ids.is_empty() || ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
-                        return Err(ConfigError::InvalidValue {
-                            key: "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS",
-                            reason: "must contain unique comma-separated process IDs".to_owned(),
-                        });
-                    }
-                    ids
-                }
-                None if mode.has_control() && !mode.has_client() => {
-                    return Err(ConfigError::Missing("OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS"));
-                }
-                None if mode.has_client() => vec![client_process_id.clone()],
-                None => Vec::new(),
-            };
-        if mode.has_client()
-            && !required_client_process_ids
+        if mode.has_auth()
+            && !required_auth_process_ids
                 .iter()
-                .any(|process_id| process_id == &client_process_id)
+                .any(|process_id| process_id == &auth_process_id)
         {
             return Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS",
-                reason: "must include this Client process's OWLAUTH_CLIENT_PROCESS_ID".to_owned(),
+                key: "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS",
+                reason: "must include this Auth process's OWLAUTH_AUTH_PROCESS_ID".to_owned(),
             });
         }
-        let client_digest_readiness_lease_ttl = parse_millis(
+        let server_digest_readiness_lease_ttl = parse_millis(
             values,
-            "OWLAUTH_CLIENT_DIGEST_READINESS_LEASE_TTL_MS",
+            "OWLAUTH_SERVER_DIGEST_READINESS_LEASE_TTL_MS",
             30_000,
         )?;
-        if (mode.has_client() || mode.has_control())
-            && (client_digest_readiness_lease_ttl < Duration::from_secs(1)
-                || client_digest_readiness_lease_ttl > Duration::from_mins(5))
+        if (mode.has_auth() || mode.has_control())
+            && (server_digest_readiness_lease_ttl < Duration::from_secs(1)
+                || server_digest_readiness_lease_ttl > Duration::from_mins(5))
         {
             return Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_CLIENT_DIGEST_READINESS_LEASE_TTL_MS",
+                key: "OWLAUTH_SERVER_DIGEST_READINESS_LEASE_TTL_MS",
                 reason: "must be between 1000 and 300000 milliseconds".to_owned(),
             });
         }
@@ -747,8 +699,7 @@ impl ServerConfig {
             instance_id
                 .as_deref()
                 .expect("validated configuration always has an instance ID"),
-            required_runtime_process_ids.len(),
-            required_client_process_ids.len(),
+            required_auth_process_ids.len(),
         )?;
         validate_protection_root_separation(
             runtime_protection.as_ref(),
@@ -757,7 +708,7 @@ impl ServerConfig {
             &managed_reauthorization_target_protection,
             &identity_mutation_evidence_protection,
             managed_credential_protection.as_ref(),
-            client_key_digest.as_ref(),
+            server_key_digest.as_ref(),
             provisioning.as_ref(),
             admission.as_ref(),
         )?;
@@ -766,7 +717,7 @@ impl ServerConfig {
         let runtime_url = optional(values, "OWLAUTH_RUNTIME_POSTGRES_URL")
             .unwrap_or(&serving_url)
             .to_owned();
-        let client_url = optional(values, "OWLAUTH_CLIENT_POSTGRES_URL")
+        let server_url = optional(values, "OWLAUTH_SERVER_POSTGRES_URL")
             .unwrap_or(&serving_url)
             .to_owned();
         let control_url = optional(values, "OWLAUTH_CONTROL_POSTGRES_URL")
@@ -776,7 +727,7 @@ impl ServerConfig {
             .unwrap_or(&serving_url)
             .to_owned();
         validate_database_authority(&serving_url, &runtime_url, "OWLAUTH_RUNTIME_POSTGRES_URL")?;
-        validate_database_authority(&serving_url, &client_url, "OWLAUTH_CLIENT_POSTGRES_URL")?;
+        validate_database_authority(&serving_url, &server_url, "OWLAUTH_SERVER_POSTGRES_URL")?;
         validate_database_authority(&serving_url, &control_url, "OWLAUTH_CONTROL_POSTGRES_URL")?;
         validate_database_authority(
             &serving_url,
@@ -872,9 +823,11 @@ impl ServerConfig {
         Ok(Self {
             mode,
             instance_id,
-            runtime,
-            client,
+            auth,
             control,
+            runtime_database_max_connections,
+            server_database_max_connections,
+            control_database_max_connections,
             control_api_key,
             control_mcp,
             provisioning,
@@ -886,13 +839,11 @@ impl ServerConfig {
             managed_reauthorization_target_protection,
             identity_mutation_evidence_protection,
             managed_credential_protection,
-            client_key_digest,
+            server_key_digest,
             provider_allow_http_loopback,
-            runtime_process_id,
-            required_runtime_process_ids,
-            client_process_id,
-            required_client_process_ids,
-            client_digest_readiness_lease_ttl,
+            auth_process_id,
+            required_auth_process_ids,
+            server_digest_readiness_lease_ttl,
             admission,
             deployment_smtp,
             webhook_allowed_private_ips,
@@ -902,7 +853,7 @@ impl ServerConfig {
             postgres: PostgresConfig {
                 serving_url: SecretString::new(serving_url),
                 runtime_url: SecretString::new(runtime_url),
-                client_url: SecretString::new(client_url),
+                server_url: SecretString::new(server_url),
                 control_url: SecretString::new(control_url),
                 migration_url: SecretString::new(migration_url),
                 migration_mode: optional(values, "OWLAUTH_MIGRATION_MODE")
@@ -919,13 +870,6 @@ impl ServerConfig {
                 migration_statement_timeout,
                 migration_deadline,
             },
-            request_timeout: parse_millis(values, "OWLAUTH_REQUEST_TIMEOUT_MS", 10_000)?,
-            max_request_bytes: parse_value(
-                values,
-                "OWLAUTH_MAX_REQUEST_BYTES",
-                "1048576",
-                "must be a positive byte count",
-            )?,
             shutdown_timeout: parse_millis(values, "OWLAUTH_SHUTDOWN_TIMEOUT_MS", 10_000)?,
         })
     }
@@ -941,7 +885,7 @@ pub enum ConfigError {
     InvalidValue { key: &'static str, reason: String },
     #[error("configured PostgreSQL URLs must identify one server and database authority ({0})")]
     DatabaseAuthority(&'static str),
-    #[error("Runtime and Control bases on one origin must be disjoint non-root paths")]
+    #[error("Auth and Control bases on one origin must be disjoint non-root paths")]
     SharedOriginBases,
 }
 
@@ -1138,13 +1082,12 @@ fn parse_deployment_smtp_fingerprint(value: &str) -> Result<[u8; 32], ConfigErro
 }
 
 fn parse_admission(
-    mode: PlaneMode,
+    mode: ProcessMode,
     values: &BTreeMap<String, String>,
     instance_id: &str,
-    runtime_roster_size: usize,
-    client_roster_size: usize,
+    auth_roster_size: usize,
 ) -> Result<Option<AdmissionConfig>, ConfigError> {
-    if !mode.has_runtime() && !mode.has_client() {
+    if !mode.has_auth() {
         return Ok(None);
     }
     let digest_key = StoreMasterKey::parse(
@@ -1188,35 +1131,18 @@ fn parse_admission(
             reason: "must be between 10 and 2000 milliseconds".to_owned(),
         });
     }
-    let runtime_maximum_processes = mode
-        .has_runtime()
-        .then(|| {
-            parse_admission_maximum_processes(
-                values,
-                "OWLAUTH_RUNTIME_MAX_PROCESSES",
-                "Runtime",
-                runtime_roster_size,
-            )
-        })
-        .transpose()?;
-    let client_maximum_processes = mode
-        .has_client()
-        .then(|| {
-            parse_admission_maximum_processes(
-                values,
-                "OWLAUTH_CLIENT_MAX_PROCESSES",
-                "Client",
-                client_roster_size,
-            )
-        })
-        .transpose()?;
+    let auth_maximum_processes = parse_admission_maximum_processes(
+        values,
+        "OWLAUTH_AUTH_MAX_PROCESSES",
+        "Auth",
+        auth_roster_size,
+    )?;
     Ok(Some(AdmissionConfig {
         redis_url,
         digest_key,
         namespace,
         redis_timeout,
-        runtime_maximum_processes,
-        client_maximum_processes,
+        auth_maximum_processes: Some(auth_maximum_processes),
     }))
 }
 
@@ -1232,7 +1158,7 @@ fn parse_admission_maximum_processes(
         reason: reason(),
     })?;
     let maximum_processes = parse_nonzero_u32(values, key, default_processes)?;
-    if maximum_processes.get() > 64
+    if usize::try_from(maximum_processes.get()).unwrap_or(usize::MAX) > MAX_AUTH_PROCESSES
         || usize::try_from(maximum_processes.get()).unwrap_or(usize::MAX) < roster_size
     {
         return Err(ConfigError::InvalidValue {
@@ -1258,7 +1184,7 @@ fn validate_admission_namespace(value: &str) -> Result<String, ConfigError> {
 }
 
 fn parse_control_identity(
-    mode: PlaneMode,
+    mode: ProcessMode,
     values: &BTreeMap<String, String>,
 ) -> Result<(Option<String>, Option<OperatorApiKey>), ConfigError> {
     let instance_id = validate_instance_id(required(values, "OWLAUTH_INSTANCE_ID")?)?;
@@ -1274,7 +1200,7 @@ fn parse_control_identity(
 }
 
 fn parse_control_mcp(
-    mode: PlaneMode,
+    mode: ProcessMode,
     values: &BTreeMap<String, String>,
 ) -> Result<McpHttpConfig, ConfigError> {
     let enabled = parse_boolean(values, "OWLAUTH_CONTROL_MCP_ENABLED", false)?;
@@ -1351,11 +1277,11 @@ fn validate_control_mcp_listener(
 }
 
 fn parse_provisioning(
-    mode: PlaneMode,
+    mode: ProcessMode,
     values: &BTreeMap<String, String>,
     require_software_custody: bool,
 ) -> Result<Option<ProvisioningConfig>, ConfigError> {
-    let runtime_needs_stores = mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE;
+    let runtime_needs_stores = mode.has_auth() && FEDERATED_PROJECT_AUTH_AVAILABLE;
     if !mode.has_control() && !runtime_needs_stores {
         return Ok(None);
     }
@@ -1416,10 +1342,10 @@ impl<'de> Deserialize<'de> for UniqueVersionedKeys {
 }
 
 fn parse_runtime_protection(
-    mode: PlaneMode,
+    mode: ProcessMode,
     values: &BTreeMap<String, String>,
 ) -> Result<Option<RuntimeProtectionConfig>, ConfigError> {
-    if !mode.has_runtime() {
+    if !mode.has_auth() {
         // Control-only composition deliberately does not parse or retain generic Runtime roots.
         // Deployments may still share a broader environment template without expanding custody.
         return Ok(None);
@@ -1439,7 +1365,7 @@ fn parse_runtime_protection(
 }
 
 fn parse_email_identity_protection(
-    _mode: PlaneMode,
+    _mode: ProcessMode,
     values: &BTreeMap<String, String>,
 ) -> Result<Option<EmailIdentityProtectionConfig>, ConfigError> {
     const EMAIL_IDENTITY_KEYS: [&str; 6] = [
@@ -1754,7 +1680,7 @@ fn validate_protection_root_separation(
     managed_target: &RuntimeProtectionConfig,
     identity_evidence: &RuntimeProtectionConfig,
     managed_credential: Option<&ManagedCredentialProtectionConfig>,
-    client_key_digest: Option<&ClientKeyDigestConfig>,
+    server_key_digest: Option<&ServerKeyDigestConfig>,
     provisioning: Option<&ProvisioningConfig>,
     admission: Option<&AdmissionConfig>,
 ) -> Result<(), ConfigError> {
@@ -1805,11 +1731,11 @@ fn validate_protection_root_separation(
             insert(key.0.as_ref(), "OWLAUTH_MANAGED_CREDENTIAL_KEY")?;
         }
     }
-    if let Some(client_key_digest) = client_key_digest {
-        for key in std::iter::once(&client_key_digest.active_key)
-            .chain(client_key_digest.retained.values())
+    if let Some(server_key_digest) = server_key_digest {
+        for key in std::iter::once(&server_key_digest.active_key)
+            .chain(server_key_digest.retained.values())
         {
-            insert(key.0.as_ref(), "OWLAUTH_CLIENT_KEY_DIGEST_KEY")?;
+            insert(key.0.as_ref(), "OWLAUTH_SERVER_KEY_DIGEST_KEY")?;
         }
     }
     for key in std::iter::once(&managed_target.active).chain(managed_target.retained.values()) {
@@ -1850,54 +1776,54 @@ fn validate_protection_root_separation(
     Ok(())
 }
 
-fn parse_client_key_digest(
-    mode: PlaneMode,
+fn parse_server_key_digest(
+    mode: ProcessMode,
     values: &BTreeMap<String, String>,
-) -> Result<Option<ClientKeyDigestConfig>, ConfigError> {
-    if !mode.has_client() && !mode.has_control() {
+) -> Result<Option<ServerKeyDigestConfig>, ConfigError> {
+    if !mode.has_auth() && !mode.has_control() {
         return Ok(None);
     }
-    let active_version = required(values, "OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION")?
+    let active_version = required(values, "OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION")?
         .parse::<i32>()
         .ok()
         .filter(|version| *version > 0)
         .ok_or_else(|| ConfigError::InvalidValue {
-            key: "OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION",
+            key: "OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION",
             reason: "must be a positive integer".to_owned(),
         })?;
     let active_key = StoreMasterKey::parse(
-        "OWLAUTH_CLIENT_KEY_DIGEST_KEY",
-        required(values, "OWLAUTH_CLIENT_KEY_DIGEST_KEY")?,
+        "OWLAUTH_SERVER_KEY_DIGEST_KEY",
+        required(values, "OWLAUTH_SERVER_KEY_DIGEST_KEY")?,
     )?;
     let retained = serde_json::from_str::<BTreeMap<i32, String>>(
-        optional(values, "OWLAUTH_CLIENT_KEY_DIGEST_RETAINED_KEYS").unwrap_or("{}"),
+        optional(values, "OWLAUTH_SERVER_KEY_DIGEST_RETAINED_KEYS").unwrap_or("{}"),
     )
     .map_err(|_| ConfigError::InvalidValue {
-        key: "OWLAUTH_CLIENT_KEY_DIGEST_RETAINED_KEYS",
+        key: "OWLAUTH_SERVER_KEY_DIGEST_RETAINED_KEYS",
         reason: "must be a JSON object keyed by unique positive key versions".to_owned(),
     })?
     .into_iter()
     .map(|(version, value)| {
         if version <= 0 || version == active_version {
             return Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_CLIENT_KEY_DIGEST_RETAINED_KEYS",
+                key: "OWLAUTH_SERVER_KEY_DIGEST_RETAINED_KEYS",
                 reason: "versions must be positive and must not repeat the active version"
                     .to_owned(),
             });
         }
         Ok((
             version,
-            StoreMasterKey::parse("OWLAUTH_CLIENT_KEY_DIGEST_RETAINED_KEYS", value)?,
+            StoreMasterKey::parse("OWLAUTH_SERVER_KEY_DIGEST_RETAINED_KEYS", value)?,
         ))
     })
     .collect::<Result<BTreeMap<_, _>, _>>()?;
     if retained.len() > 31 {
         return Err(ConfigError::InvalidValue {
-            key: "OWLAUTH_CLIENT_KEY_DIGEST_RETAINED_KEYS",
+            key: "OWLAUTH_SERVER_KEY_DIGEST_RETAINED_KEYS",
             reason: "at most 31 retained versions are supported".to_owned(),
         });
     }
-    Ok(Some(ClientKeyDigestConfig {
+    Ok(Some(ServerKeyDigestConfig {
         active_version,
         active_key,
         retained,
@@ -1905,10 +1831,10 @@ fn parse_client_key_digest(
 }
 
 fn parse_managed_credential_protection(
-    mode: PlaneMode,
+    mode: ProcessMode,
     values: &BTreeMap<String, String>,
 ) -> Result<Option<ManagedCredentialProtectionConfig>, ConfigError> {
-    let required_for_runtime = mode.has_runtime() && FEDERATED_PROJECT_AUTH_AVAILABLE;
+    let required_for_runtime = mode.has_auth() && FEDERATED_PROJECT_AUTH_AVAILABLE;
     if !required_for_runtime {
         return Ok(None);
     }
@@ -1979,7 +1905,7 @@ fn validate_process_id(value: &str) -> Result<String, ConfigError> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return Err(ConfigError::InvalidValue {
-            key: "OWLAUTH_RUNTIME_PROCESS_ID",
+            key: "OWLAUTH_AUTH_PROCESS_ID",
             reason: "must be 1 to 128 URL-safe opaque ASCII characters".to_owned(),
         });
     }
@@ -2030,6 +1956,56 @@ fn parse_nonzero_u32(
     NonZeroU32::new(value).ok_or_else(|| ConfigError::InvalidValue {
         key,
         reason: "must be greater than zero".to_owned(),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum HttpBudgetPlane {
+    Auth,
+    Control,
+}
+
+fn parse_http_budget(
+    values: &BTreeMap<String, String>,
+    plane: HttpBudgetPlane,
+) -> Result<HttpBudgetConfig, ConfigError> {
+    let (timeout, body, in_flight, connections, header_count, header_bytes, uri_bytes, defaults) =
+        match plane {
+            HttpBudgetPlane::Auth => (
+                "OWLAUTH_AUTH_REQUEST_TIMEOUT_MS",
+                "OWLAUTH_AUTH_MAX_REQUEST_BYTES",
+                "OWLAUTH_AUTH_MAX_IN_FLIGHT_REQUESTS",
+                "OWLAUTH_AUTH_MAX_CONNECTIONS",
+                "OWLAUTH_AUTH_MAX_HEADER_COUNT",
+                "OWLAUTH_AUTH_MAX_HEADER_BYTES",
+                "OWLAUTH_AUTH_MAX_URI_BYTES",
+                (256, 512),
+            ),
+            HttpBudgetPlane::Control => (
+                "OWLAUTH_CONTROL_REQUEST_TIMEOUT_MS",
+                "OWLAUTH_CONTROL_MAX_REQUEST_BYTES",
+                "OWLAUTH_CONTROL_MAX_IN_FLIGHT_REQUESTS",
+                "OWLAUTH_CONTROL_MAX_CONNECTIONS",
+                "OWLAUTH_CONTROL_MAX_HEADER_COUNT",
+                "OWLAUTH_CONTROL_MAX_HEADER_BYTES",
+                "OWLAUTH_CONTROL_MAX_URI_BYTES",
+                (64, 128),
+            ),
+        };
+    Ok(HttpBudgetConfig {
+        request_timeout: parse_bounded_millis(
+            values,
+            timeout,
+            10_000,
+            Duration::from_millis(10),
+            Duration::from_mins(1),
+        )?,
+        max_request_bytes: parse_bounded_usize(values, body, 1_048_576, 16_777_216)?,
+        max_in_flight_requests: parse_bounded_usize(values, in_flight, defaults.0, 4096)?,
+        max_connections: parse_bounded_usize(values, connections, defaults.1, 8192)?,
+        max_header_count: parse_bounded_usize(values, header_count, 128, 512)?,
+        max_header_bytes: parse_bounded_usize(values, header_bytes, 65_536, 262_144)?,
+        max_uri_bytes: parse_bounded_usize(values, uri_bytes, 8_192, 65_536)?,
     })
 }
 
@@ -2126,18 +2102,16 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn validate_external_bases(runtime: &Url, client: &Url, control: &Url) -> Result<(), ConfigError> {
-    for (left, right) in [(runtime, client), (runtime, control), (client, control)] {
-        if same_origin(left, right) {
-            let left_path = left.path();
-            let right_path = right.path();
-            if left_path == "/"
-                || right_path == "/"
-                || left_path.starts_with(right_path)
-                || right_path.starts_with(left_path)
-            {
-                return Err(ConfigError::SharedOriginBases);
-            }
+fn validate_external_bases(auth: &Url, control: &Url) -> Result<(), ConfigError> {
+    if same_origin(auth, control) {
+        let auth_path = auth.path();
+        let control_path = control.path();
+        if auth_path == "/"
+            || control_path == "/"
+            || auth_path.starts_with(control_path)
+            || control_path.starts_with(auth_path)
+        {
+            return Err(ConfigError::SharedOriginBases);
         }
     }
     Ok(())
@@ -2210,19 +2184,18 @@ mod tests {
             .collect()
     }
 
-    fn runtime_values() -> BTreeMap<String, String> {
+    fn auth_values() -> BTreeMap<String, String> {
         values(&[
             (
                 "OWLAUTH_POSTGRES_URL",
                 "postgres://runtime:secret@database.example/owlauth",
             ),
             ("OWLAUTH_INSTANCE_ID", "test-deployment"),
-            ("OWLAUTH_RUNTIME_PROCESS_ID", "test-runtime"),
-            ("OWLAUTH_CLIENT_PROCESS_ID", "test-client"),
-            ("OWLAUTH_REQUIRED_CLIENT_PROCESS_IDS", "test-client"),
-            ("OWLAUTH_CLIENT_KEY_DIGEST_KEY_VERSION", "1"),
+            ("OWLAUTH_AUTH_PROCESS_ID", "test-auth"),
+            ("OWLAUTH_REQUIRED_AUTH_PROCESS_IDS", "test-auth"),
+            ("OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION", "1"),
             (
-                "OWLAUTH_CLIENT_KEY_DIGEST_KEY",
+                "OWLAUTH_SERVER_KEY_DIGEST_KEY",
                 "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo",
             ),
             ("OWLAUTH_RUNTIME_KEY_VERSION", "2"),
@@ -2286,8 +2259,80 @@ mod tests {
     }
 
     #[test]
+    fn listener_http_budgets_are_independent_bounded_and_use_only_plane_keys() {
+        let mut input = auth_values();
+        input.extend(control_store_values());
+        input.extend(values(&[
+            ("OWLAUTH_AUTH_REQUEST_TIMEOUT_MS", "101"),
+            ("OWLAUTH_AUTH_MAX_REQUEST_BYTES", "1001"),
+            ("OWLAUTH_AUTH_MAX_IN_FLIGHT_REQUESTS", "11"),
+            ("OWLAUTH_AUTH_MAX_CONNECTIONS", "21"),
+            ("OWLAUTH_AUTH_MAX_HEADER_COUNT", "31"),
+            ("OWLAUTH_AUTH_MAX_HEADER_BYTES", "10001"),
+            ("OWLAUTH_AUTH_MAX_URI_BYTES", "2001"),
+            ("OWLAUTH_CONTROL_REQUEST_TIMEOUT_MS", "103"),
+            ("OWLAUTH_CONTROL_MAX_REQUEST_BYTES", "1003"),
+            ("OWLAUTH_CONTROL_MAX_IN_FLIGHT_REQUESTS", "13"),
+            ("OWLAUTH_CONTROL_MAX_CONNECTIONS", "23"),
+            ("OWLAUTH_CONTROL_MAX_HEADER_COUNT", "33"),
+            ("OWLAUTH_CONTROL_MAX_HEADER_BYTES", "10003"),
+            ("OWLAUTH_CONTROL_MAX_URI_BYTES", "2003"),
+        ]));
+        let configured = ServerConfig::from_values(&input).expect("independent listener budgets");
+        assert_eq!(
+            configured.auth.http.request_timeout,
+            Duration::from_millis(101)
+        );
+        assert_eq!(configured.auth.http.max_request_bytes, 1001);
+        assert_eq!(configured.auth.http.max_in_flight_requests, 11);
+        assert_eq!(configured.auth.http.max_connections, 21);
+        assert_eq!(configured.auth.http.max_header_count, 31);
+        assert_eq!(configured.auth.http.max_header_bytes, 10001);
+        assert_eq!(configured.auth.http.max_uri_bytes, 2001);
+        assert_eq!(
+            configured.control.http.request_timeout,
+            Duration::from_millis(103)
+        );
+        assert_eq!(configured.control.http.max_connections, 23);
+
+        for (key, invalid) in [
+            ("OWLAUTH_AUTH_REQUEST_TIMEOUT_MS", "9"),
+            ("OWLAUTH_AUTH_MAX_REQUEST_BYTES", "0"),
+            ("OWLAUTH_CONTROL_MAX_IN_FLIGHT_REQUESTS", "4097"),
+            ("OWLAUTH_AUTH_MAX_CONNECTIONS", "8193"),
+            ("OWLAUTH_AUTH_MAX_HEADER_COUNT", "513"),
+            ("OWLAUTH_CONTROL_MAX_HEADER_BYTES", "262145"),
+            ("OWLAUTH_AUTH_MAX_URI_BYTES", "65537"),
+        ] {
+            let mut rejected = input.clone();
+            rejected.insert(key.to_owned(), invalid.to_owned());
+            assert!(matches!(
+                ServerConfig::from_values(&rejected),
+                Err(ConfigError::InvalidValue { key: rejected_key, .. }) if rejected_key == key
+            ));
+        }
+
+        for removed in [
+            "OWLAUTH_REQUEST_TIMEOUT_MS",
+            "OWLAUTH_MAX_REQUEST_BYTES",
+            "OWLAUTH_RUNTIME_ADDR",
+            "OWLAUTH_RUNTIME_BASE_URL",
+            "OWLAUTH_CLIENT_ADDR",
+            "OWLAUTH_CLIENT_BASE_URL",
+            "OWLAUTH_CLIENT_REQUEST_TIMEOUT_MS",
+        ] {
+            let mut rejected = input.clone();
+            rejected.insert(removed.to_owned(), "1000".to_owned());
+            assert!(matches!(
+                ServerConfig::from_values(&rejected),
+                Err(ConfigError::Unknown(key)) if key == removed
+            ));
+        }
+    }
+
+    #[test]
     fn database_lock_and_migration_timeouts_are_bounded_and_independent() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         let config = ServerConfig::from_values(&input).expect("default database timeout model");
         assert_eq!(
@@ -2442,7 +2487,7 @@ mod tests {
 
     #[test]
     fn webhook_private_allowlist_is_exact_bounded_and_fail_closed() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_WEBHOOK_ALLOWED_PRIVATE_IPS".to_owned(),
@@ -2469,7 +2514,7 @@ mod tests {
 
     #[test]
     fn publication_lease_ttl_cannot_exceed_projection_authority_bound() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_PUBLICATION_LEASE_TTL_MS".to_owned(),
@@ -2497,7 +2542,7 @@ mod tests {
 
     #[test]
     fn runtime_key_inventory_cannot_exceed_email_alias_bound() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         let retained = (10..26)
             .map(|version| {
                 (
@@ -2514,7 +2559,7 @@ mod tests {
             serde_json::Value::Object(retained).to_string(),
         );
         assert!(matches!(
-            parse_runtime_protection(PlaneMode::Runtime, &input),
+            parse_runtime_protection(ProcessMode::Auth, &input),
             Err(ConfigError::InvalidValue {
                 key: "OWLAUTH_RUNTIME_RETAINED_KEYS",
                 ..
@@ -2524,7 +2569,7 @@ mod tests {
 
     #[test]
     fn alias_cutover_and_retirement_cannot_be_pre_authorized_together() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.insert(
             "OWLAUTH_EMAIL_IDENTITY_ALIAS_CUTOVER_VERSION".to_owned(),
             "2".to_owned(),
@@ -2533,7 +2578,7 @@ mod tests {
             "OWLAUTH_EMAIL_IDENTITY_ALIAS_RETIRE_VERSION".to_owned(),
             "2".to_owned(),
         );
-        for mode in [PlaneMode::Runtime, PlaneMode::All] {
+        for mode in [ProcessMode::Auth, ProcessMode::All] {
             assert!(matches!(
                 parse_email_identity_protection(mode, &input),
                 Err(ConfigError::InvalidValue {
@@ -2546,13 +2591,13 @@ mod tests {
 
     #[test]
     fn alias_retirement_configuration_is_distinct_and_active_version_bound() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.insert(
             "OWLAUTH_EMAIL_IDENTITY_ALIAS_RETIRE_VERSION".to_owned(),
             "1".to_owned(),
         );
         assert!(matches!(
-            parse_email_identity_protection(PlaneMode::Runtime, &input),
+            parse_email_identity_protection(ProcessMode::Auth, &input),
             Err(ConfigError::InvalidValue {
                 key: "OWLAUTH_EMAIL_IDENTITY_ALIAS_RETIRE_VERSION",
                 ..
@@ -2562,7 +2607,7 @@ mod tests {
             "OWLAUTH_EMAIL_IDENTITY_ALIAS_RETIRE_VERSION".to_owned(),
             "2".to_owned(),
         );
-        let protection = parse_email_identity_protection(PlaneMode::Runtime, &input)
+        let protection = parse_email_identity_protection(ProcessMode::Auth, &input)
             .expect("valid retirement authorization")
             .expect("email identity protection");
         assert_eq!(protection.identity_alias_cutover_version, None);
@@ -2571,7 +2616,7 @@ mod tests {
 
     #[test]
     fn missing_email_identity_ring_is_scoped_and_control_loads_only_the_narrow_source_ring() {
-        let mut runtime = runtime_values();
+        let mut runtime = auth_values();
         for key in [
             "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION",
             "OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY",
@@ -2584,7 +2629,7 @@ mod tests {
             .expect("provider/session Runtime remains composable without long-term email keys");
         assert!(configured.email_identity_protection.is_none());
 
-        let source = runtime_values();
+        let source = auth_values();
         let control = BTreeMap::from([
             (
                 "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION".to_owned(),
@@ -2600,18 +2645,18 @@ mod tests {
             ),
         ]);
         assert!(
-            parse_email_identity_protection(PlaneMode::Control, &control)
+            parse_email_identity_protection(ProcessMode::Control, &control)
                 .expect("Control exact source-reader ring")
                 .is_some()
         );
     }
 
     #[test]
-    fn runtime_mode_loads_provider_authority_without_control_credentials() {
+    fn auth_mode_loads_provider_authority_without_control_credentials() {
         const { assert!(FEDERATED_PROJECT_AUTH_AVAILABLE) };
-        assert!(ServerConfig::from_values(&runtime_values()).is_err());
+        assert!(ServerConfig::from_values(&auth_values()).is_err());
 
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_CONTROL_API_KEY".to_owned(),
@@ -2619,7 +2664,7 @@ mod tests {
         );
         let config = ServerConfig::from_values(&input)
             .expect("Runtime auth requires the bundled software provider root");
-        assert_eq!(config.mode, PlaneMode::Runtime);
+        assert_eq!(config.mode, ProcessMode::Auth);
         assert!(config.control_api_key.is_none());
         assert!(config.provisioning.is_some());
         let debug = format!("{config:?}");
@@ -2629,7 +2674,7 @@ mod tests {
 
     #[test]
     fn custom_provider_parser_does_not_require_the_bundled_software_root() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.remove("OWLAUTH_SOFTWARE_CUSTODY_KEY");
         assert!(ServerConfig::from_values(&input).is_err());
@@ -2646,7 +2691,7 @@ mod tests {
 
     #[test]
     fn managed_credential_ring_is_runtime_only_distinct_and_rotation_aware() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         let config =
             ServerConfig::from_values(&input).expect("dedicated managed ring should parse");
@@ -2709,7 +2754,7 @@ mod tests {
 
     #[test]
     fn every_runtime_protection_root_is_unique_across_active_and_retained_rings() {
-        let mut email_retained_aliases_managed_active = runtime_values();
+        let mut email_retained_aliases_managed_active = auth_values();
         email_retained_aliases_managed_active.extend(control_store_values());
         email_retained_aliases_managed_active.insert(
             "OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS".to_owned(),
@@ -2724,7 +2769,7 @@ mod tests {
             })
         ));
 
-        let mut managed_retained_aliases_email_active = runtime_values();
+        let mut managed_retained_aliases_email_active = auth_values();
         managed_retained_aliases_email_active.extend(control_store_values());
         managed_retained_aliases_email_active.insert(
             "OWLAUTH_MANAGED_CREDENTIAL_RETAINED_KEYS".to_owned(),
@@ -2738,7 +2783,7 @@ mod tests {
             })
         ));
 
-        let mut target_retained_aliases_email_active = runtime_values();
+        let mut target_retained_aliases_email_active = auth_values();
         target_retained_aliases_email_active.extend(control_store_values());
         target_retained_aliases_email_active.insert(
             "OWLAUTH_MANAGED_REAUTHORIZATION_RETAINED_KEYS".to_owned(),
@@ -2753,7 +2798,7 @@ mod tests {
             })
         ));
 
-        let mut email_retained_aliases_target_active = runtime_values();
+        let mut email_retained_aliases_target_active = auth_values();
         email_retained_aliases_target_active.extend(control_store_values());
         email_retained_aliases_target_active.insert(
             "OWLAUTH_EMAIL_IDENTITY_RETAINED_KEYS".to_owned(),
@@ -2771,7 +2816,7 @@ mod tests {
 
     #[test]
     fn identity_mutation_evidence_ring_is_required_rotatable_redacted_and_globally_separate() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_CONTROL_API_KEY".to_owned(),
@@ -2782,28 +2827,25 @@ mod tests {
             r#"{"2":{"digest_key":"EhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhI","protection_key":"ExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExM"}}"#
                 .to_owned(),
         );
-        for mode in [
-            PlaneMode::Runtime,
-            PlaneMode::Client,
-            PlaneMode::Control,
-            PlaneMode::All,
-        ] {
+        for mode in [ProcessMode::Auth, ProcessMode::Control, ProcessMode::All] {
             input.insert(
                 "OWLAUTH_MODE".to_owned(),
                 match mode {
-                    PlaneMode::Runtime => "runtime",
-                    PlaneMode::Client => "client",
-                    PlaneMode::Control => "control",
-                    PlaneMode::All => "all",
+                    ProcessMode::Auth => "auth",
+                    ProcessMode::Control => "control",
+                    ProcessMode::All => "all",
                 }
                 .to_owned(),
             );
-            if mode == PlaneMode::Control {
-                input.insert(
-                    "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-                    "test-runtime".to_owned(),
-                );
-            }
+            input.insert(
+                "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+                if mode == ProcessMode::Control {
+                    "auth-a"
+                } else {
+                    "test-auth"
+                }
+                .to_owned(),
+            );
             let config = ServerConfig::from_values(&input)
                 .expect("every serving mode requires the dedicated evidence ring");
             assert_eq!(
@@ -2846,7 +2888,7 @@ mod tests {
 
     #[test]
     fn projection_email_ring_accepts_only_aead_keys() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS".to_owned(),
@@ -2894,7 +2936,7 @@ mod tests {
             ),
         ];
         for (family_key, family_material) in families {
-            let mut active_alias = runtime_values();
+            let mut active_alias = auth_values();
             active_alias.extend(control_store_values());
             active_alias.insert(
                 "OWLAUTH_PROJECTION_EMAIL_PROTECTION_KEY".to_owned(),
@@ -2905,7 +2947,7 @@ mod tests {
                 Err(ConfigError::InvalidValue { key, .. }) if key == family_key
             ));
 
-            let mut retained_alias = runtime_values();
+            let mut retained_alias = auth_values();
             retained_alias.extend(control_store_values());
             retained_alias.insert(
                 "OWLAUTH_PROJECTION_EMAIL_RETAINED_KEYS".to_owned(),
@@ -2924,7 +2966,7 @@ mod tests {
         reason = "one matrix proves dedicated target-ring rotation and every fail-closed alias case"
     )]
     fn managed_reauthorization_target_ring_is_dedicated_rotatable_and_fail_closed() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_MANAGED_REAUTHORIZATION_RETAINED_KEYS".to_owned(),
@@ -2954,7 +2996,7 @@ mod tests {
             })
         ));
 
-        let mut managed_alias = runtime_values();
+        let mut managed_alias = auth_values();
         managed_alias.extend(control_store_values());
         managed_alias.insert(
             "OWLAUTH_MANAGED_REAUTHORIZATION_PROTECTION_KEY".to_owned(),
@@ -2983,7 +3025,7 @@ mod tests {
             })
         ));
 
-        let mut admission_alias = runtime_values();
+        let mut admission_alias = auth_values();
         admission_alias.extend(control_store_values());
         admission_alias.insert(
             "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
@@ -2997,7 +3039,7 @@ mod tests {
             })
         ));
 
-        let mut control = runtime_values();
+        let mut control = auth_values();
         control.extend(control_store_values());
         control.insert("OWLAUTH_MODE".to_owned(), "control".to_owned());
         control.insert(
@@ -3005,10 +3047,10 @@ mod tests {
             "owl_ctrl_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
         );
         control.insert(
-            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-            "runtime-a".to_owned(),
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            "auth-a".to_owned(),
         );
-        control.remove("OWLAUTH_RUNTIME_PROCESS_ID");
+        control.remove("OWLAUTH_AUTH_PROCESS_ID");
         for key in [
             "OWLAUTH_RUNTIME_KEY_VERSION",
             "OWLAUTH_RUNTIME_DIGEST_KEY",
@@ -3036,7 +3078,7 @@ mod tests {
 
     #[test]
     fn runtime_admission_configuration_is_bounded_and_redacted() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_ADMISSION_REDIS_URL".to_owned(),
@@ -3046,18 +3088,17 @@ mod tests {
             "OWLAUTH_ADMISSION_NAMESPACE".to_owned(),
             "deployment_a".to_owned(),
         );
-        input.insert("OWLAUTH_RUNTIME_MAX_PROCESSES".to_owned(), "4".to_owned());
+        input.insert("OWLAUTH_AUTH_MAX_PROCESSES".to_owned(), "4".to_owned());
         let config = ServerConfig::from_values(&input).expect("admission config should parse");
         let admission = config.admission.as_ref().expect("Runtime has admission");
         assert_eq!(admission.namespace, "deployment_a");
         assert_eq!(
             admission
-                .runtime_maximum_processes
+                .auth_maximum_processes
                 .expect("Runtime bound is configured")
                 .get(),
             4
         );
-        assert!(admission.client_maximum_processes.is_none());
         let debug = format!("{config:?}");
         assert!(!debug.contains("admission-secret"));
         assert!(!debug.contains("BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"));
@@ -3106,51 +3147,70 @@ mod tests {
             "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
         );
         input.insert(
-            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-            "test-runtime,runtime-b,runtime-c,runtime-d,runtime-e".to_owned(),
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            "test-auth,auth-b,auth-c,auth-d,auth-e".to_owned(),
         );
         assert!(matches!(
             ServerConfig::from_values(&input),
             Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_RUNTIME_MAX_PROCESSES",
+                key: "OWLAUTH_AUTH_MAX_PROCESSES",
                 ..
             })
         ));
     }
 
     #[test]
-    fn admission_process_bounds_are_plane_local() {
+    fn control_roster_is_bounded_before_capability_composition() {
+        let mut input = auth_values();
+        input.extend(control_store_values());
+        input.insert("OWLAUTH_MODE".to_owned(), "control".to_owned());
+        input.insert(
+            "OWLAUTH_CONTROL_API_KEY".to_owned(),
+            "owl_ctrl_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        );
+        input.remove("OWLAUTH_AUTH_PROCESS_ID");
+        input.insert(
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            (0..=MAX_AUTH_PROCESSES)
+                .map(|index| format!("auth-{index}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        assert!(matches!(
+            ServerConfig::from_values(&input),
+            Err(ConfigError::InvalidValue {
+                key: "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn admission_process_bound_covers_the_auth_roster() {
         let mut input = values(&[
             (
                 "OWLAUTH_ADMISSION_DIGEST_KEY",
                 "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
             ),
-            ("OWLAUTH_RUNTIME_MAX_PROCESSES", "64"),
-            ("OWLAUTH_CLIENT_MAX_PROCESSES", "2"),
+            ("OWLAUTH_AUTH_MAX_PROCESSES", "64"),
         ]);
-        let admission = parse_admission(PlaneMode::All, &input, "deployment-a", 64, 2)
-            .expect("independent plane bounds should parse")
+        let admission = parse_admission(ProcessMode::All, &input, "deployment-a", 2)
+            .expect("Auth process bound should parse")
             .expect("All mode has admission");
         assert_eq!(
             admission
-                .runtime_maximum_processes
-                .expect("Runtime bound is configured")
+                .auth_maximum_processes
+                .expect("Auth bound is configured")
                 .get(),
             64
         );
-        assert_eq!(
-            admission
-                .client_maximum_processes
-                .expect("Client bound is configured")
-                .get(),
-            2
-        );
 
-        input.insert("OWLAUTH_CLIENT_MAX_PROCESSES".to_owned(), "1".to_owned());
+        input.insert("OWLAUTH_AUTH_MAX_PROCESSES".to_owned(), "1".to_owned());
         assert!(matches!(
-            parse_admission(PlaneMode::All, &input, "deployment-a", 64, 2),
+            parse_admission(ProcessMode::All, &input, "deployment-a", 2),
             Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_CLIENT_MAX_PROCESSES",
+                key: "OWLAUTH_AUTH_MAX_PROCESSES",
                 ..
             })
         ));
@@ -3158,7 +3218,7 @@ mod tests {
 
     #[test]
     fn provider_http_loopback_policy_is_an_explicit_boolean() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         let config = ServerConfig::from_values(&input)
             .expect("provider HTTP loopback is disabled by default");
@@ -3188,7 +3248,7 @@ mod tests {
     #[test]
     fn control_and_all_modes_retain_provisioning_stores() {
         for mode in ["control", "all"] {
-            let mut input = runtime_values();
+            let mut input = auth_values();
             input.extend(control_store_values());
             input.insert("OWLAUTH_MODE".to_owned(), mode.to_owned());
             input.insert(
@@ -3207,8 +3267,8 @@ mod tests {
                     input.remove(key);
                 }
                 input.insert(
-                    "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-                    "runtime-a".to_owned(),
+                    "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+                    "auth-a".to_owned(),
                 );
             }
             let config = ServerConfig::from_values(&input)
@@ -3239,13 +3299,13 @@ mod tests {
 
     #[test]
     fn control_requires_exact_canonical_key() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.insert("OWLAUTH_MODE".to_owned(), "control".to_owned());
         input.insert(
-            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-            "runtime-a".to_owned(),
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            "auth-a".to_owned(),
         );
-        input.remove("OWLAUTH_RUNTIME_PROCESS_ID");
+        input.remove("OWLAUTH_AUTH_PROCESS_ID");
         for key in [
             "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION",
             "OWLAUTH_EMAIL_IDENTITY_DIGEST_KEY",
@@ -3279,7 +3339,7 @@ mod tests {
 
     #[test]
     fn control_mcp_is_explicit_control_only_and_bounded() {
-        let disabled = parse_control_mcp(PlaneMode::Control, &BTreeMap::new())
+        let disabled = parse_control_mcp(ProcessMode::Control, &BTreeMap::new())
             .expect("disabled MCP defaults are valid");
         assert!(!disabled.enabled);
         assert_eq!(disabled.max_request_bytes, 65_536);
@@ -3310,7 +3370,7 @@ mod tests {
                 "49152".to_owned(),
             ),
         ]);
-        let enabled = parse_control_mcp(PlaneMode::Control, &values)
+        let enabled = parse_control_mcp(ProcessMode::Control, &values)
             .expect("bounded Control MCP configuration is valid");
         assert!(enabled.enabled);
         assert_eq!(enabled.max_request_bytes, 32_768);
@@ -3321,7 +3381,7 @@ mod tests {
         let listener = |bind, external_base| ListenerConfig {
             bind,
             external_base: Url::parse(external_base).unwrap(),
-            database_max_connections: NonZeroU32::new(1).unwrap(),
+            http: parse_http_budget(&BTreeMap::new(), HttpBudgetPlane::Control).unwrap(),
         };
         validate_control_mcp_listener(
             &enabled,
@@ -3355,7 +3415,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            parse_control_mcp(PlaneMode::Runtime, &values),
+            parse_control_mcp(ProcessMode::Auth, &values),
             Err(ConfigError::InvalidValue {
                 key: "OWLAUTH_CONTROL_MCP_ENABLED",
                 ..
@@ -3366,7 +3426,7 @@ mod tests {
             "65".to_owned(),
         );
         assert!(matches!(
-            parse_control_mcp(PlaneMode::Control, &values),
+            parse_control_mcp(ProcessMode::Control, &values),
             Err(ConfigError::InvalidValue {
                 key: "OWLAUTH_CONTROL_MCP_MAX_CONCURRENT_REQUESTS",
                 ..
@@ -3376,14 +3436,14 @@ mod tests {
 
     #[test]
     fn rejects_unknown_values_and_independent_database_authorities() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.insert("OWLAUTH_TYPO".to_owned(), "value".to_owned());
         assert!(matches!(
             ServerConfig::from_values(&input),
             Err(ConfigError::Unknown(key)) if key == "OWLAUTH_TYPO"
         ));
 
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_RUNTIME_POSTGRES_URL".to_owned(),
@@ -3396,7 +3456,7 @@ mod tests {
             ))
         ));
 
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_RUNTIME_POSTGRES_URL".to_owned(),
@@ -3407,36 +3467,36 @@ mod tests {
     }
 
     #[test]
-    fn runtime_process_must_be_present_in_its_required_roster() {
-        let mut input = runtime_values();
+    fn auth_process_must_be_present_in_its_required_roster() {
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
-            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-            "other-runtime".to_owned(),
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            "other-auth".to_owned(),
         );
         assert!(matches!(
             ServerConfig::from_values(&input),
             Err(ConfigError::InvalidValue {
-                key: "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS",
+                key: "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS",
                 ..
             })
         ));
 
         input.insert(
-            "OWLAUTH_REQUIRED_RUNTIME_PROCESS_IDS".to_owned(),
-            "test-runtime,other-runtime".to_owned(),
+            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
+            "test-auth,other-auth".to_owned(),
         );
         let config = ServerConfig::from_values(&input)
-            .expect("a Runtime process may require itself and additional roster members");
+            .expect("an Auth process may require itself and additional roster members");
         assert_eq!(
-            config.required_runtime_process_ids,
-            ["test-runtime", "other-runtime"]
+            config.required_auth_process_ids,
+            ["test-auth", "other-auth"]
         );
     }
 
     #[test]
     fn rejects_propagation_delay_beyond_the_upgrade_safety_bound() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_KEY_PROPAGATION_DELAY_MS".to_owned(),
@@ -3453,7 +3513,7 @@ mod tests {
 
     #[test]
     fn rejects_verification_retention_beyond_the_safety_bound() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.insert(
             "OWLAUTH_SIGNING_VERIFICATION_RETENTION_MS".to_owned(),
@@ -3470,7 +3530,7 @@ mod tests {
 
     #[test]
     fn validates_shared_origin_base_partition() {
-        let mut input = runtime_values();
+        let mut input = auth_values();
         input.extend(control_store_values());
         input.extend(values(&[
             ("OWLAUTH_MODE", "all"),
@@ -3479,7 +3539,7 @@ mod tests {
                 "OWLAUTH_CONTROL_API_KEY",
                 "owl_ctrl_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
-            ("OWLAUTH_RUNTIME_BASE_URL", "https://identity.example/auth/"),
+            ("OWLAUTH_AUTH_BASE_URL", "https://identity.example/auth/"),
             (
                 "OWLAUTH_CONTROL_BASE_URL",
                 "https://identity.example/control/",
@@ -3500,7 +3560,7 @@ mod tests {
             })
         ));
 
-        for mode in ["all", "runtime", "control"] {
+        for mode in ["all", "auth", "control"] {
             let mut overlapping = input.clone();
             overlapping.insert("OWLAUTH_MODE".to_owned(), mode.to_owned());
             overlapping.insert(
