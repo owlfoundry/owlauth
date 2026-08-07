@@ -201,7 +201,7 @@ These routes organize existing or contract-backed workflows; they do not require
 
 ### Project directory and overview
 
-The Project directory uses a compact table on ordinary desktop widths and a stacked row treatment at narrow widths. Each row displays the display name, public ID, and user-facing status. The `belongs_to` extension pointer and optimistic-concurrency revisions are API-level integration details and MUST NOT appear in ordinary lists, summaries, creation, or editing. The whole row MAY be clickable, but its name remains a real link and row actions remain keyboard-operable controls.
+The Project directory is a navigation collection with one primary action per item, so it uses a compact semantic list of whole-row links rather than a comparison table. Each linked row displays the display name, public ID, and user-facing status, stacks safely at narrow widths, and exposes the public ID and status as accessible description without replacing the display name as the link name. The `belongs_to` extension pointer and optimistic-concurrency revisions are API-level integration details and MUST NOT appear in ordinary lists, summaries, creation, or editing. If the directory gains comparison-oriented columns or independent row actions, it MUST become a semantic table instead of nesting controls inside the whole-row link.
 
 Project creation opens a focused dialog or narrow side sheet instead of placing a permanent create form above the inventory. The surface contains only the display name, preserves idempotency, and moves to the created Project overview after success.
 
@@ -216,7 +216,7 @@ It MUST NOT infer health from browser-visible heuristics or claim that a deploym
 
 ### Resource lists and detail pages
 
-- Inventories with repeated structured fields use semantic tables. Cards are reserved for heterogeneous summaries, choices, or small collections.
+- Inventories with repeated structured fields use semantic tables. Cards are reserved for heterogeneous summaries, choices, or small collections; a compact linked list is permitted for a navigation collection whose items each have exactly one route action, as defined for the Project directory above.
 - Table headers remain visible when a bounded page region scrolls. Horizontal overflow, when unavoidable for exact identifiers, is contained to the table region rather than the document.
 - Default rows expose the primary identifier, safe status, and one or two high-frequency actions. Secondary actions use an overflow menu with full keyboard behavior.
 - Selecting a resource navigates to a stable detail route. Large editable detail forms do not expand inline inside inventory rows.

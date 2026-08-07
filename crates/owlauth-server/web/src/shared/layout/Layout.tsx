@@ -14,11 +14,13 @@ export function PageHeader({ title, description, status, actions, headingRef }: 
   return (
     <header className={styles["pageHeader"]}>
       <div>
-        <h1 ref={headingRef} tabIndex={-1}>
-          {title}
-        </h1>
+        <div className={styles["pageTitleRow"]}>
+          <h1 ref={headingRef} tabIndex={-1}>
+            {title}
+          </h1>
+          {status}
+        </div>
         {description === undefined ? null : <p>{description}</p>}
-        {status}
       </div>
       {actions === undefined ? null : <div className={styles["pageActions"]}>{actions}</div>}
     </header>

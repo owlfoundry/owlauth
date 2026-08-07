@@ -13,6 +13,7 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   const suffix = `${browserName}-${Date.now().toString(36)}`;
   const injectionMarker = `<img src=x onerror=alert('${suffix}')>`;
   const projectName = `E2E Project ${injectionMarker}`;
+  const longProjectName = `${suffix.replaceAll("-", "")}p`.padEnd(128, "p").slice(0, 128);
   const updatedProjectName = `${projectName} updated`;
   const applicationName = `E2E Application ${injectionMarker}`;
   const providerName = `E2E Provider ${injectionMarker}`;
@@ -29,6 +30,38 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
   const projectId = new URL(page.url()).pathname.split("/").at(-1);
   if (projectId === undefined || projectId === "") throw new Error("Project route ID is absent");
+  await expect(page.getByRole("list", { name: "Sign-in setup" }).getByRole("listitem")).toHaveCount(
+    4,
+  );
+  await expect(page.getByRole("link", { name: "Switch project" })).toBeVisible();
+  for (const width of [1440, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    await assertNoDocumentOverflow(page);
+    await assertOverviewLayout(page, width);
+    await page.screenshot({
+      path: testInfo.outputPath(`project-overview-${browserName}-${String(width)}.png`),
+      fullPage: true,
+    });
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page
+    .getByRole("navigation", { name: "Breadcrumb" })
+    .getByRole("link", { name: "Projects" })
+    .click();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  const projectDirectoryLink = page.getByRole("link", { name: projectName, exact: true });
+  await expect(projectDirectoryLink).toBeVisible();
+  for (const width of [1440, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    await assertNoDocumentOverflow(page);
+    await page.screenshot({
+      path: testInfo.outputPath(`project-directory-${browserName}-${String(width)}.png`),
+      fullPage: true,
+    });
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await projectDirectoryLink.click();
+  await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
   const projectPublicId = await page
     .getByRole("button", { name: "Copy Project public ID" })
     .locator("..")
@@ -237,9 +270,9 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await page.getByRole("button", { name: "Open navigation" }).click();
   const navigationSheet = page.getByRole("dialog", { name: "Console navigation" });
   await expect(navigationSheet).toBeVisible();
-  const projectSwitcher = navigationSheet.getByLabel("Project context");
-  await navigationSheet.getByText("Project context", { exact: true }).click();
-  await expect(projectSwitcher).toBeFocused();
+  const switchProjectLink = navigationSheet.getByRole("link", { name: "Switch project" });
+  await switchProjectLink.focus();
+  await expect(switchProjectLink).toBeFocused();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
   const mobileApplicationsLink = navigationSheet.getByRole("link", {
     name: "Applications",
@@ -277,7 +310,94 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
         .violations,
     ).toEqual([]);
   }
+
+  await page.emulateMedia({ forcedColors: "none", reducedMotion: "no-preference" });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page
+    .getByRole("navigation", { name: "Resources" })
+    .getByRole("link", { name: "Projects", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Create Project" }).first().click();
+  await page.getByLabel("Display name").fill(longProjectName);
+  await page.getByRole("dialog").getByRole("button", { name: "Create Project" }).click();
+  await expect(page.getByRole("heading", { name: longProjectName, exact: true })).toBeVisible();
+  await page.setViewportSize({ width: 320, height: 900 });
+  await assertNoDocumentOverflow(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page
+    .getByRole("navigation", { name: "Breadcrumb" })
+    .getByRole("link", { name: "Projects" })
+    .click();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await page.setViewportSize({ width: 320, height: 900 });
+  await expect(page.getByRole("link", { name: longProjectName, exact: true })).toBeVisible();
+  await assertNoDocumentOverflow(page);
 });
+
+async function assertOverviewLayout(
+  page: import("@playwright/test").Page,
+  width: number,
+): Promise<void> {
+  const layout = await page
+    .getByRole("list", { name: "Sign-in setup" })
+    .getByRole("listitem")
+    .evaluateAll((steps) =>
+      steps.map((step) => {
+        const content = step.querySelector<HTMLElement>(":scope > div");
+        const heading = step.querySelector<HTMLElement>("h3");
+        const badge = heading?.nextElementSibling;
+        const action = step.querySelector<HTMLElement>(":scope > a");
+        if (
+          content === null ||
+          heading === null ||
+          !(badge instanceof HTMLElement) ||
+          action === null
+        ) {
+          throw new Error("Setup step layout elements are missing");
+        }
+        const contentBounds = content.getBoundingClientRect();
+        const badgeBounds = badge.getBoundingClientRect();
+        const actionBounds = action.getBoundingClientRect();
+        const stepBounds = step.getBoundingClientRect();
+        return {
+          action: {
+            bottom: actionBounds.bottom,
+            left: actionBounds.left,
+            right: actionBounds.right,
+            top: actionBounds.top,
+          },
+          badgeWidth: badgeBounds.width,
+          content: {
+            bottom: contentBounds.bottom,
+            left: contentBounds.left,
+            right: contentBounds.right,
+            top: contentBounds.top,
+          },
+          step: { left: stepBounds.left, right: stepBounds.right },
+        };
+      }),
+    );
+
+  expect(layout).toHaveLength(4);
+  for (const step of layout) {
+    expect(step.badgeWidth).toBeLessThan(180);
+    expect(step.step.left).toBeGreaterThanOrEqual(0);
+    expect(step.step.right).toBeLessThanOrEqual(width + 0.5);
+  }
+  if (width > 768) {
+    const actionRights = layout.map((step) => step.action.right);
+    expect(Math.max(...actionRights) - Math.min(...actionRights)).toBeLessThanOrEqual(1);
+    for (const step of layout) {
+      expect(step.action.left - step.content.right).toBeGreaterThanOrEqual(8);
+    }
+  } else {
+    for (const step of layout) {
+      expect(Math.abs(step.action.left - step.content.left)).toBeLessThanOrEqual(1);
+      expect(step.action.top - step.content.bottom).toBeGreaterThanOrEqual(8);
+    }
+  }
+}
 
 async function assertNoDocumentOverflow(page: import("@playwright/test").Page): Promise<void> {
   await expect

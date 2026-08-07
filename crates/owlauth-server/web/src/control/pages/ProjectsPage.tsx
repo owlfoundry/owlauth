@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { Link, useNavigate } from "react-router";
 
-import { DataTable, EmptyState, PageHeader } from "../../shared/layout/Layout";
+import { ArrowRightIcon, PlusIcon } from "../../shared/icons/Icons";
+import { EmptyState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { Field, Input } from "../../shared/primitives/Field";
@@ -91,7 +92,7 @@ export function ProjectsPage() {
       <UnsavedChangesGuard dirty={createDirty} submitting={submitting} onDiscard={discardCreate} />
       <PageHeader
         title="Projects"
-        description="Select a Project or create a bounded authentication authority."
+        description="Create and manage isolated authentication projects."
         actions={
           <Button
             type="button"
@@ -101,6 +102,7 @@ export function ProjectsPage() {
               setCreating(true);
             }}
           >
+            <PlusIcon />
             Create Project
           </Button>
         }
@@ -112,21 +114,29 @@ export function ProjectsPage() {
           description="Create the first Project to configure Applications and authentication methods."
         />
       ) : (
-        <DataTable caption="Projects in this deployment" headings={["Project", "Status"]}>
+        <ul className={styles["projectDirectory"]} aria-label="Projects in this deployment">
           {projects.map((project) => (
-            <tr key={project.id}>
-              <td>
-                <Link className={styles["resourceLink"]} to={`/projects/${project.id}`}>
-                  {project.display_name}
-                </Link>
-                <span className={styles["machineValue"]}>{project.public_id}</span>
-              </td>
-              <td>
-                <StatusBadge status={project.status} />
-              </td>
-            </tr>
+            <li key={project.id}>
+              <Link
+                className={styles["projectDirectoryItem"]}
+                to={`/projects/${project.id}`}
+                aria-labelledby={`project-${project.id}-name`}
+                aria-describedby={`project-${project.id}-public-id project-${project.id}-status`}
+              >
+                <span className={styles["projectDirectoryBody"]}>
+                  <strong id={`project-${project.id}-name`}>{project.display_name}</strong>
+                  <code id={`project-${project.id}-public-id`}>{project.public_id}</code>
+                </span>
+                <span className={styles["projectDirectoryMeta"]}>
+                  <span id={`project-${project.id}-status`}>
+                    <StatusBadge status={project.status} />
+                  </span>
+                  <ArrowRightIcon />
+                </span>
+              </Link>
+            </li>
           ))}
-        </DataTable>
+        </ul>
       )}
       <Dialog
         open={creating}

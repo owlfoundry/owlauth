@@ -136,6 +136,79 @@ describe("Control application shell", () => {
     expect(projectReads).toBe(2);
   });
 
+  it("presents Project context and sign-in requirements with explicit hierarchy", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const url = new URL(requestUrl(input));
+        if (url.pathname.endsWith("/v1/system")) return Promise.resolve(systemResponse());
+        if (url.pathname.endsWith("/v1/projects")) {
+          return Promise.resolve(Response.json({ items: [project] }));
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/applications`)) {
+          return Promise.resolve(Response.json({ items: [application] }));
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/providers`)) {
+          return Promise.resolve(Response.json({ items: [] }));
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/signing-keys`)) {
+          return Promise.resolve(
+            Response.json({
+              items: [
+                {
+                  id: "signing-key-1",
+                  project_id: project.id,
+                  kid: "kid_active",
+                  algorithm: "EdDSA",
+                  state: "active",
+                  ring_revision: 1,
+                  signing_epoch: 1,
+                  sign_not_before: null,
+                  verify_not_after: null,
+                  public_jwk: { kid: "kid_active" },
+                },
+              ],
+            }),
+          );
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/email-method/assignments`)) {
+          return Promise.resolve(Response.json({ items: [] }));
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/email-method`)) {
+          return Promise.resolve(Response.json({ enabled: false }));
+        }
+        return Promise.resolve(Response.json({ items: [] }));
+      }),
+    );
+    renderConsole(`/projects/${project.id}`);
+    await unlock("owl_ctrl_v1_test", project.display_name);
+
+    const navigation = screen.getByRole("navigation", { name: "Resources" });
+    expect(within(navigation).getByText("Current project")).toBeVisible();
+    expect(within(navigation).getByText(project.display_name)).toBeVisible();
+    expect(within(navigation).getByRole("link", { name: "Switch project" })).toBeVisible();
+    expect(screen.queryByText("Directory")).toBeNull();
+
+    const setupHeading = screen.getByRole("heading", { name: "Set up sign-in" });
+    const setupSection = setupHeading.closest("section");
+    if (setupSection === null) throw new Error("Sign-in setup section is missing");
+    expect(await within(setupSection).findAllByRole("listitem")).toHaveLength(4);
+    expect(
+      within(setupSection).getByRole("heading", { name: "Create an Application" }),
+    ).toBeVisible();
+    expect(within(setupSection).getByRole("link", { name: "Review Applications" })).toBeVisible();
+    expect(within(setupSection).getByRole("link", { name: "Configure login URLs" })).toBeVisible();
+    expect(within(setupSection).getByRole("link", { name: "Add sign-in method" })).toBeVisible();
+    expect(within(setupSection).getByRole("link", { name: "Review signing keys" })).toBeVisible();
+    expect(within(navigation).getByRole("group", { name: "Project" })).toBeVisible();
+    expect(within(navigation).getByRole("group", { name: "Authentication" })).toBeVisible();
+    expect(within(navigation).getByRole("group", { name: "Security" })).toBeVisible();
+
+    fireEvent.click(within(navigation).getByRole("link", { name: "Switch project" }));
+    const projectLink = await screen.findByRole("link", { name: project.display_name });
+    expect(projectLink).toHaveAccessibleDescription(/project_public_1.*active/u);
+  });
+
   it("clears authenticated DOM on pagehide and persisted pageshow", async () => {
     vi.stubGlobal(
       "fetch",
@@ -290,9 +363,8 @@ describe("Control application shell", () => {
     await waitFor(() => {
       expect(staleRequest).toBeDefined();
     });
-    fireEvent.change(screen.getByLabelText("Project context"), {
-      target: { value: otherProject.id },
-    });
+    fireEvent.click(screen.getByRole("link", { name: "Switch project" }));
+    fireEvent.click(await screen.findByRole("link", { name: "Second Project" }));
     fireEvent.click(
       within(screen.getByRole("navigation", { name: "Resources" })).getByRole("link", {
         name: "Signing keys",
@@ -408,9 +480,8 @@ describe("Control application shell", () => {
       expect(resolveRotation).toBeDefined();
     });
 
-    fireEvent.change(screen.getByLabelText("Project context"), {
-      target: { value: otherProject.id },
-    });
+    fireEvent.click(screen.getByRole("link", { name: "Switch project" }));
+    fireEvent.click(await screen.findByRole("link", { name: "Second Project" }));
     fireEvent.click(
       within(screen.getByRole("navigation", { name: "Resources" })).getByRole("link", {
         name: "Signing keys",

@@ -1,6 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useState, type ReactNode } from "react";
-import { NavLink, Outlet, useLocation, useNavigate, useParams } from "react-router";
+import { NavLink, Outlet, useLocation, useParams } from "react-router";
 
+import { LockIcon } from "../../shared/icons/Icons";
 import { Breadcrumbs } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { NotificationRegion, ToastRegion } from "../../shared/primitives/Feedback";
@@ -12,11 +13,9 @@ import { OwlAuthWordmark } from "./LockedEntry";
 export function WorkspaceShell() {
   const { projectId } = useParams();
   const project = useProject(projectId);
-  const { projects, message, messageTone, toasts, dismissToast, clearFeedback, lock } =
-    useControl();
+  const { message, messageTone, toasts, dismissToast, clearFeedback, lock } = useControl();
   const [navigationOpen, setNavigationOpen] = useState(false);
   const location = useLocation();
-  const navigate = useNavigate();
 
   useEffect(() => {
     clearFeedback();
@@ -28,12 +27,13 @@ export function WorkspaceShell() {
 
   const navigation = (
     <Navigation
-      projectId={projectId}
+      project={project}
       onNavigate={() => {
         setNavigationOpen(false);
       }}
     />
   );
+  const section = currentSection(location.pathname, projectId);
 
   return (
     <div className={styles["workspace"]}>
@@ -42,19 +42,8 @@ export function WorkspaceShell() {
       </a>
       <aside className={styles["sidebar"]} aria-label="Console navigation">
         <OwlAuthWordmark />
-        <ProjectSwitcher
-          projectId={projectId}
-          projects={projects}
-          onChange={(id) => {
-            void navigate(id === "" ? "/" : `/projects/${id}`);
-          }}
-        />
         {navigation}
-        <div className={styles["sidebarFooter"]}>
-          <Button type="button" variant="quiet" fullWidth onClick={lock}>
-            Lock console
-          </Button>
-        </div>
+        <ConsoleLockAction onLock={lock} />
       </aside>
       <header className={styles["topbar"]}>
         <span className={styles["menuButton"]}>
@@ -72,18 +61,29 @@ export function WorkspaceShell() {
           </Button>
         </span>
         <Breadcrumbs>
-          <li>
-            <NavLink to="/">Projects</NavLink>
-          </li>
-          {project === null ? null : (
-            <li>
-              <NavLink to={`/projects/${project.id}`}>{project.display_name}</NavLink>
-            </li>
+          {project === null ? (
+            <li aria-current="page">Projects</li>
+          ) : (
+            <>
+              <li>
+                <NavLink to="/">Projects</NavLink>
+              </li>
+              {section === "Overview" ? (
+                <li aria-current="page">{project.display_name}</li>
+              ) : (
+                <>
+                  <li>
+                    <NavLink to={`/projects/${project.id}`}>{project.display_name}</NavLink>
+                  </li>
+                  <li aria-current="page">{section}</li>
+                </>
+              )}
+            </>
           )}
-          <li aria-current="page">{currentSection(location.pathname, projectId)}</li>
         </Breadcrumbs>
         <span className={styles["mobileOnly"]}>
           <Button type="button" variant="quiet" onClick={lock}>
+            <LockIcon />
             Lock
           </Button>
         </span>
@@ -100,83 +100,75 @@ export function WorkspaceShell() {
           setNavigationOpen(false);
         }}
       >
-        <ProjectSwitcher
-          projectId={projectId}
-          projects={projects}
-          onChange={(id) => {
-            void navigate(id === "" ? "/" : `/projects/${id}`);
-            setNavigationOpen(false);
-          }}
-        />
         {navigation}
-        <div className={styles["sidebarFooter"]}>
-          <Button type="button" variant="quiet" fullWidth onClick={lock}>
-            Lock console
-          </Button>
-        </div>
+        <ConsoleLockAction onLock={lock} />
       </SideSheet>
     </div>
   );
 }
 
-function ProjectSwitcher({
-  projectId,
-  projects,
-  onChange,
-}: {
-  readonly projectId: string | undefined;
-  readonly projects: readonly { readonly id: string; readonly display_name: string }[];
-  readonly onChange: (id: string) => void;
-}) {
-  const selectId = useId();
-  return (
-    <div className={styles["projectContext"]}>
-      <label htmlFor={selectId}>Project context</label>
-      <select
-        id={selectId}
-        className={styles["projectSelect"]}
-        value={projectId ?? ""}
-        onChange={(event) => {
-          onChange(event.target.value);
-        }}
-      >
-        <option value="">All Projects</option>
-        {projects.map((project) => (
-          <option key={project.id} value={project.id}>
-            {project.display_name}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
 function Navigation({
-  projectId,
+  project,
   onNavigate,
 }: {
-  readonly projectId: string | undefined;
+  readonly project: { readonly id: string; readonly display_name: string } | null;
   readonly onNavigate: () => void;
 }) {
-  const base = projectId === undefined ? null : `/projects/${projectId}`;
+  const base = project === null ? null : `/projects/${project.id}`;
+  const navigationId = useId();
   return (
     <nav className={styles["navigation"]} aria-label="Resources">
-      <ConsoleNavLink to="/" end onNavigate={onNavigate}>
-        Projects
-      </ConsoleNavLink>
-      {base === null ? null : (
+      <div
+        className={styles["workspaceNavigation"]}
+        role="group"
+        aria-labelledby={`${navigationId}-workspace`}
+      >
+        <span id={`${navigationId}-workspace`} className={styles["navigationLabel"]}>
+          Workspace
+        </span>
+        <ConsoleNavLink to="/" end onNavigate={onNavigate}>
+          Projects
+        </ConsoleNavLink>
+      </div>
+      {base === null || project === null ? null : (
         <>
-          <div className={styles["navigationGroup"]}>
-            <span className={styles["navigationLabel"]}>Project</span>
+          <div
+            className={styles["currentProject"]}
+            role="group"
+            aria-labelledby={`${navigationId}-current-project`}
+          >
+            <span id={`${navigationId}-current-project`}>Current project</span>
+            <strong title={project.display_name}>{project.display_name}</strong>
+            <NavLink to="/" onClick={onNavigate}>
+              Switch project
+            </NavLink>
+          </div>
+          <div
+            className={styles["navigationGroup"]}
+            role="group"
+            aria-labelledby={`${navigationId}-project`}
+          >
+            <span id={`${navigationId}-project`} className={styles["navigationLabel"]}>
+              Project
+            </span>
             <ConsoleNavLink to={base} end onNavigate={onNavigate}>
               Overview
             </ConsoleNavLink>
             <ConsoleNavLink to={`${base}/applications`} onNavigate={onNavigate}>
               Applications
             </ConsoleNavLink>
+            <ConsoleNavLink to={`${base}/settings`} onNavigate={onNavigate}>
+              Settings
+            </ConsoleNavLink>
           </div>
-          <div className={styles["navigationGroup"]}>
-            <span className={styles["navigationLabel"]}>Authentication</span>
+          <div
+            className={styles["navigationGroup"]}
+            role="group"
+            aria-labelledby={`${navigationId}-authentication`}
+          >
+            <span id={`${navigationId}-authentication`} className={styles["navigationLabel"]}>
+              Authentication
+            </span>
             <ConsoleNavLink to={`${base}/authentication/providers`} onNavigate={onNavigate}>
               Providers
             </ConsoleNavLink>
@@ -184,14 +176,26 @@ function Navigation({
               Passwordless email
             </ConsoleNavLink>
           </div>
-          <div className={styles["navigationGroup"]}>
-            <span className={styles["navigationLabel"]}>User management</span>
+          <div
+            className={styles["navigationGroup"]}
+            role="group"
+            aria-labelledby={`${navigationId}-manage`}
+          >
+            <span id={`${navigationId}-manage`} className={styles["navigationLabel"]}>
+              Manage
+            </span>
             <ConsoleNavLink to={`${base}/users`} onNavigate={onNavigate}>
               Users
             </ConsoleNavLink>
           </div>
-          <div className={styles["navigationGroup"]}>
-            <span className={styles["navigationLabel"]}>Security</span>
+          <div
+            className={styles["navigationGroup"]}
+            role="group"
+            aria-labelledby={`${navigationId}-security`}
+          >
+            <span id={`${navigationId}-security`} className={styles["navigationLabel"]}>
+              Security
+            </span>
             <ConsoleNavLink to={`${base}/security/signing-keys`} onNavigate={onNavigate}>
               Signing keys
             </ConsoleNavLink>
@@ -199,14 +203,27 @@ function Navigation({
               Client API keys
             </ConsoleNavLink>
           </div>
-          <div className={styles["navigationGroup"]}>
-            <ConsoleNavLink to={`${base}/settings`} onNavigate={onNavigate}>
-              Settings
-            </ConsoleNavLink>
-          </div>
         </>
       )}
     </nav>
+  );
+}
+
+function ConsoleLockAction({ onLock }: { readonly onLock: () => void }) {
+  return (
+    <div className={styles["sidebarFooter"]}>
+      <Button
+        type="button"
+        variant="secondary"
+        fullWidth
+        className={styles["lockButton"]}
+        onClick={onLock}
+      >
+        <LockIcon />
+        Lock console
+      </Button>
+      <p>Clear operator access from this console page.</p>
+    </div>
   );
 }
 

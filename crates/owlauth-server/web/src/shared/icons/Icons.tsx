@@ -89,6 +89,15 @@ export function TrashIcon(props: IconProps) {
   );
 }
 
+export function LockIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="4" y="8" width="12" height="9" rx="2" />
+      <path d="M7 8V6a3 3 0 0 1 6 0v2" />
+    </Icon>
+  );
+}
+
 export function ArrowRightIcon(props: IconProps) {
   return (
     <Icon {...props}>

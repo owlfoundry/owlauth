@@ -2,8 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
 
 import { CopyValue } from "../../shared/compositions/CopyValue";
+import { ArrowRightIcon } from "../../shared/icons/Icons";
 import { EmptyState, PageHeader, Section } from "../../shared/layout/Layout";
-import { Button } from "../../shared/primitives/Button";
+import { Button, buttonClassName, classes } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
 import { useControl, useProject } from "../app/ControlContext";
 import { requireData } from "../client";
@@ -138,7 +139,7 @@ export function ProjectOverviewPage() {
     <div className={styles["page"]}>
       <PageHeader
         title={project.display_name}
-        description="Review committed Project state and continue with one configuration area."
+        description="Configure the resources required to authenticate users securely."
         status={<StatusBadge status={project.status} />}
       />
       {project.status !== "active" ? (
@@ -146,19 +147,24 @@ export function ProjectOverviewPage() {
           This Project is disabled. Configuration actions are unavailable.
         </InlineAlert>
       ) : null}
-      <Section title="Project ID" description="Use this public identifier in trusted integrations.">
-        <CopyValue
-          value={project.public_id}
-          label="Project public ID"
-          block
-          onCopied={(message) => {
-            setMessage(message, "success");
-          }}
-        />
-      </Section>
+      <div className={styles["projectIdSection"]}>
+        <Section
+          title="Project ID"
+          description="Use this public identifier in trusted integrations."
+        >
+          <CopyValue
+            value={project.public_id}
+            label="Project public ID"
+            block
+            onCopied={(message) => {
+              setMessage(message, "success");
+            }}
+          />
+        </Section>
+      </div>
       <Section
         title="Set up sign-in"
-        description="Complete the steps in order. Status comes from committed Project resources."
+        description="Complete every requirement before enabling sign-in for users."
       >
         {loadState === "loading" ? <p role="status">Loading Project resources</p> : null}
         {loadState === "failed" ? (
@@ -170,13 +176,13 @@ export function ProjectOverviewPage() {
           </InlineAlert>
         ) : null}
         {loadState === "ready" && summary !== null ? (
-          <ol className={styles["setupList"]}>
+          <ol className={styles["setupList"]} aria-label="Sign-in setup">
             <SetupStep
               title="Create an Application"
               ready={summary.applications > 0}
               detail={
                 summary.applications > 0
-                  ? `${String(summary.applications)} configured`
+                  ? `${String(summary.applications)} active Application${summary.applications === 1 ? "" : "s"}`
                   : "Add the app that will send users to OwlAuth."
               }
               href={`/projects/${project.id}/applications`}
@@ -238,16 +244,27 @@ function SetupStep({
   readonly action: string;
 }) {
   return (
-    <li className={styles["setupStep"]}>
-      <div>
-        <StatusBadge
-          status={ready ? "Ready" : "Not configured"}
-          family={ready ? "active" : "disabled"}
-        />
-        <h3>{title}</h3>
+    <li className={styles["setupStep"]} data-ready={ready ? "true" : "false"}>
+      <div className={styles["setupStepContent"]}>
+        <div className={styles["setupStepHeading"]}>
+          <h3>{title}</h3>
+          <StatusBadge
+            status={ready ? "Ready" : "Not configured"}
+            family={ready ? "active" : "disabled"}
+          />
+        </div>
         <p>{detail}</p>
       </div>
-      <Link to={href}>{action}</Link>
+      <Link
+        className={classes(
+          buttonClassName(ready ? "quiet" : "secondary"),
+          styles["setupStepAction"],
+        )}
+        to={href}
+      >
+        {action}
+        <ArrowRightIcon />
+      </Link>
     </li>
   );
 }

@@ -6,11 +6,23 @@
   margin-bottom: 1.5rem;
 }
 
+.pageTitleRow {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+}
+
 .pageHeader h1 {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
-  font-size: 1.5rem;
-  font-weight: 650;
-  line-height: 2rem;
+  overflow-wrap: anywhere;
+  font-size: 1.75rem;
+  font-weight: 680;
+  letter-spacing: -0.025em;
+  line-height: 2.25rem;
 }
 
 .pageHeader p {
@@ -223,5 +235,23 @@
 
   .descriptionList dd {
     padding-top: 0.25rem;
+  }
+}
+
+@media (width <= 40rem) {
+  .breadcrumbs ol {
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+
+  .breadcrumbs li:not(:last-child) {
+    display: none;
+  }
+
+  .breadcrumbs li:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 }
