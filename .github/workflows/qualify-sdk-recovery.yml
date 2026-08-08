@@ -516,8 +516,21 @@ jobs:
         with:
           ref: ${{ env.SOURCE_COMMIT }}
           persist-credentials: false
-      - name: Validate development manifests
-        run: python3 scripts/release/prepare_release.py
+      - name: Prepare and validate combined recovered SDK manifests
+        run: |
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "scripts/release")
+          from prepare_release import prepare_release, release_overrides, validate_version_state
+
+          overrides = {}
+          for component in ("typescript", "python", "rust"):
+              prepare_release(component, "0.1.0")
+              overrides.update(release_overrides(component, "0.1.0"))
+          validate_version_state(Path("."), overrides)
+          PY
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
