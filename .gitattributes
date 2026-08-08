@@ -1,0 +1,2 @@
+# Embedded hosted-web assets are content-addressed and must retain exact committed bytes.
+crates/owlauth-server/web/dist/** -text

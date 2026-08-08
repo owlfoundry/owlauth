@@ -99,7 +99,8 @@ jobs:
           fi
           while IFS= read -r path; do
             case "$path" in
-              .github/workflows/recover-server-release.yml | \
+              .gitattributes | \
+                .github/workflows/recover-server-release.yml | \
                 .github/workflows/release-cli.yml | \
                 .github/workflows/release-server.yml) ;;
               *)
@@ -155,6 +156,14 @@ jobs:
           ref: ${{ needs.verify.outputs.source-commit }}
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py server "${{ needs.verify.outputs.version }}"
+      - name: Restore exact embedded asset bytes on Windows
+        if: runner.os == 'Windows'
+        env:
+          SOURCE_COMMIT: ${{ needs.verify.outputs.source-commit }}
+        run: |
+          while IFS= read -r -d '' path; do
+            git show "${SOURCE_COMMIT}:${path}" > "$path"
+          done < <(git ls-files -z 'crates/owlauth-server/web/dist/**')
       - name: Build server
         run: cargo build --release --locked --package owlauth-server
       - name: Package server deterministically
