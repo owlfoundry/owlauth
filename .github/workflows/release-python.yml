@@ -103,15 +103,21 @@ jobs:
         run: python3 scripts/release/prepare_release.py
       - name: Re-verify release eligibility
         run: scripts/release/verify-release.sh python >/dev/null
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.32
       - name: Download package
         uses: actions/download-artifact@v8
         with:
           name: python-release-package
           path: dist
       - name: Publish package
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
+        run: |
+          uv publish --trusted-publishing always \
+            --check-url https://pypi.org/simple/owlauth-client/ dist/*.whl
 
   release:
     name: Create GitHub Release
@@ -208,16 +214,21 @@ jobs:
     env:
       VERSION: 0.1.2
     steps:
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.32
       - name: Download recovery package
         uses: actions/download-artifact@v8
         with:
           name: python-0.1.2-recovery
           path: recovery
       - name: Publish or reuse package
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: recovery/dist
-          skip-existing: true
+        run: |
+          uv publish --trusted-publishing always \
+            --check-url https://pypi.org/simple/owlauth-client/ recovery/dist/*.whl
       - name: Verify published package digest
         run: |
           python3 - "recovery/dist/owlauth_client-${VERSION}-py3-none-any.whl" <<'PY'
