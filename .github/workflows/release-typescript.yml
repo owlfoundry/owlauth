@@ -172,7 +172,7 @@ jobs:
       - name: Verify immutable release tag
         run: |
           test "$TAG" = "typescript-v${VERSION}"
-          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
+          test "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_COMMIT"
           test "$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')" = "$TAG_OBJECT"
           test "$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')" = "$SOURCE_COMMIT"
       - name: Prepare package and release notes
@@ -223,8 +223,6 @@ jobs:
       id-token: write
     env:
       VERSION: 0.1.2
-      TAG: typescript-v0.1.2
-      SOURCE_COMMIT: d86e072ae576b7338d72a7a19856ac5ed6cc7c47
     steps:
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -243,8 +241,7 @@ jobs:
           if [[ -n "$published_integrity" ]]; then
             test "$published_integrity" = "$expected_integrity"
           else
-            GITHUB_REF="refs/tags/${TAG}" GITHUB_SHA="$SOURCE_COMMIT" \
-              npm publish "./${archive}" --access public --provenance
+            npm publish "./${archive}" --access public --provenance=false
           fi
 
   recover-release-0-1-2:

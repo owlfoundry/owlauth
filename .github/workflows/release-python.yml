@@ -162,7 +162,7 @@ jobs:
       - name: Verify immutable release tag
         run: |
           test "$TAG" = "python-v${VERSION}"
-          test "$(git rev-parse HEAD^{commit})" = "$SOURCE_COMMIT"
+          test "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_COMMIT"
           test "$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')" = "$TAG_OBJECT"
           test "$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')" = "$SOURCE_COMMIT"
       - name: Prepare package and release notes
