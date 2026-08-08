@@ -114,10 +114,14 @@ jobs:
         with:
           name: python-release-package
           path: dist
+      - name: Generate publication attestation
+        run: |
+          uvx --from pypi-attestations==0.0.28 \
+            pypi-attestations sign dist/*.whl
       - name: Publish package
         run: |
           uv publish --trusted-publishing always \
-            --check-url https://pypi.org/simple/owlauth-client/ dist/*.whl
+            --check-url https://pypi.org/simple/owlauth-client/ dist/*
 
   release:
     name: Create GitHub Release
@@ -225,10 +229,14 @@ jobs:
         with:
           name: python-0.1.2-recovery
           path: recovery
+      - name: Generate publication attestation
+        run: |
+          uvx --from pypi-attestations==0.0.28 \
+            pypi-attestations sign recovery/dist/*.whl
       - name: Publish or reuse package
         run: |
           uv publish --trusted-publishing always \
-            --check-url https://pypi.org/simple/owlauth-client/ recovery/dist/*.whl
+            --check-url https://pypi.org/simple/owlauth-client/ recovery/dist/*
       - name: Verify published package digest
         run: |
           python3 - "recovery/dist/owlauth_client-${VERSION}-py3-none-any.whl" <<'PY'
