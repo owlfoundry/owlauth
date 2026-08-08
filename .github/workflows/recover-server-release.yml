@@ -92,7 +92,7 @@ jobs:
 
           git fetch --quiet --no-tags origin \
             +refs/heads/main:refs/remotes/release-recovery/main
-          main_commit="$(git rev-parse refs/remotes/release-recovery/main^{commit})"
+          main_commit="$(git rev-parse 'refs/remotes/release-recovery/main^{commit}')"
           if ! git merge-base --is-ancestor "$RECOVERY_SOURCE_COMMIT" "$main_commit"; then
             echo "$RECOVERY_TAG is not an ancestor of current main" >&2
             exit 1
