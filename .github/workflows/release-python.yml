@@ -142,14 +142,11 @@ jobs:
             --notes-file release-metadata/release-notes.md \
             --title "Python SDK v${VERSION}"
 
-  recover-0-1-2:
-    name: Recover Python SDK v0.1.2
+  recover-build-0-1-2:
+    name: Recover Python SDK v0.1.2 package
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    permissions:
-      contents: write
-      id-token: write
     env:
       VERSION: 0.1.2
       TAG: python-v0.1.2
@@ -189,16 +186,93 @@ jobs:
           uv run --locked twine check "$archive"
           python3 scripts/sdk_artifact.py inspect \
             --component python --archive "$archive"
-      - name: Publish package
+      - name: Upload recovery package
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-0.1.2-recovery
+          path: |
+            dist/*.whl
+            release-notes.md
+          if-no-files-found: error
+          retention-days: 1
+
+  recover-publish-0-1-2:
+    name: Recover owlauth-client v0.1.2 publication
+    if: github.event_name == 'workflow_dispatch'
+    needs: recover-build-0-1-2
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: 0.1.2
+    steps:
+      - name: Download recovery package
+        uses: actions/download-artifact@v8
+        with:
+          name: python-0.1.2-recovery
+          path: recovery
+      - name: Publish or reuse package
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
-      - name: Create GitHub Release
+          packages-dir: recovery/dist
+          skip-existing: true
+      - name: Verify published package digest
+        run: |
+          python3 - "recovery/dist/owlauth_client-${VERSION}-py3-none-any.whl" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          archive = sys.argv[1]
+          version = os.environ["VERSION"]
+          expected = hashlib.sha256(open(archive, "rb").read()).hexdigest()
+          with urllib.request.urlopen(
+              f"https://pypi.org/pypi/owlauth-client/{version}/json", timeout=30
+          ) as response:
+              release = json.load(response)
+          files = [
+              item
+              for item in release["urls"]
+              if item["filename"] == os.path.basename(archive)
+          ]
+          if len(files) != 1 or files[0]["digests"]["sha256"] != expected:
+              raise SystemExit("published wheel does not match the recovery artifact")
+          PY
+
+  recover-release-0-1-2:
+    name: Recover Python SDK v0.1.2 GitHub Release
+    if: github.event_name == 'workflow_dispatch'
+    needs: [recover-build-0-1-2, recover-publish-0-1-2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      VERSION: 0.1.2
+      TAG: python-v0.1.2
+    steps:
+      - name: Download recovery package
+        uses: actions/download-artifact@v8
+        with:
+          name: python-0.1.2-recovery
+          path: recovery
+      - name: Create or repair GitHub Release
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$TAG" \
-            "dist/owlauth_client-${VERSION}-py3-none-any.whl" \
-            --notes-file release-notes.md \
-            --title "Python SDK v${VERSION}"
+          archive="recovery/dist/owlauth_client-${VERSION}-py3-none-any.whl"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --notes-file recovery/release-notes.md \
+              --title "Python SDK v${VERSION}"
+            gh release upload "$TAG" "$archive" --clobber
+          else
+            gh release create "$TAG" "$archive" \
+              --notes-file recovery/release-notes.md \
+              --title "Python SDK v${VERSION}"
+          fi
