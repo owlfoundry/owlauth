@@ -28,7 +28,7 @@ release_tag_prefix() {
 
 main() {
   local component="${1:-}"
-  local tag_prefix tag version remote release_commit main_commit tag_commit remote_tag_commit
+  local tag_prefix tag version remote release_commit tag_commit remote_tag_commit
   local conflicting_tag conflicting_remote_ref conflicting_tag_commit shared_remote_refs
 
   tag_prefix="$(release_tag_prefix "$component")"
@@ -54,19 +54,7 @@ main() {
   fi
 
   remote="${RELEASE_REMOTE:-origin}"
-  if ! git fetch --quiet --no-tags "$remote" \
-    +refs/heads/main:refs/remotes/release-verification/main; then
-    printf 'failed to fetch main from release remote %s\n' "$remote" >&2
-    return 1
-  fi
-
   release_commit="$(git rev-parse HEAD^{commit})"
-  main_commit="$(git rev-parse refs/remotes/release-verification/main^{commit})"
-  if [[ "$release_commit" != "$main_commit" ]]; then
-    printf 'release commit %s must equal current main commit %s\n' \
-      "$release_commit" "$main_commit" >&2
-    return 1
-  fi
 
   if ! tag_commit="$(git rev-parse "refs/tags/$tag^{commit}" 2>/dev/null)"; then
     printf 'release tag is not available in the checkout: %s\n' "$tag" >&2

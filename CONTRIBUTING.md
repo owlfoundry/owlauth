@@ -70,7 +70,7 @@ pnpm --filter @owlauth/docs build
 - CI and release workflows run package-content checks for every registry artifact, including the BSD license text.
 - Enforce the Rust product dependency direction in CI: CLI must not reach server; server must not reach client SDK.
 - Shared fixtures and conformance cases define cross-language behavioral parity.
-- The real PostgreSQL Project Auth E2E is manually dispatched when Runtime, SDK, or browser behavior changes; it is not part of every push or pull-request run. Do not replace it with fake E2E tests.
+- The real PostgreSQL Project Auth E2E is an optional local `make web-e2e` check when Runtime, SDK, or browser behavior changes; it is intentionally absent from CI. Do not replace it with fake E2E tests.
 
 ## Pull request titles and changelog
 
@@ -97,7 +97,7 @@ Generated notes classify `security`, `feat`, `fix`, `perf`, `refactor`, `docs`, 
 
 ## Releases
 
-Each released component follows independent SemVer. Release tags must point at the current `main` commit and use exactly one of:
+Each released component follows independent SemVer. Release tags identify a selected reviewed commit and use exactly one of:
 
 - Server and public dependency crates (`owlauth-key-provider`, `owlauth-types`, and `owlauth-server`): `server-v{version}`
 - CLI and its exact public types dependency (`owlauth-types` and `owlauth-cli`): `cli-v{version}`
@@ -109,7 +109,7 @@ Committed package manifests, including private workspace packages, use developme
 
 A server release publishes `owlauth-key-provider`, `owlauth-types`, then `owlauth-server` at the server tag version. A CLI release publishes `owlauth-types` then `owlauth-cli` at the CLI tag version so the CLI crate retains an exact public-types dependency. Server and CLI versions normally advance one shared crate sequence. They may use the same version only when both tags point to the same commit; publish Server first, then CLI reuses the checksum-identical `owlauth-types` crate. Versions must never move backward. The selected version must satisfy the strongest SemVer change among every crate emitted by that tag, including public `owlauth-types` changes. The SDK tag families remain independent. Python release tags currently use stable `X.Y.Z` only so PEP 440 normalization cannot make package metadata differ from the tag. Development sentinels must never be published. Do not reuse, move, or delete a published release tag.
 
-Full validation belongs to CI before tagging. Pushing a valid release tag performs only release-specific version checks, artifact builds and package-content inspection, publication, and GitHub Release creation. Publication must consume the uploaded notes artifact rather than GitHub-generated notes.
+Full validation belongs to CI before tagging. Pushing a valid release tag performs only release-specific version checks, artifact builds and package-content inspection, publication, and GitHub Release creation. The tag remains valid if `main` advances before publication. Publication must consume the uploaded notes artifact rather than GitHub-generated notes.
 
 Server images are published as `ghcr.io/owlfoundry/owlauth`. A server release publishes its versioned image and updates `latest`; SemVer `+` build-metadata separators are represented as `_` because OCI tags do not allow `+`. A push to `main` updates `dev`. A `build/server/{tag}` branch publishes the isolated test tag `build-{tag}` after image build and health smoke testing. The requested test tag must be one lowercase OCI tag segment; the `build-` registry prefix prevents collisions with release versions, `dev`, and `latest`.
 

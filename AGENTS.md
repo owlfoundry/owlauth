@@ -46,7 +46,7 @@ Common targets:
 - `make package-check` — inspect registry candidates and compile packaged Rust products offline.
 - `make openapi` — export `target/openapi/{runtime,server,control}.json`.
 - `make web-contracts` / `make web-build` / `make web-verify` — regenerate types, rebuild deterministic assets, and reject drift.
-- `make web-e2e` — qualify the exact SDK artifacts against real PostgreSQL, Rust, Chromium, and Firefox. It requires a clean committed `HEAD` so candidate bytes are attributable.
+- `make web-e2e` — optionally qualify the exact SDK artifacts locally against real PostgreSQL, Rust, Chromium, and Firefox. It requires a clean committed `HEAD` so candidate bytes are attributable.
 - `make test-containers` / `make docker-build` — focused Docker-backed infrastructure or image smoke tests.
 - `make docs` / `make docs-build` — serve or build the public documentation.
 
@@ -62,9 +62,9 @@ Generated-asset gates compare against Git state. Stage intended generated files 
 ## Release quick reference
 
 - Committed Cargo/npm manifests stay at `0.0.0-dev`; Python stays at `0.0.0.dev0`. Never commit release-only version bumps and never publish a development sentinel.
-- Releases are tag-driven from the current `main` commit: `server-v{version}`, `cli-v{version}`, `typescript-v{version}`, `python-v{version}`, or `rust-v{version}`. `{version}` is SemVer; Python currently permits stable `X.Y.Z` only.
+- Releases are driven by an immutable tag on the selected reviewed commit: `server-v{version}`, `cli-v{version}`, `typescript-v{version}`, `python-v{version}`, or `rust-v{version}`. `{version}` is SemVer; Python currently permits stable `X.Y.Z` only. A tag remains releasable if `main` advances afterward.
 - Server and CLI tags share the `owlauth-types` crates.io version sequence. Their versions normally increase globally; a matching version is allowed only when both tags point to the same commit, with Server published before CLI so CLI reuses the checksum-identical shared crate. Server publishes `owlauth-key-provider` → `owlauth-types` → `owlauth-server`; CLI publishes `owlauth-types` → `owlauth-cli`. SDK versions are independent.
-- Before tagging, verify the clean current `main` commit with the relevant focused tests plus `make check`, `make test`, and `make package-check`. Run the manually dispatched Project Auth E2E when Runtime, SDK, or browser behavior changed. Push `main`, wait for required checks, then create and push one immutable release tag. Do not move, reuse, or delete a published tag.
+- Before tagging, select a clean reviewed commit that has passed the relevant focused tests plus `make check`, `make test`, and `make package-check`. Run local `make web-e2e` only when its real browser coverage is useful. Create and push one immutable release tag; publishing need not race later changes to `main`. Do not move, reuse, or delete a published tag.
 - Release workflows do not rerun full CI. They derive versions in isolated workspaces, build and inspect the registry artifact, generate component-filtered notes, publish packages/artifacts, and create the GitHub Release. Server releases also publish the versioned GHCR image and `latest`; pushes to `main` publish `dev`.
 - `scripts/release/prepare_release.py` and `scripts/release/verify-release.sh` are workflow authorities, not a reason to commit materialized versions. Run release mutation tooling only in a disposable worktree when diagnosing automation.
 

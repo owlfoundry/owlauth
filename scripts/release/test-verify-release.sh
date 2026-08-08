@@ -104,6 +104,10 @@ git -C "$work" tag "$development_tag"
 git -C "$work" push --quiet origin "$development_tag"
 expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$development_tag"
 
+typescript_tag=typescript-v1.2.3
+git -C "$work" tag "$typescript_tag"
+git -C "$work" push --quiet origin "$typescript_tag"
+
 server_tag=server-v2.0.0
 git -C "$work" tag -a "$server_tag" -m "$server_tag"
 git -C "$work" push --quiet origin "$server_tag"
@@ -125,7 +129,7 @@ printf 'advanced\n' > "$updater/ADVANCED"
 git -C "$updater" add ADVANCED
 git -C "$updater" commit --quiet -m "advance main"
 git -C "$updater" push --quiet origin main
-expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag"
+run_verifier typescript GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$typescript_tag" >/dev/null
 
 old_server_tag=server-v4.0.0
 git -C "$work" tag "$old_server_tag" "$initial_commit"
