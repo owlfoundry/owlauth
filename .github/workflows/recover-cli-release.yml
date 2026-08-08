@@ -303,12 +303,20 @@ jobs:
             -F draft=true \
             -F prerelease=false)"
           release_id="$(jq -r .id <<<"$metadata")"
-          pages="$(gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
-          matches="$(jq --arg tag "$SOURCE_TAG" \
-            '[.[][] | select(.tag_name == $tag)]' <<<"$pages")"
-          [[ "$(jq 'length' <<<"$matches")" -eq 1 ]]
-          [[ "$(jq -r '.[0].id' <<<"$matches")" == "$release_id" ]]
+          for attempt in {1..10}; do
+            pages="$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+            matches="$(jq --arg tag "$SOURCE_TAG" \
+              '[.[][] | select(.tag_name == $tag)]' <<<"$pages")"
+            match_count="$(jq 'length' <<<"$matches")"
+            [[ "$match_count" -le 1 ]]
+            if [[ "$match_count" -eq 1 && \
+              "$(jq -r '.[0].id' <<<"$matches")" == "$release_id" ]]; then
+              break
+            fi
+            if [[ "$attempt" == 10 ]]; then exit 1; fi
+            sleep 2
+          done
           upload_url="$(jq -r .upload_url <<<"$metadata")"
           upload_url="${upload_url%%\{*}"
           for asset_path in artifacts/*; do
