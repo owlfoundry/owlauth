@@ -106,9 +106,15 @@ The three clients share semantic behavior while using native conventions such as
 
 ## Error semantics
 
-Public errors distinguish configuration, protocol, login, handoff, authentication, session, refresh, rate limiting, transport, timeout, cancellation, and an **indeterminate** one-use operation. Errors include a stable safe code/category, optional correlation ID, and retry classification.
+Public errors distinguish configuration, protocol, login, handoff, authentication, session, refresh, optional SaaS/ingress rate limiting, transport, timeout, cancellation, and an **indeterminate** one-use operation. Errors include a stable safe code/category, optional correlation ID, and retry classification. A valid Core `408 request_timeout` is a caller-decision `Timeout` for non-sensitive operations, but is `Indeterminate` with the existing quarantine action for a dispatched handoff, refresh, or logout operation because the server deadline may expire after authority work starts. Malformed `408` responses fail conservatively as invalid responses.
 
 Raw bodies, authorization headers, callback URLs, tokens, tickets, PKCE verifiers, cookies, provider details, and HTTP-library implementation exceptions are not stable public error data. Equivalent server responses map to equivalent semantic classes in every SDK.
+
+## Optional debug logging
+
+All three clients provide an optional debug hook and leave it disabled by default. TypeScript accepts `debugHook` in `ClientOptions`; Python accepts `debug_hook` on `Client`; Rust exposes `Client::with_debug_hook` and the `DebugHook` trait without requiring a logging facade. One real network attempt emits at most one immutable completion event with only operation, `GET`/`POST`, closed outcome, elapsed milliseconds, dispatch status, and optional status/safe error fields. A failing hook is isolated from the protocol result.
+
+Events never contain a URL/path/query, headers, cookies, body, redirect/callback, Project/Application/publishable identifiers, email/profile/projection data, OAuth state, PKCE, handoff, access/refresh credentials, transport object, exception object, or arbitrary error message. Applications may forward these closed events to their logger, but must not wrap the transport with raw request/response logging.
 
 ## Operation traceability
 

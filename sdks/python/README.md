@@ -103,13 +103,19 @@ context-invalid success response received after either sensitive dispatch raises
 Application logout revokes the exact Application session. Project browser logout preparation
 returns a Hosted confirmation target as data; the SDK never navigates to it.
 
+## Optional debug logging
+
+Pass `debug_hook=` to `Client` to observe one frozen `SdkDebugEvent` per real network attempt. The hook is disabled by default and its exceptions cannot change the protocol result. Events contain only fixed operation/method/outcome, elapsed milliseconds, dispatch status, and optional safe status/error metadata; they never contain URLs, headers, bodies, identifiers, callbacks, PKCE, or credentials.
+
 ## Errors and ambiguous outcomes
 
 All public failures derive from `OwlAuthError` and expose stable `category`, `code`, `retry`,
 `action`, `operation`, optional validated `request_id`, and optional `retry_after_seconds` fields.
-A valid `429` requires one decimal-seconds `Retry-After` value between 0 and 86400; malformed or
+When a SaaS/ingress layer adds a `429`, a valid response requires one decimal-seconds `Retry-After` value between 0 and 86400; malformed or
 missing guidance is an invalid response rather than an invented delay. Messages are SDK-owned and
 do not include raw Runtime bodies, callback URLs, tokens, tickets, or PKCE values.
+
+A valid Core `408 request_timeout` raises `OwlAuthTimeoutError` with caller-decision retry and no local action for non-sensitive operations. The same response raises `IndeterminateError` with the existing quarantine action for a dispatched handoff, refresh, Application logout, or Project browser-logout preparation because the server deadline may expire after authority work starts. A malformed `408` is treated as an invalid response.
 
 Handoff, refresh, Application logout, and Project browser-logout preparation are never retried.
 If a timeout, cancellation, disconnect, or server failure occurs after dispatch and the commit

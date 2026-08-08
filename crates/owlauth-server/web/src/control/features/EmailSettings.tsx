@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 
 import { formatDuration } from "../../shared/compositions/CopyValue";
+import { ChevronDownIcon } from "../../shared/icons/Icons";
 import {
   DataTable,
   DescriptionList,
@@ -16,10 +17,8 @@ import { Dialog, SideSheet } from "../../shared/primitives/Overlay";
 import { useControlConfirmation } from "../app/Confirmation";
 import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
 import {
-  type Application,
   type CreateSmtpConfigurationRequest,
   type DisposableControlClient,
-  type EmailAssignment,
   type EmailMethodPolicy,
   IdempotencyAttempt,
   type Project,
@@ -32,8 +31,6 @@ import styles from "./features.module.css";
 interface EmailSettingsProps {
   readonly session: DisposableControlClient;
   readonly project: Project;
-  readonly applications: Application[];
-  readonly onApplicationsChanged: () => Promise<void>;
   readonly onProjectChanged: () => Promise<void>;
   readonly onError: (error: unknown, refreshConflict?: () => Promise<void>) => Promise<void>;
   readonly setMessage: (message: string | null) => void;
@@ -42,16 +39,14 @@ interface EmailSettingsProps {
 export function EmailSettings({
   session,
   project,
-  applications,
-  onApplicationsChanged,
   onProjectChanged,
   onError,
   setMessage,
 }: EmailSettingsProps) {
   const confirm = useControlConfirmation();
   const [policy, setPolicy] = useState<EmailMethodPolicy | null>(null);
-  const [assignments, setAssignments] = useState<EmailAssignment[]>([]);
   const [smtp, setSmtp] = useState<SmtpConfiguration[]>([]);
+  const [expandedSmtpId, setExpandedSmtpId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "failed">("loading");
   const [editingPolicy, setEditingPolicy] = useState(false);
   const [creatingSmtp, setCreatingSmtp] = useState(false);
@@ -68,12 +63,8 @@ export function EmailSettings({
 
   const refresh = useCallback(
     async (signal?: AbortSignal) => {
-      const [policyResult, assignmentResult, smtpResult] = await Promise.all([
+      const [policyResult, smtpResult] = await Promise.all([
         session.client.GET("/v1/projects/{project_id}/email-method", {
-          params: { path: { project_id: project.id } },
-          signal: signal ?? null,
-        }),
-        session.client.GET("/v1/projects/{project_id}/email-method/assignments", {
           params: { path: { project_id: project.id } },
           signal: signal ?? null,
         }),
@@ -84,11 +75,15 @@ export function EmailSettings({
       ]);
       if (signal?.aborted !== true) {
         setPolicy(requireData(policyResult.data, policyResult.error, policyResult.response));
-        setAssignments(
-          requireData(assignmentResult.data, assignmentResult.error, assignmentResult.response)
-            .items,
+        const configurations = requireData(
+          smtpResult.data,
+          smtpResult.error,
+          smtpResult.response,
+        ).items;
+        setSmtp(configurations);
+        setExpandedSmtpId((current) =>
+          current !== null && configurations.some((item) => item.id === current) ? current : null,
         );
-        setSmtp(requireData(smtpResult.data, smtpResult.error, smtpResult.response).items);
       }
     },
     [project.id, session],
@@ -170,11 +165,6 @@ export function EmailSettings({
     };
   }, [onError, project.id, session, smtpTestOperation, smtpTestPolling, smtpTestRevision]);
 
-  const assignmentByApplication = useMemo(
-    () => new Map(assignments.map((assignment) => [assignment.application_id, assignment])),
-    [assignments],
-  );
-
   async function updatePolicy(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();
     if (policy === null) return;
@@ -209,44 +199,6 @@ export function EmailSettings({
       await onError(error, async () => {
         await refresh();
         setEditingPolicy(false);
-      });
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function assign(application: Application, enabled: boolean) {
-    if (
-      !enabled &&
-      !(await confirm({
-        title: "Remove passwordless email",
-        message: `Remove passwordless email from ${application.display_name} (${application.public_id})? Users will no longer be able to choose this method for this exact Application.`,
-        actionLabel: "Remove email method",
-        destructive: true,
-      }))
-    ) {
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const result = await session.client.PUT(
-        "/v1/projects/{project_id}/applications/{application_id}/email-method",
-        {
-          params: { path: { project_id: project.id, application_id: application.id } },
-          body: {
-            enabled,
-            expected_application_security_revision: application.security_revision,
-          },
-        },
-      );
-      setPolicy(requireData(result.data, result.error, result.response));
-      await Promise.all([onApplicationsChanged(), refresh()]);
-      setMessage(
-        `Email method ${enabled ? "assigned to" : "removed from"} ${application.display_name}.`,
-      );
-    } catch (error) {
-      await onError(error, async () => {
-        await Promise.all([onApplicationsChanged(), refresh()]);
       });
     } finally {
       setSubmitting(false);
@@ -407,7 +359,7 @@ export function EmailSettings({
   if (loadState === "failed" || policy === null) {
     return (
       <InlineAlert tone="danger" role="alert">
-        <p>Email policy, assignments, or SMTP generations could not be loaded.</p>
+        <p>Email policy or SMTP generations could not be loaded.</p>
         <Button type="button" onClick={() => void load().catch(onError)}>
           Retry email configuration
         </Button>
@@ -502,49 +454,6 @@ export function EmailSettings({
         />
       </Section>
 
-      <Section
-        title="Application assignments"
-        description="Only assigned Applications may offer the Project email method."
-      >
-        {applications.length === 0 ? (
-          <EmptyState
-            level={3}
-            title="No Applications"
-            description="Create an Application before assigning passwordless email."
-          />
-        ) : (
-          <DataTable
-            caption="Passwordless email Application assignments"
-            headings={["Application", "Status", "Action"]}
-          >
-            {applications.map((application) => {
-              const enabled = assignmentByApplication.get(application.id)?.enabled === true;
-              return (
-                <tr key={application.id}>
-                  <td>{application.display_name}</td>
-                  <td>
-                    <StatusBadge
-                      status={enabled ? "assigned" : "not assigned"}
-                      family={enabled ? "active" : "disabled"}
-                    />
-                  </td>
-                  <td>
-                    <Button
-                      type="button"
-                      variant={enabled ? "quiet" : "secondary"}
-                      disabled={!active || application.status !== "active" || submitting}
-                      onClick={() => void assign(application, !enabled)}
-                    >
-                      {enabled ? "Remove" : "Assign"}
-                    </Button>
-                  </td>
-                </tr>
-              );
-            })}
-          </DataTable>
-        )}
-      </Section>
-
       {smtpTestOperation === null ? null : (
         <SmtpTestStatus
           operation={smtpTestOperation}
@@ -588,77 +497,134 @@ export function EmailSettings({
         ) : (
           <DataTable
             caption="Project SMTP generations"
-            headings={["Generation", "Delivery", "Status", "Fingerprint", "Actions"]}
+            headings={["Generation", "Delivery", "Status", "Actions", "Details"]}
           >
             {smtp.map((configuration) => (
-              <tr key={configuration.id}>
-                <td>{String(configuration.generation)}</td>
-                <td>
-                  <span className={styles["machineValue"]}>
-                    {configuration.host}:{String(configuration.port)}
-                  </span>
-                  <span>{configuration.sender_address}</span>
-                </td>
-                <td>
-                  <StatusBadge status={configuration.status} />
-                </td>
-                <td>
-                  <code>{configuration.safe_fingerprint}</code>
-                </td>
-                <td>
-                  <div className={styles["actions"]}>
-                    <Button
-                      type="button"
-                      variant="quiet"
-                      disabled={submitting}
-                      onClick={() => {
-                        setEditorError(null);
-                        setTestingSmtp(configuration);
-                      }}
-                    >
-                      Send test
-                    </Button>
-                    {configuration.status === "pending" ? (
-                      <>
-                        <Button
-                          type="button"
-                          disabled={submitting}
-                          onClick={() => void transition(configuration, "activate")}
-                        >
-                          Activate
-                        </Button>
-                        <span>
-                          {deliveredSmtpTests[configuration.id] === configuration.revision
-                            ? "Delivered test observed for this revision; the server revalidates it on activation."
-                            : "A delivered test for this exact revision is required. The server validates durable evidence, including tests completed in another Console session."}
-                        </span>
-                      </>
-                    ) : null}
-                    {!(["disabled", "compromised", "retired"] as string[]).includes(
-                      configuration.status,
-                    ) ? (
+              <Fragment key={configuration.id}>
+                <tr>
+                  <td>{String(configuration.generation)}</td>
+                  <td>
+                    <span className={styles["machineValue"]}>
+                      {configuration.host}:{String(configuration.port)}
+                    </span>
+                    <span>{configuration.sender_address}</span>
+                  </td>
+                  <td>
+                    <StatusBadge status={configuration.status} />
+                  </td>
+                  <td>
+                    <div className={styles["actions"]}>
                       <Button
                         type="button"
                         variant="quiet"
                         disabled={submitting}
-                        onClick={() => void transition(configuration, "disable")}
+                        onClick={() => {
+                          setEditorError(null);
+                          setTestingSmtp(configuration);
+                        }}
                       >
-                        Disable
+                        Send test
                       </Button>
-                    ) : null}
-                    {!(["compromised", "retired"] as string[]).includes(configuration.status) ? (
-                      <Button
-                        type="button"
-                        variant="danger"
-                        disabled={submitting}
-                        onClick={() => void transition(configuration, "compromise")}
-                      >
-                        Mark compromised
-                      </Button>
-                    ) : null}
-                  </div>
-                </td>
-              </tr>
+                      {configuration.status === "pending" ? (
+                        <>
+                          <Button
+                            type="button"
+                            disabled={submitting}
+                            onClick={() => void transition(configuration, "activate")}
+                          >
+                            Activate
+                          </Button>
+                          <span>
+                            {deliveredSmtpTests[configuration.id] === configuration.revision
+                              ? "Delivered test observed for this revision; the server revalidates it on activation."
+                              : "A delivered test for this exact revision is required. The server validates durable evidence, including tests completed in another Console session."}
+                          </span>
+                        </>
+                      ) : null}
+                      {!(["disabled", "compromised", "retired"] as string[]).includes(
+                        configuration.status,
+                      ) ? (
+                        <Button
+                          type="button"
+                          variant="quiet"
+                          disabled={submitting}
+                          onClick={() => void transition(configuration, "disable")}
+                        >
+                          Disable
+                        </Button>
+                      ) : null}
+                      {!(["compromised", "retired"] as string[]).includes(configuration.status) ? (
+                        <Button
+                          type="button"
+                          variant="danger"
+                          disabled={submitting}
+                          onClick={() => void transition(configuration, "compromise")}
+                        >
+                          Mark compromised
+                        </Button>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td>
+                    <Button
+                      type="button"
+                      variant="quiet"
+                      iconOnly
+                      aria-label={`${expandedSmtpId === configuration.id ? "Collapse" : "Expand"} SMTP generation ${String(configuration.generation)} details`}
+                      aria-expanded={expandedSmtpId === configuration.id}
+                      aria-controls={`smtp-generation-${configuration.id}`}
+                      onClick={() => {
+                        setExpandedSmtpId((current) =>
+                          current === configuration.id ? null : configuration.id,
+                        );
+                      }}
+                    >
+                      <ChevronDownIcon
+                        className={
+                          expandedSmtpId === configuration.id
+                            ? styles["disclosureIconExpanded"]
+                            : styles["disclosureIcon"]
+                        }
+                      />
+                    </Button>
+                  </td>
+                </tr>
+                {expandedSmtpId === configuration.id ? (
+                  <tr id={`smtp-generation-${configuration.id}`}>
+                    <td colSpan={5} className={styles["expandedDetailCell"]}>
+                      <DescriptionList
+                        items={[
+                          {
+                            term: "Hostname",
+                            detail: `${configuration.host}:${String(configuration.port)}`,
+                          },
+                          {
+                            term: "TLS mode",
+                            detail:
+                              configuration.tls_mode === "implicit_tls"
+                                ? "Implicit TLS"
+                                : "STARTTLS required",
+                          },
+                          {
+                            term: "Sender",
+                            detail:
+                              configuration.sender_name === null ||
+                              configuration.sender_name === undefined
+                                ? configuration.sender_address
+                                : `${configuration.sender_name} <${configuration.sender_address}>`,
+                          },
+                          { term: "Reply-to", detail: configuration.reply_to ?? "Not configured" },
+                          {
+                            term: "Safe fingerprint",
+                            detail: <code>{configuration.safe_fingerprint}</code>,
+                          },
+                          { term: "Revision", detail: String(configuration.revision) },
+                        ]}
+                      />
+                    </td>
+                  </tr>
+                ) : null}
+              </Fragment>
             ))}
           </DataTable>
         )}

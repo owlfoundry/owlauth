@@ -16,10 +16,6 @@ pub(crate) enum ApplicationError {
     IdempotencyConflict,
     #[error("operation is already in progress")]
     OperationInProgress,
-    #[error("publication has not propagated to Runtime")]
-    PublicationPending,
-    #[error("required Server verifier fleet is not ready")]
-    ServerVerifierUnavailable,
     #[error("state transition is not allowed")]
     InvalidTransition,
     #[error("bounded resource capacity is exhausted")]

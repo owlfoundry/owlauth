@@ -96,7 +96,7 @@ test("server-key reveal is one-time, non-dismissible, and revisioned in a real b
   await page.getByRole("dialog").getByRole("button", { name: "Create Project" }).click();
   await expect(page.getByRole("heading", { name: projectName })).toBeVisible();
 
-  await page.getByRole("link", { name: "Project secret keys" }).click();
+  await page.getByRole("link", { name: "Project secret keys", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Project secret keys", exact: true }),
   ).toBeVisible();

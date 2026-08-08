@@ -171,6 +171,7 @@ flowchart LR
     Overview --> Security[Security]
     Overview --> Settings[Settings]
     Apps --> AppDetail[Application detail]
+    AppDetail --> Methods[Authentication assignments]
     AppDetail --> Delivery[Projection and webhooks]
     Auth --> Providers[Providers]
     Auth --> Email[Passwordless email]
@@ -183,19 +184,19 @@ flowchart LR
 
 The target client routes are relative to the configured `console/` base:
 
-| Route                                                  | Page responsibility                                                                                                                         |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/`                                                    | Project directory, empty state, and create-Project action                                                                                   |
-| `/projects/{project_id}`                               | compact operational dashboard with safe Project resource summaries                                                                          |
-| `/projects/{project_id}/applications`                  | Application inventory and create action                                                                                                     |
-| `/projects/{project_id}/applications/{application_id}` | metadata, exact browser configuration, user projection, webhook endpoints, delivery state, and replay actions grouped into tabs or sections |
-| `/projects/{project_id}/authentication/providers`      | provider inventory, onboarding, configuration state, Application assignments, provisioning reconciliation, and disablement                  |
-| `/projects/{project_id}/authentication/email`          | email method policy, Application assignments, and SMTP generations                                                                          |
-| `/projects/{project_id}/users`                         | authoritative Project-user search, status/identity/provider filters, creation-time sort, and cursor-bounded inventory                       |
-| `/projects/{project_id}/users/{user_id}`               | user provenance, identities, sessions, exact managed-connection synchronization/reauthorization/revoke/disconnect, and link/unlink/merge    |
-| `/projects/{project_id}/security/signing-keys`         | signing-key inventory, provisioning, activation, rotation state, and recovery                                                               |
-| `/projects/{project_id}/security/server-keys`          | Project server-key safe inventory, create-once reveal, overlap rotation guidance, and revisioned revocation                                 |
-| `/projects/{project_id}/settings`                      | Project metadata, policy, projection defaults, egress policy when supported, and a separated danger zone                                    |
+| Route                                                  | Page responsibility                                                                                                                                                     |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/`                                                    | Project directory, empty state, and create-Project action                                                                                                               |
+| `/projects/{project_id}`                               | compact operational dashboard with safe Project resource summaries                                                                                                      |
+| `/projects/{project_id}/applications`                  | Application inventory and create action                                                                                                                                 |
+| `/projects/{project_id}/applications/{application_id}` | metadata, Authentication assignments, exact browser configuration, user projection, webhook endpoints, delivery state, and replay actions grouped into tabs or sections |
+| `/projects/{project_id}/authentication/providers`      | provider inventory, onboarding, editable safe configuration, callback registration guidance, provisioning reconciliation, and disablement                               |
+| `/projects/{project_id}/authentication/email`          | email method policy and SMTP generations                                                                                                                                |
+| `/projects/{project_id}/users`                         | authoritative Project-user search, status/identity/provider filters, creation-time sort, and cursor-bounded inventory                                                   |
+| `/projects/{project_id}/users/{user_id}`               | user provenance, identities, sessions, exact managed-connection synchronization/reauthorization/revoke/disconnect, and link/unlink/merge                                |
+| `/projects/{project_id}/security/signing-keys`         | signing-key inventory, provisioning, activation, rotation state, and recovery                                                                                           |
+| `/projects/{project_id}/security/server-keys`          | Project server-key safe inventory, create-once reveal, overlap rotation guidance, and revisioned revocation                                                             |
+| `/projects/{project_id}/settings`                      | Project metadata, policy, projection defaults, egress policy when supported, and a separated danger zone                                                                |
 
 These routes organize existing or contract-backed workflows; they do not require a second API. A route whose Control capability does not exist MUST remain absent rather than showing a disabled future-product placeholder. Direct navigation returns the Console shell only within the route partition allowed by spec 09 and TS-002.
 
@@ -207,7 +208,7 @@ Project creation opens a focused dialog or narrow side sheet instead of placing 
 
 The Project overview is a compact operational dashboard, not an analytics or onboarding surface. It MAY show:
 
-- Applications, active authentication methods, signing-key state, and email-delivery configuration summaries when returned by reviewed Control queries;
+- Applications, Identity providers, Project users, and Project secret-key summaries returned by one authoritative Project-scoped Control overview query;
 - direct links from each resource summary to its authoritative management surface; and
 - public identifiers or callback guidance safe for the operator to copy inline with the Project context.
 
@@ -226,6 +227,8 @@ It MUST NOT infer health from browser-visible heuristics or claim that a deploym
 - Inventory filters and refresh actions use a compact local toolbar adjacent to the collection. Filters do not occupy a distant page-header or section-header action slot.
 - Exact IDs, origins, callback URLs, timestamps, and revisions are selectable monospace text. A copy action MAY be supplied only for non-secret values and must announce success without replacing the visible value.
 - Empty states explain why the collection is empty and offer one permitted next action. They do not use decorative illustrations as a substitute for guidance.
+
+Authentication-method assignment is owned by the Application detail **Authentication** tab because the mutation is fenced by that Application's security revision. Provider and passwordless-email routes MUST NOT duplicate assignment controls. The Provider and SMTP inventories use a right-edge, icon-only disclosure with `aria-expanded` and `aria-controls` to reveal safe detail in an adjacent semantic table row; provider editing remains a focused side sheet rather than an inline form. Expanded provider detail includes a directly copyable callback URL and states that the exact value must be registered as the upstream provider's callback or authorized redirect URI.
 
 The Users route uses one coherent inventory measure and a full-width local toolbar rather than a small filter card beside a wider empty state or list. Search is explicit-submit: ordinary text is an authoritative case-insensitive prefix over safe display name/public ID, while a value containing `@` invokes the exact-email body lookup. Status, active identity kind, configured provider provenance, and newest/oldest creation order are server criteria; changing or clearing criteria resets pagination. The toolbar is four fields on wide screens, two columns at intermediate widths, and one column on narrow screens. Empty copy distinguishes a Project with no users from a valid query with no matches.
 
@@ -267,7 +270,7 @@ Toast-only error reporting is forbidden. Time-limited notifications MAY suppleme
 
 ### Secrets, confirmations, and danger zones
 
-Write-only provider, SMTP, webhook, and other submitted secrets render only in the active native password control and short-lived request object permitted by spec 09. The UI does not provide reveal, copy, recovery, or retained masked-value affordances. A committed submitted secret is represented only by safe metadata such as configured/not configured, generation, or last safe outcome.
+Write-only provider, SMTP, webhook, and other submitted secrets render only in the active native password control and short-lived request object permitted by spec 09. The UI does not provide reveal, copy, or retained masked-value affordances. A committed submitted secret is represented only by safe metadata such as configured/not configured, generation, or last safe outcome. If a durable Provider client-secret replacement remains pending after an uncertain result, the Provider inventory exposes only that safe pending state and requires the operator either to re-enter the intended secret to resume the generation-fenced operation or explicitly abandon it. Abandonment erases unpublished material and leaves the current active secret unchanged; neither browser navigation nor loss of a page-memory idempotency key may make the Provider permanently unmanageable.
 
 The generated Project server key is the one explicit exception: its non-dismissible create dialog renders the original response credential exactly once with a copy action and an external-storage assertion. The Console commits the revision-fenced server acknowledgement before disposing the credential or closing; failure keeps both reveal and retry visible. Later inventory shows only label, public key ID/display prefix, status, revision, created/acknowledged/last-used/revoked time. Any active unacknowledged key blocks another create across reload and offers truthful retained-credential acknowledgement or revocation. No marker or credential is persisted in browser storage. The page offers overlap guidance—create, store, deploy, then revoke—without a fake rotate/reveal action. An ambiguous create outcome never claims the secret can be recovered.
 
@@ -464,7 +467,7 @@ Before this UI scheme is considered implemented:
 12. both applications work at `1440`, `1024`, `768`, and `320px`, at 200% zoom, with no document-level horizontal overflow except a bounded exact-value region;
 13. keyboard-only route navigation, dialogs, menus, tabs, forms, confirmation, async completion, error recovery, and lock restore predictable focus and expose correct semantics;
 14. axe, semantic-role queries, reduced-motion, forced-color, zoom/reflow, and manual visual review cover representative Console and every Runtime flow family in Chromium and Firefox as required by TS-002;
-15. malicious text, oversized safe values, long IDs, empty collections, loading, `401`, `404`, `409`, rate limit, unavailable dependency, and uncertain mutation outcomes remain readable and cannot break layout or navigation safety;
+15. malicious text, oversized safe values, long IDs, empty collections, loading, `401`, `404`, `409`, capacity failure, unavailable dependency, and uncertain mutation outcomes remain readable and cannot break layout or navigation safety;
 16. shared UI source remains authority-free and build validation still proves separate Runtime and Control contracts, import graphs, chunks, manifests, assets, embed roots, CSP, and cross-plane retrieval denial;
 17. production remains self-contained and loads no remote font, logo, icon, script, style, analytics, or other third-party resource;
 18. visual review confirms a consistent teal-neutral SaaS identity, compact information density, restrained elevation, and clear hierarchy without copying the referenced products;

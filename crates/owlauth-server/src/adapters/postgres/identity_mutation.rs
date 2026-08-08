@@ -2,7 +2,7 @@
 //!
 //! This adapter deliberately uses raw SQL for the interaction aggregate: the migration's
 //! deferred aggregate constraints and typed callback/email owners are part of the authority.
-//! Runtime transactions acquire the exact incarnation fence first. Control transactions have no
+//! Runtime transactions lock their exact protocol owner first. Control transactions have no
 //! Runtime authority and instead receive only the narrow projection materializer. Both facades use
 //! `PostgreSQL`'s clock for eligibility and lifecycle timestamps; caller clocks are never authority.
 
@@ -23,7 +23,7 @@ use crate::{
         AdmittedEmailMethod, ApplicationError, CandidateEvidenceMaterial,
         ClaimIdentityMutationProvider, CommitIdentityMutationEmailGeneration,
         CompleteIdentityMutationEmailProof, ControlIdentityMutationRepository,
-        CreateIdentityMutationResult, EmailIdentityAliasAuthority, EmailProofKind,
+        CreateIdentityMutationResult, EmailProofKind,
         EstablishIdentityMutationMagicTransferContext,
         EstablishedIdentityMutationMagicTransferContext, FailIdentityMutationProvider,
         IdentityMutationBindingsDisposition, IdentityMutationCandidate,
@@ -50,9 +50,9 @@ use crate::{
 
 use super::{
     audit::append_runtime_audit,
-    auth_incarnation::AuthIncarnationFence,
     authentication::persistence,
     entity::project_user,
+    mail_delivery_safety::{MailDeliveryAuthorization, authorize_mail_delivery},
     projection::{
         IdentityProjectionMaterializer, MAX_APPLICATION_BINDINGS_PER_USER, base_profile_digest,
     },
@@ -65,19 +65,16 @@ const MAX_MAGIC_CONTEXTS: i64 = 8;
 pub(crate) struct PostgresControlIdentityMutationRepository {
     database: DatabaseConnection,
     projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-    required_auth_process_ids: Vec<String>,
 }
 
 impl PostgresControlIdentityMutationRepository {
     pub(crate) fn new(
         database: DatabaseConnection,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-        required_auth_process_ids: Vec<String>,
     ) -> Self {
         Self {
             database,
             projection_materializer,
-            required_auth_process_ids,
         }
     }
 
@@ -89,28 +86,15 @@ impl PostgresControlIdentityMutationRepository {
 #[derive(Clone)]
 pub(crate) struct PostgresRuntimeIdentityMutationRepository {
     database: DatabaseConnection,
-    fence: AuthIncarnationFence,
-    required_auth_process_ids: Vec<String>,
 }
 
 impl PostgresRuntimeIdentityMutationRepository {
-    pub(crate) fn new(
-        database: DatabaseConnection,
-        process_id: String,
-        incarnation: Uuid,
-        required_auth_process_ids: Vec<String>,
-    ) -> Self {
-        Self {
-            database,
-            fence: AuthIncarnationFence::new(process_id, incarnation),
-            required_auth_process_ids,
-        }
+    pub(crate) fn new(database: DatabaseConnection) -> Self {
+        Self { database }
     }
 
     async fn begin(&self) -> Result<DatabaseTransaction, ApplicationError> {
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        self.fence.lock(&transaction).await?;
-        Ok(transaction)
+        self.database.begin().await.map_err(persistence)
     }
 }
 
@@ -488,8 +472,8 @@ impl ControlIdentityMutationRepository for PostgresControlIdentityMutationReposi
         confirmation: PreparedIdentityMutationConfirmation,
     ) -> Result<IdentityMutationRecord, ApplicationError> {
         let transaction = self.begin().await?;
-        // Control confirmation has no Auth process incarnation. It locks the Project graph
-        // before any typed namespace and delegates projection cryptography through one narrow,
+        // Control confirmation locks the Project graph before any typed namespace and delegates
+        // projection cryptography through one narrow,
         // transaction-scoped materializer.
         lock_project_graph(&transaction, confirmation.project_id).await?;
         if confirmation.expected_kind == IdentityMutationKind::Link {
@@ -508,7 +492,7 @@ impl ControlIdentityMutationRepository for PostgresControlIdentityMutationReposi
             confirmation.expected_kind,
         )
         .await?;
-        revalidate_final_authority(&transaction, &intent, &self.required_auth_process_ids).await?;
+        revalidate_final_authority(&transaction, &intent).await?;
         if confirmation.expected_kind == IdentityMutationKind::Merge
             && merge_binding_union_count(&transaction, &intent).await?
                 > MAX_APPLICATION_BINDINGS_PER_USER
@@ -825,13 +809,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        revalidate_slot_authority(
-            &transaction,
-            &intent_row,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await?;
+        revalidate_slot_authority(&transaction, &intent_row, &slot).await?;
         let timestamp = database_now(&transaction).await?;
         let updated = transaction
             .execute_raw(statement(
@@ -923,14 +901,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             "provider_authorization_started" => {}
             _ => return Err(ApplicationError::InvalidTransition),
         }
-        match revalidate_slot_authority(
-            &transaction,
-            &intent,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await
-        {
+        match revalidate_slot_authority(&transaction, &intent, &slot).await {
             Ok(()) => {}
             Err(
                 ApplicationError::RevisionConflict
@@ -1044,13 +1015,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         {
             return Err(ApplicationError::RevisionConflict);
         }
-        revalidate_slot_authority(
-            &transaction,
-            &intent,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await?;
+        revalidate_slot_authority(&transaction, &intent, &slot).await?;
         let role = parse_role(&get::<String>(&slot, "slot_role")?)?;
         let timestamp = database_now(&transaction).await?;
         let evidence = if role == IdentityMutationSlotRole::CandidateIdentity {
@@ -1187,13 +1152,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        revalidate_slot_authority(
-            &transaction,
-            &intent_row,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await?;
+        revalidate_slot_authority(&transaction, &intent_row, &slot).await?;
         let timestamp = database_now(&transaction).await?;
         let updated = transaction
             .execute_raw(statement(
@@ -1224,12 +1183,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         _now: OffsetDateTime,
     ) -> Result<IdentityMutationEmailGenerationPreparation, ApplicationError> {
         let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
         let (intent_row, slot) = lock_authenticated_slot(
             &transaction,
             intent_id,
@@ -1251,13 +1204,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        revalidate_slot_authority(
-            &transaction,
-            &intent_row,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await?;
+        revalidate_slot_authority(&transaction, &intent_row, &slot).await?;
         let aggregate = transaction
             .query_one_raw(statement(
                 "SELECT COALESCE(MAX(generation),0)::SMALLINT AS generation,
@@ -1274,8 +1221,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::Integrity)?;
-        let policy =
-            admitted_email_method(&transaction, &slot, &self.required_auth_process_ids).await?;
+        let policy = admitted_email_method(&transaction, &slot).await?;
         let generation: i16 = get(&aggregate, "generation")?;
         if generation >= policy.max_generations || generation >= 5 {
             return Err(ApplicationError::InvalidTransition);
@@ -1305,12 +1251,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
     ) -> Result<IdentityMutationRecord, ApplicationError> {
         validate_generation(&generation)?;
         let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
         let intent = lock_intent(&transaction, generation.intent_id).await?;
         require_project(&intent, generation.project_id)?;
         if expire_locked_if_needed(&transaction, &intent).await? {
@@ -1328,15 +1268,8 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        revalidate_slot_authority(
-            &transaction,
-            &intent,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await?;
-        let policy =
-            admitted_email_method(&transaction, &slot, &self.required_auth_process_ids).await?;
+        revalidate_slot_authority(&transaction, &intent, &slot).await?;
+        let policy = admitted_email_method(&transaction, &slot).await?;
         if policy != generation.admitted_method {
             return Err(ApplicationError::RevisionConflict);
         }
@@ -1407,7 +1340,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
                 "UPDATE email_challenges SET status='superseded',terminal_at=$4,updated_at=$4
                   WHERE owner_kind='identity_mutation' AND project_id=$1
                     AND identity_mutation_intent_id=$2 AND identity_mutation_proof_slot_id=$3
-                    AND status='pending'",
+                    AND status IN ('pending','delivery_unavailable')",
                 vec![
                     generation.project_id.into(),
                     generation.intent_id.into(),
@@ -1417,6 +1350,21 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             ))
             .await
             .map_err(persistence)?;
+        let delivery_authorization = authorize_mail_delivery(
+            &transaction,
+            generation.project_id,
+            generation.canonicalization_version,
+            &generation.recipient_digests,
+            policy.resend_after_seconds,
+        )
+        .await?;
+        let dispatch = delivery_authorization == MailDeliveryAuthorization::Dispatch;
+        let challenge_status = if dispatch {
+            "pending"
+        } else {
+            "delivery_unavailable"
+        };
+        let terminal_at = (!dispatch).then_some(timestamp);
         transaction
             .execute_raw(statement(
                 "INSERT INTO email_challenges
@@ -1428,9 +1376,9 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
                   method_policy_revision,method_security_revision,assignment_security_revision,
                   smtp_selection_kind,smtp_configuration_id,smtp_generation,
                   smtp_security_eligibility_revision,browser_binding_required,issued_at,
-                  otp_expires_at,magic_expires_at,expires_at,created_at,updated_at)
-                 VALUES ($1,$2,$3,'identity_mutation',NULL,$4,$5,$6,'pending',$7,$8,$9,$10,$11,
-                         $12,$13,0,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$25,$25)",
+                  otp_expires_at,magic_expires_at,expires_at,terminal_at,created_at,updated_at)
+                 VALUES ($1,$2,$3,'identity_mutation',NULL,$4,$5,$6,$29,$7,$8,$9,$10,$11,
+                         $12,$13,0,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$30,$25,$25)",
                 vec![
                     generation.challenge_id.into(),
                     generation.project_id.into(),
@@ -1460,43 +1408,45 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
                     otp_expiry.into(),
                     magic_expiry.into(),
                     challenge_expiry.into(),
+                    challenge_status.into(),
+                    terminal_at.into(),
                 ],
             ))
             .await
             .map_err(persistence)?;
-        transaction
-            .execute_raw(statement(
-                "INSERT INTO mail_outbox
+        if dispatch {
+            transaction
+                .execute_raw(statement(
+                    "INSERT INTO mail_outbox
                  (id,project_id,transaction_id,challenge_id,challenge_generation,status,
                   smtp_selection_kind,smtp_configuration_id,smtp_generation,
                   smtp_security_eligibility_revision,message_id,envelope_ciphertext,
                   envelope_key_version,body_ciphertext,body_key_version,attempts,max_attempts,
                   next_attempt_at,safe_outcome,useful_until,terminal_at,created_at,updated_at)
-                 VALUES ($1,$2,NULL,$3,$4,CASE WHEN $16 THEN 'cancelled' ELSE 'pending' END,
+                 VALUES ($1,$2,NULL,$3,$4,'pending',
                          $5,$6,$7,$8,$9,$10,$11,$12,$13,0,5,$14,
-                         CASE WHEN $16 THEN 'policy_denied' ELSE NULL END,$15,
-                         CASE WHEN $16 THEN $14 ELSE NULL END,$14,$14)",
-                vec![
-                    generation.outbox_id.into(),
-                    generation.project_id.into(),
-                    generation.challenge_id.into(),
-                    generation.expected_generation.into(),
-                    policy.smtp_selection_kind.into(),
-                    policy.smtp_configuration_id.into(),
-                    policy.smtp_generation.into(),
-                    policy.smtp_security_eligibility_revision.into(),
-                    generation.message_id.into(),
-                    generation.envelope.ciphertext.into(),
-                    generation.envelope.key_version.into(),
-                    generation.body.ciphertext.into(),
-                    generation.body.key_version.into(),
-                    timestamp.into(),
-                    challenge_expiry.into(),
-                    generation.suppress_delivery.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?;
+                         NULL,$15,NULL,$14,$14)",
+                    vec![
+                        generation.outbox_id.into(),
+                        generation.project_id.into(),
+                        generation.challenge_id.into(),
+                        generation.expected_generation.into(),
+                        policy.smtp_selection_kind.into(),
+                        policy.smtp_configuration_id.into(),
+                        policy.smtp_generation.into(),
+                        policy.smtp_security_eligibility_revision.into(),
+                        generation.message_id.into(),
+                        generation.envelope.ciphertext.into(),
+                        generation.envelope.key_version.into(),
+                        generation.body.ciphertext.into(),
+                        generation.body.key_version.into(),
+                        timestamp.into(),
+                        challenge_expiry.into(),
+                    ],
+                ))
+                .await
+                .map_err(persistence)?;
+        }
         let updated = transaction
             .execute_raw(statement(
                 "UPDATE identity_mutation_proof_slots
@@ -1533,12 +1483,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         validate_digest(&command.context)?;
         validate_digest(&command.csrf)?;
         let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
         let owner = magic_transfer_owner(&transaction, command.challenge_id).await?;
         let intent = lock_intent(&transaction, owner.intent_id).await?;
         require_project(&intent, owner.project_id)?;
@@ -1613,12 +1557,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         validate_digest(&command.context)?;
         validate_digest(&command.csrf)?;
         let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
         let owner = magic_transfer_owner(&transaction, command.challenge_id).await?;
         let intent = lock_intent(&transaction, owner.intent_id).await?;
         require_project(&intent, owner.project_id)?;
@@ -1678,12 +1616,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             EmailProofKind::MagicLink => "magic_digest_key_version",
         };
         let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
         let intent = lock_intent(&transaction, key.intent_id).await?;
         require_project(&intent, key.project_id)?;
         if expire_locked_if_needed(&transaction, &intent).await? {
@@ -1760,12 +1692,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
     ) -> Result<IdentityMutationEmailProofDecision, ApplicationError> {
         validate_verification(&verification)?;
         let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
         let intent = lock_intent(&transaction, verification.intent_id).await?;
         require_project(&intent, verification.project_id)?;
         if expire_locked_if_needed(&transaction, &intent).await? {
@@ -1794,13 +1720,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
             transaction.commit().await.map_err(persistence)?;
             return Ok(IdentityMutationEmailProofDecision::Invalid);
         }
-        revalidate_slot_authority(
-            &transaction,
-            &intent,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await?;
+        revalidate_slot_authority(&transaction, &intent, &slot).await?;
         if !proof_matches(&challenge, &verification)? {
             if verification.proof_kind == EmailProofKind::Otp {
                 let timestamp = database_now(&transaction).await?;
@@ -1841,12 +1761,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         validate_digest(&completion.verified_challenge_lookup)?;
         validate_digest(&completion.receipt_digest)?;
         let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
         let verification = &completion.verification;
         let intent = lock_intent(&transaction, verification.intent_id).await?;
         require_project(&intent, verification.project_id)?;
@@ -1877,13 +1791,7 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         {
             return Err(ApplicationError::InvalidTransition);
         }
-        revalidate_slot_authority(
-            &transaction,
-            &intent,
-            &slot,
-            &self.required_auth_process_ids,
-        )
-        .await?;
+        revalidate_slot_authority(&transaction, &intent, &slot).await?;
         require_digest_columns(
             &challenge,
             "lookup_digest",
@@ -1979,30 +1887,6 @@ impl RuntimeIdentityMutationRepository for PostgresRuntimeIdentityMutationReposi
         let record = read_record(&transaction, verification.intent_id).await?;
         transaction.commit().await.map_err(persistence)?;
         Ok(record)
-    }
-
-    async fn identity_alias_authority(
-        &self,
-    ) -> Result<EmailIdentityAliasAuthority, ApplicationError> {
-        let transaction = self.begin().await?;
-        assert_email_ready(
-            &transaction,
-            self.fence.process_id(),
-            self.fence.incarnation(),
-        )
-        .await?;
-        let row = transaction
-            .query_one_raw(statement(
-                "SELECT revision,write_version,accepted_versions
-                   FROM email_identity_alias_authority WHERE singleton=TRUE FOR SHARE",
-                vec![],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let result = alias_authority(&row)?;
-        transaction.commit().await.map_err(persistence)?;
-        Ok(result)
     }
 
     async fn confirm_ready(
@@ -3109,7 +2993,8 @@ async fn terminalize(
             "UPDATE email_challenges SET status='expired',consumed_at=NULL,
                     terminal_at=COALESCE(terminal_at,$3),updated_at=$3
               WHERE owner_kind='identity_mutation' AND project_id=$1
-                AND identity_mutation_intent_id=$2 AND status IN ('pending','consumed')",
+                AND identity_mutation_intent_id=$2
+                AND status IN ('pending','delivery_unavailable','consumed')",
             vec![project_id.into(), intent_id.into(), timestamp.into()],
         ))
         .await
@@ -3207,39 +3092,6 @@ pub(super) async fn terminalize_due_identity_mutations(
     Ok(count)
 }
 
-pub(super) async fn terminalize_unreadable_identity_mutations(
-    transaction: &DatabaseTransaction,
-    readable_versions: serde_json::Value,
-) -> Result<u64, ApplicationError> {
-    let intents = transaction
-        .query_all_raw(statement(
-            "SELECT intent.* FROM identity_mutation_intents intent
-              WHERE intent.status IN ('pending_proof','ready')
-                AND EXISTS (SELECT 1 FROM email_challenges challenge
-                  WHERE challenge.owner_kind='identity_mutation'
-                    AND challenge.project_id=intent.project_id
-                    AND challenge.identity_mutation_intent_id=intent.id
-                    AND challenge.status='pending' AND (
-                      NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text($1) version
-                        WHERE version::INT=challenge.address_key_version)
-                      OR (challenge.otp_digest_key_version IS NOT NULL AND NOT EXISTS
-                        (SELECT 1 FROM jsonb_array_elements_text($1) version
-                          WHERE version::INT=challenge.otp_digest_key_version))
-                      OR (challenge.magic_digest_key_version IS NOT NULL AND NOT EXISTS
-                        (SELECT 1 FROM jsonb_array_elements_text($1) version
-                          WHERE version::INT=challenge.magic_digest_key_version))))
-              ORDER BY intent.id LIMIT 100 FOR UPDATE OF intent SKIP LOCKED",
-            vec![readable_versions.into()],
-        ))
-        .await
-        .map_err(persistence)?;
-    let count = u64::try_from(intents.len()).map_err(|_| ApplicationError::Integrity)?;
-    for intent in intents {
-        terminalize(transaction, &intent, "cancelled").await?;
-    }
-    Ok(count)
-}
-
 async fn erase_create_result(
     transaction: &DatabaseTransaction,
     intent_id: Uuid,
@@ -3302,7 +3154,6 @@ async fn revalidate_slot_authority(
     transaction: &DatabaseTransaction,
     intent: &QueryResult,
     slot: &QueryResult,
-    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     let project_id: Uuid = get(intent, "project_id")?;
     let owners = transaction
@@ -3443,13 +3294,7 @@ async fn revalidate_slot_authority(
                     .await
                     .map_err(persistence)?
                     .ok_or(ApplicationError::RevisionConflict)?;
-                assert_smtp_authority(
-                    transaction,
-                    project_id,
-                    &challenge,
-                    required_auth_process_ids,
-                )
-                .await?;
+                assert_smtp_authority(transaction, project_id, &challenge).await?;
             }
         }
         _ => return Err(ApplicationError::Integrity),
@@ -3460,7 +3305,6 @@ async fn revalidate_slot_authority(
 async fn admitted_email_method(
     transaction: &DatabaseTransaction,
     slot: &QueryResult,
-    required_auth_process_ids: &[String],
 ) -> Result<AdmittedEmailMethod, ApplicationError> {
     let project_id: Uuid = get(slot, "project_id")?;
     let application_id: Uuid = get(slot, "application_id")?;
@@ -3525,13 +3369,7 @@ async fn admitted_email_method(
         generation,
         revision,
     };
-    assert_smtp_values(
-        transaction,
-        project_id,
-        &authority,
-        required_auth_process_ids,
-    )
-    .await?;
+    assert_smtp_values(transaction, project_id, &authority).await?;
     Ok(AdmittedEmailMethod {
         policy_revision: get(&row, "policy_revision")?,
         security_revision: get(&row, "security_revision")?,
@@ -3564,7 +3402,6 @@ async fn assert_smtp_authority(
     transaction: &DatabaseTransaction,
     project_id: Uuid,
     row: &QueryResult,
-    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     assert_smtp_values(
         transaction,
@@ -3575,7 +3412,6 @@ async fn assert_smtp_authority(
             generation: get(row, "smtp_generation")?,
             revision: get(row, "smtp_security_eligibility_revision")?,
         },
-        required_auth_process_ids,
     )
     .await
 }
@@ -3584,7 +3420,6 @@ async fn assert_smtp_values(
     transaction: &DatabaseTransaction,
     project_id: Uuid,
     authority: &SyntheticSmtpAuthority,
-    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     let present = if authority.selection == "project" {
         transaction
@@ -3594,26 +3429,12 @@ async fn assert_smtp_values(
                     AND smtp.security_eligibility_revision=$4
                     AND (smtp.status='active' OR (smtp.status='retained'
                          AND smtp.retained_until>clock_timestamp()))
-                    AND NOT EXISTS (
-                      SELECT required.process_id FROM jsonb_array_elements_text($5::jsonb) required(process_id)
-                       WHERE NOT EXISTS (
-                         SELECT 1 FROM project_smtp_runtime_readiness readiness
-                          JOIN auth_process_incarnations incarnation
-                            ON incarnation.process_id=readiness.process_id
-                           AND incarnation.process_incarnation=readiness.process_incarnation
-                         WHERE readiness.project_id=smtp.project_id
-                           AND readiness.configuration_id=smtp.id
-                           AND readiness.generation=smtp.generation
-                           AND readiness.process_id=required.process_id
-                           AND readiness.state='ready'
-                           AND readiness.lease_expires_at>clock_timestamp()))
                   FOR SHARE OF smtp",
                 vec![
                     project_id.into(),
                     authority.configuration.into(),
                     authority.generation.into(),
                     authority.revision.into(),
-                    json!(required_auth_process_ids).into(),
                 ],
             ))
             .await
@@ -3634,28 +3455,6 @@ async fn assert_smtp_values(
         false
     };
     present.then_some(()).ok_or(ApplicationError::Disabled)
-}
-
-async fn assert_email_ready(
-    transaction: &DatabaseTransaction,
-    process_id: &str,
-    incarnation: Uuid,
-) -> Result<(), ApplicationError> {
-    let ready = transaction
-        .query_one_raw(statement(
-            "SELECT 1 FROM email_protection_runtime_readiness readiness
-               JOIN auth_process_incarnations current
-                 ON current.process_id=readiness.process_id
-                AND current.process_incarnation=readiness.process_incarnation
-              WHERE readiness.process_id=$1 AND readiness.process_incarnation=$2
-                AND readiness.state='ready' AND readiness.lease_expires_at>clock_timestamp()
-              FOR SHARE OF readiness,current",
-            vec![process_id.to_owned().into(), incarnation.into()],
-        ))
-        .await
-        .map_err(persistence)?
-        .is_some();
-    ready.then_some(()).ok_or(ApplicationError::Disabled)
 }
 
 enum ReceiptEvidence {
@@ -4055,7 +3854,6 @@ fn verified_challenge(
 async fn revalidate_final_authority(
     transaction: &DatabaseTransaction,
     intent: &QueryResult,
-    required_auth_process_ids: &[String],
 ) -> Result<(), ApplicationError> {
     let project_id: Uuid = get(intent, "project_id")?;
     let project = transaction
@@ -4131,7 +3929,7 @@ async fn revalidate_final_authority(
         if get::<String>(slot, "state")? != "proved" {
             return Err(ApplicationError::InvalidTransition);
         }
-        revalidate_slot_authority(transaction, intent, slot, required_auth_process_ids).await?;
+        revalidate_slot_authority(transaction, intent, slot).await?;
         if let Some(id) = get::<Option<Uuid>>(slot, "existing_provider_identity_id")? {
             require_identity(
                 transaction,
@@ -4372,17 +4170,6 @@ async fn confirm_link(
             }
             validate_email_candidate(candidate)?;
             // `confirm_control` already holds the Project-wide email namespace after the graph.
-            let authority_row = transaction
-                .query_one_raw(statement(
-                    "SELECT revision,write_version,accepted_versions
-                       FROM email_identity_alias_authority WHERE singleton=TRUE FOR SHARE",
-                    vec![],
-                ))
-                .await
-                .map_err(persistence)?
-                .ok_or(ApplicationError::Integrity)?;
-            let authority = alias_authority(&authority_row)?;
-            require_email_authority(candidate, &authority)?;
             for alias in &candidate.lookup_aliases {
                 if transaction
                     .query_one_raw(statement(
@@ -5085,28 +4872,7 @@ async fn revalidate_existing_email(
     {
         return Err(ApplicationError::RevisionConflict);
     }
-    let authority_row = transaction
-        .query_one_raw(statement(
-            "SELECT revision,write_version,accepted_versions
-               FROM email_identity_alias_authority WHERE singleton=TRUE FOR SHARE",
-            vec![],
-        ))
-        .await
-        .map_err(persistence)?
-        .ok_or(ApplicationError::Integrity)?;
-    let authority = alias_authority(&authority_row)?;
-    if authority.revision != material.alias_authority_revision
-        || material.active_alias.key_version != authority.write_version
-        || material
-            .lookup_aliases
-            .iter()
-            .map(|v| v.key_version)
-            .collect::<BTreeSet<_>>()
-            != authority
-                .accepted_versions
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
+    if material.alias_authority_revision != 1
         || !material.lookup_aliases.contains(&material.active_alias)
         || !material.lookup_aliases.contains(challenge_lookup)
     {
@@ -5220,31 +4986,6 @@ fn require_candidate_context(
     Ok(())
 }
 
-fn alias_authority(row: &QueryResult) -> Result<EmailIdentityAliasAuthority, ApplicationError> {
-    let accepted: serde_json::Value = get(row, "accepted_versions")?;
-    let accepted_versions: Vec<i32> =
-        serde_json::from_value(accepted).map_err(|_| ApplicationError::Integrity)?;
-    let authority = EmailIdentityAliasAuthority {
-        revision: get(row, "revision")?,
-        write_version: get(row, "write_version")?,
-        accepted_versions,
-    };
-    let versions = authority
-        .accepted_versions
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if authority.revision <= 0
-        || authority.write_version <= 0
-        || versions.is_empty()
-        || versions.len() != authority.accepted_versions.len()
-        || !versions.contains(&authority.write_version)
-    {
-        return Err(ApplicationError::Integrity);
-    }
-    Ok(authority)
-}
-
 fn validate_email_candidate(
     candidate: &crate::application::IdentityMutationEmailCandidate,
 ) -> Result<(), ApplicationError> {
@@ -5263,30 +5004,16 @@ fn validate_email_candidate(
         validate_digest(alias)?;
     }
     validate_digest(&candidate.active_alias)?;
-    Ok(())
-}
-
-fn require_email_authority(
-    candidate: &crate::application::IdentityMutationEmailCandidate,
-    authority: &EmailIdentityAliasAuthority,
-) -> Result<(), ApplicationError> {
-    let supplied = candidate
+    let versions = candidate
         .lookup_aliases
         .iter()
         .map(|alias| alias.key_version)
         .collect::<BTreeSet<_>>();
-    let accepted = authority
-        .accepted_versions
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if candidate.alias_authority_revision != authority.revision
-        || supplied != accepted
-        || candidate.lookup_aliases.len() != supplied.len()
-        || candidate.active_alias.key_version != authority.write_version
+    if candidate.alias_authority_revision != 1
+        || versions.len() != candidate.lookup_aliases.len()
         || !candidate.lookup_aliases.contains(&candidate.active_alias)
     {
-        return Err(ApplicationError::RevisionConflict);
+        return Err(ApplicationError::InvalidInput);
     }
     Ok(())
 }
@@ -5311,6 +5038,15 @@ fn validate_generation(
     value: &CommitIdentityMutationEmailGeneration,
 ) -> Result<(), ApplicationError> {
     validate_digest(&value.lookup_digest)?;
+    if value.recipient_digests.is_empty()
+        || value.recipient_digests.len() > 16
+        || !value.recipient_digests.contains(&value.lookup_digest)
+    {
+        return Err(ApplicationError::InvalidInput);
+    }
+    for digest in &value.recipient_digests {
+        validate_digest(digest)?;
+    }
     validate_protected_range(&value.address, 41, 2_048)?;
     validate_protected_range(&value.envelope, 41, 8_192)?;
     validate_protected_range(&value.body, 41, 65_536)?;

@@ -27,22 +27,13 @@ pub(crate) struct PostgresIdentityMutationRepository {
 impl PostgresIdentityMutationRepository {
     pub(crate) fn new(
         database: DatabaseConnection,
-        process_id: String,
-        incarnation: Uuid,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
-        required_auth_process_ids: Vec<String>,
     ) -> Self {
         Self {
-            runtime: PostgresRuntimeIdentityMutationRepository::new(
-                database.clone(),
-                process_id,
-                incarnation,
-                required_auth_process_ids.clone(),
-            ),
+            runtime: PostgresRuntimeIdentityMutationRepository::new(database.clone()),
             control: PostgresControlIdentityMutationRepository::new(
                 database,
                 projection_materializer,
-                required_auth_process_ids,
             ),
         }
     }

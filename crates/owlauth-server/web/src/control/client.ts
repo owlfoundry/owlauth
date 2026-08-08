@@ -4,6 +4,7 @@ import type { components, paths } from "../generated/control-openapi";
 import { assertSameOriginPlaneUrl } from "../shared/configured-base";
 
 export type Project = components["schemas"]["Project"];
+export type ProjectOverviewSummary = components["schemas"]["ProjectOverviewSummary"];
 export type ProjectPolicy = components["schemas"]["ProjectPolicy"];
 export type Application = components["schemas"]["Application"];
 export type WebhookEndpoint = components["schemas"]["WebhookEndpoint"];

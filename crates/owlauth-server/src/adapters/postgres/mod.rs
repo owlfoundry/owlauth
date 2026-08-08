@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod application_sync_tests;
 mod audit;
-mod auth_incarnation;
 pub(crate) mod authentication;
 pub(crate) mod control_lifecycle;
+pub(crate) mod control_overview;
 pub(crate) mod custody;
 pub(crate) mod email;
 pub(crate) mod email_control;
@@ -18,6 +18,7 @@ pub(crate) mod identity_mutation;
 mod identity_mutation_test_support;
 #[cfg(test)]
 mod identity_mutation_tests;
+mod mail_delivery_safety;
 pub(crate) mod managed_connection;
 pub(crate) mod managed_reauthorization;
 pub(crate) mod projection;
@@ -29,7 +30,6 @@ pub(crate) mod readiness;
 pub(crate) mod runtime_authority;
 pub(crate) mod server_api;
 pub(crate) mod server_key;
-pub(crate) mod server_readiness;
 pub(crate) mod session_authority;
 #[cfg(test)]
 mod session_authority_tests;

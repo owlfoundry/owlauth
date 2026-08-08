@@ -41,7 +41,6 @@ Project identifiers are globally unique within the deployment. User identifiers 
 | Deployment operator        | creates Projects/Applications/providers and manages users, keys, and policy                                                                    | trusted holder of the deployment-wide Control API key; all Control actions audit as the deployment operator |
 | External control gateway   | optionally proxies Control for another product's organization/RBAC layer                                                                       | separate policy-enforcement point; must validate `belongs_to` and object access                             |
 | PostgreSQL                 | stores authoritative Project, identity, login, session, token, key, and audit state                                                            | privileged durability and consistency boundary                                                              |
-| Redis                      | provides non-authoritative caching, rate coordination, and invalidation hints                                                                  | disposable support dependency; values may be stale or absent                                                |
 | Key-provider capability    | provisions/signs Project keys or seals/opens configuration secrets; bundled mode uses PostgreSQL envelopes, custom mode may use remote custody | privileged role-specific cryptographic boundary                                                             |
 | SDK, CLI, or MCP caller    | adapts Runtime or Control interfaces                                                                                                           | untrusted input; never an authorization authority                                                           |
 
@@ -98,12 +97,11 @@ flowchart LR
     end
 
     P --> PG[(PostgreSQL authority + protected material)]
-    P --> Redis[(Redis)]
     P --> KP[Role-specific key-provider capabilities]
     P --> IdP[GitHub / Google / upstream OIDC]
 ```
 
-Auth's shared transport address does not merge its surfaces: Runtime and Server API have distinct route trees, state, caller authentication, CORS/HTML/JSON behavior, admission, PostgreSQL pools, readiness inputs, and OpenAPI contracts. Transport adapters perform parsing, admission control, caller authentication, Project/Application resolution, and response mapping. They do not implement identity linking, handoff consumption, session validity, refresh-family behavior, key transitions, or audit transactions.
+Auth's shared transport address does not merge its surfaces: Runtime and Server API have distinct route trees, state, caller authentication, CORS/HTML/JSON behavior, PostgreSQL pools, readiness inputs, and OpenAPI contracts. Transport adapters perform bounded parsing, caller authentication, Project/Application resolution, and response mapping. They do not implement identity linking, handoff consumption, session validity, refresh-family behavior, key transitions, or audit transactions.
 
 ## Runtime / Protocol Plane
 
@@ -156,7 +154,6 @@ flowchart LR
     Hosted --> Auth[OwlAuth Auth endpoint]
     Auth --> Provider[GitHub / Google]
     Auth --> PG[(PostgreSQL + protected material)]
-    Auth --> Redis[(Redis)]
     Auth --> RKP[Runtime signer / secret opener]
 
     Backend[Customer backend] --> Auth
@@ -199,7 +196,7 @@ OWLAUTH_MODE=auth owlauth-server
 OWLAUTH_MODE=control owlauth-server
 ```
 
-`all` binds the Auth and Control endpoints in one process. `auth` composes both required Auth surfaces on one listener, while preserving their internal routers, credentials, admission, readiness inputs, and PostgreSQL pools. `control` composes only the administrative endpoint and capabilities. Every mode uses the same domain modules, Project rules, schema, and configuration model.
+`all` binds the Auth and Control endpoints in one process. `auth` composes both required Auth surfaces on one listener, while preserving their internal routers, credentials, readiness inputs, and PostgreSQL pools. `control` composes only the administrative endpoint and capabilities. Every mode uses the same domain modules, Project rules, schema, and configuration model.
 
 A typical topology assigns `auth.example.com` to Auth and `admin.auth.example.com` or a private address to Control. Customer backends call Server API paths on the Auth origin. Hostname separation does not replace endpoint isolation or the corresponding Project-server/operator authentication.
 
@@ -212,7 +209,7 @@ A typical topology assigns `auth.example.com` to Auth and `admin.auth.example.co
 05. **Browser redirect boundary:** login state, provider callback values, redirect targets, cookies, and handoff values are attacker-controlled inputs.
 06. **Shared-core boundary:** only application services initiate domain state transitions; adapters and rows are not authority.
 07. **Persistence boundary:** PostgreSQL constraints and transactions protect durable invariants; stored rows are validated when mapped into domain types.
-08. **Cache boundary:** Redis values may be missing, delayed, duplicated, or stale and never establish a security fact.
+08. **Traffic-governance boundary:** OwlAuth Core owns no deployment-wide IP/route/global quota, bot/risk, traffic-shaping, or commercial limit. A SaaS or operator-owned ingress may enforce those controls, but they never authenticate a caller or establish an identity fact.
 09. **Cryptographic boundary:** plaintext private-key and provider/SMTP/webhook secret operations occur behind role-specific key-provider capabilities. PostgreSQL carries public keys and bounded purpose/context-bound software ciphertext or opaque custom-provider handles/envelopes; the bundled software custody root remains deployment-injected and outside PostgreSQL.
 10. **External-provider boundary:** remote calls use exact configured endpoints, TLS, timeouts, response bounds, state binding, and issuer/subject validation.
 11. **External-gateway boundary:** `belongs_to` is evidence for the gateway's policy decision, not proof that OwlAuth performed tenant authorization.

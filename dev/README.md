@@ -2,10 +2,9 @@
 
 `dev/compose.yml` runs the disposable infrastructure used by local OwlAuth development:
 
-- PostgreSQL 17 on `127.0.0.1:5432`;
-- Redis 8 on `127.0.0.1:6379`.
+- PostgreSQL 17 on `127.0.0.1:5432`.
 
-The services bind to loopback by default and use named Docker volumes. The default credentials are intentionally development-only.
+The service binds to loopback by default and use named Docker volumes. The default credentials are intentionally development-only.
 
 To run the complete OwlAuth application from the repository root:
 
@@ -36,7 +35,7 @@ make dev-logs
 make dev-down
 ```
 
-`make dev-reset` removes the containers and both data volumes before starting healthy empty services again. It is intentionally destructive to local development data.
+`make dev-reset` removes the container and its data volume before starting a healthy empty service again. It is intentionally destructive to local development data.
 
 Optional Compose-only overrides can be placed in `dev/.env`:
 
@@ -44,16 +43,15 @@ Optional Compose-only overrides can be placed in `dev/.env`:
 cp dev/.env.example dev/.env
 ```
 
-The default infrastructure URLs are:
+The default infrastructure URL is:
 
 ```text
 postgres://owlauth:owlauth_dev@127.0.0.1:5432/owlauth
-redis://127.0.0.1:6379/
 ```
 
-If `dev/.env` changes a PostgreSQL/Redis port, database name, user, or password, update the matching
-`OWLAUTH_POSTGRES_URL` or `OWLAUTH_ADMISSION_REDIS_URL` in the root `.env` as well. Changing database
+If `dev/.env` changes the PostgreSQL port, database name, user, or password, update the matching
+`OWLAUTH_POSTGRES_URL` in the root `.env` as well. Changing database
 initialization credentials does not rewrite an existing named volume; use `make dev-reset` only when
 deleting all local development data is intended.
 
-Container-backed Rust integration tests do not reuse these long-lived services. They start isolated PostgreSQL and Redis containers through Testcontainers and remove them after each test process. When Docker is unavailable locally those tests report a skip; CI sets `OWLAUTH_REQUIRE_DOCKER=1` so container startup failures are fatal.
+Container-backed Rust integration tests do not reuse these long-lived services. They start an isolated PostgreSQL container through Testcontainers and remove them after each test process. When Docker is unavailable locally those tests report a skip; CI sets `OWLAUTH_REQUIRE_DOCKER=1` so container startup failures are fatal.

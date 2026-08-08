@@ -1,6 +1,6 @@
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -144,98 +144,6 @@ impl PostgresIdentityProjectionMaterializer {
             },
         }
     }
-
-    #[cfg(test)]
-    pub(crate) async fn converge_binding(
-        &self,
-        transaction: &sea_orm::DatabaseTransaction,
-        binding_id: uuid::Uuid,
-        now: OffsetDateTime,
-    ) -> Result<(), ApplicationError> {
-        assert_projection_write_authority(
-            transaction,
-            self.cryptography.projection_protector.as_ref(),
-        )
-        .await?;
-        let hint = application_user_binding::Entity::find_by_id(binding_id)
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let project = project::Entity::find_by_id(hint.project_id)
-            .lock_shared()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if project.status != "active" {
-            return Ok(());
-        }
-        let application = application::Entity::find_by_id(hint.application_id)
-            .filter(application::Column::ProjectId.eq(hint.project_id))
-            .lock_shared()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if application.status != "active" {
-            return Ok(());
-        }
-        let user = project_user::Entity::find_by_id(hint.user_id)
-            .filter(project_user::Column::ProjectId.eq(hint.project_id))
-            .lock_shared()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let binding = application_user_binding::Entity::find_by_id(binding_id)
-            .filter(application_user_binding::Column::ProjectId.eq(hint.project_id))
-            .filter(application_user_binding::Column::ApplicationId.eq(hint.application_id))
-            .filter(application_user_binding::Column::UserId.eq(user.id))
-            .lock_exclusive()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        if binding.status != "active" {
-            return Ok(());
-        }
-        let projection = application_user_projection::Entity::find()
-            .filter(application_user_projection::Column::ProjectId.eq(binding.project_id))
-            .filter(application_user_projection::Column::BindingId.eq(binding.id))
-            .lock_exclusive()
-            .one(transaction)
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let (projection, material) = repair_runtime_projection(
-            transaction,
-            projection,
-            application.id,
-            &user,
-            &self.cryptography,
-            now,
-        )
-        .await?;
-        if material.semantic_change {
-            let event_type = if user.status == "disabled" {
-                crate::domain::ApplicationUserEventType::Disabled
-            } else {
-                crate::domain::ApplicationUserEventType::Updated
-            };
-            super::webhook::append_projection_event(
-                transaction,
-                &project.public_id,
-                &application.public_id,
-                binding.id,
-                &projection,
-                &material.document,
-                event_type,
-            )
-            .await?;
-        }
-        Ok(())
-    }
 }
 
 impl ProjectionCryptography for PostgresIdentityProjectionMaterializer {
@@ -300,11 +208,7 @@ impl IdentityProjectionMaterializer for PostgresIdentityProjectionMaterializer {
         user: &project_user::Model,
         now: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
-        assert_projection_write_authority(
-            transaction,
-            self.cryptography.projection_protector.as_ref(),
-        )
-        .await?;
+        assert_projection_write_authority(self.cryptography.projection_protector.as_ref())?;
         fan_out_projected_user(transaction, user, &self.cryptography, now).await
     }
 }
@@ -553,7 +457,7 @@ pub(super) async fn authoritative_runtime_projection_material<
     let projection_write_version = if source_email.is_some()
         || projection.is_some_and(|existing| existing.verified_email_ciphertext.is_some())
     {
-        Some(projection_authority_write_version(transaction, protector).await?)
+        Some(projection_authority_write_version(protector)?)
     } else {
         None
     };
@@ -759,484 +663,36 @@ async fn fan_out_projected_user<P: ProjectionCryptography + ?Sized>(
     Ok(())
 }
 
-pub(super) async fn assert_projection_write_authority(
-    transaction: &sea_orm::DatabaseTransaction,
+pub(super) fn assert_projection_write_authority(
     protector: &dyn ProjectionVerifiedEmailProtector,
 ) -> Result<(), ApplicationError> {
-    assert_projection_versions(
-        transaction,
-        protector.write_version(),
-        &protector.readable_versions(),
-    )
-    .await
-    .map(|_| ())
-}
-
-pub(super) async fn assert_projection_crypto_authority<P: ProjectionCryptography + ?Sized>(
-    transaction: &sea_orm::DatabaseTransaction,
-    protector: &P,
-) -> Result<(), ApplicationError> {
-    projection_authority_write_version(transaction, protector)
-        .await
+    validate_local_projection_ring(protector.write_version(), &protector.readable_versions())
         .map(|_| ())
 }
 
-async fn projection_authority_write_version<P: ProjectionCryptography + ?Sized>(
-    transaction: &sea_orm::DatabaseTransaction,
+pub(super) fn assert_projection_crypto_authority<P: ProjectionCryptography + ?Sized>(
+    protector: &P,
+) -> Result<(), ApplicationError> {
+    projection_authority_write_version(protector).map(|_| ())
+}
+
+fn projection_authority_write_version<P: ProjectionCryptography + ?Sized>(
     protector: &P,
 ) -> Result<i32, ApplicationError> {
-    assert_projection_versions(
-        transaction,
+    validate_local_projection_ring(
         protector.projection_write_version(),
         &protector.projection_readable_versions(),
     )
-    .await
 }
 
-async fn assert_projection_versions(
-    transaction: &sea_orm::DatabaseTransaction,
-    local_write_version: i32,
+fn validate_local_projection_ring(
+    write_version: i32,
     readable: &std::collections::BTreeSet<i32>,
 ) -> Result<i32, ApplicationError> {
-    let row = transaction
-        .query_one_raw(Statement::from_string(
-            DbBackend::Postgres,
-            "SELECT write_version,accepted_versions FROM projection_email_key_authority \
-             WHERE singleton=TRUE FOR SHARE"
-                .to_owned(),
-        ))
-        .await
-        .map_err(persistence)?
-        .ok_or(ApplicationError::Integrity)?;
-    let write_version: i32 = row.try_get("", "write_version").map_err(persistence)?;
-    let accepted: Vec<i32> = row.try_get("", "accepted_versions").map_err(persistence)?;
-    if write_version != local_write_version
-        || !accepted.contains(&write_version)
-        || !accepted.iter().all(|version| readable.contains(version))
-    {
+    if write_version <= 0 || !readable.contains(&write_version) {
         return Err(ApplicationError::Disabled);
     }
     Ok(write_version)
-}
-
-const MAX_PROJECTION_AUTHORITY_DURATION_MILLIS: i64 = 86_400_000;
-
-fn bounded_projection_authority_duration(
-    duration: time::Duration,
-) -> Result<i64, ApplicationError> {
-    let milliseconds = duration.whole_milliseconds();
-    if !(1..=i128::from(MAX_PROJECTION_AUTHORITY_DURATION_MILLIS)).contains(&milliseconds) {
-        return Err(ApplicationError::InvalidInput);
-    }
-    let milliseconds = i64::try_from(milliseconds).map_err(|_| ApplicationError::InvalidInput)?;
-    if duration != time::Duration::milliseconds(milliseconds) {
-        return Err(ApplicationError::InvalidInput);
-    }
-    Ok(milliseconds)
-}
-
-#[derive(Clone)]
-pub(crate) struct PostgresProjectionEmailKeyAuthority {
-    database: sea_orm::DatabaseConnection,
-}
-
-impl PostgresProjectionEmailKeyAuthority {
-    pub(crate) fn new(database: sea_orm::DatabaseConnection) -> Self {
-        Self { database }
-    }
-
-    /// Re-encrypts a bounded set of stored projection fields under the authority-backed write
-    /// version. Rows are claimed with `SKIP LOCKED`, so concurrent supervisors make disjoint
-    /// progress and a process restart safely resumes from the remaining old-version inventory.
-    /// Public projection semantics and immutable events are deliberately untouched.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the bounded transaction keeps authority validation, exact-context crypto, and conditional storage-only writes together"
-    )]
-    pub(crate) async fn rewrap_projection_email_batch(
-        &self,
-        protector: &dyn ProjectionVerifiedEmailProtector,
-        limit: u64,
-    ) -> Result<u64, ApplicationError> {
-        const MAX_BATCH: u64 = 256;
-        if !(1..=MAX_BATCH).contains(&limit) {
-            return Err(ApplicationError::InvalidInput);
-        }
-        let limit = i64::try_from(limit).map_err(|_| ApplicationError::InvalidInput)?;
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let authority = transaction
-            .query_one_raw(Statement::from_string(
-                DbBackend::Postgres,
-                "SELECT write_version,accepted_versions FROM projection_email_key_authority \
-                 WHERE singleton=TRUE FOR SHARE"
-                    .to_owned(),
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let write_version: i32 = authority
-            .try_get("", "write_version")
-            .map_err(persistence)?;
-        let accepted: Vec<i32> = authority
-            .try_get("", "accepted_versions")
-            .map_err(persistence)?;
-        let readable = protector.readable_versions();
-        if protector.write_version() != write_version
-            || !accepted.contains(&write_version)
-            || accepted.iter().any(|version| !readable.contains(version))
-        {
-            return Err(ApplicationError::Disabled);
-        }
-
-        let rows = transaction
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT id,project_id,application_id,user_id,projection_revision, \
-                        verified_email_ciphertext,verified_email_key_version \
-                   FROM application_user_projections \
-                  WHERE verified_email_key_version IS NOT NULL \
-                    AND verified_email_key_version<>$1 \
-                  ORDER BY verified_email_key_version,id \
-                  LIMIT $2 FOR UPDATE SKIP LOCKED",
-                [write_version.into(), limit.into()],
-            ))
-            .await
-            .map_err(persistence)?;
-        let mut rewrapped = 0_u64;
-        for row in rows {
-            let id: uuid::Uuid = row.try_get("", "id").map_err(persistence)?;
-            let project_id: uuid::Uuid = row.try_get("", "project_id").map_err(persistence)?;
-            let application_id: uuid::Uuid =
-                row.try_get("", "application_id").map_err(persistence)?;
-            let user_id: uuid::Uuid = row.try_get("", "user_id").map_err(persistence)?;
-            let projection_revision: i64 = row
-                .try_get("", "projection_revision")
-                .map_err(persistence)?;
-            let ciphertext: Vec<u8> = row
-                .try_get("", "verified_email_ciphertext")
-                .map_err(persistence)?;
-            let old_version: i32 = row
-                .try_get("", "verified_email_key_version")
-                .map_err(persistence)?;
-            if old_version <= 0
-                || !accepted.contains(&old_version)
-                || !readable.contains(&old_version)
-            {
-                return Err(ApplicationError::Disabled);
-            }
-            let old = ProtectedValue {
-                ciphertext: ciphertext.clone(),
-                key_version: old_version,
-            };
-            let plaintext = protector.unprotect_verified_email(
-                project_id,
-                application_id,
-                user_id,
-                projection_revision,
-                &old,
-            )?;
-            let protected = protector.protect_verified_email(
-                project_id,
-                application_id,
-                user_id,
-                projection_revision,
-                plaintext.as_bytes(),
-            )?;
-            if protected.key_version != write_version {
-                return Err(ApplicationError::Disabled);
-            }
-            let result = transaction
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "UPDATE application_user_projections \
-                        SET verified_email_ciphertext=$1,verified_email_key_version=$2 \
-                      WHERE id=$3 AND projection_revision=$4 \
-                        AND verified_email_key_version=$5 \
-                        AND verified_email_ciphertext=$6",
-                    [
-                        protected.ciphertext.into(),
-                        protected.key_version.into(),
-                        id.into(),
-                        projection_revision.into(),
-                        old_version.into(),
-                        ciphertext.into(),
-                    ],
-                ))
-                .await
-                .map_err(persistence)?;
-            if result.rows_affected() != 1 {
-                return Err(ApplicationError::Integrity);
-            }
-            rewrapped = rewrapped
-                .checked_add(1)
-                .ok_or(ApplicationError::Integrity)?;
-        }
-        transaction.commit().await.map_err(persistence)?;
-        Ok(rewrapped)
-    }
-
-    pub(crate) async fn observe_runtime(
-        &self,
-        process_id: &str,
-        process_incarnation: uuid::Uuid,
-        protector: &dyn ProjectionVerifiedEmailProtector,
-        lease_duration: time::Duration,
-    ) -> Result<(), ApplicationError> {
-        if process_id.is_empty() {
-            return Err(ApplicationError::InvalidInput);
-        }
-        let lease_milliseconds = bounded_projection_authority_duration(lease_duration)?;
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let incarnation = transaction
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT process_incarnation FROM auth_process_incarnations \
-                 WHERE process_id=$1 FOR SHARE",
-                [process_id.into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Disabled)?;
-        let current: uuid::Uuid = incarnation
-            .try_get("", "process_incarnation")
-            .map_err(persistence)?;
-        if current != process_incarnation {
-            return Err(ApplicationError::Disabled);
-        }
-        let authority = transaction
-            .query_one_raw(Statement::from_string(
-                DbBackend::Postgres,
-                "SELECT authority_revision FROM projection_email_key_authority \
-                 WHERE singleton=TRUE FOR SHARE"
-                    .to_owned(),
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let revision: i64 = authority
-            .try_get("", "authority_revision")
-            .map_err(persistence)?;
-        let readable = protector
-            .readable_versions()
-            .into_iter()
-            .collect::<Vec<_>>();
-        transaction
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "WITH db_clock AS (SELECT clock_timestamp() AS observed_at) \
-                 INSERT INTO projection_email_runtime_observations \
-                 (process_id,process_incarnation,authority_revision,readable_versions,observed_at,lease_expires_at) \
-                 SELECT $1,$2,$3,$4,db_clock.observed_at, \
-                        db_clock.observed_at + $5 * INTERVAL '1 millisecond' FROM db_clock \
-                 ON CONFLICT (process_id,process_incarnation) DO UPDATE SET \
-                 authority_revision=EXCLUDED.authority_revision, \
-                 readable_versions=EXCLUDED.readable_versions,observed_at=EXCLUDED.observed_at, \
-                 lease_expires_at=EXCLUDED.lease_expires_at",
-                [
-                    process_id.into(),
-                    process_incarnation.into(),
-                    revision.into(),
-                    readable.into(),
-                    lease_milliseconds.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?;
-        transaction.commit().await.map_err(persistence)
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "one revision-CAS lifecycle keeps staging, observation, cutover, reference, and retirement authority explicit"
-    )]
-    pub(crate) async fn reconcile(
-        &self,
-        required_process_ids: &[String],
-        protector: &dyn ProjectionVerifiedEmailProtector,
-        requested_cutover: Option<i32>,
-        requested_retirement: Option<i32>,
-        retirement_retention: time::Duration,
-    ) -> Result<(), ApplicationError> {
-        if required_process_ids.is_empty()
-            || requested_cutover.is_some() && requested_retirement.is_some()
-        {
-            return Err(ApplicationError::InvalidInput);
-        }
-        let retention_milliseconds = bounded_projection_authority_duration(retirement_retention)?;
-        let transaction = self.database.begin().await.map_err(persistence)?;
-        let row = transaction
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT authority_revision,write_version,accepted_versions,target_version, \
-                 target_staged_at,retirement_version,retirement_authorized_at, \
-                 retirement_authorized_at IS NOT NULL AND clock_timestamp() >= \
-                   retirement_authorized_at + $1 * INTERVAL '1 millisecond' AS retirement_elapsed \
-                 FROM projection_email_key_authority WHERE singleton=TRUE FOR UPDATE",
-                [retention_milliseconds.into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Integrity)?;
-        let revision: i64 = row.try_get("", "authority_revision").map_err(persistence)?;
-        let write_version: i32 = row.try_get("", "write_version").map_err(persistence)?;
-        let mut accepted: Vec<i32> = row.try_get("", "accepted_versions").map_err(persistence)?;
-        let target: Option<i32> = row.try_get("", "target_version").map_err(persistence)?;
-        let retirement: Option<i32> = row.try_get("", "retirement_version").map_err(persistence)?;
-        let retirement_elapsed: bool =
-            row.try_get("", "retirement_elapsed").map_err(persistence)?;
-        let local_write = protector.write_version();
-        let readable = protector.readable_versions();
-        if !readable.contains(&local_write) || accepted.iter().any(|v| !readable.contains(v)) {
-            return Err(ApplicationError::Disabled);
-        }
-
-        if local_write != write_version && target.is_none() {
-            if requested_cutover != Some(local_write) {
-                return Err(ApplicationError::Disabled);
-            }
-            accepted.push(local_write);
-            accepted.sort_unstable();
-            accepted.dedup();
-            transaction
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "UPDATE projection_email_key_authority SET authority_revision=authority_revision+1, \
-                     accepted_versions=$1,target_version=$2,target_staged_at=db_clock.now, \
-                     updated_at=db_clock.now FROM (SELECT clock_timestamp() AS now) db_clock \
-                     WHERE singleton=TRUE AND authority_revision=$3",
-                    [accepted.into(), local_write.into(), revision.into()],
-                ))
-                .await
-                .map_err(persistence)?;
-            transaction.commit().await.map_err(persistence)?;
-            return Err(ApplicationError::Disabled);
-        }
-
-        if target == Some(local_write) && requested_cutover == Some(local_write) {
-            assert_required_projection_observations(
-                &transaction,
-                required_process_ids,
-                revision,
-                local_write,
-            )
-            .await?;
-            transaction
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "UPDATE projection_email_key_authority SET authority_revision=authority_revision+1, \
-                     write_version=$1,target_version=NULL,target_staged_at=NULL, \
-                     updated_at=db_clock.now FROM (SELECT clock_timestamp() AS now) db_clock \
-                     WHERE singleton=TRUE AND authority_revision=$2",
-                    [local_write.into(), revision.into()],
-                ))
-                .await
-                .map_err(persistence)?;
-            transaction.commit().await.map_err(persistence)?;
-            return Ok(());
-        }
-
-        if let Some(version) = requested_retirement {
-            if version == write_version || !accepted.contains(&version) {
-                return Err(ApplicationError::InvalidInput);
-            }
-            let observation_revision = if retirement == Some(version) {
-                revision.checked_sub(1).ok_or(ApplicationError::Integrity)?
-            } else {
-                revision
-            };
-            assert_required_projection_observations(
-                &transaction,
-                required_process_ids,
-                observation_revision,
-                write_version,
-            )
-            .await?;
-            let referenced: bool = transaction
-                .query_one_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "SELECT EXISTS(SELECT 1 FROM application_user_projections \
-                                      WHERE verified_email_key_version=$1) \
-                            OR EXISTS(SELECT 1 FROM application_user_events \
-                                      WHERE verified_email_key_version=$1) AS referenced",
-                    [version.into()],
-                ))
-                .await
-                .map_err(persistence)?
-                .ok_or(ApplicationError::Integrity)?
-                .try_get("", "referenced")
-                .map_err(persistence)?;
-            if referenced {
-                return Err(ApplicationError::Disabled);
-            }
-            if retirement != Some(version) {
-                transaction
-                    .execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Postgres,
-                        "UPDATE projection_email_key_authority SET authority_revision=authority_revision+1, \
-                         retirement_version=$1,retirement_authorized_at=db_clock.now, \
-                         updated_at=db_clock.now FROM (SELECT clock_timestamp() AS now) db_clock \
-                         WHERE singleton=TRUE AND authority_revision=$2",
-                        [version.into(), revision.into()],
-                    ))
-                    .await
-                    .map_err(persistence)?;
-                transaction.commit().await.map_err(persistence)?;
-                return Err(ApplicationError::Disabled);
-            }
-            if !retirement_elapsed {
-                return Err(ApplicationError::Disabled);
-            }
-            accepted.retain(|accepted_version| *accepted_version != version);
-            transaction
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "UPDATE projection_email_key_authority SET authority_revision=authority_revision+1, \
-                     accepted_versions=$1,retirement_version=NULL,retirement_authorized_at=NULL, \
-                     updated_at=db_clock.now FROM (SELECT clock_timestamp() AS now) db_clock \
-                     WHERE singleton=TRUE AND authority_revision=$2",
-                    [accepted.into(), revision.into()],
-                ))
-                .await
-                .map_err(persistence)?;
-        }
-        transaction.commit().await.map_err(persistence)
-    }
-}
-
-async fn assert_required_projection_observations(
-    transaction: &sea_orm::DatabaseTransaction,
-    required_process_ids: &[String],
-    authority_revision: i64,
-    required_version: i32,
-) -> Result<(), ApplicationError> {
-    for process_id in required_process_ids {
-        let row = transaction
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT observation.authority_revision,observation.readable_versions, \
-                 observation.lease_expires_at > clock_timestamp() AS lease_is_live \
-                 FROM auth_process_incarnations incarnation \
-                 JOIN projection_email_runtime_observations observation \
-                   ON observation.process_id=incarnation.process_id \
-                  AND observation.process_incarnation=incarnation.process_incarnation \
-                 WHERE incarnation.process_id=$1 FOR SHARE OF incarnation,observation",
-                [process_id.clone().into()],
-            ))
-            .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Disabled)?;
-        let observed_revision: i64 = row.try_get("", "authority_revision").map_err(persistence)?;
-        let versions: Vec<i32> = row.try_get("", "readable_versions").map_err(persistence)?;
-        let lease_is_live: bool = row.try_get("", "lease_is_live").map_err(persistence)?;
-        if observed_revision < authority_revision
-            || !versions.contains(&required_version)
-            || !lease_is_live
-        {
-            return Err(ApplicationError::Disabled);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

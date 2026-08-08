@@ -49,18 +49,20 @@ The following table is normative for the initial SDK surface. An accepted succes
 | `logout_application_session`    | `POST /v1/projects/{project_public_id}/auth/sessions/logout`        | no body and no invented `{}`             | Project access token as Bearer                 | `200`         |
 | `prepare_browser_logout`        | `POST /v1/projects/{project_public_id}/auth/browser-logout/prepare` | no body and no invented `{}`             | Project access token as Bearer                 | `201`         |
 
-The accepted Runtime error statuses are also exact and come from the selected normalized contract:
+The accepted error statuses are exact. Every Core Runtime operation declares `408`; it is valid only with the closed Runtime envelope and exact code `request_timeout`. Other Core statuses come from the selected normalized contract. Every operation also reserves `429` for the optional SaaS/ingress extension defined in spec 05, even though Core OpenAPI does not declare or emit that traffic-policy response:
 
-| Operation ID                    | Exact Runtime error statuses |
-| ------------------------------- | ---------------------------- |
-| `get_public_application_config` | `400`, `404`, `429`, `503`   |
-| `get_project_jwks`              | `404`, `429`, `503`          |
-| `start_login`                   | `400`, `404`, `429`, `503`   |
-| `exchange_handoff`              | `400`, `409`, `429`, `503`   |
-| `refresh_session`               | `400`, `409`, `429`, `503`   |
-| `get_current_user`              | `401`, `429`, `503`          |
-| `logout_application_session`    | `401`, `429`, `503`          |
-| `prepare_browser_logout`        | `401`, `429`, `503`          |
+| Operation ID                    | Exact SDK error statuses          |
+| ------------------------------- | --------------------------------- |
+| `get_public_application_config` | `400`, `404`, `408`, `429`, `503` |
+| `get_project_jwks`              | `404`, `408`, `429`, `503`        |
+| `start_login`                   | `400`, `404`, `408`, `429`, `503` |
+| `exchange_handoff`              | `400`, `408`, `409`, `429`, `503` |
+| `refresh_session`               | `400`, `408`, `409`, `429`, `503` |
+| `get_current_user`              | `401`, `408`, `429`, `503`        |
+| `logout_application_session`    | `401`, `408`, `429`, `503`        |
+| `prepare_browser_logout`        | `401`, `408`, `429`, `503`        |
+
+A valid `408 request_timeout` is `Timeout` with `application_decision` retry and no local action for a non-sensitive operation. Because the same listener deadline includes both semaphore waiting and handler execution, a valid `408 request_timeout` after dispatch of handoff, refresh, Application logout, or browser-logout preparation is `Indeterminate`, uses that operation's quarantine action, and is never replayed automatically. A `408` with another code or a malformed envelope is an invalid response: `Protocol` for non-sensitive operations and `Indeterminate` with the quarantine action after a dispatched sensitive mutation.
 
 A status outside the operation's exact success and error sets is an invalid response even if it carries a syntactically valid Runtime error envelope. It is `Protocol` for reads and `Indeterminate` with the operation's quarantine action after a possibly dispatched sensitive mutation.
 
@@ -71,7 +73,7 @@ For responses:
 - the maximum decoded body is 65,536 bytes for every claimed success or error; a larger declared or observed body fails before parsing, and a transport should stop reading once the bound is exceeded;
 - a non-empty body and media type `application/json` are required; media-type matching is ASCII case-insensitive and permits parameters such as `charset=utf-8`;
 - redirects are never followed and are not successes, including same-origin redirects;
-- malformed JSON, an empty body, an unexpected exact status, a wrong media type, or a structurally invalid success is a `Protocol` failure for reads; after a possibly dispatched sensitive mutation it is `Indeterminate` with the operation's quarantine action because Runtime may already have committed;
+- malformed JSON, an empty body, an unexpected exact status, a wrong media type, a malformed `408`, or a structurally invalid success is a `Protocol` failure for non-sensitive operations; after a possibly dispatched sensitive mutation it is `Indeterminate` with the operation's quarantine action because Runtime may already have committed;
 - unknown object fields follow the selected schema exactly: objects with `additionalProperties: false` reject them, while open response objects ignore bounded additive fields and never re-export them as trusted data; an unknown value of a safety-relevant enum is a protocol failure until the contract, adapters, and shared cases explicitly support it;
 - an unknown Runtime error code is retained only as a bounded safe code and receives the conservative mapping in spec 05; and
 - `request_id` is exposed as optional allowlisted metadata even though the current Runtime schema emits it, so clients remain safe when an intermediary or compatible older response omits it.
@@ -90,7 +92,7 @@ A request may be retried automatically only when:
 
 1. the operation is classified as safe/replayable (for example, public configuration or Project JWKS retrieval);
 2. no caller cancellation/deadline has occurred;
-3. bounded backoff safely honors the single required decimal-seconds `Retry-After` value on a valid `429` response;
+3. when a SaaS/ingress layer adds a valid `429` response, bounded backoff safely honors its single required decimal-seconds `Retry-After` value;
 4. credentials are never repeated to another authority;
 5. the retry cannot consume a handoff or rotate/revoke a session twice.
 

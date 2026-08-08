@@ -60,9 +60,20 @@ Each listener uses the seven variables below with `ENDPOINT` replaced by `AUTH` 
 | `OWLAUTH_<ENDPOINT>_MAX_HEADER_BYTES`       |        65536 |           65536 |       1–262144 |
 | `OWLAUTH_<ENDPOINT>_MAX_URI_BYTES`          |         8192 |            8192 |        1–65536 |
 
-The Beta-era shared names `OWLAUTH_REQUEST_TIMEOUT_MS` and `OWLAUTH_MAX_REQUEST_BYTES` are removed, not aliases. Unknown `OWLAUTH_*` variables fail startup, so configure each enabled endpoint explicitly. Connection capacity is enforced for the complete accepted transport lifetime; body, deadline, in-flight request, and parsed request-shape bounds are endpoint-local. Runtime and Server API retain distinct authentication, admission, router state, PostgreSQL pools, and readiness inputs inside Auth. Header and URI checks occur after protocol parsing, so the ingress proxy or TLS terminator must also retain bounded parser settings.
+The Beta-era shared names `OWLAUTH_REQUEST_TIMEOUT_MS` and `OWLAUTH_MAX_REQUEST_BYTES` are removed, not aliases. Unknown `OWLAUTH_*` variables fail startup, so configure each enabled endpoint explicitly. Connection capacity is enforced for the complete accepted transport lifetime; body, deadline, in-flight request, and parsed request-shape bounds are endpoint-local. In-flight saturation waits within the same request deadline rather than returning an admission response; queue or handler expiry returns the plane's declared `408 request_timeout` envelope and does not prove that a dispatched mutation had no effect. Runtime and Server API retain distinct authentication, router state, PostgreSQL pools, and readiness inputs inside Auth. Header and URI checks occur after protocol parsing, so the ingress proxy or TLS terminator must also retain bounded parser settings.
 
-Client-address admission uses only the direct transport peer. This release does not trust ambient `Forwarded` or `X-Forwarded-For` headers and exposes no trusted-forwarding mode. See `.env.example` for the complete local values and the [deployment guide](../../docs/guide/deployment.md) for production posture.
+OwlAuth Core does not perform client-address or route-window traffic limiting. This release does not trust ambient `Forwarded` or `X-Forwarded-For` headers for authority and exposes no trusted-forwarding mode. A SaaS or operator-owned ingress owns generic traffic governance. See `.env.example` for the complete local values and the [deployment guide](../../docs/guide/deployment.md) for production posture.
+
+### Retention maintenance
+
+Run bounded PostgreSQL row retention from the released server binary or container:
+
+```bash
+OWLAUTH_POSTGRES_URL='postgres://...' \
+  owlauth-server maintenance prune --batch-size 1000
+```
+
+This command starts no listener, verifies the binary's exact SQLx migration history before any DML, uses PostgreSQL-authored cutoffs, and prints one JSON count report. It prunes only reviewed expired interaction/session/SMTP-test and webhook records; it does not delete append-only audit/key history, durable-resource idempotency or merge tombstones, identity-mutation create authority, or live resources. Schedule it through an operator-owned CronJob, systemd timer, or equivalent. See the [deployment guide](../../docs/guide/deployment.md#run-retention-maintenance) for the exact retention classes, SMTP-test idempotency horizon, and container invocation.
 
 ## Development
 

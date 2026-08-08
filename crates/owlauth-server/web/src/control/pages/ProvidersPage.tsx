@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject, SyntheticEvent } from "react";
 import { Link, useParams } from "react-router";
 
@@ -8,7 +8,7 @@ import {
   isValidStringList,
   StringListField,
 } from "../../shared/compositions/StringListField";
-import { ProviderIcon } from "../../shared/icons/Icons";
+import { ChevronDownIcon, ProviderIcon } from "../../shared/icons/Icons";
 import {
   DataTable,
   DescriptionList,
@@ -24,7 +24,6 @@ import { Dialog, SideSheet } from "../../shared/primitives/Overlay";
 import { useControl, useProject } from "../app/ControlContext";
 import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
 import {
-  type Application,
   ControlRequestError,
   IdempotencyAttempt,
   type NamedProviderPreflightResult,
@@ -38,7 +37,7 @@ import styles from "./pages.module.css";
 type OnboardingKind = "google" | "oidc" | "github";
 type Confirmation =
   | { kind: "disable"; provider: Provider }
-  | { kind: "unassign"; provider: Provider; application: Application }
+  | { kind: "abandon-secret-replacement"; provider: Provider }
   | null;
 
 export function ProvidersPage() {
@@ -46,10 +45,10 @@ export function ProvidersPage() {
   const project = useProject(projectId);
   const { session, refreshProjects, handleError, setMessage } = useControl();
   const [providers, setProviders] = useState<Provider[]>([]);
-  const [applications, setApplications] = useState<Application[]>([]);
   const [policy, setPolicy] = useState<ProviderEgressPolicy | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "failed">("loading");
-  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  const [expandedProviderId, setExpandedProviderId] = useState<string | null>(null);
+  const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
   const [choosingProvider, setChoosingProvider] = useState(false);
   const [onboarding, setOnboarding] = useState<OnboardingKind | null>(null);
   const [preflight, setPreflight] = useState<OidcPreflightResult | null>(null);
@@ -63,9 +62,15 @@ export function ProvidersPage() {
   const [overlayError, setOverlayError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [reconcileProvider, setReconcileProvider] = useState<Provider | null>(null);
+  const [resolvingSecretReplacement, setResolvingSecretReplacement] = useState<Provider | null>(
+    null,
+  );
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
   const createAttempt = useRef(new IdempotencyAttempt());
+  const updateAttempt = useRef(new IdempotencyAttempt());
   const onboardingSecretInput = useRef<HTMLInputElement>(null);
+  const editSecretInput = useRef<HTMLInputElement>(null);
+  const replacementRecoverySecretInput = useRef<HTMLInputElement>(null);
 
   const clearOnboardingSecret = useCallback(() => {
     if (onboardingSecretInput.current !== null) onboardingSecretInput.current.value = "";
@@ -76,12 +81,8 @@ export function ProvidersPage() {
       if (project === null) return;
       setLoadState("loading");
       try {
-        const [providerResult, applicationResult, policyResult] = await Promise.all([
+        const [providerResult, policyResult] = await Promise.all([
           session.client.GET("/v1/projects/{project_id}/providers", {
-            params: { path: { project_id: project.id } },
-            signal: signal ?? null,
-          }),
-          session.client.GET("/v1/projects/{project_id}/applications", {
             params: { path: { project_id: project.id } },
             signal: signal ?? null,
           }),
@@ -95,11 +96,6 @@ export function ProvidersPage() {
           providerResult.error,
           providerResult.response,
         ).items;
-        const nextApplications = requireData(
-          applicationResult.data,
-          applicationResult.error,
-          applicationResult.response,
-        ).items;
         const nextPolicy = requireData(
           policyResult.data,
           policyResult.error,
@@ -107,12 +103,21 @@ export function ProvidersPage() {
         );
         if (signal?.aborted !== true) {
           setProviders(nextProviders);
-          setApplications(nextApplications);
           setPolicy(nextPolicy);
-          setSelectedProviderId((current) =>
+          setExpandedProviderId((current) =>
             current !== null && nextProviders.some((provider) => provider.id === current)
               ? current
-              : (nextProviders[0]?.id ?? null),
+              : null,
+          );
+          setEditingProvider((current) =>
+            current === null
+              ? null
+              : (nextProviders.find((provider) => provider.id === current.id) ?? null),
+          );
+          setResolvingSecretReplacement((current) =>
+            current === null
+              ? null
+              : (nextProviders.find((provider) => provider.id === current.id) ?? null),
           );
           setLoadState("ready");
         }
@@ -147,6 +152,18 @@ export function ProvidersPage() {
     setProviderKey("");
     setOverlayError(null);
     setOnboarding(null);
+  }
+
+  function closeProviderEditor() {
+    if (submitting) return;
+    const refreshReplacementState = updateAttempt.current.retainsKey;
+    updateAttempt.current.abandon();
+    if (editSecretInput.current !== null) editSecretInput.current.value = "";
+    setEditingProvider(null);
+    setOverlayError(null);
+    if (refreshReplacementState) {
+      void refresh().catch((error: unknown) => void handleError(error));
+    }
   }
 
   async function runPreflight(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
@@ -347,7 +364,7 @@ export function ProvidersPage() {
       const created = requireData(result.data, result.error, result.response);
       createAttempt.current.settle();
       await Promise.all([refresh(), refreshProjects()]);
-      setSelectedProviderId(created.id);
+      setExpandedProviderId(created.id);
       closeOnboardingAfterSuccess();
       setMessage("Provider configured. Its client secret was discarded from the page.", "success");
     } catch (error) {
@@ -415,33 +432,141 @@ export function ProvidersPage() {
     }
   }
 
-  async function assign(provider: Provider, event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
+  async function updateProvider(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();
-    if (project === null) return;
-    const fields = new FormData(event.currentTarget);
-    const application = applications.find(
-      (candidate) => candidate.id === text(fields, "application_id"),
-    );
-    if (application === undefined) return;
-    try {
-      const result = await session.client.PUT(
-        "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
-        {
-          params: {
-            path: {
-              project_id: project.id,
-              provider_id: provider.id,
-              application_id: application.id,
-            },
-          },
-          body: { expected_application_revision: application.security_revision },
-        },
+    if (project === null || editingProvider === null) return;
+    const form = event.currentTarget;
+    const fields = new FormData(form);
+    const clientSecret = text(fields, "client_secret");
+    const secretInput = form.elements.namedItem("client_secret");
+    if (secretInput instanceof HTMLInputElement) secretInput.value = "";
+    if (clientSecret === "" && updateAttempt.current.retainsKey) {
+      setOverlayError(
+        "Re-enter the client secret to retry the unresolved replacement, or cancel this editor before making a metadata-only update.",
       );
+      return;
+    }
+    const metadata = {
+      display_name: text(fields, "display_name"),
+      client_id: text(fields, "client_id"),
+      expected_provider_revision: editingProvider.revision,
+    };
+    const idempotencyKey = clientSecret === "" ? null : updateAttempt.current.begin();
+    if (clientSecret !== "" && idempotencyKey === null) return;
+    setOverlayError(null);
+    setSubmitting(true);
+    try {
+      if (clientSecret === "") {
+        const result = await session.client.PATCH(
+          "/v1/projects/{project_id}/providers/{provider_id}",
+          {
+            params: { path: { project_id: project.id, provider_id: editingProvider.id } },
+            body: metadata,
+          },
+        );
+        requireData(result.data, result.error, result.response);
+      } else {
+        if (idempotencyKey === null) return;
+        const body = { ...metadata, client_secret: clientSecret };
+        const result = await (async () => {
+          try {
+            return await session.client.POST(
+              "/v1/projects/{project_id}/providers/{provider_id}/replace-secret",
+              {
+                params: {
+                  path: { project_id: project.id, provider_id: editingProvider.id },
+                  header: { "Idempotency-Key": idempotencyKey },
+                },
+                body,
+              },
+            );
+          } finally {
+            body.client_secret = "";
+          }
+        })();
+        requireData(result.data, result.error, result.response);
+        updateAttempt.current.settle();
+      }
+      await refresh();
+      setEditingProvider(null);
+      setMessage(
+        clientSecret === ""
+          ? "Provider configuration updated."
+          : "Provider configuration and client secret updated. The secret was discarded from the page.",
+        "success",
+      );
+    } catch (error) {
+      if (clientSecret !== "") updateAttempt.current.settle(error);
+      if (updateAttempt.current.retainsKey) {
+        try {
+          await refresh();
+        } catch (refreshError) {
+          await handleError(refreshError);
+        }
+      }
+      setOverlayError(
+        updateAttempt.current.retainsKey
+          ? "The replacement result is unresolved. Re-enter the same client secret to retry safely with the retained operation key."
+          : errorMessage(error, "Provider configuration could not be updated."),
+      );
+      await handleError(error, async () => {
+        updateAttempt.current.abandon();
+        await refresh();
+        setEditingProvider(null);
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function reconcileSecretReplacement(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
+    event.preventDefault();
+    if (project === null || resolvingSecretReplacement === null) return;
+    const form = event.currentTarget;
+    const fields = new FormData(form);
+    const body = {
+      client_secret: text(fields, "client_secret"),
+      expected_provider_revision: resolvingSecretReplacement.revision,
+    };
+    const secretInput = form.elements.namedItem("client_secret");
+    if (secretInput instanceof HTMLInputElement) secretInput.value = "";
+    setOverlayError(null);
+    setSubmitting(true);
+    try {
+      const result = await (async () => {
+        try {
+          return await session.client.POST(
+            "/v1/projects/{project_id}/providers/{provider_id}/replace-secret/reconcile",
+            {
+              params: {
+                path: {
+                  project_id: project.id,
+                  provider_id: resolvingSecretReplacement.id,
+                },
+              },
+              body,
+            },
+          );
+        } finally {
+          body.client_secret = "";
+        }
+      })();
       requireData(result.data, result.error, result.response);
       await refresh();
-      setMessage("Provider assigned to Application.", "success");
+      setResolvingSecretReplacement(null);
+      setMessage(
+        "Provider client secret replacement reconciled. The secret was discarded from the page.",
+        "success",
+      );
     } catch (error) {
-      await handleError(error, refresh);
+      body.client_secret = "";
+      setOverlayError(errorMessage(error, "The client secret replacement could not be resumed."));
+      await handleError(error, async () => {
+        await refresh();
+        setResolvingSecretReplacement(null);
+      });
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -450,34 +575,23 @@ export function ProvidersPage() {
     setOverlayError(null);
     setSubmitting(true);
     try {
-      if (confirmation.kind === "disable") {
-        const result = await session.client.POST(
-          "/v1/projects/{project_id}/providers/{provider_id}/disable",
-          {
-            params: { path: { project_id: project.id, provider_id: confirmation.provider.id } },
-            body: { expected_provider_revision: confirmation.provider.revision },
-          },
-        );
-        requireData(result.data, result.error, result.response);
-        setMessage("Provider disabled.", "success");
-      } else {
-        const result = await session.client.POST(
-          "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}/unassign",
-          {
-            params: {
-              path: {
-                project_id: project.id,
-                provider_id: confirmation.provider.id,
-                application_id: confirmation.application.id,
-              },
-            },
-            body: { expected_application_revision: confirmation.application.security_revision },
-          },
-        );
-        requireData(result.data, result.error, result.response);
-        setMessage("Provider unassigned.", "success");
-      }
+      const path =
+        confirmation.kind === "disable"
+          ? ("/v1/projects/{project_id}/providers/{provider_id}/disable" as const)
+          : ("/v1/projects/{project_id}/providers/{provider_id}/replace-secret/abandon" as const);
+      const result = await session.client.POST(path, {
+        params: { path: { project_id: project.id, provider_id: confirmation.provider.id } },
+        body: { expected_provider_revision: confirmation.provider.revision },
+      });
+      requireData(result.data, result.error, result.response);
+      setMessage(
+        confirmation.kind === "disable"
+          ? "Provider disabled."
+          : "Pending client secret replacement abandoned.",
+        "success",
+      );
       await refresh();
+      setResolvingSecretReplacement(null);
       setConfirmation(null);
     } catch (error) {
       if (
@@ -509,7 +623,7 @@ export function ProvidersPage() {
       <div className={styles["page"]}>
         <PageHeader
           title="Authentication providers"
-          description="Choose how users sign in and assign each provider to an Application."
+          description="Configure the upstream identity providers available to Applications."
         />
         {loadState === "loading" ? (
           <LoadingState>Loading authentication providers</LoadingState>
@@ -526,18 +640,26 @@ export function ProvidersPage() {
     );
   }
 
-  const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? null;
   return (
     <div className={styles["page"]}>
       <UnsavedChangesGuard
-        dirty={editingEgressPolicy || onboarding !== null || reconcileProvider !== null}
+        dirty={
+          editingEgressPolicy ||
+          onboarding !== null ||
+          reconcileProvider !== null ||
+          resolvingSecretReplacement !== null ||
+          editingProvider !== null
+        }
         submitting={submitting}
         onDiscard={() => {
           clearOnboardingSecret();
           createAttempt.current.abandon();
+          updateAttempt.current.abandon();
           setEditingEgressPolicy(false);
+          setEditingProvider(null);
           setOnboarding(null);
           setReconcileProvider(null);
+          setResolvingSecretReplacement(null);
           setPreflight(null);
           setPreflightIssuer("");
           setNamedPreflight(null);
@@ -548,7 +670,7 @@ export function ProvidersPage() {
       />
       <PageHeader
         title="Authentication providers"
-        description="Choose how users sign in and assign each provider to an Application."
+        description="Configure the upstream identity providers available to Applications."
         actions={
           project.status === "active" ? (
             <Button
@@ -629,54 +751,91 @@ export function ProvidersPage() {
         ) : (
           <DataTable
             caption="Configured identity providers"
-            headings={["Provider", "Kind", "Status", "Assignments", "Action"]}
+            headings={["Provider", "Kind", "Status", "Action", "Details"]}
           >
-            {providers.map((provider) => (
-              <tr key={provider.id}>
-                <td>
-                  <strong title={provider.display_name}>{provider.display_name}</strong>
-                  <span className={styles["machineValue"]}>{provider.provider_key}</span>
-                </td>
-                <td>{provider.kind}</td>
-                <td>
-                  <StatusBadge status={provider.status} />
-                </td>
-                <td>{String(provider.assigned_application_ids.length)}</td>
-                <td>
-                  <Button
-                    type="button"
-                    variant="quiet"
-                    onClick={() => {
-                      setSelectedProviderId(provider.id);
-                    }}
-                  >
-                    Review
-                  </Button>
-                </td>
-              </tr>
-            ))}
+            {providers.map((provider) => {
+              const expanded = expandedProviderId === provider.id;
+              return (
+                <Fragment key={provider.id}>
+                  <tr>
+                    <td>
+                      <strong title={provider.display_name}>{provider.display_name}</strong>
+                      <span className={styles["machineValue"]}>{provider.provider_key}</span>
+                    </td>
+                    <td>{provider.kind}</td>
+                    <td>
+                      <StatusBadge status={provider.status} />
+                      {provider.secret_replacement_pending ? (
+                        <StatusBadge status="secret replacement pending" family="pending" />
+                      ) : null}
+                    </td>
+                    <td>
+                      <Button
+                        type="button"
+                        variant="quiet"
+                        disabled={provider.status !== "active" || project.status !== "active"}
+                        onClick={() => {
+                          updateAttempt.current.abandon();
+                          if (editSecretInput.current !== null) editSecretInput.current.value = "";
+                          if (replacementRecoverySecretInput.current !== null) {
+                            replacementRecoverySecretInput.current.value = "";
+                          }
+                          setOverlayError(null);
+                          if (provider.secret_replacement_pending) {
+                            setResolvingSecretReplacement(provider);
+                          } else {
+                            setEditingProvider(provider);
+                          }
+                        }}
+                      >
+                        {provider.secret_replacement_pending ? "Resolve replacement" : "Edit"}
+                      </Button>
+                    </td>
+                    <td>
+                      <Button
+                        type="button"
+                        variant="quiet"
+                        iconOnly
+                        aria-label={`${expanded ? "Collapse" : "Expand"} ${provider.display_name} details`}
+                        aria-expanded={expanded}
+                        aria-controls={`provider-details-${provider.id}`}
+                        onClick={() => {
+                          setExpandedProviderId((current) =>
+                            current === provider.id ? null : provider.id,
+                          );
+                        }}
+                      >
+                        <ChevronDownIcon
+                          className={
+                            expanded ? styles["disclosureIconExpanded"] : styles["disclosureIcon"]
+                          }
+                        />
+                      </Button>
+                    </td>
+                  </tr>
+                  {expanded ? (
+                    <tr id={`provider-details-${provider.id}`}>
+                      <td colSpan={5} className={styles["expandedDetailCell"]}>
+                        <ProviderDetail
+                          provider={provider}
+                          onReconcile={() => {
+                            setOverlayError(null);
+                            setReconcileProvider(provider);
+                          }}
+                          onDisable={() => {
+                            setOverlayError(null);
+                            setConfirmation({ kind: "disable", provider });
+                          }}
+                        />
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
+              );
+            })}
           </DataTable>
         )}
       </Section>
-      {selectedProvider === null ? null : (
-        <ProviderDetail
-          provider={selectedProvider}
-          applications={applications}
-          onAssign={assign}
-          onReconcile={() => {
-            setOverlayError(null);
-            setReconcileProvider(selectedProvider);
-          }}
-          onDisable={() => {
-            setOverlayError(null);
-            setConfirmation({ kind: "disable", provider: selectedProvider });
-          }}
-          onUnassign={(application) => {
-            setOverlayError(null);
-            setConfirmation({ kind: "unassign", provider: selectedProvider, application });
-          }}
-        />
-      )}
       <Dialog
         open={choosingProvider}
         title="Choose a provider"
@@ -814,6 +973,177 @@ export function ProvidersPage() {
         onCreate={createProvider}
         onAdoptOrigins={() => void adoptPreflightOrigins()}
       />
+      <SideSheet
+        open={editingProvider !== null}
+        side="right"
+        title="Edit provider"
+        closeLabel="Close provider editor"
+        onClose={closeProviderEditor}
+        actions={
+          <>
+            <Button
+              type="button"
+              variant="quiet"
+              disabled={submitting}
+              onClick={closeProviderEditor}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" form="provider-edit-form" variant="primary" busy={submitting}>
+              Save provider
+            </Button>
+          </>
+        }
+      >
+        {editingProvider === null ? null : (
+          <form
+            id="provider-edit-form"
+            className={styles["form"]}
+            onSubmit={(event) => void updateProvider(event)}
+          >
+            {overlayError === null ? null : (
+              <InlineAlert tone="danger" role="alert">
+                {overlayError}
+              </InlineAlert>
+            )}
+            <DescriptionList
+              items={[
+                {
+                  term: "Provider key",
+                  detail: (
+                    <span className={styles["machineValue"]}>{editingProvider.provider_key}</span>
+                  ),
+                },
+                { term: "Kind", detail: editingProvider.kind },
+                {
+                  term: "Issuer",
+                  detail: <span className={styles["machineValue"]}>{editingProvider.issuer}</span>,
+                },
+              ]}
+            />
+            <Field label="Display name" htmlFor="provider-edit-name">
+              <Input
+                id="provider-edit-name"
+                name="display_name"
+                defaultValue={editingProvider.display_name}
+                required
+                maxLength={128}
+                data-owl-initial-focus
+              />
+            </Field>
+            <Field label="Client ID" htmlFor="provider-edit-client-id">
+              <Input
+                id="provider-edit-client-id"
+                name="client_id"
+                defaultValue={editingProvider.client_id}
+                required
+                maxLength={512}
+              />
+            </Field>
+            <Field
+              label="New client secret"
+              htmlFor="provider-edit-client-secret"
+              optional
+              description="Leave blank to keep the current write-only secret. Enter a value to replace it."
+            >
+              <Input
+                ref={editSecretInput}
+                id="provider-edit-client-secret"
+                name="client_secret"
+                type="password"
+                autoComplete="new-password"
+                maxLength={4096}
+              />
+            </Field>
+          </form>
+        )}
+      </SideSheet>
+      <Dialog
+        open={resolvingSecretReplacement !== null}
+        title="Resolve client secret replacement"
+        onClose={() => {
+          if (submitting) return;
+          if (replacementRecoverySecretInput.current !== null) {
+            replacementRecoverySecretInput.current.value = "";
+          }
+          setResolvingSecretReplacement(null);
+          setOverlayError(null);
+        }}
+        actions={
+          <>
+            <Button
+              type="button"
+              variant="quiet"
+              disabled={submitting}
+              onClick={() => {
+                if (replacementRecoverySecretInput.current !== null) {
+                  replacementRecoverySecretInput.current.value = "";
+                }
+                setResolvingSecretReplacement(null);
+                setOverlayError(null);
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="danger"
+              disabled={submitting}
+              onClick={() => {
+                if (resolvingSecretReplacement !== null) {
+                  if (replacementRecoverySecretInput.current !== null) {
+                    replacementRecoverySecretInput.current.value = "";
+                  }
+                  setConfirmation({
+                    kind: "abandon-secret-replacement",
+                    provider: resolvingSecretReplacement,
+                  });
+                  setResolvingSecretReplacement(null);
+                }
+              }}
+            >
+              Abandon replacement
+            </Button>
+            <Button
+              type="submit"
+              variant="primary"
+              form="reconcile-secret-replacement"
+              busy={submitting}
+            >
+              Resume replacement
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="reconcile-secret-replacement"
+          className={styles["form"]}
+          onSubmit={(event) => void reconcileSecretReplacement(event)}
+        >
+          {overlayError === null ? null : (
+            <InlineAlert tone="danger" role="alert">
+              {overlayError}
+            </InlineAlert>
+          )}
+          <p>
+            The protected replacement was prepared but not confirmed. Re-enter the intended client
+            secret to resume it, or explicitly abandon the pending generation before editing this
+            provider again.
+          </p>
+          <Field label="Replacement client secret" htmlFor="replacement-recovery-secret">
+            <Input
+              ref={replacementRecoverySecretInput}
+              id="replacement-recovery-secret"
+              name="client_secret"
+              type="password"
+              autoComplete="new-password"
+              required
+              maxLength={4096}
+              data-owl-initial-focus
+            />
+          </Field>
+        </form>
+      </Dialog>
       <Dialog
         open={reconcileProvider !== null}
         title="Resume provider provisioning"
@@ -863,7 +1193,11 @@ export function ProvidersPage() {
       </Dialog>
       <Dialog
         open={confirmation !== null}
-        title={confirmation?.kind === "disable" ? "Disable provider" : "Remove provider assignment"}
+        title={
+          confirmation?.kind === "abandon-secret-replacement"
+            ? "Abandon client secret replacement"
+            : "Disable provider"
+        }
         onClose={() => {
           if (!submitting) setConfirmation(null);
         }}
@@ -885,7 +1219,9 @@ export function ProvidersPage() {
               busy={submitting}
               onClick={() => void confirmAction()}
             >
-              {confirmation?.kind === "disable" ? "Disable provider" : "Remove assignment"}
+              {confirmation?.kind === "abandon-secret-replacement"
+                ? "Abandon replacement"
+                : "Disable provider"}
             </Button>
           </>
         }
@@ -895,17 +1231,18 @@ export function ProvidersPage() {
             {overlayError}
           </InlineAlert>
         )}
-        {confirmation?.kind === "disable" ? (
+        {confirmation === null ? null : confirmation.kind === "disable" ? (
           <p>
-            Disable <strong>{confirmation.provider.display_name}</strong> and prevent all of its
-            current assignments from being used?
+            Disable <strong>{confirmation.provider.display_name}</strong> and remove it from every
+            Application’s active sign-in methods?
           </p>
-        ) : confirmation?.kind === "unassign" ? (
+        ) : (
           <p>
-            Remove <strong>{confirmation.provider.display_name}</strong> from{" "}
-            <strong>{confirmation.application.display_name}</strong>?
+            Abandon the pending protected client secret generation for{" "}
+            <strong>{confirmation.provider.display_name}</strong>? The unpublished material will be
+            erased, and the current active client secret will remain unchanged.
           </p>
-        ) : null}
+        )}
       </Dialog>
     </div>
   );
@@ -913,115 +1250,76 @@ export function ProvidersPage() {
 
 function ProviderDetail({
   provider,
-  applications,
-  onAssign,
   onReconcile,
   onDisable,
-  onUnassign,
 }: {
   readonly provider: Provider;
-  readonly applications: Application[];
-  readonly onAssign: (
-    provider: Provider,
-    event: SyntheticEvent<HTMLFormElement, SubmitEvent>,
-  ) => Promise<void>;
   readonly onReconcile: () => void;
   readonly onDisable: () => void;
-  readonly onUnassign: (application: Application) => void;
 }) {
-  const assigned = applications.filter((application) =>
-    provider.assigned_application_ids.includes(application.id),
-  );
-  const available = applications.filter(
-    (application) =>
-      application.status === "active" &&
-      !provider.assigned_application_ids.includes(application.id),
-  );
   return (
-    <Section
-      title={provider.display_name}
-      description="Committed provider state and Application assignments."
-    >
-      <div className={styles["detailSurface"]}>
-        <DescriptionList
-          items={[
-            {
-              term: "Provider key",
-              detail: <span className={styles["machineValue"]}>{provider.provider_key}</span>,
-            },
-            { term: "Kind", detail: provider.kind },
-            { term: "Status", detail: <StatusBadge status={provider.status} /> },
-            {
-              term: "Callback URL",
-              detail: <span className={styles["machineValue"]}>{provider.callback_url}</span>,
-            },
-            {
-              term: "Managed profile",
-              detail: provider.managed_profile.enabled ? "Enabled" : "Disabled",
-            },
-            {
-              term: "Fixed scopes",
-              detail: provider.managed_profile.exact_scopes.join(" ") || "None",
-            },
-          ]}
-        />
-        {provider.status === "provisioning" ? (
-          <div className={styles["formActions"]}>
-            <Button type="button" variant="primary" onClick={onReconcile}>
-              Resume provisioning
-            </Button>
-          </div>
-        ) : null}
-        {provider.status === "active" && available.length > 0 ? (
-          <form className={styles["form"]} onSubmit={(event) => void onAssign(provider, event)}>
-            <Field label="Assign to Application" htmlFor={`provider-assignment-${provider.id}`}>
-              <Select id={`provider-assignment-${provider.id}`} name="application_id">
-                {available.map((application) => (
-                  <option key={application.id} value={application.id}>
-                    {application.display_name}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-            <div className={styles["formActions"]}>
-              <Button type="submit" variant="secondary">
-                Assign provider
-              </Button>
-            </div>
-          </form>
-        ) : null}
-        <h3>Assigned Applications</h3>
-        {assigned.length === 0 ? (
-          <p className={styles["muted"]}>No assignments.</p>
-        ) : (
-          <ul>
-            {assigned.map((application) => (
-              <li key={application.id}>
-                {application.display_name}{" "}
-                <Button
-                  type="button"
-                  variant="quiet"
-                  onClick={() => {
-                    onUnassign(application);
-                  }}
-                >
-                  Remove
-                </Button>
-              </li>
-            ))}
-          </ul>
-        )}
-        {provider.status === "active" ? (
-          <div className={styles["dangerZone"]}>
+    <div className={styles["inlineDetail"]}>
+      <p className={styles["muted"]}>
+        Register the callback URL below as an exact redirect URI in this provider’s console.
+      </p>
+      <DescriptionList
+        items={[
+          {
+            term: "Provider key",
+            detail: <span className={styles["machineValue"]}>{provider.provider_key}</span>,
+          },
+          {
+            term: "Issuer",
+            detail: <span className={styles["machineValue"]}>{provider.issuer}</span>,
+          },
+          {
+            term: "Client ID",
+            detail: <span className={styles["machineValue"]}>{provider.client_id}</span>,
+          },
+          {
+            term: "Callback URL",
+            detail: <CopyValue value={provider.callback_url} label="provider callback URL" block />,
+          },
+          {
+            term: "Callback registration",
+            detail:
+              "Copy this URL to the provider’s authorized redirect URI or callback URL setting.",
+          },
+          {
+            term: "Managed profile",
+            detail: provider.managed_profile.enabled ? "Enabled" : "Disabled",
+          },
+          {
+            term: "Fixed scopes",
+            detail: provider.managed_profile.exact_scopes.join(" ") || "None",
+          },
+        ]}
+      />
+      {provider.secret_replacement_pending ? (
+        <InlineAlert tone="warning">
+          A protected client secret replacement is pending. Resume or abandon it from the table
+          action before changing or disabling this provider.
+        </InlineAlert>
+      ) : null}
+      {provider.status === "provisioning" ? (
+        <div className={styles["formActions"]}>
+          <Button type="button" variant="primary" onClick={onReconcile}>
+            Resume provisioning
+          </Button>
+        </div>
+      ) : null}
+      {provider.status === "active" && !provider.secret_replacement_pending ? (
+        <div className={styles["inlineDangerZone"]}>
+          <div>
             <h3>Disable provider</h3>
-            <p>Disabling removes this provider from active sign-in methods.</p>
-            <Button type="button" variant="danger" onClick={onDisable}>
-              Disable provider
-            </Button>
+            <p>Disabling removes this provider from every Application’s active sign-in methods.</p>
           </div>
-        ) : null}
-      </div>
-    </Section>
+          <Button type="button" variant="danger" onClick={onDisable}>
+            Disable provider
+          </Button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

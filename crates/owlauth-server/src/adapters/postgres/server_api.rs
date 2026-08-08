@@ -146,8 +146,6 @@ impl ProjectionCryptography for ServerProjectionReader {
 #[derive(Clone)]
 pub(crate) struct PostgresServerApiRepository {
     database: DatabaseConnection,
-    server_process_id: String,
-    auth_process_incarnation: Uuid,
     source_reader: Arc<dyn DurableEmailAddressReader>,
     projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
 }
@@ -155,66 +153,25 @@ pub(crate) struct PostgresServerApiRepository {
 impl PostgresServerApiRepository {
     pub(crate) fn new(
         database: DatabaseConnection,
-        server_process_id: String,
-        auth_process_incarnation: Uuid,
         source_reader: Arc<dyn DurableEmailAddressReader>,
         projection_protector: Arc<dyn ProjectionVerifiedEmailProtector>,
-    ) -> Result<Self, ApplicationError> {
-        if auth_process_incarnation.is_nil()
-            || server_process_id.is_empty()
-            || server_process_id.len() > 128
-            || !server_process_id.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-            })
-        {
-            return Err(ApplicationError::InvalidInput);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             database,
-            server_process_id,
-            auth_process_incarnation,
             source_reader,
             projection_protector,
-        })
+        }
     }
 
-    async fn fenced_transaction(
-        &self,
-        read_only: bool,
-    ) -> Result<DatabaseTransaction, ApplicationError> {
+    async fn read_transaction(&self) -> Result<DatabaseTransaction, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        if read_only {
-            // The incarnation fence below requires a row-level `FOR SHARE` lock. PostgreSQL
-            // rejects that lock in a transaction declared READ ONLY, so read paths use a
-            // repeatable-read transaction and enforce no-write authority in this repository's
-            // narrow methods rather than weakening the replacement fence.
-            transaction
-                .execute_raw(Statement::from_string(
-                    DbBackend::Postgres,
-                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ".to_owned(),
-                ))
-                .await
-                .map_err(persistence)?;
-        }
-        let observed = transaction
-            .query_one_raw(Statement::from_sql_and_values(
+        transaction
+            .execute_raw(Statement::from_string(
                 DbBackend::Postgres,
-                "SELECT process_incarnation FROM auth_process_incarnations
-                  WHERE process_id=$1 AND process_incarnation=$2 FOR SHARE",
-                [
-                    self.server_process_id.clone().into(),
-                    self.auth_process_incarnation.into(),
-                ],
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY".to_owned(),
             ))
             .await
-            .map_err(persistence)?
-            .ok_or(ApplicationError::Disabled)?;
-        let incarnation: Uuid = observed
-            .try_get("", "process_incarnation")
             .map_err(persistence)?;
-        if incarnation != self.auth_process_incarnation {
-            return Err(ApplicationError::Integrity);
-        }
         Ok(transaction)
     }
 
@@ -365,7 +322,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
         &self,
         public_key_id: &str,
     ) -> Result<ServerKeyAuthority, ApplicationError> {
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -403,7 +360,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
     }
 
     async fn confirm_active(&self, project_id: Uuid, key_id: Uuid) -> Result<(), ApplicationError> {
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -461,7 +418,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
         if !(2..=101).contains(&limit_plus_one) {
             return Err(ApplicationError::InvalidInput);
         }
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         self.active_project(&transaction, project_id, project_public_id)
             .await?;
         let mut query =
@@ -505,7 +462,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
         project_public_id: &str,
         user_public_id: &str,
     ) -> Result<ServerUser, ApplicationError> {
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         self.active_project(&transaction, project_id, project_public_id)
             .await?;
         let user = project_user::Entity::find()
@@ -537,7 +494,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
         if candidates.is_empty() || candidates.len() > 32 {
             return Err(ApplicationError::InvalidInput);
         }
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         self.active_project(&transaction, project_id, project_public_id)
             .await?;
         let Some(user_id) = super::email_identity_lookup::resolve_active_email_user_id(
@@ -572,7 +529,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
         application_public_id: &str,
         user_public_id: &str,
     ) -> Result<ServerApplicationProjection, ApplicationError> {
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         self.active_project(&transaction, project_id, project_public_id)
             .await?;
         let application = application::Entity::find()
@@ -627,7 +584,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
         kid: &str,
         now: OffsetDateTime,
     ) -> Result<ServerVerificationKey, ApplicationError> {
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         let owner = project::Entity::find_by_id(project_id)
             .filter(project::Column::Status.eq("active"))
             .one(&transaction)
@@ -669,7 +626,7 @@ impl ServerApiRepository for PostgresServerApiRepository {
         &self,
         lookup: ServerTokenSessionLookup,
     ) -> Result<ActiveServerToken, ApplicationError> {
-        let transaction = self.fenced_transaction(true).await?;
+        let transaction = self.read_transaction().await?;
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,

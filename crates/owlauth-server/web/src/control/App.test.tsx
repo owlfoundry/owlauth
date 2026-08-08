@@ -137,6 +137,7 @@ describe("Control application shell", () => {
   });
 
   it("presents compact Project context and a resource dashboard", async () => {
+    let overviewReads = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn<typeof fetch>((input) => {
@@ -145,73 +146,17 @@ describe("Control application shell", () => {
         if (url.pathname.endsWith("/v1/projects")) {
           return Promise.resolve(Response.json({ items: [project] }));
         }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/applications`)) {
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/overview`)) {
+          overviewReads += 1;
           return Promise.resolve(
             Response.json({
-              items: [
-                application,
-                { ...application, id: "application-disabled", status: "disabled" },
-              ],
+              project_id: project.id,
+              applications: { total: 2, active: 1, configured: 1 },
+              providers: { total: 1, active: 0, active_assignments: 0 },
+              users: { total: 7, active: 5, disabled: 1, merged: 1 },
+              project_server_keys: { total: 3, active: 2, revoked: 1 },
             }),
           );
-        }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/providers`)) {
-          return Promise.resolve(
-            Response.json({
-              items: [
-                {
-                  id: "provider-disabled",
-                  project_id: project.id,
-                  provider_key: "disabled-provider",
-                  display_name: "Disabled provider",
-                  kind: "oidc",
-                  issuer: "https://disabled.example/",
-                  client_id: "disabled-client",
-                  callback_url: "https://identity.example/runtime/callback",
-                  status: "disabled",
-                  revision: 1,
-                  assigned_application_ids: [],
-                  login_supported: true,
-                  identity_proof_supported: true,
-                  managed_profile: {
-                    supported: true,
-                    enabled: false,
-                    exact_scopes: [],
-                    profile_schema: "oidc.v1",
-                    read_retry_safe: true,
-                    renewal_idempotent_replay: true,
-                    supports_revocation: true,
-                  },
-                },
-              ],
-            }),
-          );
-        }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/signing-keys`)) {
-          return Promise.resolve(
-            Response.json({
-              items: [
-                {
-                  id: "signing-key-1",
-                  project_id: project.id,
-                  kid: "kid_active",
-                  algorithm: "EdDSA",
-                  state: "active",
-                  ring_revision: 1,
-                  signing_epoch: 1,
-                  sign_not_before: null,
-                  verify_not_after: null,
-                  public_jwk: { kid: "kid_active" },
-                },
-              ],
-            }),
-          );
-        }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/email-method/assignments`)) {
-          return Promise.resolve(Response.json({ items: [] }));
-        }
-        if (url.pathname.endsWith(`/v1/projects/${project.id}/email-method`)) {
-          return Promise.resolve(Response.json({ enabled: false }));
         }
         return Promise.resolve(Response.json({ items: [] }));
       }),
@@ -243,6 +188,7 @@ describe("Control application shell", () => {
     const resourcesSection = resourcesHeading.closest("section");
     if (resourcesSection === null) throw new Error("Project resource dashboard is missing");
     expect(await within(resourcesSection).findAllByRole("link")).toHaveLength(4);
+    expect(overviewReads).toBe(1);
     expect(
       within(resourcesSection).getByRole("link", { name: /^Applications/u }),
     ).toHaveTextContent("2");
@@ -255,12 +201,19 @@ describe("Control application shell", () => {
     expect(
       within(resourcesSection).getByRole("link", { name: /^Identity providers/u }),
     ).toHaveTextContent("0 active");
-    expect(
-      within(resourcesSection).getByRole("link", { name: /^Passwordless email/u }),
-    ).toHaveTextContent("0");
-    expect(
-      within(resourcesSection).getByRole("link", { name: /^Signing keys/u }),
-    ).toHaveTextContent("1");
+    const usersSummary = within(resourcesSection).getByRole("link", { name: /^Users/u });
+    expect(usersSummary).toHaveTextContent("7");
+    expect(usersSummary).toHaveTextContent("5 active · 1 disabled · 1 merged");
+    expect(usersSummary).toHaveAttribute("href", `/projects/${project.id}/users`);
+    const serverKeysSummary = within(resourcesSection).getByRole("link", {
+      name: /^Project secret keys/u,
+    });
+    expect(serverKeysSummary).toHaveTextContent("3");
+    expect(serverKeysSummary).toHaveTextContent("2 active · 1 revoked");
+    expect(serverKeysSummary).toHaveAttribute(
+      "href",
+      `/projects/${project.id}/security/server-keys`,
+    );
     expect(within(navigation).getByRole("group", { name: "Project" })).toBeVisible();
     expect(within(navigation).getByRole("group", { name: "Authentication" })).toBeVisible();
     expect(within(navigation).getByRole("group", { name: "Security" })).toBeVisible();
@@ -740,6 +693,306 @@ describe("Control application shell", () => {
       expect(screen.queryByRole("dialog", { name: "Add Custom OIDC" })).toBeNull();
     });
     expect(document.body.textContent).not.toContain("write-only-secret");
+  });
+
+  it("expands provider details and separates metadata updates from secret replacement", async () => {
+    let provider = {
+      id: "provider-1",
+      project_id: project.id,
+      provider_key: "workforce",
+      display_name: "Workforce SSO",
+      kind: "oidc",
+      issuer: "https://issuer.example/",
+      client_id: "client-id",
+      callback_url: "https://identity.example/runtime/callback/workforce",
+      status: "active",
+      revision: 5,
+      secret_replacement_pending: false,
+      assigned_application_ids: [],
+      login_supported: true,
+      identity_proof_supported: true,
+      managed_profile: {
+        supported: false,
+        enabled: false,
+        exact_scopes: [],
+        profile_schema: "unsupported",
+        read_retry_safe: false,
+        renewal_idempotent_replay: false,
+        supports_revocation: false,
+      },
+    };
+    const metadataUpdates: Record<string, unknown>[] = [];
+    const secretReplacements: Record<string, unknown>[] = [];
+    const replacementKeys: (string | null)[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return systemResponse();
+        if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+          return Response.json({ items: [project] });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/provider-egress-policy`)) {
+          return Response.json({
+            project_id: project.id,
+            mode: "allow_all",
+            exact_origins: [],
+            revision: 1,
+          });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/providers`)) {
+          return Response.json({ items: [provider] });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/providers/${provider.id}`)) {
+          const body = (await request.clone().json()) as Record<string, unknown>;
+          metadataUpdates.push(body);
+          provider = {
+            ...provider,
+            display_name: String(body["display_name"]),
+            client_id: String(body["client_id"]),
+            revision: provider.revision + 1,
+          };
+          return Response.json(provider);
+        }
+        if (
+          url.pathname.endsWith(
+            `/v1/projects/${project.id}/providers/${provider.id}/replace-secret`,
+          )
+        ) {
+          const body = (await request.clone().json()) as Record<string, unknown>;
+          secretReplacements.push(body);
+          replacementKeys.push(request.headers.get("idempotency-key"));
+          provider = {
+            ...provider,
+            display_name: String(body["display_name"]),
+            client_id: String(body["client_id"]),
+            revision: provider.revision + 1,
+          };
+          return Response.json(provider);
+        }
+        throw new Error(`Unexpected request: ${request.method} ${url.pathname}`);
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/authentication/providers`);
+    await unlock("owl_ctrl_v1_test", "Authentication providers");
+    fireEvent.click(await screen.findByRole("button", { name: "Expand Workforce SSO details" }));
+    expect(screen.getByText(provider.callback_url)).toBeVisible();
+    expect(screen.getByText(/exact redirect URI/u)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    let editor = screen.getByRole("dialog", { name: "Edit provider" });
+    fireEvent.change(within(editor).getByLabelText("Display name"), {
+      target: { value: "Workforce Login" },
+    });
+    fireEvent.change(within(editor).getByLabelText("Client ID"), {
+      target: { value: "client-id-2" },
+    });
+    fireEvent.click(within(editor).getByRole("button", { name: "Save provider" }));
+    await waitFor(() => {
+      expect(metadataUpdates).toHaveLength(1);
+    });
+    expect(metadataUpdates[0]).toEqual({
+      display_name: "Workforce Login",
+      client_id: "client-id-2",
+      expected_provider_revision: 5,
+    });
+    expect(secretReplacements).toHaveLength(0);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    editor = screen.getByRole("dialog", { name: "Edit provider" });
+    fireEvent.change(within(editor).getByLabelText(/^New client secret/u), {
+      target: { value: "replacement-secret" },
+    });
+    fireEvent.click(within(editor).getByRole("button", { name: "Save provider" }));
+    await waitFor(() => {
+      expect(secretReplacements).toHaveLength(1);
+    });
+    expect(secretReplacements[0]).toEqual({
+      display_name: "Workforce Login",
+      client_id: "client-id-2",
+      client_secret: "replacement-secret",
+      expected_provider_revision: 6,
+    });
+    expect(replacementKeys[0]).toMatch(/^console_[0-9a-f]{32}$/u);
+    expect(document.body.textContent).not.toContain("replacement-secret");
+  });
+
+  it("resumes a durable pending provider secret replacement without retaining the secret", async () => {
+    let provider = {
+      id: "provider-pending",
+      project_id: project.id,
+      provider_key: "pending-workforce",
+      display_name: "Pending Workforce",
+      kind: "oidc",
+      issuer: "https://issuer.example/",
+      client_id: "client-id",
+      callback_url: "https://identity.example/runtime/callback/pending-workforce",
+      status: "active",
+      revision: 8,
+      secret_replacement_pending: true,
+      assigned_application_ids: [],
+      login_supported: true,
+      identity_proof_supported: true,
+      managed_profile: {
+        supported: false,
+        enabled: false,
+        exact_scopes: [],
+        profile_schema: "unsupported",
+        read_retry_safe: false,
+        renewal_idempotent_replay: false,
+        supports_revocation: false,
+      },
+    };
+    const recoveryBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return systemResponse();
+        if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+          return Response.json({ items: [project] });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/provider-egress-policy`)) {
+          return Response.json({
+            project_id: project.id,
+            mode: "allow_all",
+            exact_origins: [],
+            revision: 1,
+          });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/providers`)) {
+          return Response.json({ items: [provider] });
+        }
+        if (
+          url.pathname.endsWith(
+            `/v1/projects/${project.id}/providers/${provider.id}/replace-secret/reconcile`,
+          )
+        ) {
+          recoveryBodies.push((await request.clone().json()) as Record<string, unknown>);
+          provider = { ...provider, revision: 9, secret_replacement_pending: false };
+          return Response.json(provider);
+        }
+        throw new Error(`Unexpected request: ${request.method} ${url.pathname}`);
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/authentication/providers`);
+    await unlock("owl_ctrl_v1_test", "Authentication providers");
+    expect(await screen.findByText("secret replacement pending")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Resolve replacement" }));
+    const dialog = screen.getByRole("dialog", { name: "Resolve client secret replacement" });
+    const secret = within(dialog).getByLabelText("Replacement client secret");
+    fireEvent.change(secret, { target: { value: "reentered-secret" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Resume replacement" }));
+
+    await waitFor(() => {
+      expect(recoveryBodies).toEqual([
+        { client_secret: "reentered-secret", expected_provider_revision: 8 },
+      ]);
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "Resolve client secret replacement" }),
+      ).toBeNull();
+    });
+    expect(document.body.textContent).not.toContain("reentered-secret");
+    expect(screen.queryByText("secret replacement pending")).not.toBeInTheDocument();
+  });
+
+  it("abandons a pending provider secret replacement only after explicit confirmation", async () => {
+    let provider = {
+      id: "provider-pending",
+      project_id: project.id,
+      provider_key: "pending-workforce",
+      display_name: "Pending Workforce",
+      kind: "oidc",
+      issuer: "https://issuer.example/",
+      client_id: "client-id",
+      callback_url: "https://identity.example/runtime/callback/pending-workforce",
+      status: "active",
+      revision: 8,
+      secret_replacement_pending: true,
+      assigned_application_ids: [],
+      login_supported: true,
+      identity_proof_supported: true,
+      managed_profile: {
+        supported: false,
+        enabled: false,
+        exact_scopes: [],
+        profile_schema: "unsupported",
+        read_retry_safe: false,
+        renewal_idempotent_replay: false,
+        supports_revocation: false,
+      },
+    };
+    const abandonmentBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return systemResponse();
+        if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+          return Response.json({ items: [project] });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/provider-egress-policy`)) {
+          return Response.json({
+            project_id: project.id,
+            mode: "allow_all",
+            exact_origins: [],
+            revision: 1,
+          });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/providers`)) {
+          return Response.json({ items: [provider] });
+        }
+        if (
+          url.pathname.endsWith(
+            `/v1/projects/${project.id}/providers/${provider.id}/replace-secret/abandon`,
+          )
+        ) {
+          abandonmentBodies.push((await request.clone().json()) as Record<string, unknown>);
+          provider = { ...provider, secret_replacement_pending: false };
+          return Response.json(provider);
+        }
+        throw new Error(`Unexpected request: ${request.method} ${url.pathname}`);
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/authentication/providers`);
+    await unlock("owl_ctrl_v1_test", "Authentication providers");
+    fireEvent.click(await screen.findByRole("button", { name: "Resolve replacement" }));
+    const resolutionDialog = screen.getByRole("dialog", {
+      name: "Resolve client secret replacement",
+    });
+    const secret = within(resolutionDialog).getByLabelText("Replacement client secret");
+    fireEvent.change(secret, { target: { value: "must-be-discarded" } });
+    fireEvent.click(within(resolutionDialog).getByRole("button", { name: "Abandon replacement" }));
+
+    expect(
+      screen.queryByRole("dialog", { name: "Resolve client secret replacement" }),
+    ).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("must-be-discarded");
+    const confirmationDialog = screen.getByRole("dialog", {
+      name: "Abandon client secret replacement",
+    });
+    expect(abandonmentBodies).toHaveLength(0);
+    fireEvent.click(
+      within(confirmationDialog).getByRole("button", { name: "Abandon replacement" }),
+    );
+
+    await waitFor(() => {
+      expect(abandonmentBodies).toEqual([{ expected_provider_revision: 8 }]);
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "Abandon client secret replacement" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(screen.queryByText("secret replacement pending")).not.toBeInTheDocument();
   });
 
   it.each([

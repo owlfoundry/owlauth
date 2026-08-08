@@ -23,13 +23,13 @@
     "malformed handoff success is indeterminate",
     "post-dispatch handoff timeout is indeterminate",
     "refresh rejection invalidates credential family",
-    "refresh admission limit preserves submitted generation",
+    "refresh SaaS ingress limit preserves submitted generation",
     "refresh requires exact successor generation",
     "post-dispatch refresh timeout is indeterminate",
     "current user projection preserves context",
     "current user unauthorized requires reauthentication",
     "application logout sends no invented body",
-    "application logout admission limit preserves credentials",
+    "application logout SaaS ingress limit preserves credentials",
     "invalid logout success is indeterminate",
     "browser logout preparation sends no invented body",
     "malformed callback inspection preserves pending state",
@@ -49,7 +49,11 @@
     "uncontracted refresh error status is indeterminate",
     "handoff timeout before dispatch preserves pending",
     "missing rate limit guidance is protocol failure",
-    "missing refresh rate limit guidance is indeterminate"
+    "missing refresh rate limit guidance is indeterminate",
+    "Core request timeout on read is a caller decision",
+    "Core request timeout on refresh is indeterminate",
+    "malformed Core timeout on read is protocol failure",
+    "malformed Core timeout on refresh is indeterminate"
   ],
   "cases": [
     {
@@ -611,7 +615,7 @@
       }
     },
     {
-      "name": "refresh admission limit preserves submitted generation",
+      "name": "refresh SaaS ingress limit preserves submitted generation",
       "required": true,
       "capability": "refresh",
       "operationId": "refresh_session",
@@ -763,7 +767,7 @@
       }
     },
     {
-      "name": "application logout admission limit preserves credentials",
+      "name": "application logout SaaS ingress limit preserves credentials",
       "required": true,
       "capability": "logout",
       "operationId": "logout_application_session",
@@ -1263,6 +1267,106 @@
       "capability": "refresh",
       "operationId": "refresh_session",
       "fixture": "../fixtures/runtime-error-rate-limited-missing-retry-after.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "invalid_response_after_dispatch",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
+      }
+    },
+    {
+      "name": "Core request timeout on read is a caller decision",
+      "required": true,
+      "capability": "request_timeout",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/runtime-error-request-timeout.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "timeout",
+        "code": "request_timeout",
+        "retry": "application_decision",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "Core request timeout on refresh is indeterminate",
+      "required": true,
+      "capability": "request_timeout",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/runtime-error-request-timeout.json",
+      "precondition": "credential_pair",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "indeterminate",
+        "code": "request_timeout",
+        "retry": "never",
+        "action": "quarantine_credentials",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "quarantined"
+      }
+    },
+    {
+      "name": "malformed Core timeout on read is protocol failure",
+      "required": true,
+      "capability": "request_timeout",
+      "operationId": "get_public_application_config",
+      "fixture": "../fixtures/runtime-error-request-timeout-wrong-code.json",
+      "precondition": "none",
+      "requestPhase": "response_received",
+      "responseReceived": true,
+      "evidenceLevel": "deterministic",
+      "configuredContext": {
+        "projectId": "prj_conformance",
+        "applicationId": "app_conformance",
+        "publishableKey": "owl_app_conformance"
+      },
+      "expected": {
+        "outcome": "error",
+        "category": "protocol",
+        "code": "invalid_response",
+        "retry": "never",
+        "action": "none",
+        "pendingDisposition": "not_applicable",
+        "credentialDisposition": "not_applicable"
+      }
+    },
+    {
+      "name": "malformed Core timeout on refresh is indeterminate",
+      "required": true,
+      "capability": "request_timeout",
+      "operationId": "refresh_session",
+      "fixture": "../fixtures/runtime-error-request-timeout-wrong-code.json",
       "precondition": "credential_pair",
       "requestPhase": "response_received",
       "responseReceived": true,

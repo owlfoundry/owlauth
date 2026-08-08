@@ -1,6 +1,6 @@
 """Official synchronous Python client for OwlAuth Project Auth."""
 
-from owlauth.client import Client
+from owlauth.client import Client, SdkDebugEvent
 from owlauth.conformance import ConformanceCase, ConformanceCorpus, load_conformance_corpus
 from owlauth.errors import (
     AuthenticationError,
@@ -72,6 +72,7 @@ __all__ = [
     "RateLimitedError",
     "RefreshError",
     "RetryDisposition",
+    "SdkDebugEvent",
     "SecretValue",
     "SessionError",
     "StdlibTransport",

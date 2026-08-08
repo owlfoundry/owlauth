@@ -856,18 +856,17 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RuntimeError"];
+                    "text/html": unknown;
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -904,14 +903,13 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RuntimeError"];
+                    "text/html": unknown;
                 };
             };
         };
@@ -952,18 +950,17 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RuntimeError"];
+                    "text/html": unknown;
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1008,14 +1005,13 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RuntimeError"];
+                    "text/html": unknown;
                 };
             };
         };
@@ -1048,18 +1044,17 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RuntimeError"];
+                    "text/html": unknown;
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1104,18 +1099,17 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["RuntimeError"];
+                    "text/html": unknown;
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1140,6 +1134,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
                 };
             };
         };
@@ -1171,10 +1174,9 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1229,7 +1231,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1237,10 +1240,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1273,6 +1274,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuntimeError"];
                 };
             };
             /** @description A listener-critical dependency is unavailable */
@@ -1318,7 +1328,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1326,10 +1337,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1367,10 +1376,9 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1424,10 +1432,9 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1483,7 +1490,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1491,10 +1499,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1534,7 +1540,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1542,10 +1549,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1610,7 +1615,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1618,10 +1624,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1679,7 +1683,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1687,10 +1692,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1748,7 +1751,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1756,10 +1760,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1817,7 +1819,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1825,10 +1828,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1886,7 +1887,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1894,10 +1896,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -1946,7 +1946,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1954,10 +1955,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2006,7 +2005,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2014,10 +2014,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2066,7 +2064,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2074,10 +2073,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2118,7 +2115,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2126,10 +2124,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2178,7 +2174,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2186,10 +2183,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2230,7 +2225,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2238,10 +2234,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2289,10 +2283,9 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2349,7 +2342,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2357,10 +2351,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2398,10 +2390,9 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2449,7 +2440,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            409: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2457,10 +2449,8 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            409: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2506,10 +2496,9 @@ export interface operations {
                     "application/json": components["schemas"]["RuntimeError"];
                 };
             };
-            429: {
+            /** @description The request exceeded the Runtime listener time budget */
+            408: {
                 headers: {
-                    /** @description Required delay in whole seconds before retrying */
-                    "Retry-After": number;
                     [name: string]: unknown;
                 };
                 content: {

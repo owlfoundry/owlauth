@@ -8,6 +8,7 @@ mod composition;
 pub mod config;
 mod domain;
 mod http;
+pub mod maintenance;
 mod providers;
 mod web_assets;
 

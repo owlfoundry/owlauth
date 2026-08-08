@@ -34,6 +34,12 @@ SDKs must:
 
 A Project JWT may be decoded only through an API that clearly distinguishes unverified display data from trusted backend validation.
 
+### Optional debug completion events
+
+Each official SDK may accept an optional debug hook. It is disabled by default, emits at most one immutable completion event per real network attempt, and is observational: hook exceptions or panics are isolated and cannot change a protocol result. The cross-language allowlist is the fixed operation name, `GET`/`POST`, closed outcome class, non-negative elapsed milliseconds, dispatch boolean, optional HTTP status, optional stable error category/code, and optional already-validated bounded Runtime request ID.
+
+The event never contains a URL or path, headers, cookies, request/response bodies, exception/transport objects, Project/Application/publishable identifiers, redirects, callbacks, email/profile/projection data, OAuth state, PKCE, handoff, access/refresh credentials, or arbitrary error messages. SDKs do not provide a “log everything” mode and do not introduce a logging-facade dependency merely to expose this hook. Tests use recognizable sentinel credentials and a failing observer to prove both redaction and outcome isolation.
+
 ## Project/Application isolation
 
 Pending login, PKCE state, user/session credentials, refresh coordination, persistence records, and cached public configuration are bound to the exact Runtime origin, Project, and Application. SDKs reject attempts to load or use them under another context.

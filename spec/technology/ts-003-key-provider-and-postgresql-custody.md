@@ -35,7 +35,7 @@ Algorithms are explicit provider capabilities. Ed25519/EdDSA is the bundled v1 d
 
 ### Bundled software provider
 
-The bundled provider requires one deployment-supplied 32-byte software custody master key. The key is delivered through the deployment's secret-injection mechanism and never enters PostgreSQL, Redis, DTOs, logs, telemetry, panic output, CLI output, or public configuration.
+The bundled provider requires one deployment-supplied 32-byte software custody master key. The key is delivered through the deployment's secret-injection mechanism and never enters PostgreSQL, DTOs, logs, telemetry, panic output, CLI output, or public configuration.
 
 HKDF-SHA-256 with a fixed versioned OwlAuth extract salt and distinct length-delimited `info` labels derives non-overlapping 32-byte subkeys for at least:
 
@@ -99,7 +99,7 @@ Before declaring this decision implemented, tests MUST prove:
 04. the software provider has fixed HKDF-SHA-256/HMAC-SHA-256/XChaCha20-Poly1305 vectors, uses fresh 24-byte nonces and canonical length-delimited exact context, produces stable safe fingerprints independently of ciphertext randomness, and rejects context/provider/version substitution;
 05. signing provisioning commits the protected-material row, normalized public key, key metadata, and operation outcome consistently, and Runtime verifies that signatures match the committed public key;
 06. provider/SMTP/webhook secret creation, rotation, activation, overlap, disablement, compromise, cleanup, idempotent replay, crash, and stale-writer races preserve one authoritative PostgreSQL lifecycle without filesystem state;
-07. opaque values and plaintext never enter DTOs, logs, telemetry, audit safe context, Redis, or error text, and transient plaintext/key material is bounded and zeroized where supported;
+07. opaque values and plaintext never enter DTOs, logs, telemetry, audit safe context or error text, and transient plaintext/key material is bounded and zeroized where supported;
 08. split Auth process replicas using the same root can open/sign exact committed generations, while a wrong root or restored database without the root makes only the affected capabilities fail closed;
 09. stable-operation remote signer test providers prove create/reconcile ambiguity, byte-identical inspection, public-key consistency, exact algorithm handling, JWS-ready signature normalization, and safe destruction classification;
 10. the stateless software signer proves fresh same-operation handles, `NotFound + ExactInputSafe` inspection, crash recovery through fresh provisioning, and cleanup by PostgreSQL opaque-value erasure without `cleanup_blocked`;

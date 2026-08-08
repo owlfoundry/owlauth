@@ -1,6 +1,5 @@
 mod http_capabilities;
 
-use std::collections::BTreeMap;
 use std::{
     future::Future,
     io,
@@ -32,12 +31,8 @@ use crate::{
         postgres::{
             DatabasePools, create_pools, custody::ProtectedMaterialRepository,
             email::PostgresPasswordlessEmailRepository,
-            projection::PostgresProjectionEmailKeyAuthority,
         },
         protected_runtime::PostgresProtectedRuntimeCustody,
-        runtime_security::{
-            RuntimeKeyMaterial, SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
-        },
     },
     application::{
         DeploymentSmtpDesiredStatus, DeploymentSmtpGeneration, DeploymentSmtpRegistry,
@@ -45,7 +40,7 @@ use crate::{
         WebhookWorker,
     },
     config::{DeploymentSmtpStatus, ListenerConfig, ProcessMode, ServerConfig},
-    http::{DirectPeer, PlaneRouters, build_routers_with_capabilities},
+    http::{PlaneRouters, build_routers_with_capabilities},
     providers::{ActiveProvider, ProviderRegistrations},
 };
 
@@ -104,18 +99,8 @@ pub enum ServerError {
     DatabasePools,
     #[error("stored material requires an unavailable provider capability")]
     ProviderReadiness,
-    #[error("Auth process incarnation could not be claimed")]
-    AuthIncarnation,
-    #[error("Server key-digest readiness could not be claimed")]
-    ServerDigestReadiness,
-    #[error("email protection inventory could not be reconciled")]
-    EmailProtection,
-    #[error("projection verified-email key authority could not be reconciled")]
-    ProjectionEmailProtection,
     #[error("deployment SMTP generation did not reconcile exactly")]
     DeploymentSmtp,
-    #[error("Project SMTP Runtime readiness inventory could not be persisted")]
-    ProjectSmtpReadiness,
     #[error("a configured listener could not bind")]
     Bind,
     #[error("a listener stopped unexpectedly")]
@@ -155,6 +140,11 @@ pub async fn run_with_providers(
     config: ServerConfig,
     providers: ProviderRegistrations,
 ) -> Result<(), ServerError> {
+    tracing::info!(
+        event = "server_starting",
+        mode = ?config.mode,
+        "OwlAuth startup began"
+    );
     providers
         .validate_for_mode(config.mode)
         .map_err(|_| ServerError::ProviderComposition)?;
@@ -162,49 +152,55 @@ pub async fn run_with_providers(
     prepare_schema(&config.postgres)
         .await
         .map_err(|error| ServerError::Schema(error.into()))?;
+    tracing::debug!(
+        event = "startup_phase_completed",
+        phase = "schema",
+        "schema is ready"
+    );
     let pools = create_pools(&config)
         .await
         .map_err(|_| ServerError::DatabasePools)?;
+    tracing::debug!(
+        event = "startup_phase_completed",
+        phase = "database_pools",
+        "serving pools are ready"
+    );
     if let Err(error) = validate_provider_readiness(&config, &pools, &providers).await {
         pools.close().await;
         return Err(error);
     }
-    // One startup incarnation is claimed once, then shared by every Auth reconciliation and
-    // serving path. No delayed startup phase may reclaim the stable process identity.
-    let auth_incarnation = Uuid::new_v4();
-    claim_auth_incarnation(&config, &pools, auth_incarnation)
-        .await
-        .map_err(|_| ServerError::AuthIncarnation)?;
-    let email_protection_maintenance =
-        reconcile_email_protection(&config, &pools, auth_incarnation)
-            .await
-            .map_err(|_| ServerError::EmailProtection)?;
-    let projection_email_maintenance =
-        reconcile_projection_email_protection(&config, &pools, auth_incarnation)
-            .await
-            .map_err(|_| ServerError::ProjectionEmailProtection)?;
-    reconcile_deployment_smtp(&config, &pools, auth_incarnation, &providers)
+    tracing::debug!(
+        event = "startup_phase_completed",
+        phase = "provider_readiness",
+        "provider capabilities are ready"
+    );
+    // Runtime workers use one ephemeral startup incarnation for lease ownership. It is never
+    // registered as deployment topology and naturally becomes stale when its leases expire.
+    let worker_incarnation = Uuid::new_v4();
+    reconcile_deployment_smtp(&config, &pools, &providers)
         .await
         .map_err(|_| ServerError::DeploymentSmtp)?;
-    let project_smtp_readiness =
-        reconcile_project_smtp_readiness(&config, &pools, auth_incarnation, &providers)
-            .await
-            .map_err(|_| ServerError::ProjectSmtpReadiness)?;
-    let capabilities =
-        build_http_capabilities(&config, Some(&pools), auth_incarnation, providers.as_ref());
-    let server_digest_readiness = capabilities
-        .server
-        .as_ref()
-        .and_then(|server| server.readiness.clone());
+    tracing::debug!(
+        event = "startup_phase_completed",
+        phase = "deployment_smtp",
+        "deployment SMTP authority is reconciled"
+    );
+    let capabilities = build_http_capabilities(
+        &config,
+        Some(&pools),
+        worker_incarnation,
+        providers.as_ref(),
+    );
     let signing_lifecycle = capabilities
         .control
         .as_ref()
         .and_then(|control| control.provisioning.clone());
-    let signing_observation = capabilities
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.readiness.clone());
     let mut routers = build_routers_with_capabilities(&config, capabilities);
+    tracing::debug!(
+        event = "startup_phase_completed",
+        phase = "http_composition",
+        "plane routers and capabilities are composed"
+    );
     if let Some(managed) = routers.managed_sync.as_deref() {
         match managed.restore_key_state().await {
             Ok(true) => {}
@@ -217,13 +213,6 @@ pub async fn run_with_providers(
                 "managed provider restore is degraded; Runtime authority remains available"
             ),
         }
-    }
-
-    if let Some(readiness) = server_digest_readiness.as_deref()
-        && readiness.claim().await.is_err()
-    {
-        pools.close().await;
-        return Err(ServerError::ServerDigestReadiness);
     }
 
     let auth_listener = match bind_selected(config.mode.has_auth(), config.auth.bind).await {
@@ -242,11 +231,12 @@ pub async fn run_with_providers(
         }
     };
 
-    let server_digest_readiness_maintenance =
-        server_digest_readiness.map(spawn_server_digest_readiness_renewal);
+    tracing::debug!(
+        event = "startup_phase_completed",
+        phase = "listener_bind",
+        "selected listener sockets are bound"
+    );
     let signing_lifecycle_maintenance = signing_lifecycle.map(spawn_signing_lifecycle_maintenance);
-    let signing_observation_maintenance =
-        signing_observation.map(spawn_signing_observation_maintenance);
 
     routers.mark_ready();
     if config.mode.has_auth() {
@@ -276,31 +266,19 @@ pub async fn run_with_providers(
         config.shutdown_timeout,
     )
     .await;
-    if let Some(maintenance) = server_digest_readiness_maintenance {
-        maintenance.abort();
-        let _ = maintenance.await;
-    }
     if let Some(maintenance) = signing_lifecycle_maintenance {
         maintenance.abort();
         let _ = maintenance.await;
     }
-    if let Some(maintenance) = signing_observation_maintenance {
-        maintenance.abort();
-        let _ = maintenance.await;
-    }
-    if let Some(maintenance) = email_protection_maintenance {
-        maintenance.abort();
-        let _ = maintenance.await;
-    }
-    if let Some(maintenance) = projection_email_maintenance {
-        maintenance.abort();
-        let _ = maintenance.await;
-    }
-    if let Some(maintenance) = project_smtp_readiness {
-        maintenance.abort();
-        let _ = maintenance.await;
-    }
     pools.close().await;
+    match &result {
+        Ok(()) => tracing::info!(event = "server_stopped", "OwlAuth shutdown completed"),
+        Err(error) => tracing::error!(
+            event = "server_stopped",
+            error = ?error,
+            "OwlAuth stopped with an operational failure"
+        ),
+    }
     result
 }
 
@@ -309,62 +287,20 @@ fn spawn_signing_lifecycle_maintenance(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = provisioning.reconcile_signing_key_lifecycle(100).await {
-                tracing::warn!(
+            match provisioning.reconcile_signing_key_lifecycle(100).await {
+                Ok(progressed) if progressed > 0 => tracing::debug!(
+                    event = "signing_key_lifecycle_reconciled",
+                    progressed,
+                    "signing key lifecycle maintenance made progress"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
                     event = "signing_key_lifecycle_reconciliation_pending",
                     error = ?error,
                     "signing key lifecycle reconciliation failed closed and will retry"
-                );
+                ),
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    })
-}
-
-fn spawn_signing_observation_maintenance(
-    readiness: Arc<crate::application::ReadinessService>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if let Err(error) = readiness.observe_signing_revisions(100).await {
-                tracing::warn!(
-                    event = "signing_key_revision_observation_pending",
-                    error = ?error,
-                    "Runtime signing revision observation failed closed and will retry"
-                );
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    })
-}
-
-fn spawn_server_digest_readiness_renewal(
-    readiness: Arc<crate::application::ServerDigestReadinessService>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let interval = readiness.renewal_interval();
-        loop {
-            tokio::time::sleep(interval).await;
-            match readiness.renew().await {
-                Ok(()) => {}
-                Err(crate::application::ApplicationError::Persistence) => {
-                    // The service marks the local observation unhealthy before returning. Keep
-                    // retrying the same exact incarnation so a transient database outage can
-                    // recover without ever claiming readiness during the failed interval.
-                    tracing::error!(
-                        event = "server_digest_readiness_renewal_failed",
-                        "Server key-digest readiness renewal failed closed; retrying"
-                    );
-                }
-                Err(error) => {
-                    tracing::error!(
-                        event = "server_digest_readiness_renewal_stopped",
-                        error = %error,
-                        "Server key-digest readiness renewal stopped after a terminal failure"
-                    );
-                    return;
-                }
-            }
         }
     })
 }
@@ -502,386 +438,6 @@ async fn authenticate_runtime_provider_inventory(
     }
 }
 
-fn email_protection_failure_class(error: crate::application::ApplicationError) -> &'static str {
-    match error {
-        crate::application::ApplicationError::Persistence => "persistence",
-        crate::application::ApplicationError::Integrity => "integrity",
-        _ => "key_unavailable",
-    }
-}
-
-fn lease_duration_from_config(
-    config: &ServerConfig,
-) -> Result<time::Duration, crate::application::ApplicationError> {
-    let seconds = config
-        .publication_lease_ttl
-        .as_secs()
-        .max(5)
-        .saturating_mul(2);
-    Ok(time::Duration::seconds(i64::try_from(seconds).map_err(
-        |_| crate::application::ApplicationError::Integrity,
-    )?))
-}
-
-async fn claim_auth_incarnation(
-    config: &ServerConfig,
-    pools: &DatabasePools,
-    auth_incarnation: Uuid,
-) -> Result<(), crate::application::ApplicationError> {
-    if !config.mode.has_auth() {
-        return Ok(());
-    }
-    let database = pools
-        .runtime
-        .as_ref()
-        .ok_or(crate::application::ApplicationError::Persistence)?;
-    PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        config.auth_process_id.clone(),
-        auth_incarnation,
-        config.required_auth_process_ids.clone(),
-        lease_duration_from_config(config)?,
-    )
-    .claim_auth_incarnation(time::OffsetDateTime::now_utc())
-    .await
-}
-
-fn should_reconcile_email_protection(mode: ProcessMode, configured: bool) -> bool {
-    mode.has_auth() && configured
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "startup and retry paths keep scoped readiness transitions and key-maintenance inputs together"
-)]
-async fn reconcile_email_protection(
-    config: &ServerConfig,
-    pools: &DatabasePools,
-    auth_incarnation: Uuid,
-) -> Result<Option<tokio::task::JoinHandle<()>>, crate::application::ApplicationError> {
-    if !should_reconcile_email_protection(config.mode, config.email_identity_protection.is_some()) {
-        return Ok(None);
-    }
-    let protection = config
-        .email_identity_protection
-        .as_ref()
-        .ok_or(crate::application::ApplicationError::Integrity)?;
-    let database = pools
-        .runtime
-        .as_ref()
-        .or(pools.control.as_ref())
-        .ok_or(crate::application::ApplicationError::Persistence)?;
-    let short_term = config
-        .runtime_protection
-        .as_ref()
-        .ok_or(crate::application::ApplicationError::Integrity)?;
-    let mut short_term_readable_versions = short_term.retained.keys().copied().collect::<Vec<_>>();
-    short_term_readable_versions.push(short_term.active_version);
-    let mut email_identity_readable_versions =
-        protection.retained.keys().copied().collect::<Vec<_>>();
-    email_identity_readable_versions.push(protection.active_version);
-    let active = RuntimeKeyMaterial::new(
-        protection.active.digest_key.expose_copy(),
-        protection.active.protection_key.expose_copy(),
-    );
-    let retained = protection
-        .retained
-        .iter()
-        .map(|(version, keys)| {
-            (
-                *version,
-                RuntimeKeyMaterial::new(
-                    keys.digest_key.expose_copy(),
-                    keys.protection_key.expose_copy(),
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let protector = SoftwareRuntimeProtector::new(
-        config
-            .instance_id
-            .clone()
-            .ok_or(crate::application::ApplicationError::Integrity)?,
-        protection.active_version,
-        active,
-        retained,
-    )?;
-    let repository = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        config.auth_process_id.clone(),
-        auth_incarnation,
-        config.required_auth_process_ids.clone(),
-        lease_duration_from_config(config)?,
-    );
-    // Startup performs at most one bounded batch. A durable authority keeps identity alias
-    // writes on the old version until every configured Auth process has observed the staged
-    // version and the operator explicitly requests cutover.
-    let now = time::OffsetDateTime::now_utc();
-    let lease_duration = time::Duration::seconds(
-        i64::try_from(config.publication_lease_ttl.as_secs())
-            .map_err(|_| crate::application::ApplicationError::Integrity)?,
-    );
-    let initial = async {
-        repository
-            .rewrap_durable_email_identities(
-                &protector,
-                100,
-                &config.auth_process_id,
-                &config.required_auth_process_ids,
-                now + lease_duration,
-                protection.identity_alias_cutover_version == Some(protection.active_version),
-                protection.identity_alias_retire_version == Some(protection.active_version),
-                now,
-            )
-            .await?;
-        repository
-            .reconcile_protection_inventory(
-                &short_term_readable_versions,
-                &email_identity_readable_versions,
-                now,
-            )
-            .await
-            .map(|_| ())
-    }
-    .await;
-    let (initial_ready, initial_failure) = match initial {
-        Ok(()) => (true, None),
-        Err(error) => {
-            tracing::error!(
-                event = "email_protection_scoped_unavailable",
-                error = ?error,
-                "durable email PII reconciliation is unavailable; unrelated listeners will continue"
-            );
-            (false, Some(email_protection_failure_class(error)))
-        }
-    };
-    if let Err(error) = repository
-        .record_email_protection_readiness(initial_ready, initial_failure, now)
-        .await
-    {
-        tracing::error!(
-            event = "email_protection_readiness_persist_failed",
-            error = ?error,
-            "email protection reconciliation status could not be persisted"
-        );
-    }
-    let maintenance_repository = repository.clone();
-    let maintenance_protector = protector.clone();
-    let maintenance_process_id = config.auth_process_id.clone();
-    let required_process_ids = config.required_auth_process_ids.clone();
-    let cutover_requested =
-        protection.identity_alias_cutover_version == Some(protection.active_version);
-    let retirement_requested =
-        protection.identity_alias_retire_version == Some(protection.active_version);
-    let maintenance_short_term_readable_versions = short_term_readable_versions;
-    let maintenance_email_identity_readable_versions = email_identity_readable_versions;
-    Ok(Some(tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let now = time::OffsetDateTime::now_utc();
-            let result = async {
-                maintenance_repository
-                    .rewrap_durable_email_identities(
-                        &maintenance_protector,
-                        100,
-                        &maintenance_process_id,
-                        &required_process_ids,
-                        now + lease_duration,
-                        cutover_requested,
-                        retirement_requested,
-                        now,
-                    )
-                    .await?;
-                maintenance_repository
-                    .reconcile_protection_inventory(
-                        &maintenance_short_term_readable_versions,
-                        &maintenance_email_identity_readable_versions,
-                        now,
-                    )
-                    .await
-                    .map(|_| ())
-            }
-            .await;
-            match result {
-                Ok(()) => {
-                    let _ = maintenance_repository
-                        .record_email_protection_readiness(true, None, now)
-                        .await;
-                }
-                Err(error) => {
-                    let failure_class = email_protection_failure_class(error);
-                    let _ = maintenance_repository
-                        .record_email_protection_readiness(false, Some(failure_class), now)
-                        .await;
-                    tracing::error!(
-                        event = "email_identity_alias_maintenance_failed",
-                        error = ?error,
-                        "bounded email identity rewrap/cutover maintenance will retry"
-                    );
-                    tokio::time::sleep(Duration::from_secs(4)).await;
-                }
-            }
-        }
-    })))
-}
-
-fn projection_email_protector(
-    config: &ServerConfig,
-) -> Result<SoftwareProjectionVerifiedEmailProtector, crate::application::ApplicationError> {
-    let protection = &config.projection_email_protection;
-    let retained = protection
-        .retained
-        .iter()
-        .map(|(version, key)| (*version, key.expose_copy()))
-        .collect::<BTreeMap<_, _>>();
-    SoftwareProjectionVerifiedEmailProtector::new(
-        config
-            .instance_id
-            .clone()
-            .ok_or(crate::application::ApplicationError::Integrity)?,
-        protection.active_version,
-        protection.active_key.expose_copy(),
-        retained,
-    )
-}
-
-#[derive(Clone)]
-struct ProjectionEmailMaintenance {
-    authority: PostgresProjectionEmailKeyAuthority,
-    protector: SoftwareProjectionVerifiedEmailProtector,
-    process_id: String,
-    auth_incarnation: Uuid,
-    required_process_ids: Vec<String>,
-    lease: time::Duration,
-    retention: time::Duration,
-    cutover: Option<i32>,
-    retirement: Option<i32>,
-}
-
-impl ProjectionEmailMaintenance {
-    async fn observe(&self) -> Result<(), crate::application::ApplicationError> {
-        self.authority
-            .observe_runtime(
-                &self.process_id,
-                self.auth_incarnation,
-                &self.protector,
-                self.lease,
-            )
-            .await
-    }
-
-    async fn reconcile(&self) -> Result<(), crate::application::ApplicationError> {
-        self.authority
-            .reconcile(
-                &self.required_process_ids,
-                &self.protector,
-                self.cutover,
-                self.retirement,
-                self.retention,
-            )
-            .await
-    }
-
-    async fn maintain(
-        &self,
-    ) -> (
-        Result<(), crate::application::ApplicationError>,
-        Result<u64, crate::application::ApplicationError>,
-    ) {
-        // Rewrap remains independent of lifecycle reconciliation so a blocked retirement cannot
-        // prevent the mutable storage inventory from converging.
-        let reconciliation = self.reconcile().await;
-        let rewrap = self
-            .authority
-            .rewrap_projection_email_batch(&self.protector, 100)
-            .await;
-        (reconciliation, rewrap)
-    }
-}
-
-fn log_projection_email_maintenance(
-    reconciliation: Result<(), crate::application::ApplicationError>,
-    rewrap: Result<u64, crate::application::ApplicationError>,
-) {
-    if reconciliation.is_ok() && rewrap.is_ok() {
-        return;
-    }
-    let unexpected = [reconciliation.as_ref().err(), rewrap.as_ref().err()]
-        .into_iter()
-        .flatten()
-        .any(|error| !matches!(error, crate::application::ApplicationError::Disabled));
-    if unexpected {
-        tracing::warn!(
-            event = "projection_email_key_reconciliation_pending",
-            reconciliation_error = ?reconciliation.as_ref().err(),
-            rewrap_error = ?rewrap.as_ref().err(),
-            "projection verified-email key lifecycle failed closed and will retry"
-        );
-    } else {
-        tracing::debug!(
-            event = "projection_email_key_reconciliation_pending",
-            "projection verified-email key lifecycle is waiting on bounded convergence"
-        );
-    }
-}
-
-async fn reconcile_projection_email_protection(
-    config: &ServerConfig,
-    pools: &DatabasePools,
-    auth_incarnation: Uuid,
-) -> Result<Option<tokio::task::JoinHandle<()>>, crate::application::ApplicationError> {
-    if !config.mode.has_auth() {
-        return Ok(None);
-    }
-    let database = pools
-        .runtime
-        .as_ref()
-        .ok_or(crate::application::ApplicationError::Persistence)?;
-    let lease_seconds = config
-        .publication_lease_ttl
-        .as_secs()
-        .max(5)
-        .saturating_mul(2);
-    let maintenance = ProjectionEmailMaintenance {
-        authority: PostgresProjectionEmailKeyAuthority::new(database.clone()),
-        protector: projection_email_protector(config)?,
-        process_id: config.auth_process_id.clone(),
-        auth_incarnation,
-        required_process_ids: config.required_auth_process_ids.clone(),
-        lease: time::Duration::seconds(
-            i64::try_from(lease_seconds)
-                .map_err(|_| crate::application::ApplicationError::Integrity)?,
-        ),
-        retention: time::Duration::try_from(config.key_propagation_delay)
-            .map_err(|_| crate::application::ApplicationError::Integrity)?,
-        cutover: config.projection_email_protection.cutover_version,
-        retirement: config.projection_email_protection.retire_version,
-    };
-    let first = maintenance.reconcile().await;
-    if first.is_err() && maintenance.cutover.is_none() && maintenance.retirement.is_none() {
-        first?;
-    }
-    maintenance.observe().await?;
-    let (reconciliation, rewrap) = maintenance.maintain().await;
-    log_projection_email_maintenance(reconciliation, rewrap);
-
-    Ok(Some(tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(error) = maintenance.observe().await {
-                tracing::warn!(
-                    event = "projection_email_key_reconciliation_pending",
-                    error = ?error,
-                    "projection verified-email observation failed closed and will retry"
-                );
-                continue;
-            }
-            let (reconciliation, rewrap) = maintenance.maintain().await;
-            log_projection_email_maintenance(reconciliation, rewrap);
-        }
-    })))
-}
-
 fn allows_unsealed_deployment_smtp_bootstrap(
     mode: ProcessMode,
     status: DeploymentSmtpStatus,
@@ -892,7 +448,6 @@ fn allows_unsealed_deployment_smtp_bootstrap(
 async fn reconcile_deployment_smtp(
     config: &ServerConfig,
     pools: &DatabasePools,
-    auth_incarnation: Uuid,
     providers: &ProviderRegistrations,
 ) -> Result<(), crate::application::ApplicationError> {
     if !config.mode.has_auth() {
@@ -902,13 +457,7 @@ async fn reconcile_deployment_smtp(
         .runtime
         .as_ref()
         .ok_or(crate::application::ApplicationError::Persistence)?;
-    let registry = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        config.auth_process_id.clone(),
-        auth_incarnation,
-        config.required_auth_process_ids.clone(),
-        lease_duration_from_config(config)?,
-    );
+    let registry = PostgresPasswordlessEmailRepository::new(database.clone());
     let Some(configured) = config.deployment_smtp.as_ref() else {
         return registry.assert_no_active_deployment_smtp().await;
     };
@@ -996,145 +545,6 @@ async fn reconcile_deployment_smtp(
     registry
         .reconcile_deployment_smtp(&generation, time::OffsetDateTime::now_utc())
         .await
-}
-
-async fn reconcile_project_smtp_readiness(
-    config: &ServerConfig,
-    pools: &DatabasePools,
-    auth_incarnation: Uuid,
-    providers: &ProviderRegistrations,
-) -> Result<Option<tokio::task::JoinHandle<()>>, crate::application::ApplicationError> {
-    if !config.mode.has_auth() {
-        return Ok(None);
-    }
-    let database = pools
-        .runtime
-        .as_ref()
-        .ok_or(crate::application::ApplicationError::Persistence)?;
-    let resolver: Arc<dyn SmtpCredentialResolver> =
-        Arc::new(PostgresProtectedRuntimeCustody::from_registrations(
-            database.clone(),
-            config
-                .instance_id
-                .as_deref()
-                .ok_or(crate::application::ApplicationError::Integrity)?,
-            providers,
-        )?);
-    let repository = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        config.auth_process_id.clone(),
-        auth_incarnation,
-        config.required_auth_process_ids.clone(),
-        lease_duration_from_config(config)?,
-    );
-    reconcile_project_smtp_readiness_restore(
-        &repository,
-        resolver.as_ref(),
-        time::OffsetDateTime::now_utc(),
-    )
-    .await?;
-    Ok(Some(tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Err(error) = reconcile_project_smtp_readiness_batch(
-                &repository,
-                resolver.as_ref(),
-                time::OffsetDateTime::now_utc(),
-            )
-            .await
-            {
-                tracing::warn!(
-                    event = "project_smtp_readiness_reconciliation_failed",
-                    error = ?error,
-                    "bounded Project SMTP readiness reconciliation will retry"
-                );
-            }
-        }
-    })))
-}
-
-pub(crate) async fn reconcile_project_smtp_readiness_restore(
-    repository: &PostgresPasswordlessEmailRepository,
-    resolver: &dyn SmtpCredentialResolver,
-    restore_epoch: time::OffsetDateTime,
-) -> Result<usize, crate::application::ApplicationError> {
-    // Stale ready observations are removed from authority before page one. Process loss at any
-    // boundary is therefore fail-closed, and one fixed epoch makes each successfully recorded
-    // row leave the bounded inventory until all eligible generations have been checked.
-    repository
-        .fail_close_project_smtp_restore_inventory(restore_epoch)
-        .await?;
-    let mut total = 0_usize;
-    loop {
-        let observed = reconcile_project_smtp_readiness_batch_before(
-            repository,
-            resolver,
-            restore_epoch,
-            restore_epoch,
-        )
-        .await?;
-        total = total.saturating_add(observed);
-        if observed == 0 {
-            return Ok(total);
-        }
-    }
-}
-
-pub(crate) async fn reconcile_project_smtp_readiness_batch(
-    repository: &PostgresPasswordlessEmailRepository,
-    resolver: &dyn SmtpCredentialResolver,
-    now: time::OffsetDateTime,
-) -> Result<(), crate::application::ApplicationError> {
-    reconcile_project_smtp_readiness_batch_before(repository, resolver, now, now)
-        .await
-        .map(|_| ())
-}
-
-async fn reconcile_project_smtp_readiness_batch_before(
-    repository: &PostgresPasswordlessEmailRepository,
-    resolver: &dyn SmtpCredentialResolver,
-    now: time::OffsetDateTime,
-    restore_epoch: time::OffsetDateTime,
-) -> Result<usize, crate::application::ApplicationError> {
-    let candidates = repository
-        .project_smtp_readiness_candidates_before(now, restore_epoch, 100)
-        .await?;
-    let observed = candidates.len();
-    let mut ready = 0_u32;
-    let mut unavailable = 0_u32;
-    for candidate in candidates {
-        let readable = resolver
-            .resolve_checked(
-                candidate.credential_material_id,
-                &candidate.safe_fingerprint,
-            )
-            .await
-            .is_ok();
-        repository
-            .record_project_smtp_readiness(&candidate, readable, now)
-            .await?;
-        if readable {
-            ready = ready.saturating_add(1);
-        } else {
-            unavailable = unavailable.saturating_add(1);
-        }
-    }
-    if observed == 0 {
-        tracing::debug!(
-            event = "project_smtp_readiness_reconciled",
-            ready,
-            unavailable,
-            "bounded Project SMTP readiness inventory completed without candidates"
-        );
-    } else {
-        tracing::info!(
-            event = "project_smtp_readiness_reconciled",
-            ready,
-            unavailable,
-            "bounded Project SMTP readiness inventory completed"
-        );
-    }
-    Ok(observed)
 }
 
 fn log_listener_ready(plane: &'static str, listener: &ListenerConfig, open_path: &str) {
@@ -1237,7 +647,7 @@ async fn serve_until_shutdown(
     let _ = shutdown_sender.send(true);
     tracing::info!(
         event = "server_draining",
-        "OwlAuth stopped business admission"
+        "OwlAuth stopped accepting business requests"
     );
 
     let runtime_worker_aborts = runtime_workers
@@ -1507,16 +917,6 @@ impl ConnectionLimitedListener {
     }
 }
 
-impl
-    axum::extract::connect_info::Connected<
-        axum::serve::IncomingStream<'_, ConnectionLimitedListener>,
-    > for DirectPeer
-{
-    fn connect_info(stream: axum::serve::IncomingStream<'_, ConnectionLimitedListener>) -> Self {
-        Self(*stream.remote_addr())
-    }
-}
-
 impl Listener for ConnectionLimitedListener {
     type Io = ConnectionPermitStream;
     type Addr = std::net::SocketAddr;
@@ -1597,7 +997,7 @@ fn spawn_selected(
     servers.spawn(async move {
         axum::serve(
             ConnectionLimitedListener::new(listener, max_connections),
-            router.into_make_service_with_connect_info::<DirectPeer>(),
+            router,
         )
         .with_graceful_shutdown(async move {
             while !*shutdown.borrow() {
@@ -1665,17 +1065,6 @@ mod tests {
                 status
             ));
         }
-    }
-
-    #[test]
-    fn control_only_never_runs_runtime_email_protection_reconciliation() {
-        assert!(!should_reconcile_email_protection(
-            ProcessMode::Control,
-            true
-        ));
-        assert!(!should_reconcile_email_protection(ProcessMode::Auth, false));
-        assert!(should_reconcile_email_protection(ProcessMode::Auth, true));
-        assert!(should_reconcile_email_protection(ProcessMode::All, true));
     }
 
     #[test]

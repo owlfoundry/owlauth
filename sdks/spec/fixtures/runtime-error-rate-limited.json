@@ -12,7 +12,7 @@
       "encoding": "json",
       "value": {
         "code": "rate_limited",
-        "message": "Synthetic admission rejection.",
+        "message": "Synthetic SaaS ingress rejection.",
         "request_id": "req_conformance_rate_limited"
       }
     }

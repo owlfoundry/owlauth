@@ -8,6 +8,8 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+const WORKER_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 use crate::{
     adapters::{
         github::GithubOAuthProviderClient,
@@ -16,6 +18,7 @@ use crate::{
             DatabasePools,
             authentication::PostgresAuthenticationRepository,
             control_lifecycle::PostgresControlLifecycleRepository,
+            control_overview::PostgresControlOverviewRepository,
             email::PostgresPasswordlessEmailRepository,
             email_control::PostgresEmailControlRepository,
             identity_mutation::{
@@ -35,13 +38,11 @@ use crate::{
                 RuntimeServerEmailLookupDigester,
             },
             server_key::PostgresServerKeyRepository,
-            server_readiness::PostgresServerDigestReadinessAdapter,
             session_authority::PostgresSessionAuthorityRepository,
             webhook::PostgresWebhookRepository,
         },
         protected_runtime::PostgresProtectedRuntimeCustody,
         provider_registry::ProviderClientRegistry,
-        redis_admission::RedisAdmissionCounter,
         runtime_security::{
             ManagedCredentialKeyMaterial, RuntimeKeyMaterial, SoftwareDurableEmailAddressReader,
             SoftwareIdentityMutationCandidateVerifier,
@@ -58,7 +59,7 @@ use crate::{
         webhook_http::SafeWebhookTransport,
     },
     application::{
-        self, AdmissionService, ConfigurationSecretSealers, ControlLifecycleService,
+        self, ConfigurationSecretSealers, ControlLifecycleService, ControlOverviewService,
         DurableEmailAddressReader, EmailControlService, EmailIdentityLookupDigester,
         IdentityMutationControlService, IdentityMutationProviderCapabilities,
         IdentityMutationRuntimeService, MailWorker, ManagedConnectionRepository,
@@ -67,15 +68,13 @@ use crate::{
         ManagedReauthorizationTargetVerifier, ProjectionVerifiedEmailProtector,
         ProviderCallbackOwnerResolver, ProviderOnboardingService, ProvisioningInfrastructure,
         ProvisioningService, ReadinessService, RuntimeAuthService, RuntimeProtector,
-        ServerApiService, ServerDigestReadinessService, ServerKeyLifecycleService,
-        ServerKeyVerifier, WebhookControlService, WebhookWorker,
+        ServerApiService, ServerKeyLifecycleService, WebhookControlService, WebhookWorker,
     },
     config::ServerConfig,
     providers::ProviderRegistrations,
 };
 
 pub(crate) struct RuntimeHttpCapabilities {
-    pub(crate) admission: Arc<AdmissionService>,
     pub(crate) readiness: Option<Arc<ReadinessService>>,
     pub(crate) auth: Option<Arc<RuntimeAuthService>>,
     pub(crate) callback_owners: Option<Arc<dyn ProviderCallbackOwnerResolver>>,
@@ -86,15 +85,14 @@ pub(crate) struct RuntimeHttpCapabilities {
 }
 
 pub(crate) struct ServerHttpCapabilities {
-    pub(crate) admission: Arc<AdmissionService>,
     pub(crate) api: Option<Arc<ServerApiService>>,
-    pub(crate) readiness: Option<Arc<ServerDigestReadinessService>>,
 }
 
 pub(crate) struct ControlHttpCapabilities {
     pub(crate) clock: Arc<dyn application::Clock>,
     pub(crate) provisioning: Option<Arc<ProvisioningService>>,
     pub(crate) lifecycle: Option<Arc<ControlLifecycleService>>,
+    pub(crate) overview: Option<Arc<ControlOverviewService>>,
     pub(crate) email_control: Option<Arc<EmailControlService>>,
     pub(crate) managed_connections: Option<Arc<dyn ManagedConnectionRepository>>,
     pub(crate) managed_reauthorization: Option<Arc<ManagedReauthorizationControlService>>,
@@ -117,7 +115,7 @@ pub(crate) struct HttpCapabilities {
 pub(crate) fn build_http_capabilities(
     config: &ServerConfig,
     pools: Option<&DatabasePools>,
-    auth_incarnation: Uuid,
+    worker_incarnation: Uuid,
     custody_providers: &ProviderRegistrations,
 ) -> HttpCapabilities {
     let server_key_ring = (config.mode.has_auth() || config.mode.has_control())
@@ -139,7 +137,7 @@ pub(crate) fn build_http_capabilities(
                     build_runtime_auth_service(
                         database,
                         config,
-                        auth_incarnation,
+                        worker_incarnation,
                         custody_providers,
                         runtime_provider_clients
                             .as_ref()
@@ -149,16 +147,9 @@ pub(crate) fn build_http_capabilities(
             })
             .flatten();
         RuntimeHttpCapabilities {
-            admission: build_runtime_admission(config),
             readiness: database.clone().map(|database| {
                 Arc::new(ReadinessService::new(Arc::new(
-                    PostgresReadinessAdapter::new(
-                        database,
-                        config.auth_process_id.clone(),
-                        auth_incarnation,
-                        config.required_auth_process_ids.clone(),
-                        config.publication_lease_ttl,
-                    ),
+                    PostgresReadinessAdapter::new(database),
                 )))
             }),
             auth: runtime_components
@@ -178,7 +169,6 @@ pub(crate) fn build_http_capabilities(
                 build_identity_mutation_runtime_service(
                     database,
                     config,
-                    auth_incarnation,
                     custody_providers,
                     runtime_provider_clients
                         .as_ref()
@@ -186,7 +176,7 @@ pub(crate) fn build_http_capabilities(
                 )
             }),
             webhook_delivery: database.map(|database| {
-                build_webhook_worker(database, config, auth_incarnation, custody_providers)
+                build_webhook_worker(database, config, worker_incarnation, custody_providers)
             }),
         }
     });
@@ -199,30 +189,11 @@ pub(crate) fn build_http_capabilities(
                 .verifier(),
         );
         let database = pools.and_then(|pools| pools.server.clone());
-        let readiness = database.clone().map(|database| {
-            Arc::new(
-                ServerDigestReadinessService::new(
-                    Arc::new(PostgresServerDigestReadinessAdapter::new(database)),
-                    config.auth_process_id.clone(),
-                    auth_incarnation,
-                    key_verifier.readable_versions(),
-                    config.required_auth_process_ids.clone(),
-                    config.server_digest_readiness_lease_ttl,
-                )
-                .expect("validated Server digest readiness configuration"),
-            )
-        });
         let api = database.map(|database| {
             let (source_reader, projection_protector) =
                 build_projection_materializer_capabilities(config);
-            let repository = PostgresServerApiRepository::new(
-                database,
-                config.auth_process_id.clone(),
-                auth_incarnation,
-                source_reader,
-                projection_protector,
-            )
-            .expect("validated Auth process identity");
+            let repository =
+                PostgresServerApiRepository::new(database, source_reader, projection_protector);
             Arc::new(ServerApiService::new(
                 Arc::new(repository),
                 key_verifier.clone(),
@@ -231,11 +202,7 @@ pub(crate) fn build_http_capabilities(
                 Arc::new(SystemClock),
             ))
         });
-        ServerHttpCapabilities {
-            admission: build_server_admission(config),
-            api,
-            readiness,
-        }
+        ServerHttpCapabilities { api }
     });
 
     let control = config.mode.has_control().then(|| {
@@ -254,6 +221,11 @@ pub(crate) fn build_http_capabilities(
                     build_server_email_lookup_digester(config),
                     Arc::new(SystemClock),
                 ))
+            }),
+            overview: database.clone().map(|database| {
+                Arc::new(ControlOverviewService::new(Arc::new(
+                    PostgresControlOverviewRepository::new(database),
+                )))
             }),
             email_control: database
                 .clone()
@@ -288,13 +260,7 @@ pub(crate) fn build_http_capabilities(
             }),
             server_keys: database.map(|database| {
                 Arc::new(ServerKeyLifecycleService::new(
-                    Arc::new(
-                        PostgresServerKeyRepository::new(
-                            database,
-                            config.required_auth_process_ids.clone(),
-                        )
-                        .expect("validated Server verifier roster"),
-                    ),
+                    Arc::new(PostgresServerKeyRepository::new(database)),
                     Arc::new(
                         server_key_ring
                             .as_ref()
@@ -406,7 +372,6 @@ fn build_provisioning_service(
     let adapter = PostgresProvisioningAdapter::new_protected(
         database,
         config.auth.external_base.clone(),
-        config.required_auth_process_ids.clone(),
         config.key_propagation_delay,
         config.signing_verification_retention,
         config
@@ -439,7 +404,6 @@ fn build_email_control_service(
         .expect("validated Control secret provider selection");
     let repository = PostgresEmailControlRepository::new_protected(
         database,
-        config.required_auth_process_ids.clone(),
         config
             .instance_id
             .as_deref()
@@ -491,7 +455,7 @@ fn build_webhook_control_service(
 fn build_webhook_worker(
     database: DatabaseConnection,
     config: &ServerConfig,
-    auth_incarnation: Uuid,
+    worker_incarnation: Uuid,
     providers: &ProviderRegistrations,
 ) -> Arc<WebhookWorker> {
     let protected_custody = PostgresProtectedRuntimeCustody::from_registrations(
@@ -523,9 +487,9 @@ fn build_webhook_worker(
                 config.webhook_extra_root_cert_der.as_deref(),
             )),
             Arc::new(SystemClock),
-            config.auth_process_id.clone(),
-            auth_incarnation,
-            config.publication_lease_ttl,
+            format!("runtime-worker-{worker_incarnation}"),
+            worker_incarnation,
+            WORKER_LEASE_TTL,
         )
         .expect("validated webhook delivery worker configuration"),
     )
@@ -537,52 +501,6 @@ fn forbidden_smtp_listener_destinations(config: &ServerConfig) -> ForbiddenSmtpD
         forbidden.insert_listener_bind(bind);
     }
     forbidden
-}
-
-fn build_runtime_admission(config: &ServerConfig) -> Arc<AdmissionService> {
-    let admission = config
-        .admission
-        .as_ref()
-        .expect("validated Runtime configuration has admission settings");
-    build_admission(
-        admission,
-        admission
-            .auth_maximum_processes
-            .expect("validated Auth process bound")
-            .get(),
-    )
-}
-
-fn build_server_admission(config: &ServerConfig) -> Arc<AdmissionService> {
-    let admission = config
-        .admission
-        .as_ref()
-        .expect("validated Auth configuration has admission settings");
-    build_admission(
-        admission,
-        admission
-            .auth_maximum_processes
-            .expect("validated Auth process bound")
-            .get(),
-    )
-}
-
-fn build_admission(
-    admission: &crate::config::AdmissionConfig,
-    maximum_processes: u32,
-) -> Arc<AdmissionService> {
-    let distributed = admission.redis_url.as_ref().map(|url| {
-        Arc::new(
-            RedisAdmissionCounter::new(url.expose(), admission.redis_timeout)
-                .expect("validated Redis admission URL"),
-        ) as Arc<dyn application::DistributedAdmissionCounter>
-    });
-    Arc::new(AdmissionService::new(
-        admission.namespace.clone(),
-        admission.digest_key.expose_copy(),
-        maximum_processes,
-        distributed,
-    ))
 }
 
 fn build_identity_projection_materializer(
@@ -766,7 +684,6 @@ fn build_identity_mutation_control_service(
             source_reader,
             projection_protector,
         )),
-        config.required_auth_process_ids.clone(),
     ));
     Arc::new(
         IdentityMutationControlService::new(
@@ -837,7 +754,6 @@ fn build_control_preflight_client(config: &ServerConfig) -> RestrictedOidcProvid
 fn build_identity_mutation_runtime_service(
     database: DatabaseConnection,
     config: &ServerConfig,
-    auth_incarnation: Uuid,
     custody_providers: &ProviderRegistrations,
     provider_clients: &RuntimeProviderClients,
 ) -> Arc<IdentityMutationRuntimeService> {
@@ -876,12 +792,7 @@ fn build_identity_mutation_runtime_service(
     .expect("validated identity mutation protected custody");
     let provider = provider_clients.registry.clone();
     Arc::new(IdentityMutationRuntimeService::new(
-        Arc::new(PostgresRuntimeIdentityMutationRepository::new(
-            database,
-            config.auth_process_id.clone(),
-            auth_incarnation,
-            config.required_auth_process_ids.clone(),
-        )),
+        Arc::new(PostgresRuntimeIdentityMutationRepository::new(database)),
         protector.clone(),
         target,
         evidence,
@@ -898,12 +809,12 @@ fn build_identity_mutation_runtime_service(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "Runtime composition keeps one process incarnation and physically distinct short-term, email identity, projection email, managed target, and managed credential custody visible"
+    reason = "Runtime composition keeps physically distinct short-term, email identity, projection email, managed target, and managed credential custody visible"
 )]
 fn build_runtime_auth_service(
     database: DatabaseConnection,
     config: &ServerConfig,
-    auth_incarnation: Uuid,
+    worker_incarnation: Uuid,
     custody_providers: &ProviderRegistrations,
     provider_clients: &RuntimeProviderClients,
 ) -> (
@@ -1003,24 +914,7 @@ fn build_runtime_auth_service(
     .expect("validated protected Runtime custody");
     let secret_resolver = Arc::new(protected_custody.clone());
     let smtp_secret_resolver = Arc::new(protected_custody);
-    let email = Arc::new(
-        PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-            database.clone(),
-            config.auth_process_id.clone(),
-            auth_incarnation,
-            config.required_auth_process_ids.clone(),
-            time::Duration::seconds(
-                i64::try_from(
-                    config
-                        .publication_lease_ttl
-                        .as_secs()
-                        .max(5)
-                        .saturating_mul(2),
-                )
-                .expect("validated Runtime publication lease duration"),
-            ),
-        ),
-    );
+    let email = Arc::new(PostgresPasswordlessEmailRepository::new(database.clone()));
     let mail_worker = Arc::new(
         MailWorker::new(
             email.clone(),
@@ -1034,7 +928,7 @@ fn build_runtime_auth_service(
             )),
             smtp_secret_resolver,
             protector.clone(),
-            config.auth_process_id.clone(),
+            format!("runtime-worker-{worker_incarnation}"),
         )
         .expect("validated mail worker configuration"),
     );
@@ -1089,30 +983,19 @@ fn build_runtime_auth_service(
         .expect("validated managed reauthorization capability"),
     );
     let auth = Arc::new(RuntimeAuthService::new(
-        Arc::new(PostgresAuthenticationRepository::new_with_runtime_identity(
-            database.clone(),
-            config.auth_process_id.clone(),
-            auth_incarnation,
-        )),
+        Arc::new(PostgresAuthenticationRepository::new(database.clone())),
         Arc::new(
-            PostgresSessionAuthorityRepository::new_with_runtime_identity_and_managed_protector(
+            PostgresSessionAuthorityRepository::new_with_managed_protector(
                 database.clone(),
-                config.auth_process_id.clone(),
-                auth_incarnation,
                 managed_protector,
                 protector.clone(),
                 projection_materializer.clone(),
             ),
         ),
-        Arc::new(
-            PostgresRuntimeAuthorityRepository::new_with_runtime_identity_and_projection_materializer(
-                database,
-                config.auth_process_id.clone(),
-                auth_incarnation,
-                config.required_auth_process_ids.clone(),
-                projection_materializer,
-            ),
-        ),
+        Arc::new(PostgresRuntimeAuthorityRepository::new(
+            database,
+            projection_materializer,
+        )),
         email,
         mail_worker,
         protector,

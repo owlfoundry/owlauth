@@ -4,7 +4,7 @@
 
 [`fixtures/`](fixtures/) stores reviewed wire examples; [`conformance/`](conformance/) stores language-neutral behavior cases. Attachments use relative paths, stable names, and an explicit `schemaVersion`.
 
-The schema-version 3 corpus contains synthetic reviewed examples for exact public configuration and JWKS parsing, login start, callback inspection, handoff exchange, atomic credential refresh, current user, both logout forms, response framing, transport ambiguity, Runtime error mapping, retry/action semantics, unknown-code conservatism, and redaction. [`conformance/cases.json`](conformance/cases.json) pins the complete required case-name manifest and binds every required case to a canonical operation identifier, configured context, precondition, request phase, response-received fact, evidence level, fixture envelope, and expected semantic outcome. Removing, renaming, duplicating, or replacing a required case fails every runner.
+The schema-version 3 corpus contains synthetic reviewed examples for exact public configuration and JWKS parsing, login start, callback inspection, handoff exchange, atomic credential refresh, current user, both logout forms, response framing, transport ambiguity, exact and malformed Core `408 request_timeout` handling, Runtime error mapping, retry/action semantics, unknown-code conservatism, and redaction. [`conformance/cases.json`](conformance/cases.json) pins the complete required case-name manifest and binds every required case to a canonical operation identifier, configured context, precondition, request phase, response-received fact, evidence level, fixture envelope, and expected semantic outcome. Removing, renaming, duplicating, or replacing a required case fails every runner.
 
 The canonical flat projection schema is exactly `owlauth.user.v1`. Its `display_name`, `picture_url`, `locale`, and `verified_email` keys are always present and nullable: `null` means that the authoritative Application projection has no admitted value, not that an SDK omitted or failed to parse the field. `verified_email` is non-null only when both Project and Application policy admit it. Handoff, refresh, and current-user carry the same projection semantics and repeat its authoritative `projection_revision` only as matching envelope metadata. SDK parsers reject another schema identifier, missing nullable keys, and unknown projection fields.
 
@@ -39,7 +39,7 @@ Every official SDK loads the same corpus and translates only language binding de
 
 - fail on unknown required fields, missing fixtures, duplicate names, bad references, or unsupported required schema versions;
 - report skipped optional capabilities explicitly;
-- compare semantic Project Auth outcomes rather than incidental formatting;
+- compare semantic Project Auth outcomes rather than incidental formatting, including the read-versus-sensitive mapping for exact and malformed Core timeout envelopes;
 - exercise generated Runtime models plus handwritten transport/lifecycle/error layers where applicable;
 - assert Project/Application context never changes because of fixture data;
 - retain language-specific unit tests for idioms not representable in shared data.
@@ -54,7 +54,7 @@ CI runs package builds, static checks, language-specific unit/contract tests, ge
 
 ### Real-server E2E
 
-Before a package claims a Project Auth capability, CI starts a real `owlauth-server` Runtime with isolated PostgreSQL/Redis/configuration, test keys, one synthetic Project/Application/provider setup, and deterministic non-secret test identities. The official SDK then exercises the claimed flow over real HTTP.
+Before a package claims a Project Auth capability, CI starts a real `owlauth-server` Runtime with isolated PostgreSQL and configuration, test keys, one synthetic Project/Application/provider setup, and deterministic non-secret test identities. The official SDK then exercises the claimed flow over real HTTP.
 
 The eventual cross-language matrix covers, as capabilities ship:
 

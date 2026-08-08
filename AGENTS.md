@@ -20,7 +20,7 @@ Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) for repository boundaries, devel
 
 ## Non-negotiable boundaries
 
-- Auth is the Project Auth endpoint. Its browser-facing Runtime surface and backend-only Server API surface share one listener and process identity but retain separate routers, credentials, CORS/response policy, admission, readiness, roles, serving pools, and pool bounds. Runtime public SDK configuration contains no Server or Control secret; Server API accepts only Project server keys. Control is the separate operator endpoint used by the Console, CLI, and MCP and accepts only the Control operator key.
+- Auth is the Project Auth endpoint. Its browser-facing Runtime surface and backend-only Server API surface share one listener and process identity but retain separate routers, credentials, CORS/response policy, readiness, roles, serving pools, and pool bounds. Runtime public SDK configuration contains no Server or Control secret; Server API accepts only Project server keys. Control is the separate operator endpoint used by the Console, CLI, and MCP and accepts only the Control operator key.
 - Official TypeScript, Python, and Rust SDKs cover Runtime Project Auth only. Server API has a generated OpenAPI document but no official SDK and must never be imported into hosted-web code.
 - Keep Auth and Control listeners independently configurable. Keep Runtime, Server API, and Control internal authority boundaries independently configurable while all three surfaces remain bound to one PostgreSQL server/database authority. The Runtime Hosted Authentication UI and Control Management Console are the only browser surfaces.
 - PostgreSQL is the durable authority. Do not add browser credential persistence, file-store fallbacks, unreviewed secret delivery, or dependencies from CLI/SDKs into the server implementation.
@@ -35,7 +35,7 @@ cp .env.example .env
 make dev
 ```
 
-`make dev-check` performs a non-mutating `.env`, toolchain, Docker, and Compose preflight. `make dev` runs that check, rebuilds embedded Runtime and Control assets, starts PostgreSQL and Redis, runs Auth and Control, and logs directly openable endpoint URLs. Use `make dev-status`, `make dev-logs`, `make dev-postgres`, or `make dev-redis` while debugging and `make dev-down` when finished. `make dev-reset` deletes all local PostgreSQL and Redis data and is intentionally destructive.
+`make dev-check` performs a non-mutating `.env`, toolchain, Docker, and Compose preflight. `make dev` runs that check, rebuilds embedded Runtime and Control assets, starts PostgreSQL, runs Auth and Control, and logs directly openable endpoint URLs. Use `make dev-status`, `make dev-logs`, or `make dev-postgres` while debugging and `make dev-down` when finished. `make dev-reset` deletes all local PostgreSQL data and is intentionally destructive.
 
 Common targets:
 
@@ -74,5 +74,9 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for changelog scopes, SemVer rules, sha
 
 - [`Makefile`](Makefile) — focused development, validation, build, package, docs, and local-service targets
 - [`scripts/`](scripts/) — repository, package, release, installer, SDK, and container checks
-- [`dev/`](dev/README.md) — local PostgreSQL and Redis development services
+- [`dev/`](dev/README.md) — local PostgreSQL development service
 - [`.github/workflows/`](.github/workflows/) — CI, documentation, image, and component release automation
+
+## AnyCap
+
+This project uses [AnyCap](https://anycap.ai) for multimodal capabilities, web search and crawling, file sharing, and static-page hosting. For these tasks, use the installed AnyCap skills and verify availability with `anycap status`. AnyCap evolves rapidly, so check or update its skills when commands or capabilities appear stale; submit `anycap feedback` for service or capability issues.

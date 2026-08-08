@@ -31,7 +31,6 @@ const MAX_APPLICATION_BINDINGS_PER_USER: usize = 64;
 
 use super::{
     audit::append_runtime_audit,
-    auth_incarnation::AuthIncarnationFence,
     authentication::{
         expire_login, is_pkce_s256_challenge, optional_digest_matches, parse_login_status,
         persistence, revalidate_login_owners, validate_digest,
@@ -49,7 +48,6 @@ use super::{
 #[derive(Clone)]
 pub(crate) struct PostgresSessionAuthorityRepository {
     database: DatabaseConnection,
-    auth_incarnation: AuthIncarnationFence,
     managed_protector: Option<Arc<dyn ManagedCredentialProtector>>,
     runtime_protector: Option<Arc<dyn RuntimeProtector>>,
     projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
@@ -60,7 +58,6 @@ impl std::fmt::Debug for PostgresSessionAuthorityRepository {
         formatter
             .debug_struct("PostgresSessionAuthorityRepository")
             .field("database", &self.database)
-            .field("auth_incarnation", &self.auth_incarnation)
             .field("managed_protector", &self.managed_protector.is_some())
             .field("runtime_protector", &self.runtime_protector.is_some())
             .field("projection_materializer", &true)
@@ -76,7 +73,6 @@ impl PostgresSessionAuthorityRepository {
     ) -> Self {
         Self {
             database,
-            auth_incarnation: AuthIncarnationFence::test_default(),
             managed_protector: None,
             runtime_protector: None,
             projection_materializer,
@@ -91,7 +87,6 @@ impl PostgresSessionAuthorityRepository {
     ) -> Self {
         Self {
             database,
-            auth_incarnation: AuthIncarnationFence::test_default(),
             managed_protector: Some(managed_protector),
             runtime_protector: None,
             projection_materializer,
@@ -107,24 +102,20 @@ impl PostgresSessionAuthorityRepository {
     ) -> Self {
         Self {
             database,
-            auth_incarnation: AuthIncarnationFence::test_default(),
             managed_protector: Some(managed_protector),
             runtime_protector: Some(runtime_protector),
             projection_materializer,
         }
     }
 
-    pub(crate) fn new_with_runtime_identity_and_managed_protector(
+    pub(crate) fn new_with_managed_protector(
         database: DatabaseConnection,
-        auth_process_id: String,
-        auth_incarnation: uuid::Uuid,
         managed_protector: Arc<dyn ManagedCredentialProtector>,
         runtime_protector: Arc<dyn RuntimeProtector>,
         projection_materializer: Arc<dyn IdentityProjectionMaterializer>,
     ) -> Self {
         Self {
             database,
-            auth_incarnation: AuthIncarnationFence::new(auth_process_id, auth_incarnation),
             managed_protector: Some(managed_protector),
             runtime_protector: Some(runtime_protector),
             projection_materializer,
@@ -172,7 +163,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         )?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, command.project_id).await?;
         let login = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
@@ -632,7 +622,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .ok_or(ApplicationError::NotFound)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, command.project_id).await?;
         let login = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
@@ -794,7 +783,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         let ticket = handoff_ticket::Entity::find()
             .filter(handoff_ticket::Column::ProjectId.eq(command.project_id))
             .filter(handoff_ticket::Column::ApplicationId.eq(command.application_id))
@@ -995,7 +983,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         }
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, command.project_id).await?;
         let ticket = handoff_ticket::Entity::find()
             .filter(handoff_ticket::Column::ProjectId.eq(command.project_id))
@@ -1425,7 +1412,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, command.project_id).await?;
         let session = application_session::Entity::find_by_id(routed_family.application_session_id)
             .filter(application_session::Column::ProjectId.eq(command.project_id))
@@ -1635,7 +1621,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .ok_or(ApplicationError::NotFound)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, command.project_id).await?;
         let session = application_session::Entity::find_by_id(routed_family.application_session_id)
             .filter(application_session::Column::ProjectId.eq(command.project_id))
@@ -1767,10 +1752,8 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .ok_or(ApplicationError::Integrity)?;
         if projection.verified_email_ciphertext.is_some() {
             super::projection::assert_projection_crypto_authority(
-                &transaction,
                 self.projection_materializer.as_ref(),
-            )
-            .await?;
+            )?;
         }
         let projection_document = super::projection::wire_projection_document(
             &projection,
@@ -1891,7 +1874,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             return Err(ApplicationError::InvalidInput);
         }
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         let abandoned = login_transaction::Entity::find()
             .filter(
                 login_transaction::Column::Status
@@ -1935,7 +1917,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
         command: LogoutApplicationSession,
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, command.project_id).await?;
         let session = application_session::Entity::find_by_id(command.application_session_id)
             .filter(application_session::Column::ProjectId.eq(command.project_id))
@@ -1995,7 +1976,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
     ) -> Result<BrowserLogoutRecord, ApplicationError> {
         validate_digest(&command.preparation)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, command.project_id).await?;
         let owners = lock_logout_owners(
             &transaction,
@@ -2097,7 +2077,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, routed_interaction.project_id).await?;
         let interaction =
             project_browser_logout_interaction::Entity::find_by_id(routed_interaction.id)
@@ -2206,7 +2185,6 @@ impl SessionAuthorityRepository for PostgresSessionAuthorityRepository {
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         lock_project_identity_graph(&transaction, routed_interaction.project_id).await?;
         let interaction =
             project_browser_logout_interaction::Entity::find_by_id(routed_interaction.id)

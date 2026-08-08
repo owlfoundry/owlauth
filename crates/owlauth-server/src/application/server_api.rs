@@ -329,8 +329,8 @@ impl ServerApiService {
         })
     }
 
-    /// Schedules lifecycle-neutral usage telemetry only after authentication and post-authority
-    /// admission have both succeeded. Work is coalesced per key/bucket, bounded to one detached
+    /// Schedules lifecycle-neutral usage telemetry only after authentication succeeds. Work is
+    /// coalesced per key/bucket, bounded to one detached
     /// database operation, and dropped on saturation or timeout.
     pub(crate) fn observe_server_key_usage(&self, principal: &ServerPrincipal) {
         let bucket_seconds = SERVER_KEY_USAGE_BUCKET.whole_seconds();
@@ -736,10 +736,6 @@ mod tests {
     struct UnusedKeyVerifier;
 
     impl ServerKeyVerifier for UnusedKeyVerifier {
-        fn readable_versions(&self) -> std::collections::BTreeSet<i32> {
-            std::collections::BTreeSet::from([1])
-        }
-
         fn digest_candidate(
             &self,
             _project_id: Uuid,

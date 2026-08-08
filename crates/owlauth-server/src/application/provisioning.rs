@@ -101,6 +101,7 @@ pub(crate) struct ProviderRecord {
     pub revision: i64,
     pub managed_profile_enabled: bool,
     pub managed_profile_revision: i64,
+    pub secret_replacement_pending: bool,
     pub assigned_application_ids: Vec<Uuid>,
 }
 
@@ -150,6 +151,22 @@ pub(crate) struct CreateProvider {
     pub idempotency_key: String,
     pub expected_project_revision: i64,
     pub egress_policy_revision: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UpdateProvider {
+    pub display_name: String,
+    pub client_id: String,
+    pub expected_provider_revision: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReplaceProviderSecret {
+    pub display_name: String,
+    pub client_id: String,
+    pub client_secret: Zeroizing<String>,
+    pub idempotency_key: String,
+    pub expected_provider_revision: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,6 +264,15 @@ pub(crate) struct PrepareProvider {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PrepareProviderSecretReplacement {
+    pub display_name: String,
+    pub client_id: String,
+    pub operation_alias: String,
+    pub expected_provider_revision: i64,
+    pub request_digest: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedProvider {
     pub operation_id: Uuid,
     pub provider_id: Uuid,
@@ -317,6 +343,14 @@ pub(crate) struct SealedProtectedMaterial {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ProviderSecretReplacementRecovery {
+    pub operation_alias: String,
+    pub display_name: String,
+    pub client_id: String,
+    pub expected_provider_revision: i64,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ProviderRecovery {
     pub operation_alias: String,
     pub kind: ProviderKind,
@@ -360,6 +394,32 @@ impl UpdateApplication {
     }
 }
 
+impl UpdateProvider {
+    fn normalize(mut self) -> Result<Self, ApplicationError> {
+        self.display_name = DisplayName::parse(self.display_name)?.into_inner();
+        validate_provider_client_id(&self.client_id)?;
+        if self.expected_provider_revision <= 0 {
+            return Err(ApplicationError::InvalidInput);
+        }
+        Ok(self)
+    }
+}
+
+impl ReplaceProviderSecret {
+    fn normalize(mut self) -> Result<Self, ApplicationError> {
+        validate_idempotency_key(&self.idempotency_key)?;
+        self.display_name = DisplayName::parse(self.display_name)?.into_inner();
+        validate_provider_client_id(&self.client_id)?;
+        if self.client_secret.is_empty()
+            || self.client_secret.len() > 4096
+            || self.expected_provider_revision <= 0
+        {
+            return Err(ApplicationError::InvalidInput);
+        }
+        Ok(self)
+    }
+}
+
 impl CreateProvider {
     fn normalize(mut self, allow_http_loopback: bool) -> Result<Self, ApplicationError> {
         validate_idempotency_key(&self.idempotency_key)?;
@@ -375,8 +435,7 @@ impl CreateProvider {
         {
             return Err(ApplicationError::InvalidInput);
         }
-        if self.client_id.is_empty()
-            || self.client_id.len() > 512
+        if validate_provider_client_id(&self.client_id).is_err()
             || self.client_secret.is_empty()
             || self.client_secret.len() > 4096
         {
@@ -384,6 +443,13 @@ impl CreateProvider {
         }
         Ok(self)
     }
+}
+
+fn validate_provider_client_id(value: &str) -> Result<(), ApplicationError> {
+    if value.is_empty() || value.len() > 512 {
+        return Err(ApplicationError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn normalize_owner(value: Option<String>) -> Result<Option<String>, ApplicationError> {
@@ -630,6 +696,26 @@ pub(crate) trait ProviderProvisioningPort: Send + Sync {
         project_id: Uuid,
         provider_id: Uuid,
     ) -> Result<ProviderRecovery, ApplicationError>;
+    async fn prepare_provider_secret_replacement(
+        &self,
+        project_id: Uuid,
+        provider_id: Uuid,
+        command: PrepareProviderSecretReplacement,
+    ) -> Result<PreparedProvider, ApplicationError>;
+    async fn provider_secret_replacement_recovery(
+        &self,
+        project_id: Uuid,
+        provider_id: Uuid,
+        expected_provider_revision: i64,
+    ) -> Result<ProviderSecretReplacementRecovery, ApplicationError>;
+    async fn abandon_provider_secret_replacement(
+        &self,
+        project_id: Uuid,
+        provider_id: Uuid,
+        expected_provider_revision: i64,
+        correlation_id: Uuid,
+        abandoned_at: OffsetDateTime,
+    ) -> Result<ProviderRecord, ApplicationError>;
     async fn prepared_provider_material(
         &self,
         project_id: Uuid,
@@ -644,6 +730,15 @@ pub(crate) trait ProviderProvisioningPort: Send + Sync {
         correlation_id: Uuid,
         finalized_at: OffsetDateTime,
     ) -> Result<ProviderRecord, ApplicationError>;
+    async fn finalize_provider_secret_replacement(
+        &self,
+        project_id: Uuid,
+        prepared: &PreparedProvider,
+        expected_provider_revision: i64,
+        material: SealedProtectedMaterial,
+        correlation_id: Uuid,
+        finalized_at: OffsetDateTime,
+    ) -> Result<ProviderRecord, ApplicationError>;
     async fn get_provider(
         &self,
         project_id: Uuid,
@@ -653,6 +748,13 @@ pub(crate) trait ProviderProvisioningPort: Send + Sync {
         &self,
         project_id: Uuid,
     ) -> Result<Vec<ProviderRecord>, ApplicationError>;
+    async fn update_provider(
+        &self,
+        project_id: Uuid,
+        provider_id: Uuid,
+        command: UpdateProvider,
+        correlation_id: Uuid,
+    ) -> Result<ProviderRecord, ApplicationError>;
     async fn assign_provider(
         &self,
         project_id: Uuid,
@@ -888,5 +990,49 @@ mod tests {
             validate_provider_issuer("http://192.0.2.1:8080/", true),
             Err(ApplicationError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn provider_edit_commands_validate_mutable_fields_and_fences() {
+        assert!(
+            UpdateProvider {
+                display_name: "Workforce Login".to_owned(),
+                client_id: "client-v2".to_owned(),
+                expected_provider_revision: 4,
+            }
+            .normalize()
+            .is_ok()
+        );
+        assert!(matches!(
+            UpdateProvider {
+                display_name: "Workforce Login".to_owned(),
+                client_id: String::new(),
+                expected_provider_revision: 4,
+            }
+            .normalize(),
+            Err(ApplicationError::InvalidInput)
+        ));
+        assert!(
+            ReplaceProviderSecret {
+                display_name: "Workforce Login".to_owned(),
+                client_id: "client-v2".to_owned(),
+                client_secret: Zeroizing::new("replacement-secret".to_owned()),
+                idempotency_key: "provider-replacement-12345678".to_owned(),
+                expected_provider_revision: 4,
+            }
+            .normalize()
+            .is_ok()
+        );
+        assert!(matches!(
+            ReplaceProviderSecret {
+                display_name: "Workforce Login".to_owned(),
+                client_id: "client-v2".to_owned(),
+                client_secret: Zeroizing::new(String::new()),
+                idempotency_key: "provider-replacement-12345678".to_owned(),
+                expected_provider_revision: 4,
+            }
+            .normalize(),
+            Err(ApplicationError::InvalidInput)
+        ));
     }
 }

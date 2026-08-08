@@ -25,9 +25,7 @@ def policy(*, operations: tuple[str, ...] = ("claimed",)) -> Any:
         normalizer_version=1,
         runtime_operations=operations,
         allowed_shared_operation_ids=frozenset({"get_liveness", "get_readiness"}),
-        forbidden_security_schemes=frozenset(
-            {"operator_api_key", "project_server_key"}
-        ),
+        forbidden_security_schemes=frozenset({"operator_api_key", "project_server_key"}),
     )
 
 
@@ -40,9 +38,7 @@ def operation(operation_id: str, schema: str = "ClaimedResponse") -> dict[str, A
             "200": {
                 "description": "ignored prose",
                 "content": {
-                    "application/json": {
-                        "schema": {"$ref": f"#/components/schemas/{schema}"}
-                    }
+                    "application/json": {"schema": {"$ref": f"#/components/schemas/{schema}"}}
                 },
             }
         },
@@ -131,9 +127,7 @@ def test_literal_json_keywords_are_opaque_and_dependency_names_are_preserved() -
     schema["properties"]["literal"] = {
         "const": {"description": "wire-value", "x-field": 1, "$ref": "literal-not-a-reference"}
     }
-    schema["properties"]["choice"] = {
-        "enum": [{"title": "wire-value", "$ref": "also-literal"}]
-    }
+    schema["properties"]["choice"] = {"enum": [{"title": "wire-value", "$ref": "also-literal"}]}
     schema["properties"]["defaulted"] = {
         "type": "object",
         "default": {"description": "wire-default", "x-field": 2},
@@ -250,6 +244,18 @@ def test_same_http_operation_with_different_ids_fails() -> None:
 def test_allowed_shared_operation_identity_and_contract_must_match() -> None:
     runtime = document(claimed=True)
     control = document(claimed=False)
+    runtime["paths"]["/health/live"]["get"]["responses"]["408"] = {
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RuntimeError"}}}
+    }
+    control["paths"]["/health/live"]["get"]["responses"]["408"] = {
+        "content": {
+            "application/problem+json": {"schema": {"$ref": "#/components/schemas/ProblemDetails"}}
+        }
+    }
+    sdk_contract.normalized_surface(runtime, control, policy())
+
+    runtime = document(claimed=True)
+    control = document(claimed=False)
     control["paths"]["/health/live"]["get"]["responses"] = {"204": {}}
     assert_contract_error(
         lambda: sdk_contract.normalized_surface(runtime, control, policy()),
@@ -301,12 +307,8 @@ def test_claimed_control_overlap_and_management_security_fail() -> None:
         schema_version=1,
         normalizer_version=1,
         runtime_operations=("claimed",),
-        allowed_shared_operation_ids=frozenset(
-            {"get_liveness", "get_readiness", "claimed"}
-        ),
-        forbidden_security_schemes=frozenset(
-            {"operator_api_key", "project_server_key"}
-        ),
+        allowed_shared_operation_ids=frozenset({"get_liveness", "get_readiness", "claimed"}),
+        forbidden_security_schemes=frozenset({"operator_api_key", "project_server_key"}),
     )
     assert_contract_error(
         lambda: sdk_contract.normalized_surface(runtime, control, overlap_policy),

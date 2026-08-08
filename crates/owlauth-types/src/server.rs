@@ -61,7 +61,7 @@ pub enum ServerErrorCode {
     InvalidCredential,
     NotFound,
     Conflict,
-    RateLimited,
+    RequestTimeout,
     TemporarilyUnavailable,
     InternalError,
 }
@@ -273,8 +273,7 @@ pub enum ProjectTokenIntrospectionResponse {
         (status = 200, body = ServerUserList),
         (status = 400, body = ServerError),
         (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ServerError)
+                (status = 503, body = ServerError)
     ),
     security(("project_server_key" = []))
 )]
@@ -290,8 +289,7 @@ pub fn list_project_users() {}
         (status = 200, body = LookupServerUserResponse),
         (status = 400, body = ServerError),
         (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ServerError)
+                (status = 503, body = ServerError)
     ),
     security(("project_server_key" = []))
 )]
@@ -310,8 +308,7 @@ pub fn lookup_project_user() {}
         (status = 400, body = ServerError),
         (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
         (status = 404, body = ServerError),
-        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ServerError)
+                (status = 503, body = ServerError)
     ),
     security(("project_server_key" = []))
 )]
@@ -332,8 +329,7 @@ pub fn get_project_user() {}
         (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
         (status = 404, body = ServerError),
         (status = 409, body = ServerError),
-        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ServerError)
+                (status = 503, body = ServerError)
     ),
     security(("project_server_key" = []))
 )]
@@ -349,8 +345,7 @@ pub fn get_application_user_projection() {}
         (status = 200, body = ProjectTokenIntrospectionResponse),
         (status = 400, body = ServerError),
         (status = 401, description = "Missing or invalid Project server key", body = ServerError, headers(("WWW-Authenticate" = String, description = "Required Bearer authentication challenge"))),
-        (status = 429, body = ServerError, headers(("Retry-After" = u64, description = "Required delay in whole seconds before retrying"))),
-        (status = 503, body = ServerError)
+                (status = 503, body = ServerError)
     ),
     security(("project_server_key" = []))
 )]
@@ -408,7 +403,15 @@ impl Modify for ServerSecurity {
 /// Generates the complete Server-plane `OpenAPI` document.
 #[must_use]
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    ServerApiDoc::openapi()
+    let mut document = ServerApiDoc::openapi();
+    crate::add_response_to_operations(&mut document, "408", |_| {
+        crate::json_error_response(
+            "The request exceeded the Server listener time budget",
+            "ServerError",
+            "application/json",
+        )
+    });
+    document
 }
 
 #[cfg(test)]

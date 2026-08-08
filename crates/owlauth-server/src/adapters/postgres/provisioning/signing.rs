@@ -13,9 +13,8 @@ use super::{
     finalize_pending_material, find_signing_key, generated_id, insert_audit,
     insert_key_state_event, json, key_provisioning_operation, locked_project, parse_signing_state,
     persistence, prepared_signing_key, project, project_key_ring, project_signing_key,
-    protected_material, provider_error_class_name, retry_classification_name,
-    runtime_publication_lease, signing_key_record, signing_public_key_from_jwk,
-    validate_protected_signing_jwk, validate_signing_operation,
+    protected_material, provider_error_class_name, retry_classification_name, signing_key_record,
+    signing_public_key_from_jwk, validate_protected_signing_jwk, validate_signing_operation,
 };
 
 async fn claim_maintenance_ids(
@@ -988,7 +987,7 @@ impl PostgresProvisioningAdapter {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "activation validates publication leases and rotates the key ring atomically"
+        reason = "activation rotates the key ring and preserves verification overlap atomically"
     )]
     async fn activate_signing_key_if_ready(
         &self,
@@ -999,43 +998,6 @@ impl PostgresProvisioningAdapter {
     ) -> Result<SigningKeyRecord, ApplicationError> {
         let candidate = find_signing_key(&self.database, project_id, key_id).await?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        // Match Runtime's global lock order: exact incarnation rows are always acquired before
-        // Project/ring/publication rows. Holding these shared locks through activation also makes
-        // predecessor leases atomically unusable when a replacement startup claims the ID.
-        let current_incarnations = transaction
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT current.process_id,current.process_incarnation
-                 FROM auth_process_incarnations current
-                 WHERE current.process_id IN (
-                   SELECT required.process_id
-                   FROM jsonb_array_elements_text($1::jsonb) required(process_id)
-                   UNION
-                   SELECT lease.process_id FROM runtime_publication_leases lease
-                   WHERE lease.project_id=$2 AND lease.ring_id=$3
-                     AND lease.expires_at>transaction_timestamp())
-                 ORDER BY current.process_id LIMIT 65 FOR SHARE OF current",
-                vec![
-                    serde_json::json!(self.required_auth_process_ids).into(),
-                    project_id.into(),
-                    candidate.ring_id.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?
-            .into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get::<String>("", "process_id")
-                        .map_err(persistence)?,
-                    row.try_get::<Uuid>("", "process_incarnation")
-                        .map_err(persistence)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, ApplicationError>>()?;
-        if current_incarnations.len() > 64 {
-            return Err(ApplicationError::Integrity);
-        }
         active_project(&transaction, project_id).await?;
         let ring = project_key_ring::Entity::find_by_id(candidate.ring_id)
             .filter(project_key_ring::Column::ProjectId.eq(project_id))
@@ -1061,41 +1023,6 @@ impl PostgresProvisioningAdapter {
             return Err(ApplicationError::InvalidTransition);
         }
         let now = database_now(&transaction).await?;
-        if self.required_auth_process_ids.is_empty() {
-            return Err(ApplicationError::PublicationPending);
-        }
-        let minimum_observation = now - self.propagation_delay;
-        let current_leases = runtime_publication_lease::Entity::find()
-            .filter(runtime_publication_lease::Column::ProjectId.eq(project_id))
-            .filter(runtime_publication_lease::Column::RingId.eq(ring.id))
-            .filter(runtime_publication_lease::Column::ExpiresAt.gt(now))
-            .lock_shared()
-            .all(&transaction)
-            .await
-            .map_err(persistence)?;
-        let required_roster_present = self.required_auth_process_ids.iter().all(|process_id| {
-            current_incarnations
-                .iter()
-                .find(|(current_id, _)| current_id == process_id)
-                .is_some_and(|(_, incarnation)| {
-                    current_leases.iter().any(|lease| {
-                        &lease.process_id == process_id && lease.process_incarnation == *incarnation
-                    })
-                })
-        });
-        let every_live_process_qualified = current_leases.iter().all(|lease| {
-            current_incarnations
-                .iter()
-                .any(|(process_id, incarnation)| {
-                    process_id == &lease.process_id && *incarnation == lease.process_incarnation
-                })
-                && lease.loaded_revision >= candidate.ring_revision
-                && lease.first_observed_at <= minimum_observation
-        });
-        if current_leases.is_empty() || !required_roster_present || !every_live_process_qualified {
-            return Err(ApplicationError::PublicationPending);
-        }
-
         let next_revision = ring.revision + 1;
         if let Some(old) = project_signing_key::Entity::find()
             .filter(project_signing_key::Column::ProjectId.eq(project_id))

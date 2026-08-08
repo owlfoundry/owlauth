@@ -2,7 +2,7 @@
 
 ## Dependency rule
 
-Dependencies point inward. Runtime HTTP, Server API HTTP, Control HTTP, PostgreSQL, Redis, key providers, upstream providers, the CLI's discovered Control client, remote HTTP MCP, and Runtime SDKs are adapters around Project-scoped application and domain policy. The public key-provider SPI is an outer composition boundary, not a second domain or application layer.
+Dependencies point inward. Runtime HTTP, Server API HTTP, Control HTTP, PostgreSQL, key providers, upstream providers, the CLI's discovered Control client, remote HTTP MCP, and Runtime SDKs are adapters around Project-scoped application and domain policy. The public key-provider SPI is an outer composition boundary, not a second domain or application layer.
 
 ```mermaid
 flowchart TB
@@ -14,14 +14,13 @@ flowchart TB
     APP --> PORTS[Application-owned private ports]
     APP --> SPI[Public owlauth-key-provider capability ports]
     PG[PostgreSQL adapter] --> PORTS
-    RC[Redis adapter] --> PORTS
     SIGN[Bundled or custom signer and secret-custody adapters] --> SPI
     DATA[Application data-protector adapters] --> PORTS
     UP[Upstream provider adapters] --> PORTS
     CLOCK[Clock and entropy adapters] --> PORTS
 ```
 
-Domain and application modules MUST NOT import HTTP framework types, OpenAPI types, SQL rows, database drivers, Redis clients, provider SDK payloads, CLI parsing, MCP schemas, or client SDK code. Adapter mappings are explicit.
+Domain and application modules MUST NOT import HTTP framework types, OpenAPI types, SQL rows, database drivers, provider SDK payloads, CLI parsing, MCP schemas, or client SDK code. Adapter mappings are explicit.
 
 ## Package ownership
 
@@ -31,9 +30,9 @@ This is the single server package. It owns:
 
 - the `owlauth-server` executable and `all`, `auth`, and `control` composition roots;
 - internal Project/Application/identity/login/session/token/key domain modules;
-- application services, Project-bound invariants, and deployment-operator Control admission policy;
-- persistence, cache, upstream-provider, data-protection, clock, entropy, and audit ports plus consumption/composition of the public key-provider capabilities;
-- PostgreSQL and Redis adapters and embedded migrations;
+- application services, Project-bound invariants, and deployment-operator Control authorization policy;
+- persistence, upstream-provider, data-protection, clock, entropy, and audit ports plus consumption/composition of the public key-provider capabilities;
+- PostgreSQL adapters and embedded migrations;
 - one Auth listener containing isolated Runtime HTTP/Hosted Authentication UI and Server API adapters, plus the Control listener/Management Console, remote Streamable HTTP MCP, telemetry, health, and process-lifecycle adapters.
 
 PostgreSQL implementation technology and migration behavior are owned by spec 04; hosted web surfaces, route/base separation, and browser credential behavior are owned by spec 09. Server-only concepts remain internal modules except for the deliberately independent `owlauth-key-provider` SPI and the narrow public server composition API needed by custom binaries. Logical plane separation does not create separate domain packages or duplicated service layers.
@@ -42,7 +41,7 @@ PostgreSQL implementation technology and migration behavior are owned by spec 04
 
 This published package owns the narrow provider-neutral Rust SPI for replaceable signing-key and provider/SMTP/webhook configuration-secret custody. It defines bounded opaque handles/envelopes, normalized signing algorithms/public keys/signatures, canonical context values, safe fingerprints, redacted error classes, and role-specific object-safe async capabilities for Control provisioning/sealing and Runtime signing/opening.
 
-It MUST NOT depend on `owlauth-server`, `owlauth-types`, PostgreSQL/Redis/HTTP/configuration crates, or a vendor SDK. It owns no Project policy, key-ring lifecycle, persistence, idempotency, audit, readiness, or provider selection. Independent community/deployment provider crates depend on this package; `owlauth-server` consumes it through a high-level public composition builder. The official binary statically links only the bundled local software-custody provider, which is not a KMS. The OwlAuth repository and official distribution include no vendor KMS/HSM implementation; a deployment compiles its custom provider into a custom binary. V1 has no runtime Rust dynamic-library, directory-scanned, subprocess, or sidecar plugin mechanism.
+It MUST NOT depend on `owlauth-server`, `owlauth-types`, PostgreSQL/HTTP/configuration crates, or a vendor SDK. It owns no Project policy, key-ring lifecycle, persistence, idempotency, audit, readiness, or provider selection. Independent community/deployment provider crates depend on this package; `owlauth-server` consumes it through a high-level public composition builder. The official binary statically links only the bundled local software-custody provider, which is not a KMS. The OwlAuth repository and official distribution include no vendor KMS/HSM implementation; a deployment compiles its custom provider into a custom binary. V1 has no runtime Rust dynamic-library, directory-scanned, subprocess, or sidecar plugin mechanism.
 
 ### `crates/owlauth-types`
 
@@ -52,7 +51,7 @@ This package owns stable public HTTP DTOs, wire enums, error serialization, endp
 
 ### `crates/owlauth-cli`
 
-This package owns the `owlauth` remote administration experience: argument parsing, endpoint profiles, well-known OwlAuth server product/instance/authority/API-base/credential-class discovery and pinning, safe operator-credential input, the typed Control client, confirmation, machine output, and public Control API calls. It MUST NOT link the server implementation, open PostgreSQL/Redis, invoke domain repositories, load Project keys, act as a local Control Plane, or launch a local MCP process.
+This package owns the `owlauth` remote administration experience: argument parsing, endpoint profiles, well-known OwlAuth server product/instance/authority/API-base/credential-class discovery and pinning, safe operator-credential input, the typed Control client, confirmation, machine output, and public Control API calls. It MUST NOT link the server implementation, open PostgreSQL, invoke domain repositories, load Project keys, act as a local Control Plane, or launch a local MCP process.
 
 Default Runtime SDK surfaces do not gain administrative operations merely because the CLI and SDK share transport primitives.
 
@@ -87,7 +86,7 @@ Forbidden dependencies apply transitively:
 - any client SDK or Control client `->` the server implementation;
 - `owlauth-server -> owlauth-cli | client SDK`;
 - `owlauth-types -> owlauth-server | owlauth-cli | client SDK`;
-- `owlauth-key-provider -> owlauth-server | owlauth-types | PostgreSQL/Redis/HTTP/configuration | vendor SDK`.
+- `owlauth-key-provider -> owlauth-server | owlauth-types | PostgreSQL/HTTP/configuration | vendor SDK`.
 
 The SPI dependency does not make arbitrary server internals public. `owlauth-server` exposes a builder or equivalent `run_with_providers` entry point accepting capability objects and typed server configuration; repositories, routers, database rows, and private application errors remain internal.
 
@@ -105,7 +104,7 @@ The SPI dependency does not make arbitrary server internals public. `owlauth-ser
 | `ApplicationUserSyncService`      | maintain Application-user binding/projection, append immutable events, administer endpoint delivery/replay           | Runtime/identity mutations append; Control configures and inspects |
 | `SessionApplicationService`       | create/validate Project browser session, issue Application session, terminate session                                | Runtime; Control can revoke through administrative commands        |
 | `TokenApplicationService`         | issue Project access token, rotate refresh family, revoke family                                                     | Runtime                                                            |
-| `ProjectPolicyService`            | manage token claims, lifetimes, provider/app admission, and session policy                                           | Control writes; Runtime evaluates                                  |
+| `ProjectPolicyService`            | manage token claims, lifetimes, provider/Application eligibility, and session policy                                 | Control writes; Runtime evaluates                                  |
 | `KeyLifecycleService`             | provision, publish, activate, retire, and revoke Project signing keys                                                | Control commands; Runtime signs and publishes Project JWKS         |
 | `ProjectServerAccessService`      | create/revoke Project server-key commitments and authenticate one exact Project server actor                         | Control lifecycle; Server API authentication                       |
 | `ProjectServerQueryService`       | bounded Project users/Application projections and authoritative access-token introspection                           | Server API                                                         |
@@ -150,12 +149,11 @@ Application-owned ports expose semantics rather than vendor APIs:
 - `ProviderCredentialProtector` for Project/identity/generation-bound renewable credential encryption and rotation;
 - a Control configuration-secret sealer that returns an opaque bounded envelope and stable safe fingerprint for exact server-derived purpose/owner/generation context, plus separate Runtime/worker openers that can open only the selected envelope under the same context and cannot provision, enumerate, or mutate unrelated material;
 - `MailDelivery` and `WebhookDelivery` with exact envelope/endpoint, deadlines, response classification, and no authority over durable outbox state;
-- `Cache` for disposable values and `RateLimiter` for coordinated admission control;
 - `Clock` and `EntropySource`;
 - `AuditSink` only for events not required in the same PostgreSQL transaction;
 - telemetry interfaces accepting redacted, bounded-cardinality fields.
 
-Redis locks, PostgreSQL advisory locks, or process mutexes MUST NOT leak through domain ports as generic correctness primitives. A port describes the atomic business operation that must be preserved.
+PostgreSQL advisory locks or process mutexes MUST NOT leak through domain ports as generic correctness primitives. A port describes the atomic business operation that must be preserved.
 
 ## Request path
 

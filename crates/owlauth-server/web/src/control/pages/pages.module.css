@@ -210,6 +210,51 @@
   border-radius: var(--owl-radius-surface);
 }
 
+.disclosureIcon,
+.disclosureIconExpanded {
+  transition: transform 150ms ease;
+}
+
+.disclosureIconExpanded {
+  transform: rotate(180deg);
+}
+
+.expandedDetailCell {
+  padding: 0 1rem 1rem !important;
+  background: var(--owl-surface-raised) !important;
+}
+
+.inlineDetail {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-control);
+}
+
+.inlineDetail > p {
+  margin: 0;
+}
+
+.inlineDangerZone {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 0.5rem;
+  padding: 1rem;
+  background: color-mix(in srgb, var(--owl-danger-surface) 55%, var(--owl-surface));
+  border: 1px solid var(--owl-danger-border);
+  border-radius: var(--owl-radius-control);
+}
+
+.inlineDangerZone h3,
+.inlineDangerZone p {
+  margin: 0;
+}
+
 .dangerZone {
   margin-top: 3rem;
   padding: 1.25rem;

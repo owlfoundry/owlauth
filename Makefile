@@ -140,7 +140,7 @@ dev-check: ## Check local application config, tools, Docker, and Compose without
 	@docker info >/dev/null 2>&1 || { echo "Docker is not running; start Docker Desktop or the Docker daemon" >&2; exit 1; }
 
 .PHONY: dev-up
-dev-up: ## Start healthy local PostgreSQL and Redis services
+dev-up: ## Start the healthy local PostgreSQL service
 	@$(DEV_COMPOSE) up --detach --wait
 
 .PHONY: dev-down
@@ -153,7 +153,7 @@ dev-reset: ## Recreate local infrastructure and remove all local data
 	@$(DEV_COMPOSE) up --detach --wait
 
 .PHONY: dev-logs
-dev-logs: ## Follow local PostgreSQL and Redis logs
+dev-logs: ## Follow local PostgreSQL logs
 	@$(DEV_COMPOSE) logs --follow --tail=100
 
 .PHONY: dev-status
@@ -163,10 +163,6 @@ dev-status: ## Show local infrastructure status and health
 .PHONY: dev-postgres
 dev-postgres: ## Open psql in the local PostgreSQL container
 	@$(DEV_COMPOSE) exec postgres psql --username "$${OWLAUTH_DEV_POSTGRES_USER:-owlauth}" --dbname "$${OWLAUTH_DEV_POSTGRES_DB:-owlauth}"
-
-.PHONY: dev-redis
-dev-redis: ## Open redis-cli in the local Redis container
-	@$(DEV_COMPOSE) exec redis redis-cli
 
 .PHONY: test-containers
 test-containers: ## Run Docker-backed server integration tests (skip if Docker is unavailable)

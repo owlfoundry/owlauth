@@ -7,14 +7,14 @@ use super::{
     ProjectStatus, QueryFilter, QueryOrder, QuerySelect, RedirectUri,
     ReplaceApplicationConfiguration, SIGNING_ALGORITHM, SIGNING_PURPOSE, Set, SigningKeyState,
     TransactionTrait, UpdateApplication, UpdateProject, UpdateProjectPolicy, Uuid, Value,
-    active_application, active_project, active_provider, application, application_origin,
+    active_application, active_project, application, application_origin,
     application_provider_assignment, application_publishable_key, application_redirect,
     async_trait, bounded_items, bounded_list, bump_provider_revision, complete_idempotency,
-    ensure_application_capacity, ensure_capacity, ensure_project, find_application, generated_id,
-    insert_audit, json, key_provisioning_operation, lock_idempotency_key, lock_project_capacity,
-    parse_application_type, persistence, project, project_key_ring, project_policy,
-    project_policy_record, project_record, project_signing_key, reject_duplicates, replay,
-    webhook_endpoint,
+    ensure_application_capacity, ensure_capacity, ensure_no_pending_secret_replacement,
+    ensure_project, find_application, generated_id, insert_audit, json, key_provisioning_operation,
+    lock_idempotency_key, lock_project_capacity, locked_active_provider, parse_application_type,
+    persistence, project, project_key_ring, project_policy, project_policy_record, project_record,
+    project_signing_key, reject_duplicates, replay, webhook_endpoint,
 };
 
 impl PostgresProvisioningAdapter {
@@ -621,6 +621,22 @@ impl PostgresProvisioningAdapter {
     ) -> Result<ApplicationRecord, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
         active_project(&transaction, project_id).await?;
+        let assignments = application_provider_assignment::Entity::find()
+            .filter(application_provider_assignment::Column::ProjectId.eq(project_id))
+            .filter(application_provider_assignment::Column::ApplicationId.eq(application_id))
+            .filter(application_provider_assignment::Column::Status.eq("active"))
+            .order_by_asc(application_provider_assignment::Column::ProviderId)
+            .all(&transaction)
+            .await
+            .map_err(persistence)?;
+        let mut providers = Vec::with_capacity(assignments.len());
+        for assignment in &assignments {
+            let provider =
+                locked_active_provider(&transaction, project_id, assignment.provider_id).await?;
+            ensure_no_pending_secret_replacement(&transaction, project_id, assignment.provider_id)
+                .await?;
+            providers.push(provider);
+        }
         let model = active_application(&transaction, project_id, application_id).await?;
         if model.security_revision != expected_security_revision {
             return Err(ApplicationError::RevisionConflict);
@@ -657,18 +673,7 @@ impl PostgresProvisioningAdapter {
             active.updated_at = Set(now);
             active.update(&transaction).await.map_err(persistence)?;
         }
-        let assignments = application_provider_assignment::Entity::find()
-            .filter(application_provider_assignment::Column::ProjectId.eq(project_id))
-            .filter(application_provider_assignment::Column::ApplicationId.eq(application_id))
-            .filter(application_provider_assignment::Column::Status.eq("active"))
-            .order_by_asc(application_provider_assignment::Column::ProviderId)
-            .lock_exclusive()
-            .all(&transaction)
-            .await
-            .map_err(persistence)?;
-        for assignment in assignments {
-            let provider =
-                active_provider(&transaction, project_id, assignment.provider_id).await?;
+        for (assignment, provider) in assignments.into_iter().zip(providers) {
             bump_provider_revision(&transaction, provider).await?;
             let mut active = assignment.into_active_model();
             active.status = Set("disabled".to_owned());

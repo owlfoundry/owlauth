@@ -1,6 +1,14 @@
 export const VERSION = "0.0.0-dev";
 
-export { Client, type BeginLoginOptions, type ClientOptions, type CryptoProvider } from "./client.js";
+export {
+  Client,
+  type BeginLoginOptions,
+  type ClientOptions,
+  type CryptoProvider,
+  type SdkDebugEvent,
+  type SdkDebugHook,
+  type SdkDebugOutcome,
+} from "./client.js";
 export {
   OwlAuthError,
   type CallerAction,

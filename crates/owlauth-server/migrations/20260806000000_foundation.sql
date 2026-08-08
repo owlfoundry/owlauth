@@ -13,7 +13,6 @@ SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
-SELECT pg_catalog.set_config('search_path', '', false);
 SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
@@ -252,7 +251,7 @@ BEGIN
                     <> challenge.assignment_security_revision
                 OR challenge.issued_at < intent.created_at
                 OR challenge.expires_at > intent.expires_at
-                OR (challenge.status = 'pending'
+                OR (challenge.status IN ('pending', 'delivery_unavailable')
                     AND (intent.status <> 'pending_proof'
                          OR slot.state <> 'email_challenge_pending'))
                 OR (challenge.status = 'consumed' AND slot.state <> 'proved'))
@@ -275,7 +274,7 @@ BEGIN
                         AND challenge.project_id = slot.project_id
                         AND challenge.identity_mutation_intent_id = slot.intent_id
                         AND challenge.identity_mutation_proof_slot_id = slot.id
-                        AND challenge.status = 'pending') <> 1
+                        AND challenge.status IN ('pending', 'delivery_unavailable')) <> 1
                     OR EXISTS (
                         SELECT 1 FROM email_challenges AS challenge
                          WHERE challenge.owner_kind = 'identity_mutation'
@@ -297,7 +296,7 @@ BEGIN
                            AND challenge.project_id = slot.project_id
                            AND challenge.identity_mutation_intent_id = slot.intent_id
                            AND challenge.identity_mutation_proof_slot_id = slot.id
-                           AND challenge.status = 'pending'
+                           AND challenge.status IN ('pending', 'delivery_unavailable')
                     )))
                 OR (slot.state NOT IN ('email_challenge_pending', 'proved')
                     AND EXISTS (
@@ -306,7 +305,7 @@ BEGIN
                            AND challenge.project_id = slot.project_id
                            AND challenge.identity_mutation_intent_id = slot.intent_id
                            AND challenge.identity_mutation_proof_slot_id = slot.id
-                           AND challenge.status IN ('pending', 'consumed')
+                           AND challenge.status IN ('pending', 'delivery_unavailable', 'consumed')
                     ))
            )
     ) THEN
@@ -1297,15 +1296,25 @@ BEGIN
         RETURN NULL;
     END IF;
     IF current_challenge.owner_kind = 'identity_mutation'
-        AND current_challenge.status = 'pending'
-        AND (SELECT count(*)
-               FROM mail_outbox AS outbox
-              WHERE outbox.project_id = current_challenge.project_id
-                AND outbox.challenge_id = current_challenge.id
-                AND outbox.challenge_generation = current_challenge.generation
-                AND outbox.transaction_id IS NULL) <> 1
+        AND (
+            (current_challenge.status = 'pending'
+             AND (SELECT count(*)
+                    FROM mail_outbox AS outbox
+                   WHERE outbox.project_id = current_challenge.project_id
+                     AND outbox.challenge_id = current_challenge.id
+                     AND outbox.challenge_generation = current_challenge.generation
+                     AND outbox.transaction_id IS NULL) <> 1)
+            OR
+            (current_challenge.status = 'delivery_unavailable'
+             AND EXISTS (
+                    SELECT 1
+                      FROM mail_outbox AS outbox
+                     WHERE outbox.project_id = current_challenge.project_id
+                       AND outbox.challenge_id = current_challenge.id
+                       AND outbox.challenge_generation = current_challenge.generation))
+        )
     THEN
-        RAISE EXCEPTION 'pending mutation email challenge requires one exact mail outbox row'
+        RAISE EXCEPTION 'mutation email challenge requires an exact delivery lifecycle'
             USING ERRCODE = '23514';
     END IF;
     RETURN NULL;
@@ -2275,6 +2284,136 @@ $$;
 
 
 --
+-- Name: owlauth_seed_provider_secret_generation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.owlauth_seed_provider_secret_generation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    INSERT INTO provider_secret_generations (
+        project_id, provider_id, generation, material_id, status, activated_at
+    ) VALUES (
+        NEW.project_id,
+        NEW.id,
+        NEW.secret_generation,
+        NEW.secret_material_id,
+        CASE WHEN NEW.status = 'provisioning' THEN 'pending' ELSE 'active' END,
+        CASE WHEN NEW.status = 'provisioning' THEN NULL ELSE transaction_timestamp() END
+    );
+    RETURN NEW;
+END
+$$;
+
+
+--
+-- Name: owlauth_enforce_provider_secret_generation_transition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.owlauth_enforce_provider_secret_generation_transition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.status = OLD.status
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.retired_at IS NOT DISTINCT FROM OLD.retired_at
+       AND NEW.abandoned_at IS NOT DISTINCT FROM OLD.abandoned_at THEN
+        RETURN NEW;
+    END IF;
+    IF (OLD.status = 'pending' AND NEW.status IN ('active', 'abandoned'))
+       OR (OLD.status = 'active' AND NEW.status = 'retired') THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'provider secret generation status transition is invalid'
+        USING ERRCODE = '23514';
+END
+$$;
+
+
+--
+-- Name: owlauth_validate_provider_secret_current_pointer(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.owlauth_validate_provider_secret_current_pointer() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    target_project_id uuid;
+    target_provider_id uuid;
+    pointer_matches boolean;
+BEGIN
+    IF TG_TABLE_NAME = 'provider_configurations' THEN
+        target_project_id := NEW.project_id;
+        target_provider_id := NEW.id;
+    ELSE
+        target_project_id := NEW.project_id;
+        target_provider_id := NEW.provider_id;
+    END IF;
+    SELECT EXISTS (
+        SELECT 1
+        FROM provider_configurations AS provider
+        JOIN provider_secret_generations AS generation
+          ON generation.project_id = provider.project_id
+         AND generation.provider_id = provider.id
+         AND generation.generation = provider.secret_generation
+         AND generation.material_id = provider.secret_material_id
+        WHERE provider.project_id = target_project_id
+          AND provider.id = target_provider_id
+          AND generation.status = CASE
+              WHEN provider.status = 'provisioning' THEN 'pending'
+              ELSE 'active'
+          END
+    ) INTO pointer_matches;
+    IF NOT pointer_matches THEN
+        RAISE EXCEPTION 'provider current secret pointer does not reference its eligible generation'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+
+--
+-- Name: owlauth_validate_provider_secret_generation_owner(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.owlauth_validate_provider_secret_generation_owner() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF EXISTS (
+            SELECT 1
+            FROM protected_materials AS material
+            WHERE material.id = OLD.material_id
+              AND material.project_id = OLD.project_id
+              AND material.owner_kind = 'provider_secret'
+              AND material.owner_id = OLD.provider_id
+              AND material.generation = OLD.generation
+        ) THEN
+            RAISE EXCEPTION 'provider secret generation cannot be deleted while its protected material remains'
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN NULL;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM protected_materials AS material
+        WHERE material.id = NEW.material_id
+          AND material.project_id = NEW.project_id
+          AND material.owner_kind = 'provider_secret'
+          AND material.owner_id = NEW.provider_id
+          AND material.generation = NEW.generation
+    ) THEN
+        RAISE EXCEPTION 'provider secret generation does not match protected material owner'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+
+--
 -- Name: owlauth_validate_protected_material_owner(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -2295,11 +2434,11 @@ BEGIN
         )
         WHEN 'provider_secret' THEN EXISTS (
             SELECT 1
-            FROM provider_configurations AS owner
-            WHERE owner.id = NEW.owner_id
+            FROM provider_secret_generations AS owner
+            WHERE owner.provider_id = NEW.owner_id
               AND owner.project_id = NEW.project_id
-              AND owner.secret_generation = NEW.generation
-              AND owner.secret_material_id = NEW.id
+              AND owner.generation = NEW.generation
+              AND owner.material_id = NEW.id
         )
         WHEN 'project_smtp' THEN EXISTS (
             SELECT 1
@@ -2735,25 +2874,6 @@ CREATE TABLE public.audit_events (
 
 
 --
--- Name: server_key_digest_readiness; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.server_key_digest_readiness (
-    process_id text NOT NULL,
-    process_incarnation uuid NOT NULL,
-    state text NOT NULL,
-    supported_digest_versions integer[] NOT NULL,
-    failure_class text,
-    checked_at timestamp with time zone NOT NULL,
-    lease_expires_at timestamp with time zone NOT NULL,
-    CONSTRAINT server_key_digest_readiness_check CHECK ((((state = 'ready'::text) AND ((cardinality(supported_digest_versions) >= 1) AND (cardinality(supported_digest_versions) <= 32)) AND (failure_class IS NULL)) OR ((state = 'failed'::text) AND (cardinality(supported_digest_versions) = 0) AND (failure_class IS NOT NULL) AND ((char_length(failure_class) >= 1) AND (char_length(failure_class) <= 64))))),
-    CONSTRAINT server_key_digest_readiness_check1 CHECK (((lease_expires_at > checked_at) AND (lease_expires_at <= (checked_at + '00:05:00'::interval)))),
-    CONSTRAINT server_key_digest_readiness_state_check CHECK ((state = ANY (ARRAY['ready'::text, 'failed'::text]))),
-    CONSTRAINT server_key_digest_readiness_supported_digest_versions_check CHECK (((cardinality(supported_digest_versions) <= 32) AND (array_position(supported_digest_versions, NULL::integer) IS NULL) AND (0 < ALL (supported_digest_versions))))
-);
-
-
---
 -- Name: control_idempotency_records; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2935,89 +3055,6 @@ CREATE TABLE public.email_identities (
 
 
 --
--- Name: email_identity_alias_authority; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.email_identity_alias_authority (
-    singleton boolean DEFAULT true NOT NULL,
-    revision bigint NOT NULL,
-    write_version integer NOT NULL,
-    target_version integer NOT NULL,
-    retirement_version integer,
-    overlap_verified_revision bigint,
-    accepted_versions jsonb NOT NULL,
-    updated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
-    CONSTRAINT email_identity_alias_authority_accepted_versions_check CHECK (((jsonb_typeof(accepted_versions) = 'array'::text) AND ((jsonb_array_length(accepted_versions) >= 1) AND (jsonb_array_length(accepted_versions) <= 16)))),
-    CONSTRAINT email_identity_alias_authority_check CHECK ((target_version >= write_version)),
-    CONSTRAINT email_identity_alias_authority_check1 CHECK (((retirement_version IS NULL) OR (retirement_version = write_version))),
-    CONSTRAINT email_identity_alias_authority_check2 CHECK (((overlap_verified_revision IS NULL) OR (overlap_verified_revision <= revision))),
-    CONSTRAINT email_identity_alias_authority_overlap_verified_revision_check CHECK (((overlap_verified_revision IS NULL) OR (overlap_verified_revision > 0))),
-    CONSTRAINT email_identity_alias_authority_revision_check CHECK ((revision > 0)),
-    CONSTRAINT email_identity_alias_authority_singleton_check CHECK (singleton),
-    CONSTRAINT email_identity_alias_authority_write_version_check CHECK ((write_version > 0))
-);
-
-
---
--- Name: email_identity_alias_authority_events; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.email_identity_alias_authority_events (
-    id bigint NOT NULL,
-    authority_revision bigint NOT NULL,
-    action text NOT NULL,
-    from_write_version integer,
-    to_write_version integer NOT NULL,
-    affected_rows bigint DEFAULT 0 NOT NULL,
-    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
-    CONSTRAINT email_identity_alias_authority_events_action_check CHECK ((action = ANY (ARRAY['initialized'::text, 'staged'::text, 'cutover'::text, 'rollback'::text, 'overlap_verified'::text, 'retirement_authorized'::text, 'aliases_retired'::text]))),
-    CONSTRAINT email_identity_alias_authority_events_affected_rows_check CHECK ((affected_rows >= 0)),
-    CONSTRAINT email_identity_alias_authority_events_authority_revision_check CHECK ((authority_revision > 0)),
-    CONSTRAINT email_identity_alias_authority_events_to_write_version_check CHECK ((to_write_version > 0))
-);
-
-
---
--- Name: email_identity_alias_authority_events_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
-
-CREATE SEQUENCE public.email_identity_alias_authority_events_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
---
--- Name: email_identity_alias_authority_events_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
---
-
-ALTER SEQUENCE public.email_identity_alias_authority_events_id_seq OWNED BY public.email_identity_alias_authority_events.id;
-
-
---
--- Name: email_identity_alias_runtime_observations; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.email_identity_alias_runtime_observations (
-    process_id text NOT NULL,
-    process_incarnation uuid NOT NULL,
-    active_version integer NOT NULL,
-    observed_authority_revision bigint NOT NULL,
-    retirement_requested boolean DEFAULT false NOT NULL,
-    retirement_request_revision bigint,
-    lease_expires_at timestamp with time zone NOT NULL,
-    updated_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
-    CONSTRAINT email_identity_alias_runtime__observed_authority_revision_check CHECK ((observed_authority_revision > 0)),
-    CONSTRAINT email_identity_alias_runtime__retirement_request_revision_check CHECK (((retirement_request_revision IS NULL) OR (retirement_request_revision > 0))),
-    CONSTRAINT email_identity_alias_runtime_observations_active_version_check CHECK ((active_version > 0)),
-    CONSTRAINT email_identity_alias_runtime_observations_check CHECK ((retirement_requested = (retirement_request_revision IS NOT NULL))),
-    CONSTRAINT email_identity_alias_runtime_observations_process_id_check CHECK ((process_id ~ '^[a-zA-Z0-9._:-]{1,128}$'::text))
-);
-
-
---
 -- Name: email_identity_aliases; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3031,25 +3068,6 @@ CREATE TABLE public.email_identity_aliases (
     CONSTRAINT email_identity_aliases_canonicalization_version_check CHECK ((canonicalization_version > 0)),
     CONSTRAINT email_identity_aliases_digest_key_version_check CHECK ((digest_key_version > 0)),
     CONSTRAINT email_identity_aliases_lookup_digest_check CHECK ((octet_length(lookup_digest) = 32))
-);
-
-
---
--- Name: email_protection_runtime_readiness; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.email_protection_runtime_readiness (
-    process_id text NOT NULL,
-    process_incarnation uuid NOT NULL,
-    state text NOT NULL,
-    failure_class text,
-    checked_at timestamp with time zone NOT NULL,
-    lease_expires_at timestamp with time zone NOT NULL,
-    CONSTRAINT email_protection_runtime_readiness_check CHECK ((lease_expires_at > checked_at)),
-    CONSTRAINT email_protection_runtime_readiness_check1 CHECK (((state = 'ready'::text) = (failure_class IS NULL))),
-    CONSTRAINT email_protection_runtime_readiness_failure_class_check CHECK (((failure_class IS NULL) OR (failure_class = ANY (ARRAY['key_unavailable'::text, 'integrity'::text, 'persistence'::text])))),
-    CONSTRAINT email_protection_runtime_readiness_process_id_check CHECK ((process_id ~ '^[a-zA-Z0-9._:-]{1,128}$'::text)),
-    CONSTRAINT email_protection_runtime_readiness_state_check CHECK ((state = ANY (ARRAY['ready'::text, 'unavailable'::text])))
 );
 
 
@@ -4231,26 +4249,6 @@ CREATE TABLE public.project_smtp_configurations (
 
 
 --
--- Name: project_smtp_runtime_readiness; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.project_smtp_runtime_readiness (
-    project_id uuid NOT NULL,
-    configuration_id uuid NOT NULL,
-    generation integer NOT NULL,
-    process_id text NOT NULL,
-    process_incarnation uuid NOT NULL,
-    state text NOT NULL,
-    checked_at timestamp with time zone NOT NULL,
-    lease_expires_at timestamp with time zone NOT NULL,
-    CONSTRAINT project_smtp_runtime_readiness_check CHECK ((lease_expires_at > checked_at)),
-    CONSTRAINT project_smtp_runtime_readiness_generation_check CHECK ((generation > 0)),
-    CONSTRAINT project_smtp_runtime_readiness_process_id_check CHECK ((process_id ~ '^[a-zA-Z0-9._:-]{1,128}$'::text)),
-    CONSTRAINT project_smtp_runtime_readiness_state_check CHECK ((state = ANY (ARRAY['ready'::text, 'unavailable'::text])))
-);
-
-
---
 -- Name: project_smtp_secret_operations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4395,47 +4393,6 @@ CREATE TABLE public.project_users (
 
 
 --
--- Name: projection_email_key_authority; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.projection_email_key_authority (
-    singleton boolean DEFAULT true NOT NULL,
-    authority_revision bigint NOT NULL,
-    write_version integer NOT NULL,
-    accepted_versions integer[] NOT NULL,
-    target_version integer,
-    target_staged_at timestamp with time zone,
-    retirement_version integer,
-    retirement_authorized_at timestamp with time zone,
-    updated_at timestamp with time zone NOT NULL,
-    CONSTRAINT projection_email_key_authority_accepted_check CHECK ((public.owlauth_positive_unique_key_versions(accepted_versions) AND (accepted_versions @> ARRAY[write_version]))),
-    CONSTRAINT projection_email_key_authority_authority_revision_check CHECK ((authority_revision > 0)),
-    CONSTRAINT projection_email_key_authority_retirement_check CHECK ((((retirement_version IS NULL) AND (retirement_authorized_at IS NULL)) OR ((retirement_version IS NOT NULL) AND (retirement_version > 0) AND (retirement_version <> write_version) AND (accepted_versions @> ARRAY[retirement_version]) AND (retirement_authorized_at IS NOT NULL)))),
-    CONSTRAINT projection_email_key_authority_singleton_check CHECK (singleton),
-    CONSTRAINT projection_email_key_authority_target_check CHECK ((((target_version IS NULL) AND (target_staged_at IS NULL)) OR ((target_version IS NOT NULL) AND (target_version > 0) AND (target_version <> write_version) AND (target_staged_at IS NOT NULL) AND (accepted_versions @> ARRAY[target_version])))),
-    CONSTRAINT projection_email_key_authority_write_version_check CHECK ((write_version > 0))
-);
-
-
---
--- Name: projection_email_runtime_observations; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.projection_email_runtime_observations (
-    process_id text NOT NULL,
-    process_incarnation uuid NOT NULL,
-    authority_revision bigint NOT NULL,
-    readable_versions integer[] NOT NULL,
-    observed_at timestamp with time zone NOT NULL,
-    lease_expires_at timestamp with time zone NOT NULL,
-    CONSTRAINT projection_email_runtime_observations_authority_revision_check CHECK ((authority_revision > 0)),
-    CONSTRAINT projection_email_runtime_observations_lease_check CHECK ((lease_expires_at > observed_at)),
-    CONSTRAINT projection_email_runtime_observations_process_id_check CHECK (((process_id <> ''::text) AND (length(process_id) <= 128))),
-    CONSTRAINT projection_email_runtime_observations_versions_check CHECK (public.owlauth_positive_unique_key_versions(readable_versions))
-);
-
-
---
 -- Name: projects; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4570,6 +4527,26 @@ CREATE TABLE public.provider_configurations (
 
 
 --
+-- Name: provider_secret_generations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.provider_secret_generations (
+    project_id uuid NOT NULL,
+    provider_id uuid NOT NULL,
+    generation bigint NOT NULL,
+    material_id uuid NOT NULL,
+    status text NOT NULL,
+    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    activated_at timestamp with time zone,
+    retired_at timestamp with time zone,
+    abandoned_at timestamp with time zone,
+    CONSTRAINT provider_secret_generations_generation_check CHECK ((generation > 0)),
+    CONSTRAINT provider_secret_generations_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'active'::text, 'retired'::text, 'abandoned'::text]))),
+    CONSTRAINT provider_secret_generations_timestamps_check CHECK ((((status = 'pending'::text) AND (activated_at IS NULL) AND (retired_at IS NULL) AND (abandoned_at IS NULL)) OR ((status = 'active'::text) AND (activated_at IS NOT NULL) AND (retired_at IS NULL) AND (abandoned_at IS NULL)) OR ((status = 'retired'::text) AND (activated_at IS NOT NULL) AND (retired_at IS NOT NULL) AND (abandoned_at IS NULL)) OR ((status = 'abandoned'::text) AND (activated_at IS NULL) AND (retired_at IS NULL) AND (abandoned_at IS NOT NULL))))
+);
+
+
+--
 -- Name: provider_secret_operations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -4578,6 +4555,10 @@ CREATE TABLE public.provider_secret_operations (
     project_id uuid NOT NULL,
     provider_id uuid NOT NULL,
     operation_alias text NOT NULL,
+    operation_kind text NOT NULL,
+    target_secret_generation bigint NOT NULL,
+    target_display_name text NOT NULL,
+    target_client_id text NOT NULL,
     request_digest bytea NOT NULL,
     state text NOT NULL,
     attempt_count integer DEFAULT 0 NOT NULL,
@@ -4595,6 +4576,10 @@ CREATE TABLE public.provider_secret_operations (
     CONSTRAINT provider_secret_operations_expected_project_revision_check CHECK ((expected_project_revision > 0)),
     CONSTRAINT provider_secret_operations_expected_provider_revision_check CHECK ((expected_provider_revision > 0)),
     CONSTRAINT provider_secret_operations_operation_alias_check CHECK (((char_length(operation_alias) >= 8) AND (char_length(operation_alias) <= 128))),
+    CONSTRAINT provider_secret_operations_operation_kind_check CHECK ((operation_kind = ANY (ARRAY['create'::text, 'replace'::text]))),
+    CONSTRAINT provider_secret_operations_target_secret_generation_check CHECK ((target_secret_generation > 0)),
+    CONSTRAINT provider_secret_operations_target_display_name_check CHECK (((char_length(target_display_name) >= 1) AND (char_length(target_display_name) <= 128))),
+    CONSTRAINT provider_secret_operations_target_client_id_check CHECK (((char_length(target_client_id) >= 1) AND (char_length(target_client_id) <= 512))),
     CONSTRAINT provider_secret_operations_request_digest_check CHECK ((octet_length(request_digest) = 32)),
     CONSTRAINT provider_secret_operations_state_check CHECK ((state = ANY (ARRAY['prepared'::text, 'stored'::text, 'completed'::text, 'failed'::text, 'abandoned'::text])))
 );
@@ -4654,38 +4639,6 @@ CREATE TABLE public.refresh_token_generations (
     CONSTRAINT refresh_token_generations_status_check CHECK ((status = ANY (ARRAY['current'::text, 'consumed'::text]))),
     CONSTRAINT refresh_token_generations_token_digest_check CHECK ((octet_length(token_digest) = 32)),
     CONSTRAINT refresh_token_generations_token_digest_key_version_check CHECK ((token_digest_key_version > 0))
-);
-
-
---
--- Name: auth_process_incarnations; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.auth_process_incarnations (
-    process_id text NOT NULL,
-    process_incarnation uuid NOT NULL,
-    started_at timestamp with time zone NOT NULL,
-    CONSTRAINT auth_process_incarnations_process_id_check CHECK ((process_id ~ '^[a-zA-Z0-9._:-]{1,128}$'::text))
-);
-
-
---
--- Name: runtime_publication_leases; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.runtime_publication_leases (
-    project_id uuid NOT NULL,
-    ring_id uuid NOT NULL,
-    process_id text NOT NULL,
-    loaded_revision bigint NOT NULL,
-    first_observed_at timestamp with time zone NOT NULL,
-    last_observed_at timestamp with time zone NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
-    process_incarnation uuid NOT NULL,
-    CONSTRAINT runtime_publication_leases_check CHECK ((last_observed_at >= first_observed_at)),
-    CONSTRAINT runtime_publication_leases_check1 CHECK ((expires_at > last_observed_at)),
-    CONSTRAINT runtime_publication_leases_loaded_revision_check CHECK ((loaded_revision > 0)),
-    CONSTRAINT runtime_publication_leases_process_id_check CHECK (((char_length(process_id) >= 1) AND (char_length(process_id) <= 128)))
 );
 
 
@@ -4910,13 +4863,3 @@ CREATE TABLE public.webhook_secret_generations (
     CONSTRAINT webhook_secret_generations_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'active'::text, 'overlap'::text, 'retired'::text, 'compromised'::text]))),
     CONSTRAINT webhook_secret_provisioning_check CHECK (((state = ANY (ARRAY['pending'::text, 'retired'::text])) OR (provisioned_at IS NOT NULL)))
 );
-
-
---
--- Name: email_identity_alias_authority_events id; Type: DEFAULT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.email_identity_alias_authority_events ALTER COLUMN id SET DEFAULT nextval('public.email_identity_alias_authority_events_id_seq'::regclass);
-
--- Restore the default path before SQLx records this migration in public._sqlx_migrations.
-SELECT pg_catalog.set_config('search_path', '"$user", public', false);

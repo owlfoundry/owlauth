@@ -2018,7 +2018,7 @@ async fn identity_lifecycle_schema_requires_exact_mutation_email_challenges() {
         .expect_err("pending mutation challenge must retain its exact outbox");
     assert_check_violation(
         &missing_outbox_error,
-        "pending mutation email challenge requires one exact mail outbox row",
+        "mutation email challenge requires an exact delivery lifecycle",
     );
 
     let immutable_outbox_owner = sqlx::query(

@@ -17,7 +17,6 @@ use tokio::time::sleep;
 const POSTGRES_PORT: u16 = 5432;
 const OPERATOR_KEY: &str = "owl_ctrl_v1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const DIGEST_KEY: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM";
-const ADMISSION_DIGEST_KEY: &str = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU";
 const PROTECTION_KEY: &str = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ";
 const MANAGED_REAUTHORIZATION_DIGEST_KEY: &str = "CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo";
 const MANAGED_REAUTHORIZATION_PROTECTION_KEY: &str = "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws";
@@ -75,10 +74,6 @@ impl TestEnvironment {
             (
                 "OWLAUTH_SERVER_KEY_DIGEST_KEY".to_owned(),
                 SERVER_KEY_DIGEST_KEY.to_owned(),
-            ),
-            (
-                "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
-                "topology-auth".to_owned(),
             ),
             (
                 "OWLAUTH_SOFTWARE_CUSTODY_KEY".to_owned(),
@@ -233,10 +228,6 @@ fn control_environment(common: &Environment, port: u16) -> Environment {
             "OWLAUTH_CONTROL_API_KEY".to_owned(),
             OPERATOR_KEY.to_owned(),
         ),
-        (
-            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
-            "topology-auth".to_owned(),
-        ),
     ]);
     result
 }
@@ -285,10 +276,6 @@ fn auth_environment(common: &Environment, port: u16) -> Environment {
             format!("http://127.0.0.1:{port}/"),
         ),
         (
-            "OWLAUTH_AUTH_PROCESS_ID".to_owned(),
-            "topology-auth".to_owned(),
-        ),
-        (
             "OWLAUTH_EMAIL_IDENTITY_KEY_VERSION".to_owned(),
             "1".to_owned(),
         ),
@@ -299,10 +286,6 @@ fn auth_environment(common: &Environment, port: u16) -> Environment {
         (
             "OWLAUTH_EMAIL_IDENTITY_PROTECTION_KEY".to_owned(),
             "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4".to_owned(),
-        ),
-        (
-            "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
-            ADMISSION_DIGEST_KEY.to_owned(),
         ),
     ]);
     result

@@ -61,11 +61,15 @@ client.logout_application(&successor).await?;
 
 `prepare_browser_logout` returns a Hosted confirmation target as data and never navigates.
 
+## Optional debug logging
+
+Use `Client::with_debug_hook(Arc<dyn DebugHook>)` to observe one closed `SdkDebugEvent` per real network attempt without adding a logging-facade dependency. The hook is disabled by default and panics are isolated from protocol results. Events contain only fixed operation/method/outcome, elapsed milliseconds, dispatch status, and optional safe status/error metadata; they never contain URLs, headers, bodies, identifiers, callbacks, PKCE, or credentials.
+
 ## Errors and one-use ambiguity
 
-`Error` exposes stable `ErrorCategory`, machine code, retry policy, local-state action, operation, optional request ID, status, and `retry_after_seconds()`. A complete valid `429 rate_limited` exposes a decimal delay in `0..=86_400`; the SDK never sleeps or retries automatically. Messages and `Debug` output never contain request bodies, callbacks, PKCE, handoff tickets, or tokens.
+`Error` exposes stable `ErrorCategory`, machine code, retry policy, local-state action, operation, optional request ID, status, and `retry_after_seconds()`. When a SaaS/ingress layer adds traffic limiting, a complete valid `429 rate_limited` exposes a decimal delay in `0..=86_400`; the SDK never sleeps or retries automatically. Messages and `Debug` output never contain request bodies, callbacks, PKCE, handoff tickets, or tokens.
 
-A timeout, cancellation, or disconnect after handoff, refresh, or logout dispatch is `ErrorCategory::Indeterminate`. The SDK never blind-replays one-use material. The caller must follow `local_action()` and reauthenticate or reconcile rather than retrying the same generation.
+A valid Core `408 request_timeout` is `ErrorCategory::Timeout` with caller-decision retry and no local action for non-sensitive operations. For a dispatched handoff, refresh, or logout operation it is `ErrorCategory::Indeterminate` with the existing quarantine action because the server deadline may expire after authority work starts; malformed `408` responses fail conservatively as invalid responses. A timeout, cancellation, or disconnect after handoff, refresh, or logout dispatch is likewise `ErrorCategory::Indeterminate`. The SDK never blind-replays one-use material. The caller must follow `local_action()` and reauthenticate or reconcile rather than retrying the same generation.
 
 Every async operation has a `*_with_options` form accepting `OperationOptions`. A caller-provided `CancellationToken` returns `Cancelled` when cancellation was observed before dispatch. Once a sensitive transport future has been polled, explicit cancellation is conservatively `Indeterminate` and consumes or quarantines one-use state. Dropping or aborting a Rust future cannot return an SDK error and remains an Application-owned possibly-dispatched outcome.
 

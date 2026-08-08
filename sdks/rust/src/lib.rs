@@ -10,7 +10,10 @@ mod error;
 mod models;
 mod transport;
 
-pub use client::{CancellationToken, Client, ClientConfig, Clock, EntropySource, OperationOptions};
+pub use client::{
+    CancellationToken, Client, ClientConfig, Clock, DebugHook, EntropySource, OperationOptions,
+    SdkDebugEvent, SdkDebugOutcome,
+};
 pub use error::{Error, ErrorCategory, LocalAction, RetryPolicy};
 pub use models::{
     AccessToken, BrowserLogoutPreparation, CredentialPair, CredentialPairRecord, CurrentUser,

@@ -7,9 +7,8 @@ use crate::application::{ApplicationError, VersionedDigest};
 
 use super::authentication::persistence;
 
-/// Resolves one exact canonical email lookup inside the caller's authoritative snapshot.
-/// Durable alias authority, rather than the process key inventory, decides which candidate
-/// versions remain accepted. The result is a Project user ID only; no address or digest escapes.
+/// Resolves one canonical email lookup against the process-local active and retained key ring.
+/// The result is a Project user ID only; no address or digest escapes.
 pub(super) async fn resolve_active_email_user_id<C: ConnectionTrait>(
     connection: &C,
     project_id: Uuid,
@@ -18,39 +17,21 @@ pub(super) async fn resolve_active_email_user_id<C: ConnectionTrait>(
     if candidates.is_empty() || candidates.len() > 32 {
         return Err(ApplicationError::InvalidInput);
     }
-    let authority = connection
-        .query_one_raw(Statement::from_string(
-            DbBackend::Postgres,
-            "SELECT accepted_versions FROM email_identity_alias_authority WHERE singleton=TRUE"
-                .to_owned(),
-        ))
-        .await
-        .map_err(persistence)?
-        .ok_or(ApplicationError::Integrity)?;
-    let accepted: serde_json::Value = authority
-        .try_get("", "accepted_versions")
-        .map_err(persistence)?;
-    let accepted =
-        serde_json::from_value::<Vec<i32>>(accepted).map_err(|_| ApplicationError::Integrity)?;
-    let accepted_set = accepted.iter().copied().collect::<BTreeSet<_>>();
-    if accepted.is_empty()
-        || accepted.len() > 16
-        || accepted_set.len() != accepted.len()
-        || accepted_set.iter().any(|version| *version <= 0)
-        || accepted_set.iter().any(|version| {
-            !candidates
-                .iter()
-                .any(|candidate| candidate.key_version == *version)
-        })
+    if candidates
+        .iter()
+        .any(|candidate| candidate.key_version <= 0)
+        || candidates
+            .iter()
+            .map(|candidate| candidate.key_version)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != candidates.len()
     {
-        return Err(ApplicationError::Integrity);
+        return Err(ApplicationError::InvalidInput);
     }
 
     let mut user_ids = BTreeSet::new();
-    for candidate in candidates
-        .iter()
-        .filter(|candidate| accepted_set.contains(&candidate.key_version))
-    {
+    for candidate in candidates {
         if candidate.key_version <= 0 {
             return Err(ApplicationError::InvalidInput);
         }

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt::Write as _};
+use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -28,113 +28,11 @@ const REVOKE_OPERATION_KIND: &str = "project_server_key.revoke";
 #[derive(Clone)]
 pub(crate) struct PostgresServerKeyRepository {
     database: DatabaseConnection,
-    required_server_process_ids: Vec<String>,
 }
 
 impl PostgresServerKeyRepository {
-    pub(crate) fn new(
-        database: DatabaseConnection,
-        required_server_process_ids: Vec<String>,
-    ) -> Result<Self, ApplicationError> {
-        let unique = required_server_process_ids.iter().collect::<BTreeSet<_>>();
-        if required_server_process_ids.is_empty()
-            || required_server_process_ids.len() > 64
-            || unique.len() != required_server_process_ids.len()
-            || required_server_process_ids
-                .iter()
-                .any(|process_id| !valid_process_id(process_id))
-        {
-            return Err(ApplicationError::InvalidInput);
-        }
-        let mut required_server_process_ids = required_server_process_ids;
-        required_server_process_ids.sort_unstable();
-        Ok(Self {
-            database,
-            required_server_process_ids,
-        })
-    }
-
-    async fn digest_version_ready(
-        &self,
-        transaction: &DatabaseTransaction,
-        digest_key_version: i32,
-    ) -> Result<bool, ApplicationError> {
-        if digest_key_version <= 0 {
-            return Err(ApplicationError::InvalidInput);
-        }
-        // Lock both the authoritative incarnation and its exact readiness observation until the
-        // key transaction commits. A concurrent process claim or renewal therefore cannot replace
-        // the evidence after this verifier-first check but before the new key becomes visible.
-        let roster = transaction
-            .query_all_raw(Statement::from_sql_and_values(
-                transaction.get_database_backend(),
-                "SELECT current.process_id
-                   FROM auth_process_incarnations current
-                   JOIN server_key_digest_readiness readiness
-                     ON readiness.process_id=current.process_id
-                    AND readiness.process_incarnation=current.process_incarnation
-                  WHERE current.process_id IN (
-                        SELECT jsonb_array_elements_text($1::jsonb))
-                  ORDER BY current.process_id
-                  FOR SHARE OF current,readiness",
-                [json!(&self.required_server_process_ids).into()],
-            ))
-            .await
-            .map_err(persistence)?;
-        if roster.len() != self.required_server_process_ids.len() {
-            return Ok(false);
-        }
-        for (row, expected_process_id) in roster.iter().zip(&self.required_server_process_ids) {
-            let process_id = row
-                .try_get::<String>("", "process_id")
-                .map_err(persistence)?;
-            if process_id != *expected_process_id {
-                return Ok(false);
-            }
-        }
-
-        // PostgreSQL may evaluate SELECT expressions before waiting for a trailing FOR SHARE lock.
-        // Evaluate lease wall time only after the first statement has acquired every parent/child
-        // lock, otherwise a lease that expires during the lock wait can be accepted from a stale
-        // pre-wait clock_timestamp() result.
-        let rows = transaction
-            .query_all_raw(Statement::from_sql_and_values(
-                transaction.get_database_backend(),
-                "SELECT current.process_id,
-                        readiness.state='ready'
-                          AND readiness.failure_class IS NULL
-                          AND readiness.lease_expires_at > clock_timestamp()
-                          AND $2 = ANY(readiness.supported_digest_versions) AS ready
-                   FROM auth_process_incarnations current
-                   JOIN server_key_digest_readiness readiness
-                     ON readiness.process_id=current.process_id
-                    AND readiness.process_incarnation=current.process_incarnation
-                  WHERE current.process_id IN (
-                        SELECT jsonb_array_elements_text($1::jsonb))
-                  ORDER BY current.process_id",
-                [
-                    json!(&self.required_server_process_ids).into(),
-                    digest_key_version.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?;
-        if rows.len() != self.required_server_process_ids.len() {
-            return Err(ApplicationError::Integrity);
-        }
-        for (row, expected_process_id) in rows.iter().zip(&self.required_server_process_ids) {
-            let process_id = row
-                .try_get::<String>("", "process_id")
-                .map_err(persistence)?;
-            let ready = row.try_get::<bool>("", "ready").map_err(persistence)?;
-            if process_id != *expected_process_id {
-                return Err(ApplicationError::Integrity);
-            }
-            if !ready {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+    pub(crate) fn new(database: DatabaseConnection) -> Self {
+        Self { database }
     }
 }
 
@@ -284,12 +182,6 @@ impl ServerKeyLifecyclePort for PostgresServerKeyRepository {
             .is_some()
         {
             return Err(ApplicationError::InvalidTransition.into());
-        }
-        if !self
-            .digest_version_ready(&transaction, prepared.digest_key_version)
-            .await?
-        {
-            return Err(ApplicationError::ServerVerifierUnavailable.into());
         }
         let active_count = project_server_key::Entity::find()
             .filter(project_server_key::Column::ProjectId.eq(prepared.project_id))
@@ -696,14 +588,6 @@ fn hex_digest(value: &[u8]) -> String {
     encoded
 }
 
-fn valid_process_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
-}
-
 fn persistence(_: sea_orm::DbErr) -> ApplicationError {
     ApplicationError::Persistence
 }
@@ -728,28 +612,6 @@ mod tests {
             credential_acknowledged_at: None,
             last_used_at: None,
             revoked_at: None,
-        }
-    }
-
-    #[test]
-    fn required_server_roster_is_non_empty_unique_and_canonical() {
-        assert!(
-            PostgresServerKeyRepository::new(
-                DatabaseConnection::default(),
-                vec!["server-1".to_owned(), "region.example:2".to_owned()],
-            )
-            .is_ok()
-        );
-        for invalid in [
-            Vec::new(),
-            vec!["server-1".to_owned(), "server-1".to_owned()],
-            vec!["contains space".to_owned()],
-            vec!["x".repeat(129)],
-        ] {
-            assert_eq!(
-                PostgresServerKeyRepository::new(DatabaseConnection::default(), invalid).err(),
-                Some(ApplicationError::InvalidInput)
-            );
         }
     }
 

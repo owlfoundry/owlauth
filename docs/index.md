@@ -37,7 +37,7 @@ features:
   - title: First-party SDK design
     details: TypeScript, Python, and Rust clients target the Runtime Project Auth contract, including PKCE handoff and coordinated refresh behavior.
   - title: Self-hosted authority
-    details: PostgreSQL is the durable authority; Redis remains disposable, and private signing or data-protection keys stay behind provider interfaces.
+    details: PostgreSQL is the durable authority, and private signing or data-protection keys stay behind provider interfaces.
 ---
 
 ::: warning Beta

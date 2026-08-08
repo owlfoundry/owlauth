@@ -405,19 +405,41 @@ where
         .ok_or(ApplicationError::NotFound)
 }
 
-pub(in crate::adapters::postgres) async fn active_provider<C>(
-    connection: &C,
+pub(in crate::adapters::postgres) async fn locked_active_provider(
+    transaction: &DatabaseTransaction,
     project_id: Uuid,
     provider_id: Uuid,
-) -> Result<provider_configuration::Model, ApplicationError>
-where
-    C: ConnectionTrait,
-{
-    let provider = find_provider(connection, project_id, provider_id).await?;
+) -> Result<provider_configuration::Model, ApplicationError> {
+    let provider = provider_configuration::Entity::find_by_id(provider_id)
+        .filter(provider_configuration::Column::ProjectId.eq(project_id))
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .map_err(persistence)?
+        .ok_or(ApplicationError::NotFound)?;
     if provider.status != "active" {
         return Err(ApplicationError::Disabled);
     }
     Ok(provider)
+}
+
+pub(in crate::adapters::postgres) async fn ensure_no_pending_secret_replacement(
+    transaction: &DatabaseTransaction,
+    project_id: Uuid,
+    provider_id: Uuid,
+) -> Result<(), ApplicationError> {
+    let pending = provider_secret_operation::Entity::find()
+        .filter(provider_secret_operation::Column::ProjectId.eq(project_id))
+        .filter(provider_secret_operation::Column::ProviderId.eq(provider_id))
+        .filter(provider_secret_operation::Column::OperationKind.eq("replace"))
+        .filter(provider_secret_operation::Column::State.is_in(["prepared", "stored"]))
+        .one(transaction)
+        .await
+        .map_err(persistence)?;
+    if pending.is_some() {
+        return Err(ApplicationError::InvalidTransition);
+    }
+    Ok(())
 }
 
 pub(in crate::adapters::postgres) async fn bump_application_security(

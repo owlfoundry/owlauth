@@ -25,6 +25,7 @@ from owlauth import (
     ProtocolError,
     RateLimitedError,
     RefreshError,
+    SdkDebugEvent,
     SecretValue,
     TransportFailure,
     TransportResponse,
@@ -772,6 +773,46 @@ def test_public_config_jwks_and_malformed_or_mismatched_responses() -> None:
     assert client.get_project_jwks().keys[0].algorithm == "EdDSA"
     with pytest.raises(ProtocolError):
         client.get_public_configuration()
+
+
+def test_optional_debug_hook_emits_one_closed_redacted_completion_event() -> None:
+    events: list[SdkDebugEvent] = []
+
+    def debug_hook(event: SdkDebugEvent) -> None:
+        events.append(event)
+        raise RuntimeError("observer failure must be isolated")
+
+    client = make_client(
+        FakeTransport(
+            response(
+                200,
+                {
+                    "project_public_id": PROJECT,
+                    "project_display_name": "Project",
+                    "application_public_id": APPLICATION,
+                    "application_display_name": "Application",
+                    "publishable_keys": [PUBLISHABLE],
+                    "providers": [],
+                    "email_available": False,
+                    "email_otp_enabled": False,
+                    "email_magic_link_enabled": False,
+                    "login_available": True,
+                },
+            )
+        ),
+        debug_hook=debug_hook,
+    )
+    client.get_public_configuration()
+    assert len(events) == 1
+    event = asdict(events[0])
+    assert event["operation"] == "get_public_application_config"
+    assert event["method"] == "GET"
+    assert event["outcome"] == "success"
+    assert event["status"] == 200
+    serialized = json.dumps(event)
+    assert PUBLISHABLE not in serialized
+    assert "auth.example" not in serialized
+    assert "publishable_key" not in serialized
 
 
 def test_unknown_runtime_error_is_conservative_and_does_not_leak_credentials() -> None:

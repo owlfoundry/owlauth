@@ -65,6 +65,7 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
   const suffix = `${browserName}-${Date.now().toString(36)}`;
   const { project, application } = await provisionEmail(page.request, suffix);
   const email = `person-${suffix}@example.test`;
+  const magicEmail = `magic-${suffix}@example.test`;
 
   // The product journey starts only after the public contract proves this providerless
   // Application truthfully advertises the currently ready email capability.
@@ -117,12 +118,12 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
 
   // OTP above used the deployment-default generation. Activate a tested Project generation on
   // the same real implicit-TLS capture before magic so both selection and worker paths are proven.
-  await activateProjectSmtp(page, project, email);
+  await activateProjectSmtp(page, project, magicEmail);
   await page.request.delete(mailCaptureUrl);
   const magicHosted = await startLogin(page.request, project, application, `magic-${suffix}`);
   await page.goto(magicHosted);
   await page.getByRole("button", { name: "Continue with email" }).click();
-  await page.getByRole("textbox", { name: "Email address", exact: true }).fill(email);
+  await page.getByRole("textbox", { name: "Email address", exact: true }).fill(magicEmail);
   await page.getByRole("button", { name: "Send sign-in email" }).click();
   const firstMagicMessage = (await waitForMail(page.request, 1)).at(-1) ?? "";
   const firstLink = magicLink(firstMagicMessage);
@@ -133,7 +134,7 @@ test("passwordless OTP and fragment magic link are newest-only and one-use", asy
   await expect(page.getByRole("button", { name: "Send a new message" })).toBeVisible({
     timeout: 10_000,
   });
-  await page.getByRole("textbox", { name: "Email address", exact: true }).fill(email);
+  await page.getByRole("textbox", { name: "Email address", exact: true }).fill(magicEmail);
   await page.getByRole("button", { name: "Send a new message" }).click({ timeout: 10_000 });
   const secondMagicMessage = (await waitForMail(page.request, 2)).at(-1) ?? "";
   const secondLink = magicLink(secondMagicMessage);
@@ -396,28 +397,19 @@ test("native magic-only completion returns trusted custom-scheme navigation once
   await page.request.delete(mailCaptureUrl);
 });
 
-test("scoped address suppression is API and Hosted-state indistinguishable", async ({
+test("scoped recipient suppression is generic, terminal, and recoverable", async ({
   page,
   browserName,
 }) => {
-  test.skip(browserName !== "chromium", "one browser exhausts the shared scoped-address lane");
-  test.setTimeout(420_000);
+  test.skip(browserName !== "chromium", "one browser proves the shared durable suppression path");
+  test.setTimeout(180_000);
   await page.request.delete(mailCaptureUrl);
   const suffix = `suppression-${Date.now().toString(36)}`;
   const { project, application } = await provisionEmail(page.request, suffix);
   const email = `hot-${suffix}@example.test`;
-  const attempts: ChallengeAttempt[] = [];
 
-  // EmailChallenge has a 256-request owner/client envelope and a 64-request scoped-address
-  // bucket. Distinct interactions therefore saturate only the server-derived address dimension;
-  // the 65th request must still commit and return the ordinary authoritative contract.
-  for (let index = 0; index <= 64; index += 1) {
-    const hostedUrl = await startLogin(
-      page.request,
-      project,
-      application,
-      `suppression-${suffix}-${String(index)}`,
-    );
+  const requestChallenge = async (interaction: string): Promise<ChallengeAttempt> => {
+    const hostedUrl = await startLogin(page.request, project, application, interaction);
     await page.goto(hostedUrl);
     await page.getByRole("button", { name: "Continue with email" }).click();
     await page.getByRole("textbox", { name: "Email address", exact: true }).fill(email);
@@ -430,94 +422,50 @@ test("scoped address suppression is API and Hosted-state indistinguishable", asy
     expect(response.status(), await response.text()).toBe(202);
     const request = response.request().postDataJSON() as ChallengeAttempt["request"];
     const accepted = (await response.json()) as EmailChallengeAccepted;
-    expect(accepted.accepted).toBe(true);
-    expect(accepted.revision).toBe(4);
-    expect(accepted.generation).toBe(1);
-    attempts.push({
-      hostedUrl,
-      challengeUrl: response.url(),
-      request,
-      response: accepted,
-    });
-  }
+    expect(accepted).toMatchObject({ accepted: true, generation: 1, revision: 4 });
+    return { hostedUrl, challengeUrl: response.url(), request, response: accepted };
+  };
 
-  const initialDeliveries = await waitForMail(page.request, 64);
-  expect(initialDeliveries).toHaveLength(64);
-
-  const admitted = attempts[0];
-  const suppressed = attempts[64];
-  if (admitted === undefined || suppressed === undefined) throw new Error("missing challenge");
+  // Distinct protocol owners for the same Project and canonical recipient both commit the
+  // ordinary accepted contract. PostgreSQL authorizes only the first physical enqueue inside the
+  // configured resend window; this is side-effect safety rather than an admission or quota API.
+  const admitted = await requestChallenge(`admitted-${suffix}`);
+  const suppressed = await requestChallenge(`suppressed-${suffix}`);
   expectContractEquivalent(admitted.response, suppressed.response, 4, 1);
-  expect(initialDeliveries.join("\n")).not.toContain(suppressed.response.challenge_id);
+  const initialDeliveries = await waitForMail(page.request, 1);
+  expect(initialDeliveries).toHaveLength(1);
+  await page.waitForTimeout(2_000);
+  expect(await capturedMail(page.request)).toHaveLength(1);
+  expect(initialDeliveries[0]).not.toContain(suppressed.response.challenge_id);
   await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Verify code" })).toBeVisible();
 
-  // A fresh Hosted document recovers the same non-secret pending challenge metadata as an
-  // admitted generation. Keeping the OTP entry available avoids revealing delivery suppression;
-  // the actual proof remains delivery-only and the suppressed challenge cannot authenticate.
+  // The accepted response and current document disclose no side-effect decision. A fresh Hosted
+  // read observes only the ordinary terminal interaction shape: it exposes neither the address nor
+  // whether suppression or another terminal safety condition ended delivery.
   const refreshed = await page.context().newPage();
   await refreshed.goto(suppressed.hostedUrl);
-  await expect(refreshed.getByRole("heading", { name: "Check your email" })).toBeVisible();
-  await expect(refreshed.getByRole("button", { name: "Verify code" })).toBeVisible();
+  await expect(refreshed.getByRole("heading", { name: "Sign-in unavailable" })).toBeVisible();
+  await expect(refreshed.getByRole("alert")).toContainText(
+    "Return to your Application and start sign-in again.",
+  );
   await refreshed.close();
 
-  // Saturate the independent resend address lane after one shared cooldown. Each interaction
-  // advances to generation two; the final resend is suppressed yet returns the same contract as
-  // the first admitted resend and keeps current/newest revision semantics.
+  // Once PostgreSQL's suppression interval has elapsed, a new protocol owner for the same
+  // recipient creates one physical enqueue. The suppressed terminal owner is never reopened, and
+  // no in-process bucket or replica observation is involved.
   await page.waitForTimeout(31_000);
-  const resends: EmailChallengeAccepted[] = [];
-  for (const attempt of attempts) {
-    const response = await sameOriginJsonPost(
-      page,
-      attempt.challengeUrl.replace(/email\/challenges$/u, "email/resend"),
-      { ...attempt.request, expected_revision: 4 },
-    );
-    expect(response.status, response.body).toBe(202);
-    resends.push(JSON.parse(response.body) as EmailChallengeAccepted);
-  }
-  const admittedResend = resends[0];
-  const suppressedResend = resends[64];
-  if (admittedResend === undefined || suppressedResend === undefined) {
-    throw new Error("missing resend response");
-  }
-  expectContractEquivalent(admittedResend, suppressedResend, 5, 2);
-  const allDeliveries = await waitForMail(page.request, 128);
-  expect(allDeliveries).toHaveLength(128);
+  const recovered = await requestChallenge(`recovered-${suffix}`);
+  const allDeliveries = await waitForMail(page.request, 2);
+  expect(allDeliveries).toHaveLength(2);
+  expect(
+    allDeliveries.filter((message) => message.includes(admitted.response.challenge_id)),
+  ).toHaveLength(1);
+  expect(
+    allDeliveries.filter((message) => message.includes(recovered.response.challenge_id)),
+  ).toHaveLength(1);
   expect(allDeliveries.join("\n")).not.toContain(suppressed.response.challenge_id);
-  expect(allDeliveries.join("\n")).not.toContain(suppressedResend.challenge_id);
 
-  const invalid = await sameOriginJsonPost(
-    page,
-    suppressed.challengeUrl.replace(/email\/challenges$/u, "email/otp/verify"),
-    {
-      csrf: suppressed.request.csrf,
-      expected_revision: 5,
-      challenge_id: suppressedResend.challenge_id,
-      generation: suppressedResend.generation,
-      otp: "000000",
-    },
-  );
-  expect(invalid.status, invalid.body).toBe(200);
-  const invalidBody = JSON.parse(invalid.body) as {
-    completed: boolean;
-    redirect_url: string | null;
-    application_type: "web" | "native" | null;
-  };
-  expect(invalidBody).toEqual({
-    completed: false,
-    redirect_url: null,
-    application_type: null,
-  });
-
-  // The original in-memory generation is now an older sibling and receives the same generic UI
-  // result; neither response discloses which address-lane requests were suppressed.
-  await page.getByLabel("One-time code").fill("000000");
-  await page.getByRole("button", { name: "Verify code" }).click();
-  await expect(page.getByRole("alert")).toContainText("Code invalid or expired.");
-
-  // All 128 admitted jobs are now physically accounted for, while both suppressed generations
-  // are absent. Clearing only after that exact drain makes the following Firefox project
-  // hermetic without a retry delay or cooldown assumption.
   await page.request.delete(mailCaptureUrl);
 });
 
@@ -679,12 +627,16 @@ async function startLogin(
 
 async function waitForMail(request: APIRequestContext, count: number): Promise<string[]> {
   for (let attempt = 0; attempt < 240; attempt += 1) {
-    const response = await request.get(mailCaptureUrl);
-    const messages = ((await response.json()) as { messages: string[] }).messages;
+    const messages = await capturedMail(request);
     if (messages.length >= count) return messages;
     await pageDelay(250);
   }
   throw new Error(`timed out waiting for ${String(count)} captured messages`);
+}
+
+async function capturedMail(request: APIRequestContext): Promise<string[]> {
+  const response = await request.get(mailCaptureUrl);
+  return ((await response.json()) as { messages: string[] }).messages;
 }
 
 function otp(message: string): string {

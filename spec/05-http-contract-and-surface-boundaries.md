@@ -19,7 +19,7 @@ Runtime, Server API, and Control operations are never combined merely because on
 flowchart TB
     subgraph AuthEndpoint[Auth endpoint: auth.example.com]
         HU[Hosted Authentication UI]
-        RM[Runtime admission and Project resolution]
+        RM[Runtime request validation and Project resolution]
         RR[Project Auth router]
         RC[Public Project config and JWKS]
         SM[Project server-key authentication]
@@ -45,7 +45,7 @@ flowchart TB
 
 OpenAPI documents are build/release artifacts from `owlauth-types`, not routes on either endpoint. Each server release attaches exact-version Runtime, Server, and Control JSON documents generated from the same qualified source.
 
-Auth and Control have distinct bind addresses, TLS policy, transport budgets, process identities, metrics, and readiness. Within Auth, Runtime and Server API retain distinct routers, state, authentication, CORS/response policy, admission, metrics dimensions, PostgreSQL pools, and readiness inputs. Runtime and Server API share the Auth transport address and external base; routing by path never permits one surface to enter the other's middleware or state. Distinct Auth and Control external origins are recommended to isolate the browser-held operator key from public Runtime script execution. A shared origin requires disjoint non-root Auth/Control base paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary as defined by spec 09.
+Auth and Control have distinct bind addresses, TLS policy, transport budgets, process identities, metrics, and readiness. Within Auth, Runtime and Server API retain distinct routers, state, authentication, CORS/response policy, metrics dimensions, PostgreSQL pools, and readiness inputs. Runtime and Server API share the Auth transport address and external base; routing by path never permits one surface to enter the other's middleware or state. Distinct Auth and Control external origins are recommended to isolate the browser-held operator key from public Runtime script execution. A shared origin requires disjoint non-root Auth/Control base paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary as defined by spec 09.
 
 In `OWLAUTH_MODE=all`, a request accepted by Auth cannot dispatch to Control, and a request accepted by Control cannot dispatch to either Auth surface through path, host, forwarding header, content type, or method manipulation.
 
@@ -83,7 +83,7 @@ A representative stable path model is:
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/method`                                 | compare-and-swap selection of one admitted current provider or email method                                             | opaque interaction in `awaiting_method_selection`, browser binding, same-origin CSRF, expected transaction revision; no method switching                                                                  |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/session/reuse`                          | explicitly confirm an eligible current Project browser session and issue the ordinary handoff                           | hardened cookie, same-origin CSRF, browser binding, expected transaction revision, current Project/user/session/auth-age/reuse-policy checks; page cannot name user/session                               |
 | `GET /projects/{project_public_id}/auth/callback/{provider_key}`                                        | receive the exact upstream callback after stored provider selection; no alias exists                                    | trusted Runtime base plus immutable Project public ID/provider key, server-owned state binding, and exact typed `login`, `identity_mutation`, or `managed_reauthorization` completion class               |
-| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/challenges`                       | accept email after stored email selection, then create an enumeration-safe newest challenge and pinned durable mail job | assigned email method, browser/CSRF/revision binding, email/IP rate policy and server safety floors                                                                                                       |
+| `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/challenges`                       | accept email after stored email selection, then create an enumeration-safe newest challenge and pinned durable mail job | assigned email method, browser/CSRF/revision binding, PostgreSQL resend/generation/attempt/newest/one-use rules, and server safety floors                                                                 |
 | `POST /v1/projects/{project_id}/auth/interactions/{interaction}/email/otp/verify`                       | consume newest OTP challenge                                                                                            | opaque interaction, proof attempt/expiry/generation and transaction binding                                                                                                                               |
 | `GET /auth/email/confirm/{challenge_id}`                                                                | load the inert fragment-only magic-link transfer document without consuming proof                                       | top-level navigation; raw proof remains in the URL fragment and is removed before explicit confirmation                                                                                                   |
 | `POST /v1/projects/{project_id}/auth/email/magic/confirm`                                               | consume a fragment-staged magic-link proof after explicit user confirmation                                             | same-origin CSRF protection, digest-bound token, exact stored transaction and safe local error/redirect policy                                                                                            |
@@ -134,7 +134,7 @@ Public configuration may include:
 - safe Runtime URLs and SDK feature flags;
 - allowed authentication methods that contain no secret; the server still snapshots and revalidates assignment when starting/selecting a method.
 
-It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal/protected-material IDs, key-provider handles/envelopes, Redis/PostgreSQL topology, or policy internals. Runtime authentication middleware recognizes neither `OWLAUTH_CONTROL_API_KEY` nor Project server keys; presenting either value to a Runtime route never grants access.
+It never includes provider client secrets, provider access tokens, the Control endpoint or operator API key, `belongs_to`, user counts, internal/protected-material IDs, key-provider handles/envelopes, PostgreSQL topology, or policy internals. Runtime authentication middleware recognizes neither `OWLAUTH_CONTROL_API_KEY` nor Project server keys; presenting either value to a Runtime route never grants access.
 
 ### Runtime parsing and errors
 
@@ -148,6 +148,8 @@ Runtime rejects:
 - redirects/origins not exactly registered for the selected Application.
 
 Malformed, unsupported, or listener-body-limit JSON extraction uses the plane's stable `400 invalid_json`/invalid-request envelope; OwlAuth does not let middleware order alternate this ordinary JSON contract with an unstructured `413`. A transport or ingress may still reject a wire request earlier under its own parser limits.
+
+Every Runtime, Server API, and Control OpenAPI operation declares the listener's `408` response. JSON Runtime requests use the exact closed Runtime envelope with code `request_timeout`; Server API uses its closed JSON envelope and `request_timeout` enum value; Control uses `application/problem+json` with code `request_timeout`. Runtime Hosted document navigation receives a safe local `text/html` timeout document instead. The deadline includes both local in-flight semaphore waiting and handler execution, so a `408` never proves that a dispatched state-changing operation had no effect.
 
 Errors use a stable OwlAuth Project Auth shape containing a machine code, safe message, and optional correlation ID. Provider errors are normalized. Responses do not reveal whether another Project, Application, user, identity, ticket, session, or refresh token exists.
 
@@ -276,7 +278,7 @@ revalidation; it is not a bypass.
 Custom discovery preflight is rate/concurrency/deadline bounded independently from provider callback
 exchanges. Its durable safe-outcome audit and operational telemetry record only Project, operation,
 safe outcome class, correlation, and bounded latency. Named guidance performs no network or durable
-mutation, remains under ordinary authenticated Control request admission/deadline limits, and does
+mutation, remains under ordinary authenticated Control request/deadline limits, and does
 not create a durable audit event; its operational telemetry uses the same bounded safe dimensions.
 Neither path records provider key, callback, issuer, endpoint, DNS, remote body, client registration,
 or secret material.
@@ -308,7 +310,7 @@ Control accepts exactly one HTTP authentication form:
 Authorization: Bearer <operator-api-key>
 ```
 
-The expected canonical ASCII value is loaded from the required `OWLAUTH_CONTROL_API_KEY` environment variable whenever the `control` or `all` plane is composed. Its `owl_ctrl_v1_` grammar and 256-bit random payload are owned by spec 06. After strict Bearer and structural parsing, the server compares the complete presented key with the configured bytes using a constant-time comparison. Missing, malformed, duplicate, or mismatched authorization fails before route handling. The key remains in protected process configuration only and is never written to PostgreSQL or Redis.
+The expected canonical ASCII value is loaded from the required `OWLAUTH_CONTROL_API_KEY` environment variable whenever the `control` or `all` plane is composed. Its `owl_ctrl_v1_` grammar and 256-bit random payload are owned by spec 06. After strict Bearer and structural parsing, the server compares the complete presented key with the configured bytes using a constant-time comparison. Missing, malformed, duplicate, or mismatched authorization fails before route handling. The key remains in protected process configuration only and is never written to PostgreSQL.
 
 A valid key represents the deployment operator and grants the entire deployment's Control authority. OwlAuth has no server-side operator principals, permissions, credential endpoints, browser Control sessions, or secondary authentication transitions. Network placement and optional transport TLS/mTLS hardening do not create alternate application credentials.
 
@@ -342,7 +344,7 @@ This contract supports external indexing but does not promise tenant isolation. 
 
 Control uses stable problem details containing safe code/type, status, correlation ID, optional bounded field violations, and revision/conflict metadata. Authentication and hidden-resource failures avoid Project enumeration.
 
-PostgreSQL, Redis, key-provider, protected-material, and upstream-provider errors map to bounded dependency/integrity classes without vendor detail, material IDs, handles, envelopes, fingerprints, or plaintext. An authentication denial does not disclose the protected resource or its `belongs_to` value.
+PostgreSQL, key-provider, protected-material, and upstream-provider errors map to bounded dependency/integrity classes without vendor detail, material IDs, handles, envelopes, fingerprints, or plaintext. An authentication denial does not disclose the protected resource or its `belongs_to` value.
 
 ## Contract mapping
 
@@ -350,7 +352,7 @@ PostgreSQL, Redis, key-provider, protected-material, and upstream-provider error
 flowchart LR
     Wire[Surface-specific DTO] --> Parse[Bounded parse and structural validation]
     Parse --> Context[Resolve actor and Project/Application context]
-    Context --> Map[Explicit command mapping and domain admission]
+    Context --> Map[Explicit command mapping and domain validation]
     Map --> App[Application service]
     App --> Result[Domain result/error]
     Result --> Shape[Surface-specific response mapping]
@@ -369,4 +371,4 @@ MCP tools are hand-designed Control capabilities over application commands, not 
 
 A wire change is incompatible when it removes/renames an operation or field, adds required input, narrows accepted values, changes Project/Application resolution, authentication, side effects, idempotency, or stable error meaning. Additive fields/enums require an explicit unknown-value policy.
 
-Runtime Project Auth and Control administrative compatibility are evaluated independently. Internal module, PostgreSQL, Redis, and provider representations have no direct wire compatibility because every crossing uses explicit mapping.
+Runtime Project Auth and Control administrative compatibility are evaluated independently. Internal module, PostgreSQL, and provider representations have no direct wire compatibility because every crossing uses explicit mapping.

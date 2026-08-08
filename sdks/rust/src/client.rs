@@ -1,10 +1,11 @@
 use std::{
     net::IpAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -204,6 +205,38 @@ impl Clock for SystemClock {
     }
 }
 
+/// Secret-free result classification for an optional SDK debug event.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SdkDebugOutcome {
+    Success,
+    RuntimeError,
+    TransportError,
+    Timeout,
+    Cancelled,
+    InvalidResponse,
+    Indeterminate,
+}
+
+/// Closed, secret-free completion event emitted only when a debug hook is configured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SdkDebugEvent {
+    pub operation: &'static str,
+    pub method: HttpMethod,
+    pub outcome: SdkDebugOutcome,
+    pub elapsed_millis: u64,
+    pub dispatched: bool,
+    pub status: Option<u16>,
+    pub category: Option<ErrorCategory>,
+    pub code: Option<String>,
+    pub request_id: Option<String>,
+}
+
+/// Optional observer for safe SDK completion events.
+pub trait DebugHook: Send + Sync {
+    fn emit(&self, event: &SdkDebugEvent);
+}
+
 /// Async Project Auth protocol client. It owns no pending or credential persistence.
 #[derive(Clone)]
 pub struct Client {
@@ -216,6 +249,7 @@ pub struct Client {
     transport: Arc<dyn Transport>,
     entropy: Arc<dyn EntropySource>,
     clock: Arc<dyn Clock>,
+    debug_hook: Option<Arc<dyn DebugHook>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -276,7 +310,15 @@ impl Client {
             transport,
             entropy,
             clock,
+            debug_hook: None,
         })
+    }
+
+    /// Installs an optional secret-free completion observer. Hook panics are isolated from protocol outcomes.
+    #[must_use]
+    pub fn with_debug_hook(mut self, debug_hook: Arc<dyn DebugHook>) -> Self {
+        self.debug_hook = Some(debug_hook);
+        self
     }
 
     #[must_use]
@@ -1156,6 +1198,8 @@ impl Client {
             ));
         }
 
+        let method = request.method;
+        let started = Instant::now();
         let send = self.transport.send(request, self.deadline);
         tokio::pin!(send);
         let outcome = if let Some(cancellation) = options.cancellation() {
@@ -1185,21 +1229,86 @@ impl Client {
                         guard.release();
                     }
                 }
-                return Err(transport_error(
-                    failure,
+                let error =
+                    transport_error(failure, policy.operation, policy.sensitive, policy.action);
+                self.emit_error_debug(
                     policy.operation,
-                    policy.sensitive,
-                    policy.action,
-                ));
+                    method,
+                    started,
+                    failure.dispatched,
+                    None,
+                    &error,
+                );
+                return Err(error);
             }
         };
-        parse_response(
+        let result = parse_response(
             &response,
             policy.operation,
             policy.expected_status,
             policy.sensitive,
             policy.action,
-        )
+        );
+        match &result {
+            Ok(_) => self.emit_success_debug(policy.operation, method, started, response.status),
+            Err(error) => self.emit_error_debug(
+                policy.operation,
+                method,
+                started,
+                true,
+                Some(response.status),
+                error,
+            ),
+        }
+        result
+    }
+
+    fn emit_success_debug(
+        &self,
+        operation: &'static str,
+        method: HttpMethod,
+        started: Instant,
+        status: u16,
+    ) {
+        self.emit_debug(&SdkDebugEvent {
+            operation,
+            method,
+            outcome: SdkDebugOutcome::Success,
+            elapsed_millis: elapsed_millis(started),
+            dispatched: true,
+            status: Some(status),
+            category: None,
+            code: None,
+            request_id: None,
+        });
+    }
+
+    fn emit_error_debug(
+        &self,
+        operation: &'static str,
+        method: HttpMethod,
+        started: Instant,
+        dispatched: bool,
+        response_status: Option<u16>,
+        error: &Error,
+    ) {
+        self.emit_debug(&SdkDebugEvent {
+            operation,
+            method,
+            outcome: debug_outcome(error.category()),
+            elapsed_millis: elapsed_millis(started),
+            dispatched,
+            status: error.status().or(response_status),
+            category: Some(error.category()),
+            code: Some(error.code().to_owned()),
+            request_id: error.request_id().map(str::to_owned),
+        });
+    }
+
+    fn emit_debug(&self, event: &SdkDebugEvent) {
+        if let Some(debug_hook) = &self.debug_hook {
+            let _ = catch_unwind(AssertUnwindSafe(|| debug_hook.emit(event)));
+        }
     }
 
     fn validate_credentials(
@@ -1259,6 +1368,21 @@ impl Client {
             return Err(protocol(operation, "credential_context_mismatch"));
         }
         Ok(())
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+const fn debug_outcome(category: ErrorCategory) -> SdkDebugOutcome {
+    match category {
+        ErrorCategory::Protocol => SdkDebugOutcome::InvalidResponse,
+        ErrorCategory::Transport => SdkDebugOutcome::TransportError,
+        ErrorCategory::Timeout => SdkDebugOutcome::Timeout,
+        ErrorCategory::Cancelled => SdkDebugOutcome::Cancelled,
+        ErrorCategory::Indeterminate => SdkDebugOutcome::Indeterminate,
+        _ => SdkDebugOutcome::RuntimeError,
     }
 }
 
@@ -1639,28 +1763,8 @@ fn parse_runtime_error<T>(
             response.status,
         ));
     }
-    let retry_after_seconds = if response.status == 429 {
-        if wire.code != "rate_limited" {
-            return Err(invalid_response(
-                operation,
-                "invalid_rate_limit_response",
-                sensitive,
-                action,
-                response.status,
-            ));
-        }
-        Some(retry_after_seconds(response).ok_or_else(|| {
-            invalid_response(
-                operation,
-                "invalid_rate_limit_response",
-                sensitive,
-                action,
-                response.status,
-            )
-        })?)
-    } else {
-        None
-    };
+    let retry_after_seconds =
+        runtime_retry_after(response, &wire.code, operation, sensitive, action)?;
     let request_id = sanitize_request_id(Some(wire.request_id));
     let code = wire.code;
     if !valid_runtime_error_code(&code) {
@@ -1670,6 +1774,20 @@ fn parse_runtime_error<T>(
             sensitive,
             action,
             response.status,
+        ));
+    }
+    if response.status == 408 {
+        if code != "request_timeout" {
+            return Err(invalid_response(
+                operation,
+                "invalid_timeout_response",
+                sensitive,
+                action,
+                response.status,
+            ));
+        }
+        return Err(runtime_request_timeout(
+            operation, sensitive, action, request_id,
         ));
     }
     if sensitive && response.status >= 500 {
@@ -1697,6 +1815,68 @@ fn parse_runtime_error<T>(
     Err(error)
 }
 
+fn runtime_retry_after(
+    response: &HttpResponse,
+    code: &str,
+    operation: &'static str,
+    sensitive: bool,
+    action: LocalAction,
+) -> Result<Option<u64>, Error> {
+    if response.status != 429 {
+        return Ok(None);
+    }
+    if code != "rate_limited" {
+        return Err(invalid_response(
+            operation,
+            "invalid_rate_limit_response",
+            sensitive,
+            action,
+            response.status,
+        ));
+    }
+    retry_after_seconds(response).map(Some).ok_or_else(|| {
+        invalid_response(
+            operation,
+            "invalid_rate_limit_response",
+            sensitive,
+            action,
+            response.status,
+        )
+    })
+}
+
+fn runtime_request_timeout(
+    operation: &'static str,
+    sensitive: bool,
+    action: LocalAction,
+    request_id: Option<String>,
+) -> Error {
+    let (category, retry, local_action, message) = if sensitive {
+        (
+            ErrorCategory::Indeterminate,
+            RetryPolicy::Never,
+            action,
+            "Runtime may have committed the operation; do not replay it.",
+        )
+    } else {
+        (
+            ErrorCategory::Timeout,
+            RetryPolicy::ApplicationDecision,
+            LocalAction::None,
+            "The Runtime request exceeded its server-side deadline.",
+        )
+    };
+    Error::new(
+        category,
+        "request_timeout",
+        message,
+        retry,
+        local_action,
+        operation,
+    )
+    .with_runtime(408, request_id)
+}
+
 fn sanitize_request_id(value: Option<String>) -> Option<String> {
     value.filter(|value| {
         !value.is_empty()
@@ -1716,11 +1896,11 @@ fn valid_runtime_error_code(code: &str) -> bool {
 
 fn allowed_error_statuses(operation: &str) -> &'static [u16] {
     match operation {
-        "get_public_application_config" | "start_login" => &[400, 404, 429, 503],
-        "get_project_jwks" => &[404, 429, 503],
-        "exchange_handoff" | "refresh_session" => &[400, 409, 429, 503],
+        "get_public_application_config" | "start_login" => &[400, 404, 408, 429, 503],
+        "get_project_jwks" => &[404, 408, 429, 503],
+        "exchange_handoff" | "refresh_session" => &[400, 408, 409, 429, 503],
         "get_current_user" | "logout_application_session" | "prepare_browser_logout" => {
-            &[401, 429, 503]
+            &[401, 408, 429, 503]
         }
         _ => &[],
     }

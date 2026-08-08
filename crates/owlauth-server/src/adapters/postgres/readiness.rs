@@ -1,19 +1,14 @@
-use std::{sync::Arc, time::Duration};
-
+use async_trait::async_trait;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, FromQueryResult, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Statement,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use time::OffsetDateTime;
-use uuid::Uuid;
-
-use async_trait::async_trait;
 
 use crate::{
     adapters::postgres::entity::{
         application, application_provider_assignment, application_publishable_key, project,
-        project_key_ring, project_signing_key, provider_configuration, runtime_publication_lease,
+        project_key_ring, project_signing_key, provider_configuration,
     },
     application::{
         ApplicationError, JwksDocument, PublicApplicationConfig, PublicProvider, ReadinessPort,
@@ -23,27 +18,11 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct PostgresReadinessAdapter {
     database: DatabaseConnection,
-    process_id: Arc<str>,
-    process_incarnation: Uuid,
-    required_auth_process_ids: Arc<[String]>,
-    lease_ttl: Duration,
 }
 
 impl PostgresReadinessAdapter {
-    pub(crate) fn new(
-        database: DatabaseConnection,
-        process_id: String,
-        process_incarnation: Uuid,
-        required_auth_process_ids: Vec<String>,
-        lease_ttl: Duration,
-    ) -> Self {
-        Self {
-            database,
-            process_id: Arc::from(process_id),
-            process_incarnation,
-            required_auth_process_ids: required_auth_process_ids.into(),
-            lease_ttl,
-        }
+    pub(crate) fn new(database: DatabaseConnection) -> Self {
+        Self { database }
     }
 
     #[allow(
@@ -56,7 +35,6 @@ impl PostgresReadinessAdapter {
         application_public_id: &str,
     ) -> Result<PublicApplicationConfig, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_auth_incarnation(&transaction).await?;
         // Every Control mutation takes the same Project row exclusively before touching
         // child aggregates. This shared guard therefore linearizes the complete public
         // snapshot and prevents a child disable/unassignment from committing mid-read.
@@ -203,8 +181,8 @@ impl PostgresReadinessAdapter {
             return Err(ApplicationError::RevisionConflict);
         }
 
-        // Email readiness follows the same canonical owner order as admission: policy and
-        // assignment first, then the selected SMTP generation/readiness, then scoped protection.
+        // Email readiness follows the canonical owner order: policy and assignment first, then
+        // the selected SMTP generation/readiness, then scoped protection.
         // Nullable outer-join sides are never row-locked.
         let email_policy = transaction
             .query_one_raw(Statement::from_sql_and_values(
@@ -231,41 +209,8 @@ impl PostgresReadinessAdapter {
                 ))
                 .await
                 .map_err(persistence)?;
-            if let Some(smtp) = project_smtp {
-                let configuration_id: Uuid = smtp.try_get("", "id").map_err(persistence)?;
-                let generation: i32 = smtp.try_get("", "generation").map_err(persistence)?;
-                let roster_ready: bool = transaction
-                    .query_one_raw(Statement::from_sql_and_values(
-                        sea_orm::DbBackend::Postgres,
-                        "SELECT NOT EXISTS (
-                           SELECT required.process_id
-                           FROM jsonb_array_elements_text($4::jsonb) AS required(process_id)
-                           WHERE NOT EXISTS (
-                             SELECT 1 FROM project_smtp_runtime_readiness readiness
-                             WHERE readiness.project_id=$1
-                               AND readiness.configuration_id=$2
-                               AND readiness.generation=$3
-                               AND readiness.process_id=required.process_id
-                               AND readiness.state='ready'
-                               AND readiness.lease_expires_at>transaction_timestamp()
-                               AND EXISTS (
-                                 SELECT 1 FROM auth_process_incarnations current
-                                 WHERE current.process_id=readiness.process_id
-                                   AND current.process_incarnation=readiness.process_incarnation)))
-                         AS roster_ready",
-                        vec![
-                            project.id.into(),
-                            configuration_id.into(),
-                            generation.into(),
-                            serde_json::json!(&*self.required_auth_process_ids).into(),
-                        ],
-                    ))
-                    .await
-                    .map_err(persistence)?
-                    .ok_or(ApplicationError::Persistence)?
-                    .try_get("", "roster_ready")
-                    .map_err(persistence)?;
-                smtp_ready = !self.required_auth_process_ids.is_empty() && roster_ready;
+            if project_smtp.is_some() {
+                smtp_ready = true;
             } else if policy
                 .try_get::<bool>("", "allow_deployment_default")
                 .map_err(persistence)?
@@ -282,29 +227,8 @@ impl PostgresReadinessAdapter {
                     .is_some();
             }
         }
-        let protection_ready = transaction
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DbBackend::Postgres,
-                "SELECT 1 FROM email_protection_runtime_readiness protection
-                 JOIN auth_process_incarnations current
-                   ON current.process_id=protection.process_id
-                  AND current.process_incarnation=protection.process_incarnation
-                 WHERE protection.process_id=$1 AND protection.process_incarnation=$2
-                   AND protection.state='ready'
-                   AND protection.lease_expires_at>transaction_timestamp()
-                 FOR SHARE OF protection,current",
-                vec![
-                    self.process_id.to_string().into(),
-                    self.process_incarnation.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?
-            .is_some();
-        let email_available = email_policy.is_some()
-            && smtp_ready
-            && protection_ready
-            && active_signing_keys.len() == 1;
+        let email_available =
+            email_policy.is_some() && smtp_ready && active_signing_keys.len() == 1;
         let email_otp_enabled = email_available
             && email_policy
                 .as_ref()
@@ -358,10 +282,8 @@ impl PostgresReadinessAdapter {
         project_public_id: &str,
     ) -> Result<JwksDocument, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.lock_local_auth_incarnation(&transaction).await?;
-        // Control mutations serialize on the Project row exclusively. Keep the
-        // corresponding shared guard through lease observation so disablement and
-        // publication have one database ordering point, with no post-disable lease.
+        // Control mutations serialize on the Project row exclusively, and the shared guard keeps
+        // the returned key set ordered with project disablement and signing-key lifecycle changes.
         let project = project::Entity::find()
             .filter(project::Column::PublicId.eq(project_public_id))
             .filter(project::Column::Status.eq("active"))
@@ -399,123 +321,12 @@ impl PostgresReadinessAdapter {
             })
             .map(|key| key.public_jwk)
             .collect();
-        self.observe_revision(&transaction, project.id, ring.id, ring.revision)
-            .await?;
         transaction.commit().await.map_err(persistence)?;
         Ok(JwksDocument {
             keys,
             revision: ring.revision,
             signing_epoch: ring.signing_epoch,
         })
-    }
-
-    async fn observe_revision(
-        &self,
-        transaction: &sea_orm::DatabaseTransaction,
-        project_id: uuid::Uuid,
-        ring_id: uuid::Uuid,
-        loaded_revision: i64,
-    ) -> Result<(), ApplicationError> {
-        let now = database_now(transaction).await?;
-        let expires_at = now + self.lease_ttl;
-        let existing = runtime_publication_lease::Entity::find_by_id((
-            project_id,
-            ring_id,
-            self.process_id.to_string(),
-        ))
-        .lock_exclusive()
-        .one(transaction)
-        .await
-        .map_err(persistence)?;
-        match existing {
-            Some(existing) => {
-                if existing.loaded_revision > loaded_revision {
-                    return Err(ApplicationError::RevisionConflict);
-                }
-                let observation_restarted = existing.process_incarnation
-                    != self.process_incarnation
-                    || existing.loaded_revision < loaded_revision
-                    || existing.expires_at <= now;
-                let mut active = existing.into_active_model();
-                active.process_incarnation = Set(self.process_incarnation);
-                active.loaded_revision = Set(loaded_revision);
-                if observation_restarted {
-                    active.first_observed_at = Set(now);
-                }
-                active.last_observed_at = Set(now);
-                active.expires_at = Set(expires_at);
-                active.update(transaction).await.map_err(persistence)?;
-            }
-            None => {
-                runtime_publication_lease::ActiveModel {
-                    project_id: Set(project_id),
-                    ring_id: Set(ring_id),
-                    process_id: Set(self.process_id.to_string()),
-                    process_incarnation: Set(self.process_incarnation),
-                    loaded_revision: Set(loaded_revision),
-                    first_observed_at: Set(now),
-                    last_observed_at: Set(now),
-                    expires_at: Set(expires_at),
-                }
-                .insert(transaction)
-                .await
-                .map_err(persistence)?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn observe_signing_revisions(&self, limit: usize) -> Result<usize, ApplicationError> {
-        let limit = u64::try_from(limit).map_err(|_| ApplicationError::InvalidInput)?;
-        if !(1..=100).contains(&limit) {
-            return Err(ApplicationError::InvalidInput);
-        }
-        let rings = project_key_ring::Entity::find()
-            .filter(project_key_ring::Column::Purpose.eq("application_tokens"))
-            .filter(project_key_ring::Column::Algorithm.eq("EdDSA"))
-            .order_by_asc(project_key_ring::Column::ProjectId)
-            .order_by_asc(project_key_ring::Column::Id)
-            .limit(limit)
-            .all(&self.database)
-            .await
-            .map_err(persistence)?;
-        let mut observed = 0;
-        for ring in rings {
-            let Some(project) = project::Entity::find_by_id(ring.project_id)
-                .filter(project::Column::Status.eq("active"))
-                .one(&self.database)
-                .await
-                .map_err(persistence)?
-            else {
-                continue;
-            };
-            match self.project_jwks(&project.public_id).await {
-                Ok(_) => observed += 1,
-                Err(ApplicationError::NotFound | ApplicationError::RevisionConflict) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(observed)
-    }
-
-    async fn lock_local_auth_incarnation<C: ConnectionTrait>(
-        &self,
-        connection: &C,
-    ) -> Result<(), ApplicationError> {
-        let current = connection
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DbBackend::Postgres,
-                "SELECT 1 FROM auth_process_incarnations
-                 WHERE process_id=$1 AND process_incarnation=$2 FOR SHARE",
-                vec![
-                    self.process_id.to_string().into(),
-                    self.process_incarnation.into(),
-                ],
-            ))
-            .await
-            .map_err(persistence)?
-            .is_some();
-        current.then_some(()).ok_or(ApplicationError::Disabled)
     }
 }
 
@@ -546,7 +357,15 @@ fn persistence(_: impl std::fmt::Debug) -> ApplicationError {
 #[async_trait]
 impl ReadinessPort for PostgresReadinessAdapter {
     async fn readiness(&self) -> Result<(), ApplicationError> {
-        self.lock_local_auth_incarnation(&self.database).await
+        self.database
+            .query_one_raw(Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT 1 AS ready".to_owned(),
+            ))
+            .await
+            .map_err(persistence)?
+            .map(|_| ())
+            .ok_or(ApplicationError::Persistence)
     }
 
     async fn public_application_config(
@@ -567,9 +386,5 @@ impl ReadinessPort for PostgresReadinessAdapter {
         project_public_id: &str,
     ) -> Result<JwksDocument, ApplicationError> {
         PostgresReadinessAdapter::project_jwks(self, project_public_id).await
-    }
-
-    async fn observe_signing_revisions(&self, limit: usize) -> Result<usize, ApplicationError> {
-        PostgresReadinessAdapter::observe_signing_revisions(self, limit).await
     }
 }

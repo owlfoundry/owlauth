@@ -39,10 +39,10 @@ use crate::{
         CreateIdentityMutation, CreateIdentityMutationResult, CreateLoginTransaction,
         CreateManagedReauthorization, CreateManagedReauthorizationResult, DenyProviderCallback,
         DisableProjectUser, EnableProjectUser, ExpectedIdentity, ExpectedUser,
-        FailManagedReauthorization, FailProviderExchange, IdentityMutationBindingsDisposition,
+        FailManagedReauthorization, IdentityMutationBindingsDisposition,
         IdentityMutationCreateOperation, IdentityMutationPrimarySourceDisposition,
         IdentityMutationProofAuthoritySelection, IdentityMutationProviderCapabilities,
-        IdentityMutationSessionsDisposition, LoginRevisionSnapshot, LogoutApplicationSession,
+        IdentityMutationSessionsDisposition, LoginRevisionSnapshot,
         ManagedAdapterCapabilitySnapshot, ManagedConnectionRepository, ManagedCredentialCapability,
         ManagedCredentialContext, ManagedCredentialProtector, ManagedInteractionCleanupService,
         ManagedReauthorizationRepository, ManagedReauthorizationStatus, PrepareBrowserLogout,
@@ -389,17 +389,6 @@ async fn start_postgres() -> Option<(testcontainers::ContainerAsync<GenericImage
     reason = "the fixture keeps one coherent PostgreSQL authority seed visible"
 )]
 async fn seed_authority(pool: &PgPool, now: OffsetDateTime, namespace: &str) -> SeededAuthority {
-    sqlx::query(
-        "INSERT INTO auth_process_incarnations
-         (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, $2)
-         ON CONFLICT (process_id) DO UPDATE SET
-           process_incarnation=EXCLUDED.process_incarnation, started_at=EXCLUDED.started_at",
-    )
-    .bind(Uuid::nil())
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("claim exact test Runtime incarnation");
     let project_public_id = format!("prj_{namespace}");
     let application_public_id = format!("app_{namespace}");
     let callback_url =
@@ -3191,7 +3180,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         refresh_generation_id: Uuid::new_v4(),
         ..stale_exchange
     };
-    let stale_incarnation_exchange = exchange.clone();
     let (exchange_a, exchange_b) = tokio::join!(
         sessions.commit_handoff_exchange(exchange.clone()),
         sessions.commit_handoff_exchange(exchange)
@@ -3356,7 +3344,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         successor_token: digest(14),
         ..refresh_a.clone()
     };
-    let stale_incarnation_refresh = refresh_a.clone();
     let (rotated_a, rotated_b) = tokio::join!(
         sessions.rotate_refresh_token(refresh_a),
         sessions.rotate_refresh_token(refresh_b)
@@ -3434,7 +3421,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
         expected_interaction_revision: bound.interaction_revision,
         now: refresh_at + Duration::seconds(3),
     };
-    let stale_incarnation_browser_logout = confirm.clone();
     let (confirmed_a, confirmed_b) = tokio::join!(
         sessions.confirm_browser_logout(confirm.clone()),
         sessions.confirm_browser_logout(confirm)
@@ -3453,67 +3439,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
             .await
             .expect("load browser session");
     assert_eq!(browser_status, "terminated");
-
-    sqlx::query(
-        "UPDATE application_user_projections
-         SET document=jsonb_set(document, '{display_name}', to_jsonb('stale_after_replacement'::text)),
-             canonical_digest=decode(repeat('03', 32), 'hex')
-         WHERE binding_id=$1",
-    )
-    .bind(session.binding_id)
-    .execute(&pool)
-    .await
-    .expect("corrupt projection before stale current-session read");
-    let audit_before_replacement: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
-        .fetch_one(&pool)
-        .await
-        .expect("count audit events before Runtime replacement");
-    let refresh_before_replacement: (String, i64, i64, i64) = sqlx::query_as(
-        "SELECT status, family_revision::BIGINT, current_generation::BIGINT,
-           (SELECT count(*) FROM refresh_token_generations WHERE family_id=$1)
-         FROM refresh_families WHERE id=$1",
-    )
-    .bind(session.refresh_family_id)
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot refresh authority before Runtime replacement");
-    let browser_before_replacement: (String, i64) = sqlx::query_as(
-        "SELECT status, session_revision::BIGINT FROM project_browser_sessions WHERE id=$1",
-    )
-    .bind(browser_session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot browser session before Runtime replacement");
-    let logout_before_replacement: (String, i64) = sqlx::query_as(
-        "SELECT status, interaction_revision::BIGINT
-         FROM project_browser_logout_interactions WHERE preparation_digest=$1",
-    )
-    .bind(digest(15).value.to_vec())
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot browser logout before Runtime replacement");
-    let authority_counts_before_replacement: (i64, i64, i64) = sqlx::query_as(
-        "SELECT
-           (SELECT count(*) FROM handoff_tickets),
-           (SELECT count(*) FROM application_sessions),
-           (SELECT count(*) FROM application_user_bindings)",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot authority row counts before Runtime replacement");
-    let projection_before_replacement: (i64, String, String) = sqlx::query_as(
-        "SELECT projection_revision::BIGINT, document::TEXT, encode(canonical_digest, 'hex')
-         FROM application_user_projections WHERE binding_id=$1",
-    )
-    .bind(session.binding_id)
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot projection before Runtime replacement");
-    let login_count_before_replacement: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM login_transactions")
-            .fetch_one(&pool)
-            .await
-            .expect("count logins before Runtime replacement");
 
     // One disabled and one active Application may intentionally share an origin. Project-level
     // CORS authorization is existential and must not route through an arbitrary disabled owner.
@@ -3544,244 +3469,6 @@ async fn callback_handoff_and_refresh_replay_are_authoritative_in_postgres() {
             .await
             .expect("active sibling authorizes shared origin")
     );
-
-    let replacement_auth_incarnation = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO auth_process_incarnations
-         (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, $2)
-         ON CONFLICT (process_id) DO UPDATE SET
-           process_incarnation=EXCLUDED.process_incarnation, started_at=EXCLUDED.started_at",
-    )
-    .bind(replacement_auth_incarnation)
-    .bind(refresh_at + Duration::seconds(4))
-    .execute(&pool)
-    .await
-    .expect("replace the Runtime incarnation");
-    let disabled = crate::application::ApplicationError::Disabled;
-    assert_eq!(
-        authentication
-            .create_login_transaction(CreateLoginTransaction {
-                id: Uuid::new_v4(),
-                project_id: seeded.project_id,
-                application_id: seeded.application_id,
-                interaction: digest(31),
-                redirect_uri: "https://app.example/callback".to_owned(),
-                application_pkce_challenge: "A".repeat(43),
-                application_state: protected(32),
-                presentation_hint: None,
-                revisions: LoginRevisionSnapshot {
-                    project_metadata_revision: 1,
-                    project_security_revision: 1,
-                    application_security_revision: 1,
-                    claims_revision: 1,
-                    session_revision: 1,
-                },
-                created_at: refresh_at + Duration::seconds(4),
-                expires_at: refresh_at + Duration::minutes(10) + Duration::seconds(4),
-                admitted_providers: vec![AdmittedProviderMethod {
-                    kind: crate::domain::ProviderKind::Oidc,
-                    method_key: seeded.provider_key.clone(),
-                    provider_id: seeded.provider_id,
-                    display_name: "OIDC".to_owned(),
-                    issuer: "https://issuer.example".to_owned(),
-                    provider_revision: 1,
-                    provider_egress_policy_revision: Some(1),
-                    assignment_security_revision: 1,
-                }],
-                admitted_email: None,
-            })
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        sessions
-            .commit_handoff_exchange(stale_incarnation_exchange)
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        sessions
-            .complete_authenticated_identity(completion_command(&seeded, &claimed, 41, now))
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        authentication
-            .fail_provider_exchange(FailProviderExchange {
-                project_id: seeded.project_id,
-                transaction_id: login.id,
-                expected_transaction_revision: 1,
-                now: refresh_at + Duration::seconds(4),
-            })
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        sessions
-            .rotate_refresh_token(stale_incarnation_refresh)
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        sessions
-            .logout_application_session(LogoutApplicationSession {
-                project_id: seeded.project_id,
-                application_id: seeded.application_id,
-                user_id: issued.user_id,
-                application_session_id: session.application_session_id,
-                now: refresh_at + Duration::seconds(4),
-            })
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        sessions
-            .recover_abandoned_provider_exchanges(RecoverProviderExchanges {
-                abandoned_before: refresh_at,
-                now: refresh_at + Duration::seconds(4),
-                limit: 10,
-            })
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        sessions
-            .confirm_browser_logout(stale_incarnation_browser_logout)
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .resolve_application(&seeded.project_public_id, "app_session01", "pk_unused")
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .resolve_public_application(&seeded.project_public_id, "app_session01")
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .exact_application_origin(
-                seeded.project_id,
-                seeded.application_id,
-                "https://app.example",
-            )
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .project_origin_allowed(&seeded.project_public_id, "https://app.example")
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .browser_session_reuse_available(seeded.project_id, &digest(9), refresh_at)
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .verification_key(&seeded.project_public_id, "kid_test01", refresh_at)
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .browser_logout_context(&digest(15), refresh_at)
-            .await,
-        Err(disabled)
-    );
-    assert_eq!(
-        runtime
-            .current_session(
-                AccessTokenSessionLookup {
-                    project_id: seeded.project_id,
-                    application_public_id: "app_session01".to_owned(),
-                    user_public_id: issued.user_public_id.clone(),
-                    application_session_id: session.application_session_id,
-                    claims_revision: 1,
-                    now: refresh_at,
-                },
-                false,
-            )
-            .await,
-        Err(disabled)
-    );
-    let login_count_after_replacement: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM login_transactions")
-            .fetch_one(&pool)
-            .await
-            .expect("count logins after stale Runtime calls");
-    assert_eq!(
-        login_count_after_replacement,
-        login_count_before_replacement
-    );
-    let application_session_status: String =
-        sqlx::query_scalar("SELECT status FROM application_sessions WHERE id=$1")
-            .bind(session.application_session_id)
-            .fetch_one(&pool)
-            .await
-            .expect("load application session after stale logout");
-    assert_eq!(application_session_status, "active");
-    let audit_after_replacement: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
-        .fetch_one(&pool)
-        .await
-        .expect("count audit events after stale calls");
-    let refresh_after_replacement: (String, i64, i64, i64) = sqlx::query_as(
-        "SELECT status, family_revision::BIGINT, current_generation::BIGINT,
-           (SELECT count(*) FROM refresh_token_generations WHERE family_id=$1)
-         FROM refresh_families WHERE id=$1",
-    )
-    .bind(session.refresh_family_id)
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot refresh authority after stale calls");
-    let browser_after_replacement: (String, i64) = sqlx::query_as(
-        "SELECT status, session_revision::BIGINT FROM project_browser_sessions WHERE id=$1",
-    )
-    .bind(browser_session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot browser session after stale calls");
-    let logout_after_replacement: (String, i64) = sqlx::query_as(
-        "SELECT status, interaction_revision::BIGINT
-         FROM project_browser_logout_interactions WHERE preparation_digest=$1",
-    )
-    .bind(digest(15).value.to_vec())
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot browser logout after stale calls");
-    let authority_counts_after_replacement: (i64, i64, i64) = sqlx::query_as(
-        "SELECT
-           (SELECT count(*) FROM handoff_tickets),
-           (SELECT count(*) FROM application_sessions),
-           (SELECT count(*) FROM application_user_bindings)",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot authority row counts after stale calls");
-    let projection_after_replacement: (i64, String, String) = sqlx::query_as(
-        "SELECT projection_revision::BIGINT, document::TEXT, encode(canonical_digest, 'hex')
-         FROM application_user_projections WHERE binding_id=$1",
-    )
-    .bind(session.binding_id)
-    .fetch_one(&pool)
-    .await
-    .expect("snapshot projection after stale current-session read");
-    assert_eq!(audit_after_replacement, audit_before_replacement);
-    assert_eq!(refresh_after_replacement, refresh_before_replacement);
-    assert_eq!(browser_after_replacement, browser_before_replacement);
-    assert_eq!(logout_after_replacement, logout_before_replacement);
-    assert_eq!(
-        authority_counts_after_replacement,
-        authority_counts_before_replacement
-    );
-    assert_eq!(projection_after_replacement, projection_before_replacement);
 
     let control =
         PostgresControlLifecycleRepository::new(database.clone(), test_projection_materializer());
@@ -8521,13 +8208,8 @@ async fn project_graph_lock_serializes_merge_against_handoff_and_refresh_writers
     let authentication = PostgresAuthenticationRepository::new(database.clone());
     let sessions =
         PostgresSessionAuthorityRepository::new(database.clone(), test_projection_materializer());
-    let mutations = PostgresIdentityMutationRepository::new(
-        database.clone(),
-        "auth-1".to_owned(),
-        Uuid::nil(),
-        test_projection_materializer(),
-        Vec::new(),
-    );
+    let mutations =
+        PostgresIdentityMutationRepository::new(database.clone(), test_projection_materializer());
 
     // Construct a real, ready Merge aggregate through the production lifecycle. An external row
     // lock pauses confirm_control only after it owns the graph lock. The real handoff writer must

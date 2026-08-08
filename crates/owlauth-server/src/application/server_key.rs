@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -197,8 +197,6 @@ pub(crate) trait ServerKeyIssuer: Send + Sync {
 }
 
 pub(crate) trait ServerKeyVerifier: Send + Sync {
-    fn readable_versions(&self) -> BTreeSet<i32>;
-
     fn digest_candidate(
         &self,
         project_id: Uuid,

@@ -28,6 +28,7 @@ import {
   ApplicationDelivery,
   type ApplicationDeliveryDraft,
 } from "../features/ApplicationDelivery";
+import { ApplicationAuthentication } from "../features/ApplicationAuthentication";
 import { type Application, ControlRequestError, requireData } from "../client";
 import styles from "./pages.module.css";
 
@@ -281,7 +282,9 @@ export function ApplicationDetailPage() {
       JSON.stringify(compactStringList(allowedOrigins)) !==
         JSON.stringify(application.configuration.allowed_origins));
   const requestedSection = searchParams.get("section");
-  const section = ["general", "urls", "webhooks", "advanced"].includes(requestedSection ?? "")
+  const section = ["general", "authentication", "urls", "webhooks", "advanced"].includes(
+    requestedSection ?? "",
+  )
     ? requestedSection
     : "general";
   const copyToast = (message: string) => {
@@ -327,6 +330,7 @@ export function ApplicationDetailPage() {
         {(
           [
             ["general", "General"],
+            ["authentication", "Authentication"],
             ["urls", "Login URLs"],
             ["webhooks", "Webhooks"],
             ["advanced", "Advanced"],
@@ -391,6 +395,18 @@ export function ApplicationDetailPage() {
             ]}
           />
         </Section>
+      ) : null}
+      {section === "authentication" ? (
+        <ApplicationAuthentication
+          session={session}
+          application={application}
+          editable={active}
+          onApplicationChanged={refresh}
+          onError={handleError}
+          setMessage={(message) => {
+            setMessage(message, "success");
+          }}
+        />
       ) : null}
       {section === "urls" ? (
         <Section

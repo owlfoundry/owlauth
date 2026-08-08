@@ -169,7 +169,6 @@ struct Fixture {
     database: DatabaseConnection,
     repository: PostgresIdentityMutationRepository,
     protector: Arc<SoftwareRuntimeProtector>,
-    incarnation: Uuid,
     project_id: Uuid,
     application_id: Uuid,
     provider_id: Uuid,
@@ -252,26 +251,9 @@ async fn fixture_with_provider(
         .await
         .expect("connect identity-mutation database");
     MIGRATOR.run(&sqlx).await.expect("apply migrations");
-    sqlx::query(
-        "INSERT INTO email_identity_alias_authority
-         (singleton,revision,write_version,target_version,accepted_versions)
-         VALUES (TRUE,1,1,1,'[1]'::jsonb)",
-    )
-    .execute(&sqlx)
-    .await
-    .expect("seed email identity alias authority");
     let database: DatabaseConnection = Database::connect(&url)
         .await
         .expect("connect SeaORM identity-mutation database");
-    let incarnation = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO auth_process_incarnations(process_id,process_incarnation,started_at)
-         VALUES ('identity-mutation-test',$1,clock_timestamp())",
-    )
-    .bind(incarnation)
-    .execute(&sqlx)
-    .await
-    .expect("seed Runtime incarnation");
     let protector = Arc::new(
         SoftwareRuntimeProtector::new(
             "identity-mutation-test".to_owned(),
@@ -283,10 +265,7 @@ async fn fixture_with_provider(
     );
     let repository = PostgresIdentityMutationRepository::new(
         database.clone(),
-        "identity-mutation-test".to_owned(),
-        incarnation,
         fixture_projection_materializer(),
-        Vec::new(),
     );
     let project_id = Uuid::new_v4();
     let application_id = Uuid::new_v4();
@@ -402,16 +381,6 @@ async fn fixture_with_provider(
     .execute(&sqlx)
     .await
     .expect("seed deployment SMTP");
-    sqlx::query(
-        "INSERT INTO email_protection_runtime_readiness
-         (process_id,process_incarnation,state,failure_class,checked_at,lease_expires_at)
-         VALUES ('identity-mutation-test',$1,'ready',NULL,clock_timestamp(),
-                 clock_timestamp()+interval '10 minutes')",
-    )
-    .bind(incarnation)
-    .execute(&sqlx)
-    .await
-    .expect("seed email protection readiness");
     let mut seed = sqlx.begin().await.expect("begin user seed");
     sqlx::query(
         "INSERT INTO project_users
@@ -455,7 +424,6 @@ async fn fixture_with_provider(
         database,
         repository,
         protector,
-        incarnation,
         project_id,
         application_id,
         provider_id,
@@ -913,14 +881,14 @@ async fn committed_candidate_email_challenge(
             challenge_id,
             outbox_id,
             canonicalization_version: 1,
-            lookup_digest: digest(103),
-            address: protected(104, 41),
+            lookup_digest: digest(handle.wrapping_add(5)),
+            recipient_digests: vec![digest(handle.wrapping_add(5))],
+            address: protected(handle.wrapping_add(6), 41),
             otp_digest: Some(otp.clone()),
             magic_digest: None,
-            envelope: protected(105, 41),
-            body: protected(106, 41),
+            envelope: protected(handle.wrapping_add(7), 41),
+            body: protected(handle.wrapping_add(8), 41),
             message_id: format!("mutation-{outbox_id}"),
-            suppress_delivery: false,
             admitted_method: generation.policy,
             issued_at: OffsetDateTime::UNIX_EPOCH,
             otp_expires_at: None,
@@ -971,11 +939,7 @@ async fn committed_login_email_challenge(
         smtp_generation: 1,
         smtp_security_eligibility_revision: 1,
     };
-    let authentication = PostgresAuthenticationRepository::new_with_runtime_identity(
-        fixture.database.clone(),
-        "identity-mutation-test".to_owned(),
-        fixture.incarnation,
-    );
+    let authentication = PostgresAuthenticationRepository::new(fixture.database.clone());
     let login_id = Uuid::new_v4();
     let now = OffsetDateTime::now_utc();
     authentication
@@ -1047,13 +1011,13 @@ async fn committed_login_email_challenge(
             outbox_id,
             canonicalization_version: 1,
             lookup_digest: digest(seed.wrapping_add(4)),
+            recipient_digests: vec![digest(seed.wrapping_add(4))],
             address: protected(seed.wrapping_add(5), 41),
             otp_digest: Some(digest(seed.wrapping_add(6))),
             magic_digest: None,
             envelope: protected(seed.wrapping_add(7), 41),
             body: protected(seed.wrapping_add(8), 41),
             message_id: format!("healthy-login-{outbox_id}"),
-            suppress_delivery: false,
             issued_at: now,
             otp_expires_at: Some(now + Duration::minutes(5)),
             magic_expires_at: None,
@@ -1062,6 +1026,91 @@ async fn committed_login_email_challenge(
         .await
         .expect("commit healthy login email");
     (login_id, challenge_id, outbox_id)
+}
+
+#[tokio::test]
+async fn mutation_recipient_suppression_commits_terminal_generation_without_outbox() {
+    let Some(fixture) = fixture().await else {
+        return;
+    };
+    let email = PostgresPasswordlessEmailRepository::new(fixture.database.clone());
+    let (_login_id, _login_challenge, _login_outbox) =
+        committed_login_email_challenge(&fixture, &email, 99).await;
+
+    let intent_id = Uuid::new_v4();
+    let (record, slot_id, challenge_id, _generation, _otp) = committed_candidate_email_challenge(
+        &fixture,
+        "recipient-suppressed-mutation",
+        intent_id,
+        98,
+    )
+    .await;
+    assert_eq!(
+        record
+            .slots
+            .iter()
+            .find(|slot| slot.id == slot_id)
+            .expect("suppressed mutation email slot")
+            .state,
+        crate::domain::IdentityMutationSlotState::EmailChallengePending
+    );
+    let delivery_shape: (String, i64) = sqlx::query_as(
+        "SELECT challenge.status,
+                (SELECT COUNT(*) FROM mail_outbox outbox
+                  WHERE outbox.project_id=challenge.project_id
+                    AND outbox.challenge_id=challenge.id
+                    AND outbox.challenge_generation=challenge.generation)
+           FROM email_challenges challenge
+          WHERE challenge.project_id=$1 AND challenge.id=$2",
+    )
+    .bind(fixture.project_id)
+    .bind(challenge_id)
+    .fetch_one(&fixture.sqlx)
+    .await
+    .expect("read suppressed mutation delivery shape");
+    assert_eq!(delivery_shape, ("delivery_unavailable".to_owned(), 0));
+
+    fixture
+        .repository
+        .cancel(
+            fixture.project_id,
+            intent_id,
+            record.revision,
+            Uuid::new_v4(),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("cancel suppressed mutation aggregate");
+    let terminal_shape: (String, String, String, i64) = sqlx::query_as(
+        "SELECT intent.status,slot.state,challenge.status,
+                (SELECT COUNT(*) FROM mail_outbox outbox
+                  WHERE outbox.project_id=challenge.project_id
+                    AND outbox.challenge_id=challenge.id
+                    AND outbox.challenge_generation=challenge.generation)
+           FROM identity_mutation_intents intent
+           JOIN identity_mutation_proof_slots slot
+             ON slot.project_id=intent.project_id AND slot.intent_id=intent.id
+           JOIN email_challenges challenge
+             ON challenge.project_id=slot.project_id
+            AND challenge.identity_mutation_intent_id=slot.intent_id
+            AND challenge.identity_mutation_proof_slot_id=slot.id
+          WHERE intent.project_id=$1 AND intent.id=$2 AND slot.id=$3",
+    )
+    .bind(fixture.project_id)
+    .bind(intent_id)
+    .bind(slot_id)
+    .fetch_one(&fixture.sqlx)
+    .await
+    .expect("read cancelled suppressed mutation shape");
+    assert_eq!(
+        terminal_shape,
+        (
+            "cancelled".to_owned(),
+            "expired".to_owned(),
+            "expired".to_owned(),
+            0,
+        )
+    );
 }
 
 #[tokio::test]
@@ -1702,13 +1751,7 @@ async fn effective_receipt_deadline_terminalizes_email_lookup_and_mail_claim_wit
         committed_candidate_email_challenge(&fixture, "mail-effective-deadline", mail_intent, 123)
             .await;
     expire_attached_receipts_with_database_clock(&fixture, mail_intent).await;
-    let email = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        fixture.database.clone(),
-        "identity-mutation-test".to_owned(),
-        fixture.incarnation,
-        Vec::new(),
-        Duration::minutes(5),
-    );
+    let email = PostgresPasswordlessEmailRepository::new(fixture.database.clone());
     assert!(
         email
             .claim_due_mail(
@@ -1766,13 +1809,7 @@ async fn generic_mail_maintenance_terminalizes_mutation_owner_without_partial_ch
         .await
         .expect("restore triggers after expired challenge fixture");
     drop(setup);
-    let email = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        fixture.database.clone(),
-        "identity-mutation-test".to_owned(),
-        fixture.incarnation,
-        Vec::new(),
-        Duration::minutes(5),
-    );
+    let email = PostgresPasswordlessEmailRepository::new(fixture.database.clone());
     let maintained = email
         .maintain_short_term_data(OffsetDateTime::UNIX_EPOCH, 100)
         .await
@@ -1866,13 +1903,7 @@ async fn mutation_mail_final_outbox_wait_rechecks_receipt_effective_deadline_ato
         .fetch_one(&mut *blocker)
         .await
         .expect("read receipt-deadline blocker backend");
-    let email = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        fixture.database.clone(),
-        "identity-mutation-test".to_owned(),
-        fixture.incarnation,
-        Vec::new(),
-        Duration::minutes(5),
-    );
+    let email = PostgresPasswordlessEmailRepository::new(fixture.database.clone());
     let claiming = tokio::spawn(async move {
         email
             .claim_due_mail(
@@ -2273,13 +2304,13 @@ async fn email_link_confirmation_waits_for_graph_before_email_namespace() {
             outbox_id,
             canonicalization_version: 1,
             lookup_digest: lookup_digest.clone(),
+            recipient_digests: vec![lookup_digest.clone()],
             address: protected(83, 41),
             otp_digest: None,
             magic_digest: Some(magic_digest.clone()),
             envelope: protected(84, 41),
             body: protected(85, 41),
             message_id: format!("email-link-{outbox_id}"),
-            suppress_delivery: false,
             admitted_method: generation.policy,
             issued_at: OffsetDateTime::UNIX_EPOCH,
             otp_expires_at: None,
@@ -2525,41 +2556,26 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     };
 
     // Exercise the production composition, not Option-only sentinels, against this real database.
-    // Auth and All use a real non-nil incarnation fence; split Control and Auth share the same
-    // PostgreSQL authority while retaining disjoint capabilities.
+    // Split Control and Auth share PostgreSQL authority while retaining disjoint capabilities.
     let runtime_config = identity_mutation_composition_config(ProcessMode::Auth);
     let runtime_pools = DatabasePools {
         runtime: Some(fixture.database.clone()),
         server: None,
         control: None,
     };
-    let runtime_only = build_routers_with_auth_incarnation(
-        &runtime_config,
-        Some(&runtime_pools),
-        fixture.incarnation,
-    );
+    let runtime_only =
+        build_routers_with_auth_incarnation(&runtime_config, Some(&runtime_pools), Uuid::new_v4());
     let runtime_repository = runtime_only
         .runtime_identity_mutations
         .clone()
-        .expect("Auth production composition exposes the fenced repository");
+        .expect("Auth production composition exposes the Runtime repository");
     assert!(runtime_only.control_identity_mutations.is_none());
     assert_eq!(
         runtime_repository
             .repository_digest_versions(Uuid::new_v4(), OffsetDateTime::UNIX_EPOCH)
             .await,
         Err(ApplicationError::NotFound),
-        "a current non-nil Runtime incarnation reaches the real transaction"
-    );
-    let stale_runtime =
-        build_routers_with_auth_incarnation(&runtime_config, Some(&runtime_pools), Uuid::new_v4());
-    assert_eq!(
-        stale_runtime
-            .runtime_identity_mutations
-            .expect("stale Runtime facade is composed but fenced")
-            .repository_digest_versions(Uuid::new_v4(), OffsetDateTime::UNIX_EPOCH)
-            .await,
-        Err(ApplicationError::Disabled),
-        "production Runtime composition rejects a stale non-nil incarnation"
+        "Runtime composition reaches the real transaction"
     );
 
     let control_config = identity_mutation_composition_config(ProcessMode::Control);
@@ -2595,8 +2611,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         server: None,
         control: Some(fixture.database.clone()),
     };
-    let all =
-        build_routers_with_auth_incarnation(&all_config, Some(&all_pools), fixture.incarnation);
+    let all = build_routers_with_auth_incarnation(&all_config, Some(&all_pools), Uuid::new_v4());
     assert!(all.control_identity_mutations.is_some());
     assert_eq!(
         all.runtime_identity_mutations
@@ -2604,7 +2619,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
             .repository_digest_versions(Uuid::new_v4(), OffsetDateTime::UNIX_EPOCH)
             .await,
         Err(ApplicationError::NotFound),
-        "All mode uses the same current-incarnation transaction fence"
+        "All mode reaches the same Runtime authority"
     );
 
     let removable_id = Uuid::new_v4();
@@ -2821,10 +2836,6 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         .await
         .expect("prepare unlink confirmation");
     assert!(preparation.candidate_evidence.is_none());
-    sqlx::query("DELETE FROM auth_process_incarnations WHERE process_id='identity-mutation-test'")
-        .execute(&fixture.sqlx)
-        .await
-        .expect("take Auth process offline before ordinary Control confirmation");
     let confirmation = PreparedIdentityMutationConfirmation {
         project_id: fixture.project_id,
         intent_id,
@@ -2837,7 +2848,6 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     let failing_control = PostgresControlIdentityMutationRepository::new(
         fixture.database.clone(),
         Arc::new(FailingProjectionMaterializer),
-        Vec::new(),
     );
     sqlx::query("UPDATE email_identities SET identity_revision=identity_revision+1 WHERE id=$1")
         .bind(email_identity_id)
@@ -2890,15 +2900,6 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
         rolled_back,
         ("ready".to_owned(), "active".to_owned(), "issued".to_owned())
     );
-    let source_reader = Arc::new(
-        SoftwareDurableEmailAddressReader::new(
-            "identity-mutation-test".to_owned(),
-            1,
-            RuntimeKeyMaterial::new([11; 32], [12; 32]),
-            BTreeMap::new(),
-        )
-        .expect("Control exact durable-email reader"),
-    );
     let projection_protector = Arc::new(
         SoftwareProjectionVerifiedEmailProtector::new(
             "identity-mutation-test".to_owned(),
@@ -2914,36 +2915,12 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
             Arc::new(UnavailableDurableEmailAddressReader),
             projection_protector.clone(),
         )),
-        Vec::new(),
     );
     assert!(matches!(
         missing_source.confirm_control(confirmation.clone()).await,
         Err(ApplicationError::Disabled)
     ));
-    let stale_projection_protector = Arc::new(
-        SoftwareProjectionVerifiedEmailProtector::new(
-            "identity-mutation-test".to_owned(),
-            2,
-            [72; 32],
-            BTreeMap::new(),
-        )
-        .expect("stale projection writer"),
-    );
-    let stale_projection_authority = PostgresControlIdentityMutationRepository::new(
-        fixture.database.clone(),
-        Arc::new(PostgresIdentityProjectionMaterializer::new(
-            source_reader.clone(),
-            stale_projection_protector,
-        )),
-        Vec::new(),
-    );
-    assert!(matches!(
-        stale_projection_authority
-            .confirm_control(confirmation.clone())
-            .await,
-        Err(ApplicationError::Disabled)
-    ));
-    let key_failure_rollback: (String, String, i64, Option<i32>) = sqlx::query_as(
+    let source_failure_rollback: (String, String, i64, Option<i32>) = sqlx::query_as(
         "SELECT intent.status,identity.status,projection.projection_revision,
                 projection.verified_email_key_version
            FROM identity_mutation_intents intent
@@ -2958,7 +2935,7 @@ async fn final_unlink_consumes_receipt_and_atomically_disables_only_target_ident
     .await
     .expect("read key-failure rollback state");
     assert_eq!(
-        key_failure_rollback,
+        source_failure_rollback,
         ("ready".to_owned(), "active".to_owned(), 1, None)
     );
     let completed = split_control_repository
@@ -3612,6 +3589,7 @@ async fn mutation_mail_claim_uses_newest_generation_and_exact_typed_owner() {
             outbox_id: first_outbox,
             canonicalization_version: 1,
             lookup_digest: digest(26),
+            recipient_digests: vec![digest(26)],
             address: protected(27, 41),
             otp_digest: Some(digest(28)),
             magic_digest: None,
@@ -3628,7 +3606,6 @@ async fn mutation_mail_claim_uses_newest_generation_and_exact_typed_owner() {
                 .protect(ProtectedPurpose::EmailOutboxBody, &first_aad, b"first body")
                 .expect("protect first body"),
             message_id: format!("mutation-{first_outbox}"),
-            suppress_delivery: false,
             admitted_method: first.policy,
             issued_at: OffsetDateTime::UNIX_EPOCH,
             otp_expires_at: None,
@@ -3732,6 +3709,7 @@ async fn mutation_mail_claim_uses_newest_generation_and_exact_typed_owner() {
             outbox_id: second_outbox,
             canonicalization_version: 1,
             lookup_digest: digest(31),
+            recipient_digests: vec![digest(31)],
             address: protected(32, 41),
             otp_digest: Some(digest(33)),
             magic_digest: None,
@@ -3752,7 +3730,6 @@ async fn mutation_mail_claim_uses_newest_generation_and_exact_typed_owner() {
                 )
                 .expect("protect second body"),
             message_id: format!("mutation-{second_outbox}"),
-            suppress_delivery: false,
             admitted_method: second.policy,
             issued_at: OffsetDateTime::UNIX_EPOCH,
             otp_expires_at: None,
@@ -3762,13 +3739,7 @@ async fn mutation_mail_claim_uses_newest_generation_and_exact_typed_owner() {
         .await
         .expect("commit second generation");
 
-    let email = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        fixture.database.clone(),
-        "identity-mutation-test".to_owned(),
-        fixture.incarnation,
-        Vec::new(),
-        Duration::minutes(5),
-    );
+    let email = PostgresPasswordlessEmailRepository::new(fixture.database.clone());
 
     // Queue an older login-owned row whose current policy is stale. The global lane selector sees
     // it first, the fully authoritative login query rejects it, and the mutation lane must still
@@ -3851,11 +3822,7 @@ async fn mutation_mail_claim_uses_newest_generation_and_exact_typed_owner() {
         smtp_generation: 1,
         smtp_security_eligibility_revision: 1,
     };
-    let authentication = PostgresAuthenticationRepository::new_with_runtime_identity(
-        fixture.database.clone(),
-        "identity-mutation-test".to_owned(),
-        fixture.incarnation,
-    );
+    let authentication = PostgresAuthenticationRepository::new(fixture.database.clone());
     let login_id = Uuid::new_v4();
     let login_now = OffsetDateTime::now_utc();
     authentication
@@ -3927,13 +3894,13 @@ async fn mutation_mail_claim_uses_newest_generation_and_exact_typed_owner() {
             outbox_id: login_outbox,
             canonicalization_version: 1,
             lookup_digest: digest(105),
+            recipient_digests: vec![digest(105)],
             address: protected(106, 41),
             otp_digest: Some(digest(107)),
             magic_digest: None,
             envelope: protected(108, 41),
             body: protected(109, 41),
             message_id: format!("stale-login-{login_outbox}"),
-            suppress_delivery: false,
             issued_at: login_now,
             otp_expires_at: Some(login_now + Duration::minutes(5)),
             magic_expires_at: None,
@@ -4165,13 +4132,7 @@ async fn post_selection_invalidation_recompares_globally_before_switching_lanes(
     let Some(fixture) = fixture().await else {
         return;
     };
-    let email = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        fixture.database.clone(),
-        "identity-mutation-test".to_owned(),
-        fixture.incarnation,
-        Vec::new(),
-        Duration::minutes(5),
-    );
+    let email = PostgresPasswordlessEmailRepository::new(fixture.database.clone());
 
     let mutation_a = Uuid::new_v4();
     let (_a_record, _a_slot, a_challenge, _a_generation, _a_otp) =
@@ -4182,7 +4143,7 @@ async fn post_selection_invalidation_recompares_globally_before_switching_lanes(
         committed_candidate_email_challenge(&fixture, "post-selection-mutation-b", mutation_b, 152)
             .await;
     let (_login_id, _login_challenge, login_outbox) =
-        committed_login_email_challenge(&fixture, &email, 153).await;
+        committed_login_email_challenge(&fixture, &email, 160).await;
     let a_outbox: Uuid = sqlx::query_scalar("SELECT id FROM mail_outbox WHERE challenge_id=$1")
         .bind(a_challenge)
         .fetch_one(&fixture.sqlx)

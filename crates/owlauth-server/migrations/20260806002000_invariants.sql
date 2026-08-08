@@ -243,14 +243,6 @@ ALTER TABLE ONLY public.audit_events
 
 
 --
--- Name: server_key_digest_readiness server_key_digest_readiness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.server_key_digest_readiness
-    ADD CONSTRAINT server_key_digest_readiness_pkey PRIMARY KEY (process_id);
-
-
---
 -- Name: control_idempotency_records control_idempotency_records_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -371,30 +363,6 @@ ALTER TABLE ONLY public.email_identities
 
 
 --
--- Name: email_identity_alias_authority_events email_identity_alias_authority_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.email_identity_alias_authority_events
-    ADD CONSTRAINT email_identity_alias_authority_events_pkey PRIMARY KEY (id);
-
-
---
--- Name: email_identity_alias_authority email_identity_alias_authority_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.email_identity_alias_authority
-    ADD CONSTRAINT email_identity_alias_authority_pkey PRIMARY KEY (singleton);
-
-
---
--- Name: email_identity_alias_runtime_observations email_identity_alias_runtime_observations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.email_identity_alias_runtime_observations
-    ADD CONSTRAINT email_identity_alias_runtime_observations_pkey PRIMARY KEY (process_id);
-
-
---
 -- Name: email_identity_aliases email_identity_aliases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -408,14 +376,6 @@ ALTER TABLE ONLY public.email_identity_aliases
 
 ALTER TABLE ONLY public.email_identity_aliases
     ADD CONSTRAINT email_identity_aliases_project_id_canonicalization_version__key UNIQUE (project_id, canonicalization_version, digest_key_version, lookup_digest);
-
-
---
--- Name: email_protection_runtime_readiness email_protection_runtime_readiness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.email_protection_runtime_readiness
-    ADD CONSTRAINT email_protection_runtime_readiness_pkey PRIMARY KEY (process_id);
 
 
 --
@@ -1083,14 +1043,6 @@ ALTER TABLE ONLY public.project_smtp_configurations
 
 
 --
--- Name: project_smtp_runtime_readiness project_smtp_runtime_readiness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.project_smtp_runtime_readiness
-    ADD CONSTRAINT project_smtp_runtime_readiness_pkey PRIMARY KEY (project_id, configuration_id, generation, process_id);
-
-
---
 -- Name: project_smtp_secret_operations project_smtp_secret_material_uq; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1211,22 +1163,6 @@ ALTER TABLE ONLY public.project_users
 
 
 --
--- Name: projection_email_key_authority projection_email_key_authority_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.projection_email_key_authority
-    ADD CONSTRAINT projection_email_key_authority_pkey PRIMARY KEY (singleton);
-
-
---
--- Name: projection_email_runtime_observations projection_email_runtime_observations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.projection_email_runtime_observations
-    ADD CONSTRAINT projection_email_runtime_observations_pkey PRIMARY KEY (process_id, process_incarnation);
-
-
---
 -- Name: projects projects_id_metadata_revision_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1331,6 +1267,37 @@ ALTER TABLE ONLY public.provider_configurations
 
 
 --
+-- Name: provider_secret_generations provider_secret_generations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_secret_generations
+    ADD CONSTRAINT provider_secret_generations_pkey PRIMARY KEY (project_id, provider_id, generation);
+
+
+--
+-- Name: provider_secret_generations provider_secret_generations_material_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_secret_generations
+    ADD CONSTRAINT provider_secret_generations_material_id_key UNIQUE (material_id);
+
+
+--
+-- Name: provider_secret_generations provider_secret_generations_owner_material_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_secret_generations
+    ADD CONSTRAINT provider_secret_generations_owner_material_key UNIQUE (project_id, provider_id, generation, material_id);
+
+
+--
+-- Name: provider_secret_generations_one_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX provider_secret_generations_one_active ON public.provider_secret_generations USING btree (project_id, provider_id) WHERE (status = 'active'::text);
+
+
+--
 -- Name: provider_secret_operations provider_secret_operations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1347,11 +1314,11 @@ ALTER TABLE ONLY public.provider_secret_operations
 
 
 --
--- Name: provider_secret_operations provider_secret_operations_project_id_provider_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: provider_secret_operations provider_secret_operations_project_provider_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.provider_secret_operations
-    ADD CONSTRAINT provider_secret_operations_project_id_provider_id_key UNIQUE (project_id, provider_id);
+    ADD CONSTRAINT provider_secret_operations_project_provider_generation_key UNIQUE (project_id, provider_id, target_secret_generation);
 
 
 --
@@ -1416,30 +1383,6 @@ ALTER TABLE ONLY public.refresh_token_generations
 
 ALTER TABLE ONLY public.refresh_token_generations
     ADD CONSTRAINT refresh_token_generations_token_digest_key_version_token_di_key UNIQUE (token_digest_key_version, token_digest);
-
-
---
--- Name: auth_process_incarnations auth_process_incarnations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.auth_process_incarnations
-    ADD CONSTRAINT auth_process_incarnations_pkey PRIMARY KEY (process_id);
-
-
---
--- Name: auth_process_incarnations auth_process_incarnations_process_id_process_incarnation_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.auth_process_incarnations
-    ADD CONSTRAINT auth_process_incarnations_process_id_process_incarnation_key UNIQUE (process_id, process_incarnation);
-
-
---
--- Name: runtime_publication_leases runtime_publication_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.runtime_publication_leases
-    ADD CONSTRAINT runtime_publication_leases_pkey PRIMARY KEY (project_id, ring_id, process_id);
 
 
 --
@@ -1585,6 +1528,20 @@ CREATE INDEX application_sessions_user_status_idx ON public.application_sessions
 
 
 --
+-- Name: application_sessions_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX application_sessions_retention_idx ON public.application_sessions USING btree (absolute_expires_at, id);
+
+
+--
+-- Name: application_sessions_browser_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX application_sessions_browser_session_idx ON public.application_sessions USING btree (browser_session_id);
+
+
+--
 -- Name: application_user_events_application_time_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1655,6 +1612,27 @@ CREATE INDEX browser_logout_expiry_idx ON public.project_browser_logout_interact
 
 
 --
+-- Name: browser_logout_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX browser_logout_retention_idx ON public.project_browser_logout_interactions USING btree (expires_at, id);
+
+
+--
+-- Name: browser_logout_application_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX browser_logout_application_session_idx ON public.project_browser_logout_interactions USING btree (application_session_id);
+
+
+--
+-- Name: browser_logout_browser_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX browser_logout_browser_session_idx ON public.project_browser_logout_interactions USING btree (browser_session_id);
+
+
+--
 -- Name: browser_sessions_user_status_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1662,10 +1640,10 @@ CREATE INDEX browser_sessions_user_status_idx ON public.project_browser_sessions
 
 
 --
--- Name: server_key_digest_readiness_lease_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: browser_sessions_retention_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX server_key_digest_readiness_lease_idx ON public.server_key_digest_readiness USING btree (lease_expires_at, process_id);
+CREATE INDEX browser_sessions_retention_idx ON public.project_browser_sessions USING btree (absolute_expires_at, id);
 
 
 --
@@ -1718,6 +1696,13 @@ CREATE INDEX email_challenges_payload_retention_idx ON public.email_challenges U
 
 
 --
+-- Name: email_challenges_project_recipient_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX email_challenges_project_recipient_idx ON public.email_challenges USING btree (project_id, canonicalization_version, lookup_digest_key_version, lookup_digest);
+
+
+--
 -- Name: email_identities_user_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1729,6 +1714,13 @@ CREATE INDEX email_identities_user_idx ON public.email_identities USING btree (p
 --
 
 CREATE INDEX handoff_tickets_expiry_idx ON public.handoff_tickets USING btree (status, expires_at, id);
+
+
+--
+-- Name: handoff_tickets_browser_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX handoff_tickets_browser_session_idx ON public.handoff_tickets USING btree (browser_session_id);
 
 
 --
@@ -1816,6 +1808,13 @@ CREATE INDEX login_transactions_expiry_idx ON public.login_transactions USING bt
 
 
 --
+-- Name: login_transactions_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX login_transactions_retention_idx ON public.login_transactions USING btree (expires_at, id);
+
+
+--
 -- Name: login_transactions_provider_callback_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1855,6 +1854,13 @@ CREATE INDEX mail_outbox_attempt_cleanup_idx ON public.mail_outbox USING btree (
 --
 
 CREATE INDEX mail_outbox_claim_idx ON public.mail_outbox USING btree (next_attempt_at, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text, 'ambiguous'::text]));
+
+
+--
+-- Name: mail_outbox_project_active_backlog_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mail_outbox_project_active_backlog_idx ON public.mail_outbox USING btree (project_id, id) WHERE (status = ANY (ARRAY['pending'::text, 'leased'::text, 'retry'::text, 'ambiguous'::text]));
 
 
 --
@@ -1956,13 +1962,6 @@ CREATE UNIQUE INDEX project_smtp_one_active_idx ON public.project_smtp_configura
 
 
 --
--- Name: project_smtp_runtime_readiness_state_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX project_smtp_runtime_readiness_state_idx ON public.project_smtp_runtime_readiness USING btree (state, lease_expires_at, checked_at);
-
-
---
 -- Name: project_smtp_test_claim_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1974,6 +1973,13 @@ CREATE INDEX project_smtp_test_claim_idx ON public.project_smtp_test_operations 
 --
 
 CREATE INDEX project_smtp_test_delivered_evidence_idx ON public.project_smtp_test_operations USING btree (project_id, configuration_id, configuration_generation, configuration_revision, configuration_security_eligibility_revision) WHERE ((state = 'delivered'::text) AND (safe_outcome = 'delivered'::text) AND (completed_at IS NOT NULL));
+
+
+--
+-- Name: project_smtp_test_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX project_smtp_test_retention_idx ON public.project_smtp_test_operations USING btree (completed_at, id) WHERE ((recipient_erased_at IS NOT NULL) AND (state = ANY (ARRAY['delivered'::text, 'failed'::text, 'ambiguous'::text])));
 
 
 --
@@ -2009,13 +2015,6 @@ CREATE INDEX project_users_public_id_search_idx ON public.project_users USING bt
 --
 
 CREATE INDEX project_users_project_status_idx ON public.project_users USING btree (project_id, status, created_at, id);
-
-
---
--- Name: projection_email_runtime_observations_live_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX projection_email_runtime_observations_live_idx ON public.projection_email_runtime_observations USING btree (process_id, lease_expires_at);
 
 
 --
@@ -2075,6 +2074,13 @@ CREATE INDEX refresh_families_session_status_idx ON public.refresh_families USIN
 
 
 --
+-- Name: refresh_families_application_session_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX refresh_families_application_session_idx ON public.refresh_families USING btree (application_session_id);
+
+
+--
 -- Name: refresh_generations_one_current_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2089,10 +2095,10 @@ CREATE INDEX refresh_generations_retention_idx ON public.refresh_token_generatio
 
 
 --
--- Name: runtime_publication_leases_expiry_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: refresh_generations_family_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX runtime_publication_leases_expiry_idx ON public.runtime_publication_leases USING btree (project_id, ring_id, expires_at);
+CREATE INDEX refresh_generations_family_idx ON public.refresh_token_generations USING btree (family_id);
 
 
 --
@@ -2121,6 +2127,13 @@ CREATE INDEX webhook_deliveries_endpoint_history_idx ON public.webhook_deliverie
 --
 
 CREATE UNIQUE INDEX webhook_deliveries_event_endpoint_replay_uq ON public.webhook_deliveries USING btree (event_id, endpoint_id, replay_sequence);
+
+
+--
+-- Name: webhook_deliveries_replay_parent_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX webhook_deliveries_replay_parent_idx ON public.webhook_deliveries USING btree (replay_of_delivery_id) WHERE (replay_of_delivery_id IS NOT NULL);
 
 
 --
@@ -2719,10 +2732,52 @@ CREATE CONSTRAINT TRIGGER provider_callback_owners_reverse_presence AFTER INSERT
 
 
 --
+-- Name: provider_configurations provider_secret_generation_seed; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER provider_secret_generation_seed AFTER INSERT ON public.provider_configurations FOR EACH ROW EXECUTE FUNCTION public.owlauth_seed_provider_secret_generation();
+
+
+--
+-- Name: provider_configurations provider_secret_current_pointer_integrity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER provider_secret_current_pointer_integrity AFTER INSERT OR UPDATE ON public.provider_configurations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.owlauth_validate_provider_secret_current_pointer();
+
+
+--
+-- Name: provider_secret_generations provider_secret_generation_current_pointer_integrity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER provider_secret_generation_current_pointer_integrity AFTER INSERT OR UPDATE ON public.provider_secret_generations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.owlauth_validate_provider_secret_current_pointer();
+
+
+--
+-- Name: provider_secret_generations provider_secret_generation_identity_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER provider_secret_generation_identity_immutable BEFORE UPDATE ON public.provider_secret_generations FOR EACH ROW EXECUTE FUNCTION public.reject_immutable_column_change('project_id', 'provider_id', 'generation', 'material_id', 'created_at');
+
+
+--
+-- Name: provider_secret_generations provider_secret_generation_material_owner_integrity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE CONSTRAINT TRIGGER provider_secret_generation_material_owner_integrity AFTER INSERT OR DELETE OR UPDATE ON public.provider_secret_generations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.owlauth_validate_provider_secret_generation_owner();
+
+
+--
+-- Name: provider_secret_generations provider_secret_generation_status_transition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER provider_secret_generation_status_transition BEFORE UPDATE ON public.provider_secret_generations FOR EACH ROW EXECUTE FUNCTION public.owlauth_enforce_provider_secret_generation_transition();
+
+
+--
 -- Name: provider_configurations providers_stable_callback_identity; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER providers_stable_callback_identity BEFORE UPDATE ON public.provider_configurations FOR EACH ROW EXECUTE FUNCTION public.reject_immutable_column_change('project_id', 'provider_key', 'kind', 'issuer', 'client_id', 'callback_url');
+CREATE TRIGGER providers_stable_callback_identity BEFORE UPDATE ON public.provider_configurations FOR EACH ROW EXECUTE FUNCTION public.reject_immutable_column_change('project_id', 'provider_key', 'kind', 'issuer', 'callback_url');
 
 
 --
@@ -3576,14 +3631,6 @@ ALTER TABLE ONLY public.project_smtp_configurations
 
 
 --
--- Name: project_smtp_runtime_readiness project_smtp_runtime_readiness_project_id_configuration_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.project_smtp_runtime_readiness
-    ADD CONSTRAINT project_smtp_runtime_readiness_project_id_configuration_id_fkey FOREIGN KEY (project_id, configuration_id) REFERENCES public.project_smtp_configurations(project_id, id) ON DELETE CASCADE;
-
-
---
 -- Name: project_smtp_secret_operations project_smtp_secret_material_owner_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3776,11 +3823,27 @@ ALTER TABLE ONLY public.provider_configurations
 
 
 --
--- Name: provider_configurations provider_configurations_secret_material_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: provider_configurations provider_configurations_current_secret_generation_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.provider_configurations
-    ADD CONSTRAINT provider_configurations_secret_material_id_fkey FOREIGN KEY (secret_material_id) REFERENCES public.protected_materials(id) DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT provider_configurations_current_secret_generation_fkey FOREIGN KEY (project_id, id, secret_generation, secret_material_id) REFERENCES public.provider_secret_generations(project_id, provider_id, generation, material_id) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: provider_secret_generations provider_secret_generations_material_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_secret_generations
+    ADD CONSTRAINT provider_secret_generations_material_id_fkey FOREIGN KEY (material_id) REFERENCES public.protected_materials(id) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: provider_secret_generations provider_secret_generations_project_provider_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_secret_generations
+    ADD CONSTRAINT provider_secret_generations_project_provider_fkey FOREIGN KEY (project_id, provider_id) REFERENCES public.provider_configurations(project_id, id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -3800,6 +3863,14 @@ ALTER TABLE ONLY public.provider_secret_operations
 
 
 --
+-- Name: provider_secret_operations provider_secret_operations_target_generation_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_secret_operations
+    ADD CONSTRAINT provider_secret_operations_target_generation_fkey FOREIGN KEY (project_id, provider_id, target_secret_generation, material_id) REFERENCES public.provider_secret_generations(project_id, provider_id, generation, material_id) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: refresh_families refresh_families_project_id_application_session_id_applica_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3813,14 +3884,6 @@ ALTER TABLE ONLY public.refresh_families
 
 ALTER TABLE ONLY public.refresh_token_generations
     ADD CONSTRAINT refresh_token_generations_project_id_family_id_application_fkey FOREIGN KEY (project_id, family_id, application_id, user_id) REFERENCES public.refresh_families(project_id, id, application_id, user_id) ON DELETE CASCADE;
-
-
---
--- Name: runtime_publication_leases runtime_publication_leases_project_id_ring_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.runtime_publication_leases
-    ADD CONSTRAINT runtime_publication_leases_project_id_ring_id_fkey FOREIGN KEY (project_id, ring_id) REFERENCES public.project_key_rings(project_id, id) ON DELETE CASCADE;
 
 
 --

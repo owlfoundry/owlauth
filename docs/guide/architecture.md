@@ -114,7 +114,6 @@ flowchart LR
     end
 
     Core --> PG[(PostgreSQL authority)]
-    Core --> Redis[(Redis support)]
     Core --> Keys[Signer / data protector]
     Core --> IdP[Upstream providers]
 ```
@@ -125,13 +124,13 @@ Runtime is public and latency-sensitive. Its implemented surface covers the Host
 
 ### Server API Surface
 
-The Server API is a secret-bearing, backend-only JSON router on the Auth listener. Customer backends authenticate with a Project-bound `owl_server_v1` key created and acknowledged through Control; browsers, Runtime SDKs, publishable Application keys, Project tokens, and the operator key are not Server credentials. Its minimal surface provides Project user directory reads, exact user lookup, Application projection reads, and online Project-token introspection. It serves no HTML, static assets, redirects, cookies, CORS grants, CLI discovery, Console, MCP, or credential-management routes. It retains a separate PostgreSQL pool, digest-version readiness input, router state, authentication, and route-local admission inside Auth.
+The Server API is a secret-bearing, backend-only JSON router on the Auth listener. Customer backends authenticate with a Project-bound `owl_server_v1` key created and acknowledged through Control; browsers, Runtime SDKs, publishable Application keys, Project tokens, and the operator key are not Server credentials. Its minimal surface provides Project user directory reads, exact user lookup, Application projection reads, and online Project-token introspection. It serves no HTML, static assets, redirects, cookies, CORS grants, CLI discovery, Console, MCP, or credential-management routes. It retains a separate PostgreSQL pool, digest-version readiness input, router state, authentication, and local resource bounds inside Auth.
 
 ### Control Plane
 
 Control currently serves the embedded Management Console, the credential-free origin-root `/.well-known/owlauth` CLI descriptor, the implemented Project, Application, provider, user, session, policy, and key APIs, and an optional bounded Streamable HTTP MCP endpoint. Broader audit administration remains planned. Control accepts only the deployment's `OWLAUTH_CONTROL_API_KEY`; a valid Bearer key has full deployment Control authority and is not stored in PostgreSQL. The Console keeps it only in active page memory. Public Project IDs, Application IDs, publishable keys, Project tokens, and provider credentials are never Control credentials.
 
-The three routers remain isolated even in combined mode. Auth and Control each have their own body/deadline, in-flight request, accepted-connection, header, and URI budget; one endpoint cannot consume the other's ordinary HTTP semaphore. Runtime and Server API share Auth's transport budget but retain independent middleware, state, admission, readiness inputs, and PostgreSQL serving pools. Admission derives source from the direct transport peer and does not trust ambient forwarding headers. See the [server configuration reference](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#per-endpoint-http-budgets) and the [spec 05 release ledger](https://github.com/owlfoundry/owlauth/blob/main/spec/05-http-contract-and-surface-boundaries.md#release-operation-ledger).
+The three routers remain isolated even in combined mode. Auth and Control each have their own body/deadline, in-flight request, accepted-connection, header, and URI budget; one endpoint cannot consume the other's ordinary HTTP semaphore. Runtime and Server API share Auth's transport budget but retain independent middleware, state, readiness inputs, and PostgreSQL serving pools. Generic IP/route/tenant traffic governance belongs to an operator-owned ingress or SaaS layer, not Core. See the [server configuration reference](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#per-endpoint-http-budgets) and the [spec 05 release ledger](https://github.com/owlfoundry/owlauth/blob/main/spec/05-http-contract-and-surface-boundaries.md#release-operation-ledger).
 
 Distinct Auth and Control origins are recommended because they isolate the Console's in-memory operator key from public Runtime script execution. An explicitly configured shared origin requires disjoint non-root paths, Runtime cookie path containment, no service workers, restrictive opener policy, and deliberate acceptance of one browser/XSS trust boundary; an operator-owned proxy must preserve the independently bound Auth and Control listeners without making forwarding headers authoritative.
 
@@ -148,7 +147,6 @@ flowchart TB
     App --> Domain[Project-scoped domain model]
     App --> Ports[Application-owned ports]
     PostgreSQL[PostgreSQL adapter] --> Ports
-    Cache[Redis adapter] --> Ports
     Signer[Signer and data protector] --> Ports
     Providers[Upstream provider adapters] --> Ports
 ```
@@ -158,13 +156,13 @@ flowchart TB
 - `crates/owlauth-cli` is the remote client for self-hosted Control, with endpoint-discovered profiles pinned to the OwlAuth server product, instance, authority, API base, and operator credential class before credential release. It cannot depend on the server implementation, access storage, load keys, or launch local MCP.
 - `sdks/*` consume the public Runtime Project Auth contract. The Rust SDK receives no privileged server dependency.
 
-Dependencies point inward. HTTP frameworks, SQL rows, Redis clients, provider payloads, CLI types, MCP schemas, and SDK code cannot become the domain model.
+Dependencies point inward. HTTP frameworks, SQL rows, provider payloads, CLI types, MCP schemas, and SDK code cannot become the domain model.
 
 ## Storage and consistency
 
 PostgreSQL is the sole transactional authority for Project ownership, identities/managed connections, login/email challenge state, handoff consumption, sessions, refresh rotation, user revisions/Application bindings and projections, mail/webhook outboxes, revocation, policy, keys, and audit. The deployment operator key is process configuration, not database state. Security-critical mutations use Project-qualified predicates, constraints, conditional updates, and transactions.
 
-Redis is non-authoritative. The current release uses optional Redis only for distributed Runtime and Server API admission counters, with a conservative local fallback; it does not implement a Redis public-configuration/JWKS cache or invalidation bus. Losing or flushing Redis must not change identity, grant duplicate credential use, undo revocation, activate a key, or cross a Project boundary.
+Core has no deployment-wide traffic-quota dependency. Connection, in-flight request, PostgreSQL pool, provider-dispatch, and worker-concurrency limits protect local resources. A SaaS or operator-owned ingress owns IP, route, tenant, global, bot/risk, traffic-shaping, and commercial quotas; those controls never establish identity authority. PostgreSQL still owns OTP attempts, resend cooldown, challenge generations, and one-use proof state.
 
 SeaORM 2 implements ordinary PostgreSQL repositories. SQLx 0.9 embeds migration files from `crates/owlauth-server/migrations/`, coordinates PostgreSQL startup migration locking, and verifies exact serving-schema compatibility. `OWLAUTH_MIGRATION_MODE` defaults to `auto`; `verify` performs no DDL. Runtime, Server API, and Control use independent serving pools on one database authority, and SeaORM schema sync is disabled.
 

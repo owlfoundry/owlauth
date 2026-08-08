@@ -14,7 +14,7 @@ OwlAuth is a self-hostable authentication and identity service for applications.
 - User disable/re-enable, identity linking, and managed profile synchronization
 - Revisioned user projections and signed webhooks
 - TypeScript, Python, and Rust SDKs
-- Self-hosted PostgreSQL authority with optional Redis rate limiting
+- Self-hosted PostgreSQL authority with no external cache dependency
 
 OwlAuth handles authentication. Your application remains responsible for product authorization such as organizations, memberships, roles, billing, and resource access.
 

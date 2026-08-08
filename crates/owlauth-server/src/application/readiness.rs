@@ -51,8 +51,6 @@ pub(crate) trait ReadinessPort: Send + Sync {
 
     async fn project_jwks(&self, project_public_id: &str)
     -> Result<JwksDocument, ApplicationError>;
-
-    async fn observe_signing_revisions(&self, limit: usize) -> Result<usize, ApplicationError>;
 }
 
 #[derive(Clone)]
@@ -84,15 +82,5 @@ impl ReadinessService {
         project_public_id: &str,
     ) -> Result<JwksDocument, ApplicationError> {
         self.port.project_jwks(project_public_id).await
-    }
-
-    pub(crate) async fn observe_signing_revisions(
-        &self,
-        limit: usize,
-    ) -> Result<usize, ApplicationError> {
-        if !(1..=100).contains(&limit) {
-            return Err(ApplicationError::InvalidInput);
-        }
-        self.port.observe_signing_revisions(limit).await
     }
 }

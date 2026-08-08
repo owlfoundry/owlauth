@@ -94,6 +94,7 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::create_project,
         crate::control_resources::get_project,
         crate::control_resources::update_project,
+        crate::control_resources::get_project_overview,
         crate::control_resources::get_project_policy,
         crate::control_resources::update_project_policy,
         crate::control_resources::disable_project,
@@ -130,6 +131,10 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::preflight_named_provider,
         crate::control_resources::list_providers,
         crate::control_resources::create_provider,
+        crate::control_resources::update_provider,
+        crate::control_resources::replace_provider_secret,
+        crate::control_resources::reconcile_provider_secret_replacement,
+        crate::control_resources::abandon_provider_secret_replacement,
         crate::control_resources::reconcile_provider,
         crate::control_resources::disable_provider,
         crate::control_resources::assign_provider,
@@ -188,6 +193,11 @@ pub fn get_system() -> SystemCapabilities {
         crate::runtime::PublicJwk,
         Project,
         ProjectList,
+        ProjectOverviewSummary,
+        ProjectOverviewApplicationCounts,
+        ProjectOverviewProviderCounts,
+        ProjectOverviewUserCounts,
+        ProjectOverviewServerKeyCounts,
         CreateProjectRequest,
         UpdateProjectRequest,
         ProjectPolicy,
@@ -242,7 +252,10 @@ pub fn get_system() -> SystemCapabilities {
         ProviderConsentBehavior,
         FixedProviderAuthorizationPolicy,
         CreateProviderRequest,
+        UpdateProviderRequest,
+        ReplaceProviderSecretRequest,
         ReconcileProviderRequest,
+        ReconcileProviderSecretReplacementRequest,
         ProviderRevisionRequest,
         ProviderAssignmentRequest,
         SmtpTlsMode,
@@ -329,7 +342,15 @@ impl Modify for ControlSecurity {
 /// Generates the complete Control-plane `OpenAPI` document.
 #[must_use]
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    ControlApiDoc::openapi()
+    let mut document = ControlApiDoc::openapi();
+    crate::add_response_to_operations(&mut document, "408", |_| {
+        crate::json_error_response(
+            "The request exceeded the Control listener time budget",
+            "ProblemDetails",
+            "application/problem+json",
+        )
+    });
+    document
 }
 
 #[cfg(test)]

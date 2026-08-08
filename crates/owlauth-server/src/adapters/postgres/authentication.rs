@@ -17,7 +17,6 @@ use crate::{
 
 use super::{
     audit::append_runtime_audit,
-    auth_incarnation::AuthIncarnationFence,
     entity::{
         application, application_provider_assignment, application_redirect, login_transaction,
         login_transaction_method, project, project_policy, project_provider_egress_policy,
@@ -28,27 +27,11 @@ use super::{
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresAuthenticationRepository {
     database: DatabaseConnection,
-    auth_incarnation: AuthIncarnationFence,
 }
 
 impl PostgresAuthenticationRepository {
-    #[cfg(test)]
     pub(crate) fn new(database: DatabaseConnection) -> Self {
-        Self {
-            database,
-            auth_incarnation: AuthIncarnationFence::test_default(),
-        }
-    }
-
-    pub(crate) fn new_with_runtime_identity(
-        database: DatabaseConnection,
-        auth_process_id: String,
-        auth_incarnation: uuid::Uuid,
-    ) -> Self {
-        Self {
-            database,
-            auth_incarnation: AuthIncarnationFence::new(auth_process_id, auth_incarnation),
-        }
+        Self { database }
     }
 }
 
@@ -64,7 +47,6 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
     ) -> Result<LoginTransactionRecord, ApplicationError> {
         validate_login_command(&command)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
 
         let project = project::Entity::find_by_id(command.project_id)
             .lock_shared()
@@ -343,7 +325,6 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         validate_digest(&command.browser_binding)?;
         validate_digest(&command.csrf)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find()
             .filter(
                 login_transaction::Column::InteractionDigest.eq(command.interaction.value.to_vec()),
@@ -402,7 +383,6 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         validate_digest(&command.oidc_nonce)?;
         validate_protected(&command.provider_pkce)?;
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -530,7 +510,6 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
             .ok_or(ApplicationError::NotFound)?;
 
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(project.id))
             .filter(login_transaction::Column::ProviderConfigurationId.eq(provider.id))
@@ -750,7 +729,6 @@ impl AuthenticationRepository for PostgresAuthenticationRepository {
         command: FailProviderExchange,
     ) -> Result<LoginTransactionRecord, ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        self.auth_incarnation.lock(&transaction).await?;
         let model = login_transaction::Entity::find_by_id(command.transaction_id)
             .filter(login_transaction::Column::ProjectId.eq(command.project_id))
             .lock_exclusive()
@@ -1056,7 +1034,8 @@ pub(super) fn parse_login_status(value: &str) -> Result<LoginTransactionStatus, 
     }
 }
 
-pub(super) fn persistence(_: sea_orm::DbErr) -> ApplicationError {
+pub(super) fn persistence<E: std::fmt::Display>(error: E) -> ApplicationError {
+    tracing::error!(error = %error, "PostgreSQL operation failed");
     ApplicationError::Persistence
 }
 
@@ -1065,7 +1044,7 @@ mod tests {
     use std::env;
 
     use sea_orm::Database;
-    use sqlx::{PgPool, postgres::PgPoolOptions};
+    use sqlx::postgres::PgPoolOptions;
     use testcontainers::{
         GenericImage, ImageExt,
         core::{IntoContainerPort, WaitFor, wait::LogWaitStrategy},
@@ -1096,30 +1075,6 @@ mod tests {
             ciphertext: vec![value; 32],
             key_version: 1,
         }
-    }
-
-    async fn wait_for_backend_blocked_by(pool: &PgPool, blocker_pid: i32, label: &str) -> i32 {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                if let Some(blocked_pid) = sqlx::query_scalar::<_, i32>(
-                    "SELECT blocked.pid FROM pg_stat_activity blocked
-                     WHERE blocked.datname=current_database()
-                       AND blocked.wait_event_type='Lock'
-                       AND $1=ANY(pg_blocking_pids(blocked.pid))
-                     ORDER BY blocked.pid LIMIT 1",
-                )
-                .bind(blocker_pid)
-                .fetch_optional(pool)
-                .await
-                .expect("observe PostgreSQL lock wait")
-                {
-                    return blocked_pid;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{label} did not establish the required PostgreSQL lock wait"))
     }
 
     async fn start_postgres() -> Option<(testcontainers::ContainerAsync<GenericImage>, String)> {
@@ -1261,14 +1216,6 @@ mod tests {
         .await
         .expect("seed assignment");
 
-        sqlx::query(
-            "INSERT INTO auth_process_incarnations
-             (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, NOW())",
-        )
-        .bind(Uuid::nil())
-        .execute(&pool)
-        .await
-        .expect("claim exact test Runtime incarnation");
         let database = Database::connect(&url).await.expect("SeaORM test pool");
         let repository = PostgresAuthenticationRepository::new(database.clone());
         let created_at = OffsetDateTime::now_utc()
@@ -1425,166 +1372,6 @@ mod tests {
                 .is_err(),
             "terminal exchange failure must not be replayed"
         );
-
-        let mut project_blocker = pool.begin().await.expect("begin Project lock blocker");
-        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *project_blocker)
-            .await
-            .expect("load blocker backend pid");
-        sqlx::query("SELECT 1 FROM projects WHERE id=$1 FOR UPDATE")
-            .bind(project_id)
-            .execute(&mut *project_blocker)
-            .await
-            .expect("block the login Project row");
-        let operation_repository = repository.clone();
-        let operation = tokio::spawn(async move {
-            operation_repository
-                .create_login_transaction(CreateLoginTransaction {
-                    id: Uuid::new_v4(),
-                    project_id,
-                    application_id,
-                    interaction: digest(21),
-                    redirect_uri: "https://app.example/callback".to_owned(),
-                    application_pkce_challenge: "A".repeat(43),
-                    application_state: protected(22),
-                    presentation_hint: None,
-                    revisions: LoginRevisionSnapshot {
-                        project_metadata_revision: 1,
-                        project_security_revision: 1,
-                        application_security_revision: 1,
-                        claims_revision: 1,
-                        session_revision: 1,
-                    },
-                    created_at: created_at + Duration::seconds(6),
-                    expires_at: created_at + Duration::minutes(10) + Duration::seconds(6),
-                    admitted_providers: vec![AdmittedProviderMethod {
-                        kind: crate::domain::ProviderKind::Oidc,
-                        method_key: "oidc-main".to_owned(),
-                        provider_id,
-                        display_name: "OIDC".to_owned(),
-                        issuer: "https://issuer.example".to_owned(),
-                        provider_revision: 1,
-                        provider_egress_policy_revision: Some(1),
-                        assignment_security_revision: 1,
-                    }],
-                    admitted_email: None,
-                })
-                .await
-        });
-        let operation_pid =
-            wait_for_backend_blocked_by(&pool, blocker_pid, "fenced login creation").await;
-        let replacement_pool = pool.clone();
-        let replacement_incarnation = Uuid::new_v4();
-        let replacement = tokio::spawn(async move {
-            sqlx::query(
-                "INSERT INTO auth_process_incarnations
-                 (process_id, process_incarnation, started_at) VALUES ('auth-1', $1, NOW())
-                 ON CONFLICT (process_id) DO UPDATE SET
-                   process_incarnation=EXCLUDED.process_incarnation,
-                   started_at=EXCLUDED.started_at",
-            )
-            .bind(replacement_incarnation)
-            .execute(&replacement_pool)
-            .await
-        });
-        let replacement_pid = wait_for_backend_blocked_by(
-            &pool,
-            operation_pid,
-            "Runtime replacement behind fenced login creation",
-        )
-        .await;
-        assert_ne!(replacement_pid, operation_pid);
-        project_blocker
-            .commit()
-            .await
-            .expect("release Project lock blocker");
-        operation
-            .await
-            .expect("join login creation")
-            .expect("operation-first login creation commits");
-        replacement
-            .await
-            .expect("join Runtime replacement")
-            .expect("replacement proceeds after login commit");
-
-        let current_repository = PostgresAuthenticationRepository::new_with_runtime_identity(
-            database.clone(),
-            "auth-1".to_owned(),
-            replacement_incarnation,
-        );
-        let login_count_before_stale: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM login_transactions")
-                .fetch_one(&pool)
-                .await
-                .expect("count logins before replacement-first race");
-        let mut replacement_blocker = pool.begin().await.expect("begin replacement blocker");
-        let replacement_blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *replacement_blocker)
-            .await
-            .expect("load replacement backend pid");
-        sqlx::query(
-            "UPDATE auth_process_incarnations
-             SET process_incarnation=$1, started_at=NOW() WHERE process_id='auth-1'",
-        )
-        .bind(Uuid::new_v4())
-        .execute(&mut *replacement_blocker)
-        .await
-        .expect("replace Runtime before predecessor operation");
-        let stale_operation = tokio::spawn(async move {
-            current_repository
-                .create_login_transaction(CreateLoginTransaction {
-                    id: Uuid::new_v4(),
-                    project_id,
-                    application_id,
-                    interaction: digest(23),
-                    redirect_uri: "https://app.example/callback".to_owned(),
-                    application_pkce_challenge: "A".repeat(43),
-                    application_state: protected(24),
-                    presentation_hint: None,
-                    revisions: LoginRevisionSnapshot {
-                        project_metadata_revision: 1,
-                        project_security_revision: 1,
-                        application_security_revision: 1,
-                        claims_revision: 1,
-                        session_revision: 1,
-                    },
-                    created_at: created_at + Duration::seconds(7),
-                    expires_at: created_at + Duration::minutes(10) + Duration::seconds(7),
-                    admitted_providers: vec![AdmittedProviderMethod {
-                        kind: crate::domain::ProviderKind::Oidc,
-                        method_key: "oidc-main".to_owned(),
-                        provider_id,
-                        display_name: "OIDC".to_owned(),
-                        issuer: "https://issuer.example".to_owned(),
-                        provider_revision: 1,
-                        provider_egress_policy_revision: Some(1),
-                        assignment_security_revision: 1,
-                    }],
-                    admitted_email: None,
-                })
-                .await
-        });
-        let stale_pid = wait_for_backend_blocked_by(
-            &pool,
-            replacement_blocker_pid,
-            "replacement-first stale login creation",
-        )
-        .await;
-        assert_ne!(stale_pid, replacement_blocker_pid);
-        replacement_blocker
-            .commit()
-            .await
-            .expect("commit replacement before stale operation");
-        assert_eq!(
-            stale_operation.await.expect("join stale login creation"),
-            Err(ApplicationError::Disabled)
-        );
-        let login_count_after_stale: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM login_transactions")
-                .fetch_one(&pool)
-                .await
-                .expect("count logins after replacement-first race");
-        assert_eq!(login_count_after_stale, login_count_before_stale);
 
         database.close().await.expect("close SeaORM pool");
         pool.close().await;

@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import wraps
+from time import monotonic
 from typing import Any, Literal, ParamSpec, TypeVar, cast
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -23,6 +24,7 @@ from owlauth.errors import (
     AuthenticationError,
     CancelledError,
     ConfigurationError,
+    ErrorCategory,
     HandoffError,
     IndeterminateError,
     LocalAction,
@@ -62,14 +64,14 @@ _PKCE_VERIFIER = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 _BEARER_TOKEN = re.compile(r"^[A-Za-z0-9._~+/=-]+$")
 _OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9._~-]+$")
 _ALLOWED_ERROR_STATUSES = {
-    "get_public_application_config": frozenset({400, 404, 429, 503}),
-    "get_project_jwks": frozenset({404, 429, 503}),
-    "start_login": frozenset({400, 404, 429, 503}),
-    "exchange_handoff": frozenset({400, 409, 429, 503}),
-    "refresh_session": frozenset({400, 409, 429, 503}),
-    "get_current_user": frozenset({401, 429, 503}),
-    "logout_application_session": frozenset({401, 429, 503}),
-    "prepare_browser_logout": frozenset({401, 429, 503}),
+    "get_public_application_config": frozenset({400, 404, 408, 429, 503}),
+    "get_project_jwks": frozenset({404, 408, 429, 503}),
+    "start_login": frozenset({400, 404, 408, 429, 503}),
+    "exchange_handoff": frozenset({400, 408, 409, 429, 503}),
+    "refresh_session": frozenset({400, 408, 409, 429, 503}),
+    "get_current_user": frozenset({401, 408, 429, 503}),
+    "logout_application_session": frozenset({401, 408, 429, 503}),
+    "prepare_browser_logout": frozenset({401, 408, 429, 503}),
 }
 _CREDENTIAL_RESPONSE_FIELDS = frozenset(
     {
@@ -142,6 +144,32 @@ def _bind_client_value(value: _Result, marker: object) -> _Result:
     return value
 
 
+DebugOutcome = Literal[
+    "success",
+    "runtime_error",
+    "transport_error",
+    "timeout",
+    "cancelled",
+    "invalid_response",
+    "indeterminate",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SdkDebugEvent:
+    """Closed, secret-free completion event emitted only when a debug hook is configured."""
+
+    operation: str
+    method: Literal["GET", "POST"]
+    outcome: DebugOutcome
+    elapsed_ms: int
+    dispatched: bool
+    status: int | None = None
+    category: str | None = None
+    code: str | None = None
+    request_id: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class Client:
     """Immutable synchronous client bound to one Runtime, Project, and Application.
@@ -158,6 +186,9 @@ class Client:
     allow_insecure_loopback: bool = False
     timeout: float = 10.0
     transport: Transport = field(default_factory=StdlibTransport, repr=False, compare=False)
+    debug_hook: Callable[[SdkDebugEvent], None] | None = field(
+        default=None, repr=False, compare=False
+    )
     _clock: Callable[[], datetime] = field(default=_utc_now, repr=False, compare=False)
     _entropy: Callable[[int], bytes] = field(default=secrets.token_bytes, repr=False, compare=False)
     _client_marker: object = field(default_factory=object, init=False, repr=False, compare=False)
@@ -174,6 +205,8 @@ class Client:
         if not isinstance(self.timeout, (int, float)) or not (0 < float(self.timeout) <= 120):
             raise ConfigurationError("invalid_timeout", "The request timeout is invalid.")
         object.__setattr__(self, "timeout", float(self.timeout))
+        if self.debug_hook is not None and not callable(self.debug_hook):
+            raise ConfigurationError("invalid_debug_hook", "The debug hook must be callable.")
         now = self._clock()
         if not isinstance(now, datetime) or now.tzinfo is None:
             raise ConfigurationError("invalid_clock", "The configured clock must return UTC time.")
@@ -809,6 +842,9 @@ class Client:
         one_use_guard: _OneUseGuard | None = None,
     ) -> JsonObject:
         request_timeout = self.timeout if timeout is None else _validate_timeout(timeout)
+        started_at = monotonic()
+        dispatched = False
+        response_status: int | None = None
         url = _runtime_join(self.base_url, relative_url)
         encoded = None
         headers: dict[str, str] = {"Accept": "application/json"}
@@ -820,6 +856,7 @@ class Client:
         if one_use_guard is not None:
             one_use_guard.reserve()
         try:
+            dispatched = True
             response = self.transport.request(
                 method, url, headers=headers, body=encoded, timeout=request_timeout
             )
@@ -829,15 +866,28 @@ class Client:
                     one_use_guard.commit()
                 else:
                     one_use_guard.release()
-            raise _map_transport_failure(operation, failure) from None
+            mapped = _map_transport_failure(operation, failure)
+            self._emit_debug(
+                _debug_event(
+                    operation,
+                    method,
+                    mapped,
+                    started_at,
+                    failure.dispatched,
+                )
+            )
+            raise mapped from None
         except Exception:
             if one_use_guard is not None:
                 one_use_guard.commit()
-            raise _map_transport_failure(
+            mapped = _map_transport_failure(
                 operation, TransportFailure(FailureKind.TRANSPORT, dispatched=True)
-            ) from None
+            )
+            self._emit_debug(_debug_event(operation, method, mapped, started_at, True))
+            raise mapped from None
         if one_use_guard is not None:
             one_use_guard.commit()
+        response_status = response.status
         try:
             if not isinstance(response.body, bytes) or len(response.body) > _MAX_JSON_BYTES:
                 raise _protocol("invalid_response", "Runtime returned an oversized response.")
@@ -855,16 +905,38 @@ class Client:
                 raise _protocol("invalid_response", "Runtime returned a non-JSON response.")
             payload = _decode_json(response.body)
         except ProtocolError as error:
-            if operation in _SENSITIVE_OPERATIONS:
-                raise _indeterminate_protocol(error, operation, response.status) from None
-            raise
+            mapped: OwlAuthError = (
+                _indeterminate_protocol(error, operation, response.status)
+                if operation in _SENSITIVE_OPERATIONS
+                else error
+            )
+            self._emit_debug(
+                _debug_event(operation, method, mapped, started_at, dispatched, response_status)
+            )
+            raise mapped from None
         if response.status == expected_status:
+            self._emit_debug(
+                SdkDebugEvent(
+                    operation=operation,
+                    method=cast(Literal["GET", "POST"], method),
+                    outcome="success",
+                    elapsed_ms=max(0, round((monotonic() - started_at) * 1000)),
+                    dispatched=dispatched,
+                    status=response.status,
+                )
+            )
             return payload
         if response.status not in _ALLOWED_ERROR_STATUSES[operation]:
             error = _protocol("invalid_response", "Runtime returned an unexpected status.")
-            if operation in _SENSITIVE_OPERATIONS:
-                raise _indeterminate_protocol(error, operation, response.status) from None
-            raise error
+            mapped = (
+                _indeterminate_protocol(error, operation, response.status)
+                if operation in _SENSITIVE_OPERATIONS
+                else error
+            )
+            self._emit_debug(
+                _debug_event(operation, method, mapped, started_at, dispatched, response_status)
+            )
+            raise mapped from None
         retry_after_seconds = None
         if response.status == 429:
             retry_after_seconds = _retry_after_seconds(response.headers)
@@ -872,15 +944,68 @@ class Client:
                 error = _protocol(
                     "invalid_response", "Runtime returned invalid rate-limit guidance."
                 )
-                if operation in _SENSITIVE_OPERATIONS:
-                    raise _indeterminate_protocol(error, operation, response.status) from None
-                raise error
-        raise _map_runtime_error(
+                mapped = (
+                    _indeterminate_protocol(error, operation, response.status)
+                    if operation in _SENSITIVE_OPERATIONS
+                    else error
+                )
+                self._emit_debug(
+                    _debug_event(operation, method, mapped, started_at, dispatched, response_status)
+                )
+                raise mapped from None
+        mapped = _map_runtime_error(
             operation,
             response.status,
             payload,
             retry_after_seconds=retry_after_seconds,
         )
+        self._emit_debug(
+            _debug_event(operation, method, mapped, started_at, dispatched, response_status)
+        )
+        raise mapped
+
+    def _emit_debug(self, event: SdkDebugEvent) -> None:
+        if self.debug_hook is None:
+            return
+        try:
+            self.debug_hook(event)
+        except Exception:
+            # Debug logging is observational and must never change protocol behavior.
+            return
+
+
+def _debug_event(
+    operation: str,
+    method: str,
+    error: OwlAuthError,
+    started_at: float,
+    dispatched: bool,
+    status: int | None = None,
+) -> SdkDebugEvent:
+    outcome: DebugOutcome
+    if error.category == ErrorCategory.PROTOCOL:
+        outcome = "invalid_response"
+    elif error.category == ErrorCategory.TIMEOUT:
+        outcome = "timeout"
+    elif error.category == ErrorCategory.CANCELLED:
+        outcome = "cancelled"
+    elif error.category == ErrorCategory.TRANSPORT:
+        outcome = "transport_error"
+    elif error.category == ErrorCategory.INDETERMINATE:
+        outcome = "indeterminate"
+    else:
+        outcome = "runtime_error"
+    return SdkDebugEvent(
+        operation=operation,
+        method=cast(Literal["GET", "POST"], method),
+        outcome=outcome,
+        elapsed_ms=max(0, round((monotonic() - started_at) * 1000)),
+        dispatched=dispatched,
+        status=error.status if error.status is not None else status,
+        category=error.category.value,
+        code=error.code,
+        request_id=error.request_id,
+    )
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
@@ -1344,6 +1469,49 @@ def _map_runtime_error(
         else None
     )
     safe_message = "Runtime rejected the request."
+    if status == 408:
+        sensitive = operation in _SENSITIVE_OPERATIONS
+        action = (
+            LocalAction.QUARANTINE_PENDING
+            if operation == "exchange_handoff"
+            else LocalAction.QUARANTINE_CREDENTIALS
+        )
+        if code != "request_timeout":
+            if sensitive:
+                return IndeterminateError(
+                    "invalid_response_after_dispatch",
+                    "Runtime may have committed the operation; do not replay it.",
+                    retry=RetryDisposition.NEVER,
+                    action=action,
+                    operation=operation,
+                    status=status,
+                )
+            return ProtocolError(
+                "invalid_response",
+                "Runtime returned an invalid timeout response.",
+                retry=RetryDisposition.NEVER,
+                operation=operation,
+                status=status,
+            )
+        if sensitive:
+            return IndeterminateError(
+                code,
+                "Runtime may have committed the operation; do not replay it.",
+                retry=RetryDisposition.NEVER,
+                action=action,
+                request_id=request_id,
+                operation=operation,
+                status=status,
+            )
+        return OwlAuthTimeoutError(
+            code,
+            "The Runtime request exceeded its server-side deadline.",
+            retry=RetryDisposition.APPLICATION_DECISION,
+            action=LocalAction.NONE,
+            request_id=request_id,
+            operation=operation,
+            status=status,
+        )
     if status == 429 and code == "rate_limited":
         handoff = operation == "exchange_handoff"
         caller_decision = operation in {
@@ -1353,7 +1521,7 @@ def _map_runtime_error(
         }
         return RateLimitedError(
             code,
-            "Runtime admission policy rejected the request.",
+            "The optional SaaS or ingress traffic policy rejected the request.",
             retry=(
                 RetryDisposition.NEVER
                 if handoff

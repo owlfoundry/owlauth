@@ -23,7 +23,6 @@ jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust
 owlauth-key-provider = { version = "=0.0.0-dev", path = "../owlauth-key-provider" }
 owlauth-types = { version = "=0.0.0-dev", path = "../owlauth-types" }
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "rustls", "stream"] }
-redis = { version = "0.32.7", default-features = false, features = ["connection-manager", "script", "tokio-rustls-comp"] }
 rmcp = { version = "3.1.0", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
 rust-embed = { version = "8.11.0", features = ["debug-embed", "include-exclude"] }
 rustls = "0.23.42"

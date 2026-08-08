@@ -280,6 +280,32 @@ pub(crate) mod provider_configuration {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub(crate) mod provider_secret_generation {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "provider_secret_generations")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub project_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub provider_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub generation: i64,
+        pub material_id: Uuid,
+        pub status: String,
+        pub created_at: TimeDateTimeWithTimeZone,
+        pub activated_at: Option<TimeDateTimeWithTimeZone>,
+        pub retired_at: Option<TimeDateTimeWithTimeZone>,
+        pub abandoned_at: Option<TimeDateTimeWithTimeZone>,
+    }
+
+    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub(crate) mod provider_secret_operation {
     use sea_orm::entity::prelude::*;
 
@@ -291,6 +317,10 @@ pub(crate) mod provider_secret_operation {
         pub project_id: Uuid,
         pub provider_id: Uuid,
         pub operation_alias: String,
+        pub operation_kind: String,
+        pub target_secret_generation: i64,
+        pub target_display_name: String,
+        pub target_client_id: String,
         pub request_digest: Vec<u8>,
         pub state: String,
         pub attempt_count: i32,
@@ -401,31 +431,6 @@ pub(crate) mod application_provider_assignment {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-pub(crate) mod runtime_publication_lease {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "runtime_publication_leases")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub project_id: Uuid,
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub ring_id: Uuid,
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub process_id: String,
-        pub process_incarnation: Uuid,
-        pub loaded_revision: i64,
-        pub first_observed_at: TimeDateTimeWithTimeZone,
-        pub last_observed_at: TimeDateTimeWithTimeZone,
-        pub expires_at: TimeDateTimeWithTimeZone,
-    }
-
-    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
 pub(crate) mod audit_event {
     use sea_orm::entity::prelude::*;
 
@@ -495,54 +500,6 @@ pub(crate) mod project_server_key {
         pub credential_acknowledged_at: Option<TimeDateTimeWithTimeZone>,
         pub last_used_at: Option<TimeDateTimeWithTimeZone>,
         pub revoked_at: Option<TimeDateTimeWithTimeZone>,
-    }
-
-    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-#[allow(
-    dead_code,
-    reason = "readiness uses fenced raw SQL for this compact authority"
-)]
-pub(crate) mod auth_process_incarnation {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "auth_process_incarnations")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub process_id: String,
-        pub process_incarnation: Uuid,
-        pub started_at: TimeDateTimeWithTimeZone,
-    }
-
-    #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-#[allow(
-    dead_code,
-    reason = "readiness uses bounded aggregate raw SQL for this authority"
-)]
-pub(crate) mod server_key_digest_readiness {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, Eq, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "server_key_digest_readiness")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub process_id: String,
-        pub process_incarnation: Uuid,
-        pub state: String,
-        pub supported_digest_versions: Vec<i32>,
-        pub failure_class: Option<String>,
-        pub checked_at: TimeDateTimeWithTimeZone,
-        pub lease_expires_at: TimeDateTimeWithTimeZone,
     }
 
     #[derive(Clone, Copy, Debug, EnumIter, DeriveRelation)]

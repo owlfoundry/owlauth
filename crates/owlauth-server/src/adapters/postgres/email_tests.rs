@@ -1,24 +1,18 @@
-use std::{collections::BTreeMap, env, sync::Arc};
+use std::env;
 
 use super::{
-    authentication::PostgresAuthenticationRepository, email::PostgresPasswordlessEmailRepository,
-    email_control::PostgresEmailControlRepository,
-    projection::PostgresIdentityProjectionMaterializer, readiness::PostgresReadinessAdapter,
-    runtime_authority::PostgresRuntimeAuthorityRepository,
-};
-use crate::adapters::runtime_security::{
-    RuntimeKeyMaterial, SoftwareProjectionVerifiedEmailProtector, SoftwareRuntimeProtector,
-    UnavailableDurableEmailAddressReader,
+    authentication::PostgresAuthenticationRepository,
+    email::PostgresPasswordlessEmailRepository,
+    mail_delivery_safety::{MailDeliveryAuthorization, authorize_mail_delivery_with_limit},
 };
 use crate::application::{
     AdmittedEmailMethod, AuthenticationRepository, BindHostedBrowser, CommitEmailGeneration,
-    CompleteEmailProof, CreateLoginTransaction, EmailControlPort, EmailProofKind,
-    EstablishMagicTransferContext, LoginRevisionSnapshot, MailOutboxRepository,
-    MailTransportOutcome, PasswordlessEmailRepository, ProtectedValue, ResolveMagicTransferContext,
-    RuntimeAuthorityRepository, RuntimeProtector, SelectEmailMethod, VerifyEmailProof,
+    CompleteEmailProof, CreateLoginTransaction, EmailProofKind, EstablishMagicTransferContext,
+    LoginRevisionSnapshot, MailOutboxRepository, MailTransportOutcome, PasswordlessEmailRepository,
+    ProtectedValue, ResolveMagicTransferContext, SelectEmailMethod, VerifyEmailProof,
     VersionedDigest,
 };
-use sea_orm::Database;
+use sea_orm::{Database, TransactionTrait};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use testcontainers::{
@@ -48,43 +42,6 @@ fn protected(value: u8) -> ProtectedValue {
         ciphertext: vec![value; 64],
         key_version: 1,
     }
-}
-
-fn runtime_protector(
-    active_version: i32,
-    retained: impl IntoIterator<Item = (i32, u8)>,
-) -> SoftwareRuntimeProtector {
-    let active_seed = u8::try_from(active_version).expect("test key version fits in one byte");
-    SoftwareRuntimeProtector::new(
-        "email-alias-test".to_owned(),
-        active_version,
-        RuntimeKeyMaterial::new([active_seed; 32], [active_seed + 32; 32]),
-        retained
-            .into_iter()
-            .map(|(version, value)| {
-                (
-                    version,
-                    RuntimeKeyMaterial::new([value; 32], [value + 32; 32]),
-                )
-            })
-            .collect::<BTreeMap<_, _>>(),
-    )
-    .expect("test Runtime protector")
-}
-
-fn test_projection_materializer() -> Arc<PostgresIdentityProjectionMaterializer> {
-    Arc::new(PostgresIdentityProjectionMaterializer::new(
-        Arc::new(UnavailableDurableEmailAddressReader),
-        Arc::new(
-            SoftwareProjectionVerifiedEmailProtector::new(
-                "email-tests-projection".to_owned(),
-                1,
-                [73; 32],
-                BTreeMap::new(),
-            )
-            .expect("email test projection protector"),
-        ),
-    ))
 }
 
 fn docker_is_required() -> bool {
@@ -452,147 +409,8 @@ async fn start_postgres() -> Option<(testcontainers::ContainerAsync<GenericImage
 }
 
 #[allow(
-    clippy::too_many_arguments,
-    reason = "the SMTP generation fixture mirrors the complete persisted owner identity"
-)]
-async fn seed_project_smtp_generation(
-    pool: &PgPool,
-    project_id: Uuid,
-    source_id: Uuid,
-    configuration_id: Uuid,
-    generation: i32,
-    status: &str,
-    fingerprint: [u8; 32],
-    now: OffsetDateTime,
-) {
-    let material_id = Uuid::new_v4();
-    let mut transaction = pool
-        .begin()
-        .await
-        .expect("Project SMTP generation transaction should begin");
-    sqlx::query(
-        "INSERT INTO protected_materials
-         (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
-          provider_id,provider_format_version,context_version,context_digest,state)
-         VALUES ($1,'project',$2,'project_smtp',$3,$4,'configuration_secret',
-                 'software',1,1,$5,'pending')",
-    )
-    .bind(material_id)
-    .bind(project_id)
-    .bind(configuration_id)
-    .bind(i64::from(generation))
-    .bind(vec![u8::try_from(generation).unwrap_or(1); 32])
-    .execute(&mut *transaction)
-    .await
-    .expect("reserve Project SMTP material");
-    sqlx::query(
-        "INSERT INTO project_smtp_configurations
-         (id,project_id,status,generation,revision,security_eligibility_revision,host,port,
-          tls_mode,sender_address,sender_name,reply_to,safe_fingerprint,
-          credential_material_id,created_at,updated_at)
-         SELECT $1,project_id,$2,$3,1,1,host,port,tls_mode,sender_address,sender_name,reply_to,
-                $4,$5,$6,$6
-         FROM project_smtp_configurations WHERE project_id=$7 AND id=$8",
-    )
-    .bind(configuration_id)
-    .bind(status)
-    .bind(generation)
-    .bind(fingerprint.to_vec())
-    .bind(material_id)
-    .bind(now)
-    .bind(project_id)
-    .bind(source_id)
-    .execute(&mut *transaction)
-    .await
-    .expect("seed Project SMTP generation");
-    sqlx::query(
-        "UPDATE protected_materials
-         SET state='live',opaque_value=$2,safe_fingerprint=$3,updated_at=$4 WHERE id=$1",
-    )
-    .bind(material_id)
-    .bind(vec![u8::try_from(generation).unwrap_or(1); 64])
-    .bind(fingerprint.to_vec())
-    .bind(now)
-    .execute(&mut *transaction)
-    .await
-    .expect("finalize Project SMTP material");
-    transaction
-        .commit()
-        .await
-        .expect("Project SMTP generation owner and material should commit atomically");
-}
-
-#[allow(
     clippy::too_many_lines,
-    reason = "the SMTP evidence fixture preserves the protected recipient owner graph"
-)]
-async fn seed_smtp_test_result(
-    pool: &PgPool,
-    configuration_id: Uuid,
-    configuration_revision: i64,
-    state: &str,
-    safe_outcome: &str,
-    now: OffsetDateTime,
-) {
-    let operation_id = Uuid::new_v4();
-    let recipient_material_id = Uuid::new_v4();
-    let mut transaction = pool
-        .begin()
-        .await
-        .expect("SMTP test result transaction should begin");
-    sqlx::query(
-        "INSERT INTO protected_materials
-         (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
-          provider_id,provider_format_version,context_version,context_digest,safe_fingerprint,
-          state,created_at,updated_at,erased_at)
-         SELECT $1,'project',smtp.project_id,'smtp_test_recipient',$2,1,
-                'configuration_secret','software',1,1,$3,$4,'erased',$5,$5,$5
-         FROM project_smtp_configurations smtp WHERE smtp.id=$6",
-    )
-    .bind(recipient_material_id)
-    .bind(operation_id)
-    .bind(vec![8_u8; 32])
-    .bind(vec![9_u8; 32])
-    .bind(now)
-    .bind(configuration_id)
-    .execute(&mut *transaction)
-    .await
-    .expect("seed erased SMTP test recipient material");
-    sqlx::query(
-        "INSERT INTO project_smtp_test_operations
-         (id,project_id,idempotency_key,configuration_id,configuration_generation,
-          configuration_revision,configuration_security_eligibility_revision,host,port,tls_mode,
-          sender_address,request_digest,message_id,recipient_erased_at,state,safe_outcome,attempts,
-          correlation_id,created_at,expires_at,completed_at,credential_material_id,recipient_material_id)
-         SELECT $1,smtp.project_id,$2,smtp.id,smtp.generation,$3,
-                smtp.security_eligibility_revision,smtp.host,smtp.port,smtp.tls_mode,
-                smtp.sender_address,$4,$5,$6,$7,$8,1,$9,$6,$6 + INTERVAL '10 minutes',$6,
-                smtp.credential_material_id,$10
-         FROM project_smtp_configurations smtp WHERE smtp.id=$11",
-    )
-    .bind(operation_id)
-    .bind(format!("smtp-test-{}", operation_id.simple()))
-    .bind(configuration_revision)
-    .bind(vec![7_u8; 32])
-    .bind(format!("<{operation_id}@runtime-test.owlauth.invalid>"))
-    .bind(now)
-    .bind(state)
-    .bind(safe_outcome)
-    .bind(Uuid::new_v4())
-    .bind(recipient_material_id)
-    .bind(configuration_id)
-    .execute(&mut *transaction)
-    .await
-    .expect("seed authoritative SMTP test result");
-    transaction
-        .commit()
-        .await
-        .expect("SMTP test result and recipient material should commit atomically");
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "the shared PostgreSQL fixture seeds one complete email authority graph"
+    reason = "the shared email test fixture keeps one coherent PostgreSQL authority graph visible"
 )]
 async fn seed_email_authority(
     pool: &PgPool,
@@ -783,46 +601,6 @@ async fn seed_email_authority(
         .commit()
         .await
         .expect("SMTP fixture owner and material should commit atomically");
-    let auth_incarnation = Uuid::nil();
-    sqlx::query(
-        "INSERT INTO auth_process_incarnations
-         (process_id,process_incarnation,started_at) VALUES ('auth-1',$1,$2)
-         ON CONFLICT (process_id) DO UPDATE SET
-           process_incarnation=EXCLUDED.process_incarnation,started_at=EXCLUDED.started_at",
-    )
-    .bind(auth_incarnation)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("seed SMTP Runtime incarnation");
-    sqlx::query(
-        "INSERT INTO project_smtp_runtime_readiness
-         (project_id,configuration_id,generation,process_id,process_incarnation,state,checked_at,lease_expires_at)
-         VALUES ($1,$2,1,'auth-1',$3,'ready',$4,$5)",
-    )
-    .bind(project_id)
-    .bind(smtp_id)
-    .bind(auth_incarnation)
-    .bind(now)
-    .bind(now + Duration::hours(1))
-    .execute(pool)
-    .await
-    .expect("seed SMTP Runtime readiness");
-    sqlx::query(
-        "INSERT INTO email_protection_runtime_readiness
-         (process_id,process_incarnation,state,failure_class,checked_at,lease_expires_at)
-         VALUES ('auth-1',$1,'ready',NULL,$2,$3)
-         ON CONFLICT (process_id) DO UPDATE SET
-           process_incarnation=EXCLUDED.process_incarnation,state=EXCLUDED.state,
-           failure_class=EXCLUDED.failure_class,checked_at=EXCLUDED.checked_at,
-           lease_expires_at=EXCLUDED.lease_expires_at",
-    )
-    .bind(auth_incarnation)
-    .bind(now)
-    .bind(now + Duration::hours(1))
-    .execute(pool)
-    .await
-    .expect("seed exact email protection readiness");
     (
         project_id,
         application_id,
@@ -847,6 +625,64 @@ async fn seed_email_authority(
             smtp_security_eligibility_revision: 1,
         },
     )
+}
+
+async fn create_selected_email_login(
+    authentication: &PostgresAuthenticationRepository,
+    email: &PostgresPasswordlessEmailRepository,
+    project_id: Uuid,
+    application_id: Uuid,
+    method: AdmittedEmailMethod,
+    now: OffsetDateTime,
+    seed: u8,
+) -> Uuid {
+    let transaction_id = Uuid::new_v4();
+    authentication
+        .create_login_transaction(CreateLoginTransaction {
+            id: transaction_id,
+            project_id,
+            application_id,
+            interaction: digest(seed),
+            redirect_uri: "https://app.example/callback".to_owned(),
+            application_pkce_challenge: "A".repeat(43),
+            application_state: protected(seed.wrapping_add(1)),
+            presentation_hint: None,
+            revisions: LoginRevisionSnapshot {
+                project_metadata_revision: 1,
+                project_security_revision: 1,
+                application_security_revision: 1,
+                claims_revision: 1,
+                session_revision: 1,
+            },
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            admitted_providers: Vec::new(),
+            admitted_email: Some(method),
+        })
+        .await
+        .expect("create suppression login");
+    authentication
+        .bind_hosted_browser(BindHostedBrowser {
+            interaction: digest(seed),
+            expected_transaction_revision: 1,
+            browser_binding: digest(seed.wrapping_add(2)),
+            csrf: digest(seed.wrapping_add(3)),
+            now: now + Duration::seconds(1),
+        })
+        .await
+        .expect("bind suppression browser");
+    email
+        .select_email_method(SelectEmailMethod {
+            project_id,
+            transaction_id,
+            expected_transaction_revision: 2,
+            browser_binding: digest(seed.wrapping_add(2)),
+            csrf: digest(seed.wrapping_add(3)),
+            now: now + Duration::seconds(2),
+        })
+        .await
+        .expect("select suppression email method");
+    transaction_id
 }
 
 fn completion(
@@ -887,14 +723,6 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .await
         .expect("connect sqlx");
     MIGRATOR.run(&pool).await.expect("migrate schema");
-    sqlx::query(
-        "INSERT INTO email_identity_alias_authority
-         (singleton,revision,write_version,target_version,accepted_versions)
-         VALUES (TRUE,1,1,1,'[1,2]'::jsonb)",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed identity alias authority");
     let database = Database::connect(&url).await.expect("connect SeaORM");
     let now = OffsetDateTime::now_utc();
     let (project_id, application_id, smtp_id, email_method) =
@@ -1014,7 +842,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
             created_at: now,
             expires_at: now + Duration::minutes(10),
             admitted_providers: Vec::new(),
-            admitted_email: Some(email_method),
+            admitted_email: Some(email_method.clone()),
         })
         .await
         .expect("create login");
@@ -1165,13 +993,13 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         outbox_id: Uuid::new_v4(),
         canonicalization_version: 1,
         lookup_digest: digest(5),
+        recipient_digests: vec![digest(5)],
         address: protected(6),
         otp_digest: Some(digest_at(7, 2)),
         magic_digest: Some(digest(8)),
         envelope: protected(9),
         body: protected(10),
         message_id: format!("<{}@mail.owlauth.invalid>", Uuid::new_v4()),
-        suppress_delivery: false,
         issued_at: now + Duration::seconds(3),
         otp_expires_at: Some(now + Duration::minutes(2)),
         magic_expires_at: Some(now + Duration::minutes(5)),
@@ -1266,196 +1094,109 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .await
         .expect("commit challenge and outbox");
 
-    // A server-derived address suppression commits the same real challenge family and revision
-    // progression as delivery, but its durable outbox disposition is terminal and unclaimable.
-    // Resend still supersedes generation n, and wrong proofs follow the ordinary bounded attempt
-    // path without any proof ever leaving the server.
-    let suppressed_transaction_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO login_transactions
-         SELECT (jsonb_populate_record(NULL::login_transactions,
-           to_jsonb(source) || jsonb_build_object(
-             'id',$1,'interaction_digest',$2,'status','email_address_entry','transaction_revision',3,
-             'user_id',NULL,'authenticated_at',NULL,'terminal_at',NULL,'created_at',$3,'updated_at',$3))).*
-         FROM login_transactions source WHERE source.id=$4",
-    )
-    .bind(suppressed_transaction_id)
-    .bind(vec![99_u8; 32])
-    .bind(now)
-    .bind(transaction_id)
-    .execute(&pool)
-    .await
-    .expect("clone selected login for suppressed equivalence");
-    sqlx::query(
-        "INSERT INTO login_email_method_snapshots
-         SELECT (jsonb_populate_record(NULL::login_email_method_snapshots,
-           to_jsonb(source) || jsonb_build_object('transaction_id',$1,'created_at',$2))).*
-         FROM login_email_method_snapshots source WHERE source.transaction_id=$3",
-    )
-    .bind(suppressed_transaction_id)
-    .bind(now)
-    .bind(transaction_id)
-    .execute(&pool)
-    .await
-    .expect("clone email snapshot for suppressed equivalence");
-    let suppressed_challenge_id = Uuid::new_v4();
-    let mut suppressed = generation.clone();
-    suppressed.transaction_id = suppressed_transaction_id;
-    suppressed.challenge_id = suppressed_challenge_id;
-    suppressed.outbox_id = Uuid::new_v4();
-    suppressed.message_id = format!("<{}@mail.owlauth.invalid>", suppressed.outbox_id);
-    suppressed.suppress_delivery = true;
-    email
-        .commit_email_generation(suppressed.clone())
+    let backlog_probe = database
+        .begin()
         .await
-        .expect("commit real suppressed generation");
-    let suppressed_state: (String, i64, String, i16, String, Option<String>, i16, bool) =
-        sqlx::query_as(
-            "SELECT login.status,login.transaction_revision,challenge.status,challenge.generation,
-                    outbox.status,outbox.safe_outcome,outbox.attempts,outbox.lease_owner IS NULL
-             FROM login_transactions login JOIN email_challenges challenge
-               ON challenge.transaction_id=login.id JOIN mail_outbox outbox
-               ON outbox.challenge_id=challenge.id
-             WHERE login.id=$1 AND challenge.id=$2",
-        )
-        .bind(suppressed_transaction_id)
-        .bind(suppressed_challenge_id)
-        .fetch_one(&pool)
-        .await
-        .expect("reload suppressed Hosted authority state");
+        .expect("begin bounded Project backlog probe");
     assert_eq!(
-        suppressed_state,
-        (
-            "email_challenge_pending".to_owned(),
-            4,
-            "pending".to_owned(),
-            1,
-            "cancelled".to_owned(),
-            Some("policy_denied".to_owned()),
-            0,
-            true,
-        )
-    );
-    sqlx::query("UPDATE mail_outbox SET next_attempt_at=$2 WHERE challenge_id=$1")
-        .bind(challenge_id)
-        .bind(now + Duration::minutes(4))
-        .execute(&pool)
-        .await
-        .expect("defer admitted sibling while probing suppressed outbox");
-    assert!(
-        email
-            .claim_due_mail(
-                "suppressed-must-never-claim",
-                now + Duration::seconds(4),
-                now + Duration::seconds(34),
-            )
+        authorize_mail_delivery_with_limit(&backlog_probe, project_id, 1, &[digest(108)], 30, 1,)
             .await
-            .expect("suppressed claim evaluation")
-            .is_none()
+            .expect("evaluate bounded Project backlog"),
+        MailDeliveryAuthorization::ProjectBacklogFull
     );
-    // Mail authority is PostgreSQL-clock based; make the fixture durably due rather than
-    // advancing a synthetic caller timestamp.
-    sqlx::query(
-        "UPDATE mail_outbox
-            SET next_attempt_at=clock_timestamp()-interval '1 second'
-          WHERE challenge_id=$1",
-    )
-    .bind(challenge_id)
-    .execute(&pool)
-    .await
-    .expect("restore admitted outbox schedule");
-    let wrong_suppressed = VerifyEmailProof {
+    backlog_probe
+        .rollback()
+        .await
+        .expect("rollback bounded Project backlog probe");
+
+    // Different login owners for the same Project and canonical recipient share one durable
+    // side-effect decision. The active/retained digest candidates keep that decision stable while
+    // the email identity digest key changes, and both callers still commit a generic generation.
+    let suppression_parent_time = now - Duration::minutes(2);
+    let suppression_left = create_selected_email_login(
+        &authentication,
+        &email,
         project_id,
-        transaction_id: suppressed_transaction_id,
-        challenge_id: suppressed_challenge_id,
-        proof_kind: EmailProofKind::Otp,
-        proof_digest: digest_at(250, 2),
-        browser_binding: Some(digest(3)),
-        csrf: digest(4),
-        transfer_context: None,
-        expected_transaction_revision: 4,
-        now: now + Duration::seconds(5),
-    };
-    assert_eq!(
-        email
-            .verify_email_proof(wrong_suppressed.clone())
-            .await
-            .expect("wrong suppressed proof is generic invalid"),
-        crate::application::EmailProofDecision::Invalid
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i16>("SELECT otp_attempts FROM email_challenges WHERE id=$1")
-            .bind(suppressed_challenge_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-        1
-    );
-    let second_suppressed_challenge_id = Uuid::new_v4();
-    suppressed.expected_transaction_revision = 4;
-    suppressed.expected_generation = 2;
-    suppressed.challenge_id = second_suppressed_challenge_id;
-    suppressed.outbox_id = Uuid::new_v4();
-    suppressed.message_id = format!("<{}@mail.owlauth.invalid>", suppressed.outbox_id);
-    suppressed.issued_at = now + Duration::seconds(40);
-    email
-        .commit_email_generation(suppressed)
-        .await
-        .expect("suppressed resend commits ordinary next generation");
-    let generations: Vec<(i16, String, String)> = sqlx::query_as(
-        "SELECT challenge.generation,challenge.status,outbox.status
-         FROM email_challenges challenge JOIN mail_outbox outbox ON outbox.challenge_id=challenge.id
-         WHERE challenge.transaction_id=$1 ORDER BY challenge.generation",
+        application_id,
+        email_method.clone(),
+        suppression_parent_time,
+        110,
     )
-    .bind(suppressed_transaction_id)
-    .fetch_all(&pool)
-    .await
-    .expect("suppressed resend family");
-    assert_eq!(
-        generations,
-        vec![
-            (1, "superseded".to_owned(), "cancelled".to_owned()),
-            (2, "pending".to_owned(), "cancelled".to_owned()),
-        ]
-    );
-    let mut wrong_old = wrong_suppressed;
-    wrong_old.expected_transaction_revision = 5;
-    wrong_old.now = now + Duration::seconds(41);
-    assert_eq!(
-        email.verify_email_proof(wrong_old).await.unwrap(),
-        crate::application::EmailProofDecision::Invalid
-    );
-    let wrong_new = VerifyEmailProof {
+    .await;
+    let suppression_right = create_selected_email_login(
+        &authentication,
+        &email,
         project_id,
-        transaction_id: suppressed_transaction_id,
-        challenge_id: second_suppressed_challenge_id,
-        proof_kind: EmailProofKind::Otp,
-        proof_digest: digest_at(251, 2),
-        browser_binding: Some(digest(3)),
-        csrf: digest(4),
-        transfer_context: None,
-        expected_transaction_revision: 5,
-        now: now + Duration::seconds(41),
+        application_id,
+        email_method,
+        suppression_parent_time,
+        120,
+    )
+    .await;
+    let retained_recipient = digest(109);
+    let active_recipient = digest_at(119, 2);
+    let suppression_command = |transaction_id, lookup_digest| CommitEmailGeneration {
+        transaction_id,
+        expected_transaction_revision: 3,
+        expected_generation: 1,
+        challenge_id: Uuid::new_v4(),
+        outbox_id: Uuid::new_v4(),
+        lookup_digest,
+        recipient_digests: vec![retained_recipient.clone(), active_recipient.clone()],
+        message_id: format!("<{}@mail.owlauth.invalid>", Uuid::new_v4()),
+        // The caller clock is behind PostgreSQL by more than the suppression window. Outbox
+        // creation time is PostgreSQL-authored, so both commits still share one recent-recipient
+        // decision instead of dispatching twice from a stale process timestamp.
+        issued_at: now - Duration::seconds(31),
+        otp_expires_at: Some(now + Duration::minutes(2)),
+        magic_expires_at: Some(now + Duration::minutes(5)),
+        expires_at: now + Duration::minutes(5),
+        ..generation.clone()
     };
-    assert_eq!(
-        email.verify_email_proof(wrong_new).await.unwrap(),
-        crate::application::EmailProofDecision::Invalid
+    let (suppression_left_result, suppression_right_result) = tokio::join!(
+        email.commit_email_generation(suppression_command(
+            suppression_left,
+            retained_recipient.clone(),
+        )),
+        email.commit_email_generation(suppression_command(
+            suppression_right,
+            active_recipient.clone(),
+        )),
     );
-    sqlx::query("DELETE FROM mail_outbox WHERE transaction_id=$1")
-        .bind(suppressed_transaction_id)
+    suppression_left_result.expect("first canonical-recipient generation should commit");
+    suppression_right_result
+        .expect("second canonical-recipient generation should commit generically");
+    let suppression_shape: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT COUNT(*) FROM email_challenges
+             WHERE transaction_id=ANY($1) AND status='pending'),
+           (SELECT COUNT(*) FROM email_challenges
+             WHERE transaction_id=ANY($1) AND status='delivery_unavailable'),
+           (SELECT COUNT(*) FROM mail_outbox WHERE transaction_id=ANY($1)),
+           (SELECT COUNT(*) FROM login_transactions
+             WHERE id=ANY($1) AND transaction_revision=4)",
+    )
+    .bind(vec![suppression_left, suppression_right])
+    .fetch_one(&pool)
+    .await
+    .expect("canonical-recipient suppression shape");
+    assert_eq!(suppression_shape, (1, 1, 1, 2));
+    let suppression_transactions = vec![suppression_left, suppression_right];
+    sqlx::query("DELETE FROM mail_outbox WHERE transaction_id=ANY($1)")
+        .bind(&suppression_transactions)
         .execute(&pool)
         .await
-        .expect("remove suppressed outbox fixture");
-    sqlx::query("DELETE FROM email_challenges WHERE transaction_id=$1")
-        .bind(suppressed_transaction_id)
+        .expect("remove suppression fixture mail");
+    sqlx::query("DELETE FROM email_challenges WHERE transaction_id=ANY($1)")
+        .bind(&suppression_transactions)
         .execute(&pool)
         .await
-        .expect("remove suppressed challenge fixture");
-    sqlx::query("DELETE FROM login_transactions WHERE id=$1")
-        .bind(suppressed_transaction_id)
+        .expect("remove suppression fixture challenges");
+    sqlx::query("DELETE FROM login_transactions WHERE id=ANY($1)")
+        .bind(&suppression_transactions)
         .execute(&pool)
         .await
-        .expect("remove suppressed login fixture by cascade");
+        .expect("remove suppression fixture logins");
 
     assert_eq!(
         email
@@ -1590,6 +1331,18 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
             .await
             .expect("restore owner after claim fence");
     }
+
+    // Mail claim eligibility is PostgreSQL-clock based. Make the fixture durably due before the
+    // lock-order races rather than relying on elapsed wall time in preceding test scenarios.
+    sqlx::query(
+        "UPDATE mail_outbox
+            SET next_attempt_at=clock_timestamp()-interval '1 second'
+          WHERE challenge_id=$1",
+    )
+    .bind(challenge_id)
+    .execute(&pool)
+    .await
+    .expect("stage due outbox for claim authority races");
 
     // Every revoking claim authority participates in a real PostgreSQL commit-order race. If the
     // disable/compromise/supersession commits first, the later claim is inert; if the claim holds
@@ -1957,26 +1710,17 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         "candidate lookup version must exact-match the re-locked challenge"
     );
 
-    // Model retirement after this v1 challenge was issued. Durable identity resolution now uses
-    // only v2, while the verified challenge-local v1 lookup remains independently authoritative.
-    sqlx::query(
-        "UPDATE email_identity_alias_authority
-         SET revision=2,write_version=2,target_version=2,accepted_versions='[2]'::jsonb,
-             retirement_version=2,updated_at=$1 WHERE singleton=TRUE",
-    )
-    .bind(now + Duration::seconds(39))
-    .execute(&pool)
-    .await
-    .expect("retire durable v1 alias authority around a live v1 challenge");
-
+    // Durable lookup uses the process-local active and retained ring, while new alias data writes
+    // only the active version. The challenge-local v1 lookup remains independently authoritative.
+    let aliases = vec![digest_at(6, 1), digest_at(6, 2)];
     let mut magic_completion = completion(magic, "magic_winner", Uuid::new_v4());
-    magic_completion.lookup_aliases = vec![digest_at(6, 2)];
+    magic_completion.lookup_aliases = aliases.clone();
     magic_completion.active_alias = digest_at(6, 2);
-    magic_completion.alias_authority_revision = 2;
+    magic_completion.alias_authority_revision = 1;
     let mut copied_completion = completion(copied_magic, "copied_winner", Uuid::new_v4());
-    copied_completion.lookup_aliases = vec![digest_at(6, 2)];
+    copied_completion.lookup_aliases = aliases;
     copied_completion.active_alias = digest_at(6, 2);
-    copied_completion.alias_authority_revision = 2;
+    copied_completion.alias_authority_revision = 1;
     let (magic_result, copied_result) = tokio::join!(
         email.complete_email_proof(magic_completion),
         email.complete_email_proof(copied_completion)
@@ -2010,28 +1754,8 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     assert_eq!(
         identity_alias_versions,
         vec![2],
-        "current durable alias authority, not the challenge-local version, resolves the identity"
+        "new durable aliases use only the configured active version"
     );
-    // Restore the long monolith's original authority fixture after the focused retirement proof;
-    // the production lifecycle remains monotonic and is covered by the dedicated cutover test.
-    sqlx::query(
-        "UPDATE email_identity_alias_authority
-         SET revision=1,write_version=1,target_version=1,accepted_versions='[1,2]'::jsonb,
-             retirement_version=NULL,updated_at=$1 WHERE singleton=TRUE",
-    )
-    .bind(now + Duration::seconds(40))
-    .execute(&pool)
-    .await
-    .expect("restore original alias-authority fixture");
-    sqlx::query(
-        "UPDATE email_identity_aliases
-         SET digest_key_version=1,lookup_digest=$1 WHERE project_id=$2",
-    )
-    .bind(digest(5).value.to_vec())
-    .bind(project_id)
-    .execute(&pool)
-    .await
-    .expect("restore original durable alias fixture");
 
     sqlx::query(
         "CREATE TABLE email_backlog_ids
@@ -2366,1427 +2090,4 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     .await
     .expect("short-term payload redaction");
     assert_eq!(redaction, ("expired".to_owned(), true, true, 0));
-
-    // A locked old-key short-term row is skipped by the bounded terminalizer, but must remain
-    // visible in inventory and keep readiness unavailable until a later retry can terminalize it.
-    let locked_outbox_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM mail_outbox ORDER BY id LIMIT 1")
-            .fetch_one(&pool)
-            .await
-            .expect("short-term protection fixture");
-    sqlx::query(
-        "UPDATE mail_outbox SET status='pending',
-         envelope_ciphertext=decode(repeat('aa',41),'hex'),envelope_key_version=2,
-         body_ciphertext=decode(repeat('bb',41),'hex'),body_key_version=2,
-         lease_owner=NULL,lease_expires_at=NULL,safe_outcome=NULL,terminal_at=NULL,delivered_at=NULL,
-         redacted_at=NULL WHERE id=$1",
-    )
-    .bind(locked_outbox_id)
-    .execute(&pool)
-    .await
-    .expect("stage unreadable short-term payload");
-    let mut short_term_lock = pool.begin().await.expect("begin short-term lock");
-    sqlx::query("SELECT id FROM mail_outbox WHERE id=$1 FOR UPDATE")
-        .bind(locked_outbox_id)
-        .fetch_one(&mut *short_term_lock)
-        .await
-        .expect("lock unreadable short-term payload");
-    assert!(matches!(
-        email
-            .reconcile_protection_inventory(&[1], &[1], now + Duration::minutes(5))
-            .await,
-        Err(crate::application::ApplicationError::Integrity)
-    ));
-    let still_pending: String = sqlx::query_scalar("SELECT status FROM mail_outbox WHERE id=$1")
-        .bind(locked_outbox_id)
-        .fetch_one(&pool)
-        .await
-        .expect("locked payload remains pending");
-    assert_eq!(still_pending, "pending");
-    short_term_lock
-        .rollback()
-        .await
-        .expect("release short-term lock");
-    email
-        .reconcile_protection_inventory(&[1], &[1], now + Duration::minutes(5))
-        .await
-        .expect("retry terminalizes unlocked unreadable short-term payload");
-
-    // Challenge lookup digests share the durable email-identity namespace, while every other
-    // challenge/outbox value is short-lived. Exercise reconciliation with deliberately
-    // non-overlapping version numbers so matching numeric versions cannot hide a namespace bug.
-    let namespace_challenge_id: Uuid =
-        sqlx::query_scalar("SELECT challenge_id FROM mail_outbox WHERE id=$1")
-            .bind(locked_outbox_id)
-            .fetch_one(&pool)
-            .await
-            .expect("lookup-namespace challenge fixture");
-    let mut namespace_fixture = pool.begin().await.expect("begin namespace fixture");
-    sqlx::query(
-        "UPDATE email_challenges SET status='superseded',terminal_at=$2
-         WHERE transaction_id=(SELECT transaction_id FROM email_challenges WHERE id=$1)
-           AND id<>$1 AND status='pending'",
-    )
-    .bind(namespace_challenge_id)
-    .bind(now + Duration::minutes(6))
-    .execute(&mut *namespace_fixture)
-    .await
-    .expect("retire any sibling pending challenge fixture");
-    sqlx::query(
-        "UPDATE email_challenges SET status='pending',terminal_at=NULL,consumed_at=NULL,
-         lookup_digest_key_version=2,address_ciphertext=decode(repeat('cc',41),'hex'),
-         address_key_version=1,redacted_at=NULL,
-         otp_digest_key_version=CASE WHEN otp_digest IS NULL THEN NULL ELSE 1 END,
-         magic_digest_key_version=CASE WHEN magic_digest IS NULL THEN NULL ELSE 1 END
-         WHERE id=$1",
-    )
-    .bind(namespace_challenge_id)
-    .execute(&mut *namespace_fixture)
-    .await
-    .expect("stage live challenge with split key namespaces");
-    sqlx::query("UPDATE email_challenges SET lookup_digest_key_version=2 WHERE status='pending'")
-        .execute(&mut *namespace_fixture)
-        .await
-        .expect("align other live lookup digests with durable namespace");
-    sqlx::query(
-        "UPDATE mail_outbox SET status='pending',
-         envelope_ciphertext=decode(repeat('dd',41),'hex'),envelope_key_version=1,
-         body_ciphertext=decode(repeat('ee',41),'hex'),body_key_version=1,redacted_at=NULL,
-         safe_outcome=NULL,terminal_at=NULL,delivered_at=NULL,lease_owner=NULL,lease_expires_at=NULL
-         WHERE id=$1",
-    )
-    .bind(locked_outbox_id)
-    .execute(&mut *namespace_fixture)
-    .await
-    .expect("stage live outbox with short-term namespace");
-    sqlx::query("UPDATE email_identity_aliases SET digest_key_version=2")
-        .execute(&mut *namespace_fixture)
-        .await
-        .expect("stage durable identity digests at version two");
-    sqlx::query("UPDATE email_identities SET address_key_version=2")
-        .execute(&mut *namespace_fixture)
-        .await
-        .expect("stage durable identity protection at version two");
-    namespace_fixture
-        .commit()
-        .await
-        .expect("commit split namespace fixture");
-
-    let inventory = email
-        .reconcile_protection_inventory(&[1], &[2], now + Duration::minutes(6))
-        .await
-        .expect("independently readable key namespaces remain ready");
-    assert_eq!(inventory.short_term_digest_versions, [1].into());
-    assert_eq!(inventory.short_term_protection_versions, [1].into());
-    assert_eq!(inventory.durable_digest_versions, [2].into());
-    assert_eq!(inventory.durable_protection_versions, [2].into());
-    let live_statuses: (String, String) = sqlx::query_as(
-        "SELECT challenge.status,outbox.status FROM email_challenges challenge
-         JOIN mail_outbox outbox ON outbox.project_id=challenge.project_id
-          AND outbox.challenge_id=challenge.id
-         WHERE challenge.id=$1 AND outbox.id=$2",
-    )
-    .bind(namespace_challenge_id)
-    .bind(locked_outbox_id)
-    .fetch_one(&pool)
-    .await
-    .expect("live split-namespace work remains available");
-    assert_eq!(live_statuses, ("pending".to_owned(), "pending".to_owned()));
-
-    assert!(matches!(
-        email
-            .reconcile_protection_inventory(&[1], &[1], now + Duration::minutes(7))
-            .await,
-        Err(crate::application::ApplicationError::Integrity)
-    ));
-    let statuses_after_missing_identity: (String, String) = sqlx::query_as(
-        "SELECT challenge.status,outbox.status FROM email_challenges challenge
-         JOIN mail_outbox outbox ON outbox.project_id=challenge.project_id
-          AND outbox.challenge_id=challenge.id
-         WHERE challenge.id=$1 AND outbox.id=$2",
-    )
-    .bind(namespace_challenge_id)
-    .bind(locked_outbox_id)
-    .fetch_one(&pool)
-    .await
-    .expect("missing identity key does not terminalize readable short-term work");
-    assert_eq!(statuses_after_missing_identity, live_statuses);
-    sqlx::query(
-        "UPDATE project_smtp_configurations SET status='active',retained_until=NULL
-         WHERE id=$1",
-    )
-    .bind(smtp_id)
-    .execute(&pool)
-    .await
-    .expect("restore SMTP prerequisite for scoped protection readiness");
-    email
-        .record_email_protection_readiness(false, Some("integrity"), now + Duration::minutes(7))
-        .await
-        .expect("persist scoped email protection failure");
-    let protection_status: (String, Option<String>) = sqlx::query_as(
-        "SELECT state,failure_class FROM email_protection_runtime_readiness
-         WHERE process_id='auth-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("bounded email protection status");
-    assert_eq!(
-        protection_status,
-        ("unavailable".to_owned(), Some("integrity".to_owned()))
-    );
-    let (project_public_id, application_public_id): (String, String) = sqlx::query_as(
-        "SELECT project.public_id,application.public_id FROM projects project
-         JOIN applications application ON application.project_id=project.id
-         WHERE project.id=$1 AND application.id=$2",
-    )
-    .bind(project_id)
-    .bind(application_id)
-    .fetch_one(&pool)
-    .await
-    .expect("public email authority IDs");
-    let readiness = PostgresReadinessAdapter::new(
-        database.clone(),
-        "auth-1".to_owned(),
-        Uuid::nil(),
-        vec!["auth-1".to_owned()],
-        std::time::Duration::from_secs(30),
-    );
-    let unavailable_public = readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("non-email public configuration remains available");
-    assert!(!unavailable_public.email_available);
-    let before: (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM email_challenges),
-                (SELECT COUNT(*) FROM mail_outbox)",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("email work counts before unavailable attempt");
-    assert_eq!(
-        email
-            .prepare_email_generation(
-                project_id,
-                Uuid::new_v4(),
-                1,
-                &digest(1),
-                &digest(2),
-                now + Duration::minutes(8),
-            )
-            .await,
-        Err(crate::application::ApplicationError::Disabled)
-    );
-    assert_eq!(
-        email
-            .claim_due_mail(
-                "protection-unavailable-worker",
-                now + Duration::minutes(8),
-                now + Duration::minutes(8) + Duration::seconds(30),
-            )
-            .await,
-        Err(crate::application::ApplicationError::Disabled)
-    );
-    let after: (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM email_challenges),
-                (SELECT COUNT(*) FROM mail_outbox)",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("email work counts after unavailable attempt");
-    assert_eq!(after, before);
-
-    email
-        .record_email_protection_readiness(true, None, now + Duration::minutes(9))
-        .await
-        .expect("restored long-term ring reopens exact Runtime capability");
-    let restored_prerequisites: (String, String, String, bool, String, bool, i64) = sqlx::query_as(
-        "SELECT policy.status,assignment.status,smtp.status,
-                smtp_ready.lease_expires_at>transaction_timestamp(),protection.state,
-                protection.lease_expires_at>transaction_timestamp(),
-                (SELECT COUNT(*) FROM project_signing_keys signing
-                 WHERE signing.project_id=$1 AND signing.state='active')
-         FROM project_email_policies policy
-         JOIN application_email_assignments assignment
-           ON assignment.project_id=policy.project_id AND assignment.application_id=$2
-         JOIN project_smtp_configurations smtp ON smtp.project_id=policy.project_id
-         JOIN project_smtp_runtime_readiness smtp_ready
-           ON smtp_ready.project_id=smtp.project_id AND smtp_ready.configuration_id=smtp.id
-          AND smtp_ready.generation=smtp.generation AND smtp_ready.process_id='auth-1'
-         JOIN email_protection_runtime_readiness protection
-           ON protection.process_id='auth-1'
-         WHERE policy.project_id=$1",
-    )
-    .bind(project_id)
-    .bind(application_id)
-    .fetch_one(&pool)
-    .await
-    .expect("restored public email prerequisites");
-    assert_eq!(
-        restored_prerequisites,
-        (
-            "enabled".to_owned(),
-            "active".to_owned(),
-            "active".to_owned(),
-            true,
-            "ready".to_owned(),
-            true,
-            1,
-        )
-    );
-    let restored_public = readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("restored public email configuration");
-    assert!(restored_public.email_available);
-    assert!(matches!(
-        email
-            .prepare_email_generation(
-                project_id,
-                Uuid::new_v4(),
-                1,
-                &digest(1),
-                &digest(2),
-                now + Duration::minutes(9),
-            )
-            .await,
-        Err(crate::application::ApplicationError::NotFound)
-    ));
-}
-
-#[tokio::test]
-#[allow(
-    clippy::similar_names,
-    clippy::too_many_lines,
-    reason = "one PostgreSQL lifecycle names each Runtime incarnation while proving roster and restart fences"
-)]
-async fn project_smtp_activation_requires_fresh_complete_runtime_roster_in_postgres() {
-    let Some((_container, url)) = start_postgres().await else {
-        return;
-    };
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .expect("connect sqlx");
-    MIGRATOR.run(&pool).await.expect("migrate schema");
-    let now = OffsetDateTime::now_utc();
-    let (project_id, application_id, active_id, _) = seed_email_authority(&pool, now).await;
-    let pending_id = Uuid::new_v4();
-    seed_project_smtp_generation(
-        &pool, project_id, active_id, pending_id, 2, "pending", [8; 32], now,
-    )
-    .await;
-    let database = Database::connect(&url).await.expect("connect SeaORM");
-    let roster = vec!["auth-a".to_owned(), "auth-b".to_owned()];
-    let control =
-        PostgresEmailControlRepository::new_with_runtime_roster(database.clone(), roster.clone());
-    let activate = |at| {
-        control.activate_smtp_configuration(
-            project_id,
-            pending_id,
-            1,
-            at + Duration::hours(1),
-            Uuid::new_v4(),
-            at,
-        )
-    };
-    assert!(matches!(
-        activate(now).await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-
-    let runtime_a_incarnation = Uuid::new_v4();
-    let runtime_a = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        "auth-a".to_owned(),
-        runtime_a_incarnation,
-        roster.clone(),
-        Duration::minutes(5),
-    );
-    runtime_a
-        .claim_auth_incarnation(now)
-        .await
-        .expect("auth-a claims its startup incarnation");
-    runtime_a
-        .record_email_protection_readiness(true, None, now)
-        .await
-        .expect("auth-a long-term email ring ready");
-    runtime_a
-        .fail_close_project_smtp_restore_inventory(now)
-        .await
-        .expect("auth-a fail-closes its restore inventory");
-    let runtime_a_candidates = runtime_a
-        .project_smtp_readiness_candidates(now, 100)
-        .await
-        .expect("pending generation is inventoried");
-    let pending = runtime_a_candidates
-        .iter()
-        .find(|candidate| candidate.configuration_id == pending_id)
-        .expect("pending candidate")
-        .clone();
-    let active = runtime_a_candidates
-        .iter()
-        .find(|candidate| candidate.configuration_id == active_id)
-        .expect("active candidate")
-        .clone();
-    runtime_a
-        .record_project_smtp_readiness(&active, true, now)
-        .await
-        .expect("auth-a active ready");
-    runtime_a
-        .record_project_smtp_readiness(&pending, true, now)
-        .await
-        .expect("auth-a ready");
-    assert!(matches!(
-        activate(now + Duration::seconds(1)).await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-
-    let (project_public_id, application_public_id): (String, String) = sqlx::query_as(
-        "SELECT project.public_id,application.public_id FROM projects project
-         JOIN applications application ON application.project_id=project.id
-         WHERE project.id=$1 AND application.id=$2",
-    )
-    .bind(project_id)
-    .bind(application_id)
-    .fetch_one(&pool)
-    .await
-    .expect("public capability authority IDs");
-    let public_readiness = PostgresReadinessAdapter::new(
-        database.clone(),
-        "auth-a".to_owned(),
-        runtime_a_incarnation,
-        roster.clone(),
-        std::time::Duration::from_secs(30),
-    );
-    let missing_peer_public = public_readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("public configuration remains available while a required Runtime is absent");
-    assert!(!missing_peer_public.email_available);
-    assert!(!missing_peer_public.login_available);
-    assert!(missing_peer_public.providers.is_empty());
-    let runtime_a_authority = PostgresRuntimeAuthorityRepository::new_with_runtime_identity(
-        database.clone(),
-        "auth-a".to_owned(),
-        runtime_a_incarnation,
-        roster.clone(),
-        test_projection_materializer(),
-    );
-    assert!(matches!(
-        runtime_a_authority
-            .prepare_login_start(
-                &project_public_id,
-                &application_public_id,
-                &format!("pk_{}", application_id.simple()),
-                "https://app.example/callback",
-            )
-            .await,
-        Err(crate::application::ApplicationError::Disabled)
-    ));
-
-    let provider_id = Uuid::new_v4();
-    sqlx::query(
-        "WITH material AS (
-             INSERT INTO protected_materials
-                (id,scope_kind,project_id,owner_kind,owner_id,generation,material_kind,
-                 provider_id,provider_format_version,context_version,context_digest,
-                 opaque_value,safe_fingerprint,state)
-             VALUES (gen_random_uuid(),'project',$2,'provider_secret',$1,1,
-                     'configuration_secret','software',1,1,
-                     decode(repeat('03',32),'hex'),decode('01','hex'),
-                     decode(repeat('02',32),'hex'),'live')
-             RETURNING id
-         )
-         INSERT INTO provider_configurations
-           (id,project_id,provider_key,kind,display_name,issuer,client_id,callback_url,
-            secret_material_id,status,revision)
-         SELECT $1,$2,'workforce','oidc','Workforce SSO','https://issuer.example/',
-                'email-roster-client','https://runtime.example/callback',material.id,
-                'active',1 FROM material",
-    )
-    .bind(provider_id)
-    .bind(project_id)
-    .execute(&pool)
-    .await
-    .expect("seed provider capability beside unavailable email");
-    sqlx::query(
-        "INSERT INTO application_provider_assignments
-           (project_id,application_id,provider_id,status,security_revision)
-         VALUES ($1,$2,$3,'active',1)",
-    )
-    .bind(project_id)
-    .bind(application_id)
-    .bind(provider_id)
-    .execute(&pool)
-    .await
-    .expect("assign provider beside unavailable email");
-    let provider_only_public = public_readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("provider capability remains available independently");
-    assert!(!provider_only_public.email_available);
-    assert!(provider_only_public.login_available);
-    assert_eq!(provider_only_public.providers.len(), 1);
-    assert_eq!(provider_only_public.providers[0].key, "workforce");
-
-    let runtime_b_incarnation = Uuid::new_v4();
-    let runtime_b = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        "auth-b".to_owned(),
-        runtime_b_incarnation,
-        roster.clone(),
-        Duration::minutes(5),
-    );
-    runtime_b
-        .claim_auth_incarnation(now + Duration::seconds(1))
-        .await
-        .expect("auth-b claims its startup incarnation");
-    runtime_b
-        .record_email_protection_readiness(true, None, now + Duration::seconds(1))
-        .await
-        .expect("auth-b long-term email ring ready");
-    runtime_b
-        .fail_close_project_smtp_restore_inventory(now + Duration::seconds(1))
-        .await
-        .expect("auth-b fail-closes its restore inventory");
-    runtime_b
-        .record_project_smtp_readiness(&active, true, now + Duration::seconds(1))
-        .await
-        .expect("auth-b active ready");
-    runtime_b
-        .record_project_smtp_readiness(&pending, false, now + Duration::seconds(1))
-        .await
-        .expect("auth-b mismatch");
-    assert!(matches!(
-        activate(now + Duration::seconds(2)).await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    let complete_active_public = public_readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("complete active-generation roster restores public email capability");
-    assert!(complete_active_public.email_available);
-    assert!(complete_active_public.login_available);
-    assert_eq!(complete_active_public.providers.len(), 1);
-
-    sqlx::query(
-        "UPDATE project_smtp_runtime_readiness
-         SET checked_at=transaction_timestamp()-INTERVAL '2 seconds',
-             lease_expires_at=transaction_timestamp()-INTERVAL '1 second'
-         WHERE project_id=$1 AND configuration_id=$2 AND process_id='auth-b'",
-    )
-    .bind(project_id)
-    .bind(active_id)
-    .execute(&pool)
-    .await
-    .expect("expire required auth-b active-generation readiness lease");
-    let expired_peer_public = public_readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("provider configuration remains available after peer lease expiry");
-    assert!(!expired_peer_public.email_available);
-    assert!(expired_peer_public.login_available);
-    assert_eq!(expired_peer_public.providers.len(), 1);
-    runtime_b
-        .record_project_smtp_readiness(&active, true, now + Duration::seconds(2))
-        .await
-        .expect("auth-b renews active-generation readiness");
-
-    let runtime_b2_incarnation = Uuid::new_v4();
-    let runtime_b2 = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        "auth-b".to_owned(),
-        runtime_b2_incarnation,
-        roster.clone(),
-        Duration::minutes(5),
-    );
-    runtime_b2
-        .claim_auth_incarnation(now + Duration::seconds(2))
-        .await
-        .expect("replacement auth-b claims the stable process identity");
-    runtime_b2
-        .record_email_protection_readiness(true, None, now + Duration::seconds(2))
-        .await
-        .expect("replacement auth-b long-term email ring ready");
-    runtime_b2
-        .fail_close_project_smtp_restore_inventory(now + Duration::seconds(2))
-        .await
-        .expect("replacement auth-b fail-closes inherited SMTP readiness");
-    let replaced_peer_public = public_readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("provider configuration remains available during peer replacement");
-    assert!(!replaced_peer_public.email_available);
-    assert!(replaced_peer_public.login_available);
-    assert_eq!(replaced_peer_public.providers.len(), 1);
-    runtime_b2
-        .record_project_smtp_readiness(&active, true, now + Duration::seconds(2))
-        .await
-        .expect("replacement auth-b restores active readiness");
-    runtime_b2
-        .record_project_smtp_readiness(&pending, true, now + Duration::seconds(2))
-        .await
-        .expect("replacement auth-b restores pending readiness");
-    let replaced_peer_ready_public = public_readiness
-        .public_application_config(&project_public_id, &application_public_id)
-        .await
-        .expect("replacement peer readiness restores public email capability");
-    assert!(replaced_peer_ready_public.email_available);
-    assert!(replaced_peer_ready_public.login_available);
-    assert_eq!(replaced_peer_ready_public.providers.len(), 1);
-    let runtime_b = runtime_b2;
-
-    // Pending is still non-advertised even with complete readiness; only activation changes the
-    // active immutable generation selected for new login snapshots.
-    let before = runtime_a_authority
-        .prepare_login_start(
-            &format!("prj_{}", project_id.simple()),
-            &format!("app_{}", application_id.simple()),
-            &format!("pk_{}", application_id.simple()),
-            "https://app.example/callback",
-        )
-        .await
-        .expect("existing active generation remains advertised");
-    assert_eq!(before.admitted_email.unwrap().smtp_generation, 1);
-    assert!(matches!(
-        activate(now + Duration::seconds(3)).await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    seed_smtp_test_result(
-        &pool,
-        pending_id,
-        1,
-        "failed",
-        "permanent",
-        now + Duration::seconds(3),
-    )
-    .await;
-    assert!(matches!(
-        activate(now + Duration::seconds(3)).await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    seed_smtp_test_result(
-        &pool,
-        pending_id,
-        2,
-        "delivered",
-        "delivered",
-        now + Duration::seconds(3),
-    )
-    .await;
-    assert!(matches!(
-        activate(now + Duration::seconds(3)).await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    seed_smtp_test_result(
-        &pool,
-        pending_id,
-        1,
-        "delivered",
-        "delivered",
-        now + Duration::seconds(3),
-    )
-    .await;
-    sqlx::query(
-        "UPDATE project_smtp_configurations
-         SET security_eligibility_revision=security_eligibility_revision+1
-         WHERE project_id=$1 AND id=$2",
-    )
-    .bind(project_id)
-    .bind(pending_id)
-    .execute(&pool)
-    .await
-    .expect("advance pending SMTP security eligibility after delivered evidence");
-    assert!(matches!(
-        activate(now + Duration::seconds(3)).await,
-        Err(crate::application::ApplicationError::InvalidTransition)
-    ));
-    seed_smtp_test_result(
-        &pool,
-        pending_id,
-        1,
-        "delivered",
-        "delivered",
-        now + Duration::seconds(3),
-    )
-    .await;
-    let activated = activate(now + Duration::seconds(3))
-        .await
-        .expect("matching delivered test and complete Runtime roster permit activation");
-    assert_eq!(activated.generation, 2);
-
-    // A restarted process fail-closes its prior incarnation before it can serve. Old evidence
-    // therefore cannot authorize a later pending generation even while its lease was unexpired.
-    let pending_restart = Uuid::new_v4();
-    seed_project_smtp_generation(
-        &pool,
-        project_id,
-        pending_id,
-        pending_restart,
-        3,
-        "pending",
-        [9; 32],
-        now,
-    )
-    .await;
-    let restart_candidate = runtime_a
-        .project_smtp_readiness_candidates(now + Duration::seconds(4), 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|candidate| candidate.configuration_id == pending_restart)
-        .unwrap();
-    runtime_a
-        .record_project_smtp_readiness(&restart_candidate, true, now + Duration::seconds(4))
-        .await
-        .unwrap();
-    runtime_b
-        .record_project_smtp_readiness(&restart_candidate, true, now + Duration::seconds(4))
-        .await
-        .unwrap();
-    let runtime_a2_incarnation = Uuid::new_v4();
-    let runtime_a2 = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        "auth-a".to_owned(),
-        runtime_a2_incarnation,
-        roster.clone(),
-        Duration::minutes(5),
-    );
-    runtime_a2
-        .claim_auth_incarnation(now + Duration::seconds(5))
-        .await
-        .expect("replacement Runtime claims the stable process identity");
-    runtime_a2
-        .record_email_protection_readiness(true, None, now + Duration::seconds(5))
-        .await
-        .expect("replacement Runtime long-term email ring ready");
-    runtime_a2
-        .fail_close_project_smtp_restore_inventory(now + Duration::seconds(5))
-        .await
-        .expect("restart fail-closes old incarnation");
-    runtime_a2
-        .record_project_smtp_readiness(&pending, true, now + Duration::seconds(6))
-        .await
-        .expect("replacement Runtime records active-generation readiness");
-    runtime_a2
-        .record_project_smtp_readiness(&restart_candidate, true, now + Duration::seconds(6))
-        .await
-        .expect("replacement Runtime records matching readiness");
-    assert_eq!(
-        runtime_a
-            .record_project_smtp_readiness(&restart_candidate, true, now + Duration::seconds(6))
-            .await,
-        Err(crate::application::ApplicationError::Disabled),
-        "a replaced Runtime must not enter the readiness mutation transaction"
-    );
-    let preserved: (Uuid, String) = sqlx::query_as(
-        "SELECT process_incarnation,state FROM project_smtp_runtime_readiness
-         WHERE project_id=$1 AND configuration_id=$2 AND process_id='auth-a'",
-    )
-    .bind(project_id)
-    .bind(pending_restart)
-    .fetch_one(&pool)
-    .await
-    .expect("replacement readiness remains present");
-    assert_eq!(preserved, (runtime_a2_incarnation, "ready".to_owned()));
-    assert!(matches!(
-        runtime_a_authority
-            .prepare_login_start(
-                &format!("prj_{}", project_id.simple()),
-                &format!("app_{}", application_id.simple()),
-                &format!("pk_{}", application_id.simple()),
-                "https://app.example/callback",
-            )
-            .await,
-        Err(crate::application::ApplicationError::Disabled)
-    ));
-    assert!(matches!(
-        runtime_a
-            .project_smtp_readiness_candidates(now + Duration::seconds(7), 100)
-            .await,
-        Err(crate::application::ApplicationError::Disabled)
-    ));
-    assert_eq!(
-        runtime_a
-            .claim_due_mail(
-                "auth-a-stale",
-                now + Duration::seconds(7),
-                now + Duration::seconds(37),
-            )
-            .await,
-        Err(crate::application::ApplicationError::Disabled)
-    );
-
-    PostgresRuntimeAuthorityRepository::new_with_runtime_identity(
-        database.clone(),
-        "auth-a".to_owned(),
-        runtime_a2_incarnation,
-        roster.clone(),
-        test_projection_materializer(),
-    )
-    .prepare_login_start(
-        &format!("prj_{}", project_id.simple()),
-        &format!("app_{}", application_id.simple()),
-        &format!("pk_{}", application_id.simple()),
-        "https://app.example/callback",
-    )
-    .await
-    .expect("replacement Runtime may use its own fresh readiness");
-
-    // Operation-first: block only the target readiness row. The repository call reaches that row
-    // only after acquiring its incarnation share lock; replacement must then block behind the
-    // repository backend rather than merely behind this test harness.
-    let mut readiness_blocker = pool.begin().await.expect("begin readiness-row blocker");
-    sqlx::query(
-        "SELECT process_id FROM project_smtp_runtime_readiness
-         WHERE project_id=$1 AND configuration_id=$2 AND process_id='auth-a' FOR UPDATE",
-    )
-    .bind(project_id)
-    .bind(pending_restart)
-    .fetch_one(&mut *readiness_blocker)
-    .await
-    .expect("hold only the final readiness row");
-    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *readiness_blocker)
-        .await
-        .expect("identify readiness blocker");
-    let racing_runtime_a2 = runtime_a2.clone();
-    let racing_candidate = restart_candidate.clone();
-    let readiness = tokio::spawn(async move {
-        racing_runtime_a2
-            .record_project_smtp_readiness(&racing_candidate, true, now + Duration::seconds(8))
-            .await
-    });
-    let readiness_pid =
-        wait_for_backend_blocked_by(&pool, blocker_pid, "Runtime readiness final row").await;
-    let runtime_a3_incarnation = Uuid::new_v4();
-    let runtime_a3 = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        "auth-a".to_owned(),
-        runtime_a3_incarnation,
-        roster.clone(),
-        Duration::minutes(5),
-    );
-    let claiming_runtime_a3 = runtime_a3.clone();
-    let replacement = tokio::spawn(async move {
-        claiming_runtime_a3
-            .claim_auth_incarnation(now + Duration::seconds(9))
-            .await
-    });
-    let replacement_pid =
-        wait_for_backend_blocked_by(&pool, readiness_pid, "Runtime incarnation replacement").await;
-    assert_ne!(
-        replacement_pid, readiness_pid,
-        "replacement must wait behind the repository backend holding the incarnation fence"
-    );
-    readiness_blocker
-        .commit()
-        .await
-        .expect("release final readiness row");
-    readiness
-        .await
-        .expect("join operation-first readiness")
-        .expect("A2 readiness commits before replacement");
-    replacement
-        .await
-        .expect("join replacement")
-        .expect("replacement proceeds after business commit");
-
-    // Replacement-first: hold A4's UPSERT uncommitted, prove the repository call waits on it,
-    // then commit replacement. A3 must return Disabled without changing A2's last committed row.
-    let runtime_a4_incarnation = Uuid::new_v4();
-    let mut replacement_first = pool.begin().await.expect("begin replacement-first UPSERT");
-    let replacement_first_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *replacement_first)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO auth_process_incarnations
-           (process_id,process_incarnation,started_at) VALUES ('auth-a',$1,$2)
-         ON CONFLICT (process_id) DO UPDATE SET process_incarnation=EXCLUDED.process_incarnation,
-           started_at=EXCLUDED.started_at",
-    )
-    .bind(runtime_a4_incarnation)
-    .bind(now + Duration::seconds(10))
-    .execute(&mut *replacement_first)
-    .await
-    .expect("hold replacement-first incarnation update");
-    let reverse_candidate = restart_candidate.clone();
-    let stale_after_commit = tokio::spawn(async move {
-        runtime_a3
-            .record_project_smtp_readiness(&reverse_candidate, true, now + Duration::seconds(11))
-            .await
-    });
-    let stale_pid = wait_for_backend_blocked_by(
-        &pool,
-        replacement_first_pid,
-        "replacement-first Runtime readiness",
-    )
-    .await;
-    assert_ne!(stale_pid, replacement_first_pid);
-    replacement_first
-        .commit()
-        .await
-        .expect("commit replacement before stale operation");
-    assert_eq!(
-        stale_after_commit.await.expect("join stale A3 readiness"),
-        Err(crate::application::ApplicationError::Disabled)
-    );
-    let current: Uuid = sqlx::query_scalar(
-        "SELECT process_incarnation FROM auth_process_incarnations
-         WHERE process_id='auth-a'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(current, runtime_a4_incarnation);
-
-    assert!(matches!(
-        PostgresRuntimeAuthorityRepository::new_with_runtime_identity(
-            database,
-            "auth-a".to_owned(),
-            runtime_a2_incarnation,
-            roster,
-            test_projection_materializer(),
-        )
-        .prepare_login_start(
-            &format!("prj_{}", project_id.simple()),
-            &format!("app_{}", application_id.simple()),
-            &format!("pk_{}", application_id.simple()),
-            "https://app.example/callback",
-        )
-        .await,
-        Err(crate::application::ApplicationError::Disabled)
-    ));
-}
-
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one real PostgreSQL journey proves rolling roster, cutover, and retirement fences"
-)]
-async fn email_alias_cutover_requires_current_complete_live_runtime_roster_in_postgres() {
-    let Some((_container, url)) = start_postgres().await else {
-        return;
-    };
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .expect("connect sqlx");
-    MIGRATOR.run(&pool).await.expect("migrate schema");
-    let database = Database::connect(&url).await.expect("connect SeaORM");
-    let email = PostgresPasswordlessEmailRepository::new(database.clone());
-    let peer_email = PostgresPasswordlessEmailRepository::new_with_runtime_identity(
-        database.clone(),
-        "runtime-peer".to_owned(),
-        Uuid::nil(),
-        vec!["auth-1".to_owned(), "runtime-peer".to_owned()],
-        Duration::minutes(5),
-    );
-    let now = OffsetDateTime::now_utc();
-    let v1 = runtime_protector(1, []);
-    let v1_with_v2 = runtime_protector(1, [(2, 2)]);
-    let v2 = runtime_protector(2, [(1, 1)]);
-
-    email
-        .claim_auth_incarnation(now)
-        .await
-        .expect("claim alias-maintenance Runtime incarnation");
-    email
-        .rewrap_durable_email_identities(
-            &v1,
-            100,
-            "auth-1",
-            &["auth-1".to_owned()],
-            now + Duration::minutes(5),
-            false,
-            false,
-            now,
-        )
-        .await
-        .expect("initialize v1 authority");
-    let (project_id, _, _, _) = seed_email_authority(&pool, now).await;
-    for index in 0..101_u16 {
-        let user_id = Uuid::new_v4();
-        let identity_id = Uuid::new_v4();
-        let public_id = format!("usr_alias_{index:03}");
-        let mut seed = pool.begin().await.expect("begin identity seed");
-        sqlx::query(
-            "INSERT INTO project_users
-             (id,project_id,public_id,status,user_revision,security_revision,primary_profile_identity_id,
-              primary_source_kind,base_profile_digest,local_display_name_set,local_picture_url_set,
-              local_locale_set,created_at,updated_at)
-             VALUES ($1,$2,$3,'active',1,1,NULL,'email',$4,FALSE,FALSE,FALSE,$5,$5)",
-        )
-        .bind(user_id)
-        .bind(project_id)
-        .bind(public_id)
-        .bind(index.to_be_bytes().repeat(16))
-        .bind(now)
-        .execute(&mut *seed)
-        .await
-        .expect("seed alias user");
-        let mut context = b"owlauth-email-identity-v1\0".to_vec();
-        context.extend_from_slice(project_id.as_bytes());
-        context.extend_from_slice(identity_id.as_bytes());
-        let address = format!("alias-{index:03}@example.test");
-        let protected = v1
-            .protect(
-                crate::application::ProtectedPurpose::EmailIdentityAddress,
-                &context,
-                address.as_bytes(),
-            )
-            .expect("protect v1 identity address");
-        sqlx::query(
-            "INSERT INTO email_identities
-             (id,project_id,user_id,status,identity_revision,canonicalization_version,
-              address_ciphertext,address_key_version,verified_at,created_at,updated_at)
-             VALUES ($1,$2,$3,$4,1,1,$5,$6,$7,$7,$7)",
-        )
-        .bind(identity_id)
-        .bind(project_id)
-        .bind(user_id)
-        .bind(if index == 100 { "disabled" } else { "active" })
-        .bind(protected.ciphertext)
-        .bind(protected.key_version)
-        .bind(now)
-        .execute(&mut *seed)
-        .await
-        .expect("seed v1 identity");
-        sqlx::query(
-            "UPDATE project_users SET primary_email_identity_id=$3
-             WHERE project_id=$1 AND id=$2",
-        )
-        .bind(project_id)
-        .bind(user_id)
-        .bind(identity_id)
-        .execute(&mut *seed)
-        .await
-        .expect("set primary email identity");
-        let alias = v1
-            .digest(
-                crate::application::OpaquePurpose::EmailIdentityLookup,
-                project_id.as_bytes(),
-                address.as_bytes(),
-            )
-            .expect("digest v1 identity alias");
-        sqlx::query(
-            "INSERT INTO email_identity_aliases
-             (project_id,identity_id,canonicalization_version,digest_key_version,lookup_digest,created_at)
-             VALUES ($1,$2,1,$3,$4,$5)",
-        )
-        .bind(project_id)
-        .bind(identity_id)
-        .bind(alias.key_version)
-        .bind(alias.value.to_vec())
-        .bind(now)
-        .execute(&mut *seed)
-        .await
-        .expect("seed v1 identity alias");
-        seed.commit().await.expect("commit identity seed");
-    }
-    let first_batch = email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-missing".to_owned()],
-            now + Duration::minutes(5),
-            true,
-            false,
-            now + Duration::seconds(1),
-        )
-        .await
-        .expect("stage v2 with missing required Runtime");
-    assert_eq!(first_batch, 100);
-    let authority: (i64, i32) = sqlx::query_as(
-        "SELECT revision,write_version FROM email_identity_alias_authority WHERE singleton=TRUE",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(authority, (2, 1));
-
-    // A configured roster cannot hide an additional still-live old Runtime.
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned()],
-            now + Duration::minutes(5),
-            true,
-            false,
-            now + Duration::seconds(2),
-        )
-        .await
-        .expect("live old Runtime blocks cutover");
-    let write_version: i32 = sqlx::query_scalar(
-        "SELECT write_version FROM email_identity_alias_authority WHERE singleton=TRUE",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(write_version, 1);
-
-    sqlx::query(
-        "UPDATE email_identity_alias_runtime_observations SET lease_expires_at=$1
-         WHERE process_id='auth-1'",
-    )
-    .bind(now)
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "WITH current AS (
-           INSERT INTO auth_process_incarnations
-             (process_id,process_incarnation,started_at) VALUES ('runtime-peer',$3,$2)
-           ON CONFLICT (process_id) DO UPDATE SET process_incarnation=EXCLUDED.process_incarnation,
-             started_at=EXCLUDED.started_at RETURNING process_incarnation)
-         INSERT INTO email_identity_alias_runtime_observations
-           (process_id,process_incarnation,active_version,observed_authority_revision,
-            lease_expires_at,updated_at)
-         SELECT 'runtime-peer',process_incarnation,2,1,$1,$2 FROM current",
-    )
-    .bind(now + Duration::minutes(5))
-    .bind(now)
-    .bind(Uuid::nil())
-    .execute(&pool)
-    .await
-    .unwrap();
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            true,
-            false,
-            now + Duration::seconds(3),
-        )
-        .await
-        .expect("stale observed authority revision blocks cutover");
-    let write_version: i32 = sqlx::query_scalar(
-        "SELECT write_version FROM email_identity_alias_authority WHERE singleton=TRUE",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(write_version, 1);
-
-    sqlx::query(
-        "UPDATE email_identity_alias_runtime_observations
-         SET observed_authority_revision=2,updated_at=$1 WHERE process_id='runtime-peer'",
-    )
-    .bind(now + Duration::seconds(4))
-    .execute(&pool)
-    .await
-    .unwrap();
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            true,
-            false,
-            now + Duration::seconds(4),
-        )
-        .await
-        .expect("expired old lease and current complete roster permit cutover");
-    let authority: (i64, i32, serde_json::Value, Option<i32>) = sqlx::query_as(
-        "SELECT revision,write_version,accepted_versions,retirement_version
-         FROM email_identity_alias_authority WHERE singleton=TRUE",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(authority, (3, 2, serde_json::json!([1, 2]), None));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        101
-    );
-
-    // Reusing cutover cannot authorize retirement, and the peer has not observed revision 3.
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            true,
-            false,
-            now + Duration::seconds(5),
-        )
-        .await
-        .expect("cutover maintenance preserves predecessor overlap");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        101
-    );
-
-    // Roll back before retirement while v1 retains v2 readability. Bounded batches restore v1
-    // protection before the authority selects v1, without deleting either accepted alias set.
-    sqlx::query("UPDATE email_identity_alias_runtime_observations SET lease_expires_at=$1")
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-    for second in 6..=8 {
-        email
-            .rewrap_durable_email_identities(
-                &v1_with_v2,
-                100,
-                "auth-1",
-                &["auth-1".to_owned()],
-                now + Duration::minutes(5),
-                true,
-                false,
-                now + Duration::seconds(second),
-            )
-            .await
-            .expect("bounded rollback convergence");
-    }
-    let rollback: (i64, i32, serde_json::Value, i64, i64) = sqlx::query_as(
-        "SELECT authority.revision,authority.write_version,authority.accepted_versions,
-          (SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1),
-          (SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=2)
-         FROM email_identity_alias_authority authority WHERE singleton=TRUE",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(rollback, (4, 1, serde_json::json!([1, 2]), 101, 101));
-
-    // Cut over again after both exact roster members observe rollback revision 4.
-    sqlx::query("UPDATE email_identity_alias_runtime_observations SET lease_expires_at=$1")
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO email_identity_alias_runtime_observations
-           (process_id,process_incarnation,active_version,observed_authority_revision,
-            lease_expires_at,updated_at)
-         SELECT 'runtime-peer',process_incarnation,2,4,$1,$2
-         FROM auth_process_incarnations WHERE process_id='runtime-peer'
-         ON CONFLICT (process_id) DO UPDATE SET
-           process_incarnation=EXCLUDED.process_incarnation,active_version=2,
-           observed_authority_revision=4,lease_expires_at=EXCLUDED.lease_expires_at,
-           updated_at=EXCLUDED.updated_at",
-    )
-    .bind(now + Duration::minutes(5))
-    .bind(now + Duration::seconds(9))
-    .execute(&pool)
-    .await
-    .unwrap();
-    for second in 10..=12 {
-        email
-            .rewrap_durable_email_identities(
-                &v2,
-                100,
-                "auth-1",
-                &["auth-1".to_owned(), "runtime-peer".to_owned()],
-                now + Duration::minutes(5),
-                true,
-                false,
-                now + Duration::seconds(second),
-            )
-            .await
-            .expect("second bounded cutover convergence");
-    }
-    let overlap: (i64, i32, serde_json::Value, Option<i32>, i64) = sqlx::query_as(
-        "SELECT authority.revision,authority.write_version,authority.accepted_versions,
-          authority.retirement_version,
-          (SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1)
-         FROM email_identity_alias_authority authority WHERE singleton=TRUE",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(overlap, (5, 2, serde_json::json!([1, 2]), None, 101));
-
-    // A retire-only request that begins before complete post-cutover observation is durably
-    // stale. It cannot become authorization merely by remaining pre-set while the roster catches
-    // up; operators must roll it off after overlap verification and then start a later rollout.
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            false,
-            true,
-            now + Duration::seconds(13),
-        )
-        .await
-        .expect("stale pre-observation retirement request remains inert");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        101
-    );
-    sqlx::query(
-        "UPDATE email_identity_alias_runtime_observations
-         SET observed_authority_revision=5,updated_at=$1 WHERE process_id='runtime-peer'",
-    )
-    .bind(now + Duration::seconds(14))
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Explicitly remove the stale request. Complete roster observation now records a separate
-    // overlap-verification authority revision; cutover itself still deleted no aliases and the
-    // rollback window remained available throughout.
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            false,
-            false,
-            now + Duration::seconds(14),
-        )
-        .await
-        .expect("local post-cutover overlap observation converges");
-    sqlx::query(
-        "UPDATE email_identity_alias_runtime_observations
-         SET active_version=2,
-             observed_authority_revision=(SELECT revision FROM email_identity_alias_authority
-                                          WHERE singleton=TRUE),
-             updated_at=$1 WHERE process_id='runtime-peer'",
-    )
-    .bind(now + Duration::seconds(15))
-    .execute(&pool)
-    .await
-    .expect("peer reports the new overlap authority revision");
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            false,
-            false,
-            now + Duration::seconds(16),
-        )
-        .await
-        .expect("complete post-cutover overlap observation converges");
-    let verified: (i64, Option<i64>, i64) = sqlx::query_as(
-        "SELECT authority.revision,authority.overlap_verified_revision,
-          (SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1)
-         FROM email_identity_alias_authority authority WHERE singleton=TRUE",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(verified, (6, Some(6), 101));
-
-    // Only the later distinct retire-only rollout across every live/required member can collapse
-    // accepted_versions and begin bounded predecessor deletion.
-    email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            false,
-            true,
-            now + Duration::seconds(17),
-        )
-        .await
-        .expect("first retire-only member cannot authorize the roster");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        101
-    );
-    let retired_first = peer_email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "runtime-peer",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            false,
-            true,
-            now + Duration::seconds(18),
-        )
-        .await
-        .expect("complete later retire-only rollout deletes one bounded batch");
-    assert_eq!(retired_first, 100);
-    let retired_tail = email
-        .rewrap_durable_email_identities(
-            &v2,
-            100,
-            "auth-1",
-            &["auth-1".to_owned(), "runtime-peer".to_owned()],
-            now + Duration::minutes(5),
-            true,
-            false,
-            now + Duration::seconds(19),
-        )
-        .await
-        .expect("durable retirement fence deletes the bounded tail");
-    assert_eq!(retired_tail, 1);
-    let closure: (i64, i32, serde_json::Value, Option<i32>, i64, i64, i64, i64, i64) =
-        sqlx::query_as(
-            "SELECT authority.revision,authority.write_version,authority.accepted_versions,
-             authority.retirement_version,
-             (SELECT COUNT(*) FROM email_identities WHERE address_key_version=2),
-             (SELECT COUNT(*) FROM email_identities WHERE status='disabled' AND address_key_version=2),
-             (SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=2),
-             (SELECT COALESCE(SUM(affected_rows),0)::BIGINT
-              FROM email_identity_alias_authority_events WHERE action='aliases_retired'),
-             (SELECT COUNT(*) FROM email_identity_alias_authority_events
-              WHERE action IN ('rollback','retirement_authorized'))
-             FROM email_identity_alias_authority authority WHERE singleton=TRUE",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("two-phase alias closure inventory");
-    assert_eq!(
-        closure,
-        (7, 2, serde_json::json!([2]), Some(2), 101, 1, 101, 101, 2)
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM email_identity_aliases WHERE digest_key_version=1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        0
-    );
-
-    database.close().await.expect("close SeaORM");
-    pool.close().await;
 }

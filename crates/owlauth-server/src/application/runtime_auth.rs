@@ -20,11 +20,10 @@ use super::{
     AuthenticationRepository, BindBrowserLogout, BindHostedBrowser, BrowserLogoutRecord,
     ClaimProviderCallback, Clock, CommitHandoffExchange, CompleteAuthenticatedIdentity,
     ConfirmBrowserLogout, ConfirmBrowserSessionReuse, CreateLoginTransaction, CurrentSession,
-    DenyProviderCallback, EmailIdentityAliasAuthority, EmailProofDecision, EmailProofKind,
-    FailProviderExchange, HandoffPreparation, HostedInteraction, LoginRevisionSnapshot,
-    LogoutApplicationSession, ManagedCredentialCapability, OpaquePurpose,
-    PasswordlessEmailRepository, PrepareBrowserLogout, PrepareHandoffExchange,
-    PrepareRefreshRotation, ProtectedPurpose, ProviderAuthorizationRequest,
+    DenyProviderCallback, EmailProofDecision, EmailProofKind, FailProviderExchange,
+    HandoffPreparation, HostedInteraction, LoginRevisionSnapshot, LogoutApplicationSession,
+    ManagedCredentialCapability, OpaquePurpose, PasswordlessEmailRepository, PrepareBrowserLogout,
+    PrepareHandoffExchange, PrepareRefreshRotation, ProtectedPurpose, ProviderAuthorizationRequest,
     ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity, ProviderRequestProfile,
     ProviderSecretResolver, RecoverProviderExchanges, RefreshPreparation, RefreshPreparationResult,
     RefreshRotationResult, RotateRefreshToken, RuntimeAuthorityRepository, RuntimeProtector,
@@ -296,29 +295,6 @@ impl RuntimeAuthService {
         })
     }
 
-    pub(crate) async fn email_admission_scope(
-        &self,
-        project_public_id: &str,
-        interaction: &str,
-        browser_binding: &str,
-    ) -> Result<EmailAdmissionScope, ApplicationError> {
-        let transaction_id = credential_id(interaction)?;
-        let interaction_digest =
-            self.digest_id_credential(OpaquePurpose::Interaction, transaction_id, interaction)?;
-        let binding = self.binding_digest(transaction_id, browser_binding)?;
-        let hosted = self
-            .authority
-            .hosted_interaction(&interaction_digest, Some(&binding), self.clock.now())
-            .await?;
-        if hosted.project_public_id != project_public_id {
-            return Err(ApplicationError::NotFound);
-        }
-        Ok(EmailAdmissionScope {
-            project_id: hosted.project_id,
-            application_id: hosted.application_id,
-        })
-    }
-
     pub(crate) async fn select_email(
         &self,
         request: SelectEmail,
@@ -396,10 +372,10 @@ impl RuntimeAuthService {
             challenge_id,
             preparation.next_generation,
         );
-        let lookup = self.protector.digest(
-            OpaquePurpose::EmailIdentityLookup,
-            preparation.project_id.as_bytes(),
-            canonical.expose().as_bytes(),
+        let (recipient_digests, lookup) = derive_email_identity_aliases(
+            self.protector.as_ref(),
+            preparation.project_id,
+            &canonical,
         )?;
         let protected_address = self.protector.protect(
             ProtectedPurpose::EmailChallengeAddress,
@@ -518,13 +494,13 @@ impl RuntimeAuthService {
                 outbox_id,
                 canonicalization_version: crate::domain::CanonicalEmail::version(),
                 lookup_digest: lookup,
+                recipient_digests,
                 address: protected_address,
                 otp_digest,
                 magic_digest,
                 envelope,
                 body,
                 message_id: format!("<{outbox_id}@mail.owlauth.invalid>"),
-                suppress_delivery: request.suppress_delivery,
                 issued_at: now,
                 otp_expires_at,
                 magic_expires_at,
@@ -765,12 +741,10 @@ impl RuntimeAuthService {
             &canonical,
             &candidate.lookup_digest,
         )?;
-        let alias_authority = self.email.identity_alias_authority().await?;
         let (lookup_aliases, active_alias) = derive_email_identity_aliases(
             self.protector.as_ref(),
             authority.project_id,
             &canonical,
-            &alias_authority,
         )?;
         let new_identity_id = Uuid::new_v4();
         let durable_address = self.protector.protect(
@@ -813,7 +787,7 @@ impl RuntimeAuthService {
                 verified_challenge_lookup,
                 lookup_aliases,
                 active_alias,
-                alias_authority_revision: alias_authority.revision,
+                alias_authority_revision: 1,
                 browser_session_id: Uuid::new_v4(),
                 existing_browser_credential,
                 browser_credential,
@@ -1780,12 +1754,6 @@ pub(crate) struct HostedBootstrap {
     pub csrf: Zeroizing<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EmailAdmissionScope {
-    pub project_id: Uuid,
-    pub application_id: Uuid,
-}
-
 pub(crate) struct SelectEmail {
     pub project_public_id: String,
     pub interaction: String,
@@ -1801,8 +1769,6 @@ pub(crate) struct BeginEmailChallenge {
     pub csrf: String,
     pub expected_revision: i64,
     pub email: String,
-    /// Internal admission outcome; it is never accepted from the wire.
-    pub suppress_delivery: bool,
 }
 
 pub(crate) struct EmailChallengeAccepted {
@@ -2213,18 +2179,17 @@ fn derive_email_identity_aliases(
     protector: &dyn RuntimeProtector,
     project_id: Uuid,
     canonical: &crate::domain::CanonicalEmail,
-    authority: &EmailIdentityAliasAuthority,
 ) -> Result<(Vec<VersionedDigest>, VersionedDigest), ApplicationError> {
-    if authority.accepted_versions.is_empty()
-        || authority.accepted_versions.len() > 16
-        || !authority
-            .accepted_versions
-            .contains(&authority.write_version)
+    let versions = protector.email_identity_readable_key_versions();
+    let write_version = protector.email_identity_active_version();
+    if versions.is_empty()
+        || versions.len() > 16
+        || write_version <= 0
+        || !versions.contains(&write_version)
     {
         return Err(ApplicationError::Integrity);
     }
-    let aliases = authority
-        .accepted_versions
+    let aliases = versions
         .iter()
         .copied()
         .map(|version| {
@@ -2238,7 +2203,7 @@ fn derive_email_identity_aliases(
         .collect::<Result<Vec<_>, _>>()?;
     let active = aliases
         .iter()
-        .find(|alias| alias.key_version == authority.write_version)
+        .find(|alias| alias.key_version == write_version)
         .cloned()
         .ok_or(ApplicationError::Integrity)?;
     Ok((aliases, active))
@@ -2315,103 +2280,28 @@ mod tests {
     }
 
     #[test]
-    fn challenge_lookup_verification_is_independent_of_durable_alias_authority() {
+    fn durable_email_aliases_follow_the_process_local_key_ring() {
         let protector = split_email_protector();
         let project_id = Uuid::new_v4();
         let canonical = crate::domain::CanonicalEmail::parse_v1("person@example.test")
             .expect("canonical address");
 
-        // A staged key rollout creates the challenge with configured active v2 while durable
-        // alias authority still writes and accepts only v1.
-        let new_v2_challenge = protector
-            .digest(
-                OpaquePurpose::EmailIdentityLookup,
-                project_id.as_bytes(),
-                canonical.expose().as_bytes(),
-            )
-            .expect("active challenge lookup");
-        let verified_v2 =
-            verify_email_challenge_lookup(&protector, project_id, &canonical, &new_v2_challenge)
-                .expect("v2 challenge remains independently verifiable");
-        let staged_authority = EmailIdentityAliasAuthority {
-            revision: 1,
-            write_version: 1,
-            accepted_versions: vec![1],
-        };
-        let (staged_aliases, staged_active) =
-            derive_email_identity_aliases(&protector, project_id, &canonical, &staged_authority)
-                .expect("staged durable v1 authority");
-        assert_eq!(verified_v2.key_version, 2);
+        let (aliases, active) = derive_email_identity_aliases(&protector, project_id, &canonical)
+            .expect("derive aliases from the configured active and retained keys");
         assert_eq!(
-            staged_aliases
-                .iter()
-                .map(|alias| alias.key_version)
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
-        assert_eq!(staged_active.key_version, 1);
-
-        // During overlap, a predecessor v1 challenge remains verifiable while durable identity
-        // resolution derives both accepted v1/v2 aliases and writes v2.
-        let predecessor_v1 = staged_active.clone();
-        assert_eq!(
-            verify_email_challenge_lookup(&protector, project_id, &canonical, &predecessor_v1),
-            Ok(predecessor_v1.clone())
-        );
-        let overlap_authority = EmailIdentityAliasAuthority {
-            revision: 2,
-            write_version: 2,
-            accepted_versions: vec![1, 2],
-        };
-        let (overlap_aliases, overlap_active) =
-            derive_email_identity_aliases(&protector, project_id, &canonical, &overlap_authority)
-                .expect("cutover overlap aliases");
-        assert_eq!(
-            overlap_aliases
+            aliases
                 .iter()
                 .map(|alias| alias.key_version)
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert_eq!(overlap_active.key_version, 2);
-
-        // Retirement collapses durable accepted/write authority to v2, but it does not invalidate
-        // an otherwise-live v1 challenge while the predecessor key remains readable.
-        let retired_authority = EmailIdentityAliasAuthority {
-            revision: 3,
-            write_version: 2,
-            accepted_versions: vec![2],
-        };
-        let (retired_aliases, retired_active) =
-            derive_email_identity_aliases(&protector, project_id, &canonical, &retired_authority)
-                .expect("retired durable v2 authority");
-        assert_eq!(
-            retired_aliases
-                .iter()
-                .map(|alias| alias.key_version)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
-        assert_eq!(retired_active.key_version, 2);
-        assert_eq!(
-            verify_email_challenge_lookup(&protector, project_id, &canonical, &predecessor_v1),
-            Ok(predecessor_v1.clone())
-        );
-
-        let mut tampered_value = predecessor_v1.clone();
-        tampered_value.value[0] ^= 1;
-        assert_eq!(
-            verify_email_challenge_lookup(&protector, project_id, &canonical, &tampered_value),
-            Err(ApplicationError::Integrity)
-        );
-        let mislabeled_version = VersionedDigest {
-            key_version: 2,
-            ..predecessor_v1
-        };
-        assert_eq!(
-            verify_email_challenge_lookup(&protector, project_id, &canonical, &mislabeled_version),
-            Err(ApplicationError::Integrity)
-        );
+        assert_eq!(active.key_version, 2);
+        for alias in aliases {
+            assert_eq!(
+                verify_email_challenge_lookup(&protector, project_id, &canonical, &alias),
+                Ok(alias)
+            );
+        }
     }
 
     #[test]
@@ -2431,7 +2321,6 @@ mod tests {
             ApplicationError::InvalidInput,
             ApplicationError::IdempotencyConflict,
             ApplicationError::OperationInProgress,
-            ApplicationError::PublicationPending,
         ] {
             assert!(!is_email_proof_terminal(preserved));
         }

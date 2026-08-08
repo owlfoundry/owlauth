@@ -452,6 +452,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/projects/{project_id}/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_project_overview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/projects/{project_id}/policy": {
         parameters: {
             query?: never;
@@ -498,6 +514,22 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/providers/{provider_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["update_provider"];
         trace?: never;
     };
     "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}": {
@@ -558,6 +590,54 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["reconcile_provider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/providers/{provider_id}/replace-secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["replace_provider_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/providers/{provider_id}/replace-secret/abandon": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["abandon_provider_secret_replacement"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{project_id}/providers/{provider_id}/replace-secret/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["reconcile_provider_secret_replacement"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1633,6 +1713,47 @@ export interface components {
         ProjectList: {
             items: components["schemas"]["Project"][];
         };
+        ProjectOverviewApplicationCounts: {
+            /** Format: int64 */
+            active: number;
+            /** Format: int64 */
+            configured: number;
+            /** Format: int64 */
+            total: number;
+        };
+        ProjectOverviewProviderCounts: {
+            /** Format: int64 */
+            active: number;
+            /** Format: int64 */
+            active_assignments: number;
+            /** Format: int64 */
+            total: number;
+        };
+        ProjectOverviewServerKeyCounts: {
+            /** Format: int64 */
+            active: number;
+            /** Format: int64 */
+            revoked: number;
+            /** Format: int64 */
+            total: number;
+        };
+        ProjectOverviewSummary: {
+            applications: components["schemas"]["ProjectOverviewApplicationCounts"];
+            project_id: string;
+            project_server_keys: components["schemas"]["ProjectOverviewServerKeyCounts"];
+            providers: components["schemas"]["ProjectOverviewProviderCounts"];
+            users: components["schemas"]["ProjectOverviewUserCounts"];
+        };
+        ProjectOverviewUserCounts: {
+            /** Format: int64 */
+            active: number;
+            /** Format: int64 */
+            disabled: number;
+            /** Format: int64 */
+            merged: number;
+            /** Format: int64 */
+            total: number;
+        };
         ProjectPolicy: {
             /** Format: int32 */
             access_token_lifetime_seconds: number;
@@ -1751,6 +1872,8 @@ export interface components {
             provider_key: string;
             /** Format: int64 */
             revision: number;
+            /** @description Whether a durable protected-secret replacement awaits reconciliation or abandonment. */
+            secret_replacement_pending: boolean;
             status: components["schemas"]["ProviderStatus"];
         };
         ProviderAssignmentRequest: {
@@ -1806,6 +1929,11 @@ export interface components {
             /** Format: int64 */
             expected_project_revision: number;
         };
+        ReconcileProviderSecretReplacementRequest: {
+            client_secret: string;
+            /** Format: int64 */
+            expected_provider_revision: number;
+        };
         /** @enum {string} */
         RedactedEmailMarker: "redacted";
         ReplaceApplicationConfigurationRequest: {
@@ -1813,6 +1941,13 @@ export interface components {
             /** Format: int64 */
             expected_security_revision: number;
             redirect_uris: string[];
+        };
+        ReplaceProviderSecretRequest: {
+            client_id: string;
+            client_secret: string;
+            display_name: string;
+            /** Format: int64 */
+            expected_provider_revision: number;
         };
         ReplayWebhookDeliveryRequest: {
             confirm: boolean;
@@ -1992,6 +2127,12 @@ export interface components {
             expected_revision: number;
             mode: components["schemas"]["ProviderEgressMode"];
         };
+        UpdateProviderRequest: {
+            client_id: string;
+            display_name: string;
+            /** Format: int64 */
+            expected_provider_revision: number;
+        };
         UpdateWebhookEndpointRequest: {
             /** Format: int64 */
             expected_revision: number;
@@ -2082,6 +2223,15 @@ export interface operations {
                     "application/json": components["schemas"]["ServiceDescriptor"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
         };
     };
     get_liveness: {
@@ -2102,6 +2252,15 @@ export interface operations {
                     "application/json": components["schemas"]["HealthResponse"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
         };
     };
     get_readiness: {
@@ -2120,6 +2279,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
             /** @description A listener-critical dependency is unavailable */
@@ -2175,6 +2343,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2264,6 +2441,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -2335,6 +2521,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2424,6 +2619,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -2495,6 +2699,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2586,6 +2799,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -2658,6 +2880,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2748,6 +2979,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -2824,6 +3064,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2914,6 +3163,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -2997,6 +3255,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -3072,6 +3339,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3162,6 +3438,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -3235,6 +3520,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3328,6 +3622,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -3400,6 +3703,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3492,6 +3804,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -3565,6 +3886,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3656,6 +3986,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -3740,6 +4079,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -3817,6 +4165,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -3910,6 +4267,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -3988,6 +4354,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4079,6 +4454,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -4161,6 +4545,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -4232,6 +4625,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4321,6 +4723,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -4392,6 +4803,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4494,6 +4914,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -4566,6 +4995,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4656,6 +5094,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -4739,6 +5186,102 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, idempotency, or capacity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    get_project_overview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project resource overview */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectOverviewSummary"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -4810,6 +5353,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4899,6 +5451,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -4970,6 +5531,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5059,6 +5629,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -5130,6 +5709,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5221,6 +5809,107 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, idempotency, or capacity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    update_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateProviderRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated provider metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Provider"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -5298,6 +5987,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5389,6 +6087,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -5465,6 +6172,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5555,6 +6271,293 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, idempotency, or capacity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    replace_provider_secret: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": string;
+            };
+            path: {
+                project_id: string;
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplaceProviderSecretRequest"];
+            };
+        };
+        responses: {
+            /** @description Replaced provider protected client secret */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Provider"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, idempotency, or capacity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    abandon_provider_secret_replacement: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderRevisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Abandoned a pending provider protected-secret replacement */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Provider"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Revision, state, idempotency, or capacity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Stored authority data violated an invariant */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Required authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+        };
+    };
+    reconcile_provider_secret_replacement: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                provider_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReconcileProviderSecretReplacementRequest"];
+            };
+        };
+        responses: {
+            /** @description Reconciled a pending provider protected-secret replacement */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Provider"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Missing or invalid operator API key */
+            401: {
+                headers: {
+                    /** @description Bearer authentication challenge */
+                    "WWW-Authenticate"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Resource not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -5630,6 +6633,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5728,6 +6740,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -5811,6 +6832,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5904,6 +6934,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Unacknowledged delivery, key limit, idempotency conflict, or secret unavailable on replay */
             409: {
                 headers: {
@@ -5976,6 +7015,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6068,6 +7116,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -6153,6 +7210,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -6224,6 +7290,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6307,6 +7382,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6398,6 +7482,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -6469,6 +7562,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6560,6 +7662,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -6636,6 +7747,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6726,6 +7846,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -6802,6 +7931,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6896,6 +8034,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -6969,6 +8116,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7063,6 +8219,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -7135,6 +8300,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7226,6 +8400,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -7303,6 +8486,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7393,6 +8585,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -7469,6 +8670,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7555,6 +8765,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -7627,6 +8846,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7711,6 +8939,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7815,6 +9052,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -7889,6 +9135,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7981,6 +9236,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -8058,6 +9322,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8149,6 +9422,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -8221,6 +9503,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8310,6 +9601,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -8368,6 +9668,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
         };
     };
     list_deployment_smtp_generations: {
@@ -8410,6 +9719,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8499,6 +9817,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -8581,6 +9908,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
             /** @description Revision, state, idempotency, or capacity conflict */
             409: {
                 headers: {
@@ -8656,6 +9992,15 @@ export interface operations {
             };
             /** @description Resource not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description The request exceeded the Control listener time budget */
+            408: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -42,10 +42,9 @@ flowchart LR
     Runtime --> PG[(One PostgreSQL authority)]
     Server --> PG
     Control --> PG
-    Runtime -. optional admission .-> Redis[(Disposable Redis)]
 ```
 
-Auth always contains both the public Runtime surface and the backend-only Server API surface. They share one listener and transport budget, but retain separate routers, credentials, CORS policy, admission, readiness inputs, state, and PostgreSQL pools. Control has its own listener, operator credential, HTTP budget, and pool.
+Auth always contains both the public Runtime surface and the backend-only Server API surface. They share one listener and transport budget, but retain separate routers, credentials, CORS policy, readiness inputs, state, and PostgreSQL pools. Control has its own listener, operator credential, HTTP budget, and pool.
 
 Choose one composition:
 
@@ -63,7 +62,7 @@ For production, prefer distinct Auth and Control origins. Control accepts one de
 
 The executable reads configuration only from environment variables and rejects every unknown `OWLAUTH_*` name before binding a listener. It has no serving subcommand and no compatibility aliases. The committed [`.env.example`](https://github.com/owlfoundry/owlauth/blob/main/.env.example) is the complete local-development starting inventory, not a production secret file.
 
-Create a reviewed environment independently for each process. Preserve the same deployment identity, database authority, protection material, and fleet roster where a value is shared, but do not inject credentials a process does not need merely for template convenience.
+Create a reviewed environment independently for each process. Preserve the same deployment identity, database authority, and active/retained protection inventory where a value is shared, but do not inject credentials a process does not need merely for template convenience.
 
 ### Generate independent secrets
 
@@ -93,13 +92,12 @@ Start from `.env.example`, replacing every development value. Review these group
 
 | Group                    | Important variables and rules                                                                                                                                                  |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Composition and identity | `OWLAUTH_MODE`, one stable `OWLAUTH_INSTANCE_ID`, and Auth fleet identity described below                                                                                      |
+| Composition and identity | `OWLAUTH_MODE` and one stable deployment-wide `OWLAUTH_INSTANCE_ID`                                                                                                            |
 | Listener identity        | `OWLAUTH_AUTH_ADDR`, `OWLAUTH_AUTH_BASE_URL`, `OWLAUTH_CONTROL_ADDR`, `OWLAUTH_CONTROL_BASE_URL`                                                                               |
 | Control authority        | `OWLAUTH_CONTROL_API_KEY` on `all` or `control` processes                                                                                                                      |
 | PostgreSQL               | `OWLAUTH_POSTGRES_URL`, optional per-surface and migration URLs, pool bounds, migration mode and timeouts                                                                      |
 | Custody and protection   | software custody, Runtime, email identity, projection email, managed reauthorization, identity-mutation evidence, managed credential, and Server-key digest roots and versions |
-| Admission                | `OWLAUTH_ADMISSION_DIGEST_KEY`, optional Redis URL, namespace, timeout, and maximum Auth process count                                                                         |
-| Fleet readiness          | `OWLAUTH_AUTH_PROCESS_ID`, `OWLAUTH_REQUIRED_AUTH_PROCESS_IDS`, and Server digest readiness lease TTL                                                                          |
+| Key-ring inventory       | process-local active version plus any retained versions needed to read persisted data; external rollout procedure described below                                              |
 | Outbound delivery        | optional deployment SMTP generation, extra DER trust anchors, and exact private-IP exceptions                                                                                  |
 | Transport bounds         | independent `OWLAUTH_AUTH_*` and `OWLAUTH_CONTROL_*` timeout, body, in-flight, connection, header, and URI limits                                                              |
 | Shutdown                 | `OWLAUTH_SHUTDOWN_TIMEOUT_MS`, default `10000`                                                                                                                                 |
@@ -109,9 +107,8 @@ For the official executable and image, the selected mode requires these roots in
 | Selected mode      | Required configuration beyond the common groups                                                                                                                        |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Every mode         | instance ID; software custody; projection-email protection; managed-reauthorization digest/protection; identity-mutation-evidence digest/protection; Server-key digest |
-| `auth` or `all`    | Auth process ID; Runtime digest/protection; managed-credential protection; admission digest                                                                            |
+| `auth` or `all`    | Runtime digest/protection; managed-credential protection                                                                                                               |
 | `control` or `all` | Control operator API key                                                                                                                                               |
-| `control`          | explicit required Auth process roster                                                                                                                                  |
 
 The email-identity ring is optional as a complete group. Its absence is not automatic generation or a way to use plaintext email authority: verified/durable email capabilities fail closed in their scope. If any email-identity variable is present, provide its active version, digest key, and protection key together. Use the complete local template to identify delivered capability inputs, then remove a group only after confirming the selected mode and intended feature do not require it.
 
@@ -137,11 +134,12 @@ The ingress must:
 - preserve the configured path prefix instead of silently rewriting it;
 - route Auth and Control to their independently bound listeners;
 - enforce bounded header, URI, body, connection, and deadline settings before OwlAuth's own bounds;
+- own IP, route, tenant, global, bot/risk, traffic-shaping, and commercial quotas, including any generic `429` contract;
 - reject spoofed forwarding headers according to the ingress's policy, even though OwlAuth ignores them;
 - restrict Control to intended operator networks and identities;
 - keep Server API routes on Auth reachable only from intended application backends where network policy permits.
 
-OwlAuth uses the direct TCP peer for source admission. Behind a proxy, that peer is the proxy, not the original browser. Forwarding headers do not restore per-user source identity. Account for that behavior when sizing ingress limits and OwlAuth admission policy; do not claim end-user-IP rate limiting through an unsupported proxy mode.
+OwlAuth Core does not perform source-IP or route-window traffic limiting and does not trust forwarding headers for authority. The local in-flight semaphore bounds active handler work by applying backpressure within the configured request deadline; saturation does not create a Core admission response or `429` contract. If queue waiting or handler execution exhausts that deadline, Core returns the declared `408 request_timeout` envelope for the plane. This is a local transport-budget outcome and does not prove that an already dispatched mutation had no effect. The ingress owns original-client network interpretation and every generic traffic quota. Keep that policy outside Core, and never use an ingress allow decision as Project, Application, server-key, session, or proof authority.
 
 Distinct origins are recommended. If Auth and Control intentionally share one origin, both base URLs must use disjoint, non-root, non-overlapping paths, for example `/identity/` and `/identity-control/`. This accepts one browser/XSS trust boundary. The Control CLI descriptor remains at `/.well-known/owlauth` on the Control origin even when the Console/API use a non-root Control base, so the proxy must route that exact origin-root path to Control.
 
@@ -194,30 +192,52 @@ Every serving pool independently repeats exact history verification. An absent h
 
 Use `auto` only in a controlled schema-change phase. Run ordinary replicas in `verify` after the exact release schema is installed. Concurrent `auto` starts are lock-coordinated, but that is not a zero-downtime compatibility guarantee. The executable has no migration-only mode: after a successful `auto` migration it continues normal startup and can serve its selected endpoint, so keep the controlled migrator isolated from traffic until the rollout is approved.
 
-## Auth fleet identity and scaling
+### Run retention maintenance
 
-Every Auth process requires one stable `OWLAUTH_AUTH_PROCESS_ID`. `OWLAUTH_REQUIRED_AUTH_PROCESS_IDS` is the unique comma-separated roster that must be ready for fleet-wide protection and Server-key digest transitions. Entries are not whitespace-trimmed. If omitted on an Auth process it defaults to that process alone; a Control-only process must receive the roster explicitly. The configuration accepts at most 64 roster entries.
+Run the released server artifact as an explicit scheduled database job:
 
-For multiple Auth replicas:
+```bash
+owlauth-server maintenance prune --batch-size 1000
+```
 
-- assign a stable unique process ID to each logical replica slot;
-- deploy the same roster and every shared protection/digest ring to each process that consumes it, while keeping mode-only roots scoped to their owning process;
-- set `OWLAUTH_AUTH_MAX_PROCESSES` to a conservative upper bound at least as large as the roster and no greater than 64;
-- keep one `OWLAUTH_INSTANCE_ID` for the deployment;
-- use one admission namespace and digest root across the Auth fleet;
-- add or remove roster members as an explicit staged operation, not an autoscaler side effect.
+The command starts no listener or Runtime worker and reads only `OWLAUTH_POSTGRES_URL`. Before any retention DML, it verifies the exact released SQLx migration count, versions, success state, and checksums. The selected PostgreSQL role must be able to read `_sqlx_migrations` and select, update, and delete the eligible rows. For the container image, invoke the same image with its entrypoint arguments, for example:
 
-A starting Auth process claims a new incarnation for its stable process ID. A replacement makes the older incarnation's readiness evidence stale, so the old process becomes unready rather than continuing to represent the slot. Load balancers must remove it on `/ready`. The roster mechanism supports deliberate replacement; it does not make arbitrary ephemeral IDs or unbounded autoscaling safe.
+```bash
+docker run --rm \
+  --env OWLAUTH_POSTGRES_URL='postgres://...' \
+  "ghcr.io/owlfoundry/owlauth:${OWLAUTH_IMAGE_TAG}" \
+  maintenance prune --batch-size 1000
+```
 
-Runtime background workers for mail, provider-exchange recovery, managed synchronization, webhooks, and key/readiness maintenance run in Auth processes. Scale Auth with both request and worker load in mind. Control processes do not replace those workers.
+Deliver the URL through the platform's protected secret mechanism rather than shell history in production. A CronJob, systemd timer, or equivalent may invoke the command repeatedly. Each run processes at most the selected batch size independently in each cleanup class and prints one JSON report; repeat until `total` is `0` when draining a backlog. The accepted batch range is 1–10,000 and the default is 1,000.
 
-## Redis
+The fixed cleanup policy removes:
 
-`OWLAUTH_ADMISSION_REDIS_URL` is optional and accepts `redis://` or `rediss://`. Redis coordinates distributed Runtime/Server admission counters; it is not identity, session, revocation, key, or migration authority.
+- login aggregates 24 hours after their ten-minute transaction deadline, cascading method snapshots, callback owner, email challenge/outbox, magic-transfer, and handoff rows;
+- browser-logout interactions 24 hours after expiry;
+- expired refresh-token generations in their own bounded batch once the Application session is 24 hours past absolute expiry and each generation's replay-evidence deadline has elapsed, followed by Application/refresh-family aggregates only after no generation remains;
+- unreferenced Project browser sessions 24 hours after absolute expiry;
+- terminal SMTP-test operations 24 hours after completion and only after recipient material erasure;
+- webhook attempts, deliveries, and immutable events after the event's PostgreSQL-authored 30-day retention deadline.
 
-Without Redis, OwlAuth uses the conservative per-process share derived from `OWLAUTH_AUTH_MAX_PROCESSES`. If configured Redis times out or fails, admission enters a sticky conservative local fallback for the current quota window. Redis recovery, loss, flush, or failover cannot add quota because successful distributed decisions also consume the local share.
+Retention uses PostgreSQL time, short independent transactions, bounded lock/statement waits, and `FOR UPDATE SKIP LOCKED`, so it may run beside serving processes. SMTP-test idempotent replay and unknown-outcome reconciliation remain supported until 24 hours after terminal completion; callers must use a fresh idempotency key for any later test, which may send another message. Retention deliberately does not delete append-only audit/key history, identity-mutation or managed-reauthorization create-result authority, durable-resource idempotency records, merge tombstones, users, identities, configuration generations, or live protected material. Back up and restore retention-relevant state consistently, monitor the reported backlog, and test the exact role and schedule before production use.
 
-Do not restore Redis as identity state. It may be flushed or recreated during disaster recovery. Monitor `runtime_admission_backend_error`, `runtime_admission_fallback_entered`, and `runtime_admission_backend_recovered` log events if Redis is configured.
+## Auth scaling and external key-ring rotation
+
+Auth replicas are ordinary ephemeral processes. OwlAuth does not configure a static replica roster, persist process incarnations, or publish per-replica readiness observations. Keep one `OWLAUTH_INSTANCE_ID` for the deployment and distribute each purpose-specific ring consistently to every process that consumes it, while keeping mode-only roots scoped to their owning process. Load balancers use each process's own `/ready`; one ready process says nothing about another replica or the fleet as a whole.
+
+Versioned protection and digest rotation is an external operation, not an OwlAuth coordinator workflow:
+
+1. inventory every persisted and in-flight reference to the old version and back up the complete current recovery set;
+2. distribute the new version as readable/retained to every consuming process while the old version remains active;
+3. observe the deployment platform until every intended process is running the expanded ring; OwlAuth does not provide a fleet barrier;
+4. switch the configured active version consistently so new data uses it;
+5. backfill or rewrap durable data where that ring requires it, validate uniqueness/integrity, and preserve both versions for rollback and every live protocol window;
+6. prove no durable or in-flight reference needs the old version, then remove it from every process.
+
+Do not overlap steps 2 and 4 across a mixed fleet. For recipient suppression and other candidate-based reads, a process that has not yet received the new readable version cannot match data written under it. Treat a violated verifier-first/expand-then-activate rollout as an operational incident: halt the cutover, restore the expanded ring everywhere, and verify affected behavior rather than relying on fallback. Project signing keys retain their separate PostgreSQL product lifecycle and old-token verification overlap; their activation does not create replica-observation state. The static `OWLAUTH_SOFTWARE_CUSTODY_KEY` is not part of this process and must not be replaced in place.
+
+Runtime background workers for mail, provider-exchange recovery, managed synchronization, webhooks, and signing-key maintenance run in Auth processes. Their PostgreSQL leases are ephemeral task-claim and crash-recovery mechanisms, not deployment topology. Scale Auth with both request and worker load in mind. Control processes do not replace those workers.
 
 ## Run the container
 
@@ -255,10 +275,10 @@ Both selected listeners expose unauthenticated JSON probes under their configure
 | Probe         | Success                        | Meaning                                                                             |
 | ------------- | ------------------------------ | ----------------------------------------------------------------------------------- |
 | `GET /health` | `200 {"status":"ok"}`          | The listener event loop can answer; this does not check PostgreSQL or key readiness |
-| `GET /ready`  | `200 {"status":"ok"}`          | The selected endpoint can admit business traffic                                    |
+| `GET /ready`  | `200 {"status":"ok"}`          | The selected endpoint can serve business traffic                                    |
 | `GET /ready`  | `503 {"status":"unavailable"}` | Startup, draining, or an endpoint-critical readiness input is unavailable           |
 
-Auth readiness checks the startup/draining flag, Runtime PostgreSQL/exact-incarnation readiness, and Server-key digest fleet readiness. Control readiness reflects successful startup and draining state; it is not a fresh database query on every probe. Neither probe certifies Redis, live SMTP delivery, webhook destinations, every upstream provider, background-worker progress, backup correctness, or the production environment. Use `/ready` for load-balancer admission and `/health` only for process liveness.
+Readiness is instance-local. Auth checks its startup/draining flag and local PostgreSQL/configuration/provider/key-ring capabilities needed by the Runtime and Server API surfaces; Control checks its own startup/draining and local composition dependencies. Neither endpoint proves another replica, fleet-wide key convergence, live SMTP delivery, webhook destinations, every upstream provider, background-worker progress, backup correctness, or the production environment. Use `/ready` for routing that exact process and `/health` only for process liveness.
 
 Configuration, provider composition, migrations, serving-pool creation, provider/key reconciliation, and selected socket binding complete before readiness is enabled. In `all` mode both sockets bind before either is marked ready.
 
@@ -266,15 +286,14 @@ On `SIGTERM` or `Ctrl-C`, OwlAuth marks listeners unready and begins graceful HT
 
 ## Observability
 
-The executable emits newline-delimited JSON logs to standard output. `RUST_LOG` controls the tracing filter and defaults to `info`. Preserve structured fields such as `event`, request/correlation identifiers, endpoint, and safe failure class, while enforcing the [Security](/guide/security) disclosure rules at collection and export.
+The executable emits newline-delimited JSON logs to standard output. `RUST_LOG` controls the tracing filter and defaults to `info`. Startup phases and request starts are `debug`; normal business request completion and lifecycle transitions are `info`; recoverable dependency/worker failures and business-request `5xx` responses are `warn`; listener, integrity, and process-stop failures are `error`. Successful `/health` and `/ready` polling stays at `debug`. Preserve structured fields such as `event`, plane, safe Axum route template, request/correlation identifier, status/outcome, and `latency_ms`, while enforcing the [Security](/guide/security) disclosure rules at collection and export. Logs never use the raw URI, query, headers, or body as fields.
 
 At minimum alert on:
 
 - process exit or restart loops;
 - `/ready` failures and prolonged drain;
-- schema, pool, provider-readiness, custody, and Server-digest startup failures;
-- admission fallback/recovery events;
-- mail, webhook, managed-provider, signing-key, and readiness-maintenance failures;
+- schema, pool, provider-readiness, custody, and locally missing referenced-key failures;
+- mail, webhook, managed-provider, signing-key, and maintenance failures;
 - PostgreSQL saturation, lock/statement timeouts, replication/backup health, and storage growth.
 
 The current server does not expose a Prometheus endpoint, bundled OpenTelemetry exporter, dashboard, or alert rules. Add infrastructure-level metrics and log-derived alerts without logging credentials, tokens, callback query values, email addresses, webhook bodies, or profiles.
@@ -287,7 +306,7 @@ Treat a server upgrade as an artifact, configuration, key-ring, and schema chang
 2. Back up PostgreSQL and the complete matching custody/configuration recovery set.
 3. Restore that set in an isolated environment and qualify the new binary with `OWLAUTH_MIGRATION_MODE=verify` when no schema change is expected, or `auto` in a controlled migration phase when one is included.
 4. If a migration is required, drain business traffic unless the release explicitly documents and proves mixed-version compatibility. Run one controlled `auto` process, then start the target release replicas in `verify` mode.
-5. Require each selected endpoint's `/ready` before admitting traffic. Replace Auth slots deliberately so stable process IDs and fleet readiness remain observable.
+5. Require each selected process's `/ready` before admitting traffic, and use deployment-platform rollout status to verify the intended fleet independently.
 6. Keep the previous artifact and pre-upgrade recovery point until post-upgrade authentication, Server API, Control, worker, and backup checks pass.
 
 Do not assume an old binary can restart after a new migration. Exact history verification rejects unexpected forward versions, and the project does not promise universal N/N-1 schema compatibility. If rollback cannot use the upgraded schema, keep traffic blocked and restore PostgreSQL plus the matched custody/configuration set to the pre-upgrade recovery point. Never “roll back” by editing SQLx history or replacing unreadable keys.
@@ -299,20 +318,20 @@ One recoverable set includes:
 - PostgreSQL physical backup and continuous WAL/PITR history, or the managed-service equivalent;
 - `OWLAUTH_SOFTWARE_CUSTODY_KEY` or the exact custom provider authority;
 - every active and retained protection/digest key with its version mapping;
-- deployment and Auth process identities, exact external base URLs, database-role configuration, admission namespace, and provider/SMTP trust configuration;
+- deployment identity, exact external base URLs, database-role configuration, and provider/SMTP trust configuration;
 - the Control operator credential and externally custodied one-time Project server keys as required by their consumers.
 
-A database-only backup is insufficient. PostgreSQL protected envelopes and signing handles remain bound to the matching custody authority. Redis is disposable and is not part of identity recovery.
+A database-only backup is insufficient. PostgreSQL protected envelopes and signing handles remain bound to the matching custody authority.
 
 Test this restore sequence continuously:
 
 1. block all external traffic;
 2. restore the custody/provider authority and exact process configuration;
 3. restore PostgreSQL to one selected point;
-4. start the complete declared Auth roster from the matched release in an isolated network with `OWLAUTH_MIGRATION_MODE=verify`;
-5. require every Auth `/ready`, exercise opening protected material plus signing and verification against committed JWKs, and inspect durable mail, webhook, and managed-provider worker recovery;
+4. start the intended Auth replica set from the matched release in an isolated network with `OWLAUTH_MIGRATION_MODE=verify`;
+5. require every started Auth process's `/ready`, independently verify that each received the intended active/retained inventory, exercise opening protected material plus signing and verification against committed JWKs, and inspect durable mail, webhook, and managed-provider worker recovery;
 6. start the intended Control process or processes in `verify`, require each `/ready`, and inspect administrative and signing-lifecycle recovery;
-7. reopen traffic only after the complete Auth roster and intended Control endpoints are ready.
+7. reopen traffic only after the intended Auth and Control processes are locally ready and deployment-level convergence checks pass.
 
 An unreadable live envelope, missing retained key, or signing handle that cannot produce a signature verifiable by its committed public JWK is a restore failure. Do not generate a replacement and declare recovery successful. Run a later schema upgrade as a separate operation after the restored release is proven.
 
@@ -325,10 +344,10 @@ Before admitting users, verify all of the following:
 - Auth and Control external URLs, base paths, TLS certificates, callback registrations, and ingress routes match exactly;
 - Control is private and distinct-origin unless one shared browser trust boundary was explicitly accepted;
 - all PostgreSQL URLs identify one authority, pool totals fit capacity, migration ownership is reviewed, and PITR is healthy;
-- every Auth replica has a stable process ID, the same explicit roster/rings, a bounded maximum process count, and working `/ready` removal;
-- proxy and OwlAuth transport limits are aligned, with deliberate handling of direct-peer admission behind the proxy;
+- every consuming process has the intended active/retained rings, external expand-then-activate convergence is proven, and instance-local `/ready` routing works;
+- proxy and OwlAuth transport limits are aligned, with ingress-owned traffic governance;
 - provider, SMTP, and webhook egress policies and private-IP exceptions are least-privilege and monitored;
-- graceful termination, worker recovery, Redis fallback, schema failure, key loss, and PostgreSQL restore have been exercised;
+- graceful termination, worker recovery, schema failure, key loss, and PostgreSQL restore have been exercised;
 - log collection and alerting are operational without exporting sensitive data.
 
 Continue with [Architecture](/guide/architecture) for system boundaries and [Security](/guide/security) for key lifecycle, token verification, browser safety, and disclosure requirements.

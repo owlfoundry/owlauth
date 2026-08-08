@@ -1,8 +1,4 @@
-use std::{
-    str::FromStr as _,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{str::FromStr as _, sync::Arc};
 
 use axum::{
     Router,
@@ -54,12 +50,10 @@ impl From<&ControlState> for McpApplicationServices {
 }
 
 #[derive(Clone)]
-struct McpAdmission {
+struct McpRequestGuard {
     operator_key: Arc<OperatorApiKey>,
     external_origin: McpExternalOrigin,
     concurrency: Arc<tokio::sync::Semaphore>,
-    rate: Arc<Mutex<McpRateWindow>>,
-    max_requests_per_second: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,12 +101,6 @@ impl McpExternalOrigin {
             && normalized_url_host(&url) == self.host
             && url.port_or_known_default() == Some(self.effective_port)
     }
-}
-
-#[derive(Debug)]
-struct McpRateWindow {
-    started_at: Instant,
-    accepted: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -960,10 +948,6 @@ fn application_error_result(error: ApplicationError) -> CallToolResult {
             "operation_in_progress",
             "The requested operation is already in progress.",
         ),
-        ApplicationError::PublicationPending => (
-            "publication_pending",
-            "The requested publication has not propagated.",
-        ),
         ApplicationError::InvalidTransition => (
             "invalid_transition",
             "The requested state transition is not allowed.",
@@ -974,7 +958,6 @@ fn application_error_result(error: ApplicationError) -> CallToolResult {
         ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
-        | ApplicationError::ServerVerifierUnavailable
         | ApplicationError::ProviderPreflightRejected
         | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
@@ -1022,11 +1005,11 @@ fn has_exact_external_authority(
 }
 
 async fn require_mcp_operator(
-    State(admission): State<McpAdmission>,
+    State(guard): State<McpRequestGuard>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    if !valid_control_authorization(request.headers(), &admission.operator_key) {
+    if !valid_control_authorization(request.headers(), &guard.operator_key) {
         let request_id = request
             .extensions()
             .get::<String>()
@@ -1040,7 +1023,7 @@ async fn require_mcp_operator(
             &request_id,
         ));
     }
-    if !has_exact_external_authority(request.headers(), request.uri(), &admission.external_origin) {
+    if !has_exact_external_authority(request.headers(), request.uri(), &guard.external_origin) {
         let request_id = request
             .extensions()
             .get::<String>()
@@ -1058,42 +1041,7 @@ async fn require_mcp_operator(
     request
         .extensions_mut()
         .insert(AuthenticatedDeploymentOperator);
-    let rate_limited = {
-        let mut window = admission
-            .rate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if window.started_at.elapsed() >= Duration::from_secs(1) {
-            window.started_at = Instant::now();
-            window.accepted = 0;
-        }
-        if window.accepted >= admission.max_requests_per_second {
-            true
-        } else {
-            window.accepted += 1;
-            false
-        }
-    };
-    if rate_limited {
-        let request_id = request
-            .extensions()
-            .get::<String>()
-            .cloned()
-            .unwrap_or_else(|| "unavailable".to_owned());
-        let mut response = control_problem(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "MCP request rate exceeded",
-            "The bounded MCP request rate has been exceeded.",
-            &request_id,
-        );
-        response.headers_mut().insert(
-            header::RETRY_AFTER,
-            "1".parse().expect("static header value"),
-        );
-        return response;
-    }
-    let Ok(permit) = Arc::clone(&admission.concurrency).try_acquire_owned() else {
+    let Ok(permit) = Arc::clone(&guard.concurrency).try_acquire_owned() else {
         let request_id = request
             .extensions()
             .get::<String>()
@@ -1173,15 +1121,10 @@ pub(super) fn router(
     Router::new()
         .nest_service("/mcp", transport)
         .route_layer(middleware::from_fn_with_state(
-            McpAdmission {
+            McpRequestGuard {
                 operator_key: Arc::clone(&state.operator_key),
                 external_origin: McpExternalOrigin::from_url(&listener.external_base),
                 concurrency: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests)),
-                rate: Arc::new(Mutex::new(McpRateWindow {
-                    started_at: Instant::now(),
-                    accepted: 0,
-                })),
-                max_requests_per_second: config.max_requests_per_second,
             },
             require_mcp_operator,
         ))

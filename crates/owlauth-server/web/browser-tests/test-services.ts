@@ -614,7 +614,7 @@ function createRuntimeFaultProxy(runtimeOrigin: string, controlToken: string) {
         const fault = armed;
         const definition = fault === undefined ? undefined : faultDefinitions[fault.operation];
         // A matching request always consumes exactly one arm. Inject ambiguity only after the
-        // Runtime committed successfully; a denial or admission response must remain an ordinary
+        // Runtime committed successfully; a denial or ingress response must remain an ordinary
         // typed response and must not leave stale global fault state for a retry or later operation.
         if (
           definition?.method === method &&

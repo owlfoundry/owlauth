@@ -11,14 +11,104 @@ pub mod server;
 
 pub use health::HealthResponse;
 
+use utoipa::openapi::{Content, OpenApi, Ref, RefOr, Response};
+
 /// Compile-time availability of the complete federated Project Auth surface.
 pub const FEDERATED_PROJECT_AUTH_AVAILABLE: bool = true;
+
+pub(crate) fn json_error_response(
+    description: &str,
+    schema_name: &str,
+    content_type: &str,
+) -> RefOr<Response> {
+    Response::builder()
+        .description(description)
+        .content(
+            content_type,
+            Content::new(Some(Ref::from_schema_name(schema_name))),
+        )
+        .build()
+        .into()
+}
+
+pub(crate) fn add_response_to_operations(
+    openapi: &mut OpenApi,
+    status: &str,
+    mut response_for_path: impl FnMut(&str) -> RefOr<Response>,
+) {
+    for (path, item) in &mut openapi.paths.paths {
+        let response = response_for_path(path);
+        for operation in [
+            item.get.as_mut(),
+            item.put.as_mut(),
+            item.post.as_mut(),
+            item.delete.as_mut(),
+            item.options.as_mut(),
+            item.head.as_mut(),
+            item.patch.as_mut(),
+            item.trace.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            operation
+                .responses
+                .responses
+                .insert(status.to_owned(), response.clone());
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
 
     use crate::{control, export, runtime, server};
+
+    #[test]
+    fn every_listener_operation_declares_its_request_timeout_envelope() {
+        let documents = [
+            (
+                serde_json::to_value(runtime::openapi()).unwrap(),
+                "RuntimeError",
+                "application/json",
+            ),
+            (
+                serde_json::to_value(server::openapi()).unwrap(),
+                "ServerError",
+                "application/json",
+            ),
+            (
+                serde_json::to_value(control::openapi()).unwrap(),
+                "ProblemDetails",
+                "application/problem+json",
+            ),
+        ];
+        for (document, schema, content_type) in documents {
+            for (path, item) in document["paths"].as_object().unwrap() {
+                for method in [
+                    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+                ] {
+                    let Some(operation) = item.get(method) else {
+                        continue;
+                    };
+                    let timeout = &operation["responses"]["408"];
+                    assert!(
+                        timeout.is_object(),
+                        "missing 408 response for {method} {path}"
+                    );
+                    if schema == "RuntimeError" && path.starts_with("/auth/") {
+                        assert!(timeout["content"]["text/html"].is_object());
+                    } else {
+                        assert_eq!(
+                            timeout["content"][content_type]["schema"]["$ref"],
+                            format!("#/components/schemas/{schema}")
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     #[allow(
@@ -190,19 +280,34 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.iter().any(|field| field == "kind"))
         );
-        assert_eq!(
-            control["components"]["schemas"]["ReconcileProviderRequest"]["properties"]["client_secret"]
-                ["writeOnly"],
-            true
+        for schema in [
+            "ReconcileProviderRequest",
+            "ReplaceProviderSecretRequest",
+            "ReconcileProviderSecretReplacementRequest",
+        ] {
+            assert_eq!(
+                control["components"]["schemas"][schema]["properties"]["client_secret"]["writeOnly"],
+                true
+            );
+        }
+        assert!(
+            control["components"]["schemas"]["UpdateProviderRequest"]["properties"]
+                .get("client_secret")
+                .is_none()
         );
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact Control operation and exceptional-response inventory is reviewed as one protocol matrix"
+    )]
     fn control_operation_inventory_and_exceptional_responses_are_exact() {
         let control = serde_json::to_value(control::openapi()).expect("Control OpenAPI serializes");
         for (path, methods) in [
             ("/v1/projects", &["get", "post"][..]),
             ("/v1/projects/{project_id}", &["get", "patch"]),
+            ("/v1/projects/{project_id}/overview", &["get"]),
             ("/v1/projects/{project_id}/applications", &["get", "post"]),
             (
                 "/v1/projects/{project_id}/applications/{application_id}",
@@ -224,6 +329,22 @@ mod tests {
                 &["get", "put"],
             ),
             ("/v1/projects/{project_id}/providers", &["get", "post"]),
+            (
+                "/v1/projects/{project_id}/providers/{provider_id}",
+                &["patch"],
+            ),
+            (
+                "/v1/projects/{project_id}/providers/{provider_id}/replace-secret",
+                &["post"],
+            ),
+            (
+                "/v1/projects/{project_id}/providers/{provider_id}/replace-secret/reconcile",
+                &["post"],
+            ),
+            (
+                "/v1/projects/{project_id}/providers/{provider_id}/replace-secret/abandon",
+                &["post"],
+            ),
             (
                 "/v1/projects/{project_id}/providers/{provider_id}/assignments/{application_id}",
                 &["put"],
@@ -289,6 +410,71 @@ mod tests {
     }
 
     #[test]
+    fn project_overview_contract_is_grouped_required_and_control_only() {
+        let control = serde_json::to_value(control::openapi()).expect("Control OpenAPI serializes");
+        let runtime = serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI serializes");
+        let server = serde_json::to_value(server::openapi()).expect("Server OpenAPI serializes");
+        let path = "/v1/projects/{project_id}/overview";
+        assert_eq!(
+            control["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/ProjectOverviewSummary"
+        );
+        assert!(runtime["paths"].get(path).is_none());
+        assert!(server["paths"].get(path).is_none());
+        let summary = &control["components"]["schemas"]["ProjectOverviewSummary"];
+        let summary_required = summary["required"]
+            .as_array()
+            .expect("overview groups are required")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            summary_required,
+            [
+                "applications",
+                "project_id",
+                "project_server_keys",
+                "providers",
+                "users",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        for (schema, fields) in [
+            (
+                "ProjectOverviewApplicationCounts",
+                &["active", "configured", "total"][..],
+            ),
+            (
+                "ProjectOverviewProviderCounts",
+                &["active", "active_assignments", "total"],
+            ),
+            (
+                "ProjectOverviewUserCounts",
+                &["active", "disabled", "merged", "total"],
+            ),
+            (
+                "ProjectOverviewServerKeyCounts",
+                &["active", "revoked", "total"],
+            ),
+        ] {
+            let definition = &control["components"]["schemas"][schema];
+            let required = definition["required"]
+                .as_array()
+                .expect("overview count fields are required")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(required, fields.iter().copied().collect());
+            for field in fields {
+                assert_eq!(definition["properties"][field]["minimum"], 0);
+            }
+        }
+    }
+
+    #[test]
     fn runtime_pending_email_and_hosted_document_contracts_are_minimal() {
         let runtime = serde_json::to_value(runtime::openapi()).expect("Runtime OpenAPI serializes");
         let pending = &runtime["components"]["schemas"]["HostedPendingEmailChallenge"];
@@ -338,82 +524,6 @@ mod tests {
         }
         for excluded in ["/auth/", "/auth/assets/{asset}"] {
             assert!(runtime["paths"].get(excluded).is_none());
-        }
-    }
-
-    #[test]
-    fn every_runtime_rate_limit_response_requires_integer_retry_after_seconds() {
-        let runtime: Value = serde_json::from_str(
-            &export::to_pretty_json(export::OpenApiPlane::Runtime)
-                .expect("Runtime OpenAPI should serialize"),
-        )
-        .expect("exported Runtime OpenAPI should be JSON");
-        let paths = runtime["paths"]
-            .as_object()
-            .expect("Runtime paths should be an object");
-        let mut checked = 0;
-        for (path, path_item) in paths {
-            let Some(methods) = path_item.as_object() else {
-                continue;
-            };
-            for (method, operation) in methods {
-                let response = &operation["responses"]["429"];
-                if !response.is_object() {
-                    continue;
-                }
-                checked += 1;
-                let retry_after = &response["headers"]["Retry-After"];
-                assert_eq!(
-                    retry_after["schema"]["type"], "integer",
-                    "Retry-After must be integer seconds for {method} {path}"
-                );
-                assert_eq!(
-                    retry_after["required"], true,
-                    "Retry-After must be required for {method} {path}"
-                );
-                assert!(
-                    retry_after["description"]
-                        .as_str()
-                        .is_some_and(|description| description.contains("Required")
-                            && description.contains("whole seconds")),
-                    "Retry-After must be documented as required whole seconds for {method} {path}"
-                );
-            }
-        }
-        assert!(
-            checked >= 20,
-            "Runtime rate-limit inventory unexpectedly shrank"
-        );
-    }
-
-    #[test]
-    fn every_server_rate_limit_response_requires_integer_retry_after_seconds() {
-        let server: Value = serde_json::from_str(
-            &export::to_pretty_json(export::OpenApiPlane::Server)
-                .expect("Server OpenAPI should serialize"),
-        )
-        .expect("exported Server OpenAPI should be JSON");
-        let operations = [
-            ("/v1/projects/{project_id}/users", "get"),
-            ("/v1/projects/{project_id}/users/lookup", "post"),
-            ("/v1/projects/{project_id}/users/{user_id}", "get"),
-            (
-                "/v1/projects/{project_id}/applications/{application_id}/users/{user_id}",
-                "get",
-            ),
-            ("/v1/projects/{project_id}/tokens/introspect", "post"),
-        ];
-        for (path, method) in operations {
-            let retry_after =
-                &server["paths"][path][method]["responses"]["429"]["headers"]["Retry-After"];
-            assert_eq!(retry_after["schema"]["type"], "integer");
-            assert_eq!(retry_after["required"], true);
-            assert!(
-                retry_after["description"]
-                    .as_str()
-                    .is_some_and(|description| description.contains("Required")
-                        && description.contains("whole seconds"))
-            );
         }
     }
 

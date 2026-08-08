@@ -66,16 +66,14 @@ pub(crate) struct CommitEmailGeneration {
     pub outbox_id: Uuid,
     pub canonicalization_version: i32,
     pub lookup_digest: VersionedDigest,
+    /// Active and retained canonical-recipient digests used only for durable delivery suppression.
+    pub recipient_digests: Vec<VersionedDigest>,
     pub address: ProtectedValue,
     pub otp_digest: Option<VersionedDigest>,
     pub magic_digest: Option<VersionedDigest>,
     pub envelope: ProtectedValue,
     pub body: ProtectedValue,
     pub message_id: String,
-    /// Server-derived only after the single atomic admission evaluation. Suppressed generations
-    /// retain the ordinary proof/challenge state machine but create a terminal, unclaimable
-    /// outbox disposition and therefore cannot perform SMTP I/O.
-    pub suppress_delivery: bool,
     pub issued_at: OffsetDateTime,
     pub otp_expires_at: Option<OffsetDateTime>,
     pub magic_expires_at: Option<OffsetDateTime>,
@@ -148,13 +146,6 @@ pub(crate) struct VerifiedEmailChallenge {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EmailIdentityAliasAuthority {
-    pub revision: i64,
-    pub write_version: i32,
-    pub accepted_versions: Vec<i32>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CompleteEmailProof {
     pub verification: VerifyEmailProof,
     pub new_user_id: Uuid,
@@ -176,10 +167,6 @@ pub(crate) struct CompleteEmailProof {
 
 #[async_trait]
 pub(crate) trait PasswordlessEmailRepository: Send + Sync {
-    async fn identity_alias_authority(
-        &self,
-    ) -> Result<EmailIdentityAliasAuthority, ApplicationError>;
-
     async fn select_email_method(
         &self,
         command: SelectEmailMethod,

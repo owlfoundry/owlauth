@@ -5,7 +5,6 @@ pub(crate) mod oidc;
 pub(crate) mod postgres;
 pub(crate) mod protected_runtime;
 pub(crate) mod provider_registry;
-pub(crate) mod redis_admission;
 pub(crate) mod runtime_security;
 pub(crate) mod server_key_security;
 pub(crate) mod smtp;

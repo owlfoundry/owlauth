@@ -80,6 +80,8 @@ Configuration and every authenticated response are checked against the immutable
 
 Every network method accepts `{ signal, timeoutMs }`. Client construction also accepts a default `timeoutMs` and an injectable Web-standard `fetch`, Web Crypto provider, and clock for deterministic integrations and tests.
 
+An optional `ClientOptions.debugHook` receives one immutable, secret-free completion event per real network attempt. It is disabled by default, and hook failures are ignored. Events contain only the fixed operation, method, closed outcome, elapsed milliseconds, dispatch flag, and optional safe status/error metadata; they never contain URLs, headers, bodies, identifiers, callbacks, PKCE, or credentials.
+
 `OwlAuthError` exposes stable, secret-free fields:
 
 - `category` and machine `code`;
@@ -87,9 +89,9 @@ Every network method accepts `{ signal, timeoutMs }`. Client construction also a
 - `retry`: `never`, `safe_after_delay`, or `application_decision`;
 - caller `action`, such as `discard_pending` or `quarantine_credentials`;
 - an allowlisted request ID and HTTP status when available;
-- bounded `retryAfterSeconds` for a contract-valid `429 rate_limited` response.
+- bounded `retryAfterSeconds` when an optional SaaS/ingress layer returns a contract-valid `429 rate_limited` response.
 
-Unknown Runtime codes remain conservative and non-retryable. Raw response bodies, callback URLs, tokens, handoff tickets, and PKCE verifiers are never copied into public errors.
+A valid Core `408 request_timeout` is `Timeout` with caller-decision retry and no local action for non-sensitive operations. For a dispatched handoff, refresh, or logout operation it is `Indeterminate` with the existing quarantine action because the server deadline may expire after authority work starts. Malformed `408` responses fail conservatively as invalid responses. Unknown Runtime codes remain conservative and non-retryable. Raw response bodies, callback URLs, tokens, handoff tickets, and PKCE verifiers are never copied into public errors.
 
 ## Real-server and exact-artifact qualification
 

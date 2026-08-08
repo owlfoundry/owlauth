@@ -10,10 +10,10 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::{
-    AdmittedEmailMethod, ApplicationError, Clock, EmailIdentityAliasAuthority, EmailProofKind,
-    OpaquePurpose, ProtectedPurpose, ProtectedValue, ProviderAuthorizationRequest,
-    ProviderCallbackRequest, ProviderExchangeError, ProviderIdentity, ProviderRequestProfile,
-    ProviderSecretResolver, RuntimeProtector, UpstreamProviderClient, VersionedDigest,
+    AdmittedEmailMethod, ApplicationError, Clock, EmailProofKind, OpaquePurpose, ProtectedPurpose,
+    ProtectedValue, ProviderAuthorizationRequest, ProviderCallbackRequest, ProviderExchangeError,
+    ProviderIdentity, ProviderRequestProfile, ProviderSecretResolver, RuntimeProtector,
+    UpstreamProviderClient, VersionedDigest,
 };
 use crate::domain::{
     IdentityKind, IdentityMutationKind, IdentityMutationSlotRole, IdentityMutationSlotState,
@@ -678,13 +678,14 @@ pub(crate) struct CommitIdentityMutationEmailGeneration {
     pub outbox_id: Uuid,
     pub canonicalization_version: i32,
     pub lookup_digest: VersionedDigest,
+    /// Active and retained canonical-recipient digests used only for durable delivery suppression.
+    pub recipient_digests: Vec<VersionedDigest>,
     pub address: ProtectedValue,
     pub otp_digest: Option<VersionedDigest>,
     pub magic_digest: Option<VersionedDigest>,
     pub envelope: ProtectedValue,
     pub body: ProtectedValue,
     pub message_id: String,
-    pub suppress_delivery: bool,
     pub admitted_method: AdmittedEmailMethod,
     pub issued_at: OffsetDateTime,
     pub otp_expires_at: Option<OffsetDateTime>,
@@ -1004,10 +1005,6 @@ pub(crate) trait RuntimeIdentityMutationRepository: Send + Sync {
         &self,
         completion: CompleteIdentityMutationEmailProof,
     ) -> Result<IdentityMutationRecord, ApplicationError>;
-
-    async fn identity_alias_authority(
-        &self,
-    ) -> Result<EmailIdentityAliasAuthority, ApplicationError>;
 
     async fn confirm_ready(
         &self,
@@ -1790,10 +1787,10 @@ impl IdentityMutationRuntimeService {
             challenge_id,
             preparation.next_generation,
         );
-        let lookup_digest = self.protector.digest(
-            OpaquePurpose::EmailIdentityLookup,
-            preparation.project_id.as_bytes(),
-            canonical.expose().as_bytes(),
+        let (recipient_digests, lookup_digest) = derive_mutation_email_aliases(
+            self.protector.as_ref(),
+            preparation.project_id,
+            &canonical,
         )?;
         let address = self.protector.protect(
             ProtectedPurpose::EmailChallengeAddress,
@@ -1903,6 +1900,7 @@ impl IdentityMutationRuntimeService {
             outbox_id,
             canonicalization_version: crate::domain::CanonicalEmail::version(),
             lookup_digest,
+            recipient_digests,
             address,
             otp_digest,
             magic_digest,
@@ -1917,7 +1915,6 @@ impl IdentityMutationRuntimeService {
                 body_plaintext.as_slice(),
             )?,
             message_id: format!("<{outbox_id}@mail.owlauth.invalid>"),
-            suppress_delivery: false,
             admitted_method,
             issued_at: now,
             otp_expires_at,
@@ -2171,19 +2168,17 @@ impl IdentityMutationRuntimeService {
             &canonical,
             &challenge.lookup_digest,
         )?;
-        let alias_authority = self.repository.identity_alias_authority().await?;
         let (lookup_aliases, active_alias) = derive_mutation_email_aliases(
             self.protector.as_ref(),
             challenge.project_id,
             &canonical,
-            &alias_authority,
         )?;
         let material = self.prepare_email_proof_material(
             &challenge,
             canonical.expose(),
             lookup_aliases,
             active_alias,
-            alias_authority.revision,
+            1,
             &verified_challenge_lookup,
         )?;
         let receipt_digest = self
@@ -3052,29 +3047,17 @@ fn derive_mutation_email_aliases(
     protector: &dyn RuntimeProtector,
     project_id: Uuid,
     canonical: &crate::domain::CanonicalEmail,
-    authority: &EmailIdentityAliasAuthority,
 ) -> Result<(Vec<VersionedDigest>, VersionedDigest), ApplicationError> {
-    if authority.revision <= 0
-        || authority.write_version <= 0
-        || authority.accepted_versions.is_empty()
-        || !authority
-            .accepted_versions
-            .contains(&authority.write_version)
+    let versions = protector.email_identity_readable_key_versions();
+    let write_version = protector.email_identity_active_version();
+    if versions.is_empty()
+        || versions.len() > 16
+        || write_version <= 0
+        || !versions.contains(&write_version)
     {
         return Err(ApplicationError::Integrity);
     }
-    let versions = authority
-        .accepted_versions
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if versions.len() != authority.accepted_versions.len()
-        || versions.iter().any(|value| *value <= 0)
-    {
-        return Err(ApplicationError::Integrity);
-    }
-    let aliases = authority
-        .accepted_versions
+    let aliases = versions
         .iter()
         .map(|version| {
             protector.digest_at(
@@ -3087,7 +3070,7 @@ fn derive_mutation_email_aliases(
         .collect::<Result<Vec<_>, _>>()?;
     let active = aliases
         .iter()
-        .find(|alias| alias.key_version == authority.write_version)
+        .find(|alias| alias.key_version == write_version)
         .cloned()
         .ok_or(ApplicationError::Integrity)?;
     Ok((aliases, active))
@@ -3772,7 +3755,6 @@ mod tests {
             assert!(body.contains("revision=3"));
             assert!(!body.contains("intent="));
             assert!(!body.contains("?proof="));
-            assert!(!generation.suppress_delivery);
             assert_eq!(generation.issued_at, TestClock.now());
             assert_eq!(
                 generation.otp_expires_at,
@@ -3843,12 +3825,6 @@ mod tests {
             &self,
             _completion: CompleteIdentityMutationEmailProof,
         ) -> Result<IdentityMutationRecord, ApplicationError> {
-            unreachable!()
-        }
-
-        async fn identity_alias_authority(
-            &self,
-        ) -> Result<EmailIdentityAliasAuthority, ApplicationError> {
             unreachable!()
         }
 
@@ -4589,6 +4565,7 @@ mod tests {
             outbox_id: Uuid::from_u128(51),
             canonicalization_version: crate::domain::CanonicalEmail::version(),
             lookup_digest: digest(5, 2),
+            recipient_digests: vec![digest(5, 2)],
             address: ProtectedValue {
                 ciphertext: vec![1],
                 key_version: 2,
@@ -4604,7 +4581,6 @@ mod tests {
                 key_version: 2,
             },
             message_id: "identity-mutation-50@example.test".to_owned(),
-            suppress_delivery: true,
             admitted_method: policy.clone(),
             issued_at,
             otp_expires_at: Some(issued_at + Duration::minutes(5)),
@@ -4614,7 +4590,6 @@ mod tests {
         assert_eq!(validate_email_generation(&generation), Ok(()));
         assert_eq!(generation.admitted_method, policy);
         assert_eq!(generation.message_id, "identity-mutation-50@example.test");
-        assert!(generation.suppress_delivery);
     }
 
     #[test]

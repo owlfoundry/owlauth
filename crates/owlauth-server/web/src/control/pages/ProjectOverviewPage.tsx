@@ -7,25 +7,14 @@ import { EmptyState, LoadingState, PageHeader, Section } from "../../shared/layo
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert } from "../../shared/primitives/Feedback";
 import { useControl, useProject } from "../app/ControlContext";
-import { requireData } from "../client";
+import { requireData, type ProjectOverviewSummary } from "../client";
 import styles from "./pages.module.css";
-
-interface Summary {
-  readonly applications: number;
-  readonly activeApplications: number;
-  readonly configuredApplications: number;
-  readonly providers: number;
-  readonly activeProviders: number;
-  readonly providerAssignments: number;
-  readonly emailAssignments: number;
-  readonly activeSigningKeys: number;
-}
 
 export function ProjectOverviewPage() {
   const { projectId } = useParams();
   const project = useProject(projectId);
   const { session, handleError, setMessage } = useControl();
-  const [summary, setSummary] = useState<Summary | null>(null);
+  const [summary, setSummary] = useState<ProjectOverviewSummary | null>(null);
   const [loadState, setLoadState] = useState<"loading" | "ready" | "failed">("loading");
 
   const refresh = useCallback(
@@ -33,74 +22,14 @@ export function ProjectOverviewPage() {
       if (project === null) return;
       setLoadState("loading");
       try {
-        const [applications, providers, keys, emailPolicy, emailAssignments] = await Promise.all([
-          session.client.GET("/v1/projects/{project_id}/applications", {
-            params: { path: { project_id: project.id } },
-            signal: signal ?? null,
-          }),
-          session.client.GET("/v1/projects/{project_id}/providers", {
-            params: { path: { project_id: project.id } },
-            signal: signal ?? null,
-          }),
-          session.client.GET("/v1/projects/{project_id}/signing-keys", {
-            params: { path: { project_id: project.id } },
-            signal: signal ?? null,
-          }),
-          session.client.GET("/v1/projects/{project_id}/email-method", {
-            params: { path: { project_id: project.id } },
-            signal: signal ?? null,
-          }),
-          session.client.GET("/v1/projects/{project_id}/email-method/assignments", {
-            params: { path: { project_id: project.id } },
-            signal: signal ?? null,
-          }),
-        ]);
-        const applicationItems = requireData(
-          applications.data,
-          applications.error,
-          applications.response,
-        ).items;
-        const providerItems = requireData(
-          providers.data,
-          providers.error,
-          providers.response,
-        ).items;
-        const keyItems = requireData(keys.data, keys.error, keys.response).items;
-        const email = requireData(emailPolicy.data, emailPolicy.error, emailPolicy.response);
-        const emailAssignmentItems = requireData(
-          emailAssignments.data,
-          emailAssignments.error,
-          emailAssignments.response,
-        ).items;
-        const activeApplications = applicationItems.filter(
-          (application) => application.status === "active",
-        );
-        const activeApplicationIds = new Set(
-          activeApplications.map((application) => application.id),
-        );
-        const activeProviders = providerItems.filter((provider) => provider.status === "active");
-        const next = {
-          applications: applicationItems.length,
-          activeApplications: activeApplications.length,
-          configuredApplications: activeApplications.filter(
-            (application) => application.configuration.redirect_uris.length > 0,
-          ).length,
-          providers: providerItems.length,
-          activeProviders: activeProviders.length,
-          providerAssignments: activeProviders.reduce(
-            (total, provider) =>
-              total +
-              provider.assigned_application_ids.filter((id) => activeApplicationIds.has(id)).length,
-            0,
-          ),
-          emailAssignments: email.enabled
-            ? emailAssignmentItems.filter(
-                (assignment) =>
-                  assignment.enabled && activeApplicationIds.has(assignment.application_id),
-              ).length
-            : 0,
-          activeSigningKeys: keyItems.filter((key) => key.state === "active").length,
-        };
+        const response = await session.client.GET("/v1/projects/{project_id}/overview", {
+          params: { path: { project_id: project.id } },
+          signal: signal ?? null,
+        });
+        const next = requireData(response.data, response.error, response.response);
+        if (next.project_id !== project.id) {
+          throw new TypeError("Project overview authority mismatch");
+        }
         if (signal?.aborted !== true) {
           setSummary(next);
           setLoadState("ready");
@@ -174,33 +103,33 @@ export function ProjectOverviewPage() {
             <li>
               <DashboardCard
                 title="Applications"
-                value={summary.applications}
-                detail={`${String(summary.activeApplications)} active · ${String(summary.configuredApplications)} with login URLs`}
+                value={summary.applications.total}
+                detail={`${String(summary.applications.active)} active · ${String(summary.applications.configured)} with login URLs`}
                 href={`/projects/${project.id}/applications`}
               />
             </li>
             <li>
               <DashboardCard
                 title="Identity providers"
-                value={summary.providers}
-                detail={`${String(summary.activeProviders)} active · ${String(summary.providerAssignments)} Application assignments`}
+                value={summary.providers.total}
+                detail={`${String(summary.providers.active)} active · ${String(summary.providers.active_assignments)} Application assignments`}
                 href={`/projects/${project.id}/authentication/providers`}
               />
             </li>
             <li>
               <DashboardCard
-                title="Passwordless email"
-                value={summary.emailAssignments}
-                detail="Active Application assignments"
-                href={`/projects/${project.id}/authentication/email`}
+                title="Users"
+                value={summary.users.total}
+                detail={`${String(summary.users.active)} active · ${String(summary.users.disabled)} disabled · ${String(summary.users.merged)} merged`}
+                href={`/projects/${project.id}/users`}
               />
             </li>
             <li>
               <DashboardCard
-                title="Signing keys"
-                value={summary.activeSigningKeys}
-                detail="Active keys available for token issuance"
-                href={`/projects/${project.id}/security/signing-keys`}
+                title="Project secret keys"
+                value={summary.project_server_keys.total}
+                detail={`${String(summary.project_server_keys.active)} active · ${String(summary.project_server_keys.revoked)} revoked`}
+                href={`/projects/${project.id}/security/server-keys`}
               />
             </li>
           </ul>

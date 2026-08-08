@@ -83,7 +83,7 @@ fn require_contract_headers(document: &mut serde_json::Value) {
             continue;
         };
         for operation in operations.values_mut() {
-            for (status, header) in [("429", "Retry-After"), ("401", "WWW-Authenticate")] {
+            for (status, header) in [("401", "WWW-Authenticate")] {
                 let Some(value) = operation
                     .get_mut("responses")
                     .and_then(|responses| responses.get_mut(status))

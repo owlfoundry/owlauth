@@ -352,6 +352,14 @@ impl RuntimeProtector for SplitRuntimeProtector {
             .map_or(0, SoftwareRuntimeProtector::active_version)
     }
 
+    fn email_identity_readable_key_versions(&self) -> BTreeSet<i32> {
+        self.email_identity
+            .as_ref()
+            .map_or_else(BTreeSet::new, |protector| {
+                RuntimeProtector::readable_key_versions(protector)
+            })
+    }
+
     fn random_opaque(&self, bytes: usize) -> Result<Zeroizing<String>, ApplicationError> {
         self.short_term.random_opaque(bytes)
     }

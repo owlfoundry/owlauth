@@ -47,14 +47,13 @@ use crate::{
                 application, application_provider_assignment, application_publishable_key,
                 audit_event, control_idempotency_record, key_provisioning_operation,
                 key_state_event, project, project_signing_key, project_user, protected_material,
-                provider_configuration, provider_secret_operation, runtime_publication_lease,
+                provider_configuration, provider_secret_operation,
             },
             provider_egress::PostgresProviderEgressPolicyRepository,
             provisioning::PostgresProvisioningAdapter,
             readiness::PostgresReadinessAdapter,
             server_api::RuntimeServerEmailLookupDigester,
             server_key::PostgresServerKeyRepository,
-            server_readiness::PostgresServerDigestReadinessAdapter,
             unit_of_work::ProjectUnitOfWork,
         },
         protected_runtime::PostgresProtectedRuntimeCustody,
@@ -70,11 +69,11 @@ use crate::{
         PreparedSigningKey, ProjectProvisioningPort, ProjectRecord, ProviderEgressPolicyPort,
         ProvisionedProtectedSigningMaterial, ProvisioningInfrastructure,
         ProvisioningOperationState, ProvisioningService, ReadinessService,
-        ReconcileDeploymentSmtpGeneration, ReplaceApplicationConfiguration, RequestDigester,
-        RevokeProjectServerKey, RuntimeProtector, ServerDigestReadinessService,
-        ServerKeyLifecycleService, SigningKeyProvisioningPort, SigningProviderAction,
-        SigningProviderCall, SigningProviderLease, SmtpControlTlsMode, SmtpCredentialResolver,
-        UpdateProject, UpdateProjectPolicy,
+        ReconcileDeploymentSmtpGeneration, ReplaceApplicationConfiguration, ReplaceProviderSecret,
+        RequestDigester, RevokeProjectServerKey, RuntimeProtector, ServerKeyLifecycleService,
+        SigningKeyProvisioningPort, SigningProviderAction, SigningProviderCall,
+        SigningProviderLease, SmtpControlTlsMode, SmtpCredentialResolver, UpdateProject,
+        UpdateProjectPolicy,
     },
     composition::build_http_capabilities,
     config::{MigrationMode, ProcessMode, ServerConfig},
@@ -502,18 +501,10 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
             "250".to_owned(),
         ),
         ("OWLAUTH_POSTGRES_URL".to_owned(), runtime_url.to_owned()),
-        (
-            "OWLAUTH_AUTH_PROCESS_ID".to_owned(),
-            "runtime-test-process".to_owned(),
-        ),
         ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
         (
             "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
             "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM".to_owned(),
-        ),
-        (
-            "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
-            "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
         ),
         (
             "OWLAUTH_RUNTIME_PROTECTION_KEY".to_owned(),
@@ -570,10 +561,6 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
         (
             "OWLAUTH_MANAGED_CREDENTIAL_KEY".to_owned(),
             "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY".to_owned(),
-        ),
-        (
-            "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
-            "runtime-test-process".to_owned(),
         ),
         (
             "OWLAUTH_SERVER_KEY_DIGEST_KEY_VERSION".to_owned(),
@@ -646,9 +633,6 @@ async fn verify_application_and_publication_journeys(
     config: &ServerConfig,
     pools: &DatabasePools,
     readiness: ReadinessService,
-    secondary_readiness: ReadinessService,
-    unexpected_readiness: ReadinessService,
-    admin_url: &str,
     control_url: String,
 ) -> Uuid {
     let reservation_revision = created_project.metadata_revision;
@@ -972,217 +956,6 @@ async fn verify_application_and_publication_journeys(
         .await
         .expect("JWK constraint test connection should close");
 
-    assert_eq!(
-        provisioning
-            .activate_signing_key(
-                created_project.id,
-                signing_key.id,
-                signing_key.ring_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(crate::application::ApplicationError::PublicationPending)
-    );
-
-    // Replacement first: public readiness must block on the exact incarnation before it can
-    // touch any Project/Application row. Rolling the replacement transaction back lets the
-    // same operation proceed with the still-current incarnation.
-    let mut observer = PgConnection::connect(admin_url)
-        .await
-        .expect("readiness lock observer should open");
-    let mut incarnation_blocker = PgConnection::connect(&control_url)
-        .await
-        .expect("incarnation blocker should open");
-    sqlx::query("BEGIN")
-        .execute(&mut incarnation_blocker)
-        .await
-        .expect("begin replacement-first transaction");
-    sqlx::query(
-        "UPDATE auth_process_incarnations SET process_incarnation=$2
-         WHERE process_id=$1",
-    )
-    .bind("runtime-test-process")
-    .bind(Uuid::new_v4())
-    .execute(&mut incarnation_blocker)
-    .await
-    .expect("stage Runtime incarnation replacement");
-    let incarnation_blocker_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-        .fetch_one(&mut incarnation_blocker)
-        .await
-        .expect("read incarnation-blocker backend pid");
-    let readiness_for_public_order = readiness.clone();
-    let project_public_id = created_project.public_id.clone();
-    let application_public_id = created_application.public_id.clone();
-    let public_read = tokio::spawn(async move {
-        readiness_for_public_order
-            .public_application_config(&project_public_id, &application_public_id)
-            .await
-    });
-    let public_read_pid = wait_for_sqlx_backend_blocked_by(
-        &mut observer,
-        incarnation_blocker_pid,
-        "public config exact-incarnation first lock",
-    )
-    .await;
-    assert_ne!(public_read_pid, incarnation_blocker_pid);
-    sqlx::query("ROLLBACK")
-        .execute(&mut incarnation_blocker)
-        .await
-        .expect("roll back staged Runtime replacement");
-    public_read
-        .await
-        .expect("join replacement-first public read")
-        .expect("public read should resume on the exact current incarnation");
-
-    // Runtime first: hold only the final key-ring row. JWKS must retain the exact incarnation
-    // lock while waiting there, forcing a concurrent replacement to wait behind Runtime. Once
-    // JWKS commits its lease and replacement wins, Control must reject that predecessor lease.
-    secondary_readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("seed every other required Runtime publication lease");
-    let mut ring_blocker = PgConnection::connect(&control_url)
-        .await
-        .expect("key-ring blocker should open");
-    sqlx::query("BEGIN")
-        .execute(&mut ring_blocker)
-        .await
-        .expect("begin Runtime-first ring transaction");
-    sqlx::query("SELECT id FROM project_key_rings WHERE project_id=$1 FOR UPDATE")
-        .bind(created_project.id)
-        .fetch_one(&mut ring_blocker)
-        .await
-        .expect("hold final key-ring lock");
-    let ring_blocker_pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-        .fetch_one(&mut ring_blocker)
-        .await
-        .expect("read ring-blocker backend pid");
-    let readiness_for_jwks_order = readiness.clone();
-    let project_public_id = created_project.public_id.clone();
-    let jwks_read = tokio::spawn(async move {
-        readiness_for_jwks_order
-            .project_jwks(&project_public_id)
-            .await
-    });
-    let jwks_read_pid =
-        wait_for_sqlx_backend_blocked_by(&mut observer, ring_blocker_pid, "JWKS final ring lock")
-            .await;
-    let replacement_incarnation = Uuid::new_v4();
-    let replacement_url = control_url.clone();
-    let (replacement_pid_sender, replacement_pid_receiver) = tokio::sync::oneshot::channel();
-    let replacement = tokio::spawn(async move {
-        let mut connection = PgConnection::connect(&replacement_url)
-            .await
-            .expect("replacement connection should open");
-        sqlx::query("BEGIN")
-            .execute(&mut connection)
-            .await
-            .expect("begin Runtime replacement");
-        let pid = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-            .fetch_one(&mut connection)
-            .await
-            .expect("read replacement backend pid");
-        replacement_pid_sender
-            .send(pid)
-            .expect("publish replacement backend pid");
-        sqlx::query(
-            "UPDATE auth_process_incarnations SET process_incarnation=$2
-             WHERE process_id=$1",
-        )
-        .bind("runtime-test-process")
-        .bind(replacement_incarnation)
-        .execute(&mut connection)
-        .await
-        .expect("replace Runtime incarnation");
-        sqlx::query("COMMIT")
-            .execute(&mut connection)
-            .await
-            .expect("commit Runtime replacement");
-    });
-    let replacement_pid = replacement_pid_receiver
-        .await
-        .expect("receive replacement backend pid");
-    assert_eq!(
-        wait_for_sqlx_backend_blocked_by(
-            &mut observer,
-            jwks_read_pid,
-            "replacement behind in-flight JWKS",
-        )
-        .await,
-        replacement_pid
-    );
-    sqlx::query("ROLLBACK")
-        .execute(&mut ring_blocker)
-        .await
-        .expect("release final key-ring lock");
-    let ordered_jwks = jwks_read
-        .await
-        .expect("join Runtime-first JWKS read")
-        .expect("JWKS read should commit before replacement");
-    assert_eq!(ordered_jwks.revision, signing_key.ring_revision);
-    replacement.await.expect("join Runtime replacement");
-    tokio::time::sleep(Duration::from_millis(15)).await;
-    assert_eq!(
-        provisioning
-            .activate_signing_key(
-                created_project.id,
-                signing_key.id,
-                signing_key.ring_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::PublicationPending),
-        "Control must not trust a predecessor-incarnation publication lease"
-    );
-    let key_after_stale_activation = provisioning
-        .list_signing_keys(created_project.id)
-        .await
-        .expect("signing keys should remain queryable")
-        .into_iter()
-        .find(|key| key.id == signing_key.id)
-        .expect("published key should remain present");
-    assert_eq!(key_after_stale_activation.state, "published");
-    sqlx::query(
-        "UPDATE auth_process_incarnations SET process_incarnation=$2
-         WHERE process_id=$1",
-    )
-    .bind("runtime-test-process")
-    .bind(Uuid::from_u128(1))
-    .execute(&mut incarnation_blocker)
-    .await
-    .expect("restore primary Runtime test incarnation");
-    sqlx::query(
-        "DELETE FROM runtime_publication_leases
-         WHERE project_id=$1 AND process_id='runtime-secondary-process'",
-    )
-    .bind(created_project.id)
-    .execute(&mut incarnation_blocker)
-    .await
-    .expect("restore the later missing-secondary publication fixture");
-
-    let published_jwks = readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("Runtime should load and lease the published JWKS revision");
-    assert_eq!(published_jwks.revision, signing_key.ring_revision);
-    assert_eq!(published_jwks.keys.len(), 1);
-    tokio::time::sleep(Duration::from_millis(15)).await;
-    assert_eq!(
-        provisioning
-            .activate_signing_key(
-                created_project.id,
-                signing_key.id,
-                signing_key.ring_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::PublicationPending)
-    );
-    secondary_readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("every required Auth process should observe the revision");
-    tokio::time::sleep(Duration::from_millis(15)).await;
     let active_key = provisioning
         .activate_signing_key(
             created_project.id,
@@ -1191,13 +964,17 @@ async fn verify_application_and_publication_journeys(
             Uuid::new_v4(),
         )
         .await
-        .expect("activation should succeed after the propagation interval");
+        .expect("signing-key activation is a local lifecycle transition");
     assert_eq!(active_key.state, "active");
-
-    unexpected_readiness
+    let published_jwks = readiness
         .project_jwks(&created_project.public_id)
         .await
-        .expect("an additional live Runtime should lease its loaded revision");
+        .expect("Runtime should publish the active signing key");
+    assert_eq!(published_jwks.keys.len(), 1);
+    let mut database_clock = PgConnection::connect(&control_url)
+        .await
+        .expect("database clock connection should open");
+
     let policy_before_reduction = provisioning
         .get_project_policy(created_project.id)
         .await
@@ -1232,45 +1009,8 @@ async fn verify_application_and_publication_journeys(
     let rotation_jwks = readiness
         .project_jwks(&created_project.public_id)
         .await
-        .expect("primary Runtime should observe the rotation revision");
-    secondary_readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("secondary Runtime should observe the rotation revision");
+        .expect("Runtime should publish both keys during verification overlap");
     assert_eq!(rotation_jwks.keys.len(), 2);
-    tokio::time::sleep(Duration::from_millis(15)).await;
-    assert_eq!(
-        provisioning
-            .activate_signing_key(
-                created_project.id,
-                rotating_key.id,
-                rotating_key.ring_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::PublicationPending),
-        "an unexpected live Runtime with a stale revision must block activation"
-    );
-    let unexpected_lease = runtime_publication_lease::Entity::find()
-        .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
-        .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-unexpected-process"))
-        .one(control)
-        .await
-        .expect("unexpected Runtime lease should be queryable")
-        .expect("unexpected Runtime lease should exist");
-    let mut unexpected_lease_active = unexpected_lease.into_active_model();
-    let database_now: time::OffsetDateTime = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut incarnation_blocker)
-        .await
-        .expect("database time should be queryable for explicit lease expiry");
-    let expired_at = database_now - time::Duration::seconds(1);
-    unexpected_lease_active.first_observed_at = Set(expired_at - time::Duration::seconds(2));
-    unexpected_lease_active.last_observed_at = Set(expired_at - time::Duration::seconds(1));
-    unexpected_lease_active.expires_at = Set(expired_at);
-    unexpected_lease_active
-        .update(control)
-        .await
-        .expect("drained Runtime lease should expire");
     let (left_activation, right_activation) = tokio::join!(
         provisioning.activate_signing_key(
             created_project.id,
@@ -1338,7 +1078,7 @@ async fn verify_application_and_publication_journeys(
         .expect("retiring key should exist");
     let mut retiring_active = retiring_model.into_active_model();
     let database_now: time::OffsetDateTime = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut incarnation_blocker)
+        .fetch_one(&mut database_clock)
         .await
         .expect("database time should be queryable for the retention cutoff");
     let elapsed_cutoff = database_now - time::Duration::seconds(1);
@@ -1407,23 +1147,55 @@ async fn verify_application_and_publication_journeys(
         .await
         .expect("provider operation should be queryable")
         .expect("provider operation should be durable");
-    let mut operation_active = operation.into_active_model();
-    operation_active.state = Set("stored".to_owned());
-    operation_active.completed_at = Set(None);
-    operation_active
-        .update(control)
+    // Reconstruct the exact crash checkpoint before the provider finalization transaction. The
+    // status transition trigger deliberately rejects moving an active generation backward, so the
+    // fixture bypasses triggers while restoring the complete, internally consistent checkpoint.
+    let mut recovery_connection = PgConnection::connect(config.postgres.migration_url.expose())
         .await
-        .expect("stored provider recovery fixture should persist");
-    let provider_model = provider_configuration::Entity::find_by_id(provider.id)
-        .one(control)
+        .expect("provider recovery fixture connection should open");
+    let mut recovery_fixture = recovery_connection
+        .begin()
         .await
-        .expect("provider should be queryable")
-        .expect("provider should exist");
-    let mut provider_active = provider_model.into_active_model();
-    provider_active.status = Set("provisioning".to_owned());
-    provider_active.revision = Set(1);
-    provider_active
-        .update(control)
+        .expect("provider recovery fixture transaction should begin");
+    sqlx::query("SET LOCAL session_replication_role=replica")
+        .execute(&mut *recovery_fixture)
+        .await
+        .expect("provider recovery fixture should disable transition triggers");
+    sqlx::query(
+        "UPDATE provider_secret_operations
+            SET state='stored',completed_at=NULL
+          WHERE id=$1",
+    )
+    .bind(operation.id)
+    .execute(&mut *recovery_fixture)
+    .await
+    .expect("provider recovery operation should rewind");
+    sqlx::query(
+        "UPDATE provider_secret_generations
+            SET status='pending',activated_at=NULL,retired_at=NULL,abandoned_at=NULL
+          WHERE project_id=$1 AND provider_id=$2 AND generation=1",
+    )
+    .bind(created_project.id)
+    .bind(provider.id)
+    .execute(&mut *recovery_fixture)
+    .await
+    .expect("provider recovery generation should rewind");
+    sqlx::query(
+        "UPDATE provider_configurations
+            SET status='provisioning',revision=1
+          WHERE project_id=$1 AND id=$2",
+    )
+    .bind(created_project.id)
+    .bind(provider.id)
+    .execute(&mut *recovery_fixture)
+    .await
+    .expect("provider recovery owner should rewind");
+    sqlx::query("SET LOCAL session_replication_role=origin")
+        .execute(&mut *recovery_fixture)
+        .await
+        .expect("provider recovery fixture should restore transition triggers");
+    recovery_fixture
+        .commit()
         .await
         .expect("stored provider recovery fixture should persist");
     let provider = restarted_provisioning
@@ -1482,7 +1254,7 @@ async fn verify_application_and_publication_journeys(
         .await
         .expect("a completed key operation should replay across later Project revisions");
     assert_eq!(replayed_signing_key.id, signing_key.id);
-    let replayed_provider = restarted_provisioning
+    let created_provider_replay = restarted_provisioning
         .create_provider(
             created_project.id,
             CreateProvider {
@@ -1501,7 +1273,42 @@ async fn verify_application_and_publication_journeys(
         )
         .await
         .expect("a completed provider operation should replay across later Project revisions");
-    assert_eq!(replayed_provider.id, provider.id);
+    assert_eq!(created_provider_replay.id, provider.id);
+    let rotated_provider = restarted_provisioning
+        .replace_provider_secret(
+            created_project.id,
+            provider.id,
+            ReplaceProviderSecret {
+                display_name: "Workforce SSO".to_owned(),
+                client_id: "owlauth-test-rotated".to_owned(),
+                client_secret: zeroize::Zeroizing::new("provider-secret-rotated".to_owned()),
+                idempotency_key: "provider-replacement-12345678".to_owned(),
+                expected_provider_revision: created_provider_replay.revision,
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("provider secret replacement should publish a new generation");
+    let replayed_after_replacement = restarted_provisioning
+        .create_provider(
+            created_project.id,
+            CreateProvider {
+                kind: crate::domain::ProviderKind::Oidc,
+                provider_key: "workforce".to_owned(),
+                display_name: "Workforce SSO".to_owned(),
+                issuer: "https://accounts.example/".to_owned(),
+                client_id: "owlauth-test".to_owned(),
+                client_secret: zeroize::Zeroizing::new("provider-secret".to_owned()),
+                managed_profile_enabled: false,
+                idempotency_key: "provider-operation-12345678".to_owned(),
+                expected_project_revision: created_project.metadata_revision,
+                egress_policy_revision: Some(1),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("completed creation should replay through its historical generation");
+    assert_eq!(replayed_after_replacement, rotated_provider);
 
     let assigned = provisioning
         .assign_provider(
@@ -1523,7 +1330,7 @@ async fn verify_application_and_publication_journeys(
     assert_eq!(public_config.providers.len(), 1);
     assert_eq!(public_config.providers[0].key, "workforce");
     assert_eq!(public_config.publishable_keys.len(), 1);
-    assert_eq!(assigned.revision, provider.revision + 1);
+    assert_eq!(assigned.revision, rotated_provider.revision + 1);
 
     let snapshot_mutation = control
         .begin()
@@ -1842,7 +1649,7 @@ async fn verify_application_and_publication_journeys(
         .get_project(created_project.id)
         .await
         .expect("current Project metadata revision should be queryable");
-    let unavailable_signer_key = provisioning
+    let _unavailable_signer_key = provisioning
         .provision_signing_key(
             created_project.id,
             "signing-missing-material-12345678".to_owned(),
@@ -1851,76 +1658,6 @@ async fn verify_application_and_publication_journeys(
         )
         .await
         .expect("a key should publish before signer validation");
-    readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("primary Runtime should observe the new revision");
-    secondary_readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("secondary Runtime should observe the new revision");
-    let primary_lease = runtime_publication_lease::Entity::find()
-        .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
-        .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-test-process"))
-        .one(control)
-        .await
-        .expect("primary lease should be queryable")
-        .expect("primary lease should exist");
-    let database_now: time::OffsetDateTime = sqlx::query_scalar("SELECT transaction_timestamp()")
-        .fetch_one(&mut incarnation_blocker)
-        .await
-        .expect("database time should be queryable for explicit lease expiry");
-    let mut primary_lease_active = primary_lease.into_active_model();
-    primary_lease_active.first_observed_at = Set(database_now - time::Duration::seconds(3));
-    primary_lease_active.last_observed_at = Set(database_now - time::Duration::seconds(2));
-    primary_lease_active.expires_at = Set(database_now - time::Duration::seconds(1));
-    let expired_primary_lease = primary_lease_active
-        .update(control)
-        .await
-        .expect("primary Runtime lease should expire explicitly");
-    assert!(expired_primary_lease.expires_at <= database_now);
-    assert_eq!(
-        provisioning
-            .activate_signing_key(
-                created_project.id,
-                unavailable_signer_key.id,
-                unavailable_signer_key.ring_revision,
-                Uuid::new_v4(),
-            )
-            .await,
-        Err(ApplicationError::PublicationPending)
-    );
-    readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("primary Runtime should renew its stale lease");
-    secondary_readiness
-        .project_jwks(&created_project.public_id)
-        .await
-        .expect("secondary Runtime should renew its stale lease");
-    let renewed_primary_lease = runtime_publication_lease::Entity::find()
-        .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
-        .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-test-process"))
-        .one(control)
-        .await
-        .expect("renewed primary lease should be queryable")
-        .expect("primary lease should still exist");
-    assert!(
-        renewed_primary_lease.first_observed_at > expired_primary_lease.first_observed_at,
-        "an expired same-revision lease starts a new propagation observation"
-    );
-    assert_eq!(
-        renewed_primary_lease.first_observed_at,
-        renewed_primary_lease.last_observed_at
-    );
-    tokio::time::sleep(Duration::from_millis(15)).await;
-    let lease_before_disable = runtime_publication_lease::Entity::find()
-        .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
-        .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-test-process"))
-        .one(control)
-        .await
-        .expect("pre-disable lease should be queryable")
-        .expect("pre-disable lease should exist");
     let disable_transaction = control
         .begin()
         .await
@@ -1955,17 +1692,6 @@ async fn verify_application_and_publication_journeys(
     assert_eq!(
         jwks_read.await.expect("JWKS race task should join"),
         Err(ApplicationError::NotFound)
-    );
-    let lease_after_disable = runtime_publication_lease::Entity::find()
-        .filter(runtime_publication_lease::Column::ProjectId.eq(created_project.id))
-        .filter(runtime_publication_lease::Column::ProcessId.eq("runtime-test-process"))
-        .one(control)
-        .await
-        .expect("post-disable lease should be queryable")
-        .expect("post-disable lease should remain as history");
-    assert_eq!(
-        lease_after_disable.last_observed_at, lease_before_disable.last_observed_at,
-        "a JWKS read that loses the disable race must not write a lease"
     );
 
     created_project.id
@@ -2010,7 +1736,6 @@ async fn verify_capacity_and_replay_limits(control_url: &str) {
     let capacity_adapter = PostgresProvisioningAdapter::new(
         capacity_database.clone(),
         url::Url::parse("https://identity.example/runtime/").unwrap(),
-        Vec::new(),
         Duration::from_millis(10),
         Duration::from_secs(1),
     )
@@ -2687,39 +2412,7 @@ async fn verify_server_key_and_listener_journeys(
     pools: &DatabasePools,
     admin_url: &str,
 ) {
-    const FIRST_INCARNATION: Uuid = Uuid::from_u128(0xc11e_0001);
-    const SECOND_INCARNATION: Uuid = Uuid::from_u128(0xc11e_0002);
     let client = pools.server.as_ref().expect("Server pool should exist");
-    client
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO auth_process_incarnations(process_id,process_incarnation,started_at)
-             VALUES($1,$2,transaction_timestamp())
-             ON CONFLICT(process_id) DO UPDATE SET
-               process_incarnation=EXCLUDED.process_incarnation,
-               started_at=EXCLUDED.started_at",
-            [
-                config.auth_process_id.clone().into(),
-                FIRST_INCARNATION.into(),
-            ],
-        ))
-        .await
-        .expect("first Auth incarnation should be claimed before Server readiness");
-    let readiness_adapter = Arc::new(PostgresServerDigestReadinessAdapter::new(client.clone()));
-    let short_readiness = ServerDigestReadinessService::new(
-        readiness_adapter.clone(),
-        config.auth_process_id.clone(),
-        FIRST_INCARNATION,
-        [1],
-        config.required_auth_process_ids.clone(),
-        Duration::from_millis(50),
-    )
-    .expect("short Server readiness should compose");
-    short_readiness
-        .claim()
-        .await
-        .expect("first Auth incarnation should claim Server readiness");
-
     let ring = SoftwareServerKeyRing::new(
         config
             .instance_id
@@ -2731,106 +2424,14 @@ async fn verify_server_key_and_listener_journeys(
     )
     .expect("test Server key ring should compose");
     let lifecycle = ServerKeyLifecycleService::new(
-        Arc::new(
-            PostgresServerKeyRepository::new(
-                pools.control.as_ref().expect("Control pool").clone(),
-                config.required_auth_process_ids.clone(),
-            )
-            .expect("Server key repository should compose"),
-        ),
+        Arc::new(PostgresServerKeyRepository::new(
+            pools.control.as_ref().expect("Control pool").clone(),
+        )),
         Arc::new(ring.issuer()),
         Arc::new(Sha256RequestDigester),
         Arc::new(SystemClock),
     );
 
-    // Hold the exact incarnation parent while create waits. The readiness lease expires during
-    // that wait, so clock_timestamp() must reject it after the lock is released rather than using
-    // the transaction's stale start time.
-    let mut blocker = PgConnection::connect(admin_url)
-        .await
-        .expect("Server readiness blocker should connect");
-    sqlx::query("BEGIN")
-        .execute(&mut blocker)
-        .await
-        .expect("Server readiness blocker should begin");
-    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut blocker)
-        .await
-        .expect("Server readiness blocker pid");
-    sqlx::query(
-        "SELECT process_id FROM auth_process_incarnations
-          WHERE process_id=$1 FOR UPDATE",
-    )
-    .bind(&config.auth_process_id)
-    .fetch_one(&mut blocker)
-    .await
-    .expect("Auth incarnation parent should lock");
-    let lifecycle_for_expiry = lifecycle.clone();
-    let project_id = project.id;
-    let mut expired_create = tokio::spawn(async move {
-        lifecycle_for_expiry
-            .create_project_server_key(CreateProjectServerKey {
-                project_id,
-                label: "expires while waiting".to_owned(),
-                idempotency_key: "server-key-expired-wait-12345678".to_owned(),
-                correlation_id: Uuid::new_v4(),
-            })
-            .await
-    });
-    let mut observer = PgConnection::connect(admin_url)
-        .await
-        .expect("Client lock observer should connect");
-    wait_for_sqlx_backend_blocked_by(&mut observer, blocker_pid, "Server key create").await;
-    sqlx::query("SELECT pg_sleep(0.075)")
-        .execute(&mut observer)
-        .await
-        .expect("database wall clock should advance beyond the Server readiness lease");
-    let lease_expired: bool = sqlx::query_scalar(
-        "SELECT lease_expires_at <= clock_timestamp()
-           FROM server_key_digest_readiness WHERE process_id=$1",
-    )
-    .bind(&config.auth_process_id)
-    .fetch_one(&mut observer)
-    .await
-    .expect("Server readiness lease expiry should be observable");
-    assert!(
-        lease_expired,
-        "Server readiness fixture lease must be expired"
-    );
-    sqlx::query("COMMIT")
-        .execute(&mut blocker)
-        .await
-        .expect("Server readiness blocker should commit");
-    assert_eq!(
-        timeout(Duration::from_secs(2), &mut expired_create)
-            .await
-            .expect("expired server-key create should complete")
-            .expect("expired server-key create task should not panic")
-            .expect_err("expired verifier evidence must fail closed"),
-        ApplicationError::ServerVerifierUnavailable
-    );
-    blocker
-        .close()
-        .await
-        .expect("Server readiness blocker should close");
-    observer
-        .close()
-        .await
-        .expect("Server readiness observer should close");
-
-    let first_readiness = ServerDigestReadinessService::new(
-        readiness_adapter.clone(),
-        config.auth_process_id.clone(),
-        FIRST_INCARNATION,
-        [1],
-        config.required_auth_process_ids.clone(),
-        Duration::from_secs(5),
-    )
-    .expect("first Server readiness should compose");
-    first_readiness
-        .claim()
-        .await
-        .expect("first Server readiness should recover");
     let first_created = lifecycle
         .create_project_server_key(CreateProjectServerKey {
             project_id: project.id,
@@ -2896,103 +2497,21 @@ async fn verify_server_key_and_listener_journeys(
         primary_key
     );
 
-    client
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE auth_process_incarnations
-                SET process_incarnation=$2,started_at=transaction_timestamp()
-              WHERE process_id=$1",
-            [
-                config.auth_process_id.clone().into(),
-                SECOND_INCARNATION.into(),
-            ],
-        ))
-        .await
-        .expect("replacement Auth incarnation should fence its predecessor");
-    assert_eq!(
-        first_readiness
-            .claim()
-            .await
-            .expect_err("delayed predecessor readiness must not reclaim the Auth process ID"),
-        ApplicationError::Disabled
-    );
-    let current_incarnation = client
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT process_incarnation FROM auth_process_incarnations WHERE process_id=$1",
-            [config.auth_process_id.clone().into()],
-        ))
-        .await
-        .expect("current Auth incarnation query should complete")
-        .expect("current Auth incarnation should exist")
-        .try_get::<Uuid>("", "process_incarnation")
-        .expect("current Auth incarnation should be a UUID");
-    assert_eq!(current_incarnation, SECOND_INCARNATION);
-
-    let second_readiness = ServerDigestReadinessService::new(
-        readiness_adapter,
-        config.auth_process_id.clone(),
-        SECOND_INCARNATION,
-        [1],
-        config.required_auth_process_ids.clone(),
-        Duration::from_secs(5),
-    )
-    .expect("replacement Server readiness should compose");
-    let lifecycle_for_interleave = lifecycle.clone();
-    let replacement_create = async move {
-        lifecycle_for_interleave
-            .create_project_server_key(CreateProjectServerKey {
-                project_id: project.id,
-                label: "replacement interleave".to_owned(),
-                idempotency_key: "server-key-replacement-12345678".to_owned(),
-                correlation_id: Uuid::new_v4(),
-            })
-            .await
-    };
-    let (replacement_claim, replacement_key) = timeout(Duration::from_secs(2), async {
-        tokio::join!(second_readiness.claim(), replacement_create)
-    })
-    .await
-    .expect("claim/create interleaving must not deadlock");
-    replacement_claim.expect("replacement incarnation should claim");
-    match replacement_key {
-        Ok(CreateProjectServerKeyResult::Created { metadata, .. }) => {
-            lifecycle
-                .acknowledge_project_server_key_delivery(AcknowledgeProjectServerKeyDelivery {
-                    project_id: project.id,
-                    key_id: metadata.id,
-                    expected_revision: metadata.revision,
-                    idempotency_key: "server-key-replacement-acknowledge-12345678".to_owned(),
-                    correlation_id: Uuid::new_v4(),
-                })
-                .await
-                .expect(
-                    "an interleaved successful create must be acknowledged before another create",
-                );
-        }
-        Err(ApplicationError::ServerVerifierUnavailable) => {}
-        other => panic!("unexpected interleaved server-key create result: {other:?}"),
-    }
     let post_replacement_key = match lifecycle
         .create_project_server_key(CreateProjectServerKey {
             project_id: project.id,
-            label: "post-replacement verifier".to_owned(),
-            idempotency_key: "server-key-post-replacement-12345678".to_owned(),
+            label: "delivery gate".to_owned(),
+            idempotency_key: "server-key-delivery-gate-12345678".to_owned(),
             correlation_id: Uuid::new_v4(),
         })
         .await
-        .expect("create must succeed against the replacement incarnation")
+        .expect("a delivered credential should permit a new Server key")
     {
         CreateProjectServerKeyResult::Created { metadata, .. } => metadata,
         CreateProjectServerKeyResult::ReplayWithoutSecret { .. } => {
-            panic!("fresh post-replacement create cannot replay")
+            panic!("fresh delivery-gate create cannot replay")
         }
     };
-    assert_eq!(
-        first_readiness.renew().await,
-        Err(ApplicationError::Disabled),
-        "a predecessor incarnation cannot renew after replacement"
-    );
 
     // Seed one materialized directory graph through the same constraints used by Runtime. This
     // gives the real Server API surface positive user/projection reads while email/token misses prove
@@ -3004,14 +2523,6 @@ async fn verify_server_key_and_listener_journeys(
     let mut graph = PgConnection::connect(admin_url)
         .await
         .expect("Client directory fixture should connect");
-    sqlx::query(
-        "INSERT INTO email_identity_alias_authority(
-             singleton,revision,write_version,target_version,accepted_versions)
-         VALUES(TRUE,1,1,1,'[1]'::jsonb) ON CONFLICT(singleton) DO NOTHING",
-    )
-    .execute(&mut graph)
-    .await
-    .expect("Client email alias authority should initialize");
     sqlx::query(
         "INSERT INTO applications(
              id,project_id,public_id,display_name,application_type,status,revision,
@@ -3177,7 +2688,12 @@ async fn verify_server_key_and_listener_journeys(
 
     let providers = crate::composition::bundled_software_providers(config)
         .expect("validated bundled provider configuration");
-    let capabilities = build_http_capabilities(config, Some(pools), SECOND_INCARNATION, &providers);
+    let capabilities = build_http_capabilities(
+        config,
+        Some(pools),
+        Uuid::from_u128(0xc11e_0002),
+        &providers,
+    );
     let mut routers = build_routers_with_capabilities(config, capabilities);
     routers.mark_ready();
     let runtime = routers.runtime.take().expect("Runtime router");
@@ -3916,21 +3432,6 @@ async fn verify_server_key_and_listener_journeys(
     assert!(final_cursor.is_none());
     let first_ids = first_page.iter().map(|key| key.id).collect::<BTreeSet<_>>();
     assert!(second_page.iter().all(|key| !first_ids.contains(&key.id)));
-
-    // This ordered container continues with Runtime operations created for the primary Auth
-    // incarnation. Restore that shared process identity after proving Server API replacement;
-    // the predecessor Server readiness lease remains stale and cannot authorize new work.
-    client
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Postgres,
-            "UPDATE auth_process_incarnations SET process_incarnation=$1 WHERE process_id=$2",
-            vec![
-                Uuid::from_u128(1).into(),
-                config.auth_process_id.clone().into(),
-            ],
-        ))
-        .await
-        .expect("restore the primary Auth incarnation for the remaining ordered journeys");
 }
 
 #[allow(
@@ -4041,10 +3542,6 @@ async fn postgres_capability_journeys_are_real() {
         PostgresProvisioningAdapter::new(
             control.clone(),
             url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec![
-                "runtime-test-process".to_owned(),
-                "runtime-secondary-process".to_owned(),
-            ],
             Duration::from_millis(10),
             Duration::from_secs(1),
         )
@@ -4071,50 +3568,7 @@ async fn postgres_capability_journeys_are_real() {
             )]),
         ),
     );
-    runtime
-        .execute_raw(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Postgres,
-            "INSERT INTO auth_process_incarnations (process_id,process_incarnation,started_at)
-             VALUES ('runtime-test-process','00000000-0000-0000-0000-000000000001',transaction_timestamp()),
-                    ('runtime-secondary-process','00000000-0000-0000-0000-000000000002',transaction_timestamp()),
-                    ('runtime-unexpected-process','00000000-0000-0000-0000-000000000003',transaction_timestamp())"
-                .to_owned(),
-        ))
-        .await
-        .expect("seed exact Runtime incarnations");
-    // Keep required Runtime leases alive across this test's lock-order scenarios. The
-    // unexpected Runtime's stale lease is exercised through explicit expiry below.
-    let required_runtime_lease_ttl = Duration::from_secs(10);
-    let readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(
-        runtime.clone(),
-        "runtime-test-process".to_owned(),
-        Uuid::from_u128(1),
-        vec![
-            "runtime-test-process".to_owned(),
-            "runtime-secondary-process".to_owned(),
-        ],
-        required_runtime_lease_ttl,
-    )));
-    let secondary_readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(
-        runtime.clone(),
-        "runtime-secondary-process".to_owned(),
-        Uuid::from_u128(2),
-        vec![
-            "runtime-test-process".to_owned(),
-            "runtime-secondary-process".to_owned(),
-        ],
-        required_runtime_lease_ttl,
-    )));
-    let unexpected_readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(
-        runtime.clone(),
-        "runtime-unexpected-process".to_owned(),
-        Uuid::from_u128(3),
-        vec![
-            "runtime-test-process".to_owned(),
-            "runtime-secondary-process".to_owned(),
-        ],
-        Duration::from_mins(1),
-    )));
+    let readiness = ReadinessService::new(Arc::new(PostgresReadinessAdapter::new(runtime.clone())));
 
     let created_project = provisioning
         .create_project(
@@ -4214,7 +3668,6 @@ async fn postgres_capability_journeys_are_real() {
         PostgresProvisioningAdapter::new(
             control.clone(),
             url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec!["runtime-test-process".to_owned()],
             Duration::from_millis(10),
             Duration::from_secs(1),
         )
@@ -4667,7 +4120,6 @@ async fn postgres_capability_journeys_are_real() {
         PostgresProvisioningAdapter::new(
             control.clone(),
             url::Url::parse("https://identity.example/runtime/").unwrap(),
-            vec!["runtime-test-process".to_owned()],
             Duration::from_millis(10),
             Duration::from_secs(1),
         )
@@ -4733,7 +4185,6 @@ async fn postgres_capability_journeys_are_real() {
     let rotated_adapter = PostgresProvisioningAdapter::new(
         control.clone(),
         url::Url::parse("https://identity.example/runtime/").unwrap(),
-        vec!["runtime-test-process".to_owned()],
         Duration::from_millis(10),
         Duration::from_secs(1),
     )
@@ -4860,7 +4311,12 @@ async fn postgres_capability_journeys_are_real() {
         ambiguous_state.lock().unwrap().object.is_some(),
         "stored remote object should exist"
     );
-    ambiguous_state.lock().unwrap().object = Some((vec![99; 48], vec![99; 32]));
+    {
+        let mut state = ambiguous_state.lock().unwrap();
+        let object = state.object.as_mut().expect("stored remote object");
+        object.0[0] ^= u8::MAX;
+        object.1[0] ^= u8::MAX;
+    }
     assert_eq!(
         ambiguous_service
             .provision_signing_key(
@@ -4902,7 +4358,6 @@ async fn postgres_capability_journeys_are_real() {
     let failed_adapter = PostgresProvisioningAdapter::new(
         control.clone(),
         url::Url::parse("https://identity.example/runtime/").unwrap(),
-        vec!["runtime-test-process".to_owned()],
         Duration::from_millis(10),
         Duration::from_secs(1),
     )
@@ -5026,7 +4481,6 @@ async fn postgres_capability_journeys_are_real() {
     let cleanup_adapter = PostgresProvisioningAdapter::new(
         control.clone(),
         url::Url::parse("https://identity.example/runtime/").unwrap(),
-        vec!["runtime-test-process".to_owned()],
         Duration::from_millis(10),
         Duration::from_secs(1),
     )
@@ -5681,9 +5135,6 @@ async fn postgres_capability_journeys_are_real() {
         &config,
         &pools,
         readiness.clone(),
-        secondary_readiness.clone(),
-        unexpected_readiness.clone(),
-        &url,
         control_url.clone(),
     ))
     .await;

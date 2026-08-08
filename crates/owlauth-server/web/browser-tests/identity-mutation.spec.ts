@@ -18,6 +18,7 @@ const mailCaptureUrl = required("OWLAUTH_E2E_MAIL_CAPTURE_URL");
 const postgresContainer = required("OWLAUTH_E2E_POSTGRES_CONTAINER");
 const authLog = required("OWLAUTH_E2E_AUTH_LOG");
 const controlLog = required("OWLAUTH_E2E_CONTROL_LOG");
+const RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS = 31_000;
 
 interface Project {
   id: string;
@@ -149,6 +150,8 @@ test("public identity Link, Email Link, Unlink, and Merge preserve exact authori
       },
     );
     expect(providerLink.hosted_target).toBeTruthy();
+    // Login and identity proof share one durable recipient side-effect boundary.
+    await page.waitForTimeout(RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS);
     await completeEmailSlot(
       page,
       providerLink.hosted_target ?? "",
@@ -268,6 +271,7 @@ test("public identity Link, Email Link, Unlink, and Merge preserve exact authori
       proof_authority: emailAuthority(authority.application),
       primary_source_disposition: { disposition: "preserve" },
     });
+    await page.waitForTimeout(RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS);
     await completeEmailSlot(page, unlink.hosted_target ?? "", "identity_owner", linkedEmail);
     await markReady(page);
     const readyUnlink = await intent(page.request, authority.project.id, unlink.id);
@@ -300,6 +304,7 @@ test("public identity Link, Email Link, Unlink, and Merge preserve exact authori
         candidate_proof_authority: providerAuthority(authority),
       },
     );
+    await page.waitForTimeout(RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS);
     await completeEmailSlot(page, collision.hosted_target ?? "", "destination_owner", loserEmail);
     await page.getByRole("button", { name: "Start provider proof" }).click();
     await expect(page).toHaveURL(/auth\/identity-mutations\//u, { timeout: 30_000 });
@@ -347,6 +352,7 @@ test("public identity Link, Email Link, Unlink, and Merge preserve exact authori
 
     // Freeze one ordinary loser handoff before merge. It is public, PKCE-bound authority but must
     // lose after the loser tombstone commits, just like stale refresh authority.
+    await page.waitForTimeout(RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS);
     const loserHandoff = await emailLoginHandoff(
       page,
       authority,
@@ -375,6 +381,7 @@ test("public identity Link, Email Link, Unlink, and Merge preserve exact authori
     const callback = await completeProviderSlot(page, "winner_owner");
     const callbackReplay = await page.request.get(callback, { maxRedirects: 0 });
     expect([303, 400, 409]).toContain(callbackReplay.status());
+    await page.waitForTimeout(RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS);
     await completeEmailSlot(page, page.url(), "loser_owner", loserEmail);
     await markReady(page);
     const readyMerge = await intent(page.request, authority.project.id, merge.id);
@@ -455,6 +462,7 @@ test("identity Runtime and Console flows are keyboard and accessibility safe", a
     });
     await page.goto(mutation.hosted_target ?? "");
     await auditIdentitySurface(page, testInfo, "runtime-identity-proof");
+    await page.waitForTimeout(RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS);
     await page.keyboard.press("Tab");
     await expect(page.getByRole("button", { name: "Start email proof" })).toBeFocused();
     await page.getByRole("button", { name: "Start email proof" }).press("Enter");
@@ -721,7 +729,7 @@ async function completeEmailMagicSlot(
 
   // Identity-mutation resend has the same real 30-second minimum as ordinary login. Waiting for
   // the actual fence (rather than changing a clock) proves newest-generation authority.
-  await page.waitForTimeout(31_000);
+  await page.waitForTimeout(RECIPIENT_SUPPRESSION_WINDOW_SETTLE_MS);
   await item.getByLabel("Email address for this proof").fill(email);
   await item.getByRole("button", { name: "Send a newer email" }).click();
   const messages = await waitForMail(page.request, 2);

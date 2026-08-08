@@ -129,7 +129,6 @@ impl ProvisioningService {
                     | ApplicationError::InvalidTransition
                     | ApplicationError::NotFound
                     | ApplicationError::OperationInProgress
-                    | ApplicationError::PublicationPending
                     | ApplicationError::RevisionConflict,
                 ) => {}
                 Err(error) => {

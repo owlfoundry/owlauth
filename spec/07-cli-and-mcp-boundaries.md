@@ -8,15 +8,15 @@ OwlAuth does not create or store management users, principals, roles, permission
 
 The operator API key is unrelated to Runtime credentials. Publishable keys, Project access tokens, refresh tokens, browser sessions, handoff tickets, provider credentials, and public Project/Application IDs cannot invoke Control. Conversely, the operator API key is categorically invalid on Runtime routes.
 
-## Control admission
+## Control authentication
 
-A Control HTTP request is admitted only when it contains exactly:
+A Control HTTP request is authenticated only when it contains exactly:
 
 ```http
 Authorization: Bearer <operator-api-key>
 ```
 
-The adapter strictly parses the header, rejects duplicate or conflicting credentials, and compares the presented key with process configuration in constant time. Authentication completes before target lookup or command execution. Optional TLS, mTLS, private networking, proxy policy, and rate limiting are defense in depth; none is an alternate Control identity.
+The adapter strictly parses the header, rejects duplicate or conflicting credentials, and compares the presented key with process configuration in constant time. Authentication completes before target lookup or command execution. Optional TLS, mTLS, private networking, proxy policy, and external ingress traffic controls are defense in depth; none is an alternate Control identity.
 
 After authentication, Project qualification, expected revisions, command preconditions, state transitions, request bounds, and idempotency still apply. Full deployment authority does not permit a caller to bypass domain invariants or combine child resources from different Projects.
 
@@ -113,7 +113,7 @@ The client bounds parsing and rejects redirects, cross-origin URLs, duplicate fi
 
 The CLI uses `OWLAUTH_CONTROL_API_KEY` by default. Raw keys are absent from profile files and ordinary arguments, URLs, process titles/history, output, and logs.
 
-The CLI never imports `owlauth-server`, opens PostgreSQL/Redis, runs repositories or migrations, loads Project signing keys, hosts Runtime/Control, or launches a local MCP process.
+The CLI never imports `owlauth-server`, opens PostgreSQL, runs repositories or migrations, loads Project signing keys, hosts Runtime/Control, or launches a local MCP process.
 
 ## CLI behavior for a self-hosted endpoint
 
@@ -155,7 +155,7 @@ The MCP endpoint:
 - requires HTTPS except explicit loopback development and remains on the Control network/exposure boundary;
 - validates the configured external authority/Host and validates `Origin` when present to prevent DNS-rebinding and browser cross-origin abuse;
 - denies broad browser CORS by default;
-- bounds protocol messages, batches, request/response bodies, streams, sessions, deadlines, concurrency, and rate;
+- bounds protocol messages, batches, request/response bodies, streams, sessions, deadlines, and concurrency;
 - rejects unsupported protocol versions/methods without generic HTTP fallback;
 - never exposes a stdio transport or causes the CLI/plugin to launch a child MCP process.
 
@@ -163,7 +163,7 @@ POST, optional GET streaming, DELETE, and session-header behavior follow the neg
 
 ## MCP tool constraints
 
-Every tool maps to one bounded application command/query and defines a closed input schema, explicit Project target where applicable, expected revisions, deterministic side effects, idempotency behavior, timeout/rate policy, safe output, audit action, and server-owned impact class that no request parameter can override. Tools are hand-designed and are not generated from OpenAPI or CLI commands.
+Every tool maps to one bounded application command/query and defines a closed input schema, explicit Project target where applicable, expected revisions, deterministic side effects, idempotency behavior, timeout/resource policy, safe output, audit action, and server-owned impact class that no request parameter can override. Tools are hand-designed and are not generated from OpenAPI or CLI commands.
 
 V1 exposes no mutating MCP tool. Any future mutation is unclassified until a reviewed specification defines its server-enforced impact class, authorization, idempotency, audit, and—when high impact—preview/commit confirmation path. Tool annotations or `tools/list` metadata never replace server-side enforcement.
 
@@ -177,7 +177,7 @@ The initial self-hosted catalog contains exactly nine read-only tools: `owlauth_
 
 - CLI workflows are not mechanically generated OpenAPI paths.
 - MCP protocol self-description does not make tools generic OpenAPI wrappers.
-- Control HTTP, server CLI, and self-hosted MCP share application commands while retaining adapter-specific parsing, admission, confirmation, and output mapping.
+- Control HTTP, server CLI, and self-hosted MCP share application commands while retaining adapter-specific parsing, authentication, confirmation, and output mapping.
 - Disabling CLI use or the MCP endpoint has no Runtime credential/contract effect.
 - Agent plugins may document remote endpoint setup but MUST NOT request, relay, persist, display, bundle, launch, supervise, or impersonate an MCP server or operator key in model context.
 

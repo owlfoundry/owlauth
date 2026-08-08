@@ -50,9 +50,9 @@ flowchart LR
     Domain --> PG[(PostgreSQL authority)]
 ```
 
-Auth has one bind address, external base URL, transport budget, process identity, health endpoint, and aggregate readiness endpoint. Behind that listener, Runtime and Server API remain distinct routers with separate state, credentials, response policy, CORS policy, admission services, metrics, PostgreSQL pools, and readiness inputs. Control retains its own listener and every operator boundary.
+Auth has one bind address, external base URL, transport budget, health endpoint, and instance-local readiness endpoint. Behind that listener, Runtime and Server API remain distinct routers with separate state, credentials, response policy, CORS policy, metrics, PostgreSQL pools, and readiness inputs. Control retains its own listener and every operator boundary.
 
-Server API serves JSON only. It serves no HTML, cookies, redirects, service worker, permissive CORS, or credentialed browser response. Server API CORS is deny-by-default with no v1 allowlist because Project server keys must never enter browser code. Sharing the Auth transport does not make Server API browser-callable and does not permit routing Server API requests through Runtime middleware or state.
+Server API serves JSON only. Every operation declares the closed `408 request_timeout` error emitted when the shared Auth listener deadline expires while waiting for local in-flight capacity or executing the handler; it is a resource-budget outcome and not traffic admission. It serves no HTML, cookies, redirects, service worker, permissive CORS, or credentialed browser response. Server API CORS is deny-by-default with no v1 allowlist because Project server keys must never enter browser code. Sharing the Auth transport does not make Server API browser-callable and does not permit routing Server API requests through Runtime middleware or state.
 
 Composition modes are exactly `all`, `auth`, and `control`. `auth` always composes both Runtime and Server API surfaces; they cannot be deployed as separate processes. Control creates/revokes Server credentials; Server API verifies and uses them; Runtime receives neither capability.
 
@@ -87,9 +87,9 @@ The full credential is confidential, redacted in `Debug`/`Display`, bounded, non
 
 ### Digest and verification
 
-OwlAuth computes a purpose- and owner-bound HMAC-SHA-256 digest over a versioned length-delimited context containing the credential version, Project UUID, key UUID, public key ID, and 32 raw secret bytes. A dedicated versioned `OWLAUTH_SERVER_KEY_DIGEST_KEY` key ring is available only to Control creation and Server verification composition. Every digest version referenced by an active key is retained in backup and every Auth process. Auth readiness fails when the authoritative active-key inventory references an unavailable verifier version.
+OwlAuth computes a purpose- and owner-bound HMAC-SHA-256 digest over a versioned length-delimited context containing the credential version, Project UUID, key UUID, public key ID, and 32 raw secret bytes. A dedicated versioned `OWLAUTH_SERVER_KEY_DIGEST_KEY` key ring is available only to Control creation and Server verification composition. Creation uses the process-local active version; every key persists that version, and verification selects it from the local active/retained ring. Every version referenced by an active key is retained in backup and every Auth process that serves Server API traffic. A missing referenced version fails affected local readiness and verification closed without trying another version.
 
-Each Auth process has one stable configured process ID and startup incarnation shared by its Runtime and Server API surfaces. Its Server verifier publishes a bounded PostgreSQL readiness lease listing the exact digest versions it can verify. Control has the same configured required-Auth roster. A create transaction may use its configured active digest version only when every required process ID has one current-incarnation, unexpired observation containing that version; an empty/missing/stale/mismatched roster fails closed. Server renewals do not authorize requests and expiry affects readiness/new creation, not verification by an already loaded process. Rollout installs the new retained version on Server first and waits for the complete roster before enabling Control creation; rollback keeps both versions. Retirement requires an authoritative zero-active-reference inventory after old keys are explicitly revoked. Loss or compromise cannot be repaired by rehashing: the operator restores the exact uncompromised version or revokes and reissues every affected key.
+PostgreSQL stores no Auth replica roster, process incarnation, or per-replica digest-readiness observation. Rollout is externally coordinated: install the replacement as retained on every verifier, make it active on Control only after distribution is complete, keep both versions through rollback observation, revoke and reissue every active key that still references the old version, prove zero active references, and then retire it consistently from every process. Loss or compromise cannot be repaired by rehashing because OwlAuth never stores raw credentials; the operator restores the exact uncompromised version or revokes and reissues every affected key.
 
 Verification:
 
@@ -100,7 +100,7 @@ Verification:
 5. verifies that Project and key remain active in the same authoritative read;
 6. returns one private typed Server actor containing Project/key identity, never raw credential bytes.
 
-Unknown, malformed, revoked, wrong-Project, disabled-Project, wrong-version, and wrong-digest credentials return the same bounded `401` response and `WWW-Authenticate: Bearer` challenge. Admission control applies before and after key resolution using safe source and purpose-keyed credential dimensions. Redis may coordinate limits but cannot authenticate a key.
+Unknown, malformed, revoked, wrong-Project, disabled-Project, wrong-version, and wrong-digest credentials return the same bounded `401` response and `WWW-Authenticate: Bearer` challenge. Core performs no source- or credential-window traffic limiting before or after key resolution; a SaaS or operator-owned ingress may apply generic traffic controls, but those controls cannot authenticate a key.
 
 A successful request may advance `last_used_at` at most once per fifteen-minute bucket through a best-effort update guarded by `status = active` and an older stored bucket. Usage metadata is lifecycle-neutral: it does not advance the key revision, cannot make an expected-revision revoke conflict, and cannot update a row after revocation wins. It never authorizes, revokes, or delays the request and has no per-request audit cardinality.
 
@@ -173,13 +173,13 @@ Public Project JWKS remains on Runtime. Customer backends may validate short-liv
 
 ## Error, cache, and consistency rules
 
-Server uses a separate complete OpenAPI error vocabulary. Authentication failures are generic. An authenticated request may receive bounded `404`, conflict, rate-limit, or unavailable errors only for resources inside its own Project.
+Server uses a separate complete OpenAPI error vocabulary. Authentication failures are generic. An authenticated request may receive bounded `404`, conflict, or unavailable errors only for resources inside its own Project.
 
 User/projection responses use `private, no-store`; key lifecycle responses use Control's no-store policy. Server responses never vary authority from cookies or browser origin. Request and response bounds are explicit, and Server does not follow or return cross-origin redirects.
 
-Default authenticated Server limits are deliberately generous, deployment-configurable abuse guards rather than product quotas. They use resolved Project/key plus coarse source dimensions, allow ordinary backend bursts, and should not produce `429` during healthy expected SaaS traffic. Unknown/malformed credential attempts retain stricter source-based protection. OwlAuth does not add per-operation quota products or billing scopes.
+OwlAuth Core does not add Server API IP, route, Project, key, global, bot/risk, product-quota, or billing limits. A SaaS or operator-owned ingress may enforce those controls for customer backend traffic and owns any generic `429` contract it introduces. Core continues to enforce request shape, deadlines, connection/in-flight capacity, PostgreSQL pool bounds, and provider/worker concurrency as local resource-safety boundaries.
 
-Project disablement and key revocation affect the next authoritative request. Server-key authentication, user/email/projection reads, and token introspection consult PostgreSQL authority on every request and are never accepted from Redis or a process cache in v1. This keeps externally observable Server reads at the latest committed PostgreSQL state without inventing a directory-cache consistency protocol. Redis may still carry non-authoritative admission counters and post-commit invalidation hints for existing Runtime public caches; it never caches raw credentials, Authorization headers, email lookup bodies, introspection tokens, Server response bodies, or Server authentication decisions. Customer backends may cache minimized directory responses under their own product policy, but must not represent them as online revocation checks; Server introspection is the authoritative online token/session path.
+Project disablement and key revocation affect the next authoritative request. Server-key authentication, user/email/projection reads, and token introspection consult PostgreSQL authority on every request and are never accepted from a process response cache in v1. This keeps externally observable Server reads at the latest committed PostgreSQL state without inventing a directory-cache consistency protocol. Customer backends may cache minimized directory responses under their own product policy, but must not represent them as online revocation checks; Server introspection is the authoritative online token/session path.
 
 ## OpenAPI and implementation ownership
 
@@ -201,7 +201,7 @@ The capability is incomplete until tests prove:
 
 - canonical key generation, entropy, redaction, zeroization, purpose/Project/key binding, constant-time digest comparison, malformed input rejection, and digest-key version behavior;
 - one-time reveal, ambiguous replay without re-reveal, maximum active keys, overlap rotation, revisioned revoke, lifecycle-neutral last-used updates, disabled Project, and cross-Project denial;
-- PostgreSQL constraints, migrations, concurrent create/revoke/authentication, last-used coarsening, digest-version fleet readiness/rollout/rollback/retirement, recovery inventory, audit atomicity, and restart behavior;
+- PostgreSQL constraints, migrations, concurrent create/revoke/authentication, last-used coarsening, persisted digest-version selection, externally coordinated rollout/rollback/retirement, zero-reference recovery inventory, audit atomicity, and restart behavior;
 - listener/router/OpenAPI isolation and rejection of operator, publishable, end-user, refresh, wrong-Project, revoked, and malformed credentials;
 - bounded cursor pagination, exact email lookup, base user minimization, frozen materialized Application projection, and inactive introspection non-enumeration;
 - Console and CLI secret disposal, denial of browser persistence, real Chromium/Firefox page lifecycle behavior, and no Server credential support in Hosted/browser assets;

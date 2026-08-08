@@ -102,6 +102,62 @@ pub struct ProjectList {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ProjectOverviewSummary {
+    pub project_id: String,
+    pub applications: ProjectOverviewApplicationCounts,
+    pub providers: ProjectOverviewProviderCounts,
+    pub users: ProjectOverviewUserCounts,
+    pub project_server_keys: ProjectOverviewServerKeyCounts,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectOverviewApplicationCounts {
+    #[schema(minimum = 0)]
+    pub total: u64,
+    #[schema(minimum = 0)]
+    pub active: u64,
+    #[schema(minimum = 0)]
+    pub configured: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectOverviewProviderCounts {
+    #[schema(minimum = 0)]
+    pub total: u64,
+    #[schema(minimum = 0)]
+    pub active: u64,
+    #[schema(minimum = 0)]
+    pub active_assignments: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectOverviewUserCounts {
+    #[schema(minimum = 0)]
+    pub total: u64,
+    #[schema(minimum = 0)]
+    pub active: u64,
+    #[schema(minimum = 0)]
+    pub disabled: u64,
+    #[schema(minimum = 0)]
+    pub merged: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectOverviewServerKeyCounts {
+    #[schema(minimum = 0)]
+    pub total: u64,
+    #[schema(minimum = 0)]
+    pub active: u64,
+    #[schema(minimum = 0)]
+    pub revoked: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProjectRequest {
     #[schema(min_length = 1, max_length = 128)]
     pub display_name: String,
@@ -570,6 +626,8 @@ pub struct Provider {
     /// Whether this adapter can serve as an identity-mutation proof authority.
     pub identity_proof_supported: bool,
     pub managed_profile: ProviderManagedProfileCapability,
+    /// Whether a durable protected-secret replacement awaits reconciliation or abandonment.
+    pub secret_replacement_pending: bool,
     #[schema(max_items = 100)]
     pub assigned_application_ids: Vec<String>,
 }
@@ -702,11 +760,44 @@ pub struct CreateProviderRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct UpdateProviderRequest {
+    #[schema(min_length = 1, max_length = 128)]
+    pub display_name: String,
+    #[schema(min_length = 1, max_length = 512)]
+    pub client_id: String,
+    #[schema(minimum = 1)]
+    pub expected_provider_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceProviderSecretRequest {
+    #[schema(min_length = 1, max_length = 128)]
+    pub display_name: String,
+    #[schema(min_length = 1, max_length = 512)]
+    pub client_id: String,
+    #[schema(write_only, min_length = 1, max_length = 4096)]
+    pub client_secret: String,
+    #[schema(minimum = 1)]
+    pub expected_provider_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReconcileProviderRequest {
     #[schema(write_only, min_length = 1, max_length = 4096)]
     pub client_secret: String,
     #[schema(minimum = 1)]
     pub expected_project_revision: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileProviderSecretReplacementRequest {
+    #[schema(write_only, min_length = 1, max_length = 4096)]
+    pub client_secret: String,
+    #[schema(minimum = 1)]
+    pub expected_provider_revision: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -1548,6 +1639,14 @@ control_path!(
     params(("project_id" = String, Path))
 );
 control_path!(
+    get_project_overview,
+    get,
+    "/v1/projects/{project_id}/overview",
+    ProjectOverviewSummary,
+    "Project resource overview",
+    params(("project_id" = String, Path))
+);
+control_path!(
     get_project_policy,
     get,
     "/v1/projects/{project_id}/policy",
@@ -1964,6 +2063,55 @@ control_path!(
     params(
         ("project_id" = String, Path),
         ("Idempotency-Key" = String, Header)
+    )
+);
+control_path!(
+    update_provider,
+    patch,
+    "/v1/projects/{project_id}/providers/{provider_id}",
+    Provider,
+    "Updated provider metadata",
+    body = UpdateProviderRequest,
+    params(
+        ("project_id" = String, Path),
+        ("provider_id" = String, Path)
+    )
+);
+control_path!(
+    replace_provider_secret,
+    post,
+    "/v1/projects/{project_id}/providers/{provider_id}/replace-secret",
+    Provider,
+    "Replaced provider protected client secret",
+    body = ReplaceProviderSecretRequest,
+    params(
+        ("project_id" = String, Path),
+        ("provider_id" = String, Path),
+        ("Idempotency-Key" = String, Header)
+    )
+);
+control_path!(
+    reconcile_provider_secret_replacement,
+    post,
+    "/v1/projects/{project_id}/providers/{provider_id}/replace-secret/reconcile",
+    Provider,
+    "Reconciled a pending provider protected-secret replacement",
+    body = ReconcileProviderSecretReplacementRequest,
+    params(
+        ("project_id" = String, Path),
+        ("provider_id" = String, Path)
+    )
+);
+control_path!(
+    abandon_provider_secret_replacement,
+    post,
+    "/v1/projects/{project_id}/providers/{provider_id}/replace-secret/abandon",
+    Provider,
+    "Abandoned a pending provider protected-secret replacement",
+    body = ProviderRevisionRequest,
+    params(
+        ("project_id" = String, Path),
+        ("provider_id" = String, Path)
     )
 );
 control_path!(

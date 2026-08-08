@@ -44,7 +44,7 @@ They do not run every CI runtime matrix or the long real PostgreSQL/provider/bro
 
 ## Run the development topology
 
-Copy the current local template and start Auth and Control with disposable PostgreSQL and Redis:
+Copy the current local template and start Auth and Control with disposable PostgreSQL:
 
 ```bash
 cp .env.example .env
@@ -55,9 +55,9 @@ Run `make dev-check` for a non-mutating preflight. It reports stale `.env` templ
 or an unavailable Docker daemon before any service starts. `make dev` prints directly openable
 Auth Hosted UI, Auth readiness, and Control Console URLs once both listeners are ready. Use
 `make dev-status`, `make dev-logs`, and `make dev-down` to inspect or stop infrastructure;
-`make dev-reset` deletes all local PostgreSQL and Redis data.
+`make dev-reset` deletes all local PostgreSQL data.
 
-OwlAuth rejects unknown `OWLAUTH_*` variables and validates endpoint databases, listeners, key stores, Runtime protection, Server key-digest readiness, provider egress, admission, and Control credentials before binding. Auth and Control independently configure request timeout/body, in-flight requests, accepted connections, headers, and URI bounds; changing one endpoint does not resize the other. Runtime and Server API retain separate admission policies and PostgreSQL pools inside Auth. The old shared `OWLAUTH_REQUEST_TIMEOUT_MS` and `OWLAUTH_MAX_REQUEST_BYTES` names were removed during Beta and now fail as unknown variables. Set `OWLAUTH_AUTH_MAX_PROCESSES` to a conservative maximum Auth replica count rather than the current count. The complete HTTP budget variable table, Redis namespace/deadline settings, and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration-and-operations).
+OwlAuth rejects unknown `OWLAUTH_*` variables and validates endpoint databases, listeners, key stores, process-local active/retained protection inventory, provider egress, and Control credentials before binding. `/ready` describes only that process and does not prove another replica or fleet-wide key convergence. Auth and Control independently configure request timeout/body, in-flight requests, accepted connections, headers, and URI bounds; changing one endpoint does not resize the other. Runtime and Server API retain separate PostgreSQL pools inside Auth. The old shared `OWLAUTH_REQUEST_TIMEOUT_MS` and `OWLAUTH_MAX_REQUEST_BYTES` names were removed during Beta and now fail as unknown variables. The complete HTTP budget variable table and a combined-listener example are maintained in the [`owlauth-server` README](https://github.com/owlfoundry/owlauth/tree/main/crates/owlauth-server#configuration-and-operations).
 
 For the fastest executable proof of a correctly provisioned topology, run:
 

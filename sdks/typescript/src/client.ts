@@ -36,6 +36,30 @@ export interface CryptoProvider {
   readonly subtle: SubtleCrypto;
 }
 
+export type SdkDebugOutcome =
+  | "success"
+  | "runtime_error"
+  | "transport_error"
+  | "timeout"
+  | "cancelled"
+  | "invalid_response"
+  | "indeterminate";
+
+/** Closed, secret-free completion event emitted only when a debug hook is configured. */
+export interface SdkDebugEvent {
+  readonly operation: string;
+  readonly method: "GET" | "POST";
+  readonly outcome: SdkDebugOutcome;
+  readonly elapsedMs: number;
+  readonly dispatched: boolean;
+  readonly status?: number;
+  readonly category?: ErrorCategory;
+  readonly code?: string;
+  readonly requestId?: string;
+}
+
+export type SdkDebugHook = (event: Readonly<SdkDebugEvent>) => void;
+
 export interface ClientOptions {
   readonly baseUrl: string;
   readonly projectId: string;
@@ -46,6 +70,7 @@ export interface ClientOptions {
   readonly now?: () => number;
   readonly timeoutMs?: number;
   readonly allowInsecureLoopback?: boolean;
+  readonly debugHook?: SdkDebugHook;
 }
 
 export interface BeginLoginOptions extends OperationOptions {
@@ -247,6 +272,20 @@ function mapRuntimeError(
   policy: RequestPolicy,
   retryAfterSeconds?: number,
 ): OwlAuthError {
+  if (status === 408 && problem.code === "request_timeout") {
+    return new OwlAuthError({
+      category: policy.sensitive ? "Indeterminate" : "Timeout",
+      code: problem.code,
+      message: policy.sensitive
+        ? "Runtime may have committed the operation; do not replay it."
+        : "The Runtime request exceeded its server-side deadline.",
+      operation: policy.operation,
+      retry: policy.sensitive ? "never" : "application_decision",
+      action: policy.sensitive ? policy.action : "none",
+      ...(problem.requestId === undefined ? {} : { requestId: problem.requestId }),
+      status,
+    });
+  }
   if (status === 429 && problem.code === "rate_limited") {
     const handoff = policy.operation === "exchange_handoff";
     const callerDecision = [
@@ -257,7 +296,7 @@ function mapRuntimeError(
     return new OwlAuthError({
       category: "RateLimited",
       code: problem.code,
-      message: "OwlAuth Runtime admission policy rejected the request.",
+      message: "The optional SaaS or ingress traffic policy rejected the request.",
       operation: policy.operation,
       retry: handoff ? "never" : callerDecision ? "application_decision" : "safe_after_delay",
       action: handoff ? "discard_pending" : "none",
@@ -448,6 +487,7 @@ export class Client {
   readonly #crypto: CryptoProvider;
   readonly #now: () => number;
   readonly #timeoutMs: number;
+  readonly #debugHook: SdkDebugHook | undefined;
 
   constructor(options: ClientOptions) {
     this.#base = parseBaseUrl(options.baseUrl, options.allowInsecureLoopback ?? false);
@@ -473,6 +513,7 @@ export class Client {
     this.#crypto = cryptoImplementation;
     this.#now = options.now ?? Date.now;
     this.#timeoutMs = timeout;
+    this.#debugHook = options.debugHook;
   }
 
   /** Restores an explicitly exported pending-login record into this exact Client context. */
@@ -603,7 +644,7 @@ export class Client {
       sensitive: false,
       action: "none",
       success: [200],
-      errors: [400, 404, 429, 503],
+      errors: [400, 404, 408, 429, 503],
     });
     if (!isObject(value)) throw this.#protocol("invalid_response", "get_public_application_config");
     const providers = value["providers"];
@@ -670,7 +711,7 @@ export class Client {
         sensitive: false,
         action: "none",
         success: [200],
-        errors: [404, 429, 503],
+        errors: [404, 408, 429, 503],
       },
     );
     if (!isObject(value) || !positiveInteger(value["revision"]) || !positiveInteger(value["signing_epoch"])) {
@@ -735,7 +776,7 @@ export class Client {
         sensitive: false,
         action: "discard_pending",
         success: [201],
-        errors: [400, 404, 429, 503],
+        errors: [400, 404, 408, 429, 503],
       },
     );
     if (!isObject(value) || !boundedString(value["hosted_url"], 512) || !validDate(value["expires_at"])) {
@@ -831,7 +872,7 @@ export class Client {
         sensitive: true,
         action: "quarantine_pending",
         success: [200],
-        errors: [400, 409, 429, 503],
+        errors: [400, 408, 409, 429, 503],
       },
     );
     return this.#credentials(value, "exchange_handoff", "quarantine_pending");
@@ -865,7 +906,7 @@ export class Client {
         sensitive: true,
         action: "quarantine_credentials",
         success: [200],
-        errors: [400, 409, 429, 503],
+        errors: [400, 408, 409, 429, 503],
       },
     );
     const successor = this.#credentials(value, "refresh_session", "quarantine_credentials");
@@ -891,7 +932,7 @@ export class Client {
         sensitive: false,
         action: "reauthenticate",
         success: [200],
-        errors: [401, 429, 503],
+        errors: [401, 408, 429, 503],
       },
     );
     const fields = [
@@ -949,7 +990,7 @@ export class Client {
         sensitive: true,
         action: "quarantine_credentials",
         success: [200],
-        errors: [401, 429, 503],
+        errors: [401, 408, 429, 503],
       },
     );
     if (!isObject(value) || value["completed"] !== true) {
@@ -972,7 +1013,7 @@ export class Client {
         sensitive: true,
         action: "quarantine_credentials",
         success: [201],
-        errors: [401, 429, 503],
+        errors: [401, 408, 429, 503],
       },
     );
     if (!isObject(value) || !boundedString(value["hosted_url"], 512) || !validDate(value["expires_at"])) {
@@ -1165,6 +1206,9 @@ export class Client {
       throw this.#protocol("url_boundary_violation", policy.operation);
     }
     const timeoutMs = this.#validateOperationOptions(options, policy.operation);
+    const method = init.method === "POST" ? "POST" : "GET";
+    const startedAt = this.#now();
+    let responseStatus: number | undefined;
     const controller = new AbortController();
     let timedOut = false;
     const onAbort = () => controller.abort();
@@ -1183,6 +1227,7 @@ export class Client {
         credentials: "omit",
         headers: { accept: "application/json", ...init.headers },
       });
+      responseStatus = response.status;
       const invalidAction = policy.sensitive ? policy.action : "none";
       const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
       if (response.redirected || contentType !== "application/json") {
@@ -1222,19 +1267,44 @@ export class Client {
           }
           retryAfterSeconds = parsed;
         }
+        if (response.status === 408 && problem.code !== "request_timeout") {
+          throw this.#invalidResponse(policy, response.status, invalidAction);
+        }
         if (policy.sensitive && response.status >= 500) {
           throw this.#indeterminate("runtime_5xx_after_dispatch", policy.operation, policy.action, response.status);
         }
         throw mapRuntimeError(problem, response.status, policy, retryAfterSeconds);
       }
+      this.#emitDebug({
+        operation: policy.operation,
+        method,
+        outcome: "success",
+        elapsedMs: this.#elapsedMs(startedAt),
+        dispatched,
+        status: response.status,
+      });
       return value;
     } catch (error) {
-      if (error instanceof OwlAuthError) throw error;
+      if (error instanceof OwlAuthError) {
+        const status = error.status ?? responseStatus;
+        this.#emitDebug({
+          operation: policy.operation,
+          method,
+          outcome: this.#debugOutcome(error.category),
+          elapsedMs: this.#elapsedMs(startedAt),
+          dispatched,
+          ...(status === undefined ? {} : { status }),
+          category: error.category,
+          code: error.code,
+          ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
+        });
+        throw error;
+      }
       if (error instanceof DOMException && error.name === "TimeoutError") timedOut = true;
       const cancelled = Boolean(options.signal?.aborted) ||
         (error instanceof DOMException && error.name === "AbortError");
       if (policy.sensitive && dispatched) {
-        throw new OwlAuthError({
+        const mapped = new OwlAuthError({
           category: "Indeterminate",
           code: "outcome_indeterminate",
           message: "Runtime may have committed the one-use operation; do not retry it.",
@@ -1243,8 +1313,19 @@ export class Client {
           action: policy.action,
           cause: new Error("redacted transport failure"),
         });
+        this.#emitDebug({
+          operation: policy.operation,
+          method,
+          outcome: "indeterminate",
+          elapsedMs: this.#elapsedMs(startedAt),
+          dispatched,
+          ...(responseStatus === undefined ? {} : { status: responseStatus }),
+          category: mapped.category,
+          code: mapped.code,
+        });
+        throw mapped;
       }
-      throw new OwlAuthError({
+      const mapped = new OwlAuthError({
         category: timedOut ? "Timeout" : cancelled ? "Cancelled" : "Transport",
         code: timedOut ? "timeout" : cancelled ? "cancelled" : "transport_failure",
         message: timedOut ? "The Runtime request timed out." : cancelled ? "The Runtime request was cancelled." : "The Runtime request failed.",
@@ -1253,9 +1334,50 @@ export class Client {
         action: "none",
         cause: new Error("redacted transport failure"),
       });
+      this.#emitDebug({
+        operation: policy.operation,
+        method,
+        outcome: this.#debugOutcome(mapped.category),
+        elapsedMs: this.#elapsedMs(startedAt),
+        dispatched,
+        ...(responseStatus === undefined ? {} : { status: responseStatus }),
+        category: mapped.category,
+        code: mapped.code,
+      });
+      throw mapped;
     } finally {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  #elapsedMs(startedAt: number): number {
+    const elapsed = this.#now() - startedAt;
+    return Number.isFinite(elapsed) ? Math.max(0, Math.round(elapsed)) : 0;
+  }
+
+  #debugOutcome(category: ErrorCategory): SdkDebugOutcome {
+    switch (category) {
+      case "Protocol":
+        return "invalid_response";
+      case "Timeout":
+        return "timeout";
+      case "Cancelled":
+        return "cancelled";
+      case "Transport":
+        return "transport_error";
+      case "Indeterminate":
+        return "indeterminate";
+      default:
+        return "runtime_error";
+    }
+  }
+
+  #emitDebug(event: SdkDebugEvent): void {
+    try {
+      this.#debugHook?.(Object.freeze({ ...event }));
+    } catch {
+      // Debug logging is observational and must never change protocol behavior.
     }
   }
 

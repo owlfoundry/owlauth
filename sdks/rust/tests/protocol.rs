@@ -8,9 +8,10 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use owlauth_client::{
-    CancellationToken, Client, ClientConfig, Clock, CredentialPairRecord, EntropySource, Error,
-    ErrorCategory, HttpRequest, HttpResponse, LocalAction, OperationOptions, PendingLoginRecord,
-    RetryPolicy, Transport, TransportFailure, TransportFailureKind,
+    CancellationToken, Client, ClientConfig, Clock, CredentialPairRecord, DebugHook, EntropySource,
+    Error, ErrorCategory, HttpMethod, HttpRequest, HttpResponse, LocalAction, OperationOptions,
+    PendingLoginRecord, RetryPolicy, SdkDebugEvent, SdkDebugOutcome, Transport, TransportFailure,
+    TransportFailureKind,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -120,6 +121,16 @@ impl EntropySource for DeterministicEntropy {
     }
 }
 
+struct RecordingDebugHook {
+    events: Mutex<Vec<SdkDebugEvent>>,
+}
+
+impl DebugHook for RecordingDebugHook {
+    fn emit(&self, event: &SdkDebugEvent) {
+        self.events.lock().unwrap().push(event.clone());
+    }
+}
+
 struct FixedClock(i64);
 impl Clock for FixedClock {
     fn now_unix_seconds(&self) -> i64 {
@@ -205,6 +216,41 @@ fn client_with_transport(transport: Arc<dyn Transport>) -> Client {
 
 fn client(transport: Arc<MockTransport>) -> Client {
     client_with_transport(transport)
+}
+
+#[tokio::test]
+async fn optional_debug_hook_emits_one_closed_redacted_completion_event() {
+    let transport = Arc::new(MockTransport::with(vec![response(
+        200,
+        json!({
+            "project_public_id": "project_public",
+            "project_display_name": "Project",
+            "application_public_id": "application_public",
+            "application_display_name": "Application",
+            "publishable_keys": ["publishable_key"],
+            "providers": [],
+            "email_available": false,
+            "email_otp_enabled": false,
+            "email_magic_link_enabled": false,
+            "login_available": true
+        }),
+    )]));
+    let hook = Arc::new(RecordingDebugHook {
+        events: Mutex::new(Vec::new()),
+    });
+    let configured = client(transport).with_debug_hook(hook.clone());
+    configured.public_configuration().await.unwrap();
+
+    let events = hook.events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.operation, "get_public_application_config");
+    assert_eq!(event.method, HttpMethod::Get);
+    assert_eq!(event.outcome, SdkDebugOutcome::Success);
+    assert_eq!(event.status, Some(200));
+    let rendered = format!("{event:?}");
+    assert!(!rendered.contains("publishable_key"));
+    assert!(!rendered.contains("runtime.example"));
 }
 
 #[test]

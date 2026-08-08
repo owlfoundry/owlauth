@@ -3,10 +3,8 @@ import { useState } from "react";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import {
-  type Application,
   ControlRequestError,
   type DisposableControlClient,
-  type EmailAssignment,
   type EmailMethodPolicy,
   type Project,
   type SmtpConfiguration,
@@ -23,22 +21,6 @@ const initialProject: Project = {
   status: "active",
   metadata_revision: 1,
   security_revision: 7,
-};
-
-const initialApplication: Application = {
-  id: "22222222-2222-4222-8222-222222222222",
-  project_id: initialProject.id,
-  public_id: "app_public123",
-  display_name: "Native client",
-  application_type: "native",
-  configuration: {
-    allowed_origins: [],
-    publishable_keys: ["pk_test"],
-    redirect_uris: ["com.example.app:/callback"],
-  },
-  status: "active",
-  metadata_revision: 1,
-  security_revision: 11,
 };
 
 const smtpConfiguration: SmtpConfiguration = {
@@ -104,27 +86,9 @@ function renderHarness(options?: {
   conflictPolicy?: boolean;
   smtp?: SmtpConfiguration;
 }) {
-  let authoritativeApplication = initialApplication;
   let authoritativeProject = initialProject;
   let authoritativePolicy = policy;
-  let authoritativeAssignments: EmailAssignment[] = [];
   const put = vi.fn((path: string, request: { body: { enabled: boolean } }) => {
-    if (path.includes("/applications/")) {
-      const current = authoritativeAssignments[0];
-      authoritativeAssignments = [
-        {
-          project_id: initialProject.id,
-          application_id: initialApplication.id,
-          enabled: request.body.enabled,
-          security_revision: (current?.security_revision ?? 0) + 1,
-        },
-      ];
-      authoritativeApplication = {
-        ...authoritativeApplication,
-        security_revision: authoritativeApplication.security_revision + 1,
-      };
-      return Promise.resolve(successful(authoritativePolicy));
-    }
     if (path.endsWith("/email-method") && options?.conflictPolicy === true) {
       authoritativePolicy = {
         ...authoritativePolicy,
@@ -167,9 +131,6 @@ function renderHarness(options?: {
     if (path.endsWith("/email-method")) {
       return Promise.resolve(successful(authoritativePolicy));
     }
-    if (path.endsWith("/email-method/assignments")) {
-      return Promise.resolve(successful({ items: authoritativeAssignments }));
-    }
     if (path.endsWith("/smtp-configurations")) {
       return Promise.resolve(
         successful({ items: options?.smtp === undefined ? [] : [options.smtp] }),
@@ -203,16 +164,10 @@ function renderHarness(options?: {
 
   function Harness() {
     const [project, setProject] = useState(initialProject);
-    const [applications, setApplications] = useState([initialApplication]);
     return (
       <EmailSettings
         session={session}
         project={project}
-        applications={applications}
-        onApplicationsChanged={() => {
-          setApplications([authoritativeApplication]);
-          return Promise.resolve();
-        }}
         onProjectChanged={() => {
           setProject(authoritativeProject);
           return Promise.resolve();
@@ -242,30 +197,19 @@ describe("Email Console owner revisions", () => {
     vi.restoreAllMocks();
   });
 
-  it("uses the refreshed Application revision for assign then remove without a reload", async () => {
-    const { put, setMessage } = renderHarness();
+  it("expands SMTP details from the table row", async () => {
+    renderHarness({ smtp: smtpConfiguration });
 
-    fireEvent.click(await screen.findByRole("button", { name: "Assign" }));
-    await waitFor(() => {
-      expect(setMessage).toHaveBeenCalledWith("Email method assigned to Native client.");
+    const disclosure = await screen.findByRole("button", {
+      name: "Expand SMTP generation 1 details",
     });
-    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
-    fireEvent.click(
-      within(screen.getByRole("dialog", { name: "Remove passwordless email" })).getByRole(
-        "button",
-        { name: "Remove email method" },
-      ),
-    );
-    await waitFor(() => {
-      expect(put).toHaveBeenCalledTimes(2);
-    });
+    expect(screen.queryByText("sha256:test")).not.toBeInTheDocument();
+    fireEvent.click(disclosure);
 
-    expect(put.mock.calls[0]?.[1]).toMatchObject({
-      body: { enabled: true, expected_application_security_revision: 11 },
-    });
-    expect(put.mock.calls[1]?.[1]).toMatchObject({
-      body: { enabled: false, expected_application_security_revision: 12 },
-    });
+    expect(screen.getByText("sha256:test")).toBeVisible();
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(disclosure);
+    expect(screen.queryByText("sha256:test")).not.toBeInTheDocument();
   });
 
   it("uses the refreshed Project revision for a replacement generation without a reload", async () => {

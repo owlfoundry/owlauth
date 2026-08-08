@@ -161,8 +161,13 @@ pub(crate) trait RuntimeProtector: Send + Sync {
         self.active_version()
     }
 
-    /// Immutable process-local key inventory used to fence durable claims before mutation.
+    /// Immutable process-local key inventory for short-lived Runtime material.
     fn readable_key_versions(&self) -> BTreeSet<i32>;
+
+    /// Immutable process-local key inventory for durable email lookup aliases and ciphertext.
+    fn email_identity_readable_key_versions(&self) -> BTreeSet<i32> {
+        self.readable_key_versions()
+    }
 
     fn random_opaque(&self, bytes: usize) -> Result<Zeroizing<String>, ApplicationError>;
 

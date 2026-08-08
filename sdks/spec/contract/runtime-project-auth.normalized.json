@@ -570,7 +570,7 @@
               }
             }
           },
-          "409": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -579,21 +579,11 @@
               }
             }
           },
-          "429": {
+          "409": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }
@@ -653,21 +643,11 @@
               }
             }
           },
-          "429": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }
@@ -723,21 +703,11 @@
               }
             }
           },
-          "429": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }
@@ -806,21 +776,11 @@
               }
             }
           },
-          "429": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }
@@ -880,21 +840,11 @@
               }
             }
           },
-          "429": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }
@@ -958,21 +908,11 @@
               }
             }
           },
-          "429": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }
@@ -1038,7 +978,7 @@
               }
             }
           },
-          "409": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1047,21 +987,11 @@
               }
             }
           },
-          "429": {
+          "409": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }
@@ -1132,21 +1062,11 @@
               }
             }
           },
-          "429": {
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RuntimeError"
-                }
-              }
-            },
-            "headers": {
-              "Retry-After": {
-                "required": true,
-                "schema": {
-                  "format": "int64",
-                  "minimum": 0,
-                  "type": "integer"
                 }
               }
             }

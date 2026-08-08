@@ -1,6 +1,6 @@
-mod admission;
 mod authentication;
 mod control_lifecycle;
+mod control_overview;
 mod email_control;
 mod email_identity_lookup;
 mod error;
@@ -18,19 +18,11 @@ mod runtime_auth;
 mod runtime_security;
 mod server_api;
 mod server_key;
-mod server_readiness;
 mod session_authority;
 #[cfg(test)]
 mod unit_of_work;
 mod webhook;
 
-#[cfg(test)]
-pub(crate) use admission::MonotonicClock;
-pub(crate) use admission::{
-    AdmissionBucket, AdmissionDecision, AdmissionDimension, AdmissionDimensionKind,
-    AdmissionEndpoint, AdmissionRejectionReason, AdmissionService, DistributedAdmissionCounter,
-    DistributedAdmissionError,
-};
 pub(crate) use authentication::{
     AdmittedProviderMethod, AuthenticationRepository, BindHostedBrowser, ClaimProviderCallback,
     ClaimedProviderExchange, CreateLoginTransaction, DenyProviderCallback, FailProviderExchange,
@@ -43,6 +35,11 @@ pub(crate) use control_lifecycle::{
     ProjectUserIdentityKind, ProjectUserIdentityRecord, ProjectUserIdentityStatus,
     ProjectUserListCriteria, ProjectUserPage, ProjectUserRecord, ProjectUserSessions,
     ProjectUserSort, ProjectUserStatus, RevokeApplicationSession, RevokeBrowserSession,
+};
+pub(crate) use control_overview::{
+    ControlOverviewPort, ControlOverviewService, ProjectOverviewApplicationCounts,
+    ProjectOverviewProviderCounts, ProjectOverviewServerKeyCounts, ProjectOverviewSummary,
+    ProjectOverviewUserCounts,
 };
 pub(crate) use email_control::{
     CreateSmtpConfiguration, DeploymentSmtpGenerationRecord, EmailAssignmentRecord,
@@ -133,9 +130,9 @@ pub(crate) use managed_reauthorization::{
 #[allow(unused_imports, reason = "passwordless email integration is additive")]
 pub(crate) use passwordless_email::{
     AdmittedEmailMethod, CommitEmailGeneration, CompleteEmailProof, EmailGenerationPreparation,
-    EmailIdentityAliasAuthority, EmailMethodSelection, EmailProofDecision, EmailProofKind,
-    EstablishMagicTransferContext, PasswordlessEmailRepository, ResolveMagicTransferContext,
-    ResolvedMagicTransferContext, SelectEmailMethod, VerifiedEmailChallenge, VerifyEmailProof,
+    EmailMethodSelection, EmailProofDecision, EmailProofKind, EstablishMagicTransferContext,
+    PasswordlessEmailRepository, ResolveMagicTransferContext, ResolvedMagicTransferContext,
+    SelectEmailMethod, VerifiedEmailChallenge, VerifyEmailProof,
 };
 pub(crate) use provider_callback::{ProviderCallbackOwner, ProviderCallbackOwnerResolver};
 pub(crate) use provider_onboarding::{
@@ -145,13 +142,14 @@ pub(crate) use provider_onboarding::{
 pub(crate) use provisioning::{
     ApplicationConfiguration, ApplicationProvisioningPort, ApplicationRecord,
     ConfigurationSecretSealers, CreateApplication, CreateProject, CreateProvider, PrepareProvider,
-    PreparedProvider, PreparedSecretMaterial, PreparedSigningKey, PreparedSigningMaterial,
-    ProjectPolicyRecord, ProjectProvisioningPort, ProjectRecord, ProviderProvisioningPort,
-    ProviderRecord, ProviderRecovery, ProvisionedProtectedSigningMaterial,
-    ProvisioningInfrastructure, ProvisioningOperationState, ProvisioningService,
-    ReplaceApplicationConfiguration, SealedProtectedMaterial, SigningKeyMaintenanceItem,
-    SigningKeyProvisioningPort, SigningKeyRecord, SigningProviderAction, SigningProviderCall,
-    SigningProviderLease, UpdateApplication, UpdateProject, UpdateProjectPolicy,
+    PrepareProviderSecretReplacement, PreparedProvider, PreparedSecretMaterial, PreparedSigningKey,
+    PreparedSigningMaterial, ProjectPolicyRecord, ProjectProvisioningPort, ProjectRecord,
+    ProviderProvisioningPort, ProviderRecord, ProviderRecovery, ProviderSecretReplacementRecovery,
+    ProvisionedProtectedSigningMaterial, ProvisioningInfrastructure, ProvisioningOperationState,
+    ProvisioningService, ReplaceApplicationConfiguration, ReplaceProviderSecret,
+    SealedProtectedMaterial, SigningKeyMaintenanceItem, SigningKeyProvisioningPort,
+    SigningKeyRecord, SigningProviderAction, SigningProviderCall, SigningProviderLease,
+    UpdateApplication, UpdateProject, UpdateProjectPolicy, UpdateProvider,
 };
 pub(crate) use readiness::{
     JwksDocument, PublicApplicationConfig, PublicProvider, ReadinessPort, ReadinessService,
@@ -186,11 +184,6 @@ pub(crate) use server_key::{
     ServerKeyCreateAttemptError, ServerKeyIssuer, ServerKeyLifecyclePort,
     ServerKeyLifecycleService, ServerKeyVerifier, StoredProjectServerKeyCreate,
     server_key_display_prefix,
-};
-pub(crate) use server_readiness::{
-    MAX_REQUIRED_SERVER_PROCESSES, ServerDigestReadinessClaim, ServerDigestReadinessPort,
-    ServerDigestReadinessService, ServerDigestReadinessSnapshot, ServerDigestReadinessState,
-    valid_server_process_id,
 };
 #[allow(
     unused_imports,

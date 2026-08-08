@@ -95,6 +95,7 @@ const provider: Provider = {
   callback_url: "https://runtime.example/callback",
   status: "active",
   revision: 5,
+  secret_replacement_pending: false,
   login_supported: true,
   identity_proof_supported: true,
   assigned_application_ids: [application.id],

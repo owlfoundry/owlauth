@@ -252,6 +252,15 @@ def strip_annotations(value: Any, *, arbitrary_names: bool = False) -> Any:
     return value
 
 
+def shared_operation_core_contract(value: Mapping[str, Any]) -> Any:
+    """Normalize one shared health operation excluding its plane-owned timeout envelope."""
+    contract = strip_annotations(value)
+    responses = contract.get("responses") if isinstance(contract, dict) else None
+    if isinstance(responses, dict):
+        responses.pop("408", None)
+    return contract
+
+
 def component_reference(reference: str) -> tuple[str, str] | None:
     segments = reference[2:].split("/") if reference.startswith("#/") else []
     if len(segments) != 3 or segments[0] != "components":
@@ -268,9 +277,7 @@ def normalized_surface(
 ) -> dict[str, Any]:
     runtime_operations = document_operations(runtime, "Runtime")
     control_operations = document_operations(control, "Control")
-    non_runtime_planes: list[tuple[str, dict[str, Operation]]] = [
-        ("Control", control_operations)
-    ]
+    non_runtime_planes: list[tuple[str, dict[str, Operation]]] = [("Control", control_operations)]
     if server is not None:
         non_runtime_planes.append(("Server", document_operations(server, "Server")))
 
@@ -293,8 +300,7 @@ def normalized_surface(
             )
 
         plane_identities = {
-            (operation.method, operation.path): operation
-            for operation in plane_operations.values()
+            (operation.method, operation.path): operation for operation in plane_operations.values()
         }
         for identity in sorted(set(runtime_identities) & set(plane_identities)):
             runtime_operation = runtime_identities[identity]
@@ -308,9 +314,9 @@ def normalized_surface(
                     f"{identity[0]} {identity[1]} as "
                     f"{runtime_operation.operation_id!r}/{plane_operation.operation_id!r}"
                 )
-            if strip_annotations(runtime_operation.value) != strip_annotations(
-                plane_operation.value
-            ):
+            if shared_operation_core_contract(
+                runtime_operation.value
+            ) != shared_operation_core_contract(plane_operation.value):
                 raise ContractError(
                     f"shared Runtime and {plane_name} operation contracts differ: "
                     f"{runtime_operation.operation_id}"
@@ -359,7 +365,9 @@ def normalized_surface(
 
     forbidden = security_names & policy.forbidden_security_schemes
     if forbidden:
-        raise ContractError(f"claimed Runtime surface uses forbidden security schemes: {sorted(forbidden)}")
+        raise ContractError(
+            f"claimed Runtime surface uses forbidden security schemes: {sorted(forbidden)}"
+        )
 
     components = runtime.get("components", {})
     if not isinstance(components, dict):
@@ -369,7 +377,9 @@ def normalized_surface(
         raise ContractError("Runtime OpenAPI securitySchemes must be an object")
     for name in sorted(security_names):
         if name not in security_schemes:
-            raise ContractError(f"claimed Runtime surface references missing security scheme: {name}")
+            raise ContractError(
+                f"claimed Runtime surface references missing security scheme: {name}"
+            )
         reference_queue.append(f"#/components/securitySchemes/{name}")
 
     collected_references: set[str] = set()
@@ -383,8 +393,7 @@ def normalized_surface(
         component = component_reference(reference)
         if component is None:
             raise ContractError(
-                "claimed Runtime surface references unsupported non-component pointer: "
-                f"{reference}"
+                f"claimed Runtime surface references unsupported non-component pointer: {reference}"
             )
         category, name = component
         retained_target = strip_annotations(target)
@@ -397,7 +406,8 @@ def normalized_surface(
     for forbidden_name in policy.forbidden_security_schemes:
         if forbidden_name in serialized:
             raise ContractError(
-                f"claimed Runtime surface contains forbidden management vocabulary: {forbidden_name}"
+                "claimed Runtime surface contains forbidden management vocabulary: "
+                f"{forbidden_name}"
             )
 
     return {
@@ -551,8 +561,7 @@ def run(arguments: list[str]) -> None:
         server_value = load_json(options.server_openapi)
         control_value = load_json(options.control_openapi)
         if not all(
-            isinstance(value, dict)
-            for value in (runtime_value, server_value, control_value)
+            isinstance(value, dict) for value in (runtime_value, server_value, control_value)
         ):
             raise ContractError("OpenAPI inputs must be JSON objects")
         runtime, server, control = runtime_value, server_value, control_value

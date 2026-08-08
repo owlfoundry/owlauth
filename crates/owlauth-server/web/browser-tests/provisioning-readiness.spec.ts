@@ -254,12 +254,31 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await providerDialog.getByRole("button", { name: "Add provider" }).click();
   await expect(page.getByRole("status").filter({ hasText: "secret was discarded" })).toBeVisible();
   await expect(page.locator("body")).not.toContainText(providerSecret);
+  await expect(
+    page.getByText(`${runtimeBase}projects/${projectPublicId}/auth/callback/${customProviderKey}`, {
+      exact: true,
+    }),
+  ).toBeVisible();
 
-  await page.getByLabel("Assign to Application").selectOption({ label: applicationName });
-  await page.getByRole("button", { name: "Assign provider" }).click();
-  await expect(page.getByRole("status").filter({ hasText: "assigned" })).toBeVisible();
-
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  const providerEditor = page.getByRole("dialog", { name: "Edit provider" });
+  await providerEditor.getByLabel("Client ID").fill(`client-replaced-${suffix}`);
+  await providerEditor.getByLabel("New client secret").fill(`replacement-${providerSecret}`);
+  await providerEditor.getByRole("button", { name: "Save provider" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "configuration and client secret updated" }),
+  ).toBeVisible();
+  await expect(page.locator("body")).not.toContainText(`replacement-${providerSecret}`);
   await auditControlRoute(page, testInfo, browserName, "providers");
+
+  await page.getByRole("link", { name: "Applications", exact: true }).click();
+  await page.getByRole("link", { name: applicationName, exact: true }).click();
+  await page.getByRole("link", { name: "Authentication", exact: true }).click();
+  const providerMethod = page.getByRole("row").filter({ hasText: providerName });
+  await providerMethod.getByRole("button", { name: "Assign" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "assigned" })).toBeVisible();
+  await expect(providerMethod.getByRole("button", { name: "Remove" })).toBeVisible();
+  await auditControlRoute(page, testInfo, browserName, "application-authentication");
 
   await navigateControl(page, "Passwordless email", "Passwordless email");
   await expect(page.getByRole("heading", { name: "Passwordless policy" })).toBeVisible();
@@ -375,7 +394,17 @@ test("fresh-database operator journey reaches exact Runtime readiness", async ({
   await auditControlRoute(page, testInfo, browserName, "application-webhooks");
 
   await navigateControl(page, "Overview", updatedProjectName);
-  await expect(page.getByRole("list", { name: "Project resource summary" })).toBeVisible();
+  const resourceSummary = page.getByRole("list", { name: "Project resource summary" });
+  await expect(resourceSummary).toBeVisible();
+  await expect(resourceSummary.getByRole("link", { name: /^Users: 0\./u })).toHaveAttribute(
+    "href",
+    new RegExp(`/projects/${projectId}/users$`, "u"),
+  );
+  await expect(
+    resourceSummary.getByRole("link", { name: /^Project secret keys: 0\./u }),
+  ).toHaveAttribute("href", new RegExp(`/projects/${projectId}/security/server-keys$`, "u"));
+  await expect(resourceSummary.getByText("Passwordless email", { exact: true })).toHaveCount(0);
+  await expect(resourceSummary.getByText("Signing keys", { exact: true })).toHaveCount(0);
   await auditControlRoute(page, testInfo, browserName, "project-overview-final");
 
   const accessibility = await new AxeBuilder({ page }).analyze();

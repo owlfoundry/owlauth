@@ -274,6 +274,27 @@
   font-size: 0.8125rem;
 }
 
+.disclosureIcon,
+.disclosureIconExpanded {
+  transition: transform 150ms ease;
+}
+
+.disclosureIconExpanded {
+  transform: rotate(180deg);
+}
+
+.expandedDetailCell {
+  padding: 0 1rem 1rem !important;
+  background: var(--owl-surface-raised) !important;
+}
+
+.expandedDetailCell > * {
+  padding: 1rem;
+  background: var(--owl-surface);
+  border: 1px solid var(--owl-border);
+  border-radius: var(--owl-radius-control);
+}
+
 code {
   overflow-wrap: anywhere;
 }

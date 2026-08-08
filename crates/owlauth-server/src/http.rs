@@ -1,10 +1,10 @@
 mod mcp;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -19,13 +19,13 @@ use sha2::{Digest, Sha256};
 use axum::{
     Extension, Json, Router,
     extract::{
-        ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, OriginalUri, Path, Query,
+        DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, OriginalUri, Path, Query,
         Request, State,
     },
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
 };
 use owlauth_types::{
     FEDERATED_PROJECT_AUTH_AVAILABLE, HealthResponse,
@@ -37,25 +37,24 @@ use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower_http::compression::CompressionLayer;
-use tracing::info;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     application::{
-        self, AdmissionDecision, AdmissionDimension, AdmissionDimensionKind, AdmissionEndpoint,
-        AdmissionService, ApplicationError, BeginEmailChallenge, BeginLogin, Clock,
+        self, ApplicationError, BeginEmailChallenge, BeginLogin, Clock,
         ConfirmProjectBrowserLogout, ConfirmSessionReuse, ControlLifecycleService,
-        CreateApplication, CreateManagedReauthorization, CreateProject, CreateProvider,
-        CreateSmtpConfiguration, EmailControlService, ExchangeHandoff,
+        ControlOverviewService, CreateApplication, CreateManagedReauthorization, CreateProject,
+        CreateProvider, CreateSmtpConfiguration, EmailControlService, ExchangeHandoff,
         IdentityMutationControlService, IdentityMutationRuntimePort, ManagedConnectionMetadata,
         ManagedConnectionRepository, ManagedConnectionService, ManagedReauthorizationCallback,
         ManagedReauthorizationCallbackOutcome, ManagedReauthorizationControlService,
         ManagedReauthorizationDenial, ManagedReauthorizationRuntimeService, ProviderCallback,
         ProviderCallbackDenial, ProviderCallbackOwner, ProviderCallbackOwnerResolver,
         ProviderOnboardingService, ProvisioningService, ReadinessService, RefreshSession,
-        ReplaceApplicationConfiguration, RuntimeAuthService, SelectEmail, SelectProvider,
-        SubmitEmailProof, UpdateApplication, UpdateProject, UpdateProjectPolicy,
-        UpdateProviderEgressPolicy, WebhookControlService, WebhookWorker,
+        ReplaceApplicationConfiguration, ReplaceProviderSecret, RuntimeAuthService, SelectEmail,
+        SelectProvider, SubmitEmailProof, UpdateApplication, UpdateProject, UpdateProjectPolicy,
+        UpdateProvider, UpdateProviderEgressPolicy, WebhookControlService, WebhookWorker,
     },
     config::{
         DeploymentSmtpConfig, HttpBudgetConfig, ListenerConfig, OperatorApiKey, ServerConfig,
@@ -101,8 +100,6 @@ struct ProbeState {
 #[derive(Clone)]
 struct RuntimeState {
     probe: ProbeState,
-    admission: Arc<AdmissionService>,
-    verified_origins: Arc<VerifiedApplicationOrigins>,
     readiness: Option<Arc<ReadinessService>>,
     auth: Option<Arc<RuntimeAuthService>>,
     callback_owners: Option<Arc<dyn ProviderCallbackOwnerResolver>>,
@@ -114,7 +111,6 @@ struct RuntimeState {
 
 #[derive(Clone)]
 struct ServerState {
-    admission: Arc<AdmissionService>,
     api: Option<Arc<application::ServerApiService>>,
 }
 
@@ -122,7 +118,6 @@ struct ServerState {
 struct AuthProbeState {
     ready: Arc<AtomicBool>,
     runtime_readiness: Option<Arc<application::ReadinessService>>,
-    server_readiness: Option<Arc<application::ServerDigestReadinessService>>,
 }
 
 #[derive(Clone)]
@@ -131,10 +126,10 @@ struct ControlState {
     clock: Arc<dyn Clock>,
     operator_key: Arc<OperatorApiKey>,
     external_origin: Arc<str>,
-    credential_failures: ControlCredentialFailures,
     descriptor: Arc<ServiceDescriptor>,
     provisioning: Option<Arc<ProvisioningService>>,
     lifecycle: Option<Arc<ControlLifecycleService>>,
+    overview: Option<Arc<ControlOverviewService>>,
     email_control: Option<Arc<EmailControlService>>,
     deployment_smtp: Option<Arc<DeploymentSmtpConfig>>,
     managed_connections: Option<Arc<dyn ManagedConnectionRepository>>,
@@ -231,10 +226,6 @@ pub(crate) fn build_routers_with_capabilities(
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.readiness.clone());
-    let server_readiness = capabilities
-        .server
-        .as_ref()
-        .and_then(|server| server.readiness.clone());
     let auth_concurrency = Arc::new(tokio::sync::Semaphore::new(
         config.auth.http.max_in_flight_requests,
     ));
@@ -256,7 +247,6 @@ pub(crate) fn build_routers_with_capabilities(
                 AuthProbeState {
                     ready: Arc::clone(&auth_ready),
                     runtime_readiness,
-                    server_readiness,
                 },
                 auth_concurrency,
             ),
@@ -301,8 +291,6 @@ fn build_runtime_surface(
                 base_path: Arc::from(config.auth.external_base.path()),
             },
             readiness: capabilities.readiness,
-            admission: capabilities.admission,
-            verified_origins: Arc::new(VerifiedApplicationOrigins::default()),
             auth: capabilities.auth,
             callback_owners: capabilities.callback_owners,
             managed_reauthorization: capabilities.managed_reauthorization,
@@ -324,7 +312,6 @@ fn build_server_surface(
     server_router(
         &config.auth,
         ServerState {
-            admission: capabilities.admission,
             api: capabilities.api,
         },
         concurrency,
@@ -351,7 +338,6 @@ fn build_control_plane(
                     .expect("validated Control configuration has an operator key"),
             ),
             external_origin: Arc::from(config.control.external_base.origin().ascii_serialization()),
-            credential_failures: ControlCredentialFailures::default(),
             descriptor: Arc::new(ServiceDescriptor {
                 schema_version: "1".to_owned(),
                 product: "owlauth-server".to_owned(),
@@ -378,6 +364,7 @@ fn build_control_plane(
             }),
             provisioning: capabilities.provisioning,
             lifecycle: capabilities.lifecycle,
+            overview: capabilities.overview,
             email_control: capabilities.email_control,
             deployment_smtp: config.deployment_smtp.clone().map(Arc::new),
             managed_connections: capabilities.managed_connections,
@@ -700,6 +687,22 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             get(list_providers).post(create_provider),
         )
         .route(
+            "/projects/{project_id}/providers/{provider_id}",
+            patch(update_provider),
+        )
+        .route(
+            "/projects/{project_id}/providers/{provider_id}/replace-secret",
+            post(replace_provider_secret),
+        )
+        .route(
+            "/projects/{project_id}/providers/{provider_id}/replace-secret/reconcile",
+            post(reconcile_provider_secret_replacement),
+        )
+        .route(
+            "/projects/{project_id}/providers/{provider_id}/replace-secret/abandon",
+            post(abandon_provider_secret_replacement),
+        )
+        .route(
             "/projects/{project_id}/providers/{provider_id}/reconcile",
             post(reconcile_provider),
         )
@@ -832,6 +835,10 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
 fn control_lifecycle_router() -> Router<ControlState> {
     Router::new()
         .route(
+            "/projects/{project_id}/overview",
+            get(get_project_overview),
+        )
+        .route(
             "/projects/{project_id}/server-keys",
             get(list_project_server_keys).post(create_project_server_key),
         )
@@ -910,57 +917,6 @@ fn control_lifecycle_router() -> Router<ControlState> {
         )
 }
 
-const CONTROL_CREDENTIAL_FAILURE_LIMIT: usize = 12;
-const CONTROL_CREDENTIAL_FAILURE_WINDOW: Duration = Duration::from_mins(1);
-const CONTROL_CREDENTIAL_SOURCE_CAPACITY: usize = 8192;
-
-#[derive(Clone, Default)]
-struct ControlCredentialFailures {
-    sources: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
-}
-
-impl ControlCredentialFailures {
-    fn record(&self, source: &str, now: Instant) -> Option<u64> {
-        let Ok(mut sources) = self.sources.lock() else {
-            return Some(1);
-        };
-        if !sources.contains_key(source)
-            && sources.len() >= CONTROL_CREDENTIAL_SOURCE_CAPACITY
-            && let Some(candidate) = sources.keys().next().cloned()
-        {
-            sources.remove(&candidate);
-        }
-        let failures = sources.entry(source.to_owned()).or_default();
-        while failures.front().is_some_and(|failure| {
-            now.duration_since(*failure) >= CONTROL_CREDENTIAL_FAILURE_WINDOW
-        }) {
-            failures.pop_front();
-        }
-        failures.push_back(now);
-        (failures.len() >= CONTROL_CREDENTIAL_FAILURE_LIMIT).then_some(1)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct DirectPeer(pub(crate) std::net::SocketAddr);
-
-#[derive(Clone)]
-struct ClientAddress(String);
-
-async fn attach_client_address(mut request: Request, next: Next) -> Response {
-    let address = request
-        .extensions()
-        .get::<ConnectInfo<DirectPeer>>()
-        .map(|peer| peer.0.0.ip().to_string());
-    #[cfg(test)]
-    let address = address.or_else(|| Some("test-direct-peer".to_owned()));
-    let Some(address) = address else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    request.extensions_mut().insert(ClientAddress(address));
-    next.run(request).await
-}
-
 fn mount_and_bound(
     listener: &ListenerConfig,
     router: Router,
@@ -1027,20 +983,22 @@ fn bound_at(
             )
         }))
         .layer(middleware::from_fn(move |request, next| {
-            concurrency_boundary(plane, Arc::clone(&concurrency), request, next)
+            concurrency_boundary(Arc::clone(&concurrency), request, next)
+        }))
+        .layer(middleware::from_fn({
+            let listener_base_path = Arc::clone(&listener_base_path);
+            move |request, next| {
+                exceptional_boundary(
+                    plane,
+                    timeout,
+                    Arc::clone(&listener_base_path),
+                    request,
+                    next,
+                )
+            }
         }))
         .layer(middleware::from_fn(move |request, next| {
-            exceptional_boundary(
-                plane,
-                timeout,
-                Arc::clone(&listener_base_path),
-                request,
-                next,
-            )
-        }))
-        .layer(middleware::from_fn(attach_client_address))
-        .layer(middleware::from_fn(move |request, next| {
-            response_policy(plane, request, next)
+            response_policy(plane, Arc::clone(&listener_base_path), request, next)
         }))
 }
 
@@ -1089,30 +1047,14 @@ async fn request_shape_boundary(
 }
 
 async fn concurrency_boundary(
-    plane: HttpPlane,
     permits: Arc<tokio::sync::Semaphore>,
     request: Request,
     next: Next,
 ) -> Response {
-    let request_id = request
-        .extensions()
-        .get::<String>()
-        .cloned()
-        .unwrap_or_else(|| "unavailable".to_owned());
-    let Ok(_permit) = permits.try_acquire_owned() else {
-        let mut response = plane_exception_response(
-            plane,
-            StatusCode::TOO_MANY_REQUESTS,
-            "listener_capacity_exceeded",
-            "This listener's in-flight request capacity is exhausted.",
-            &request_id,
-            false,
-        );
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        return response;
-    };
+    let _permit = permits
+        .acquire_owned()
+        .await
+        .expect("the listener concurrency semaphore remains open");
     next.run(request).await
 }
 
@@ -1210,7 +1152,13 @@ fn plane_exception_response(
         HttpPlane::Runtime => runtime_error_response(status, code, message, request_id),
         HttpPlane::Server => server_error_response(
             status,
-            server_types::ServerErrorCode::TemporarilyUnavailable,
+            match status {
+                StatusCode::REQUEST_TIMEOUT => server_types::ServerErrorCode::RequestTimeout,
+                StatusCode::URI_TOO_LONG | StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE => {
+                    server_types::ServerErrorCode::InvalidRequest
+                }
+                _ => server_types::ServerErrorCode::InternalError,
+            },
             message,
             request_id,
         ),
@@ -1248,177 +1196,6 @@ fn runtime_document_error(state: &RuntimeState, title: &str, message: &str) -> R
             (web_assets::RUNTIME_BOOTSTRAP_META_NAME, &serialized),
         ],
     )
-}
-
-async fn admit_runtime(
-    state: &RuntimeState,
-    client: &ClientAddress,
-    endpoint: AdmissionEndpoint,
-    dimensions: &[AdmissionDimension<'_>],
-    request_id: &str,
-) -> Result<(), Response> {
-    match state.admission.admit(endpoint, &client.0, dimensions).await {
-        AdmissionDecision::Allowed => Ok(()),
-        AdmissionDecision::Rejected {
-            retry_after_seconds,
-            ..
-        } => Err(runtime_rate_limited_response(
-            retry_after_seconds,
-            request_id,
-        )),
-    }
-}
-
-fn runtime_rate_limited_response(retry_after_seconds: u64, request_id: &str) -> Response {
-    let mut response = runtime_error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate_limited",
-        "The Runtime request rate limit was exceeded.",
-        request_id,
-    );
-    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
-        response.headers_mut().insert(header::RETRY_AFTER, value);
-    }
-    response
-}
-
-const VERIFIED_ORIGIN_CAPACITY: usize = 1024;
-const VERIFIED_ORIGIN_TTL: Duration = Duration::from_mins(5);
-
-#[derive(Clone, Copy)]
-enum VerifiedOriginSubject<'a> {
-    Application {
-        project_public_id: &'a str,
-        application_public_id: &'a str,
-    },
-    Credential {
-        project_public_id: &'a str,
-        credential: &'a str,
-    },
-}
-
-struct VerifiedOriginEntry {
-    fingerprint: [u8; 32],
-    expires_at: Instant,
-}
-
-#[derive(Default)]
-struct VerifiedApplicationOrigins {
-    entries: Mutex<VecDeque<VerifiedOriginEntry>>,
-}
-
-impl VerifiedApplicationOrigins {
-    fn remember(&self, subject: VerifiedOriginSubject<'_>, origin: &str) {
-        let fingerprint = verified_origin_fingerprint(subject, origin);
-        let now = Instant::now();
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.retain(|entry| entry.expires_at > now && entry.fingerprint != fingerprint);
-        while entries.len() >= VERIFIED_ORIGIN_CAPACITY {
-            entries.pop_front();
-        }
-        entries.push_back(VerifiedOriginEntry {
-            fingerprint,
-            expires_at: now + VERIFIED_ORIGIN_TTL,
-        });
-    }
-
-    fn contains(&self, subject: VerifiedOriginSubject<'_>, origin: &str) -> bool {
-        let fingerprint = verified_origin_fingerprint(subject, origin);
-        let now = Instant::now();
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.retain(|entry| entry.expires_at > now);
-        entries.iter().any(|entry| entry.fingerprint == fingerprint)
-    }
-}
-
-fn verified_origin_fingerprint(subject: VerifiedOriginSubject<'_>, origin: &str) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    match subject {
-        VerifiedOriginSubject::Application {
-            project_public_id,
-            application_public_id,
-        } => {
-            digest.update(b"application\0");
-            update_length_prefixed(&mut digest, project_public_id);
-            update_length_prefixed(&mut digest, application_public_id);
-        }
-        VerifiedOriginSubject::Credential {
-            project_public_id,
-            credential,
-        } => {
-            digest.update(b"credential\0");
-            update_length_prefixed(&mut digest, project_public_id);
-            update_length_prefixed(&mut digest, credential);
-        }
-    }
-    update_length_prefixed(&mut digest, origin);
-    digest.finalize().into()
-}
-
-fn update_length_prefixed(digest: &mut Sha256, value: &str) {
-    digest.update(value.len().to_be_bytes());
-    digest.update(value.as_bytes());
-}
-
-async fn admit_runtime_with_verified_cors(
-    state: &RuntimeState,
-    client: &ClientAddress,
-    endpoint: AdmissionEndpoint,
-    dimensions: &[AdmissionDimension<'_>],
-    headers: &HeaderMap,
-    subject: VerifiedOriginSubject<'_>,
-    request_id: &str,
-) -> Result<(), Response> {
-    admit_runtime(state, client, endpoint, dimensions, request_id)
-        .await
-        .map_err(|response| {
-            apply_verified_admission_cors(&state.verified_origins, headers, subject, response)
-        })
-}
-
-fn apply_verified_admission_cors(
-    verified_origins: &VerifiedApplicationOrigins,
-    headers: &HeaderMap,
-    subject: VerifiedOriginSubject<'_>,
-    mut response: Response,
-) -> Response {
-    append_vary_origin(&mut response);
-    if let Ok(Some(origin)) = request_origin(headers)
-        && verified_origins.contains(subject, &origin)
-    {
-        apply_cors(&mut response, &origin, false);
-        response.headers_mut().insert(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static("Retry-After"),
-        );
-    }
-    response
-}
-
-fn admission_dimension(kind: AdmissionDimensionKind, value: &str) -> AdmissionDimension<'_> {
-    AdmissionDimension {
-        kind,
-        value,
-        email_scope: None,
-    }
-}
-
-fn scoped_email_admission_dimension<'a>(
-    value: &'a str,
-    project_id: &'a str,
-    application_id: &'a str,
-) -> AdmissionDimension<'a> {
-    AdmissionDimension {
-        kind: AdmissionDimensionKind::Email,
-        value,
-        email_scope: Some((project_id, application_id)),
-    }
 }
 
 async fn runtime_asset(Path(path): Path<String>) -> Response {
@@ -1479,31 +1256,10 @@ async fn runtime_preflight(
 async fn start_login(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::LoginStartRequest>,
 ) -> Response {
-    if let Err(response) = admit_runtime_with_verified_cors(
-        &state,
-        &client,
-        AdmissionEndpoint::LoginStart,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Application, &request.application_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &request.publishable_key),
-        ],
-        &headers,
-        VerifiedOriginSubject::Application {
-            project_public_id: &project_public_id,
-            application_public_id: &request.application_id,
-        },
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let cors_origin = match application_cors_origin(
         &state,
         &headers,
@@ -1545,7 +1301,6 @@ async fn start_login(
 async fn hosted_interaction_shell(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(interaction): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1556,20 +1311,6 @@ async fn hosted_interaction_shell(
             "Hosted authentication must start from a top-level document navigation.",
             &request_id,
         );
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::HostedInteraction,
-        &[admission_dimension(
-            AdmissionDimensionKind::Credential,
-            &interaction,
-        )],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(interaction_cookie) = interaction_cookie_name(&interaction) else {
         return runtime_document_error(
@@ -1678,7 +1419,6 @@ struct IdentityMutationHostedSlot {
 async fn identity_mutation_shell(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(interaction): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1689,20 +1429,6 @@ async fn identity_mutation_shell(
             "Identity verification must start from a top-level document navigation.",
             &request_id,
         );
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::HostedInteraction,
-        &[admission_dimension(
-            AdmissionDimensionKind::Credential,
-            &interaction,
-        )],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(cookie_name) = interaction_cookie_name(&interaction) else {
         return runtime_document_error(
@@ -1798,7 +1524,6 @@ async fn identity_mutation_shell(
 async fn identity_mutation_magic_shell(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(challenge_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1809,20 +1534,6 @@ async fn identity_mutation_magic_shell(
             "Open the verification link in a top-level browser window.",
             &request_id,
         );
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::EmailMagicRead,
-        &[admission_dimension(
-            AdmissionDimensionKind::Credential,
-            &challenge_id,
-        )],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(challenge_id) = Uuid::parse_str(&challenge_id) else {
         return runtime_document_error(
@@ -1878,28 +1589,12 @@ async fn identity_mutation_magic_shell(
 async fn select_identity_mutation_method(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction, proof_slot)): Path<(String, String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::SelectIdentityMutationMethodRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::ProviderSelection,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-            admission_dimension(AdmissionDimensionKind::Credential, &proof_slot),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -1965,27 +1660,12 @@ async fn select_identity_mutation_method(
 async fn begin_identity_mutation_email_challenge(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction, proof_slot)): Path<(String, String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::BeginIdentityMutationEmailChallengeRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::EmailChallenge,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -2029,7 +1709,6 @@ async fn begin_identity_mutation_email_challenge(
 async fn verify_identity_mutation_email_otp(
     state: State<RuntimeState>,
     request_id: Extension<String>,
-    client: Extension<ClientAddress>,
     path: Path<(String, String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::VerifyIdentityMutationEmailOtpRequest>,
@@ -2037,7 +1716,6 @@ async fn verify_identity_mutation_email_otp(
     verify_identity_mutation_email(
         state.0,
         request_id.0,
-        client.0,
         path.0,
         headers,
         request.expected_revision,
@@ -2053,7 +1731,6 @@ async fn verify_identity_mutation_email_otp(
 async fn verify_identity_mutation_email_link(
     state: State<RuntimeState>,
     request_id: Extension<String>,
-    client: Extension<ClientAddress>,
     path: Path<(String, String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::VerifyIdentityMutationEmailLinkRequest>,
@@ -2061,7 +1738,6 @@ async fn verify_identity_mutation_email_link(
     verify_identity_mutation_email(
         state.0,
         request_id.0,
-        client.0,
         path.0,
         headers,
         request.expected_revision,
@@ -2077,12 +1753,11 @@ async fn verify_identity_mutation_email_link(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the shared OTP/magic handler keeps admission, same-browser, and transfer-cookie authority explicit"
+    reason = "the shared OTP/magic handler keeps same-browser and transfer-cookie authority explicit"
 )]
 async fn verify_identity_mutation_email(
     state: RuntimeState,
     request_id: String,
-    client: ClientAddress,
     (project_public_id, interaction, proof_slot): (String, String, String),
     headers: HeaderMap,
     expected_revision: i64,
@@ -2094,24 +1769,6 @@ async fn verify_identity_mutation_email(
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    let endpoint = match proof_kind {
-        application::EmailProofKind::Otp => AdmissionEndpoint::EmailOtpVerify,
-        application::EmailProofKind::MagicLink => AdmissionEndpoint::EmailMagicConfirm,
-    };
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        endpoint,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let binding = required_interaction_cookie(&headers, &interaction).ok();
     let (Ok(proof_slot_id), Ok(challenge_id)) =
@@ -2202,27 +1859,12 @@ async fn verify_identity_mutation_email(
 async fn confirm_identity_mutation_ready(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::ConfirmHostedIdentityMutationRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::HostedInteraction,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -2335,7 +1977,6 @@ struct ManagedReauthorizationHostedBootstrap {
 async fn managed_reauthorization_shell(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(interaction): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -2346,20 +1987,6 @@ async fn managed_reauthorization_shell(
             "Managed reauthorization must start from a top-level document navigation.",
             &request_id,
         );
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::HostedInteraction,
-        &[admission_dimension(
-            AdmissionDimensionKind::Credential,
-            &interaction,
-        )],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(cookie_name) = interaction_cookie_name(&interaction) else {
         return runtime_document_error(
@@ -2427,27 +2054,12 @@ async fn managed_reauthorization_shell(
 async fn start_managed_reauthorization(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::StartManagedReauthorizationRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::ManagedReauthorizationStart,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -2473,28 +2085,12 @@ async fn start_managed_reauthorization(
 async fn select_provider_method(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::SelectProviderRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::ProviderSelection,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-            admission_dimension(AdmissionDimensionKind::Provider, &request.provider_key),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -2519,27 +2115,12 @@ async fn select_provider_method(
 async fn select_email_method(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::SelectEmailRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::EmailSelection,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -2571,121 +2152,39 @@ async fn select_email_method(
 async fn begin_email_challenge(
     state: State<RuntimeState>,
     request_id: Extension<String>,
-    client: Extension<ClientAddress>,
     path: Path<(String, String)>,
     headers: HeaderMap,
     request: RuntimeJson<runtime_types::BeginEmailChallengeRequest>,
 ) -> Response {
-    email_challenge(state, request_id, client, path, headers, request, false).await
+    email_challenge(state, request_id, path, headers, request).await
 }
 
 async fn resend_email_challenge(
     state: State<RuntimeState>,
     request_id: Extension<String>,
-    client: Extension<ClientAddress>,
     path: Path<(String, String)>,
     headers: HeaderMap,
     request: RuntimeJson<runtime_types::BeginEmailChallengeRequest>,
 ) -> Response {
-    email_challenge(state, request_id, client, path, headers, request, true).await
-}
-
-async fn after_email_pre_authority<T, E, F, Fut>(
-    admission: &AdmissionService,
-    endpoint: AdmissionEndpoint,
-    client_address: &str,
-    interaction: &str,
-    authority: F,
-) -> Result<Result<T, E>, u64>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-{
-    match admission
-        .admit_email_pre_authority(endpoint, client_address, interaction)
-        .await
-    {
-        AdmissionDecision::Allowed => Ok(authority().await),
-        AdmissionDecision::Rejected {
-            retry_after_seconds,
-            ..
-        } => Err(retry_after_seconds),
-    }
+    email_challenge(state, request_id, path, headers, request).await
 }
 
 async fn email_challenge(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::BeginEmailChallengeRequest>,
-    resend: bool,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
     }
-    let Ok(canonical_email) = crate::domain::CanonicalEmail::parse_v1(&request.email) else {
-        return runtime_problem(ApplicationError::InvalidInput, &request_id);
-    };
-    let endpoint = if resend {
-        AdmissionEndpoint::EmailResend
-    } else {
-        AdmissionEndpoint::EmailChallenge
-    };
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
     };
     let service = match runtime_auth(&state) {
         Ok(service) => service,
         Err(error) => return runtime_problem(error, &request_id),
-    };
-    // This hard gate uses only request-derived, purpose-separated digests. The authority closure
-    // cannot run until it passes, making the no-PostgreSQL-on-rejection invariant testable.
-    let scope =
-        match after_email_pre_authority(&state.admission, endpoint, &client.0, &interaction, || {
-            service.email_admission_scope(&project_public_id, &interaction, &binding)
-        })
-        .await
-        {
-            Ok(Ok(scope)) => scope,
-            Ok(Err(error)) => return runtime_problem(error, &request_id),
-            Err(retry_after_seconds) => {
-                return runtime_rate_limited_response(retry_after_seconds, &request_id);
-            }
-        };
-    // Project and Application scope come from persisted interaction authority, never request
-    // dimensions. This second stage consumes only authoritative owner/address buckets: request
-    // client and opaque interaction quota were consumed exactly once by the hard pre-gate.
-    let authoritative_project = scope.project_id.to_string();
-    let authoritative_application = scope.application_id.to_string();
-    let dimensions = [
-        admission_dimension(AdmissionDimensionKind::Project, &authoritative_project),
-        admission_dimension(
-            AdmissionDimensionKind::Application,
-            &authoritative_application,
-        ),
-        scoped_email_admission_dimension(
-            canonical_email.expose(),
-            &authoritative_project,
-            &authoritative_application,
-        ),
-    ];
-    let suppress_delivery = match state
-        .admission
-        .admit_email_authoritative(endpoint, &dimensions)
-        .await
-    {
-        AdmissionDecision::Allowed => false,
-        AdmissionDecision::Rejected {
-            reason: application::AdmissionRejectionReason::Quota,
-            suppression_eligible: true,
-            ..
-        } => true,
-        AdmissionDecision::Rejected {
-            retry_after_seconds,
-            ..
-        } => return runtime_rate_limited_response(retry_after_seconds, &request_id),
     };
     let result = service
         .begin_email_challenge(BeginEmailChallenge {
@@ -2695,7 +2194,6 @@ async fn email_challenge(
             csrf: request.csrf,
             expected_revision: request.expected_revision,
             email: request.email,
-            suppress_delivery,
         })
         .await
         .map(|accepted| runtime_types::EmailChallengeAcceptedResponse {
@@ -2712,7 +2210,6 @@ async fn email_challenge(
 async fn verify_email_otp(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::VerifyEmailOtpRequest>,
@@ -2724,20 +2221,6 @@ async fn verify_email_otp(
         || !request.otp.bytes().all(|byte| byte.is_ascii_digit())
     {
         return runtime_problem(ApplicationError::InvalidInput, &request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::EmailOtpVerify,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -2774,7 +2257,6 @@ async fn verify_email_otp(
 async fn confirm_email_magic(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::ConfirmEmailMagicRequest>,
@@ -2789,20 +2271,6 @@ async fn confirm_email_magic(
         });
     if !(22..=128).contains(&request.proof.len()) || !canonical_magic_proof {
         return runtime_problem(ApplicationError::InvalidInput, &request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::EmailMagicConfirm,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &request.challenge_id),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(challenge_id) = Uuid::parse_str(&request.challenge_id) else {
         return runtime_problem(ApplicationError::InvalidInput, &request_id);
@@ -2895,8 +2363,6 @@ fn email_completion_response(
 
 async fn email_magic_confirmation_shell(
     State(state): State<RuntimeState>,
-    Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(challenge_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -2906,17 +2372,6 @@ async fn email_magic_confirmation_shell(
             "Link unavailable",
             "Open this link in a browser to continue.",
         );
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::EmailMagicRead,
-        &[],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(challenge_id) = Uuid::parse_str(&challenge_id) else {
         return runtime_document_error(
@@ -2963,27 +2418,12 @@ async fn email_magic_confirmation_shell(
 async fn reuse_browser_session(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::ConfirmSessionReuseRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::SessionReuse,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &interaction),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(binding) = required_interaction_cookie(&headers, &interaction) else {
         return invalid_cookie(&request_id);
@@ -3100,7 +2540,6 @@ fn should_clear_identity_callback_alias<T>(result: &Result<T, ApplicationError>)
 async fn provider_callback(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, provider_key)): Path<(String, String)>,
     Query(query): Query<ProviderCallbackQuery>,
     headers: HeaderMap,
@@ -3113,21 +2552,6 @@ async fn provider_callback(
         ProviderCallbackPayload::Success { state, .. }
         | ProviderCallbackPayload::Denial { state, .. } => state,
     };
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::ProviderCallback,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Provider, &provider_key),
-            admission_dimension(AdmissionDimensionKind::Credential, callback_state),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     // Classify exactly one typed owner before reading any class-specific cookie. There is no
     // probing or fallback after this authority decision, and no provider transport has run yet.
     let Ok(state_id) = validate_interaction_credential(callback_state) else {
@@ -3491,31 +2915,10 @@ async fn provider_callback(
 async fn exchange_handoff(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::HandoffExchangeRequest>,
 ) -> Response {
-    if let Err(response) = admit_runtime_with_verified_cors(
-        &state,
-        &client,
-        AdmissionEndpoint::HandoffExchange,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Application, &request.application_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &request.handoff),
-        ],
-        &headers,
-        VerifiedOriginSubject::Application {
-            project_public_id: &project_public_id,
-            application_public_id: &request.application_id,
-        },
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let cors_origin = match application_cors_origin(
         &state,
         &headers,
@@ -3552,31 +2955,10 @@ async fn exchange_handoff(
 async fn refresh_session(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::RefreshRequest>,
 ) -> Response {
-    if let Err(response) = admit_runtime_with_verified_cors(
-        &state,
-        &client,
-        AdmissionEndpoint::Refresh,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Application, &request.application_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &request.refresh_token),
-        ],
-        &headers,
-        VerifiedOriginSubject::Application {
-            project_public_id: &project_public_id,
-            application_public_id: &request.application_id,
-        },
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let cors_origin = match application_cors_origin(
         &state,
         &headers,
@@ -3612,32 +2994,12 @@ async fn refresh_session(
 async fn current_user(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(token) = bearer_token(&headers) else {
         return unauthorized_runtime(&request_id);
     };
-    if let Err(response) = admit_runtime_with_verified_cors(
-        &state,
-        &client,
-        AdmissionEndpoint::CurrentUser,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &token),
-        ],
-        &headers,
-        VerifiedOriginSubject::Credential {
-            project_public_id: &project_public_id,
-            credential: &token,
-        },
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let cors_origin =
         match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
             Ok(origin) => origin,
@@ -3661,12 +3023,6 @@ async fn current_user(
                 if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
                     Err(ApplicationError::NotFound)
                 } else {
-                    remember_verified_credential_origin(
-                        &state,
-                        &project_public_id,
-                        &token,
-                        cors_origin.as_deref(),
-                    );
                     user_projection(current.projection_document).and_then(|projection| {
                         let projection_revision = projection.projection_revision;
                         if current.projection_revision != projection_revision {
@@ -3698,32 +3054,12 @@ async fn current_user(
 async fn logout_application_session(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(token) = bearer_token(&headers) else {
         return unauthorized_runtime(&request_id);
     };
-    if let Err(response) = admit_runtime_with_verified_cors(
-        &state,
-        &client,
-        AdmissionEndpoint::ApplicationLogout,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &token),
-        ],
-        &headers,
-        VerifiedOriginSubject::Credential {
-            project_public_id: &project_public_id,
-            credential: &token,
-        },
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let cors_origin =
         match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
             Ok(origin) => origin,
@@ -3747,12 +3083,6 @@ async fn logout_application_session(
                 if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
                     Err(ApplicationError::NotFound)
                 } else {
-                    remember_verified_credential_origin(
-                        &state,
-                        &project_public_id,
-                        &token,
-                        cors_origin.as_deref(),
-                    );
                     service
                         .logout_application(current)
                         .await
@@ -3773,32 +3103,12 @@ async fn logout_application_session(
 async fn prepare_browser_logout(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(token) = bearer_token(&headers) else {
         return unauthorized_runtime(&request_id);
     };
-    if let Err(response) = admit_runtime_with_verified_cors(
-        &state,
-        &client,
-        AdmissionEndpoint::BrowserLogoutPrepare,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &token),
-        ],
-        &headers,
-        VerifiedOriginSubject::Credential {
-            project_public_id: &project_public_id,
-            credential: &token,
-        },
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let cors_origin =
         match project_cors_origin(&state, &headers, &project_public_id, &request_id).await {
             Ok(origin) => origin,
@@ -3822,12 +3132,6 @@ async fn prepare_browser_logout(
                 if current.project_public_id != project_public_id || origin_allowed != Ok(true) {
                     Err(ApplicationError::NotFound)
                 } else {
-                    remember_verified_credential_origin(
-                        &state,
-                        &project_public_id,
-                        &token,
-                        cors_origin.as_deref(),
-                    );
                     service.prepare_browser_logout(&token).await.map(|target| {
                         runtime_types::BrowserLogoutPreparationResponse {
                             hosted_url: target.hosted_url,
@@ -3850,7 +3154,6 @@ async fn prepare_browser_logout(
 async fn browser_logout_shell(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(preparation): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -3861,20 +3164,6 @@ async fn browser_logout_shell(
             "Browser logout confirmation requires a top-level document navigation.",
             &request_id,
         );
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::BrowserLogoutRead,
-        &[admission_dimension(
-            AdmissionDimensionKind::Credential,
-            &preparation,
-        )],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let Ok(service) = runtime_auth(&state) else {
         return runtime_document_error(
@@ -3935,27 +3224,12 @@ async fn browser_logout_shell(
 async fn confirm_browser_logout(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path((project_public_id, preparation)): Path<(String, String)>,
     headers: HeaderMap,
     RuntimeJson(request): RuntimeJson<runtime_types::ConfirmBrowserLogoutRequest>,
 ) -> Response {
     if !is_same_origin_mutation(&headers, &state.external_origin) {
         return forbidden_hosted_request(&request_id);
-    }
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::BrowserLogoutConfirm,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Credential, &preparation),
-        ],
-        &request_id,
-    )
-    .await
-    {
-        return response;
     }
     let cookie_name = project_session_cookie_name(&project_public_id);
     let Ok(Some(browser_session)) = cookie_value(&headers, &cookie_name) else {
@@ -4005,17 +3279,7 @@ async fn auth_readiness(State(state): State<AuthProbeState>) -> Response {
         Some(readiness) => readiness.readiness().await.is_ok(),
         None => true,
     };
-    if !runtime_ready {
-        return readiness_response(false);
-    }
-    let server_ready = match state.server_readiness.as_deref() {
-        Some(readiness) => readiness
-            .readiness()
-            .await
-            .is_ok_and(|snapshot| snapshot.is_ready()),
-        None => true,
-    };
-    readiness_response(server_ready)
+    readiness_response(runtime_ready)
 }
 
 async fn control_readiness(State(state): State<ControlState>) -> Response {
@@ -4398,7 +3662,6 @@ where
 
 async fn require_server_key(
     State(state): State<ServerState>,
-    Extension(client): Extension<ClientAddress>,
     Path(parameters): Path<HashMap<String, String>>,
     mut request: Request,
     next: Next,
@@ -4408,18 +3671,11 @@ async fn require_server_key(
         .get::<String>()
         .cloned()
         .unwrap_or_else(|| "unavailable".to_owned());
-    if let AdmissionDecision::Rejected {
-        retry_after_seconds,
-        ..
-    } = state.admission.admit_server_pre_authority(&client.0).await
-    {
-        return server_rate_limited_response(retry_after_seconds, &request_id);
-    }
     let Some(project_public_id) = parameters.get("project_id") else {
         return server_problem(ApplicationError::InvalidInput, &request_id);
     };
     let Some(credential) = server_bearer_credential(request.headers()) else {
-        return server_credential_denial(&state, &client, &request_id).await;
+        return unauthorized_server(&request_id);
     };
     let service = match server_api(&state) {
         Ok(service) => service,
@@ -4428,18 +3684,6 @@ async fn require_server_key(
     let principal = service.authenticate(project_public_id, credential).await;
     match principal {
         Ok(principal) => {
-            let project_id = principal.project_id.to_string();
-            let key_id = principal.key_id.to_string();
-            if let AdmissionDecision::Rejected {
-                retry_after_seconds,
-                ..
-            } = state
-                .admission
-                .admit_server_authoritative(&client.0, &project_id, &key_id)
-                .await
-            {
-                return server_rate_limited_response(retry_after_seconds, &request_id);
-            }
             service.observe_server_key_usage(&principal);
             request.headers_mut().remove(header::AUTHORIZATION);
             request.extensions_mut().insert(principal);
@@ -4450,25 +3694,7 @@ async fn require_server_key(
             | ApplicationError::Persistence
             | ApplicationError::ExternalStore,
         ) => server_problem(ApplicationError::Persistence, &request_id),
-        Err(_) => server_credential_denial(&state, &client, &request_id).await,
-    }
-}
-
-async fn server_credential_denial(
-    state: &ServerState,
-    client: &ClientAddress,
-    request_id: &str,
-) -> Response {
-    match state
-        .admission
-        .admit_server_credential_failure(&client.0)
-        .await
-    {
-        AdmissionDecision::Allowed => unauthorized_server(request_id),
-        AdmissionDecision::Rejected {
-            retry_after_seconds,
-            ..
-        } => server_rate_limited_response(retry_after_seconds, request_id),
+        Err(_) => unauthorized_server(&request_id),
     }
 }
 
@@ -4495,23 +3721,6 @@ async fn require_operator(
         .cloned()
         .unwrap_or_else(|| "unavailable".to_owned());
     if !valid_control_authorization(request.headers(), &state.operator_key) {
-        let source = request
-            .extensions()
-            .get::<ClientAddress>()
-            .map_or("unknown", |client| client.0.as_str());
-        if let Some(retry_after) = state.credential_failures.record(source, Instant::now()) {
-            let mut response = control_problem(
-                StatusCode::TOO_MANY_REQUESTS,
-                "credential_rate_limited",
-                "Authentication rate limited",
-                "Too many invalid operator credentials were presented from this source.",
-                &request_id,
-            );
-            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, value);
-            }
-            return response;
-        }
         return bearer_challenge(control_problem(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -4990,6 +4199,13 @@ fn managed_connection_response(
 fn control_lifecycle(state: &ControlState) -> Result<&ControlLifecycleService, ApplicationError> {
     state
         .lifecycle
+        .as_deref()
+        .ok_or(ApplicationError::Persistence)
+}
+
+fn control_overview(state: &ControlState) -> Result<&ControlOverviewService, ApplicationError> {
+    state
+        .overview
         .as_deref()
         .ok_or(ApplicationError::Persistence)
 }
@@ -6419,6 +5635,48 @@ async fn revoke_project_server_key(
             .await
         {
             Ok(key) => Json(control_project_server_key(key)).into_response(),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn get_project_overview(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match control_overview(&state) {
+        Ok(service) => match service.get_project_overview(project_id).await {
+            Ok(summary) => Json(control_types::ProjectOverviewSummary {
+                project_id: summary.project_id.to_string(),
+                applications: control_types::ProjectOverviewApplicationCounts {
+                    total: summary.applications.total,
+                    active: summary.applications.active,
+                    configured: summary.applications.configured,
+                },
+                providers: control_types::ProjectOverviewProviderCounts {
+                    total: summary.providers.total,
+                    active: summary.providers.active,
+                    active_assignments: summary.providers.active_assignments,
+                },
+                users: control_types::ProjectOverviewUserCounts {
+                    total: summary.users.total,
+                    active: summary.users.active,
+                    disabled: summary.users.disabled,
+                    merged: summary.users.merged,
+                },
+                project_server_keys: control_types::ProjectOverviewServerKeyCounts {
+                    total: summary.project_server_keys.total,
+                    active: summary.project_server_keys.active,
+                    revoked: summary.project_server_keys.revoked,
+                },
+            })
+            .into_response(),
             Err(error) => application_problem(error, &request_id),
         },
         Err(error) => application_problem(error, &request_id),
@@ -7946,6 +7204,129 @@ async fn create_provider(
     }
 }
 
+async fn update_provider(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, provider_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::UpdateProviderRequest>,
+) -> Response {
+    let (project_id, provider_id) = match resource_pair(&project_id, &provider_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .update_provider(
+                project_id,
+                provider_id,
+                UpdateProvider {
+                    display_name: body.display_name,
+                    client_id: body.client_id,
+                    expected_provider_revision: body.expected_provider_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(provider) => control_json(control_provider(provider), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn replace_provider_secret(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, provider_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    ControlJson(body): ControlJson<control_types::ReplaceProviderSecretRequest>,
+) -> Response {
+    let (project_id, provider_id) = match resource_pair(&project_id, &provider_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    let Ok(idempotency_key) = idempotency_key(&headers) else {
+        return invalid_idempotency(&request_id);
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .replace_provider_secret(
+                project_id,
+                provider_id,
+                ReplaceProviderSecret {
+                    display_name: body.display_name,
+                    client_id: body.client_id,
+                    client_secret: zeroize::Zeroizing::new(body.client_secret),
+                    idempotency_key,
+                    expected_provider_revision: body.expected_provider_revision,
+                },
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(provider) => control_json(control_provider(provider), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn reconcile_provider_secret_replacement(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, provider_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::ReconcileProviderSecretReplacementRequest>,
+) -> Response {
+    let (project_id, provider_id) = match resource_pair(&project_id, &provider_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .reconcile_provider_secret_replacement(
+                project_id,
+                provider_id,
+                zeroize::Zeroizing::new(body.client_secret),
+                body.expected_provider_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(provider) => control_json(control_provider(provider), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn abandon_provider_secret_replacement(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path((project_id, provider_id)): Path<(String, String)>,
+    ControlJson(body): ControlJson<control_types::ProviderRevisionRequest>,
+) -> Response {
+    let (project_id, provider_id) = match resource_pair(&project_id, &provider_id, &request_id) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .abandon_provider_secret_replacement(
+                project_id,
+                provider_id,
+                body.expected_provider_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(provider) => control_json(control_provider(provider), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
 async fn reconcile_provider(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -8097,7 +7478,6 @@ struct PublicConfigQuery {
 async fn public_application_config(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
     headers: HeaderMap,
     query: Result<Query<PublicConfigQuery>, axum::extract::rejection::QueryRejection>,
@@ -8105,25 +7485,6 @@ async fn public_application_config(
     let Ok(Query(query)) = query else {
         return runtime_problem(ApplicationError::InvalidInput, &request_id);
     };
-    if let Err(response) = admit_runtime_with_verified_cors(
-        &state,
-        &client,
-        AdmissionEndpoint::PublicConfig,
-        &[
-            admission_dimension(AdmissionDimensionKind::Project, &project_public_id),
-            admission_dimension(AdmissionDimensionKind::Application, &query.application_id),
-        ],
-        &headers,
-        VerifiedOriginSubject::Application {
-            project_public_id: &project_public_id,
-            application_public_id: &query.application_id,
-        },
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let cors_origin = match public_application_cors_origin(
         &state,
         &headers,
@@ -8180,23 +7541,8 @@ async fn public_application_config(
 async fn project_jwks(
     State(state): State<RuntimeState>,
     Extension(request_id): Extension<String>,
-    Extension(client): Extension<ClientAddress>,
     Path(project_public_id): Path<String>,
 ) -> Response {
-    if let Err(response) = admit_runtime(
-        &state,
-        &client,
-        AdmissionEndpoint::ProjectJwks,
-        &[admission_dimension(
-            AdmissionDimensionKind::Project,
-            &project_public_id,
-        )],
-        &request_id,
-    )
-    .await
-    {
-        return response;
-    }
     let service = match readiness(&state) {
         Ok(service) => service,
         Err(error) => return runtime_problem(error, &request_id),
@@ -8606,13 +7952,6 @@ async fn application_cors_origin(
             request_id,
         ));
     }
-    state.verified_origins.remember(
-        VerifiedOriginSubject::Application {
-            project_public_id,
-            application_public_id,
-        },
-        &origin,
-    );
     Ok(Some(origin))
 }
 
@@ -8647,31 +7986,7 @@ async fn public_application_cors_origin(
             request_id,
         ));
     }
-    state.verified_origins.remember(
-        VerifiedOriginSubject::Application {
-            project_public_id,
-            application_public_id,
-        },
-        &origin,
-    );
     Ok(Some(origin))
-}
-
-fn remember_verified_credential_origin(
-    state: &RuntimeState,
-    project_public_id: &str,
-    credential: &str,
-    origin: Option<&str>,
-) {
-    if let Some(origin) = origin {
-        state.verified_origins.remember(
-            VerifiedOriginSubject::Credential {
-                project_public_id,
-                credential,
-            },
-            origin,
-        );
-    }
 }
 
 async fn project_cors_origin(
@@ -8990,6 +8305,7 @@ fn control_provider(
         revision: provider.revision,
         login_supported: domain_kind.capabilities().login,
         identity_proof_supported: domain_kind.capabilities().identity_proof,
+        secret_replacement_pending: provider.secret_replacement_pending,
         managed_profile: control_types::ProviderManagedProfileCapability {
             supported: managed_supported,
             enabled: provider.managed_profile_enabled,
@@ -9042,6 +8358,7 @@ where
 }
 
 fn application_problem(error: ApplicationError, request_id: &str) -> Response {
+    log_application_error("control", error, request_id);
     let (status, code, title, detail) = match error {
         ApplicationError::InvalidInput => (
             StatusCode::BAD_REQUEST,
@@ -9078,18 +8395,6 @@ fn application_problem(error: ApplicationError, request_id: &str) -> Response {
             "operation_in_progress",
             "Operation in progress",
             "The durable operation has not completed yet.",
-        ),
-        ApplicationError::PublicationPending => (
-            StatusCode::CONFLICT,
-            "publication_pending",
-            "Publication pending",
-            "Runtime has not observed this key revision for the propagation interval.",
-        ),
-        ApplicationError::ServerVerifierUnavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_verifier_unavailable",
-            "Server verifier fleet unavailable",
-            "The required Server verifier fleet is not ready for this credential version.",
         ),
         ApplicationError::InvalidTransition => (
             StatusCode::CONFLICT,
@@ -9168,6 +8473,7 @@ where
 }
 
 fn server_problem(error: ApplicationError, request_id: &str) -> Response {
+    log_application_error("server", error, request_id);
     let (status, code, message) = match error {
         ApplicationError::InvalidInput => (
             StatusCode::BAD_REQUEST,
@@ -9183,15 +8489,13 @@ fn server_problem(error: ApplicationError, request_id: &str) -> Response {
         | ApplicationError::InvalidTransition
         | ApplicationError::CapacityExceeded
         | ApplicationError::IdempotencyConflict
-        | ApplicationError::OperationInProgress
-        | ApplicationError::PublicationPending => (
+        | ApplicationError::OperationInProgress => (
             StatusCode::CONFLICT,
             server_types::ServerErrorCode::Conflict,
             "The Server API request is no longer valid in the current state.",
         ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
-        | ApplicationError::ServerVerifierUnavailable
         | ApplicationError::ProviderPreflightRejected
         | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
@@ -9201,20 +8505,6 @@ fn server_problem(error: ApplicationError, request_id: &str) -> Response {
         ),
     };
     server_error_response(status, code, message, request_id)
-}
-
-fn server_rate_limited_response(retry_after_seconds: u64, request_id: &str) -> Response {
-    let retry_after_seconds = retry_after_seconds.clamp(1, 60);
-    let mut response = server_error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        server_types::ServerErrorCode::RateLimited,
-        "The Server API request rate limit was exceeded.",
-        request_id,
-    );
-    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
-        response.headers_mut().insert(header::RETRY_AFTER, value);
-    }
-    response
 }
 
 fn unauthorized_server(request_id: &str) -> Response {
@@ -9248,6 +8538,7 @@ fn server_error_response(
 }
 
 fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
+    log_application_error("runtime", error, request_id);
     let (status, code, message) = match error {
         ApplicationError::NotFound | ApplicationError::Disabled => (
             StatusCode::NOT_FOUND,
@@ -9263,15 +8554,13 @@ fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
         | ApplicationError::InvalidTransition
         | ApplicationError::CapacityExceeded
         | ApplicationError::IdempotencyConflict
-        | ApplicationError::OperationInProgress
-        | ApplicationError::PublicationPending => (
+        | ApplicationError::OperationInProgress => (
             StatusCode::CONFLICT,
             "invalid_state",
             "The Runtime operation is no longer valid in the current state.",
         ),
         ApplicationError::Integrity
         | ApplicationError::Persistence
-        | ApplicationError::ServerVerifierUnavailable
         | ApplicationError::ProviderPreflightRejected
         | ApplicationError::ProviderPreflightUnavailable
         | ApplicationError::ExternalStore => (
@@ -9281,6 +8570,41 @@ fn runtime_problem(error: ApplicationError, request_id: &str) -> Response {
         ),
     };
     runtime_error_response(status, code, message, request_id)
+}
+
+fn log_application_error(
+    plane: &'static str,
+    application_error: ApplicationError,
+    request_id: &str,
+) {
+    match application_error {
+        ApplicationError::Integrity => error!(
+            event = "application_operation_failed",
+            plane,
+            %request_id,
+            error = ?application_error,
+            outcome = "integrity_failure",
+            "application operation failed closed"
+        ),
+        ApplicationError::Persistence
+        | ApplicationError::ExternalStore
+        | ApplicationError::ProviderPreflightUnavailable => warn!(
+            event = "application_operation_failed",
+            plane,
+            %request_id,
+            error = ?application_error,
+            outcome = "dependency_unavailable",
+            "application operation could not reach an authority"
+        ),
+        _ => debug!(
+            event = "application_operation_rejected",
+            plane,
+            %request_id,
+            error = ?application_error,
+            outcome = "rejected",
+            "application operation was rejected safely"
+        ),
+    }
 }
 
 fn runtime_error_response(
@@ -9384,10 +8708,30 @@ fn valid_control_authorization(headers: &HeaderMap, expected: &OperatorApiKey) -
         .is_some_and(|candidate| expected.matches(candidate.as_bytes()))
 }
 
-async fn response_policy(plane: HttpPlane, mut request: Request, next: Next) -> Response {
+async fn response_policy(
+    plane: HttpPlane,
+    listener_base_path: Arc<str>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let correlation_id = Uuid::new_v4().to_string();
     request.extensions_mut().insert(correlation_id.clone());
     let method = request.method().clone();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str)
+        .to_owned();
+    let probe = is_probe_route(&route, &listener_base_path);
+    let started = Instant::now();
+    debug!(
+        event = "http_request_started",
+        plane = plane.as_str(),
+        %correlation_id,
+        method = %method,
+        %route,
+        "request started"
+    );
     let mut response = next.run(request).await;
 
     response.headers_mut().insert(
@@ -9422,15 +8766,53 @@ async fn response_policy(plane: HttpPlane, mut request: Request, next: Next) -> 
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
 
-    info!(
-        event = "http_request_completed",
-        plane = plane.as_str(),
-        %correlation_id,
-        method = %method,
-        status = response.status().as_u16(),
-        "request completed"
-    );
+    let status = response.status();
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if probe {
+        debug!(
+            event = "http_request_completed",
+            plane = plane.as_str(),
+            %correlation_id,
+            method = %method,
+            %route,
+            status = status.as_u16(),
+            latency_ms,
+            outcome = if status.is_success() { "success" } else { "unavailable" },
+            "probe completed"
+        );
+    } else if status.is_server_error() {
+        warn!(
+            event = "http_request_completed",
+            plane = plane.as_str(),
+            %correlation_id,
+            method = %method,
+            %route,
+            status = status.as_u16(),
+            latency_ms,
+            outcome = "server_error",
+            "request completed with a server error"
+        );
+    } else {
+        info!(
+            event = "http_request_completed",
+            plane = plane.as_str(),
+            %correlation_id,
+            method = %method,
+            %route,
+            status = status.as_u16(),
+            latency_ms,
+            outcome = if status.is_client_error() { "client_error" } else { "success" },
+            "request completed"
+        );
+    }
     response
+}
+
+fn is_probe_route(route: &str, listener_base_path: &str) -> bool {
+    let base = listener_base_path.trim_end_matches('/');
+    route
+        .strip_prefix(base)
+        .is_some_and(|relative| matches!(relative, "/health" | "/ready"))
 }
 
 #[cfg(test)]
@@ -9478,13 +8860,6 @@ pub(crate) mod tests {
             _project_public_id: &str,
         ) -> Result<application::JwksDocument, ApplicationError> {
             panic!("readiness probe must not load Project JWKS")
-        }
-
-        async fn observe_signing_revisions(
-            &self,
-            _limit: usize,
-        ) -> Result<usize, ApplicationError> {
-            panic!("readiness probe must not mutate signing observations")
         }
     }
 
@@ -9793,13 +9168,6 @@ pub(crate) mod tests {
                 ready: Arc::new(AtomicBool::new(true)),
                 base_path: Arc::from("/runtime/"),
             },
-            admission: Arc::new(AdmissionService::new(
-                format!("identity-http-{}", Uuid::new_v4()),
-                [77; 32],
-                1,
-                None,
-            )),
-            verified_origins: Arc::new(VerifiedApplicationOrigins::default()),
             readiness: None,
             auth: None,
             callback_owners,
@@ -9860,7 +9228,6 @@ pub(crate) mod tests {
         let authority = Arc::new(TestIdentityMutationAuthority::posts());
         let state = test_identity_runtime_state(authority.clone(), None);
         let request_id = || Extension("identity-handler-test".to_owned());
-        let client = || Extension(ClientAddress("203.0.113.125".to_owned()));
         let proof_path = || {
             Path((
                 TEST_PROJECT.to_owned(),
@@ -9872,7 +9239,6 @@ pub(crate) mod tests {
         let response = select_identity_mutation_method(
             State(state.clone()),
             request_id(),
-            client(),
             proof_path(),
             same_origin_headers(Some(interaction_cookie())),
             RuntimeJson(runtime_types::SelectIdentityMutationMethodRequest {
@@ -9896,7 +9262,6 @@ pub(crate) mod tests {
         let response = begin_identity_mutation_email_challenge(
             State(state.clone()),
             request_id(),
-            client(),
             proof_path(),
             same_origin_headers(Some(interaction_cookie())),
             RuntimeJson(runtime_types::BeginIdentityMutationEmailChallengeRequest {
@@ -9911,7 +9276,6 @@ pub(crate) mod tests {
         let response = verify_identity_mutation_email_otp(
             State(state.clone()),
             request_id(),
-            client(),
             proof_path(),
             same_origin_headers(Some(interaction_cookie())),
             RuntimeJson(runtime_types::VerifyIdentityMutationEmailOtpRequest {
@@ -9930,7 +9294,6 @@ pub(crate) mod tests {
         let response = verify_identity_mutation_email_link(
             State(state.clone()),
             request_id(),
-            client(),
             proof_path(),
             same_origin_headers(Some(format!("{transfer_cookie_name}=transfer-context"))),
             RuntimeJson(runtime_types::VerifyIdentityMutationEmailLinkRequest {
@@ -9953,7 +9316,6 @@ pub(crate) mod tests {
         let response = confirm_identity_mutation_ready(
             State(state),
             request_id(),
-            client(),
             Path((TEST_PROJECT.to_owned(), test_identity_interaction())),
             same_origin_headers(Some(interaction_cookie())),
             RuntimeJson(runtime_types::ConfirmHostedIdentityMutationRequest {
@@ -9999,7 +9361,6 @@ pub(crate) mod tests {
             let response = provider_callback(
                 State(state),
                 Extension("identity-callback-test".to_owned()),
-                Extension(ClientAddress("203.0.113.126".to_owned())),
                 Path((TEST_PROJECT.to_owned(), "workforce".to_owned())),
                 Query(query),
                 HeaderMap::from_iter([(
@@ -10027,55 +9388,6 @@ pub(crate) mod tests {
                     .iter()
                     .all(|cookie| !cookie.starts_with("owl_runtime_")),
                 "callback must leave the intent browser binding untouched"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn rejected_email_pre_gate_never_invokes_authority_for_challenge_or_resend() {
-        for endpoint in [
-            AdmissionEndpoint::EmailChallenge,
-            AdmissionEndpoint::EmailResend,
-        ] {
-            let admission =
-                AdmissionService::new(format!("pre-gate-{endpoint:?}"), [19; 32], 1, None);
-            let authority_calls = AtomicUsize::new(0);
-            for _ in 0..256 {
-                assert!(
-                    after_email_pre_authority(
-                        &admission,
-                        endpoint,
-                        "203.0.113.44",
-                        "opaque-interaction",
-                        || async {
-                            authority_calls.fetch_add(1, Ordering::SeqCst);
-                            Ok::<_, ()>(())
-                        },
-                    )
-                    .await
-                    .expect("pre-gate allows reviewed quota")
-                    .is_ok()
-                );
-            }
-            let before = authority_calls.load(Ordering::SeqCst);
-            assert!(
-                after_email_pre_authority(
-                    &admission,
-                    endpoint,
-                    "203.0.113.44",
-                    "opaque-interaction",
-                    || async {
-                        authority_calls.fetch_add(1, Ordering::SeqCst);
-                        Ok::<_, ()>(())
-                    },
-                )
-                .await
-                .is_err()
-            );
-            assert_eq!(
-                authority_calls.load(Ordering::SeqCst),
-                before,
-                "an exhausted pre-gate must not invoke PostgreSQL authority"
             );
         }
     }
@@ -10304,6 +9616,7 @@ pub(crate) mod tests {
             revision: 1,
             managed_profile_enabled: true,
             managed_profile_revision: 1,
+            secret_replacement_pending: false,
             assigned_application_ids: Vec::new(),
         };
         let public = control_provider(record.clone()).expect("map reviewed OIDC capability");
@@ -10550,8 +9863,22 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn mounted_probe_route_templates_are_classified_exactly() {
+        assert!(is_probe_route("/health", "/"));
+        assert!(is_probe_route("/ready", "/"));
+        assert!(is_probe_route("/identity/health", "/identity/"));
+        assert!(is_probe_route("/identity/ready", "/identity/"));
+        assert!(!is_probe_route(
+            "/identity/projects/{project_id}",
+            "/identity/"
+        ));
+        assert!(!is_probe_route("/identityish/ready", "/identity/"));
+        assert!(!is_probe_route("/identity/ready/details", "/identity/"));
+    }
+
     #[tokio::test]
-    async fn request_concurrency_is_plane_local_and_releases_its_permit() {
+    async fn request_concurrency_is_plane_local_and_backpressures_until_release() {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let entered_for_handler = Arc::clone(&entered);
@@ -10584,19 +9911,23 @@ pub(crate) mod tests {
         });
         entered_signal.await;
 
-        let rejected = router
-            .clone()
-            .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
-        let problem: runtime_types::RuntimeError =
-            serde_json::from_slice(&to_bytes(rejected.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(problem.code, "listener_capacity_exceeded");
+        let queued_router = router.clone();
+        let mut queued = tokio::spawn(async move {
+            queued_router
+                .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err(),
+            "the second request must wait without receiving a Core admission response"
+        );
 
         release.notify_one();
         assert_eq!(first.await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(queued.await.unwrap().status(), StatusCode::OK);
         assert_eq!(
             router
                 .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
@@ -10608,13 +9939,63 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn queued_requests_crossing_the_listener_deadline_return_contracted_timeouts() {
+        for (plane, expected_content_type) in [
+            (HttpPlane::Runtime, "application/json"),
+            (HttpPlane::Server, "application/json"),
+            (HttpPlane::Control, "application/problem+json"),
+        ] {
+            let permits = Arc::new(tokio::sync::Semaphore::new(1));
+            let held = Arc::clone(&permits).acquire_owned().await.unwrap();
+            let mut budget = test_http_budget();
+            budget.max_in_flight_requests = 1;
+            budget.request_timeout = Duration::from_millis(10);
+            let router = bound_with_concurrency(
+                Router::new().route(
+                    "/work",
+                    axum::routing::get(|| async { StatusCode::NO_CONTENT }),
+                ),
+                plane,
+                &budget,
+                Arc::clone(&permits),
+            );
+
+            let response = router
+                .clone()
+                .oneshot(Request::get("/work").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                expected_content_type
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["code"], "request_timeout");
+
+            drop(held);
+            assert_eq!(permits.available_permits(), 1);
+            assert_eq!(
+                router
+                    .oneshot(Request::get("/work").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NO_CONTENT,
+                "a cancelled waiter must not retain or consume the listener permit"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn auth_readiness_fails_when_runtime_authority_is_unavailable() {
         let response = auth_readiness(State(AuthProbeState {
             ready: Arc::new(AtomicBool::new(true)),
             runtime_readiness: Some(Arc::new(application::ReadinessService::new(Arc::new(
                 TestRuntimeReadinessPort { ready: false },
             )))),
-            server_readiness: None,
         }))
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -10671,22 +10052,23 @@ pub(crate) mod tests {
         });
         entered_signal.await;
 
-        let rejected = router
-            .clone()
-            .oneshot(Request::get("/server-ready").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(rejected.headers()[header::RETRY_AFTER], "1");
-        let problem: server_types::ServerError =
-            serde_json::from_slice(&to_bytes(rejected.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(
-            problem.code,
-            server_types::ServerErrorCode::TemporarilyUnavailable
+        let queued_router = router.clone();
+        let mut queued = tokio::spawn(async move {
+            queued_router
+                .oneshot(Request::get("/server-ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err(),
+            "Server and Runtime must share backpressure without inventing a 429 contract"
         );
 
         release.notify_one();
         assert_eq!(first.await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(queued.await.unwrap().status(), StatusCode::OK);
         assert_eq!(
             router
                 .oneshot(Request::get("/server-ready").body(Body::empty()).unwrap(),)
@@ -10709,6 +10091,15 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
 
+        let response = bound(base.clone(), HttpPlane::Server, &uri_budget)
+            .oneshot(Request::get("/too-long?x=1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+        let error: server_types::ServerError =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(error.code, server_types::ServerErrorCode::InvalidRequest);
+
         let mut count_budget = test_http_budget();
         count_budget.max_header_count = 1;
         let response = bound(base.clone(), HttpPlane::Server, &count_budget)
@@ -10725,6 +10116,9 @@ pub(crate) mod tests {
             response.status(),
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
         );
+        let error: server_types::ServerError =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(error.code, server_types::ServerErrorCode::InvalidRequest);
 
         let mut bytes_budget = test_http_budget();
         bytes_budget.max_header_bytes = 8;
@@ -10839,21 +10233,6 @@ pub(crate) mod tests {
         assert!(!control_browser_metadata_allowed(&duplicate_origin, origin));
     }
 
-    #[test]
-    fn control_credential_failures_are_source_keyed_and_bounded() {
-        let failures = ControlCredentialFailures::default();
-        let now = Instant::now();
-        for _ in 1..CONTROL_CREDENTIAL_FAILURE_LIMIT {
-            assert_eq!(failures.record("source-a", now), None);
-        }
-        assert_eq!(failures.record("source-a", now), Some(1));
-        assert_eq!(failures.record("source-b", now), None);
-        assert_eq!(
-            failures.record("source-a", now + CONTROL_CREDENTIAL_FAILURE_WINDOW),
-            None
-        );
-    }
-
     #[allow(
         clippy::too_many_lines,
         reason = "HTTP fixture enumerates complete Runtime and Control security configuration"
@@ -10861,7 +10240,6 @@ pub(crate) mod tests {
     pub(crate) fn test_config(mode: ProcessMode) -> ServerConfig {
         test_config_with_identity_material(
             mode,
-            "http-test-runtime",
             "test-deployment",
             "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0",
             "Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4-Pj4",
@@ -10872,7 +10250,6 @@ pub(crate) mod tests {
     pub(crate) fn identity_mutation_composition_config(mode: ProcessMode) -> ServerConfig {
         test_config_with_identity_material(
             mode,
-            "identity-mutation-test",
             "identity-mutation-test",
             "CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws",
             "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw",
@@ -10887,7 +10264,6 @@ pub(crate) mod tests {
     )]
     fn test_config_with_identity_material(
         mode: ProcessMode,
-        auth_process_id: &str,
         instance_id: &str,
         email_digest_key: &str,
         email_protection_key: &str,
@@ -10899,15 +10275,6 @@ pub(crate) mod tests {
                 "OWLAUTH_POSTGRES_URL".to_owned(),
                 "postgres://owlauth:test@127.0.0.1/owlauth".to_owned(),
             ),
-            (
-                "OWLAUTH_AUTH_PROCESS_ID".to_owned(),
-                auth_process_id.to_owned(),
-            ),
-            (
-                "OWLAUTH_REQUIRED_AUTH_PROCESS_IDS".to_owned(),
-                auth_process_id.to_owned(),
-            ),
-            ("OWLAUTH_AUTH_MAX_PROCESSES".to_owned(), "64".to_owned()),
             ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
             (
                 "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
@@ -10961,10 +10328,6 @@ pub(crate) mod tests {
                 "OWLAUTH_IDENTITY_MUTATION_EVIDENCE_PROTECTION_KEY".to_owned(),
                 "ERERERERERERERERERERERERERERERERERERERERERE".to_owned(),
             ),
-            (
-                "OWLAUTH_ADMISSION_DIGEST_KEY".to_owned(),
-                "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU".to_owned(),
-            ),
             ("OWLAUTH_CONTROL_API_KEY".to_owned(), key),
             ("OWLAUTH_INSTANCE_ID".to_owned(), instance_id.to_owned()),
             (
@@ -11012,251 +10375,6 @@ pub(crate) mod tests {
             );
         }
         ServerConfig::from_values_for_test(&values).expect("test config should parse")
-    }
-
-    #[tokio::test]
-    async fn runtime_admission_returns_bounded_429_before_downstream_authority() {
-        let config = test_config(ProcessMode::Auth);
-        let mut routers = build_routers(&config, None);
-        let router = routers.runtime.take().expect("Runtime router exists");
-        let uri = "/v1/projects/project/auth/config?application_id=application";
-
-        for _ in 0..9 {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::get(uri)
-                        .header(header::ORIGIN, "https://unverified.example")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        }
-        let response = router
-            .oneshot(
-                Request::get(uri)
-                    .header(header::ORIGIN, "https://unverified.example")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let retry_after = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
-        assert!((1..=60).contains(&retry_after));
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-store"
-        );
-        assert!(
-            !response
-                .headers()
-                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
-            "an unverified Origin must never be reflected"
-        );
-        assert!(
-            response
-                .headers()
-                .get_all(header::VARY)
-                .iter()
-                .any(|value| value == "Origin"),
-            "admission responses must vary by Origin even when it is not reflected"
-        );
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let problem: runtime_types::RuntimeError = serde_json::from_slice(&body).unwrap();
-        assert_eq!(problem.code, "rate_limited");
-        assert_eq!(
-            problem.message,
-            "The Runtime request rate limit was exceeded."
-        );
-        assert!(!problem.request_id.is_empty());
-        assert!(problem.request_id.len() <= 128);
-    }
-
-    #[tokio::test]
-    async fn managed_reauthorization_start_rejects_concurrency_before_runtime_services() {
-        let config = test_config(ProcessMode::Auth);
-        let origin = config.auth.external_base.origin().ascii_serialization();
-        // Compose the real PostgreSQL repository and OIDC discovery client around a disconnected
-        // database sentinel. Touching either downstream path would fail instead of yielding 429.
-        let pools = DatabasePools {
-            runtime: Some(DatabaseConnection::default()),
-            server: None,
-            control: None,
-        };
-        let mut routers = build_routers(&config, Some(&pools));
-        assert!(routers.runtime_auth.is_some());
-        let router = routers.runtime.take().expect("Runtime router exists");
-        let interaction = "opaque-interaction".to_owned();
-        let base_path = config.auth.external_base.path().trim_end_matches('/');
-        let uri = format!(
-            "{base_path}/v1/projects/project/auth/managed-reauthorizations/{interaction}/start"
-        );
-        let request = || {
-            Request::post(&uri)
-                .header(header::ORIGIN, &origin)
-                .header("sec-fetch-site", "same-origin")
-                .header("sec-fetch-mode", "cors")
-                .header("sec-fetch-dest", "empty")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"expected_revision":1,"csrf":"opaque"}"#))
-                .unwrap()
-        };
-
-        // This endpoint's reviewed local policy permits one request per process/window when the
-        // deployment is configured for its maximum process count. The admitted probe stops at the
-        // missing opaque cookie before touching the composed PostgreSQL/provider services.
-        let admitted = router.clone().oneshot(request()).await.unwrap();
-        assert_eq!(admitted.status(), StatusCode::NOT_FOUND);
-
-        // Every concurrent retry must be rejected by admission. If admission moved below cookie
-        // validation, PostgreSQL, or provider discovery, these requests would not return bounded
-        // 429 responses with the disconnected PostgreSQL sentinel.
-        let mut attempts = tokio::task::JoinSet::new();
-        for _ in 0..16 {
-            let router = router.clone();
-            let request = request();
-            attempts.spawn(async move { router.oneshot(request).await.unwrap() });
-        }
-        while let Some(response) = attempts.join_next().await {
-            let response = response.unwrap();
-            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-            let retry_after = response
-                .headers()
-                .get(header::RETRY_AFTER)
-                .expect("admission rejection carries Retry-After")
-                .to_str()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap();
-            assert!((1..=60).contains(&retry_after));
-            let problem: runtime_types::RuntimeError =
-                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
-                    .unwrap();
-            assert_eq!(problem.code, "rate_limited");
-            assert_eq!(
-                problem.message,
-                "The Runtime request rate limit was exceeded."
-            );
-        }
-    }
-
-    #[test]
-    fn admission_cors_reflects_only_a_previously_verified_exact_application_origin() {
-        let verified = VerifiedApplicationOrigins::default();
-        let allowed = "https://app.example";
-        let application = VerifiedOriginSubject::Application {
-            project_public_id: "project-a",
-            application_public_id: "application-a",
-        };
-        verified.remember(application, allowed);
-
-        let response_for = |subject, origin: &'static str| {
-            let headers =
-                HeaderMap::from_iter([(header::ORIGIN, HeaderValue::from_static(origin))]);
-            let mut response = runtime_error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "The Runtime request rate limit was exceeded.",
-                "request-id",
-            );
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
-            apply_verified_admission_cors(&verified, &headers, subject, response)
-        };
-
-        let readable = response_for(application, allowed);
-        assert_eq!(readable.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            readable.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
-            allowed
-        );
-        assert_eq!(readable.headers()[header::RETRY_AFTER], "7");
-        assert_eq!(
-            readable.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
-            "Retry-After"
-        );
-        assert!(
-            readable
-                .headers()
-                .get_all(header::VARY)
-                .iter()
-                .any(|value| value == "Origin")
-        );
-
-        for rejected in [
-            response_for(application, "https://unknown.example"),
-            response_for(
-                VerifiedOriginSubject::Application {
-                    project_public_id: "project-a",
-                    application_public_id: "application-b",
-                },
-                allowed,
-            ),
-            response_for(
-                VerifiedOriginSubject::Application {
-                    project_public_id: "project-b",
-                    application_public_id: "application-a",
-                },
-                allowed,
-            ),
-        ] {
-            assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
-            assert!(
-                !rejected
-                    .headers()
-                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            );
-            assert!(
-                !rejected
-                    .headers()
-                    .contains_key(header::ACCESS_CONTROL_EXPOSE_HEADERS)
-            );
-            assert_eq!(rejected.headers()[header::RETRY_AFTER], "7");
-            assert!(
-                rejected
-                    .headers()
-                    .get_all(header::VARY)
-                    .iter()
-                    .any(|value| value == "Origin")
-            );
-        }
-    }
-
-    #[test]
-    fn admission_cors_credential_verification_is_not_reusable_by_another_token() {
-        let verified = VerifiedApplicationOrigins::default();
-        let origin = "https://app.example";
-        let verified_subject = VerifiedOriginSubject::Credential {
-            project_public_id: "project-a",
-            credential: "token-a",
-        };
-        verified.remember(verified_subject, origin);
-        assert!(verified.contains(verified_subject, origin));
-        assert!(!verified.contains(
-            VerifiedOriginSubject::Credential {
-                project_public_id: "project-a",
-                credential: "token-b",
-            },
-            origin,
-        ));
-        assert!(!verified.contains(
-            VerifiedOriginSubject::Credential {
-                project_public_id: "project-b",
-                credential: "token-a",
-            },
-            origin,
-        ));
     }
 
     #[test]
@@ -11501,22 +10619,6 @@ pub(crate) mod tests {
             denied.headers()[header::CONTENT_TYPE],
             "application/problem+json"
         );
-        for _ in 1..(CONTROL_CREDENTIAL_FAILURE_LIMIT - 1) {
-            let response = control
-                .clone()
-                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-        let throttled = control
-            .clone()
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(throttled.headers()[header::RETRY_AFTER], "1");
-
         let accepted = control
             .clone()
             .oneshot(
@@ -11619,7 +10721,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one protocol journey proves MCP discovery, admission, negotiation, catalog, dispatch, and plane isolation"
+        reason = "one protocol journey proves MCP discovery, authentication, negotiation, catalog, dispatch, and plane isolation"
     )]
     async fn mcp_is_explicit_control_only_authenticated_and_tools_only() {
         let mut config = test_config(ProcessMode::All);
@@ -12482,10 +11584,6 @@ pub(crate) mod tests {
     struct TestServerKeyVerifier;
 
     impl application::ServerKeyVerifier for TestServerKeyVerifier {
-        fn readable_versions(&self) -> std::collections::BTreeSet<i32> {
-            std::collections::BTreeSet::from([1])
-        }
-
         fn digest_candidate(
             &self,
             project_id: Uuid,
@@ -12560,16 +11658,7 @@ pub(crate) mod tests {
         ));
         let router = build_server_surface(
             &config,
-            crate::composition::ServerHttpCapabilities {
-                admission: Arc::new(AdmissionService::new(
-                    format!("server-http-{}", Uuid::new_v4()),
-                    [83; 32],
-                    1,
-                    None,
-                )),
-                api: Some(api),
-                readiness: None,
-            },
+            crate::composition::ServerHttpCapabilities { api: Some(api) },
             Arc::new(tokio::sync::Semaphore::new(
                 config.auth.http.max_in_flight_requests,
             )),
@@ -12649,109 +11738,6 @@ pub(crate) mod tests {
                 server_types::ServerErrorCode::InvalidCredential,
             )
             .await;
-        }
-    }
-
-    #[tokio::test]
-    async fn server_pre_authority_admission_stops_unknown_credentials_before_authority() {
-        let router = isolated_test_server_router();
-        let path = "/v1/projects/project-a/users";
-        for _ in 0..120 {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::get(path)
-                        .header(header::AUTHORIZATION, "Bearer malformed")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-        let response = router
-            .oneshot(
-                Request::get(path)
-                    .header(header::AUTHORIZATION, "Bearer malformed")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let retry_after = response.headers()[header::RETRY_AFTER]
-            .to_str()
-            .expect("integer Retry-After")
-            .parse::<u64>()
-            .expect("numeric Retry-After");
-        assert!((1..=60).contains(&retry_after));
-        assert_no_browser_authority_headers(&response);
-        assert_server_error(
-            response,
-            StatusCode::TOO_MANY_REQUESTS,
-            server_types::ServerErrorCode::RateLimited,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn failure_block_stops_canonical_unknown_credentials_before_another_repository_lookup() {
-        let (router, authority_calls) = isolated_test_server_router_with_authority_calls();
-        let unknown = format!(
-            "Bearer owl_server_v1.{}.{}",
-            URL_SAFE_NO_PAD.encode([1_u8; application::SERVER_KEY_PUBLIC_ID_BYTES]),
-            "A".repeat(43)
-        );
-        let request = || {
-            Request::get("/v1/projects/project-a/users")
-                .header(header::AUTHORIZATION, &unknown)
-                .body(Body::empty())
-                .unwrap()
-        };
-
-        for request_number in 1..=120 {
-            let response = router.clone().oneshot(request()).await.unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "unknown canonical request {request_number}"
-            );
-        }
-        assert_eq!(authority_calls.load(Ordering::SeqCst), 120);
-
-        let threshold_response = router.clone().oneshot(request()).await.unwrap();
-        assert_eq!(threshold_response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(authority_calls.load(Ordering::SeqCst), 121);
-
-        let preblocked_response = router.oneshot(request()).await.unwrap();
-        assert_eq!(preblocked_response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            authority_calls.load(Ordering::SeqCst),
-            121,
-            "an active source block must reject before another authority lookup"
-        );
-    }
-
-    #[tokio::test]
-    async fn valid_server_traffic_does_not_consume_the_strict_failure_budget() {
-        let router = isolated_test_server_router();
-        let authorization = format!("Bearer {}", canonical_test_server_credential());
-        for request_number in 1..=130 {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::get("/v1/projects/project-a/users")
-                        .header(header::AUTHORIZATION, &authorization)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::OK,
-                "valid request {request_number} was incorrectly charged to failure admission"
-            );
         }
     }
 

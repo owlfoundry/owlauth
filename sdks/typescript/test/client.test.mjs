@@ -406,6 +406,47 @@ test("public configuration and JWKS are bounded and context checked", async () =
   assert.equal(jwks.signingEpoch, 2);
 });
 
+test("optional debug hook emits one closed redacted completion event", async () => {
+  const events = [];
+  const instance = client(
+    queuedFetch([
+      jsonResponse({
+        project_public_id: PROJECT,
+        project_display_name: "Project",
+        application_public_id: APPLICATION,
+        application_display_name: "App",
+        publishable_keys: [KEY],
+        providers: [],
+        email_available: false,
+        email_otp_enabled: false,
+        email_magic_link_enabled: false,
+        login_available: true,
+      }),
+    ]),
+    {
+      debugHook(event) {
+        events.push(event);
+        throw new Error("observer failure must be isolated");
+      },
+    },
+  );
+  await instance.getPublicConfiguration();
+  assert.deepEqual(events, [
+    {
+      operation: "get_public_application_config",
+      method: "GET",
+      outcome: "success",
+      elapsedMs: 0,
+      dispatched: true,
+      status: 200,
+    },
+  ]);
+  const serialized = JSON.stringify(events);
+  assert.equal(serialized.includes(KEY), false);
+  assert.equal(serialized.includes("identity.example"), false);
+  assert.equal(serialized.includes("publishable_key"), false);
+});
+
 test("one-use transport ambiguity is Indeterminate and never retried", async () => {
   const calls = [];
   const responses = [];

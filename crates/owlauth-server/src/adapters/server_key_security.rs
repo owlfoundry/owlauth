@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
@@ -150,10 +150,6 @@ impl ServerKeyIssuer for SoftwareServerKeyIssuer {
 }
 
 impl ServerKeyVerifier for SoftwareServerKeyVerifier {
-    fn readable_versions(&self) -> BTreeSet<i32> {
-        self.inner.keys.keys().copied().collect()
-    }
-
     fn digest_candidate(
         &self,
         project_id: Uuid,
@@ -245,7 +241,6 @@ mod tests {
     #[test]
     fn verifier_rejects_unavailable_versions_and_reports_only_versions() {
         let ring = ring();
-        assert_eq!(ring.verifier().readable_versions(), BTreeSet::from([1, 2]));
         assert_eq!(
             ring.verifier().digest_candidate(
                 Uuid::new_v4(),

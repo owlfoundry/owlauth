@@ -80,7 +80,7 @@ owlauth update --dry-run
 owlauth update
 ```
 
-The CLI must not access PostgreSQL/Redis, load server modules, run migrations, or host Auth or Control listeners. Audit export remains deferred.
+The CLI must not access PostgreSQL, load server modules, run migrations, or host Auth or Control listeners. Audit export remains deferred.
 
 ## Remote CLI trust model
 
@@ -187,7 +187,7 @@ Resource IDs are exact canonical UUIDs. Omit optional arguments or send JSON `nu
 
 The endpoint creates no MCP session and declares no prompts or resources. Every request reauthenticates the operator key and checks the configured Control authority. It is not a Runtime route or local plugin process; the CLI, plugins, installers, and agent packages do not launch or impersonate it.
 
-Each tool maps to one bounded Control query with explicit targets, closed input/output, and timeout/rate/concurrency policy. MCP does not provide raw SQL, generic HTTP/OpenAPI forwarding, repository access, CLI/shell/filesystem execution, mutation, unrestricted bulk reads, or export of secrets, provider tokens, sessions, operator/API keys, private keys, or user-profile dumps. Any future mutation requires a separately reviewed server-enforced authorization, idempotency, audit, and confirmation design before it enters the catalog.
+Each tool maps to one bounded Control query with explicit targets, closed input/output, and timeout/concurrency policy. MCP does not provide raw SQL, generic HTTP/OpenAPI forwarding, repository access, CLI/shell/filesystem execution, mutation, unrestricted bulk reads, or export of secrets, provider tokens, sessions, operator/API keys, private keys, or user-profile dumps. Any future mutation requires a separately reviewed server-enforced authorization, idempotency, audit, and confirmation design before it enters the catalog.
 
 ## External control gateways
 

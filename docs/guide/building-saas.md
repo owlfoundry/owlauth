@@ -36,7 +36,24 @@ flowchart LR
 
 The SaaS service is the tenant policy-enforcement point. It calls only published OwlAuth Control APIs; it must not import `owlauth-server`, share its repositories, or read or write an OwlAuth database directly.
 
-A managed cell is one OwlAuth administrative trust domain. It includes an `owlauth-server` deployment, PostgreSQL, optional Redis, a separately preserved software custody root or custom-provider authority, Auth ingress for both public Runtime and backend-only Server API routes, plus private Control ingress, and one deployment operator key. A cell can hold Projects for several organizations only when your trusted SaaS service is the sole operator.
+A managed cell is one OwlAuth administrative trust domain. It includes an `owlauth-server` deployment, PostgreSQL, a separately preserved software custody root or custom-provider authority, Auth ingress for both public Runtime and backend-only Server API routes, plus private Control ingress, and one deployment operator key. A cell can hold Projects for several organizations only when your trusted SaaS service is the sole operator.
+
+## Own traffic governance at the SaaS ingress
+
+OwlAuth Core does not provide deployment-wide IP, route, Project, global, bot/risk, traffic-shaping, or commercial quota enforcement. A managed SaaS must apply those controls at its trusted edge or ingress, where it has the correct network, tenant, plan, and fleet context.
+
+| Control                                                                                                 | Owning layer                                |
+| ------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| IP/network abuse, bot detection, reputation, and traffic shaping                                        | edge/WAF/Auth ingress                       |
+| Per-route, per-tenant, global, and fleet capacity quotas                                                | SaaS gateway or Auth ingress                |
+| Subscription, entitlement, and billable usage limits                                                    | SaaS policy and metering authority          |
+| Request bytes, deadlines, accepted connections, and in-flight work                                      | ingress plus OwlAuth local transport bounds |
+| PostgreSQL pool and provider/worker concurrency                                                         | OwlAuth local resource-safety bounds        |
+| OTP attempts, generation/proof lifecycle, recipient side-effect suppression, active mail backlog safety | OwlAuth PostgreSQL protocol authority       |
+
+Core's declared `408 request_timeout` means that the local listener deadline expired while waiting for in-flight capacity or running the handler. It is not a rate-limit response and does not prove that a dispatched mutation had no effect; official Runtime SDKs therefore quarantine ambiguous handoff, refresh, and logout state. Ingress traffic policy may return `429`, but that is a SaaS contract rather than a Core OpenAPI guarantee. Official Runtime SDKs recognize the optional extension only when it has the exact closed Runtime error envelope with `code` set to `rate_limited`, a bounded safe `message` and `request_id`, plus exactly one decimal-seconds `Retry-After` value in `0..=86400`; other gateway or WAF `429` shapes remain conservative protocol or indeterminate failures. Apply the denial before forwarding any Core authority work, keep its dimensions free of raw credentials and email addresses, and do not use an ingress allow decision to authenticate a Project, Application, server key, session, or proof.
+
+Core identity semantics still fail closed independently of ingress policy. In particular, removing or resetting an edge quota cannot reset OTP attempts, bypass generation policy, revive an older challenge, or repeat a consumed proof. Passwordless email also serializes a Project-wide side-effect decision in PostgreSQL: a recent actual enqueue to the same canonical recipient or the hard active-outbox safety bound can commit the real newest generation as terminal without creating mail, while returning the same generic accepted response. That mechanism protects protocol side effects and enumeration safety; it is not IP/route admission, plan quota, billing policy, or a Core `429`. Conversely, an edge denial must not mutate those PostgreSQL state machines.
 
 ## Keep identities separate
 
@@ -161,7 +178,7 @@ Use different credentials and secret namespaces for each trust domain:
 | Customer API key                | SaaS API                             | SaaS principal plus a scope ceiling                     |
 | Cell operator API key           | one managed cell Control listener    | full deployment Control authority                       |
 | Project server key              | Server API routes on one cell's Auth | one Project's backend directory/introspection authority |
-| Application publishable key     | managed Runtime                      | public Application identification and abuse attribution |
+| Application publishable key     | managed Runtime                      | public Application identification                       |
 | Project access or refresh token | managed Runtime/customer backend     | Project user and Application session context            |
 
 A customer API key must never be forwarded to OwlAuth. A cell operator key must never appear in customer responses, browsers, tenant records, logs, traces, metrics, support bundles, or agent context. Project server keys are one-time Control reveals that must be acknowledged only after durable external secret-manager storage; they belong exclusively in customer backend custody and never in browsers, Runtime SDK configuration, URLs, or frontend bundles. Use one operator key per cell to limit blast radius, and keep Control ingress private even though network position does not replace Bearer authentication.
