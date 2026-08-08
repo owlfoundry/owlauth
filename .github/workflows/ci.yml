@@ -490,12 +490,14 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Prepare release manifests
-        run: python3 scripts/release/prepare_release.py
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: "3.14"
+      - name: Test release manifest preparation from development state
+        run: python3 scripts/release/test-prepare-release.py
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
       - name: Set up Go for workflow validation
         uses: actions/setup-go@v7
         with:
@@ -526,7 +528,6 @@ jobs:
           scripts/release/test-verify-release.sh
           python3 scripts/release/test-verify-shared-crate-version.py
           python3 scripts/release/test-changelog.py
-          python3 scripts/release/test-prepare-release.py
           scripts/release/test-publish-crate.sh
           python3 scripts/test-sdk-artifact.py
           python3 scripts/test-sdk-evidence.py

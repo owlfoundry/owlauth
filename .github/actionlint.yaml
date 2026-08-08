@@ -3,3 +3,6 @@ paths:
   .github/workflows/release-cli.yml:
     ignore:
       - 'label "macos-15-intel" is unknown'
+  .github/workflows/recover-cli-release.yml:
+    ignore:
+      - 'label "macos-15-intel" is unknown'
