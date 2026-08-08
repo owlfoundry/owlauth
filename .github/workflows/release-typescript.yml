@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "typescript-v*"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,7 +15,6 @@ concurrency:
 jobs:
   verify:
     name: Verify release tag
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -151,129 +149,3 @@ jobs:
             "dist/owlauth-client-${VERSION}.tgz" \
             --notes-file release-metadata/release-notes.md \
             --title "TypeScript SDK v${VERSION}"
-
-  recover-build-0-1-2:
-    name: Recover TypeScript SDK v0.1.2 package
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      VERSION: 0.1.2
-      TAG: typescript-v0.1.2
-      SOURCE_COMMIT: d86e072ae576b7338d72a7a19856ac5ed6cc7c47
-      TAG_OBJECT: 1d700afe9e69db6dad3b9a2195041ef6f0844aaa
-    steps:
-      - name: Check out immutable release source
-        uses: actions/checkout@v7
-        with:
-          ref: d86e072ae576b7338d72a7a19856ac5ed6cc7c47
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify immutable release tag
-        run: |
-          test "$TAG" = "typescript-v${VERSION}"
-          test "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_COMMIT"
-          test "$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')" = "$TAG_OBJECT"
-          test "$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')" = "$SOURCE_COMMIT"
-      - name: Prepare package and release notes
-        run: |
-          python3 scripts/release/prepare_release.py typescript "$VERSION"
-          python3 scripts/release/generate-changelog.py \
-            --component typescript --version "$VERSION" --output release-notes.md
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.14"
-      - name: Install pnpm
-        run: npm install --global pnpm@11.20.0
-      - name: Install locked dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Build and inspect package
-        run: |
-          mkdir dist
-          pnpm --filter @owlauth/client build
-          (cd sdks/typescript && npm pack --pack-destination ../../dist)
-          archive="dist/owlauth-client-${VERSION}.tgz"
-          test -f "$archive"
-          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 1
-          python3 scripts/sdk_artifact.py inspect \
-            --component typescript --archive "$archive"
-      - name: Upload recovery package
-        uses: actions/upload-artifact@v7
-        with:
-          name: typescript-0.1.2-recovery
-          path: |
-            dist/*.tgz
-            release-notes.md
-          if-no-files-found: error
-          retention-days: 1
-
-  recover-publish-0-1-2:
-    name: Recover @owlauth/client v0.1.2 publication
-    if: github.event_name == 'workflow_dispatch'
-    needs: recover-build-0-1-2
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      VERSION: 0.1.2
-    steps:
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - name: Download recovery package
-        uses: actions/download-artifact@v8
-        with:
-          name: typescript-0.1.2-recovery
-          path: recovery
-      - name: Publish or verify package
-        run: |
-          archive="recovery/dist/owlauth-client-${VERSION}.tgz"
-          expected_integrity="sha512-$(openssl dgst -sha512 -binary "$archive" | base64 -w 0)"
-          published_integrity="$(npm view "@owlauth/client@${VERSION}" dist.integrity 2>/dev/null || true)"
-          if [[ -n "$published_integrity" ]]; then
-            test "$published_integrity" = "$expected_integrity"
-          else
-            npm publish "./${archive}" --access public --provenance=false
-          fi
-
-  recover-release-0-1-2:
-    name: Recover TypeScript SDK v0.1.2 GitHub Release
-    if: github.event_name == 'workflow_dispatch'
-    needs: [recover-build-0-1-2, recover-publish-0-1-2]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    env:
-      VERSION: 0.1.2
-      TAG: typescript-v0.1.2
-    steps:
-      - name: Download recovery package
-        uses: actions/download-artifact@v8
-        with:
-          name: typescript-0.1.2-recovery
-          path: recovery
-      - name: Create or repair GitHub Release
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          archive="recovery/dist/owlauth-client-${VERSION}.tgz"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" \
-              --notes-file recovery/release-notes.md \
-              --title "TypeScript SDK v${VERSION}"
-            gh release upload "$TAG" "$archive" --clobber
-          else
-            gh release create "$TAG" "$archive" \
-              --notes-file recovery/release-notes.md \
-              --title "TypeScript SDK v${VERSION}"
-          fi
