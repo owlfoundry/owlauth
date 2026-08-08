@@ -43,21 +43,51 @@ jobs:
           name: python-release-notes
           path: release-notes.md
           if-no-files-found: error
+          retention-days: 7
 
-  ci:
-    name: Full CI
+  build:
+    name: Build package
     needs: verify
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv==0.11.32
+      - name: Build and inspect package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          mkdir dist
+          (cd sdks/python && uv run --locked hatchling build -t wheel -d ../../dist)
+          archive="dist/owlauth_client-${VERSION}-py3-none-any.whl"
+          test -f "$archive"
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 1
+          uv run --locked twine check "$archive"
+          python3 scripts/sdk_artifact.py inspect \
+            --component python --archive "$archive"
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-release-package
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: Publish owlauth-client
-    needs: [verify, ci]
+    needs: [verify, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     permissions:
       contents: read
       id-token: write
@@ -69,77 +99,31 @@ jobs:
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.14"
-      - name: Install locked Python release tools
-        run: |
-          python -m pip install --disable-pip-version-check uv==0.11.32
-          uv sync --all-packages --locked
-      - name: Download immutable SDK candidate
+      - name: Re-verify release eligibility
+        run: scripts/release/verify-release.sh python >/dev/null
+      - name: Download package
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.ci.outputs.python-candidate-artifact-name }}
-          path: candidate
-      - name: Download final SDK evidence
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
-          path: final-evidence
-      - name: Re-verify release and exact candidate
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-          CANDIDATE_VERSION: ${{ needs.ci.outputs.python-candidate-version }}
-          ARCHIVE_SHA256: ${{ needs.ci.outputs.python-candidate-archive-sha256 }}
-          DESCRIPTOR_SHA256: ${{ needs.ci.outputs.python-candidate-descriptor-sha256 }}
-        run: |
-          scripts/release/verify-release.sh python >/dev/null
-          [[ "$CANDIDATE_VERSION" == "$VERSION" ]]
-          archive="candidate/owlauth_client-${VERSION}-py3-none-any.whl"
-          verified_sha="$(python scripts/release/verify-sdk-candidate.py \
-            --component python --version "$VERSION" --source-commit "$GITHUB_SHA" \
-            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --build-configuration python-hatch-wheel-v1 --tag "$GITHUB_REF_NAME" \
-            --descriptor candidate/candidate.json --archive "$archive" \
-            --distribution-directory candidate)"
-          [[ "$verified_sha" == "$ARCHIVE_SHA256" ]]
-          actual_descriptor_sha="$(sha256sum candidate/candidate.json | cut -d ' ' -f 1)"
-          [[ "$actual_descriptor_sha" == "$DESCRIPTOR_SHA256" ]]
-          uv run --locked twine check "$archive"
-      - name: Verify final exact-artifact evidence
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          python scripts/release/verify-sdk-evidence.py \
-            --component python --version "$VERSION" --source-commit "$GITHUB_SHA" \
-            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --tag "$GITHUB_REF_NAME" --descriptor candidate/candidate.json \
-            --manifest final-evidence/python-final-evidence.json >/dev/null
-      - name: Stage only the qualified wheel for publication
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          mkdir publish
-          cp "candidate/owlauth_client-${VERSION}-py3-none-any.whl" publish/
-      - name: Publish the qualified wheel with PyPI trusted publishing
+          name: python-release-package
+          path: dist
+      - name: Publish package
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: publish
+          packages-dir: dist
 
   release:
-    name: Create Python SDK GitHub Release
-    needs: [verify, ci, publish]
+    name: Create GitHub Release
+    needs: [verify, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - name: Download final SDK evidence
+      - name: Download package
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
-          path: final-evidence
+          name: python-release-package
+          path: dist
       - name: Download release changelog
         uses: actions/download-artifact@v8
         with:
@@ -151,8 +135,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          cat final-evidence/summary.md >> release-metadata/release-notes.md
           gh release create "python-v${VERSION}" \
-            final-evidence/python-final-evidence.json \
+            "dist/owlauth_client-${VERSION}-py3-none-any.whl" \
             --notes-file release-metadata/release-notes.md \
             --title "Python SDK v${VERSION}"

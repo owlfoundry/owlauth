@@ -27,5 +27,6 @@ expect_failure "$publisher" "$manifest"
 sed -i.bak 's/0\.0\.0-dev/1.2.3/' "$manifest"
 rm -f "$manifest.bak"
 expect_failure "$publisher" "$manifest" "1.2.4"
+expect_failure "$publisher" "$manifest" "1.2.3" "$temporary_directory/missing.crate"
 
 printf 'crate publication guard tests passed\n'

@@ -97,15 +97,20 @@ def main() -> int:
     if not previous:
         return 0
 
-    latest, latest_tag = max(previous, key=lambda item: item[0])
-    if not latest < candidate:
-        print(
-            f"shared owlauth-types release version {args.version} must be greater than "
-            f"existing {latest_tag} ({latest.text})",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
+    blocking = [
+        (version, tag)
+        for version, tag in previous
+        if not version < candidate and version.text != candidate.text
+    ]
+    if not blocking:
+        return 0
+    latest, latest_tag = max(blocking, key=lambda item: item[0])
+    print(
+        f"shared owlauth-types release version {args.version} must not be lower than "
+        f"existing {latest_tag} ({latest.text})",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

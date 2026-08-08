@@ -46,18 +46,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  ci:
-    name: Full CI
-    needs: verify
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-
   image:
-    name: Build verified server image
-    needs: [verify, ci]
+    name: Build server image
+    needs: verify
     uses: ./.github/workflows/publish-server-image.yml
     with:
       mode: release
@@ -68,7 +59,7 @@ jobs:
 
   build:
     name: Build server (${{ matrix.os }})
-    needs: [verify, ci]
+    needs: verify
     strategy:
       fail-fast: false
       matrix:

@@ -29,7 +29,7 @@ release_tag_prefix() {
 main() {
   local component="${1:-}"
   local tag_prefix tag version remote release_commit main_commit tag_commit remote_tag_commit
-  local conflicting_tag conflicting_remote_ref shared_remote_refs
+  local conflicting_tag conflicting_remote_ref conflicting_tag_commit shared_remote_refs
 
   tag_prefix="$(release_tag_prefix "$component")"
   if [[ -n "${GITHUB_REF_TYPE:-}" && "$GITHUB_REF_TYPE" != "tag" ]]; then
@@ -112,9 +112,18 @@ main() {
       return 1
     fi
     if [[ -n "$conflicting_remote_ref" ]]; then
-      printf 'release version %s is already reserved by %s for shared owlauth-types publication\n' \
-        "$version" "$conflicting_tag" >&2
-      return 1
+      conflicting_tag_commit="$(
+        awk '
+          $2 ~ /\^\{\}$/ { peeled = $1 }
+          $2 !~ /\^\{\}$/ { direct = $1 }
+          END { print (peeled != "" ? peeled : direct) }
+        ' <<< "$conflicting_remote_ref"
+      )"
+      if [[ "$conflicting_tag_commit" != "$release_commit" ]]; then
+        printf 'shared release tag %s must resolve to the same commit %s\n' \
+          "$conflicting_tag" "$release_commit" >&2
+        return 1
+      fi
     fi
     if ! shared_remote_refs="$(
       git ls-remote --tags "$remote" 'refs/tags/server-v*' 'refs/tags/cli-v*'

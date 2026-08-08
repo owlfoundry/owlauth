@@ -65,6 +65,7 @@ git -C "$work" config user.name "Release Test"
 git -C "$work" config user.email "release-test@example.com"
 git -C "$work" add scripts/release/verify-release.sh scripts/release/verify-shared-crate-version.py
 git -C "$work" commit --quiet -m "initial"
+initial_commit="$(git -C "$work" rev-parse HEAD)"
 git -C "$work" remote add origin "$remote"
 git -C "$work" push --quiet --set-upstream origin main
 git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
@@ -82,10 +83,11 @@ cli_tag=cli-v1.2.3
 git -C "$work" tag "$cli_tag"
 git -C "$work" push --quiet origin "$cli_tag"
 run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag" >/dev/null
-conflicting_server_tag=server-v1.2.3
-git -C "$work" tag "$conflicting_server_tag"
-git -C "$work" push --quiet origin "$conflicting_server_tag"
-expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag"
+matching_server_tag=server-v1.2.3
+git -C "$work" tag "$matching_server_tag"
+git -C "$work" push --quiet origin "$matching_server_tag"
+run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag" >/dev/null
+run_verifier server GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$matching_server_tag" >/dev/null
 expect_failure run_verifier cli GITHUB_REF_TYPE=branch GITHUB_REF_NAME="$cli_tag"
 expect_failure run_verifier server GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag"
 expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME=cli-v9.9.9
@@ -124,5 +126,14 @@ git -C "$updater" add ADVANCED
 git -C "$updater" commit --quiet -m "advance main"
 git -C "$updater" push --quiet origin main
 expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$cli_tag"
+
+old_server_tag=server-v4.0.0
+git -C "$work" tag "$old_server_tag" "$initial_commit"
+git -C "$work" push --quiet origin "$old_server_tag"
+git -C "$work" pull --quiet --ff-only origin main
+new_cli_tag=cli-v4.0.0
+git -C "$work" tag "$new_cli_tag"
+git -C "$work" push --quiet origin "$new_cli_tag"
+expect_failure run_verifier cli GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$new_cli_tag"
 
 printf 'release verifier tests passed\n'

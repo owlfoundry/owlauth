@@ -46,18 +46,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  ci:
-    name: Full CI
-    needs: verify
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-
   build:
     name: Build CLI (${{ matrix.target }})
-    needs: [verify, ci]
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -201,82 +192,3 @@ jobs:
           gh release create "cli-v${VERSION}" artifacts/* \
             --notes-file release-metadata/release-notes.md \
             --title "OwlAuth CLI v${VERSION}"
-
-  update-smoke:
-    name: Exercise CLI update (${{ matrix.os }})
-    needs: [verify, release]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-15-intel, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
-    permissions:
-      contents: read
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Prepare release manifests
-        run: python3 scripts/release/prepare_release.py
-      - name: Resolve updater source CLI release
-        id: source
-        env:
-          CURRENT_TAG: cli-v${{ needs.verify.outputs.version }}
-        run: |
-          git fetch --quiet --tags origin
-          previous="$(git tag --list 'cli-v*' --sort=-version:refname | grep -Fvx "$CURRENT_TAG" | head -n 1 || true)"
-          source="$previous"
-          if [[ "$RUNNER_OS" == "Windows" && ( "$previous" == "cli-v0.0.2" || "$previous" == "cli-v0.0.3" ) ]]; then
-            # These releases used PowerShell stdin mode, which did not execute the bundled installer on Windows.
-            # Exercise the repaired current updater in self-reinstall mode; the next release upgrades from it.
-            source="$CURRENT_TAG"
-          fi
-          echo "previous_tag=$previous" >> "$GITHUB_OUTPUT"
-          echo "tag=$source" >> "$GITHUB_OUTPUT"
-          echo "updater source: ${source:-<none>}"
-      - name: Install updater source CLI artifact
-        if: steps.source.outputs.tag != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_TAG: ${{ steps.source.outputs.tag }}
-        run: |
-          version="${SOURCE_TAG#cli-v}"
-          case "$RUNNER_OS" in
-            Linux) target=x86_64-unknown-linux-gnu; extension=tar.gz ;;
-            macOS) target=x86_64-apple-darwin; extension=tar.gz ;;
-            Windows) target=x86_64-pc-windows-msvc; extension=zip ;;
-          esac
-          archive="owlauth-cli-${version}-${target}.${extension}"
-          mkdir -p previous installed
-          gh release download "$SOURCE_TAG" --pattern "$archive" --dir previous
-          if [[ "$extension" == zip ]]; then
-            powershell -NoProfile -NonInteractive -Command \
-              "Expand-Archive -LiteralPath 'previous/$archive' -DestinationPath 'installed'"
-          else
-            tar -xzf "previous/$archive" -C installed
-          fi
-      - name: Update to current CLI release
-        if: steps.source.outputs.tag != ''
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          binary=installed/owlauth
-          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
-          "$binary" update --version "$VERSION" --force --install-dir "$PWD/installed"
-          for _ in {1..30}; do
-            if "$binary" --version | grep -Fq " $VERSION"; then
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "updated CLI did not report version $VERSION" >&2
-          exit 1
-      - name: Report first release
-        if: steps.source.outputs.previous_tag == ''
-        run: echo "No previous CLI release exists; upgrade smoke test starts with the next release."

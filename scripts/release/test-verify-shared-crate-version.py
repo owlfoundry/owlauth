@@ -32,6 +32,7 @@ def verify(version: str, current_tag: str, tags: tuple[str, ...]) -> int:
 
 def main() -> None:
     assert verify("1.0.0", "server-v1.0.0", ("cli-v0.9.9", "server-v1.0.0")) == 0
+    assert verify("1.0.0", "server-v1.0.0", ("cli-v1.0.0",)) == 0
     assert verify("1.0.0-beta.2", "cli-v1.0.0-beta.2", ("server-v1.0.0-beta.1",)) == 0
     assert verify("1.0.0", "server-v1.0.0", ("cli-v1.0.0-beta.9",)) == 0
     assert verify("0.9.9", "server-v0.9.9", ("cli-v1.0.0",)) == 1

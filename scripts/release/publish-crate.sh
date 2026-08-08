@@ -3,8 +3,9 @@ set -euo pipefail
 
 manifest="${1:-}"
 expected_version="${2:-}"
+expected_archive="${3:-}"
 if [[ -z "$manifest" || ! -f "$manifest" || -z "$expected_version" ]]; then
-  printf 'usage: %s <Cargo.toml> <expected-release-version>\n' "$0" >&2
+  printf 'usage: %s <Cargo.toml> <expected-release-version> [expected-archive]\n' "$0" >&2
   exit 2
 fi
 
@@ -38,6 +39,10 @@ if [[ "$version" != "$expected_version" ]]; then
     "$version" "$package" "$expected_version" >&2
   exit 1
 fi
+if [[ -n "$expected_archive" && ! -f "$expected_archive" ]]; then
+  printf 'expected crate archive does not exist: %s\n' "$expected_archive" >&2
+  exit 1
+fi
 
 cargo package --locked --allow-dirty --manifest-path "$manifest"
 archive="target/package/${package}-${version}.crate"
@@ -45,6 +50,10 @@ archive="target/package/${package}-${version}.crate"
   printf 'cargo package did not create %s\n' "$archive" >&2
   exit 1
 }
+if [[ -n "$expected_archive" ]] && ! cmp -s "$expected_archive" "$archive"; then
+  printf 'packaged crate differs from expected archive: %s\n' "$expected_archive" >&2
+  exit 1
+fi
 
 metadata_file="$(mktemp)"
 trap 'rm -f "$metadata_file"' EXIT

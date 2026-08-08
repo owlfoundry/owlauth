@@ -43,23 +43,59 @@ jobs:
           name: typescript-release-notes
           path: release-notes.md
           if-no-files-found: error
+          retention-days: 7
 
-  ci:
-    name: Full CI
+  build:
+    name: Build package
     needs: verify
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install pnpm
+        run: npm install --global pnpm@11.20.0
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build and inspect package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          mkdir dist
+          pnpm --filter @owlauth/client build
+          (cd sdks/typescript && npm pack --pack-destination ../../dist)
+          archive="dist/owlauth-client-${VERSION}.tgz"
+          test -f "$archive"
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 1
+          python3 scripts/sdk_artifact.py inspect \
+            --component typescript --archive "$archive"
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: typescript-release-package
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: Publish @owlauth/client
-    needs: [verify, ci]
+    needs: [verify, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - name: Check out repository
@@ -69,67 +105,47 @@ jobs:
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
+      - name: Re-verify release eligibility
+        run: scripts/release/verify-release.sh typescript >/dev/null
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: "24"
-      - name: Set up Python for candidate verification
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.14"
-      - name: Download immutable SDK candidate
+      - name: Download package
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.ci.outputs.typescript-candidate-artifact-name }}
-          path: candidate
-      - name: Download final SDK evidence
+          name: typescript-release-package
+          path: dist
+      - name: Publish package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: npm publish "dist/owlauth-client-${VERSION}.tgz" --access public --provenance
+
+  release:
+    name: Create GitHub Release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download package
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
-          path: final-evidence
+          name: typescript-release-package
+          path: dist
       - name: Download release changelog
         uses: actions/download-artifact@v8
         with:
           name: typescript-release-notes
           path: release-metadata
-      - name: Re-verify release and exact candidate
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-          CANDIDATE_VERSION: ${{ needs.ci.outputs.typescript-candidate-version }}
-          ARCHIVE_SHA256: ${{ needs.ci.outputs.typescript-candidate-archive-sha256 }}
-          DESCRIPTOR_SHA256: ${{ needs.ci.outputs.typescript-candidate-descriptor-sha256 }}
-        run: |
-          scripts/release/verify-release.sh typescript >/dev/null
-          [[ "$CANDIDATE_VERSION" == "$VERSION" ]]
-          archive="candidate/owlauth-client-${VERSION}.tgz"
-          verified_sha="$(python scripts/release/verify-sdk-candidate.py \
-            --component typescript --version "$VERSION" --source-commit "$GITHUB_SHA" \
-            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --build-configuration typescript-npm-pack-v1 --tag "$GITHUB_REF_NAME" \
-            --descriptor candidate/candidate.json --archive "$archive")"
-          [[ "$verified_sha" == "$ARCHIVE_SHA256" ]]
-          actual_descriptor_sha="$(sha256sum candidate/candidate.json | cut -d ' ' -f 1)"
-          [[ "$actual_descriptor_sha" == "$DESCRIPTOR_SHA256" ]]
-      - name: Verify final exact-artifact evidence
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          python scripts/release/verify-sdk-evidence.py \
-            --component typescript --version "$VERSION" --source-commit "$GITHUB_SHA" \
-            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --tag "$GITHUB_REF_NAME" --descriptor candidate/candidate.json \
-            --manifest final-evidence/typescript-final-evidence.json >/dev/null
-          cat final-evidence/summary.md >> release-metadata/release-notes.md
-      - name: Publish the qualified tarball with npm trusted publishing
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: npm publish "candidate/owlauth-client-${VERSION}.tgz" --access public --provenance
       - name: Create GitHub Release
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           gh release create "typescript-v${VERSION}" \
-            final-evidence/typescript-final-evidence.json \
+            "dist/owlauth-client-${VERSION}.tgz" \
             --notes-file release-metadata/release-notes.md \
             --title "TypeScript SDK v${VERSION}"

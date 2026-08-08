@@ -43,23 +43,55 @@ jobs:
           name: rust-release-notes
           path: release-notes.md
           if-no-files-found: error
+          retention-days: 7
 
-  ci:
-    name: Full CI
+  build:
+    name: Build package
     needs: verify
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Build and inspect package
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          cargo package --manifest-path sdks/rust/Cargo.toml \
+            --locked --allow-dirty --no-verify
+          archive="target/package/owlauth-client-${VERSION}.crate"
+          test -f "$archive"
+          python3 scripts/sdk_artifact.py inspect \
+            --component rust --archive "$archive"
+          mkdir dist
+          cp "$archive" dist/
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-release-package
+          path: dist/*.crate
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: Publish owlauth-client
-    needs: [verify, ci]
+    needs: [verify, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: write
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -68,78 +100,50 @@ jobs:
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.14"
-      - name: Download immutable SDK candidate
+      - name: Re-verify release eligibility
+        run: scripts/release/verify-release.sh rust >/dev/null
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Download inspected package
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.ci.outputs.rust-candidate-artifact-name }}
-          path: candidate
-      - name: Download final SDK evidence
+          name: rust-release-package
+          path: dist
+      - name: Publish package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN"
+          scripts/release/publish-crate.sh \
+            sdks/rust/Cargo.toml "$VERSION" \
+            "dist/owlauth-client-${VERSION}.crate"
+
+  release:
+    name: Create GitHub Release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download package
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
-          path: final-evidence
+          name: rust-release-package
+          path: dist
       - name: Download release changelog
         uses: actions/download-artifact@v8
         with:
           name: rust-release-notes
           path: release-metadata
-      - name: Re-verify release and exact candidate
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-          CANDIDATE_VERSION: ${{ needs.ci.outputs.rust-candidate-version }}
-          ARCHIVE_SHA256: ${{ needs.ci.outputs.rust-candidate-archive-sha256 }}
-          DESCRIPTOR_SHA256: ${{ needs.ci.outputs.rust-candidate-descriptor-sha256 }}
-        run: |
-          scripts/release/verify-release.sh rust >/dev/null
-          [[ "$CANDIDATE_VERSION" == "$VERSION" ]]
-          archive="candidate/owlauth-client-${VERSION}.crate"
-          metadata="candidate/owlauth-client-${VERSION}.upload.json"
-          verified_sha="$(python scripts/release/verify-sdk-candidate.py \
-            --component rust --version "$VERSION" --source-commit "$GITHUB_SHA" \
-            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --build-configuration rust-cargo-package-v1 --tag "$GITHUB_REF_NAME" \
-            --descriptor candidate/candidate.json --archive "$archive" \
-            --upload-metadata "$metadata")"
-          [[ "$verified_sha" == "$ARCHIVE_SHA256" ]]
-          actual_descriptor_sha="$(sha256sum candidate/candidate.json | cut -d ' ' -f 1)"
-          [[ "$actual_descriptor_sha" == "$DESCRIPTOR_SHA256" ]]
-      - name: Verify final exact-artifact evidence
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          python scripts/release/verify-sdk-evidence.py \
-            --component rust --version "$VERSION" --source-commit "$GITHUB_SHA" \
-            --workflow-run-id "$GITHUB_RUN_ID" --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --tag "$GITHUB_REF_NAME" --descriptor candidate/candidate.json \
-            --manifest final-evidence/rust-final-evidence.json >/dev/null
-          cat final-evidence/summary.md >> release-metadata/release-notes.md
-      - name: Require crates.io token
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: test -n "$CARGO_REGISTRY_TOKEN"
-      - name: Upload the qualified crate bytes
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          python scripts/release/upload-crate.py \
-            --archive "candidate/owlauth-client-${VERSION}.crate" \
-            --metadata "candidate/owlauth-client-${VERSION}.upload.json" \
-            --descriptor candidate/candidate.json \
-            --expected-version "$VERSION" --expected-source-commit "$GITHUB_SHA" \
-            --expected-workflow-run-id "$GITHUB_RUN_ID" \
-            --expected-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --expected-tag "$GITHUB_REF_NAME"
       - name: Create GitHub Release
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           gh release create "rust-v${VERSION}" \
-            final-evidence/rust-final-evidence.json \
+            "dist/owlauth-client-${VERSION}.crate" \
             --notes-file release-metadata/release-notes.md \
             --title "Rust SDK v${VERSION}"

@@ -5,34 +5,7 @@ on:
     branches:
       - main
   pull_request:
-  workflow_call:
-    outputs:
-      typescript-candidate-artifact-name:
-        value: ${{ jobs.typescript-candidate.outputs.artifact-name }}
-      typescript-candidate-archive-sha256:
-        value: ${{ jobs.typescript-candidate.outputs.archive-sha256 }}
-      typescript-candidate-descriptor-sha256:
-        value: ${{ jobs.typescript-candidate.outputs.descriptor-sha256 }}
-      typescript-candidate-version:
-        value: ${{ jobs.typescript-candidate.outputs.version }}
-      python-candidate-artifact-name:
-        value: ${{ jobs.python-candidate.outputs.artifact-name }}
-      python-candidate-archive-sha256:
-        value: ${{ jobs.python-candidate.outputs.archive-sha256 }}
-      python-candidate-descriptor-sha256:
-        value: ${{ jobs.python-candidate.outputs.descriptor-sha256 }}
-      python-candidate-version:
-        value: ${{ jobs.python-candidate.outputs.version }}
-      rust-candidate-artifact-name:
-        value: ${{ jobs.rust-candidate.outputs.artifact-name }}
-      rust-candidate-archive-sha256:
-        value: ${{ jobs.rust-candidate.outputs.archive-sha256 }}
-      rust-candidate-descriptor-sha256:
-        value: ${{ jobs.rust-candidate.outputs.descriptor-sha256 }}
-      rust-candidate-version:
-        value: ${{ jobs.rust-candidate.outputs.version }}
-      sdk-final-evidence-artifact-name:
-        value: ${{ jobs.sdk-evidence.outputs.artifact-name }}
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -70,6 +43,7 @@ jobs:
 
   project-auth-e2e:
     name: Project Auth E2E exact SDK artifacts
+    if: github.event_name == 'workflow_dispatch'
     needs: [hosted-web, typescript-candidate, python-candidate, rust-candidate]
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -162,19 +136,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-features --locked
-      - name: Verify publishable Rust product packages
-        run: |
-          cargo package --manifest-path crates/owlauth-key-provider/Cargo.toml --locked --allow-dirty
-          key_provider_files="$(cargo package --manifest-path crates/owlauth-key-provider/Cargo.toml --locked --allow-dirty --list)"
-          grep -qx LICENSE <<< "$key_provider_files"
-          cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty
-          types_files="$(cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty --list)"
-          grep -qx LICENSE <<< "$types_files"
-          # The SDK candidate is packaged exactly once in rust-candidate. The CLI and
-          # server use the just-packaged unpublished dependency crates through temporary
-          # local patches and must compile without network access.
-          scripts/test-cli-package.sh
-          scripts/test-server-package.sh
       - name: Verify Rust product boundaries
         run: |
           cli_tree="$(cargo tree --locked --package owlauth-cli --edges normal --prefix none)"
@@ -193,6 +154,32 @@ jobs:
           version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' crates/owlauth-cli/Cargo.toml | head -n 1)"
           cargo run --locked --package owlauth-cli -- update \
             --version "$version" --force --dry-run --install-dir "${RUNNER_TEMP}/bin"
+
+  rust-packages:
+    name: Rust package checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Verify dependency package contents
+        run: |
+          key_provider_files="$(cargo package --manifest-path crates/owlauth-key-provider/Cargo.toml --locked --allow-dirty --list)"
+          grep -qx LICENSE <<< "$key_provider_files"
+          types_files="$(cargo package --manifest-path crates/owlauth-types/Cargo.toml --locked --allow-dirty --list)"
+          grep -qx LICENSE <<< "$types_files"
+      - name: Verify packaged CLI
+        run: scripts/test-cli-package.sh
+      - name: Verify packaged server
+        run: scripts/test-server-package.sh
 
   windows-cli:
     name: Windows CLI self-update
@@ -846,90 +833,3 @@ jobs:
           name: typescript-sdk-result-browser-bundle-${{ github.run_id }}-${{ github.run_attempt }}
           path: result.json
           if-no-files-found: error
-
-  sdk-evidence:
-    name: Aggregate final SDK evidence
-    needs:
-      - project-auth-e2e
-      - typescript-candidate
-      - typescript-artifact
-      - typescript-browser-artifact
-      - python-candidate
-      - python-artifact
-      - rust-candidate
-      - rust-artifact
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    outputs:
-      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - name: Prepare release manifests
-        run: python3 scripts/release/prepare_release.py
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.14"
-      - name: Download TypeScript candidate
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ needs.typescript-candidate.outputs.artifact-name }}
-          path: candidates/typescript
-      - name: Download Python candidate
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ needs.python-candidate.outputs.artifact-name }}
-          path: candidates/python
-      - name: Download Rust candidate
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ needs.rust-candidate.outputs.artifact-name }}
-          path: candidates/rust
-      - name: Download exact-artifact result fragments
-        uses: actions/download-artifact@v8
-        with:
-          pattern: "*-sdk-result-*-${{ github.run_id }}-${{ github.run_attempt }}"
-          path: qualification-results
-      - name: Download same-server result fragments
-        uses: actions/download-artifact@v8
-        with:
-          name: sdk-e2e-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: e2e-results
-      - name: Aggregate candidate-bound final manifests
-        run: |
-          python scripts/sdk_evidence.py \
-            --typescript-descriptor candidates/typescript/candidate.json \
-            --python-descriptor candidates/python/candidate.json \
-            --rust-descriptor candidates/rust/candidate.json \
-            --results-directory qualification-results \
-            --e2e-directory e2e-results \
-            --output-directory final-evidence
-      - name: Select immutable evidence artifact name
-        id: metadata
-        run: echo "artifact-name=sdk-final-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
-      - name: Upload final evidence manifests
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.metadata.outputs.artifact-name }}
-          path: final-evidence
-          if-no-files-found: error
-      - name: Attest exact candidates and final manifests
-        if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: |
-            candidates/typescript/${{ needs.typescript-candidate.outputs.archive-file }}
-            candidates/typescript/candidate.json
-            candidates/python/${{ needs.python-candidate.outputs.archive-file }}
-            candidates/python/candidate.json
-            candidates/rust/${{ needs.rust-candidate.outputs.archive-file }}
-            candidates/rust/${{ needs.rust-candidate.outputs.upload-metadata-file }}
-            candidates/rust/candidate.json
-            final-evidence/*.json
