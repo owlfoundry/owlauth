@@ -11,7 +11,7 @@ RUN mkdir -p /openapi \
 FROM node:24-bookworm-slim AS web-builder
 
 WORKDIR /workspace
-RUN npm install --global pnpm@11.17.0
+RUN npm install --global pnpm@11.20.0
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY crates/owlauth-server/web/package.json crates/owlauth-server/web/package.json
 RUN pnpm install --filter @owlauth/server-web... --frozen-lockfile

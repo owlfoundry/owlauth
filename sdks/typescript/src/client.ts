@@ -32,7 +32,7 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const TOKEN_PATTERN = /^[A-Za-z0-9._~-]+$/u;
 
 export interface CryptoProvider {
-  getRandomValues<T extends ArrayBufferView | null>(array: T): T;
+  getRandomValues<T extends ArrayBufferView>(array: T): T;
   readonly subtle: SubtleCrypto;
 }
 

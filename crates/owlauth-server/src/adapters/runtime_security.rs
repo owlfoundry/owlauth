@@ -100,7 +100,7 @@ impl SoftwareRuntimeProtector {
         value: &[u8],
     ) -> Result<[u8; 32], ApplicationError> {
         let key = self.key(version)?;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.digest_key.as_ref())
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key.digest_key.as_ref())
             .map_err(|_| ApplicationError::Integrity)?;
         mac.update(domain);
         update_framed(&mut mac, self.deployment_context.as_bytes())?;

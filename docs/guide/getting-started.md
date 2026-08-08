@@ -12,7 +12,7 @@ The repository's pinned development baseline is:
 
 - stable Rust;
 - Node.js 22.13 or later for repository tooling;
-- pnpm 11.17.0;
+- pnpm 11.20.0;
 - Python 3.11 through 3.14;
 - `uv` 0.11.32;
 - Docker Engine/Desktop with Compose v2 when running `make dev`, container-backed tests, or building the server image.

@@ -21,7 +21,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -39,7 +39,7 @@ jobs:
             --version "${{ steps.release.outputs.version }}" \
             --output release-notes.md
       - name: Upload release changelog
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: cli-release-notes
           path: release-notes.md
@@ -82,7 +82,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Prepare release manifests
@@ -120,7 +120,7 @@ jobs:
           powershell -NoProfile -NonInteractive -Command \
             "Compress-Archive -LiteralPath 'target/$TARGET/release/owlauth.exe' -DestinationPath '$archive'"
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: owlauth-cli-${{ matrix.target }}
           path: owlauth-cli-${{ needs.verify.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
@@ -136,20 +136,20 @@ jobs:
       contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
       - name: Download CLI artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: owlauth-cli-*
           path: artifacts
           merge-multiple: true
       - name: Download release changelog
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: cli-release-notes
           path: release-metadata
@@ -216,7 +216,7 @@ jobs:
       contents: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false

@@ -2,11 +2,9 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use hickory_resolver::{
-    ResolveErrorKind, TokioResolver,
-    proto::{
-        ProtoErrorKind,
-        rr::{RData, RecordType},
-    },
+    TokioResolver,
+    net::NetError,
+    proto::rr::{RData, RecordType},
 };
 use reqwest::{Certificate, Client, redirect::Policy};
 
@@ -33,10 +31,13 @@ struct SystemWebhookDnsResolver(TokioResolver);
 impl WebhookDnsResolver for SystemWebhookDnsResolver {
     async fn lookup_cname(&self, hostname: &str) -> Result<Option<String>, ApplicationError> {
         match self.0.lookup(hostname, RecordType::CNAME).await {
-            Ok(records) => Ok(records.iter().find_map(|record| match record {
-                RData::CNAME(name) => Some(name.0.to_utf8()),
-                _ => None,
-            })),
+            Ok(records) => Ok(records
+                .answers()
+                .iter()
+                .find_map(|record| match &record.data {
+                    RData::CNAME(name) => Some(name.0.to_utf8()),
+                    _ => None,
+                })),
             Err(error) if is_no_records(&error) => Ok(None),
             Err(_) => Err(ApplicationError::ExternalStore),
         }
@@ -69,7 +70,8 @@ impl SafeWebhookTransport {
             resolver: Arc::new(SystemWebhookDnsResolver(
                 TokioResolver::builder_tokio()
                     .expect("system DNS resolver configuration is readable")
-                    .build(),
+                    .build()
+                    .expect("system DNS resolver can be constructed"),
             )),
             forbidden_listener_addresses: Arc::new(listener_addresses.into_iter().collect()),
             explicitly_allowed_private_ips: Arc::new(explicitly_allowed_private_ips),
@@ -249,12 +251,8 @@ impl WebhookSendFailure {
     }
 }
 
-fn is_no_records(error: &hickory_resolver::ResolveError) -> bool {
-    matches!(
-        error.kind(),
-        ResolveErrorKind::Proto(proto)
-            if matches!(proto.kind(), ProtoErrorKind::NoRecordsFound { .. })
-    )
+fn is_no_records(error: &NetError) -> bool {
+    error.is_no_records_found()
 }
 
 #[cfg(test)]

@@ -11,11 +11,9 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hickory_resolver::{
-    ResolveErrorKind, TokioResolver,
-    proto::{
-        ProtoErrorKind,
-        rr::{RData, RecordType},
-    },
+    TokioResolver,
+    net::NetError,
+    proto::rr::{RData, RecordType},
 };
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::Deserialize;
@@ -70,10 +68,13 @@ struct SystemSmtpDnsResolver(TokioResolver);
 impl SmtpDnsResolver for SystemSmtpDnsResolver {
     async fn lookup_cname(&self, hostname: &str) -> Result<Option<String>, ApplicationError> {
         match self.0.lookup(hostname, RecordType::CNAME).await {
-            Ok(records) => Ok(records.iter().find_map(|record| match record {
-                RData::CNAME(name) => Some(name.0.to_utf8()),
-                _ => None,
-            })),
+            Ok(records) => Ok(records
+                .answers()
+                .iter()
+                .find_map(|record| match &record.data {
+                    RData::CNAME(name) => Some(name.0.to_utf8()),
+                    _ => None,
+                })),
             Err(error) if is_no_records(&error) => Ok(None),
             Err(_) => Err(ApplicationError::ExternalStore),
         }
@@ -150,7 +151,8 @@ impl SafeSmtpTransport {
         .with_no_client_auth();
         let resolver = TokioResolver::builder_tokio()
             .expect("system DNS resolver configuration is readable")
-            .build();
+            .build()
+            .expect("system DNS resolver can be constructed");
         Self {
             tls: TlsConnector::from(Arc::new(config)),
             resolver: Arc::new(SystemSmtpDnsResolver(resolver)),
@@ -342,12 +344,8 @@ fn tls_error_category(error: &std::io::Error) -> &'static str {
     }
 }
 
-fn is_no_records(error: &hickory_resolver::ResolveError) -> bool {
-    matches!(
-        error.kind(),
-        ResolveErrorKind::Proto(error)
-            if matches!(error.kind(), ProtoErrorKind::NoRecordsFound { .. })
-    )
+fn is_no_records(error: &NetError) -> bool {
+    error.is_no_records_found()
 }
 
 impl SafeSmtpTransport {
@@ -1106,10 +1104,10 @@ mod tests {
     }
 
     fn test_tls(hostname: &str) -> (RootCertStore, TlsAcceptor) {
-        let CertifiedKey { cert, key_pair } =
+        let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec![hostname.to_owned()]).expect("test certificate");
         let certificate: CertificateDer<'static> = cert.der().clone();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
         let mut roots = RootCertStore::empty();
         roots.add(certificate.clone()).expect("test trust root");
         let config = ServerConfig::builder_with_provider(Arc::new(

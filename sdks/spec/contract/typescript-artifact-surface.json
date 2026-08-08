@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "normalization": "replace exact exported VERSION string with <VERSION> in index.js and index.d.ts",
   "files": {
-    "client.d.ts": "90c1ff2b95a8888f0b51487dc6d99b0dacd42c2f3bbc88c831dcab933ce58699",
+    "client.d.ts": "a9b9d4f746532876bfe1a67aeebb7510e6664217fb6e052aa0d0ad1370ff6256",
     "client.js": "0c2e2c7ffc203f4e6d405cea22126360b2e903f588b17e680667df5a9ecd9cb9",
     "errors.d.ts": "4a96d30c039f58db92b25f4dd4f5c07cde9472f3bec00ad78c3054ca20a3d771",
     "errors.js": "4b39dc7947d07c56de891773946d5f1615229016602f3399587ba0e4e1087f13",

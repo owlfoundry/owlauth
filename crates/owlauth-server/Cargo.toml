@@ -12,14 +12,14 @@ categories = ["authentication", "web-programming::http-server"]
 [dependencies]
 async-trait = "0.1.91"
 axum = "0.8.9"
-base64 = "0.22.1"
-chacha20poly1305 = "0.10.1"
-ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
-getrandom = "0.3.4"
-hmac = "0.12.1"
-hkdf = "0.12.4"
-jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
+getrandom = "0.4.3"
+hmac = "0.13.0"
+hkdf = "0.13.0"
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 owlauth-key-provider = { version = "=0.0.0-dev", path = "../owlauth-key-provider" }
 owlauth-types = { version = "=0.0.0-dev", path = "../owlauth-types" }
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "rustls", "stream"] }
@@ -31,20 +31,20 @@ webpki-roots = "1.0.9"
 sea-orm = { version = "2.0.0", default-features = false, features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "with-json", "with-time", "with-uuid"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "uuid", "time", "json"] }
 subtle = "2.6.1"
 thiserror = "2.0.18"
 time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
 tower = { version = "0.5.3", features = ["limit", "util"] }
-tower-http = { version = "0.6.8", features = ["catch-panic", "compression-br", "compression-gzip", "limit", "request-id", "timeout", "trace"] }
+tower-http = { version = "0.7.0", features = ["catch-panic", "compression-br", "compression-gzip", "limit", "request-id", "timeout", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.21.0", features = ["v4"] }
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
-hickory-resolver = { version = "0.25.2", features = ["tokio"] }
+hickory-resolver = { version = "0.26.1", features = ["tokio"] }
 
 [lints]
 workspace = true
@@ -52,10 +52,10 @@ workspace = true
 [build-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 
 [dev-dependencies]
 crc = "3.4.0"
-rcgen = "0.13.2"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto", "use_pem"] }
-testcontainers = "0.27.3"
+rcgen = "0.14.8"
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto", "use_pem"] }
+testcontainers = "0.28.0"

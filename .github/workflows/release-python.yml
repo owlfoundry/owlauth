@@ -21,7 +21,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -38,7 +38,7 @@ jobs:
             --component python --version "${{ steps.release.outputs.version }}" \
             --output release-notes.md
       - name: Upload release changelog
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: python-release-notes
           path: release-notes.md
@@ -63,14 +63,14 @@ jobs:
       id-token: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
       - name: Install locked Python release tools
@@ -78,12 +78,12 @@ jobs:
           python -m pip install --disable-pip-version-check uv==0.11.32
           uv sync --all-packages --locked
       - name: Download immutable SDK candidate
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.ci.outputs.python-candidate-artifact-name }}
           path: candidate
       - name: Download final SDK evidence
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
           path: final-evidence
@@ -136,12 +136,12 @@ jobs:
       contents: write
     steps:
       - name: Download final SDK evidence
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.ci.outputs.sdk-final-evidence-artifact-name }}
           path: final-evidence
       - name: Download release changelog
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: python-release-notes
           path: release-metadata

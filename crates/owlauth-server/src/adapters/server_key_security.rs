@@ -97,7 +97,7 @@ impl SoftwareServerKeyRingInner {
             .keys
             .get(&digest_key_version)
             .ok_or(ApplicationError::Integrity)?;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key.0.as_ref())
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key.0.as_ref())
             .map_err(|_| ApplicationError::Integrity)?;
         mac.update(SERVER_KEY_DIGEST_DOMAIN);
         update_framed(&mut mac, self.deployment_context.as_bytes())?;

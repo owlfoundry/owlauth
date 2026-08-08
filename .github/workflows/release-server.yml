@@ -21,7 +21,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -39,7 +39,7 @@ jobs:
             --version "${{ steps.release.outputs.version }}" \
             --output release-notes.md
       - name: Upload release changelog
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: server-release-notes
           path: release-notes.md
@@ -78,7 +78,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Prepare release manifests
@@ -97,7 +97,7 @@ jobs:
           archive="owlauth-server-${VERSION}-${host}.tar.gz"
           tar -czf "$archive" -C target/release "$binary"
       - name: Upload server artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: owlauth-server-${{ matrix.os }}
           path: owlauth-server-*.tar.gz
@@ -114,25 +114,25 @@ jobs:
       packages: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
       - name: Download server artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: owlauth-server-*
           path: artifacts
           merge-multiple: true
       - name: Download release changelog
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: server-release-notes
           path: release-metadata
       - name: Download verified server image
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: server-container-image
           path: container-artifact

@@ -158,8 +158,9 @@ impl SoftwareCustodyProvider {
         context: &owlauth_key_provider::ProtectionContext,
         plaintext: &[u8],
     ) -> Result<[u8; 32], ProviderError> {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(self.keys.fingerprints.as_ref())
-            .map_err(|_| integrity())?;
+        let mut mac =
+            <HmacSha256 as hmac::KeyInit>::new_from_slice(self.keys.fingerprints.as_ref())
+                .map_err(|_| integrity())?;
         mac.update(FINGERPRINT_DOMAIN);
         update_framed(&mut mac, context.canonical_bytes())?;
         update_framed(&mut mac, plaintext)?;

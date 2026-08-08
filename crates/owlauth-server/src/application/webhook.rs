@@ -1014,8 +1014,8 @@ pub(crate) fn webhook_signature(
     if timestamp <= 0 || event_id.is_empty() || event_id.len() > 128 {
         return Err(ApplicationError::InvalidInput);
     }
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret).map_err(|_| ApplicationError::Integrity)?;
+    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(secret)
+        .map_err(|_| ApplicationError::Integrity)?;
     mac.update(timestamp.to_string().as_bytes());
     mac.update(b".");
     mac.update(event_id.as_bytes());
