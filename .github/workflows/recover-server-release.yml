@@ -1,0 +1,553 @@
+name: Recover Server v0.1.0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-server-refs/tags/server-v0.1.0
+  cancel-in-progress: false
+
+env:
+  RECOVERY_TAG: server-v0.1.0
+  RECOVERY_TAG_OBJECT: 73a59b23b7a96a5c6f156b304a16734cebcec853
+  RECOVERY_SOURCE_COMMIT: cb0890428adbb281140e818b8a00a786272b349d
+  RECOVERY_VERSION: 0.1.0
+
+jobs:
+  verify:
+    name: Verify immutable release recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source-commit: ${{ steps.release.outputs.source-commit }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out verified source commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: cb0890428adbb281140e818b8a00a786272b349d
+      - name: Verify recovery eligibility
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          function verify_remote_tag() {
+            local refs direct peeled
+            refs="$(git ls-remote --tags origin \
+              "refs/tags/$RECOVERY_TAG" "refs/tags/$RECOVERY_TAG^{}")"
+            direct="$(awk '$2 !~ /\^\{\}$/ { print $1 }' <<<"$refs")"
+            peeled="$(awk '$2 ~ /\^\{\}$/ { print $1 }' <<<"$refs")"
+            if [[ "$direct" != "$RECOVERY_TAG_OBJECT" || \
+              "$peeled" != "$RECOVERY_SOURCE_COMMIT" ]]; then
+              echo "remote tag identity changed for $RECOVERY_TAG" >&2
+              exit 1
+            fi
+          }
+
+          function verify_successful_run() {
+            local run_id="$1" workflow_path="$2" workflow_name="$3" run
+            run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")"
+            if ! jq -e \
+              --argjson run_id "$run_id" \
+              --arg path "$workflow_path" \
+              --arg name "$workflow_name" \
+              --arg sha "$RECOVERY_SOURCE_COMMIT" \
+              '.id == $run_id and .path == $path and .name == $name and
+               .event == "push" and .head_branch == "main" and .head_sha == $sha and
+               .status == "completed" and .conclusion == "success"' \
+              <<<"$run" >/dev/null; then
+              echo "run $run_id is not successful exact-source $workflow_name evidence" >&2
+              exit 1
+            fi
+          }
+
+          function verify_shared_version() {
+            local conflict refs
+            conflict="$(git ls-remote --tags origin \
+              'refs/tags/cli-v0.1.0' 'refs/tags/cli-v0.1.0^{}')"
+            if [[ -n "$conflict" ]]; then
+              echo "cli-v0.1.0 conflicts with shared owlauth-types publication" >&2
+              exit 1
+            fi
+            refs="$(git ls-remote --tags origin \
+              'refs/tags/server-v*' 'refs/tags/cli-v*')"
+            python3 scripts/release/verify-shared-crate-version.py \
+              --version "$RECOVERY_VERSION" --current-tag "$RECOVERY_TAG" <<<"$refs"
+          }
+
+          if [[ "$(git cat-file -t "refs/tags/$RECOVERY_TAG")" != "tag" ]]; then
+            echo "recovery requires the annotated tag $RECOVERY_TAG" >&2
+            exit 1
+          fi
+          test "$(git rev-parse "refs/tags/$RECOVERY_TAG")" = "$RECOVERY_TAG_OBJECT"
+          test "$(git rev-parse "refs/tags/$RECOVERY_TAG^{commit}")" = "$RECOVERY_SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$RECOVERY_SOURCE_COMMIT"
+          verify_remote_tag
+
+          git fetch --quiet --no-tags origin \
+            +refs/heads/main:refs/remotes/release-recovery/main
+          main_commit="$(git rev-parse refs/remotes/release-recovery/main^{commit})"
+          if ! git merge-base --is-ancestor "$RECOVERY_SOURCE_COMMIT" "$main_commit"; then
+            echo "$RECOVERY_TAG is not an ancestor of current main" >&2
+            exit 1
+          fi
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/recover-server-release.yml | \
+                .github/workflows/release-cli.yml | \
+                .github/workflows/release-server.yml) ;;
+              *)
+                echo "current main contains non-recovery changes after $RECOVERY_TAG: $path" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git diff --name-only "$RECOVERY_SOURCE_COMMIT" "$main_commit")
+
+          verify_successful_run 31245601445 .github/workflows/ci.yml CI
+          verify_successful_run 31245601428 .github/workflows/docs.yml Docs
+          verify_successful_run \
+            31245601409 .github/workflows/publish-server-image.yml "Publish Server Image"
+          verify_shared_version
+
+          python3 scripts/release/prepare_release.py server "$RECOVERY_VERSION"
+          {
+            echo "source-commit=$RECOVERY_SOURCE_COMMIT"
+            echo "version=$RECOVERY_VERSION"
+          } >> "$GITHUB_OUTPUT"
+      - name: Generate release changelog
+        run: |
+          python3 scripts/release/generate-changelog.py \
+            --component server \
+            --version "${{ steps.release.outputs.version }}" \
+            --output release-notes.md
+      - name: Upload release changelog
+        uses: actions/upload-artifact@v7
+        with:
+          name: recovered-server-release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  build:
+    name: Build recovered server (${{ matrix.os }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out verified source commit
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.source-commit }}
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py server "${{ needs.verify.outputs.version }}"
+      - name: Build server
+        run: cargo build --release --locked --package owlauth-server
+      - name: Package server deterministically
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          binary="owlauth-server"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="owlauth-server.exe"; fi
+          export BINARY_PATH="target/release/$binary"
+          export ARCHIVE_PATH="owlauth-server-${VERSION}-${host}.tar.gz"
+          python3 - <<'PY'
+          import gzip
+          import io
+          import os
+          import tarfile
+          from pathlib import Path
+
+          binary = Path(os.environ["BINARY_PATH"])
+          archive = Path(os.environ["ARCHIVE_PATH"])
+          data = binary.read_bytes()
+          info = tarfile.TarInfo(binary.name)
+          info.size = len(data)
+          info.mode = 0o755
+          info.mtime = 0
+          info.uid = 0
+          info.gid = 0
+          info.uname = "root"
+          info.gname = "root"
+          with archive.open("wb") as output:
+              with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+                  with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as tar:
+                      tar.addfile(info, io.BytesIO(data))
+          PY
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: recovered-owlauth-server-${{ matrix.os }}
+          path: owlauth-server-*.tar.gz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  image:
+    name: Build recovered server image
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out verified source commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.source-commit }}
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py server "${{ needs.verify.outputs.version }}"
+      - name: Build server image
+        env:
+          SOURCE_COMMIT: ${{ needs.verify.outputs.source-commit }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker build --pull \
+            --build-arg "OWLAUTH_VERSION=$VERSION" \
+            --build-arg "VCS_REF=$SOURCE_COMMIT" \
+            --build-arg "SOURCE_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --tag "$image:${VERSION//+/_}" \
+            .
+      - name: Smoke-test server image
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          scripts/docker/smoke-server-image.sh "$image:${VERSION//+/_}"
+      - name: Save verified server image
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          mkdir image-artifact
+          docker save "$image:${VERSION//+/_}" | gzip -n > image-artifact/server-image.tar.gz
+      - name: Upload verified server image
+        uses: actions/upload-artifact@v7
+        with:
+          name: recovered-server-container-image
+          path: image-artifact/server-image.tar.gz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  release:
+    name: Publish recovered server release
+    needs: [verify, build, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out verified source commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.verify.outputs.source-commit }}
+      - name: Prepare release manifests
+        run: python3 scripts/release/prepare_release.py server "${{ needs.verify.outputs.version }}"
+      - name: Download server artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: recovered-owlauth-server-*
+          path: artifacts
+          merge-multiple: true
+      - name: Download release changelog
+        uses: actions/download-artifact@v8
+        with:
+          name: recovered-server-release-notes
+          path: release-metadata
+      - name: Download verified server image
+        uses: actions/download-artifact@v8
+        with:
+          name: recovered-server-container-image
+          path: container-artifact
+      - name: Generate exact-version plane OpenAPI artifacts
+        run: |
+          cargo run --release --locked --package owlauth-types --bin export-openapi -- \
+            runtime artifacts/owlauth-runtime-openapi.json
+          cargo run --release --locked --package owlauth-types --bin export-openapi -- \
+            server artifacts/owlauth-server-openapi.json
+          cargo run --release --locked --package owlauth-types --bin export-openapi -- \
+            control artifacts/owlauth-control-openapi.json
+      - name: Verify source artifact set
+        working-directory: artifacts
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          expected=(
+            "owlauth-server-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "owlauth-server-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "owlauth-server-${VERSION}-x86_64-pc-windows-msvc.tar.gz"
+            "owlauth-runtime-openapi.json"
+            "owlauth-server-openapi.json"
+            "owlauth-control-openapi.json"
+          )
+          for asset in "${expected[@]}"; do test -f "$asset"; done
+          test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq "${#expected[@]}"
+      - name: Re-verify immutable tag and shared version
+        run: |
+          refs="$(git ls-remote --tags origin \
+            "refs/tags/$RECOVERY_TAG" "refs/tags/$RECOVERY_TAG^{}")"
+          test "$(awk '$2 !~ /\^\{\}$/ { print $1 }' <<<"$refs")" = "$RECOVERY_TAG_OBJECT"
+          test "$(awk '$2 ~ /\^\{\}$/ { print $1 }' <<<"$refs")" = "$RECOVERY_SOURCE_COMMIT"
+          test -z "$(git ls-remote --tags origin \
+            'refs/tags/cli-v0.1.0' 'refs/tags/cli-v0.1.0^{}')"
+          shared_refs="$(git ls-remote --tags origin \
+            'refs/tags/server-v*' 'refs/tags/cli-v*')"
+          python3 scripts/release/verify-shared-crate-version.py \
+            --version "$RECOVERY_VERSION" --current-tag "$RECOVERY_TAG" <<<"$shared_refs"
+      - name: Load verified server image
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          gzip -dc container-artifact/server-image.tar.gz | docker load
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${VERSION//+/_}"
+          docker image inspect "$image" >/dev/null
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Preflight mutable publication destinations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          function registry_manifest_status() {
+            local repository token status
+            repository="${GITHUB_REPOSITORY,,}"
+            token="$(curl --fail --silent --show-error --get \
+              --user "$GITHUB_ACTOR:$GHCR_TOKEN" \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode "scope=repository:$repository:pull" \
+              https://ghcr.io/token | jq -er '.token // .access_token')"
+            status="$(curl --silent --show-error --head \
+              --output "$RUNNER_TEMP/ghcr-manifest-preflight" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer $token" \
+              --header 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json' \
+              "https://ghcr.io/v2/$repository/manifests/${VERSION//+/_}")"
+            printf '%s\n' "$status"
+          }
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version_tag="${VERSION//+/_}"
+          candidate="$image:recovery-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          candidate_id="$(docker image inspect --format '{{.Id}}' "$image:$version_tag")"
+          docker tag "$image:$version_tag" "$candidate"
+          status="$(registry_manifest_status)"
+          case "$status" in
+            200)
+              docker pull "$image:$version_tag"
+              published_id="$(docker image inspect --format '{{.Id}}' "$image:$version_tag")"
+              if [[ "$published_id" != "$candidate_id" ]]; then
+                rm -rf image-evidence
+                mkdir image-evidence
+                gh release download "$RECOVERY_TAG" \
+                  --pattern server-image-digest.txt --dir image-evidence
+                published_digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                  "$image:$version_tag" | grep -F "$image@" | head -n 1)"
+                grep -Fxq "$published_digest" image-evidence/server-image-digest.txt
+              fi
+              test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+                "$image:$version_tag")" = "$VERSION"
+              test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+                "$image:$version_tag")" = "$RECOVERY_SOURCE_COMMIT"
+              ;;
+            404) ;;
+            *)
+              echo "GHCR returned HTTP $status while preflighting $image:$version_tag" >&2
+              exit 1
+              ;;
+          esac
+
+          if gh release view "$RECOVERY_TAG" >/dev/null 2>&1; then
+            release="$(gh release view "$RECOVERY_TAG" \
+              --json tagName,name,isDraft,isPrerelease,assets)"
+            jq -e --arg tag "$RECOVERY_TAG" --arg name "OwlAuth Server v$VERSION" \
+              '.tagName == $tag and .name == $name and
+               .isDraft == false and .isPrerelease == false' \
+              <<<"$release" >/dev/null
+            while IFS= read -r name; do
+              case "$name" in
+                "owlauth-server-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | \
+                  "owlauth-server-${VERSION}-aarch64-apple-darwin.tar.gz" | \
+                  "owlauth-server-${VERSION}-x86_64-pc-windows-msvc.tar.gz" | \
+                  owlauth-runtime-openapi.json | owlauth-server-openapi.json | \
+                  owlauth-control-openapi.json | server-image-digest.txt | SHA256SUMS) ;;
+                *)
+                  echo "unexpected pre-existing GitHub Release asset: $name" >&2
+                  exit 1
+                  ;;
+              esac
+            done < <(jq -r '.assets[].name' <<<"$release")
+            mkdir -p preflight-assets
+            for local in artifacts/*; do
+              name="$(basename "$local")"
+              if jq -e --arg name "$name" '.assets[] | select(.name == $name)' \
+                <<<"$release" >/dev/null; then
+                gh release download "$RECOVERY_TAG" --pattern "$name" --dir preflight-assets
+                cmp "$local" "preflight-assets/$name"
+              fi
+            done
+          fi
+      - name: Require crates.io token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: test -n "$CARGO_REGISTRY_TOKEN"
+      - name: Publish server crates idempotently
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          scripts/release/publish-crate.sh \
+            crates/owlauth-key-provider/Cargo.toml "$VERSION"
+          scripts/release/publish-crate.sh \
+            crates/owlauth-types/Cargo.toml "$VERSION"
+          for attempt in {1..12}; do
+            if scripts/release/publish-crate.sh \
+              crates/owlauth-server/Cargo.toml "$VERSION"; then
+              exit 0
+            fi
+            if [[ "$attempt" == 12 ]]; then exit 1; fi
+            sleep 10
+          done
+      - name: Publish or verify versioned server image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          function registry_manifest_status() {
+            local repository token status
+            repository="${GITHUB_REPOSITORY,,}"
+            token="$(curl --fail --silent --show-error --get \
+              --user "$GITHUB_ACTOR:$GHCR_TOKEN" \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode "scope=repository:$repository:pull" \
+              https://ghcr.io/token | jq -er '.token // .access_token')"
+            status="$(curl --silent --show-error --head \
+              --output "$RUNNER_TEMP/ghcr-manifest-publish" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer $token" \
+              --header 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json' \
+              "https://ghcr.io/v2/$repository/manifests/${VERSION//+/_}")"
+            printf '%s\n' "$status"
+          }
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version_tag="${VERSION//+/_}"
+          candidate="$image:recovery-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          candidate_id="$(docker image inspect --format '{{.Id}}' "$candidate")"
+          status="$(registry_manifest_status)"
+          case "$status" in
+            200)
+              docker pull "$image:$version_tag"
+              published_id="$(docker image inspect --format '{{.Id}}' "$image:$version_tag")"
+              if [[ "$published_id" != "$candidate_id" ]]; then
+                rm -rf image-evidence
+                mkdir image-evidence
+                gh release download "$RECOVERY_TAG" \
+                  --pattern server-image-digest.txt --dir image-evidence
+                published_digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+                  "$image:$version_tag" | grep -F "$image@" | head -n 1)"
+                grep -Fxq "$published_digest" image-evidence/server-image-digest.txt
+              fi
+              ;;
+            404)
+              docker tag "$candidate" "$image:$version_tag"
+              docker push "$image:$version_tag"
+              docker pull "$image:$version_tag"
+              ;;
+            *)
+              echo "GHCR returned HTTP $status while publishing $image:$version_tag" >&2
+              exit 1
+              ;;
+          esac
+
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+            "$image:$version_tag")" = "$VERSION"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            "$image:$version_tag")" = "$RECOVERY_SOURCE_COMMIT"
+          digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            "$image:$version_tag" | grep -F "$image@" | head -n 1)"
+          [[ "$digest" == "$image@sha256:"* ]]
+          printf '%s\n' "$digest" > artifacts/server-image-digest.txt
+      - name: Create release checksums
+        working-directory: artifacts
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          sha256sum \
+            "owlauth-server-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "owlauth-server-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            "owlauth-server-${VERSION}-x86_64-pc-windows-msvc.tar.gz" \
+            owlauth-runtime-openapi.json \
+            owlauth-server-openapi.json \
+            owlauth-control-openapi.json \
+            server-image-digest.txt > SHA256SUMS
+      - name: Create or resume exact GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if gh release view "$RECOVERY_TAG" >/dev/null 2>&1; then
+            release="$(gh release view "$RECOVERY_TAG" \
+              --json tagName,name,isDraft,isPrerelease,assets)"
+            jq -e --arg tag "$RECOVERY_TAG" --arg name "OwlAuth Server v$VERSION" \
+              '.tagName == $tag and .name == $name and
+               .isDraft == false and .isPrerelease == false' \
+              <<<"$release" >/dev/null
+          else
+            gh release create "$RECOVERY_TAG" artifacts/* \
+              --notes-file release-metadata/release-notes.md \
+              --title "OwlAuth Server v${VERSION}"
+          fi
+
+          mkdir -p published-assets
+          release="$(gh release view "$RECOVERY_TAG" --json assets)"
+          for local in artifacts/*; do
+            name="$(basename "$local")"
+            if jq -e --arg name "$name" '.assets[] | select(.name == $name)' \
+              <<<"$release" >/dev/null; then
+              gh release download "$RECOVERY_TAG" --pattern "$name" --dir published-assets
+              cmp "$local" "published-assets/$name"
+            else
+              gh release upload "$RECOVERY_TAG" "$local"
+            fi
+          done
+
+          expected="$(find artifacts -maxdepth 1 -type f -exec basename {} \; | sort)"
+          actual="$(gh release view "$RECOVERY_TAG" --json assets \
+            --jq '.assets[].name' | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "GitHub Release asset set differs from the verified local set" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+      - name: Promote verified server image to latest
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag "$image:${VERSION//+/_}" "$image:latest"
+          docker push "$image:latest"
