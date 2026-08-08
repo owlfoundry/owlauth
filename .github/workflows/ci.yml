@@ -494,8 +494,26 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.14"
-      - name: Test release manifest preparation from development state
-        run: python3 scripts/release/test-prepare-release.py
+      - name: Test release tooling and installers from development state
+        run: |
+          scripts/release/test-verify-release.sh
+          python3 scripts/release/test-verify-shared-crate-version.py
+          python3 scripts/release/test-changelog.py
+          python3 scripts/release/test-prepare-release.py
+          scripts/release/test-publish-crate.sh
+          env -u GITHUB_REF_TYPE -u GITHUB_REF_NAME \
+            python3 scripts/test-sdk-artifact.py
+          python3 scripts/test-sdk-evidence.py
+          python3 scripts/release/test-verify-sdk-candidate.py
+          python3 scripts/release/test-verify-sdk-evidence.py
+          python3 scripts/release/test-upload-crate.py
+          sh -n scripts/install.sh
+          scripts/test-installers.sh
+          cmp scripts/install.sh crates/owlauth-cli/assets/install.sh
+          cmp scripts/install.ps1 crates/owlauth-cli/assets/install.ps1
+          # shellcheck disable=SC2016
+          pwsh -NoProfile -NonInteractive -Command \
+            '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Out-String | Write-Error; exit 1 }'
       - name: Prepare release manifests
         run: python3 scripts/release/prepare_release.py
       - name: Set up Go for workflow validation
@@ -523,25 +541,6 @@ jobs:
           for fixture in sdks/spec/fixtures/*.json sdks/spec/conformance/cases.json; do
             python3 -m json.tool "$fixture" >/dev/null
           done
-      - name: Test release tooling and installers
-        run: |
-          scripts/release/test-verify-release.sh
-          python3 scripts/release/test-verify-shared-crate-version.py
-          python3 scripts/release/test-changelog.py
-          scripts/release/test-publish-crate.sh
-          python3 scripts/test-sdk-artifact.py
-          python3 scripts/test-sdk-evidence.py
-          python3 scripts/release/test-verify-sdk-candidate.py
-          python3 scripts/release/test-verify-sdk-evidence.py
-          python3 scripts/release/test-upload-crate.py
-          sh -n scripts/install.sh
-          scripts/test-installers.sh
-          cmp scripts/install.sh crates/owlauth-cli/assets/install.sh
-          cmp scripts/install.ps1 crates/owlauth-cli/assets/install.ps1
-          # shellcheck disable=SC2016
-          pwsh -NoProfile -NonInteractive -Command \
-            '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Out-String | Write-Error; exit 1 }'
-
 
   typescript-candidate:
     name: Build TypeScript SDK candidate
