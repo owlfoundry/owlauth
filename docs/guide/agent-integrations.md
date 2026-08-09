@@ -9,7 +9,7 @@ OwlAuth separates documentation assistance, remote administration, and future ag
 | `owlauth` CLI           | Descriptor-pinned self-hosted Control commands and checksum-verified self-update are available |
 | Codex/Claude plugin     | Repository-distributed integration skill and reference material only                           |
 | Remote Control commands | Typed Project/Application/user/session/provider/key/webhook commands are available             |
-| MCP server/tools        | Seven self-hosted read-only Control tools are available when explicitly enabled                |
+| MCP server/tools        | Full self-hosted Control administration is available when explicitly enabled                   |
 
 The plugin does not bundle a server, launch a local MCP process, expose Project Auth operations, or create credentials. Treat it as documentation and guardrails for the Beta repository.
 
@@ -25,7 +25,7 @@ The shared source under [`plugins/owlauth`](https://github.com/owlfoundry/owlaut
 - require the component's candidate-bound final evidence manifest before describing an SDK operation as release-qualified; exported methods, package versions, workspace tests, generated OpenAPI, and fixtures alone are insufficient, and current manifests prove one exact Runtime/source coordinate rather than a range;
 - direct security reports to the private disclosure path.
 
-Plugin text or model output is never authority. Do not paste provider secrets, `OWLAUTH_CONTROL_API_KEY`, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, private keys, full callback URLs, or user profiles into agent context.
+Plugin text or model output is never authority. Outside the explicitly invoked full-authority remote MCP tools described below, do not put provider secrets, `OWLAUTH_CONTROL_API_KEY`, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, private keys, full callback URLs, or user profiles into agent context. The operator key remains transport-only even for MCP.
 
 ## Install and configure the CLI
 
@@ -159,35 +159,62 @@ curl --fail --silent --show-error --config "$OWLAUTH_MCP_CURL_CONFIG" \
   }' | jq
 ```
 
-The catalog exposes exactly these nine read-only tools with closed inputs:
+The catalog exposes the complete authenticated Control operation inventory: 85 independently named tools in the current contract. `tools/list` is cursor-paginated; MCP hosts must follow `nextCursor` until it is absent. Each reviewed Control operation has a fixed method, fixed `/v1` route, closed input schema, and typed output schema. The adapter accepts no caller-selected method, path, arbitrary header, Runtime route, Server API route, or external URL.
 
-| Tool                                | Arguments                                                                                                                                                            |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `owlauth_system_get`                | `{}`                                                                                                                                                                 |
-| `owlauth_projects_list`             | `belongs_to` (optional exact ownership metadata)                                                                                                                     |
-| `owlauth_project_get`               | `project_id`                                                                                                                                                         |
-| `owlauth_applications_list`         | `project_id`                                                                                                                                                         |
-| `owlauth_application_get`           | `project_id`, `application_id`                                                                                                                                       |
-| `owlauth_webhook_endpoints_list`    | `project_id`, `application_id`                                                                                                                                       |
-| `owlauth_webhook_deliveries_list`   | `project_id`, `application_id`, optional `endpoint_id`, optional opaque `cursor`, optional `limit` from 1–100                                                        |
-| `owlauth_project_users_list`        | `project_id`, optional `status`, safe-prefix `search`, `identity_kind`, provider-provenance `provider_key`, `sort`, criteria-stable `cursor`, and `limit` from 1–100 |
-| `owlauth_project_user_lookup_email` | `project_id`, exact canonical `email`; returns zero or one safe Project user without the email                                                                       |
+The original nine bounded query tools retain their established names:
 
-Resource IDs are exact canonical UUIDs. Omit optional arguments or send JSON `null` according to the MCP host's typed tool-call API. For example, the delivery-list arguments are:
+- `owlauth_system_get`
+- `owlauth_projects_list` and `owlauth_project_get`
+- `owlauth_applications_list` and `owlauth_application_get`
+- `owlauth_webhook_endpoints_list` and `owlauth_webhook_deliveries_list`
+- `owlauth_project_users_list` and `owlauth_project_user_lookup_email`
+
+Every other tool is named `owlauth_{operationId}` from the Control OpenAPI contract. The resulting management surface covers Project/Application metadata and policy, server keys, signing keys, providers and assignments, email and SMTP configuration, webhook lifecycle and replay, Project users and sessions, managed provider connections, and identity-mutation intents. Inspect the generated tool schema rather than guessing fields.
+
+Generated tool arguments follow one stable mapping:
+
+- path and query parameters are top-level arguments;
+- an `Idempotency-Key` header is the top-level `idempotency_key` argument;
+- the operation's JSON request entity is the `body` object;
+- omitted optional values remain omitted rather than being synthesized;
+- resource IDs and expected revisions retain their Control contract validation.
+
+For example, an agent can create a Project directly:
 
 ```json
 {
-  "project_id": "00000000-0000-0000-0000-000000000000",
-  "application_id": "00000000-0000-0000-0000-000000000000",
-  "endpoint_id": null,
-  "cursor": null,
-  "limit": 50
+  "name": "owlauth_create_project",
+  "arguments": {
+    "idempotency_key": "project_create_20260808",
+    "body": {
+      "display_name": "Example Project",
+      "belongs_to": "tenant-42"
+    }
+  }
 }
 ```
 
-The endpoint creates no MCP session and declares no prompts or resources. Every request reauthenticates the operator key and checks the configured Control authority. It is not a Runtime route or local plugin process; the CLI, plugins, installers, and agent packages do not launch or impersonate it.
+It can then update that exact Project using the current metadata revision:
 
-Each tool maps to one bounded Control query with explicit targets, closed input/output, and timeout/concurrency policy. MCP does not provide raw SQL, generic HTTP/OpenAPI forwarding, repository access, CLI/shell/filesystem execution, mutation, unrestricted bulk reads, or export of secrets, provider tokens, sessions, operator/API keys, private keys, or user-profile dumps. Any future mutation requires a separately reviewed server-enforced authorization, idempotency, audit, and confirmation design before it enters the catalog.
+```json
+{
+  "name": "owlauth_update_project",
+  "arguments": {
+    "project_id": "00000000-0000-0000-0000-000000000000",
+    "body": {
+      "display_name": "Renamed Project",
+      "belongs_to": "tenant-42",
+      "expected_metadata_revision": 1
+    }
+  }
+}
+```
+
+MCP deliberately adds no read-only role or adapter-specific confirmation step. The authenticated operator key grants full deployment Control authority. Server-required `confirm`, `expected_*_revision`, and idempotency fields still apply exactly as declared by each operation; CLI-only `--yes` prompts do not apply to MCP.
+
+Full parity includes secret-bearing Control operations. Provider client secrets, SMTP passwords, and webhook signing secrets are write-only request fields and therefore become model-visible tool arguments when those tools are invoked. Project server-key creation returns a credential exactly once, so that credential becomes a model-visible tool result. Reviewed identity queries may likewise return model-visible identity presentation fields. Use these tools only with a trusted MCP host/model and approved secret and personal-data handling. The operator key itself must remain in host secret storage and is never a tool argument or result. Stored provider tokens, sessions, signing private keys, protected-material handles, and raw repository data remain unavailable.
+
+The endpoint creates no MCP session and declares no prompts or resources. Every request reauthenticates the operator key and checks the configured Control authority. It is not a Runtime route or local plugin process; the CLI, plugins, installers, and agent packages do not launch or impersonate it. Dispatch stays inside the server's Control router and preserves the same DTO parsing, Project ownership, revision, idempotency, state-transition, custody, and application/domain checks as direct Control HTTP.
 
 ## External control gateways
 

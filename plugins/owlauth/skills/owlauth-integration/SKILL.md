@@ -42,7 +42,7 @@ OAuth/OIDC exists only between OwlAuth and configured upstream providers such as
 - Public `project_id`, `application_id`, and publishable configuration are identifiers, not secrets or Control credentials.
 - Do not add a path or package dependency from any SDK or CLI to `owlauth-server`.
 - Do not commit generated OpenAPI output. Generate the plane-specific documents from `crates/owlauth-types` with `make openapi` when needed.
-- Treat MCP as an optional remote Streamable HTTP Control adapter authenticated by the deployment operator key. The plugin never bundles, launches, downloads, supervises, or impersonates a local MCP process.
+- Treat MCP as an optional remote Streamable HTTP Control adapter authenticated by the deployment operator key and exposing the complete reviewed Control operation inventory. It has full deployment authority; secret-bearing operations make those specific arguments or one-time results model-visible. The plugin never bundles, launches, downloads, supervises, or impersonates a local MCP process.
 - Treat only documented CLI commands as implemented. The CLI discovers and pins the self-hosted server endpoint identity before reading the operator credential; it never guesses identity from an authenticated failure.
 - Never request provider client secrets, registry tokens, Project access/refresh tokens, management credentials, signing keys, or Cloudflare credentials in chat. Use secure local prompts, secret stores, or trusted publishing.
 - Present the delivered scope as Beta and pre-1.0, never as deployment-certified or production-supported authentication or authorization infrastructure. Operators retain hardening, monitoring, upgrade, backup, PITR, and restore responsibility.

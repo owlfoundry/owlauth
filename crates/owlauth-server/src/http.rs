@@ -585,8 +585,8 @@ fn federated_project_auth_router() -> Router<RuntimeState> {
     clippy::too_many_lines,
     reason = "the Control route inventory is intentionally explicit and plane-local"
 )]
-fn control_router(listener: &ListenerConfig, state: ControlState, config: &ServerConfig) -> Router {
-    let protected = Router::new()
+fn control_api_router() -> Router<ControlState> {
+    Router::new()
         .route("/system", get(system_capabilities))
         .route("/projects", get(list_projects).post(create_project))
         .route(
@@ -783,6 +783,12 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
             "/projects/{project_id}/identity-mutation-intents/{intent_id}/confirm",
             post(confirm_identity_mutation_intent),
         )
+}
+
+fn control_router(listener: &ListenerConfig, state: ControlState, config: &ServerConfig) -> Router {
+    let control_api = control_api_router();
+    let protected = control_api
+        .clone()
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_operator,
@@ -801,8 +807,12 @@ fn control_router(listener: &ListenerConfig, state: ControlState, config: &Serve
         .nest("/v1", protected)
         .with_state(state.clone());
     if config.control_mcp.enabled {
+        let mcp_control_api = Router::new()
+            .nest("/v1", control_api)
+            .with_state(state.clone());
         application = application.merge(mcp::router(
             &state,
+            mcp_control_api,
             listener,
             &config.control_mcp,
             listener.http.max_request_bytes,
@@ -10941,17 +10951,16 @@ pub(crate) mod tests {
         assert_eq!(tools.status(), StatusCode::OK);
         let tools: serde_json::Value =
             serde_json::from_slice(&to_bytes(tools.into_body(), 65_536).await.unwrap()).unwrap();
+        assert!(tools["result"]["nextCursor"].is_string());
         let tools = tools["result"]["tools"]
             .as_array()
-            .expect("tools/list returns a bounded catalog");
-        assert_eq!(tools.len(), 9);
-        for expected in [
-            "owlauth_system_get",
-            "owlauth_project_users_list",
-            "owlauth_project_user_lookup_email",
-        ] {
-            assert!(tools.iter().any(|tool| tool["name"] == expected));
-        }
+            .expect("tools/list returns a bounded catalog page");
+        assert_eq!(tools.len(), 8);
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "owlauth_abandon_provider_secret_replacement")
+        );
         assert!(tools.iter().all(|tool| {
             tool["inputSchema"]["additionalProperties"] == false
                 && tool["outputSchema"]["type"] == "object"
@@ -10960,8 +10969,8 @@ pub(crate) mod tests {
         assert!(
             tools
                 .iter()
-                .all(|tool| tool["annotations"]["readOnlyHint"] == true),
-            "the initial MCP catalog is read-only"
+                .any(|tool| tool["annotations"]["readOnlyHint"] == false),
+            "the Control MCP catalog includes administrative mutations"
         );
 
         let called = control

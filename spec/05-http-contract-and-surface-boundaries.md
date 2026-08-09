@@ -325,7 +325,7 @@ The operator API key appears only in the Authorization header, never URLs, bodie
 
 ### HTTP MCP route
 
-When enabled, the Control listener exposes `mcp` relative to its configured external base as a standards-conformant Streamable HTTP endpoint. Every MCP protocol request uses the same operator Bearer key and full deployment authority. It is absent from Runtime and never accepts a Runtime credential. Normal MCP initialization and tool discovery own protocol self-description; MCP schemas are not REST/OpenAPI operations. Transport, tool, confirmation, redaction, and no-local-process rules are owned by spec 07.
+When enabled, the Control listener exposes `mcp` relative to its configured external base as a standards-conformant Streamable HTTP endpoint. Every MCP protocol request uses the same operator Bearer key and full deployment authority. It is absent from Runtime and never accepts a Runtime credential. Normal MCP initialization and tool discovery own protocol self-description. The authenticated `/v1` Control OpenAPI operation inventory and DTO schemas generate fixed, independently named MCP tools, but the MCP protocol endpoint itself is not a REST/OpenAPI operation and accepts no generic method/path invocation. Transport, catalog generation, secret visibility, dispatch, redaction, and no-local-process rules are owned by spec 07.
 
 ### `belongs_to` contract
 
@@ -365,7 +365,7 @@ DTO validation handles wire shape. Domain validation enforces current Project ow
 
 Default SDK generation consumes Runtime Project Auth only. Control uses a distinct client module/feature or CLI-owned typed transport generated solely from the Control contract. The well-known service descriptor is a small shared CLI-discovery contract, not authorization or product capability discovery. Health/internal diagnostics and MCP schemas do not enter either client automatically.
 
-MCP tools are hand-designed Control capabilities over application commands, not generated generic forwarding. No client can access server-internal rows or provider payloads.
+MCP tools are generated from the reviewed authenticated Control operation inventory and dispatch only to the matching fixed in-process Control route. They are not caller-selected generic forwarding, and no client can access Runtime, Server API, server-internal rows, protected-material handles, or provider payloads outside the public Control contract.
 
 ## Compatibility semantics
 
