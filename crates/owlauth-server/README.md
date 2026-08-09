@@ -13,7 +13,7 @@ The server library and executable for [OwlAuth](https://github.com/owlfoundry/ow
 - Project signing-key lifecycle and PostgreSQL protected-material custody
 - User projections, signed webhooks, managed profiles, and background workers
 - Embedded SQL migrations and deterministic hosted-web assets
-- Optional read-only remote MCP tools for Control
+- Optional full-authority remote MCP administration over reviewed Control operations
 
 OwlAuth uses OAuth/OIDC only for upstream identity federation. It is not a general-purpose downstream OAuth authorization server or provider-token broker.
 

@@ -1,5 +1,7 @@
 use std::{str::FromStr as _, sync::Arc};
 
+mod control;
+
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request, State},
@@ -9,9 +11,15 @@ use axum::{
 };
 use rmcp::{
     ErrorData, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    model::{
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        Implementation, ListToolsResult, PaginatedRequestParams, ResultType, ServerCapabilities,
+        ServerInfo, Tool,
+    },
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
     },
@@ -21,9 +29,13 @@ use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer};
 use url::{Host, Url};
 use uuid::Uuid;
 
+use self::control::ControlToolCatalog;
 use super::{
     ControlState, bearer_challenge, control_problem, timestamp, valid_control_authorization,
 };
+const TOOL_PAGE_SIZE: usize = 8;
+const TOOL_CURSOR_PREFIX: &str = "owlauth-tools-v1:";
+
 use crate::{
     application::{
         ApplicationError, ControlLifecycleService, ProjectUserIdentityKind, ProjectUserSort,
@@ -109,6 +121,8 @@ struct AuthenticatedDeploymentOperator;
 #[derive(Clone, Debug)]
 struct OwlAuthMcpServer {
     services: McpApplicationServices,
+    control_api: Router,
+    control_tools: ControlToolCatalog,
     max_result_bytes: usize,
     tool_router: ToolRouter<Self>,
 }
@@ -120,9 +134,16 @@ impl std::fmt::Debug for McpApplicationServices {
 }
 
 impl OwlAuthMcpServer {
-    fn new(services: McpApplicationServices, max_result_bytes: usize) -> Self {
+    fn new(
+        services: McpApplicationServices,
+        control_api: Router,
+        control_tools: ControlToolCatalog,
+        max_result_bytes: usize,
+    ) -> Self {
         Self {
             services,
+            control_api,
+            control_tools,
             max_result_bytes,
             tool_router: Self::tool_router(),
         }
@@ -162,12 +183,10 @@ impl OwlAuthMcpServer {
                     ErrorData::internal_error("tool result serialization failed", None)
                 })?;
                 if encoded.len() > self.max_result_bytes {
-                    return Ok(CallToolResult::structured_error(serde_json::json!({
-                        "error": {
-                            "code": "result_too_large",
-                            "message": "The bounded tool result exceeds the configured limit."
-                        }
-                    })));
+                    return Ok(mcp_tool_error(
+                        "result_too_large",
+                        "The bounded tool result exceeds the configured limit.",
+                    ));
                 }
                 Ok(CallToolResult::structured(value))
             }
@@ -913,9 +932,87 @@ impl ServerHandler for OwlAuthMcpServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("owlauth-server", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Seven bounded, read-only deployment-operator inspection tools over OwlAuth Control application services.",
+                "Full deployment-operator administration over the reviewed OwlAuth Control contract. Every tool call has the same authority as the Control operator API key used to authenticate the MCP request.",
             )
     }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if self.control_tools.contains(request.name.as_ref()) {
+            return self
+                .control_tools
+                .call(
+                    self.control_api.clone(),
+                    request.name.as_ref(),
+                    request.arguments,
+                    self.max_result_bytes,
+                )
+                .await
+                .map(Into::into);
+        }
+        let context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(context).await
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        tools.extend(self.control_tools.tools());
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        let (tools, next_cursor) = tool_page(
+            &tools,
+            request
+                .as_ref()
+                .and_then(|request| request.cursor.as_deref()),
+        )?;
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(CacheScope::Public),
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.control_tools
+            .get_tool(name)
+            .or_else(|| self.tool_router.get(name).cloned())
+    }
+}
+
+fn tool_page(
+    tools: &[Tool],
+    cursor: Option<&str>,
+) -> Result<(Vec<Tool>, Option<String>), ErrorData> {
+    let offset = tool_cursor_offset(cursor)?;
+    if cursor.is_some() && offset >= tools.len() {
+        return Err(ErrorData::invalid_params("invalid tools/list cursor", None));
+    }
+    let end = offset.saturating_add(TOOL_PAGE_SIZE).min(tools.len());
+    let next_cursor = (end < tools.len()).then(|| format!("{TOOL_CURSOR_PREFIX}{end}"));
+    Ok((tools[offset..end].to_vec(), next_cursor))
+}
+
+fn tool_cursor_offset(cursor: Option<&str>) -> Result<usize, ErrorData> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    cursor
+        .strip_prefix(TOOL_CURSOR_PREFIX)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|offset| *offset > 0 && offset % TOOL_PAGE_SIZE == 0)
+        .ok_or_else(|| ErrorData::invalid_params("invalid tools/list cursor", None))
 }
 
 fn parse_uuid(field: &'static str, value: &str) -> Result<Uuid, ErrorData> {
@@ -929,6 +1026,18 @@ fn parse_uuid(field: &'static str, value: &str) -> Result<Uuid, ErrorData> {
         ));
     }
     Ok(parsed)
+}
+
+fn mcp_tool_error(code: &str, message: &str) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(
+        serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message
+            }
+        })
+        .to_string(),
+    )])
 }
 
 fn application_error_result(error: ApplicationError) -> CallToolResult {
@@ -965,9 +1074,7 @@ fn application_error_result(error: ApplicationError) -> CallToolResult {
             "The Control capability is temporarily unavailable.",
         ),
     };
-    CallToolResult::structured_error(serde_json::json!({
-        "error": { "code": code, "message": message }
-    }))
+    mcp_tool_error(code, message)
 }
 
 fn has_exact_external_authority(
@@ -1100,15 +1207,25 @@ fn external_authority(url: &Url) -> String {
 
 pub(super) fn router(
     state: &ControlState,
+    control_api: Router,
     listener: &ListenerConfig,
     config: &McpHttpConfig,
     control_max_request_bytes: usize,
 ) -> Router {
     let services = McpApplicationServices::from(state);
+    let control_tools = ControlToolCatalog::from_control_openapi()
+        .expect("reviewed Control OpenAPI generates a valid MCP tool catalog");
     let max_result_bytes = config.max_result_bytes;
     let max_request_bytes = config.max_request_bytes.min(control_max_request_bytes);
     let transport = StreamableHttpService::new(
-        move || Ok(OwlAuthMcpServer::new(services.clone(), max_result_bytes)),
+        move || {
+            Ok(OwlAuthMcpServer::new(
+                services.clone(),
+                control_api.clone(),
+                control_tools.clone(),
+                max_result_bytes,
+            ))
+        },
         Arc::new(NeverSessionManager::default()),
         StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
@@ -1139,6 +1256,19 @@ pub(super) fn router(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_server() -> OwlAuthMcpServer {
+        OwlAuthMcpServer::new(
+            McpApplicationServices {
+                provisioning: None,
+                lifecycle: None,
+                webhooks: None,
+            },
+            Router::new(),
+            ControlToolCatalog::from_control_openapi().unwrap(),
+            1024,
+        )
+    }
 
     #[test]
     fn resource_ids_are_exact_canonical_uuids() {
@@ -1193,15 +1323,66 @@ mod tests {
     }
 
     #[test]
-    fn every_tool_has_a_closed_mcp_owned_output_schema() {
-        let server = OwlAuthMcpServer::new(
-            McpApplicationServices {
-                provisioning: None,
-                lifecycle: None,
-                webhooks: None,
-            },
-            1024,
-        );
+    fn full_catalog_pages_fit_a_48_kib_protocol_response_budget() {
+        let server = test_server();
+        let mut tools = server.tool_router.list_all();
+        tools.extend(server.control_tools.tools());
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(tools.len(), 85);
+        for tools in tools.chunks(TOOL_PAGE_SIZE) {
+            let encoded = serde_json::to_vec(tools).unwrap();
+            assert!(
+                encoded.len() < 48_000,
+                "MCP tool page is {} bytes",
+                encoded.len()
+            );
+        }
+    }
+
+    #[test]
+    fn full_catalog_pagination_is_complete_and_rejects_invalid_cursors() {
+        let server = test_server();
+        let mut tools = server.tool_router.list_all();
+        tools.extend(server.control_tools.tools());
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let expected = tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next_cursor) = tool_page(&tools, cursor.as_deref()).unwrap();
+            assert!(!page.is_empty());
+            assert!(page.len() <= TOOL_PAGE_SIZE);
+            actual.extend(page.into_iter().map(|tool| tool.name.to_string()));
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(actual, expected);
+
+        for cursor in [
+            "",
+            "8",
+            "owlauth-tools-v0:8",
+            "owlauth-tools-v1:0",
+            "owlauth-tools-v1:1",
+            "owlauth-tools-v1:not-a-number",
+            "owlauth-tools-v1:88",
+        ] {
+            assert!(
+                tool_page(&tools, Some(cursor)).is_err(),
+                "accepted {cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_hand_designed_tool_has_a_closed_mcp_owned_output_schema() {
+        let server = test_server();
         let tools = server.tool_router.list_all();
         assert_eq!(tools.len(), 9);
         for tool in tools {
@@ -1217,15 +1398,26 @@ mod tests {
     }
 
     #[test]
+    fn hand_designed_tool_errors_have_no_success_structured_content() {
+        let server = test_server();
+        let application_error = application_error_result(ApplicationError::NotFound);
+        let oversized = server
+            .result::<serde_json::Value>(Ok(serde_json::json!({
+                "value": "x".repeat(2048)
+            })))
+            .unwrap();
+
+        for result in [application_error, oversized] {
+            let result = serde_json::to_value(result).unwrap();
+            assert_eq!(result["isError"], true);
+            assert!(result.get("structuredContent").is_none());
+            assert!(result["content"][0]["text"].is_string());
+        }
+    }
+
+    #[test]
     fn project_user_directory_tools_publish_closed_inputs() {
-        let server = OwlAuthMcpServer::new(
-            McpApplicationServices {
-                provisioning: None,
-                lifecycle: None,
-                webhooks: None,
-            },
-            1024,
-        );
+        let server = test_server();
         let tools = server.tool_router.list_all();
         for (name, expected_properties) in [
             (

@@ -26,7 +26,7 @@ Control has a distinct listener and accepts only the single API key loaded from 
 
 Public IDs, Project access/refresh tokens, upstream provider credentials, network location, client-certificate identity, and forwarding headers are not Control credentials. Runtime never accepts the operator key.
 
-The optional remote Streamable HTTP MCP endpoint belongs to Control and reauthenticates the operator Bearer key on every request. A protected MCP host supplies the header; the key never enters prompts, model-visible context, tools/results, transport session IDs, or a local plugin/CLI process. Protocol tool discovery is not authorization.
+The optional remote Streamable HTTP MCP endpoint belongs to Control and reauthenticates the operator Bearer key on every request. A protected MCP host supplies the header; the key never enters prompts, model-visible context, tools/results, transport session IDs, or a local plugin/CLI process. Protocol tool discovery is not authorization. Once authenticated, MCP exposes the complete reviewed Control operation inventory with the key's full deployment authority. Secret-bearing Control fields and one-time server-key responses become model-visible when those specific tools are used, so operators must restrict them to a trusted MCP host/model and approved secret handling.
 
 ### Provider and redirect boundary
 
@@ -100,7 +100,7 @@ A target Project signing key is published in Project JWKS before activation. Run
 
 Remote signing-key effects use durable operation identities, database-time leases, provider inspection, and explicit cleanup. A non-retryable or unsupported cleanup remains fail-closed as blocked rather than discarding the handle or asserting destruction. After the exact retained provider implementation becomes available again, background signing-key maintenance resumes eligible work from the durable operation state; counters and the last provider-safe diagnostic remain durable. Never force the PostgreSQL row to an erased state or remove historical provider authority without provider-confirmed absence or destruction.
 
-Secrets enter through protected environment/file descriptors, files, or secret managers—not ordinary CLI arguments, public configuration, health responses, panic messages, OpenAPI examples, or agent context.
+Secrets normally enter through protected environment/file descriptors, files, or secret managers—not ordinary CLI arguments, public configuration, health responses, panic messages, or OpenAPI examples. The deliberate remote-MCP exception is limited to declared full-authority Control fields: provider, SMTP, and webhook secrets may enter model-visible tool arguments, and Project server-key creation may return its one-time credential in a tool result. Use those tools only through a trusted MCP host/model with approved secret handling.
 
 ## Browser and request safety
 
@@ -117,7 +117,9 @@ Auth serves the Runtime Hosted Authentication UI and JSON-only Server API; Contr
 
 ## Observability and data disclosure
 
-Logs, traces, metrics, errors, audit events, generated examples, and agent context must never contain provider codes/tokens or renewable credentials, email addresses/OTP/magic tokens, SMTP credentials/message bodies, webhook secrets/bodies, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, the operator API key, Project server-key credentials, private keys, full callback URLs, or complete profiles.
+Logs, traces, metrics, errors, audit events, and generated examples must never contain provider codes/tokens or renewable credentials, email addresses/OTP/magic tokens, SMTP credentials/message bodies, webhook secrets/bodies, handoff tickets, access/refresh tokens, PKCE verifiers, cookies, provider secrets, the operator API key, Project server-key credentials, private keys, full callback URLs, or complete profiles.
+
+Model-visible context follows a narrower explicit rule. It may contain the declared arguments and reviewed responses of an operator-invoked full-authority remote MCP tool, including write-only provider/SMTP/webhook configuration secrets, a one-time Project server-key credential, and identity presentation fields returned by Control. It must not expose the transport-only operator key, stored provider tokens or renewable credentials, session/token material, signing private keys, protected-material envelopes, or undeclared repository data. Outside those explicit MCP calls, ordinary prompts, model output, local plugins, and agent configuration must not carry Control secrets or personal data.
 
 Redaction happens before serialization/export. Metrics use bounded-cardinality labels; `belongs_to`, provider subjects, arbitrary URLs, and user profiles are not labels. External errors carry stable safe codes and correlation IDs without revealing cross-Project existence or vendor internals.
 
