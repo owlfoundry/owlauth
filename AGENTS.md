@@ -24,7 +24,8 @@ Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) for repository boundaries, devel
 - Official TypeScript, Python, and Rust SDKs cover Runtime Project Auth only. Server API has a generated OpenAPI document but no official SDK and must never be imported into hosted-web code.
 - Keep Auth and Control listeners independently configurable. Keep Runtime, Server API, and Control internal authority boundaries independently configurable while all three surfaces remain bound to one PostgreSQL server/database authority. The Runtime Hosted Authentication UI and Control Management Console are the only browser surfaces.
 - PostgreSQL is the durable authority. Do not add browser credential persistence, file-store fallbacks, unreviewed secret delivery, or dependencies from CLI/SDKs into the server implementation.
-- Edit Rust DTOs in `owlauth-types`; regenerate derived OpenAPI/hosted-web contracts rather than hand-editing generated files. Until the first deployed schema is declared, rebuild clean module baselines instead of preserving pre-release migration history; after deployment, freeze those baselines and add ordered migrations only.
+- Edit Rust DTOs in `owlauth-types`; regenerate derived OpenAPI/hosted-web contracts rather than hand-editing generated files.
+- The PostgreSQL schema has been deployed. Existing migration files are immutable compatibility artifacts: never edit, reorder, squash, or replace them. Every schema change must use a new ordered migration and must be tested both as a clean install and as an upgrade from the deployed migration set.
 
 ## Development quick start
 
@@ -76,7 +77,3 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for changelog scopes, SemVer rules, sha
 - [`scripts/`](scripts/) — repository, package, release, installer, SDK, and container checks
 - [`dev/`](dev/README.md) — local PostgreSQL development service
 - [`.github/workflows/`](.github/workflows/) — CI, documentation, image, and component release automation
-
-## AnyCap
-
-This project uses [AnyCap](https://anycap.ai) for multimodal capabilities, web search and crawling, file sharing, and static-page hosting. For these tasks, use the installed AnyCap skills and verify availability with `anycap status`. AnyCap evolves rapidly, so check or update its skills when commands or capabilities appear stale; submit `anycap feedback` for service or capability issues.

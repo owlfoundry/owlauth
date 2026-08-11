@@ -752,7 +752,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     };
     for (mutation, expected) in [
         (
-            "UPDATE projects SET status='disabled' WHERE id=$1",
+            "UPDATE projects SET status='disabled', security_revision=security_revision + 1 WHERE id=$1",
             crate::application::ApplicationError::Disabled,
         ),
         (
@@ -806,6 +806,15 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
             persisted, 0,
             "failed create must not snapshot stale authority"
         );
+        sqlx::query(
+            "UPDATE projects
+                SET status='active', security_revision=security_revision + 1
+              WHERE id=$1 AND status='disabled'",
+        )
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .expect("restore disabled project before resetting revisions");
         for restore in [
             "UPDATE projects SET status='active',metadata_revision=1,security_revision=1 WHERE id=$1",
             "UPDATE applications SET status='active',security_revision=1 WHERE project_id=$1",
@@ -868,11 +877,13 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
     // Hold the Project mutation lock while selection reaches its owner fence. After the disable
     // commits, the blocked selection must reject without burning the login revision.
     let mut disable_project = pool.begin().await.expect("begin Project-disable race");
-    sqlx::query("UPDATE projects SET status='disabled' WHERE id=$1")
-        .bind(project_id)
-        .execute(&mut *disable_project)
-        .await
-        .expect("hold Project disable lock");
+    sqlx::query(
+        "UPDATE projects SET status='disabled',security_revision=security_revision + 1 WHERE id=$1",
+    )
+    .bind(project_id)
+    .execute(&mut *disable_project)
+    .await
+    .expect("hold Project disable lock");
     let racing_email = email.clone();
     let racing_selection = selection.clone();
     let racing_select =
@@ -894,15 +905,22 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
             .await
             .expect("racing selection rejection state");
     assert_eq!(unchanged, ("awaiting_method_selection".to_owned(), 2));
-    sqlx::query("UPDATE projects SET status='active' WHERE id=$1")
+    sqlx::query(
+        "UPDATE projects SET status='active',security_revision=security_revision + 1 WHERE id=$1",
+    )
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .expect("restore Project after selection race");
+    sqlx::query("UPDATE projects SET security_revision=1 WHERE id=$1")
         .bind(project_id)
         .execute(&pool)
         .await
-        .expect("restore Project after selection race");
+        .expect("restore Project revision after selection race");
 
     for (mutation, expected) in [
         (
-            "UPDATE projects SET status='disabled' WHERE id=$1",
+            "UPDATE projects SET status='disabled',security_revision=security_revision + 1 WHERE id=$1",
             crate::application::ApplicationError::RevisionConflict,
         ),
         (
@@ -951,6 +969,15 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .await
         .expect("selection rejection state");
         assert_eq!(unchanged, ("awaiting_method_selection".to_owned(), 2));
+        sqlx::query(
+            "UPDATE projects
+                SET status='active', security_revision=security_revision + 1
+              WHERE id=$1 AND status='disabled'",
+        )
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .expect("restore disabled Project before resetting selection revisions");
         for restore in [
             "UPDATE projects SET status='active',metadata_revision=1,security_revision=1 WHERE id=$1",
             "UPDATE applications SET status='active',security_revision=1 WHERE project_id=$1",
@@ -1048,7 +1075,7 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .expect("restore Application after generation race");
 
     for mutation in [
-        "UPDATE projects SET status='disabled' WHERE id=$1",
+        "UPDATE projects SET status='disabled',security_revision=security_revision + 1 WHERE id=$1",
         "UPDATE projects SET metadata_revision=2 WHERE id=$1",
         "UPDATE projects SET security_revision=2 WHERE id=$1",
         "UPDATE applications SET status='disabled' WHERE project_id=$1",
@@ -1074,6 +1101,15 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
         .await
         .expect("rejected generation leaves no durable email work");
         assert_eq!(unchanged, ("email_address_entry".to_owned(), 3, 0, 0));
+        sqlx::query(
+            "UPDATE projects
+                SET status='active', security_revision=security_revision + 1
+              WHERE id=$1 AND status='disabled'",
+        )
+        .bind(project_id)
+        .execute(&pool)
+        .await
+        .expect("restore disabled Project before resetting generation revisions");
         sqlx::query(
             "UPDATE projects SET status='active',metadata_revision=1,security_revision=1 WHERE id=$1",
         )
@@ -1294,8 +1330,8 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
 
     for (disable, restore) in [
         (
-            "UPDATE projects SET status='disabled' WHERE id=$1",
-            "UPDATE projects SET status='active' WHERE id=$1",
+            "UPDATE projects SET status='disabled',security_revision=security_revision + 1 WHERE id=$1",
+            "UPDATE projects SET status='active',security_revision=security_revision + 1 WHERE id=$1",
         ),
         (
             "UPDATE applications SET status='disabled' WHERE project_id=$1",
@@ -1330,6 +1366,11 @@ async fn email_generation_sibling_proofs_and_completion_are_one_winner_in_postgr
             .execute(&pool)
             .await
             .expect("restore owner after claim fence");
+        sqlx::query("UPDATE projects SET security_revision=1 WHERE id=$1 AND status='active'")
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .expect("restore Project revision after claim fence");
     }
 
     // Mail claim eligibility is PostgreSQL-clock based. Make the fixture durably due before the

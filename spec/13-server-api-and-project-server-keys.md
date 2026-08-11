@@ -100,7 +100,7 @@ Verification:
 5. verifies that Project and key remain active in the same authoritative read;
 6. returns one private typed Server actor containing Project/key identity, never raw credential bytes.
 
-Unknown, malformed, revoked, wrong-Project, disabled-Project, wrong-version, and wrong-digest credentials return the same bounded `401` response and `WWW-Authenticate: Bearer` challenge. Core performs no source- or credential-window traffic limiting before or after key resolution; a SaaS or operator-owned ingress may apply generic traffic controls, but those controls cannot authenticate a key.
+Unknown, malformed, revoked, wrong-Project, disabled-or-deleting-Project, wrong-version, and wrong-digest credentials return the same bounded `401` response and `WWW-Authenticate: Bearer` challenge. Core performs no source- or credential-window traffic limiting before or after key resolution; a SaaS or operator-owned ingress may apply generic traffic controls, but those controls cannot authenticate a key.
 
 A successful request may advance `last_used_at` at most once per fifteen-minute bucket through a best-effort update guarded by `status = active` and an older stored bucket. Usage metadata is lifecycle-neutral: it does not advance the key revision, cannot make an expected-revision revoke conflict, and cannot update a row after revocation wins. It never authorizes, revokes, or delays the request and has no per-request audit cardinality.
 
@@ -179,7 +179,7 @@ User/projection responses use `private, no-store`; key lifecycle responses use C
 
 OwlAuth Core does not add Server API IP, route, Project, key, global, bot/risk, product-quota, or billing limits. A SaaS or operator-owned ingress may enforce those controls for customer backend traffic and owns any generic `429` contract it introduces. Core continues to enforce request shape, deadlines, connection/in-flight capacity, PostgreSQL pool bounds, and provider/worker concurrency as local resource-safety boundaries.
 
-Project disablement and key revocation affect the next authoritative request. Server-key authentication, user/email/projection reads, and token introspection consult PostgreSQL authority on every request and are never accepted from a process response cache in v1. This keeps externally observable Server reads at the latest committed PostgreSQL state without inventing a directory-cache consistency protocol. Customer backends may cache minimized directory responses under their own product policy, but must not represent them as online revocation checks; Server introspection is the authoritative online token/session path.
+Project disablement, re-enablement, accepted deletion, and key revocation affect the next authoritative request. Server-key authentication, user/email/projection reads, and token introspection consult PostgreSQL authority on every request and are never accepted from a process response cache in v1. This keeps externally observable Server reads at the latest committed PostgreSQL state without inventing a directory-cache consistency protocol. Customer backends may cache minimized directory responses under their own product policy, but must not represent them as online revocation checks; Server introspection is the authoritative online token/session path.
 
 ## OpenAPI and implementation ownership
 

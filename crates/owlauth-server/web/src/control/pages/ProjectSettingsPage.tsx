@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { SyntheticEvent } from "react";
-import { Link, useParams } from "react-router";
+import { flushSync } from "react-dom";
+import { Link, useNavigate, useParams } from "react-router";
 
 import { CopyValue, formatDuration } from "../../shared/compositions/CopyValue";
 import {
@@ -20,20 +21,25 @@ import { ControlRequestError, type ProjectPolicy, requireData } from "../client"
 import styles from "./pages.module.css";
 
 type LoadState = "loading" | "ready" | "failed";
+type LifecycleAction = "disable" | "enable";
 
 export function ProjectSettingsPage() {
   const { projectId } = useParams();
+  const navigate = useNavigate();
   const project = useProject(projectId);
-  const { session, refreshProjects, handleError, setMessage } = useControl();
+  const { session, refreshProjects, upsertProject, handleError, setMessage } = useControl();
   const [policy, setPolicy] = useState<ProjectPolicy | null>(null);
   const [policyLoadState, setPolicyLoadState] = useState<LoadState>("loading");
   const [editingMetadata, setEditingMetadata] = useState(false);
   const [editingPolicy, setEditingPolicy] = useState(false);
-  const [confirmDisable, setConfirmDisable] = useState(false);
+  const [lifecycleAction, setLifecycleAction] = useState<LifecycleAction | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [metadataError, setMetadataError] = useState<string | null>(null);
   const [policyError, setPolicyError] = useState<string | null>(null);
-  const [disableError, setDisableError] = useState<string | null>(null);
+  const [lifecycleError, setLifecycleError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const refreshPolicy = useCallback(
     async (signal?: AbortSignal) => {
@@ -148,29 +154,81 @@ export function ProjectSettingsPage() {
     }
   }
 
-  async function disableProject() {
+  async function transitionProject(action: LifecycleAction) {
     if (project === null) return;
-    setDisableError(null);
+    setLifecycleError(null);
     setSubmitting(true);
     try {
-      const result = await session.client.POST("/v1/projects/{project_id}/disable", {
-        params: { path: { project_id: project.id } },
-        body: { expected_security_revision: project.security_revision },
-      });
+      const result =
+        action === "disable"
+          ? await session.client.POST("/v1/projects/{project_id}/disable", {
+              params: { path: { project_id: project.id } },
+              body: { expected_security_revision: project.security_revision },
+            })
+          : await session.client.POST("/v1/projects/{project_id}/enable", {
+              params: { path: { project_id: project.id } },
+              body: { expected_security_revision: project.security_revision },
+            });
       requireData(result.data, result.error, result.response);
       await refreshProjects();
-      setConfirmDisable(false);
-      setMessage("Project disabled.", "success");
+      setLifecycleAction(null);
+      setMessage(action === "disable" ? "Project disabled." : "Project enabled.", "success");
     } catch (error) {
       const conflict =
         error instanceof ControlRequestError &&
         error.status === 409 &&
         error.code === "revision_conflict";
-      if (conflict) setConfirmDisable(false);
+      if (conflict) setLifecycleAction(null);
       else
-        setDisableError(
-          error instanceof ControlRequestError ? error.message : "Project could not be disabled.",
+        setLifecycleError(
+          error instanceof ControlRequestError
+            ? error.message
+            : `Project could not be ${action === "disable" ? "disabled" : "enabled"}.`,
         );
+      await handleError(error, async () => {
+        await refreshProjects();
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function deleteProject(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
+    event.preventDefault();
+    if (deleteConfirmation !== project?.display_name) return;
+    setDeleteError(null);
+    setSubmitting(true);
+    try {
+      const result = await session.client.DELETE("/v1/projects/{project_id}", {
+        params: { path: { project_id: project.id } },
+        body: {
+          expected_security_revision: project.security_revision,
+        },
+      });
+      const deletingProject = requireData(result.data, result.error, result.response);
+      setConfirmDelete(false);
+      setDeleteConfirmation("");
+      flushSync(() => {
+        setSubmitting(false);
+      });
+      upsertProject(deletingProject);
+      setMessage("Project deletion accepted.", "success");
+      void navigate("/", { replace: true });
+    } catch (error) {
+      const conflict =
+        error instanceof ControlRequestError &&
+        error.status === 409 &&
+        error.code === "revision_conflict";
+      if (conflict) {
+        setConfirmDelete(false);
+        setDeleteConfirmation("");
+      } else {
+        setDeleteError(
+          error instanceof ControlRequestError
+            ? error.message
+            : "Project deletion could not be accepted.",
+        );
+      }
       await handleError(error, async () => {
         await refreshProjects();
       });
@@ -209,7 +267,10 @@ export function ProjectSettingsPage() {
         status={<StatusBadge status={project.status} />}
       />
       {!active ? (
-        <InlineAlert tone="warning">This Project is disabled and cannot be changed.</InlineAlert>
+        <InlineAlert tone="warning">
+          This Project is disabled. Its committed configuration remains visible, but changes and
+          Runtime authentication are blocked until it is enabled.
+        </InlineAlert>
       ) : null}
       <Section
         title="Project metadata"
@@ -393,27 +454,42 @@ export function ProjectSettingsPage() {
           </form>
         )}
       </Dialog>
-      {active ? (
-        <section className={styles["dangerZone"]}>
-          <h2>Danger zone</h2>
-          <p>Disabling this Project blocks new Runtime authentication across its Applications.</p>
+      <section className={styles["dangerZone"]}>
+        <h2>Danger zone</h2>
+        <p>
+          {active
+            ? "Disable this Project to stop Runtime authentication and configuration changes without deleting its data."
+            : "Enable this Project to restore Runtime authentication and configuration changes."}
+        </p>
+        <div className={styles["actions"]}>
+          <Button
+            type="button"
+            variant={active ? "danger" : "secondary"}
+            onClick={() => {
+              setLifecycleError(null);
+              setLifecycleAction(active ? "disable" : "enable");
+            }}
+          >
+            {active ? "Disable Project" : "Enable Project"}
+          </Button>
           <Button
             type="button"
             variant="danger"
             onClick={() => {
-              setDisableError(null);
-              setConfirmDisable(true);
+              setDeleteError(null);
+              setDeleteConfirmation("");
+              setConfirmDelete(true);
             }}
           >
-            Disable Project
+            Permanently delete Project
           </Button>
-        </section>
-      ) : null}
+        </div>
+      </section>
       <Dialog
-        open={confirmDisable}
-        title="Disable Project"
+        open={lifecycleAction !== null}
+        title={lifecycleAction === "disable" ? "Disable Project" : "Enable Project"}
         onClose={() => {
-          if (!submitting) setConfirmDisable(false);
+          if (!submitting) setLifecycleAction(null);
         }}
         actions={
           <>
@@ -422,31 +498,101 @@ export function ProjectSettingsPage() {
               variant="quiet"
               disabled={submitting}
               onClick={() => {
-                setConfirmDisable(false);
+                setLifecycleAction(null);
+              }}
+            >
+              Cancel
+            </Button>
+            {lifecycleAction === null ? null : (
+              <Button
+                type="button"
+                variant={lifecycleAction === "disable" ? "danger" : "primary"}
+                busy={submitting}
+                onClick={() => void transitionProject(lifecycleAction)}
+              >
+                {lifecycleAction === "disable" ? "Disable" : "Enable"} {project.display_name}
+              </Button>
+            )}
+          </>
+        }
+      >
+        {lifecycleError === null ? null : (
+          <InlineAlert tone="danger" role="alert">
+            {lifecycleError}
+          </InlineAlert>
+        )}
+        <p>
+          {lifecycleAction === "disable" ? "Disable" : "Enable"}{" "}
+          <strong>{project.display_name}</strong>?
+          {lifecycleAction === "disable"
+            ? " New authentication and configuration actions will be blocked until it is enabled again."
+            : " Runtime authentication and configuration actions will become available again."}
+        </p>
+      </Dialog>
+      <Dialog
+        open={confirmDelete}
+        title="Permanently delete Project"
+        onClose={() => {
+          if (!submitting) {
+            setConfirmDelete(false);
+            setDeleteConfirmation("");
+          }
+        }}
+        actions={
+          <>
+            <Button
+              type="button"
+              variant="quiet"
+              disabled={submitting}
+              onClick={() => {
+                setConfirmDelete(false);
+                setDeleteConfirmation("");
               }}
             >
               Cancel
             </Button>
             <Button
-              type="button"
+              type="submit"
+              form="delete-project-form"
               variant="danger"
               busy={submitting}
-              onClick={() => void disableProject()}
+              disabled={deleteConfirmation !== project.display_name}
             >
-              Disable {project.display_name}
+              Permanently delete Project
             </Button>
           </>
         }
       >
-        {disableError === null ? null : (
+        {deleteError === null ? null : (
           <InlineAlert tone="danger" role="alert">
-            {disableError}
+            {deleteError}
           </InlineAlert>
         )}
-        <p>
-          Disable <strong>{project.display_name}</strong>? New authentication and configuration
-          actions will be blocked.
-        </p>
+        <InlineAlert tone="danger">
+          Access stops immediately. This action cannot be undone. Provider key cleanup may continue
+          asynchronously before all live Project data is physically removed.
+        </InlineAlert>
+        <form
+          id="delete-project-form"
+          className={styles["form"]}
+          onSubmit={(event) => void deleteProject(event)}
+        >
+          <Field
+            label={`Type ${project.display_name} to confirm`}
+            htmlFor="delete-project-confirmation"
+            description="Enter the exact current Project display name."
+          >
+            <Input
+              id="delete-project-confirmation"
+              value={deleteConfirmation}
+              autoComplete="off"
+              onChange={(event) => {
+                setDeleteConfirmation(event.currentTarget.value);
+              }}
+              data-owl-initial-focus
+            />
+          </Field>
+        </form>
       </Dialog>
     </div>
   );

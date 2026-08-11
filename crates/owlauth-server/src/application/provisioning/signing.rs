@@ -138,6 +138,14 @@ impl ProvisioningService {
                 }
             }
         }
+        match self.finalize_project_deletions(limit).await {
+            Ok(finalized) => progressed += finalized,
+            Err(error) => {
+                if first_hard_error.is_none() {
+                    first_hard_error = Some(error);
+                }
+            }
+        }
         if let Some(error) = first_hard_error {
             Err(error)
         } else {

@@ -1,21 +1,27 @@
 use super::{
     ActiveModelTrait, ApplicationConfiguration, ApplicationError, ApplicationProvisioningPort,
     ApplicationRecord, ApplicationStatus, BrowserOrigin, CONFIGURATION_VALUE_LIMIT, ColumnTrait,
-    CreateApplication, CreateProject, EntityTrait, IntoActiveModel, LIST_LIMIT,
-    MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION, MaterialKind, MaterialOwnerKind, MaterialPurpose,
-    PostgresProvisioningAdapter, ProjectPolicyRecord, ProjectProvisioningPort, ProjectRecord,
-    ProjectStatus, QueryFilter, QueryOrder, QuerySelect, RedirectUri,
-    ReplaceApplicationConfiguration, SIGNING_ALGORITHM, SIGNING_PURPOSE, Set, SigningKeyState,
-    TransactionTrait, UpdateApplication, UpdateProject, UpdateProjectPolicy, Uuid, Value,
-    active_application, active_project, application, application_origin,
-    application_provider_assignment, application_publishable_key, application_redirect,
-    async_trait, bounded_items, bounded_list, bump_provider_revision, complete_idempotency,
-    ensure_application_capacity, ensure_capacity, ensure_no_pending_secret_replacement,
-    ensure_project, find_application, generated_id, insert_audit, json, key_provisioning_operation,
-    lock_idempotency_key, lock_project_capacity, locked_active_provider, parse_application_type,
+    ConnectionTrait, CreateApplication, CreateProject, DbBackend, EntityTrait, FromQueryResult,
+    IntoActiveModel, LIST_LIMIT, MAX_WEBHOOK_ENDPOINTS_PER_APPLICATION, MaterialKind,
+    MaterialOwnerKind, MaterialPurpose, PostgresProvisioningAdapter, ProjectPolicyRecord,
+    ProjectProvisioningPort, ProjectRecord, ProjectStatus, QueryFilter, QueryOrder, QuerySelect,
+    RedirectUri, ReplaceApplicationConfiguration, SIGNING_ALGORITHM, SIGNING_PURPOSE, Set,
+    SigningKeyState, Statement, TransactionTrait, UpdateApplication, UpdateProject,
+    UpdateProjectPolicy, Uuid, Value, active_application, active_project, application,
+    application_origin, application_provider_assignment, application_publishable_key,
+    application_redirect, async_trait, bounded_items, bounded_list, bump_provider_revision,
+    complete_idempotency, ensure_application_capacity, ensure_capacity,
+    ensure_no_pending_secret_replacement, ensure_project, find_application, generated_id,
+    insert_audit, json, key_provisioning_operation, lock_idempotency_key, lock_material_inventory,
+    lock_project_capacity, locked_active_provider, locked_project, parse_application_type,
     persistence, project, project_key_ring, project_policy, project_policy_record, project_record,
     project_signing_key, reject_duplicates, replay, webhook_endpoint,
 };
+
+#[derive(FromQueryResult)]
+struct FinalizedProject {
+    id: Option<Uuid>,
+}
 
 impl PostgresProvisioningAdapter {
     #[allow(
@@ -359,6 +365,231 @@ impl PostgresProvisioningAdapter {
         .await?;
         transaction.commit().await.map_err(persistence)?;
         Ok(project_record(updated))
+    }
+
+    async fn enable_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        let model = locked_project(&transaction, project_id).await?;
+        if model.security_revision != expected_security_revision {
+            return Err(ApplicationError::RevisionConflict);
+        }
+        if model.status != ProjectStatus::Disabled.as_str() {
+            return Err(ApplicationError::InvalidTransition);
+        }
+        let mut status = ProjectStatus::Disabled;
+        status
+            .enable()
+            .map_err(|_| ApplicationError::InvalidTransition)?;
+        let mut active = model.into_active_model();
+        active.status = Set(status.as_str().to_owned());
+        active.security_revision = Set(expected_security_revision + 1);
+        active.updated_at = Set(self.clock.now());
+        let updated = active.update(&transaction).await.map_err(persistence)?;
+        insert_audit(
+            &transaction,
+            Some(project_id),
+            "project.enabled",
+            "project",
+            Some(project_id),
+            correlation_id,
+        )
+        .await?;
+        transaction.commit().await.map_err(persistence)?;
+        Ok(project_record(updated))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the deletion fence, crypto-erasure, signing cleanup handoff, and audit remain one visible transaction"
+    )]
+    async fn delete_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError> {
+        let transaction = self.database.begin().await.map_err(persistence)?;
+        let model = locked_project(&transaction, project_id).await?;
+        if model.status == ProjectStatus::Deleting.as_str() {
+            transaction.commit().await.map_err(persistence)?;
+            return Ok(project_record(model));
+        }
+        if model.security_revision != expected_security_revision {
+            return Err(ApplicationError::RevisionConflict);
+        }
+        let mut status = match model.status.as_str() {
+            "active" => ProjectStatus::Active,
+            "disabled" => ProjectStatus::Disabled,
+            _ => return Err(ApplicationError::Integrity),
+        };
+        status
+            .delete()
+            .map_err(|_| ApplicationError::InvalidTransition)?;
+        let now = self.clock.now();
+        let mut active = model.into_active_model();
+        active.status = Set(status.as_str().to_owned());
+        active.security_revision = Set(expected_security_revision + 1);
+        active.deletion_requested_at = Set(Some(now));
+        active.updated_at = Set(now);
+        let updated = active.update(&transaction).await.map_err(persistence)?;
+
+        // Managed credential custody is independent from protected_materials. Lock its owner,
+        // ciphertext, and renewal operation rows in their canonical order before crypto-erasing
+        // every generation and terminalizing in-flight renewal work. A late worker completion is
+        // then fenced both by the terminal Project and by its abandoned operation/cleared lease.
+        transaction
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM managed_provider_connections
+                  WHERE project_id = $1
+                  ORDER BY id
+                  FOR UPDATE",
+                vec![project_id.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        transaction
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT connection_id, credential_generation
+                   FROM managed_provider_credentials
+                  WHERE project_id = $1
+                  ORDER BY connection_id, credential_generation
+                  FOR UPDATE",
+                vec![project_id.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE managed_provider_credentials
+                    SET ciphertext = NULL,
+                        destroyed_at = $2
+                  WHERE project_id = $1
+                    AND ciphertext IS NOT NULL",
+                vec![project_id.into(), now.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE managed_provider_renewal_operations
+                    SET state = 'abandoned',
+                        safe_outcome = 'project_deleting',
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        terminal_at = $2,
+                        updated_at = $2
+                  WHERE project_id = $1
+                    AND state IN ('prepared', 'submitted')",
+                vec![project_id.into(), now.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE managed_provider_connections
+                    SET lease_owner = NULL,
+                        lease_kind = NULL,
+                        lease_expires_at = NULL,
+                        next_synchronize_at = NULL,
+                        next_renewal_at = NULL,
+                        last_safe_outcome = 'project_deleting',
+                        updated_at = $2
+                  WHERE project_id = $1",
+                vec![project_id.into(), now.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+
+        lock_material_inventory(&transaction).await?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE protected_materials
+                    SET opaque_value = NULL,
+                        state = 'erased',
+                        erased_at = $2,
+                        updated_at = $2
+                  WHERE project_id = $1
+                    AND material_kind = 'configuration_secret'
+                    AND state <> 'erased'",
+                vec![project_id.into(), now.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE key_provisioning_operations AS operation
+                    SET state = 'cleanup_pending',
+                        provider_lease_token = NULL,
+                        provider_lease_expires_at = NULL,
+                        next_attempt_at = NULL,
+                        maintenance_claimed_at = NULL
+                   FROM protected_materials AS material
+                  WHERE operation.project_id = $1
+                    AND material.id = operation.material_id
+                    AND material.state <> 'erased'
+                    AND operation.state IN (
+                        'prepared', 'submitted', 'stored', 'completed',
+                        'cleanup_pending', 'cleanup_leased', 'failed'
+                    )",
+                vec![project_id.into()],
+            ))
+            .await
+            .map_err(persistence)?;
+        insert_audit(
+            &transaction,
+            Some(project_id),
+            "project.deletion_requested",
+            "project",
+            Some(project_id),
+            correlation_id,
+        )
+        .await?;
+        transaction.commit().await.map_err(persistence)?;
+        Ok(project_record(updated))
+    }
+
+    async fn finalize_project_deletions(&self, limit: usize) -> Result<usize, ApplicationError> {
+        if !(1..=usize::try_from(LIST_LIMIT).expect("list limit fits usize")).contains(&limit) {
+            return Err(ApplicationError::InvalidInput);
+        }
+        let mut finalized = 0;
+        for _ in 0..limit {
+            let transaction = self.database.begin().await.map_err(persistence)?;
+            transaction
+                .execute_raw(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".to_owned(),
+                ))
+                .await
+                .map_err(persistence)?;
+            let result = FinalizedProject::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT public.owlauth_finalize_project_deletion($1, $2) AS id",
+                vec![Uuid::new_v4().into(), Uuid::new_v4().into()],
+            ))
+            .one(&transaction)
+            .await
+            .map_err(persistence)?
+            .ok_or(ApplicationError::Integrity)?;
+            transaction.commit().await.map_err(persistence)?;
+            if result.id.is_none() {
+                break;
+            }
+            finalized += 1;
+        }
+        Ok(finalized)
     }
 
     async fn create_application(
@@ -839,6 +1070,40 @@ impl ProjectProvisioningPort for PostgresProvisioningAdapter {
             correlation_id,
         )
         .await
+    }
+
+    async fn enable_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError> {
+        PostgresProvisioningAdapter::enable_project(
+            self,
+            project_id,
+            expected_security_revision,
+            correlation_id,
+        )
+        .await
+    }
+
+    async fn delete_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError> {
+        PostgresProvisioningAdapter::delete_project(
+            self,
+            project_id,
+            expected_security_revision,
+            correlation_id,
+        )
+        .await
+    }
+
+    async fn finalize_project_deletions(&self, limit: usize) -> Result<usize, ApplicationError> {
+        PostgresProvisioningAdapter::finalize_project_deletions(self, limit).await
     }
 }
 

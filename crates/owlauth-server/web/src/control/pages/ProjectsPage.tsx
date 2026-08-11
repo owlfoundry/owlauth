@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { SyntheticEvent } from "react";
 import { Link, useNavigate } from "react-router";
 
@@ -6,17 +6,19 @@ import { ArrowRightIcon, PlusIcon } from "../../shared/icons/Icons";
 import { EmptyState, LoadingState, PageHeader } from "../../shared/layout/Layout";
 import { Button } from "../../shared/primitives/Button";
 import { InlineAlert, StatusBadge } from "../../shared/primitives/Feedback";
-import { Field, Input } from "../../shared/primitives/Field";
+import { Checkbox, Field, Input } from "../../shared/primitives/Field";
 import { Dialog } from "../../shared/primitives/Overlay";
 import { useControl } from "../app/ControlContext";
 import { UnsavedChangesGuard } from "../app/UnsavedChangesGuard";
-import { ControlRequestError, IdempotencyAttempt, requireData } from "../client";
+import { ControlRequestError, IdempotencyAttempt, type Project, requireData } from "../client";
 import styles from "./pages.module.css";
 
 export function ProjectsPage() {
   const { session, projects, loadingProjects, upsertProject, setMessage, handleError } =
     useControl();
   const [creating, setCreating] = useState(false);
+  const [showInactiveProjects, setShowInactiveProjects] = useState(false);
+  const [projectSearch, setProjectSearch] = useState("");
   const [createName, setCreateName] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
   const [createdProjectId, setCreatedProjectId] = useState<string | null>(null);
@@ -87,6 +89,20 @@ export function ProjectsPage() {
   }
 
   const createDirty = creating && createName !== "";
+  const normalizedProjectSearch = projectSearch.trim().toLowerCase();
+  const visibleProjects = useMemo(
+    () =>
+      projects.filter((project) => {
+        if (!showInactiveProjects && project.status !== "active") return false;
+        if (normalizedProjectSearch === "") return true;
+        return [project.display_name, project.public_id].some((value) =>
+          value.toLowerCase().includes(normalizedProjectSearch),
+        );
+      }),
+    [normalizedProjectSearch, projects, showInactiveProjects],
+  );
+  const hasInactiveProjects = projects.some((project) => project.status !== "active");
+  const hasProjectSearch = normalizedProjectSearch !== "";
   return (
     <div className={styles["page"]}>
       <UnsavedChangesGuard dirty={createDirty} submitting={submitting} onDiscard={discardCreate} />
@@ -108,32 +124,86 @@ export function ProjectsPage() {
         }
       />
       {loadingProjects ? <LoadingState>Loading projects</LoadingState> : null}
-      {projects.length === 0 && !loadingProjects ? (
+      {!loadingProjects && projects.length > 0 ? (
+        <div className={styles["directoryControls"]} aria-label="Project directory filters">
+          <div className={styles["directorySearch"]}>
+            <Input
+              type="search"
+              value={projectSearch}
+              placeholder="Search by name or Project ID"
+              aria-label="Search projects"
+              onChange={(event) => {
+                setProjectSearch(event.currentTarget.value);
+              }}
+            />
+          </div>
+          <span className={styles["directoryResultCount"]} aria-live="polite">
+            {visibleProjects.length} {visibleProjects.length === 1 ? "Project" : "Projects"}
+          </span>
+          {hasInactiveProjects ? (
+            <div className={styles["inactiveFilter"]}>
+              <Checkbox
+                checked={showInactiveProjects}
+                onChange={(event) => {
+                  setShowInactiveProjects(event.currentTarget.checked);
+                }}
+              >
+                Show inactive projects
+              </Checkbox>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {visibleProjects.length === 0 && !loadingProjects ? (
         <EmptyState
-          title="No Projects yet"
-          description="Create the first Project to configure Applications and authentication methods."
+          title={
+            projects.length === 0
+              ? "No Projects yet"
+              : hasProjectSearch
+                ? "No matching Projects"
+                : "No active Projects"
+          }
+          description={
+            projects.length === 0
+              ? "Create the first Project to configure Applications and authentication methods."
+              : hasProjectSearch
+                ? "Try another name or Project ID, or adjust the inactive filter."
+                : "Enable an inactive Project or show inactive projects to review its status."
+          }
         />
       ) : (
         <ul className={styles["projectDirectory"]} aria-label="Projects in this deployment">
-          {projects.map((project) => (
+          {visibleProjects.map((project) => (
             <li key={project.id}>
-              <Link
-                className={styles["projectDirectoryItem"]}
-                to={`/projects/${project.id}`}
-                aria-labelledby={`project-${project.id}-name`}
-                aria-describedby={`project-${project.id}-public-id project-${project.id}-status`}
-              >
-                <span className={styles["projectDirectoryBody"]}>
-                  <strong id={`project-${project.id}-name`}>{project.display_name}</strong>
-                  <code id={`project-${project.id}-public-id`}>{project.public_id}</code>
-                </span>
-                <span className={styles["projectDirectoryMeta"]}>
-                  <span id={`project-${project.id}-status`}>
-                    <StatusBadge status={project.status} />
+              {project.status === "deleting" ? (
+                <div
+                  className={`${styles["projectDirectoryItem"] ?? ""} ${styles["projectDirectoryItemStatic"] ?? ""}`}
+                  aria-labelledby={`project-${project.id}-name`}
+                  aria-describedby={`project-${project.id}-public-id project-${project.id}-status`}
+                >
+                  <ProjectDirectoryBody project={project} />
+                  <span className={styles["projectDirectoryMeta"]}>
+                    <span id={`project-${project.id}-status`}>
+                      <StatusBadge status={project.status} />
+                    </span>
                   </span>
-                  <ArrowRightIcon />
-                </span>
-              </Link>
+                </div>
+              ) : (
+                <Link
+                  className={styles["projectDirectoryItem"]}
+                  to={`/projects/${project.id}`}
+                  aria-labelledby={`project-${project.id}-name`}
+                  aria-describedby={`project-${project.id}-public-id project-${project.id}-status`}
+                >
+                  <ProjectDirectoryBody project={project} />
+                  <span className={styles["projectDirectoryMeta"]}>
+                    <span id={`project-${project.id}-status`}>
+                      <StatusBadge status={project.status} />
+                    </span>
+                    <ArrowRightIcon />
+                  </span>
+                </Link>
+              )}
             </li>
           ))}
         </ul>
@@ -179,6 +249,15 @@ export function ProjectsPage() {
         </form>
       </Dialog>
     </div>
+  );
+}
+
+function ProjectDirectoryBody({ project }: { readonly project: Project }) {
+  return (
+    <span className={styles["projectDirectoryBody"]}>
+      <strong id={`project-${project.id}-name`}>{project.display_name}</strong>
+      <code id={`project-${project.id}-public-id`}>{project.public_id}</code>
+    </span>
   );
 }
 

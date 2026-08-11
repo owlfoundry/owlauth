@@ -591,13 +591,14 @@ fn control_api_router() -> Router<ControlState> {
         .route("/projects", get(list_projects).post(create_project))
         .route(
             "/projects/{project_id}",
-            get(get_project).patch(update_project),
+            get(get_project).patch(update_project).delete(delete_project),
         )
         .route(
             "/projects/{project_id}/policy",
             get(get_project_policy).put(update_project_policy),
         )
         .route("/projects/{project_id}/disable", post(disable_project))
+        .route("/projects/{project_id}/enable", post(enable_project))
         .route(
             "/projects/{project_id}/applications",
             get(list_applications).post(create_application),
@@ -4426,6 +4427,61 @@ async fn disable_project(
     }
 }
 
+async fn enable_project(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::ExpectedSecurityRevision>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .enable_project(
+                project_id,
+                body.expected_security_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(project) => control_json(control_project(project), &request_id),
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
+async fn delete_project(
+    State(state): State<ControlState>,
+    Extension(request_id): Extension<String>,
+    Path(project_id): Path<String>,
+    ControlJson(body): ControlJson<control_types::ExpectedSecurityRevision>,
+) -> Response {
+    let project_id = match resource_uuid(&project_id, &request_id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    match provisioning(&state) {
+        Ok(service) => match service
+            .delete_project(
+                project_id,
+                body.expected_security_revision,
+                request_uuid(&request_id),
+            )
+            .await
+        {
+            Ok(project) => match control_project(project) {
+                Ok(project) => (StatusCode::ACCEPTED, Json(project)).into_response(),
+                Err(error) => application_problem(error, &request_id),
+            },
+            Err(error) => application_problem(error, &request_id),
+        },
+        Err(error) => application_problem(error, &request_id),
+    }
+}
+
 async fn get_email_method_policy(
     State(state): State<ControlState>,
     Extension(request_id): Extension<String>,
@@ -8201,6 +8257,7 @@ fn control_project(
     let status = match project.status.as_str() {
         "active" => control_types::ProjectStatus::Active,
         "disabled" => control_types::ProjectStatus::Disabled,
+        "deleting" => control_types::ProjectStatus::Deleting,
         _ => return Err(ApplicationError::Integrity),
     };
     Ok(control_types::Project {

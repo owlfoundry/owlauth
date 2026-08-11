@@ -234,8 +234,10 @@ impl SigningKeyProvisioner for StatefulRemoteSigningProvider {
                         RetryClassification::Reconcile,
                     )
                 })?;
+            let next_security_revision = project.security_revision + 1;
             let mut project = project.into_active_model();
             project.status = Set("disabled".to_owned());
+            project.security_revision = Set(next_security_revision);
             project.update(database).await.map_err(|_| {
                 ProviderError::new(
                     ProviderErrorClass::Unavailable,
@@ -477,7 +479,7 @@ fn unavailable_or_fail(error: impl std::fmt::Display) -> bool {
     clippy::too_many_lines,
     reason = "integration fixture enumerates the complete split-plane key configuration"
 )]
-fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> ServerConfig {
+fn server_config(database_url: &str) -> ServerConfig {
     let values = BTreeMap::from([
         ("OWLAUTH_MODE".to_owned(), "all".to_owned()),
         (
@@ -493,14 +495,10 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
             "Hh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4".to_owned(),
         ),
         (
-            "OWLAUTH_MIGRATION_OWNER_ROLE".to_owned(),
-            "owlauth_owner".to_owned(),
-        ),
-        (
             "OWLAUTH_DATABASE_LOCK_TIMEOUT_MS".to_owned(),
             "250".to_owned(),
         ),
-        ("OWLAUTH_POSTGRES_URL".to_owned(), runtime_url.to_owned()),
+        ("OWLAUTH_POSTGRES_URL".to_owned(), database_url.to_owned()),
         ("OWLAUTH_RUNTIME_KEY_VERSION".to_owned(), "1".to_owned()),
         (
             "OWLAUTH_RUNTIME_DIGEST_KEY".to_owned(),
@@ -569,22 +567,6 @@ fn server_config(migration_url: &str, runtime_url: &str, control_url: &str) -> S
         (
             "OWLAUTH_SERVER_KEY_DIGEST_KEY".to_owned(),
             "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo".to_owned(),
-        ),
-        (
-            "OWLAUTH_RUNTIME_POSTGRES_URL".to_owned(),
-            runtime_url.to_owned(),
-        ),
-        (
-            "OWLAUTH_SERVER_POSTGRES_URL".to_owned(),
-            runtime_url.to_owned(),
-        ),
-        (
-            "OWLAUTH_CONTROL_POSTGRES_URL".to_owned(),
-            control_url.to_owned(),
-        ),
-        (
-            "OWLAUTH_MIGRATION_POSTGRES_URL".to_owned(),
-            migration_url.to_owned(),
         ),
         (
             "OWLAUTH_RUNTIME_DATABASE_MAX_CONNECTIONS".to_owned(),
@@ -2252,14 +2234,248 @@ async fn verify_pools_unit_of_work_and_egress(config: &ServerConfig) -> Database
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the upgrade proof deliberately installs every immutable baseline, applies the ordered migration, introspects graph closure, and exercises the finalizer together"
+)]
+async fn verify_deployed_baseline_upgrade(host: &str, port: u16) {
+    const FOUNDATION: &str = include_str!("../../../migrations/20260806000000_foundation.sql");
+    const AUTHORITIES: &str = include_str!("../../../migrations/20260806001000_authorities.sql");
+    const INVARIANTS: &str = include_str!("../../../migrations/20260806002000_invariants.sql");
+    const PROJECT_LIFECYCLE: &str =
+        include_str!("../../../migrations/20260810000000_project_lifecycle.sql");
+
+    let admin_url = format!("postgres://owlauth:owlauth_test@{host}:{port}/owlauth_test");
+    let mut admin = PgConnection::connect(&admin_url)
+        .await
+        .expect("upgrade-proof administrator should connect");
+    sqlx::query("CREATE DATABASE owlauth_deployed_upgrade")
+        .execute(&mut admin)
+        .await
+        .expect("isolated deployed-schema upgrade database should be created");
+    admin
+        .close()
+        .await
+        .expect("upgrade-proof administrator should close");
+
+    let upgrade_url =
+        format!("postgres://owlauth:owlauth_test@{host}:{port}/owlauth_deployed_upgrade");
+    let mut connection = PgConnection::connect(&upgrade_url)
+        .await
+        .expect("deployed-schema upgrade connection should open");
+    sqlx::raw_sql(FOUNDATION)
+        .execute(&mut connection)
+        .await
+        .expect("the immutable deployed foundation should install");
+    sqlx::raw_sql(AUTHORITIES)
+        .execute(&mut connection)
+        .await
+        .expect("the immutable deployed singleton authorities should install");
+    sqlx::raw_sql(INVARIANTS)
+        .execute(&mut connection)
+        .await
+        .expect("the immutable deployed invariants should install");
+    sqlx::query(
+        "INSERT INTO projects(id,public_id,status,metadata_revision,security_revision,display_name)
+         VALUES('20000000-0000-0000-0000-000000000001','upgrade_fixture','active',1,1,
+                'Deployed upgrade fixture')",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("pre-upgrade Project fixture should satisfy the deployed schema");
+
+    sqlx::raw_sql(PROJECT_LIFECYCLE)
+        .execute(&mut connection)
+        .await
+        .expect("the ordered Project lifecycle migration should upgrade deployed schema in place");
+    let deletion_requested_at: Option<time::OffsetDateTime> = sqlx::query_scalar(
+        "SELECT deletion_requested_at FROM projects
+         WHERE id='20000000-0000-0000-0000-000000000001'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("upgraded Project should remain readable");
+    assert_eq!(deletion_requested_at, None);
+    sqlx::query(
+        "UPDATE projects SET status='disabled',security_revision=2
+         WHERE id='20000000-0000-0000-0000-000000000001'",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("upgraded deployed Project should support disable");
+    assert!(
+        sqlx::query(
+            "UPDATE projects SET status='active'
+             WHERE id='20000000-0000-0000-0000-000000000001'",
+        )
+        .execute(&mut connection)
+        .await
+        .is_err(),
+        "the upgrade must enforce the security-revision lifecycle fence"
+    );
+    sqlx::query(
+        "UPDATE projects SET status='active',security_revision=3
+         WHERE id='20000000-0000-0000-0000-000000000001'",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("upgraded deployed Project should support revision-fenced enable");
+    let unvalidated_project_roots: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE conname LIKE '%\\_project\\_root\\_fkey' ESCAPE '\\' AND NOT convalidated",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("Project deletion root constraints should be inspectable");
+    assert_eq!(unvalidated_project_roots, 0);
+    let project_owned_tables_outside_cascade_closure: Vec<String> = sqlx::query_scalar(
+        "WITH RECURSIVE project_roots(relation_id) AS (
+             SELECT DISTINCT relation.oid
+               FROM pg_attribute AS attribute
+               JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+               JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = 'public'
+                AND relation.relkind IN ('r', 'p')
+                AND attribute.attname = 'project_id'
+                AND attribute.attnotnull
+                AND NOT attribute.attisdropped
+             UNION
+             SELECT 'public.projects'::regclass::oid
+         ), project_owned(relation_id) AS (
+             SELECT relation_id FROM project_roots
+             UNION
+             SELECT foreign_key.conrelid
+               FROM pg_constraint AS foreign_key
+               JOIN project_owned AS parent
+                 ON parent.relation_id = foreign_key.confrelid
+               JOIN pg_class AS child ON child.oid = foreign_key.conrelid
+               JOIN pg_namespace AS namespace ON namespace.oid = child.relnamespace
+              WHERE foreign_key.contype = 'f'
+                AND namespace.nspname = 'public'
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM unnest(foreign_key.conkey) AS key_column(attnum)
+                      JOIN pg_attribute AS key_attribute
+                        ON key_attribute.attrelid = foreign_key.conrelid
+                       AND key_attribute.attnum = key_column.attnum
+                     WHERE NOT key_attribute.attnotnull
+                )
+         ), cascade_closure(relation_id) AS (
+             SELECT 'public.projects'::regclass::oid
+             UNION
+             SELECT foreign_key.conrelid
+               FROM pg_constraint AS foreign_key
+               JOIN cascade_closure AS parent
+                 ON parent.relation_id = foreign_key.confrelid
+               JOIN pg_class AS child ON child.oid = foreign_key.conrelid
+               JOIN pg_namespace AS namespace ON namespace.oid = child.relnamespace
+              WHERE foreign_key.contype = 'f'
+                AND foreign_key.confdeltype = 'c'
+                AND namespace.nspname = 'public'
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM unnest(foreign_key.conkey) AS key_column(attnum)
+                      JOIN pg_attribute AS key_attribute
+                        ON key_attribute.attrelid = foreign_key.conrelid
+                       AND key_attribute.attnum = key_column.attnum
+                     WHERE NOT key_attribute.attnotnull
+                )
+         )
+         SELECT format('%I.%I', namespace.nspname, relation.relname)
+           FROM project_owned
+           JOIN pg_class AS relation ON relation.oid = project_owned.relation_id
+           JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          WHERE project_owned.relation_id <> 'public.projects'::regclass
+            AND relation.relname <> 'webhook_delivery_attempts'
+            AND NOT EXISTS (
+                SELECT 1 FROM cascade_closure
+                 WHERE cascade_closure.relation_id = project_owned.relation_id
+            )
+          ORDER BY namespace.nspname, relation.relname",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .expect("the recursive Project-owned deletion graph should be introspectable");
+    assert!(
+        project_owned_tables_outside_cascade_closure.is_empty(),
+        "Project-owned tables fall outside the cascade or explicit-delete closure: \
+         {project_owned_tables_outside_cascade_closure:?}"
+    );
+    let immediate_internal_deletion_blockers: Vec<String> = sqlx::query_scalar(
+        "WITH RECURSIVE cascade_closure(relation_id) AS (
+             SELECT 'public.projects'::regclass::oid
+             UNION
+             SELECT foreign_key.conrelid
+               FROM pg_constraint AS foreign_key
+               JOIN cascade_closure AS parent
+                 ON parent.relation_id = foreign_key.confrelid
+               JOIN pg_class AS child ON child.oid = foreign_key.conrelid
+               JOIN pg_namespace AS namespace ON namespace.oid = child.relnamespace
+              WHERE foreign_key.contype = 'f'
+                AND foreign_key.confdeltype = 'c'
+                AND namespace.nspname = 'public'
+         )
+         SELECT format('%I.%I', child.relname, foreign_key.conname)
+           FROM pg_constraint AS foreign_key
+           JOIN cascade_closure AS child_closure
+             ON child_closure.relation_id = foreign_key.conrelid
+           JOIN cascade_closure AS parent_closure
+             ON parent_closure.relation_id = foreign_key.confrelid
+           JOIN pg_class AS child ON child.oid = foreign_key.conrelid
+          WHERE foreign_key.contype = 'f'
+            AND foreign_key.confdeltype IN ('a', 'r')
+            AND NOT foreign_key.condeferrable
+            AND child.relname <> 'webhook_delivery_attempts'
+          ORDER BY child.relname, foreign_key.conname",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .expect("Project cascade ordering constraints should be introspectable");
+    assert!(
+        immediate_internal_deletion_blockers.is_empty(),
+        "immediate foreign keys can block Project cascade ordering: \
+         {immediate_internal_deletion_blockers:?}"
+    );
+
+    sqlx::query(
+        "UPDATE projects
+            SET status='deleting',security_revision=4,
+                deletion_requested_at=transaction_timestamp()
+          WHERE id='20000000-0000-0000-0000-000000000001'",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("upgraded deployed Project should enter terminal deletion");
+    let finalized: Option<Uuid> = sqlx::query_scalar(
+        "SELECT public.owlauth_finalize_project_deletion(
+             '20000000-0000-0000-0000-000000000002',
+             '20000000-0000-0000-0000-000000000003')",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("the owner-executed finalizer should delete an eligible upgraded Project");
+    assert_eq!(
+        finalized,
+        Some(Uuid::parse_str("20000000-0000-0000-0000-000000000001").unwrap())
+    );
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM projects
+          WHERE id='20000000-0000-0000-0000-000000000001'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("upgraded Project absence should be queryable");
+    assert_eq!(remaining, 0);
+    connection
+        .close()
+        .await
+        .expect("deployed-schema upgrade connection should close");
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "the migration journey keeps lock, ownership, and history checks together"
 )]
-async fn migrate_and_verify_main_database(
-    admin_url: &str,
-    runtime_url: &str,
-    control_url: &str,
-) -> ServerConfig {
-    let mut config = server_config(admin_url, runtime_url, control_url);
+async fn migrate_and_verify_main_database(admin_url: &str) -> ServerConfig {
+    let mut config = server_config(admin_url);
 
     config.postgres.migration_mode = MigrationMode::Verify;
     assert_eq!(
@@ -2303,13 +2519,15 @@ async fn migrate_and_verify_main_database(
     let mut ownership_connection = PgConnection::connect(admin_url)
         .await
         .expect("ownership query connection should open");
-    let schema_owner: String = sqlx::query_scalar(
-        "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'public'",
+    let finalizer_owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(proowner)
+           FROM pg_proc
+          WHERE oid = 'public.owlauth_finalize_project_deletion(uuid,uuid)'::regprocedure",
     )
     .fetch_one(&mut ownership_connection)
     .await
-    .expect("schema owner should be queryable");
-    assert_eq!(schema_owner, "owlauth_owner");
+    .expect("Project finalizer owner should be queryable");
+    assert_eq!(finalizer_owner, "owlauth");
     let table_owners: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT tableowner FROM pg_tables \
          WHERE schemaname = 'public' AND tablename IN (\
@@ -2320,23 +2538,7 @@ async fn migrate_and_verify_main_database(
     .fetch_all(&mut ownership_connection)
     .await
     .expect("migration-created table owners should be queryable");
-    assert_eq!(table_owners, vec!["owlauth_owner".to_owned()]);
-    sqlx::query(
-        "REVOKE INSERT, UPDATE, DELETE ON _sqlx_migrations \
-         FROM owlauth_runtime, owlauth_control",
-    )
-    .execute(&mut ownership_connection)
-    .await
-    .expect("serving roles should retain read-only migration history access");
-    let history_privileges: (bool, bool) = sqlx::query_as(
-        "SELECT \
-             has_table_privilege('owlauth_runtime', '_sqlx_migrations', 'SELECT'), \
-             has_table_privilege('owlauth_runtime', '_sqlx_migrations', 'INSERT,UPDATE,DELETE')",
-    )
-    .fetch_one(&mut ownership_connection)
-    .await
-    .expect("serving history grants should be queryable");
-    assert_eq!(history_privileges, (true, false));
+    assert_eq!(table_owners, vec![finalizer_owner]);
     let provider_constraints: Vec<(String, String)> = sqlx::query_as(
         "SELECT conname, pg_get_constraintdef(oid) \
          FROM pg_constraint \
@@ -3436,6 +3638,406 @@ async fn verify_server_key_and_listener_journeys(
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the end-to-end Project lifecycle fixture keeps its deletion fence, provider cleanup, physical deletion, and detached audit assertions together"
+)]
+async fn verify_project_lifecycle_and_permanent_deletion(
+    provisioning: &ProvisioningService,
+    control: &DatabaseConnection,
+    database_url: &str,
+) {
+    let project = provisioning
+        .create_project(
+            CreateProject {
+                display_name: "Project lifecycle deletion".to_owned(),
+                belongs_to: None,
+                idempotency_key: "project-lifecycle-deletion-12345678".to_owned(),
+            },
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("lifecycle Project should be created");
+    for _ in 0..10 {
+        provisioning
+            .reconcile_signing_key_lifecycle(100)
+            .await
+            .expect("initial signing lifecycle should reconcile");
+        let keys = provisioning
+            .list_signing_keys(project.id)
+            .await
+            .expect("lifecycle Project signing keys should list");
+        if keys.iter().any(|key| key.state == "active") {
+            break;
+        }
+    }
+    let signing_material_id = project_signing_key::Entity::find()
+        .filter(project_signing_key::Column::ProjectId.eq(project.id))
+        .one(control)
+        .await
+        .expect("lifecycle signing material owner query should work")
+        .expect("lifecycle Project should own a signing key")
+        .signer_material_id;
+
+    let managed_connection_id = Uuid::new_v4();
+    let managed_operation_id = Uuid::new_v4();
+    let managed_attempt_id = Uuid::new_v4();
+    let managed_lease_owner = Uuid::new_v4();
+    let webhook_endpoint_id = Uuid::new_v4();
+    let webhook_delivery_id = Uuid::new_v4();
+    let webhook_event_id = Uuid::new_v4();
+    let webhook_cleanup_id = Uuid::new_v4();
+    let webhook_application_id = Uuid::new_v4();
+    let webhook_user_id = Uuid::new_v4();
+    let webhook_binding_id = Uuid::new_v4();
+    let mut owner_fixture = PgConnection::connect(database_url)
+        .await
+        .expect("managed-credential deletion fixture connection should open");
+    sqlx::query("SET session_replication_role=replica")
+        .execute(&mut owner_fixture)
+        .await
+        .expect("managed-credential fixture should disable unrelated graph triggers");
+    sqlx::query(
+        "INSERT INTO managed_provider_credentials(
+             project_id,connection_id,connection_generation,credential_generation,
+             key_version,ciphertext,created_at)
+         VALUES($1,$2,1,1,1,decode(repeat('01',40),'hex'),transaction_timestamp())",
+    )
+    .bind(project.id)
+    .bind(managed_connection_id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("live managed credential fixture should insert");
+    sqlx::query(
+        "INSERT INTO managed_provider_renewal_operations(
+             id,project_id,connection_id,expected_connection_generation,
+             expected_credential_generation,successor_connection_generation,
+             successor_credential_generation,attempt_id,state,adapter_idempotent_replay,
+             lease_owner,lease_expires_at,safe_outcome,prepared_at,submitted_at,updated_at)
+         VALUES($1,$2,$3,1,1,2,2,$4,'submitted',true,$5,
+                transaction_timestamp()+interval '1 minute','submitted',
+                transaction_timestamp(),transaction_timestamp(),transaction_timestamp())",
+    )
+    .bind(managed_operation_id)
+    .bind(project.id)
+    .bind(managed_connection_id)
+    .bind(managed_attempt_id)
+    .bind(managed_lease_owner)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("in-flight managed renewal fixture should insert");
+    sqlx::query(
+        "INSERT INTO applications(
+             id,project_id,public_id,status,revision,display_name,application_type,
+             metadata_revision,security_revision)
+         VALUES($1,$2,'app_lifecycle_cleanup','active',1,'Lifecycle cleanup','web',1,1)",
+    )
+    .bind(webhook_application_id)
+    .bind(project.id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook Application deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO project_users(
+             id,project_id,public_id,status,user_revision,security_revision,
+             base_profile_digest,primary_source_kind)
+         VALUES($1,$2,'usr_lifecycle_cleanup','active',1,1,
+                decode(repeat('05',32),'hex'),'provider')",
+    )
+    .bind(webhook_user_id)
+    .bind(project.id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook user deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO application_user_bindings(
+             id,project_id,application_id,user_id,status,binding_revision)
+         VALUES($1,$2,$3,$4,'active',1)",
+    )
+    .bind(webhook_binding_id)
+    .bind(project.id)
+    .bind(webhook_application_id)
+    .bind(webhook_user_id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook binding deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO application_user_events(
+             id,event_id,project_id,application_id,binding_id,user_id,event_type,
+             user_revision,projection_revision,projection_schema,safe_body,
+             canonical_body_digest,occurred_at,replay_until,retain_until,created_at)
+         VALUES($1,'evt_lifecycle_cleanup',$2,$3,$4,$5,'user.projection.updated',
+                1,1,'owlauth.user.v1',
+                '{\"data\":{\"projection\":{\"verified_email\":null}}}'::jsonb,
+                decode(repeat('04',32),'hex'),transaction_timestamp(),
+                transaction_timestamp()+interval '1 hour',
+                transaction_timestamp()+interval '2 hours',transaction_timestamp())",
+    )
+    .bind(webhook_event_id)
+    .bind(project.id)
+    .bind(webhook_application_id)
+    .bind(webhook_binding_id)
+    .bind(webhook_user_id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook event deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO webhook_endpoints(
+             id,project_id,application_id,public_id,idempotency_key,
+             secret_request_fingerprint,url,subscribed_event_types,status,revision,
+             created_at,updated_at,disabled_at)
+         VALUES($1,$2,$3,'whk_lifecycle_cleanup','webhook-lifecycle-cleanup',
+                decode(repeat('02',32),'hex'),'https://webhook.example/lifecycle',
+                ARRAY['user.projection.updated'],'disabled',1,
+                transaction_timestamp(),transaction_timestamp(),transaction_timestamp())",
+    )
+    .bind(webhook_endpoint_id)
+    .bind(project.id)
+    .bind(webhook_application_id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook endpoint deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO webhook_secret_generations(
+             endpoint_id,generation,idempotency_key,request_fingerprint,state,
+             created_at,retired_at,material_id)
+         VALUES($1,1,'webhook-generation-cleanup',decode(repeat('03',32),'hex'),
+                'retired',transaction_timestamp(),transaction_timestamp(),$2)",
+    )
+    .bind(webhook_endpoint_id)
+    .bind(signing_material_id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook secret-generation deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO webhook_secret_cleanup_operations(
+             id,endpoint_id,generation,state,erased_at,material_id)
+         VALUES($1,$2,1,'erased',transaction_timestamp(),$3)",
+    )
+    .bind(webhook_cleanup_id)
+    .bind(webhook_endpoint_id)
+    .bind(signing_material_id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook secret-cleanup deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO webhook_deliveries(
+             id,project_id,application_id,endpoint_id,event_id,state,attempt_count,
+             next_attempt_at,created_at,updated_at,terminal_at)
+         VALUES($1,$2,$3,$4,$5,'terminal',1,transaction_timestamp(),
+                transaction_timestamp(),transaction_timestamp(),transaction_timestamp())",
+    )
+    .bind(webhook_delivery_id)
+    .bind(project.id)
+    .bind(webhook_application_id)
+    .bind(webhook_endpoint_id)
+    .bind(webhook_event_id)
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook delivery deletion fixture should insert");
+    sqlx::query(
+        "INSERT INTO webhook_delivery_attempts(
+             delivery_id,attempt_number,lease_generation,attempted_at,attempt_timestamp,
+             outcome_class,http_status,duration_millis,correlation_id)
+         VALUES($1,1,1,transaction_timestamp(),1,'http_4xx',400,1,$2)",
+    )
+    .bind(webhook_delivery_id)
+    .bind(Uuid::new_v4())
+    .execute(&mut owner_fixture)
+    .await
+    .expect("webhook delivery-attempt deletion fixture should insert");
+    sqlx::query("SET session_replication_role=origin")
+        .execute(&mut owner_fixture)
+        .await
+        .expect("managed-credential fixture should restore graph triggers");
+    owner_fixture
+        .close()
+        .await
+        .expect("managed-credential fixture connection should close");
+
+    let disabled = provisioning
+        .disable_project(project.id, project.security_revision, Uuid::new_v4())
+        .await
+        .expect("active Project should disable");
+    assert_eq!(disabled.status, "disabled");
+    let enabled = provisioning
+        .enable_project(project.id, disabled.security_revision, Uuid::new_v4())
+        .await
+        .expect("disabled Project should re-enable");
+    assert_eq!(enabled.status, "active");
+    assert_eq!(enabled.security_revision, project.security_revision + 2);
+
+    let deleting = provisioning
+        .delete_project(project.id, enabled.security_revision, Uuid::new_v4())
+        .await
+        .expect("active Project deletion should be accepted");
+    assert_eq!(deleting.status, "deleting");
+    assert_eq!(deleting.security_revision, enabled.security_revision + 1);
+    let replayed = provisioning
+        .delete_project(project.id, project.security_revision, Uuid::new_v4())
+        .await
+        .expect("deleting Project request should replay current terminal state");
+    assert_eq!(replayed, deleting);
+
+    let mut control_sql = PgConnection::connect(database_url)
+        .await
+        .expect("Project-deletion control-role probe should connect");
+    let managed_ciphertext: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT ciphertext FROM managed_provider_credentials
+          WHERE project_id=$1 AND connection_id=$2 AND credential_generation=1",
+    )
+    .bind(project.id)
+    .bind(managed_connection_id)
+    .fetch_one(&mut control_sql)
+    .await
+    .expect("managed credential should remain queryable until physical deletion");
+    assert!(
+        managed_ciphertext.is_none(),
+        "Project deletion must crypto-erase locally renewable provider credentials"
+    );
+    let renewal_state: (String, Option<Uuid>, Option<time::OffsetDateTime>) = sqlx::query_as(
+        "SELECT state,lease_owner,terminal_at FROM managed_provider_renewal_operations
+          WHERE id=$1",
+    )
+    .bind(managed_operation_id)
+    .fetch_one(&mut control_sql)
+    .await
+    .expect("terminalized managed renewal should remain queryable");
+    assert_eq!(renewal_state.0, "abandoned");
+    assert!(renewal_state.1.is_none());
+    assert!(renewal_state.2.is_some());
+
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut control_sql)
+        .await
+        .expect("non-READ-COMMITTED finalizer probe should begin");
+    let isolation_error = sqlx::query("SELECT public.owlauth_finalize_project_deletion($1,$2)")
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&mut control_sql)
+        .await
+        .expect_err("the finalizer must reject a stale-snapshot isolation level");
+    assert_eq!(
+        isolation_error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("25001")
+    );
+    sqlx::query("ROLLBACK")
+        .execute(&mut control_sql)
+        .await
+        .expect("non-READ-COMMITTED finalizer probe should roll back");
+
+    assert!(
+        sqlx::query("DELETE FROM projects WHERE id=$1")
+            .bind(project.id)
+            .execute(&mut control_sql)
+            .await
+            .is_err(),
+        "direct Project DELETE must not bypass the finalizer"
+    );
+    let deletion_audit_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM audit_events
+          WHERE project_id=$1 AND action='project.deletion_requested'",
+    )
+    .bind(project.id)
+    .fetch_one(&mut control_sql)
+    .await
+    .expect("deletion-request audit should exist");
+    assert!(
+        sqlx::query("DELETE FROM audit_events WHERE id=$1")
+            .bind(deletion_audit_id)
+            .execute(&mut control_sql)
+            .await
+            .is_err(),
+        "ordinary deletion must not bypass immutable Project audit"
+    );
+    control_sql
+        .close()
+        .await
+        .expect("Project-deletion control-role probe should close");
+
+    assert_eq!(
+        provisioning
+            .update_project(
+                project.id,
+                UpdateProject {
+                    display_name: "Must stay fenced".to_owned(),
+                    belongs_to: None,
+                    expected_metadata_revision: project.metadata_revision,
+                },
+                Uuid::new_v4(),
+            )
+            .await,
+        Err(ApplicationError::Disabled),
+        "deleting must fence ordinary Control writes immediately"
+    );
+    assert_eq!(
+        provisioning
+            .finalize_project_deletions(100)
+            .await
+            .expect("premature deletion finalization should remain safe"),
+        0,
+        "live signing material must block physical deletion"
+    );
+    for _ in 0..10 {
+        provisioning
+            .reconcile_signing_key_lifecycle(100)
+            .await
+            .expect("deleting Project signing cleanup should reconcile");
+        if provisioning.get_project(project.id).await == Err(ApplicationError::NotFound) {
+            break;
+        }
+    }
+    assert_eq!(
+        provisioning.get_project(project.id).await,
+        Err(ApplicationError::NotFound),
+        "Project row should be physically removed after provider cleanup"
+    );
+    assert!(
+        protected_material::Entity::find_by_id(signing_material_id)
+            .one(control)
+            .await
+            .expect("deleted material lookup should work")
+            .is_none(),
+        "Project protected material should be physically removed"
+    );
+    let completion = audit_event::Entity::find()
+        .filter(audit_event::Column::ProjectId.is_null())
+        .filter(audit_event::Column::Action.eq("project.deleted"))
+        .filter(audit_event::Column::TargetId.eq(project.id))
+        .one(control)
+        .await
+        .expect("detached deletion completion audit should be queryable");
+    assert!(completion.is_some());
+    let mut residue_sql = PgConnection::connect(database_url)
+        .await
+        .expect("deleted Project residue probe should connect");
+    let webhook_residue: i64 = sqlx::query_scalar(
+        "SELECT
+             (SELECT COUNT(*) FROM webhook_delivery_attempts WHERE delivery_id=$1)
+           + (SELECT COUNT(*) FROM webhook_deliveries WHERE id=$1)
+           + (SELECT COUNT(*) FROM webhook_secret_cleanup_operations WHERE id=$2)
+           + (SELECT COUNT(*) FROM webhook_secret_generations WHERE endpoint_id=$3)
+           + (SELECT COUNT(*) FROM webhook_endpoints WHERE id=$3)",
+    )
+    .bind(webhook_delivery_id)
+    .bind(webhook_cleanup_id)
+    .bind(webhook_endpoint_id)
+    .fetch_one(&mut residue_sql)
+    .await
+    .expect("deleted Project webhook graph should remain queryable as absent");
+    residue_sql
+        .close()
+        .await
+        .expect("deleted Project residue probe should close");
+    assert_eq!(
+        webhook_residue, 0,
+        "Project deletion must remove child-only webhook history and secret cleanup rows"
+    );
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "one container preserves the ordered shared fixtures across named PostgreSQL capability journeys"
 )]
 #[tokio::test]
@@ -3469,29 +4071,10 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("mapped port should be available");
     let url = format!("postgres://owlauth:owlauth_test@{host}:{port}/owlauth_test");
-    let mut owner_setup = PgConnection::connect(&url)
-        .await
-        .expect("owner setup connection should open");
-    for statement in [
-        "CREATE ROLE owlauth_owner NOLOGIN",
-        "CREATE ROLE owlauth_runtime LOGIN PASSWORD 'runtime_test'",
-        "CREATE ROLE owlauth_control LOGIN PASSWORD 'control_test'",
-        "GRANT owlauth_owner TO owlauth",
-        "ALTER SCHEMA public OWNER TO owlauth_owner",
-        "GRANT USAGE ON SCHEMA public TO owlauth_runtime, owlauth_control",
-        "ALTER DEFAULT PRIVILEGES FOR ROLE owlauth_owner IN SCHEMA public \
-         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO owlauth_runtime, owlauth_control",
-        "ALTER DEFAULT PRIVILEGES FOR ROLE owlauth_owner IN SCHEMA public \
-         GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO owlauth_runtime, owlauth_control",
-    ] {
-        sqlx::query(statement)
-            .execute(&mut owner_setup)
-            .await
-            .expect("owner and serving-role setup should succeed");
-    }
-    let runtime_url = format!("postgres://owlauth_runtime:runtime_test@{host}:{port}/owlauth_test");
-    let control_url = format!("postgres://owlauth_control:control_test@{host}:{port}/owlauth_test");
-    let config = migrate_and_verify_main_database(&url, &runtime_url, &control_url).await;
+    let host_name = host.to_string();
+    verify_deployed_baseline_upgrade(&host_name, port).await;
+
+    let config = migrate_and_verify_main_database(&url).await;
 
     let pools = verify_pools_unit_of_work_and_egress(&config).await;
     let runtime = pools.runtime.as_ref().expect("Runtime pool should exist");
@@ -3957,8 +4540,10 @@ async fn postgres_capability_journeys_are_real() {
         .await
         .expect("disabled-cleanup Project query should work")
         .expect("disabled-cleanup Project should exist");
+    let next_security_revision = disabled_cleanup_project_model.security_revision + 1;
     let mut disabled_project = disabled_cleanup_project_model.into_active_model();
     disabled_project.status = Set("disabled".to_owned());
+    disabled_project.security_revision = Set(next_security_revision);
     disabled_project
         .update(control)
         .await
@@ -5135,9 +5720,11 @@ async fn postgres_capability_journeys_are_real() {
         &config,
         &pools,
         readiness.clone(),
-        control_url.clone(),
+        url.clone(),
     ))
     .await;
+
+    verify_project_lifecycle_and_permanent_deletion(&provisioning, control, &url).await;
 
     control
         .execute_raw(Statement::from_string(
@@ -5202,7 +5789,7 @@ async fn postgres_capability_journeys_are_real() {
             if initially_deferred.contains(&key_id)
     )));
 
-    verify_capacity_and_replay_limits(&control_url).await;
+    verify_capacity_and_replay_limits(&url).await;
 
     pools.close().await;
 }

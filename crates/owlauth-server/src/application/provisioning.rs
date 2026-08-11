@@ -526,6 +526,19 @@ pub(crate) trait ProjectProvisioningPort: Send + Sync {
         expected_security_revision: i64,
         correlation_id: Uuid,
     ) -> Result<ProjectRecord, ApplicationError>;
+    async fn enable_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError>;
+    async fn delete_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError>;
+    async fn finalize_project_deletions(&self, limit: usize) -> Result<usize, ApplicationError>;
 }
 
 #[async_trait]
