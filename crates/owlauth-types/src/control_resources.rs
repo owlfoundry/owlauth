@@ -34,6 +34,7 @@ where
 pub enum ProjectStatus {
     Active,
     Disabled,
+    Deleting,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -1672,6 +1673,33 @@ control_path!(
     body = ExpectedSecurityRevision,
     params(("project_id" = String, Path))
 );
+control_path!(
+    enable_project,
+    post,
+    "/v1/projects/{project_id}/enable",
+    Project,
+    "Enabled project",
+    body = ExpectedSecurityRevision,
+    params(("project_id" = String, Path))
+);
+#[utoipa::path(
+    delete,
+    path = "/v1/projects/{project_id}",
+    request_body = ExpectedSecurityRevision,
+    responses(
+        (status = 202, description = "Project deletion accepted and immediately fenced", body = Project),
+        (status = 400, description = "Invalid request", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 401, description = "Missing or invalid operator API key", body = ProblemDetails, content_type = "application/problem+json", headers(("WWW-Authenticate" = String, description = "Bearer authentication challenge"))),
+        (status = 404, description = "Resource not found", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 409, description = "Revision or state conflict", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 500, description = "Stored authority data violated an invariant", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 503, description = "Required authority unavailable", body = ProblemDetails, content_type = "application/problem+json")
+    ),
+    params(("project_id" = String, Path)),
+    security(("operator_api_key" = []))
+)]
+#[doc(hidden)]
+pub fn delete_project() {}
 control_path!(
     list_project_server_keys,
     get,

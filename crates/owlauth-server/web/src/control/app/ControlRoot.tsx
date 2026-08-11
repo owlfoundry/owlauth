@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, Route, Routes, useNavigate, useParams } from "react-router";
+import { Link, Outlet, Route, Routes, useNavigate, useParams } from "react-router";
 
 import { EmptyState } from "../../shared/layout/Layout";
-import { ControlProvider } from "./ControlContext";
+import { ControlProvider, useProject } from "./ControlContext";
 import { ControlConfirmationProvider } from "./Confirmation";
 import { LockedEntry, VerifiedBootstrapFailure } from "./LockedEntry";
 import { WorkspaceShell } from "./WorkspaceShell";
@@ -182,25 +182,18 @@ export function ControlRoot() {
         <Routes>
           <Route element={<WorkspaceShell />}>
             <Route index element={<ProjectsPage />} />
-            <Route path="projects/:projectId" element={<ProjectOverviewPage />} />
-            <Route path="projects/:projectId/applications" element={<ApplicationsPage />} />
-            <Route
-              path="projects/:projectId/applications/:applicationId"
-              element={<ApplicationDetailPage />}
-            />
-            <Route
-              path="projects/:projectId/authentication/providers"
-              element={<ProvidersPage />}
-            />
-            <Route path="projects/:projectId/authentication/email" element={<EmailPage />} />
-            <Route path="projects/:projectId/users" element={<UsersPage />} />
-            <Route path="projects/:projectId/users/:userId" element={<UserDetailPage />} />
-            <Route path="projects/:projectId/security/signing-keys" element={<SigningKeysPage />} />
-            <Route
-              path="projects/:projectId/security/server-keys"
-              element={<ProjectScopedServerKeysPage />}
-            />
-            <Route path="projects/:projectId/settings" element={<ProjectSettingsPage />} />
+            <Route path="projects/:projectId" element={<ManageableProjectRoute />}>
+              <Route index element={<ProjectOverviewPage />} />
+              <Route path="applications" element={<ApplicationsPage />} />
+              <Route path="applications/:applicationId" element={<ApplicationDetailPage />} />
+              <Route path="authentication/providers" element={<ProvidersPage />} />
+              <Route path="authentication/email" element={<EmailPage />} />
+              <Route path="users" element={<UsersPage />} />
+              <Route path="users/:userId" element={<UserDetailPage />} />
+              <Route path="security/signing-keys" element={<SigningKeysPage />} />
+              <Route path="security/server-keys" element={<ProjectScopedServerKeysPage />} />
+              <Route path="settings" element={<ProjectSettingsPage />} />
+            </Route>
             <Route
               path="*"
               element={
@@ -217,6 +210,22 @@ export function ControlRoot() {
       </ControlConfirmationProvider>
     </ControlProvider>
   );
+}
+
+function ManageableProjectRoute() {
+  const { projectId } = useParams();
+  const project = useProject(projectId);
+  if (project?.status === "deleting") {
+    return (
+      <EmptyState
+        level={1}
+        title="Project deletion in progress"
+        description="This Project is immediately fenced. Provider cleanup may continue before its live data is physically removed."
+        action={<Link to="/">Return to Projects</Link>}
+      />
+    );
+  }
+  return <Outlet />;
 }
 
 function ProjectScopedServerKeysPage() {

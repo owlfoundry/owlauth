@@ -216,6 +216,28 @@ mod tests {
     }
 
     #[test]
+    fn project_lifecycle_commands_require_security_revisions() {
+        const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
+        for transition in ["disable", "enable", "delete"] {
+            assert!(
+                Cli::try_parse_from([
+                    "owlauth",
+                    "project",
+                    transition,
+                    PROJECT,
+                    "--expected-security-revision",
+                    "2",
+                    "--yes",
+                ])
+                .is_ok()
+            );
+            assert!(
+                Cli::try_parse_from(["owlauth", "project", transition, PROJECT, "--yes",]).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn project_user_directory_commands_parse_closed_arguments() {
         const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
         const USER: &str = "22222222-2222-4222-8222-222222222222";

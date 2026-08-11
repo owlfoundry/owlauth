@@ -135,7 +135,9 @@ Every Project-owned table has `project_id` directly or reaches it through a cons
 
 A Runtime request resolves Project and Application before provider, user, session, ticket, or token lookup. A Server API request authenticates one Project server key, requires the route Project to match that exact Project, and invokes only the read-only Server query boundary. A Control request first authenticates the deployment operator API key and then invokes a Project-bound command. A valid key grants all Control commands; `belongs_to` does not replace Project qualification and is never an authorization check.
 
-Project disablement cannot transfer child resources to another Project. A disabled Project rejects new login, handoff, refresh, current-user, and signing operations while preserving identifiers and durable state for audit and controlled recovery. The Control model exposes no hard-delete transition for Projects, Applications, providers, or users.
+Project disablement cannot transfer child resources to another Project. Project status follows `active ⇄ disabled`; either transition advances `security_revision`, and a disabled Project rejects new login, handoff, refresh, current-user, Server API, and signing operations while preserving identifiers and durable state for controlled re-enablement.
+
+Permanent Project deletion is the separate irreversible `active|disabled → deleting → absent` lifecycle. The first revision-checked Control transaction advances `security_revision`, records the deletion request, and fences every Runtime, Server API, and ordinary Project-scoped Control operation. `deleting` cannot transition back to `active` or `disabled`. Bounded maintenance destroys provider-backed signing material and crypto-erases other live material before one Project-qualified finalizer physically removes the complete Project-owned PostgreSQL graph. Applications, providers, users, and other child resources expose no independent hard-delete transition.
 
 ## Ports
 

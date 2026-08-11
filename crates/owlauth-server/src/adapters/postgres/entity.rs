@@ -12,6 +12,7 @@ pub(crate) mod project {
         pub status: String,
         pub metadata_revision: i64,
         pub security_revision: i64,
+        pub deletion_requested_at: Option<TimeDateTimeWithTimeZone>,
         pub created_at: TimeDateTimeWithTimeZone,
         pub updated_at: TimeDateTimeWithTimeZone,
     }

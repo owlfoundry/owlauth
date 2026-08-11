@@ -3,18 +3,19 @@ use super::{
     DbBackend, Duration, EntityTrait, IntoActiveModel, LIST_LIMIT,
     MAX_ACCESS_TOKEN_LIFETIME_SECONDS, MaterialKind, MaterialOwnerKind, MaterialPurpose,
     OffsetDateTime, OpaqueHandle, PostgresProvisioningAdapter, PreparedSigningKey,
-    PreparedSigningMaterial, ProviderErrorClass, ProvisionedProtectedSigningMaterial, QueryFilter,
-    QueryOrder, QuerySelect, RetryClassification, SIGNING_ALGORITHM, SIGNING_PURPOSE, Set,
-    SigningKeyMaintenanceItem, SigningKeyProvisioningPort, SigningKeyRecord, SigningKeyState,
-    SigningProviderAction, SigningProviderCall, SigningProviderLease, Statement, TransactionTrait,
-    Uuid, Value, abandon_signing_key_operation, active_project, async_trait,
-    authenticate_committed_signing_provider_replay, bounded_list, database_now, ensure_capacity,
-    ensure_project, ensure_publishable_signing_key_capacity, ensure_signing_provider_lease,
-    finalize_pending_material, find_signing_key, generated_id, insert_audit,
-    insert_key_state_event, json, key_provisioning_operation, locked_project, parse_signing_state,
-    persistence, prepared_signing_key, project, project_key_ring, project_signing_key,
-    protected_material, provider_error_class_name, retry_classification_name, signing_key_record,
-    signing_public_key_from_jwk, validate_protected_signing_jwk, validate_signing_operation,
+    PreparedSigningMaterial, ProjectStatus, ProviderErrorClass,
+    ProvisionedProtectedSigningMaterial, QueryFilter, QueryOrder, QuerySelect, RetryClassification,
+    SIGNING_ALGORITHM, SIGNING_PURPOSE, Set, SigningKeyMaintenanceItem, SigningKeyProvisioningPort,
+    SigningKeyRecord, SigningKeyState, SigningProviderAction, SigningProviderCall,
+    SigningProviderLease, Statement, TransactionTrait, Uuid, Value, abandon_signing_key_operation,
+    active_project, async_trait, authenticate_committed_signing_provider_replay, bounded_list,
+    database_now, ensure_capacity, ensure_project, ensure_publishable_signing_key_capacity,
+    ensure_signing_provider_lease, finalize_pending_material, find_signing_key, generated_id,
+    insert_audit, insert_key_state_event, json, key_provisioning_operation, locked_project,
+    parse_signing_state, persistence, prepared_signing_key, project, project_key_ring,
+    project_signing_key, protected_material, provider_error_class_name, retry_classification_name,
+    signing_key_record, signing_public_key_from_jwk, validate_protected_signing_jwk,
+    validate_signing_operation,
 };
 
 async fn claim_maintenance_ids(
@@ -480,18 +481,14 @@ impl PostgresProvisioningAdapter {
         completed_at: OffsetDateTime,
     ) -> Result<(), ApplicationError> {
         let transaction = self.database.begin().await.map_err(persistence)?;
-        let operation = key_provisioning_operation::Entity::find_by_id(prepared.operation_id)
-            .filter(key_provisioning_operation::Column::ProjectId.eq(project_id))
+        // Project is the root lock for deletion and every signing transition. Acquire it before
+        // ring, key, and operation locks so cleanup cannot deadlock with terminal Project fencing.
+        let project = project::Entity::find_by_id(project_id)
+            .lock_shared()
             .one(&transaction)
             .await
             .map_err(persistence)?
             .ok_or(ApplicationError::NotFound)?;
-        validate_signing_operation(prepared, &operation)?;
-        if operation.state != "cleanup_leased"
-            || operation.provider_lease_token != Some(lease.token)
-        {
-            return Err(ApplicationError::OperationInProgress);
-        }
         let ring = project_key_ring::Entity::find_by_id(prepared.ring_id)
             .filter(project_key_ring::Column::ProjectId.eq(project_id))
             .lock_exclusive()
@@ -530,6 +527,27 @@ impl PostgresProvisioningAdapter {
             return Ok(());
         }
         let material_id = operation.material_id;
+        if project.status == ProjectStatus::Deleting.as_str() {
+            let custody = self.custody();
+            custody
+                .materials
+                .erase_by_id_in_transaction(&transaction, material_id, completed_at)
+                .await?;
+            let mut operation_active = operation.into_active_model();
+            operation_active.state = Set("abandoned".to_owned());
+            operation_active.provider_lease_token = Set(None);
+            operation_active.provider_lease_expires_at = Set(None);
+            operation_active.next_attempt_at = Set(None);
+            operation_active.abandoned_at = Set(Some(completed_at));
+            operation_active.destroyed_at = Set(Some(completed_at));
+            operation_active.last_attempt_at = Set(Some(completed_at));
+            operation_active
+                .update(&transaction)
+                .await
+                .map_err(persistence)?;
+            transaction.commit().await.map_err(persistence)?;
+            return Ok(());
+        }
         if key.state != SigningKeyState::Provisioning.as_str()
             && key.state != SigningKeyState::Abandoned.as_str()
         {

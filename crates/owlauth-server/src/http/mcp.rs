@@ -1328,7 +1328,7 @@ mod tests {
         let mut tools = server.tool_router.list_all();
         tools.extend(server.control_tools.tools());
         tools.sort_by(|left, right| left.name.cmp(&right.name));
-        assert_eq!(tools.len(), 85);
+        assert_eq!(tools.len(), 87);
         for tools in tools.chunks(TOOL_PAGE_SIZE) {
             let encoded = serde_json::to_vec(tools).unwrap();
             assert!(

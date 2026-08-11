@@ -111,10 +111,14 @@ function Navigation({
   project,
   onNavigate,
 }: {
-  readonly project: { readonly id: string; readonly display_name: string } | null;
+  readonly project: {
+    readonly id: string;
+    readonly display_name: string;
+    readonly status: "active" | "disabled" | "deleting";
+  } | null;
   readonly onNavigate: () => void;
 }) {
-  const base = project === null ? null : `/projects/${project.id}`;
+  const base = project === null || project.status === "deleting" ? null : `/projects/${project.id}`;
   const navigationId = useId();
   return (
     <nav className={styles["navigation"]} aria-label="Resources">

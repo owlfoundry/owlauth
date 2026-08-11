@@ -65,6 +65,7 @@ impl fmt::Display for PublicId {
 pub(crate) enum ProjectStatus {
     Active,
     Disabled,
+    Deleting,
 }
 
 impl ProjectStatus {
@@ -72,6 +73,7 @@ impl ProjectStatus {
         match self {
             Self::Active => "active",
             Self::Disabled => "disabled",
+            Self::Deleting => "deleting",
         }
     }
 
@@ -80,6 +82,22 @@ impl ProjectStatus {
             return Err(DomainError::InvalidTransition);
         }
         *self = Self::Disabled;
+        Ok(())
+    }
+
+    pub(crate) fn enable(&mut self) -> Result<(), DomainError> {
+        if *self != Self::Disabled {
+            return Err(DomainError::InvalidTransition);
+        }
+        *self = Self::Active;
+        Ok(())
+    }
+
+    pub(crate) fn delete(&mut self) -> Result<(), DomainError> {
+        if !matches!(*self, Self::Active | Self::Disabled) {
+            return Err(DomainError::InvalidTransition);
+        }
+        *self = Self::Deleting;
         Ok(())
     }
 }
@@ -116,10 +134,15 @@ mod tests {
     }
 
     #[test]
-    fn project_disable_is_monotonic() {
+    fn project_status_supports_reversible_disable_and_terminal_delete() {
         let mut status = ProjectStatus::Active;
         status.disable().unwrap();
         assert_eq!(status, ProjectStatus::Disabled);
-        assert_eq!(status.disable(), Err(DomainError::InvalidTransition));
+        status.enable().unwrap();
+        assert_eq!(status, ProjectStatus::Active);
+        status.delete().unwrap();
+        assert_eq!(status, ProjectStatus::Deleting);
+        assert_eq!(status.enable(), Err(DomainError::InvalidTransition));
+        assert_eq!(status.delete(), Err(DomainError::InvalidTransition));
     }
 }

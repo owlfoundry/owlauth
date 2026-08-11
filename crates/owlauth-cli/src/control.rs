@@ -142,8 +142,24 @@ enum ProjectCommand {
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Monotonically disable a Project.
+    /// Disable a Project until it is explicitly enabled again.
     Disable {
+        project_id: String,
+        #[arg(long)]
+        expected_security_revision: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Enable a disabled Project.
+    Enable {
+        project_id: String,
+        #[arg(long)]
+        expected_security_revision: i64,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Permanently delete a Project and all of its live authority data.
+    Delete {
         project_id: String,
         #[arg(long)]
         expected_security_revision: i64,
@@ -707,6 +723,67 @@ enum WebhookDeliveryCommand {
     },
 }
 
+fn run_project_transition(
+    profile: Option<&str>,
+    project_id: &str,
+    expected_security_revision: i64,
+    confirmed: bool,
+    action: &str,
+    effect: &str,
+) -> Result<(), RemoteError> {
+    resource(project_id)?;
+    let target = format!("projects/{project_id}/{action}");
+    let stored = require_confirmation(
+        confirmed,
+        profile,
+        &format!("project.{action}"),
+        &target,
+        &serde_json::json!({
+            "effect": effect,
+            "expected_security_revision": expected_security_revision,
+        }),
+    )?;
+    let value: Project = authenticated_server_snapshot(stored)?.send(
+        Method::POST,
+        &target,
+        &ExpectedSecurityRevision {
+            expected_security_revision,
+        },
+        None,
+    )?;
+    print_json(&value)
+}
+
+fn run_project_delete(
+    profile: Option<&str>,
+    project_id: &str,
+    expected_security_revision: i64,
+    confirmed: bool,
+) -> Result<(), RemoteError> {
+    resource(project_id)?;
+    let target = format!("projects/{project_id}");
+    let stored = require_confirmation(
+        confirmed,
+        profile,
+        "project.delete",
+        &target,
+        &serde_json::json!({
+            "effect": "permanently delete the Project after provider cleanup",
+            "expected_security_revision": expected_security_revision,
+            "recoverable": false,
+        }),
+    )?;
+    let value: Project = authenticated_server_snapshot(stored)?.send(
+        Method::DELETE,
+        &target,
+        &ExpectedSecurityRevision {
+            expected_security_revision,
+        },
+        None,
+    )?;
+    print_json(&value)
+}
+
 pub(crate) fn run_project(profile: Option<&str>, args: ProjectArgs) -> Result<(), RemoteError> {
     match args.command {
         ProjectCommand::List { belongs_to } => {
@@ -744,29 +821,31 @@ pub(crate) fn run_project(profile: Option<&str>, args: ProjectArgs) -> Result<()
             project_id,
             expected_security_revision,
             yes,
-        } => {
-            resource(&project_id)?;
-            let target = format!("projects/{project_id}/disable");
-            let stored = require_confirmation(
-                yes,
-                profile,
-                "project.disable",
-                &target,
-                &serde_json::json!({
-                    "effect": "monotonically disable the Project",
-                    "expected_security_revision": expected_security_revision,
-                }),
-            )?;
-            let value: Project = authenticated_server_snapshot(stored)?.send(
-                Method::POST,
-                &target,
-                &ExpectedSecurityRevision {
-                    expected_security_revision,
-                },
-                None,
-            )?;
-            print_json(&value)
-        }
+        } => run_project_transition(
+            profile,
+            &project_id,
+            expected_security_revision,
+            yes,
+            "disable",
+            "disable the Project until it is explicitly enabled",
+        ),
+        ProjectCommand::Enable {
+            project_id,
+            expected_security_revision,
+            yes,
+        } => run_project_transition(
+            profile,
+            &project_id,
+            expected_security_revision,
+            yes,
+            "enable",
+            "enable the Project",
+        ),
+        ProjectCommand::Delete {
+            project_id,
+            expected_security_revision,
+            yes,
+        } => run_project_delete(profile, &project_id, expected_security_revision, yes),
         ProjectCommand::Policy(args) => run_project_policy(profile, args),
         ProjectCommand::User(args) => run_project_user(profile, args),
     }

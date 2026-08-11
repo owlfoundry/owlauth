@@ -98,6 +98,8 @@ pub fn get_system() -> SystemCapabilities {
         crate::control_resources::get_project_policy,
         crate::control_resources::update_project_policy,
         crate::control_resources::disable_project,
+        crate::control_resources::enable_project,
+        crate::control_resources::delete_project,
         crate::control_resources::list_project_server_keys,
         crate::control_resources::get_project_server_key,
         crate::control_resources::create_project_server_key,

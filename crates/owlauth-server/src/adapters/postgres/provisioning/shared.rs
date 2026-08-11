@@ -301,11 +301,14 @@ pub(in crate::adapters::postgres) async fn ensure_project<C>(
 where
     C: ConnectionTrait,
 {
-    project::Entity::find_by_id(project_id)
+    let project = project::Entity::find_by_id(project_id)
         .one(connection)
         .await
         .map_err(persistence)?
         .ok_or(ApplicationError::NotFound)?;
+    if project.status == ProjectStatus::Deleting.as_str() {
+        return Err(ApplicationError::Disabled);
+    }
     Ok(())
 }
 

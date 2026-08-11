@@ -42,7 +42,7 @@ Every authenticated command repeats discovery validation before reading the refe
 
 The self-hosted client supports typed commands for:
 
-- Project list/get/create/disable, token/session policy get/set, and Project-user authoritative search/filter/sort/page, exact-email lookup, get/identity/session inspection, disable, and exact session revoke;
+- Project list/get/create/disable/enable/permanent-delete, token/session policy get/set, and Project-user authoritative search/filter/sort/page, exact-email lookup, get/identity/session inspection, disable, and exact session revoke;
 - Application list/get/create/disable and cursor-bounded immutable user-event history;
 - provider Project-egress get/set, Custom OIDC preflight, and list/create/disable/assign/unassign for the closed `oidc`, `google`, and `github` kinds;
 - signing-key list/rotate/revoke, with provisioning, publication, activation, and retirement handled by the automatic lifecycle;
@@ -58,6 +58,14 @@ owlauth --profile local project list
 owlauth --profile local project create \
   --display-name 'Example' \
   --idempotency-key project_create_20260803
+owlauth --profile local project enable \
+  11111111-1111-4111-8111-111111111111 \
+  --expected-security-revision 2 \
+  --yes
+owlauth --profile local project delete \
+  11111111-1111-4111-8111-111111111111 \
+  --expected-security-revision 3 \
+  --yes
 owlauth --profile local application list \
   11111111-1111-4111-8111-111111111111
 owlauth --profile local project user list \
@@ -81,7 +89,7 @@ owlauth --profile local server-key acknowledge \
   --yes
 ```
 
-All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. `server-key create` leaves replacement creation blocked until the emitted credential is durably stored and the exact returned key revision is passed to `server-key acknowledge`, or the key is revoked. Acknowledgement is an explicit assertion about external secret-manager storage; successful stdout delivery alone does not make that assertion. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require explicit `--yes` where exposed. The CLI rejects the operation before authentication when confirmation is absent; when present, it prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before authenticating. Full-replacement booleans such as `--browser-session-reuse` require an explicit `true` or `false` value.
+All Control path identifiers must be canonical lowercase hyphenated UUIDs. Create commands require an explicit 8–128 character `--idempotency-key`; retain and reuse that key when reconciling an ambiguous transport outcome instead of submitting the same normalized create under a new key. `server-key create` leaves replacement creation blocked until the emitted credential is durably stored and the exact returned key revision is passed to `server-key acknowledge`, or the key is revoked. Acknowledgement is an explicit assertion about external secret-manager storage; successful stdout delivery alone does not make that assertion. Revision-fenced trust, visibility, activation, disable, retirement, revoke, assignment, unassignment, endpoint-test, and policy changes require confirmation. Project disable, enable, and permanent delete require `--yes`. The CLI rejects an unconfirmed operation before authentication and prints a redacted preview containing the selected profile, pinned endpoint/instance, exact target, operation, and bounded effect before the mutation. Full-replacement booleans such as `--browser-session-reuse` require an explicit `true` or `false` value.
 
 Provider client secrets and webhook signing secrets, including candidate rotation generations, are accepted only through named environment-variable references:
 

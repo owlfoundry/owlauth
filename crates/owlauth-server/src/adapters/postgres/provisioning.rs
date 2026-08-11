@@ -22,7 +22,7 @@ use crate::{
         postgres::{
             custody::{
                 MaterialOwnerKind, MaterialPurpose, ProtectedMaterialRepository,
-                finalize_pending_material,
+                finalize_pending_material, lock_material_inventory,
             },
             entity::{
                 application, application_origin, application_provider_assignment,

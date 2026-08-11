@@ -70,6 +70,32 @@ impl ProvisioningService {
             .disable_project(project_id, expected_security_revision, correlation_id)
             .await
     }
+    pub(crate) async fn enable_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError> {
+        self.projects
+            .enable_project(project_id, expected_security_revision, correlation_id)
+            .await
+    }
+    pub(crate) async fn delete_project(
+        &self,
+        project_id: Uuid,
+        expected_security_revision: i64,
+        correlation_id: Uuid,
+    ) -> Result<ProjectRecord, ApplicationError> {
+        self.projects
+            .delete_project(project_id, expected_security_revision, correlation_id)
+            .await
+    }
+    pub(crate) async fn finalize_project_deletions(
+        &self,
+        limit: usize,
+    ) -> Result<usize, ApplicationError> {
+        self.projects.finalize_project_deletions(limit).await
+    }
     pub(crate) async fn create_application(
         &self,
         project_id: Uuid,

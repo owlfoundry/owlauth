@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { ControlApp } from "./App";
-import type { ProjectServerKey } from "./client";
+import type { Project, ProjectServerKey } from "./client";
 
 function requestUrl(input: RequestInfo | URL): string {
   return input instanceof Request ? input.url : String(input);
@@ -222,6 +222,128 @@ describe("Control application shell", () => {
     fireEvent.click(within(navigation).getByRole("link", { name: "Back to projects" }));
     const projectLink = await screen.findByRole("link", { name: project.display_name });
     expect(projectLink).toHaveAccessibleDescription(/project_public_1.*active/u);
+  });
+
+  it("hides inactive Projects by default and keeps deleting rows out of management routes", async () => {
+    const disabledProject = {
+      ...project,
+      id: "project-disabled",
+      public_id: "project_public_disabled",
+      display_name: "Disabled Project",
+      status: "disabled",
+      security_revision: 2,
+    } as const;
+    const deletingProject = {
+      ...project,
+      id: "project-deleting",
+      public_id: "project_public_deleting",
+      display_name: "Deleting Project",
+      status: "deleting",
+      security_revision: 3,
+    } as const;
+    const localStorageLength = window.localStorage.length;
+    const sessionStorageLength = window.sessionStorage.length;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) =>
+        Promise.resolve(
+          requestUrl(input).endsWith("/v1/system")
+            ? systemResponse()
+            : Response.json({ items: [project, disabledProject, deletingProject] }),
+        ),
+      ),
+    );
+
+    renderConsole();
+    await unlock();
+    expect(screen.getByRole("link", { name: project.display_name })).toBeVisible();
+    expect(screen.queryByText(disabledProject.display_name)).toBeNull();
+    expect(screen.queryByText(deletingProject.display_name)).toBeNull();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Show inactive projects" }));
+    expect(screen.getByRole("link", { name: disabledProject.display_name })).toBeVisible();
+    expect(screen.getByText(deletingProject.display_name)).toBeVisible();
+    expect(screen.queryByRole("link", { name: deletingProject.display_name })).toBeNull();
+    expect(window.localStorage).toHaveLength(localStorageLength);
+    expect(window.sessionStorage).toHaveLength(sessionStorageLength);
+  });
+
+  it("searches the Project directory by name and public ID across the inactive filter", async () => {
+    const activeProject = {
+      ...project,
+      id: "project-payments",
+      public_id: "project_payments_eu",
+      display_name: "Payments Europe",
+    } as const;
+    const disabledProject = {
+      ...project,
+      id: "project-archive",
+      public_id: "project_archive_2025",
+      display_name: "Legacy Archive",
+      status: "disabled",
+      security_revision: 2,
+    } as const;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) =>
+        Promise.resolve(
+          requestUrl(input).endsWith("/v1/system")
+            ? systemResponse()
+            : Response.json({ items: [project, activeProject, disabledProject] }),
+        ),
+      ),
+    );
+
+    renderConsole();
+    await unlock();
+    const search = screen.getByRole("searchbox", { name: "Search projects" });
+    expect(screen.getByRole("link", { name: project.display_name })).toBeVisible();
+    expect(screen.getByRole("link", { name: activeProject.display_name })).toBeVisible();
+    expect(screen.getByText("2 Projects")).toBeVisible();
+
+    fireEvent.change(search, { target: { value: "payments" } });
+    expect(screen.queryByRole("link", { name: project.display_name })).toBeNull();
+    expect(screen.getByRole("link", { name: activeProject.display_name })).toBeVisible();
+    expect(screen.getByText("1 Project")).toBeVisible();
+
+    fireEvent.change(search, { target: { value: "PROJECT_PUBLIC_1" } });
+    expect(screen.getByRole("link", { name: project.display_name })).toBeVisible();
+    expect(screen.queryByRole("link", { name: activeProject.display_name })).toBeNull();
+
+    fireEvent.change(search, { target: { value: "archive_2025" } });
+    expect(screen.getByRole("heading", { name: "No matching Projects" })).toBeVisible();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Show inactive projects" }));
+    expect(screen.getByRole("link", { name: disabledProject.display_name })).toBeVisible();
+  });
+
+  it("renders only deletion status for direct navigation to a deleting Project", async () => {
+    const deletingProject = {
+      ...project,
+      status: "deleting",
+      security_revision: 2,
+    } as const;
+    let scopedRequests = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return Promise.resolve(systemResponse());
+        if (url.pathname.endsWith("/v1/projects")) {
+          return Promise.resolve(Response.json({ items: [deletingProject] }));
+        }
+        scopedRequests += 1;
+        return Promise.resolve(Response.json({ code: "unexpected" }, { status: 500 }));
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/settings`);
+    await unlock("owl_ctrl_v1_test", "Project deletion in progress");
+    const navigation = screen.getByRole("navigation", { name: "Resources" });
+    expect(within(navigation).queryByRole("link", { name: "Settings" })).toBeNull();
+    expect(within(navigation).getByRole("link", { name: "Back to projects" })).toBeVisible();
+    expect(screen.getByText(/immediately fenced/u)).toBeVisible();
+    expect(scopedRequests).toBe(0);
   });
 
   it("clears authenticated DOM on pagehide and persisted pageshow", async () => {
@@ -1195,6 +1317,111 @@ describe("Control application shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry Project policy" }));
     expect(await screen.findByText("15 minutes")).toBeVisible();
     expect(policyReads).toBe(2);
+  });
+
+  it("supports reversible Project disable and enable before exact-name permanent deletion", async () => {
+    let currentProject: Project = { ...project };
+    const mutations: {
+      readonly method: string;
+      readonly path: string;
+      readonly body: unknown;
+    }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input) => {
+        const request = input as Request;
+        const url = new URL(request.url);
+        if (url.pathname.endsWith("/v1/system")) return systemResponse();
+        if (url.pathname.endsWith("/v1/projects") && request.method === "GET") {
+          return Response.json({ items: [currentProject] });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/policy`)) {
+          return Response.json({
+            project_id: project.id,
+            access_token_lifetime_seconds: 900,
+            browser_session_reuse: false,
+            claims_revision: 1,
+            session_revision: 1,
+          });
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/disable`)) {
+          mutations.push({
+            method: request.method,
+            path: url.pathname,
+            body: await request.clone().json(),
+          });
+          currentProject = { ...currentProject, status: "disabled", security_revision: 2 };
+          return Response.json(currentProject);
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}/enable`)) {
+          mutations.push({
+            method: request.method,
+            path: url.pathname,
+            body: await request.clone().json(),
+          });
+          currentProject = { ...currentProject, status: "active", security_revision: 3 };
+          return Response.json(currentProject);
+        }
+        if (url.pathname.endsWith(`/v1/projects/${project.id}`) && request.method === "DELETE") {
+          mutations.push({
+            method: request.method,
+            path: url.pathname,
+            body: await request.clone().json(),
+          });
+          currentProject = { ...currentProject, status: "deleting", security_revision: 4 };
+          return Response.json(currentProject, { status: 202 });
+        }
+        throw new Error(`Unexpected request: ${request.method} ${url.pathname}`);
+      }),
+    );
+
+    renderConsole(`/projects/${project.id}/settings`);
+    await unlock("owl_ctrl_v1_test", "Project settings");
+    fireEvent.click(screen.getByRole("button", { name: "Disable Project" }));
+    let dialog = screen.getByRole("dialog", { name: "Disable Project" });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: `Disable ${project.display_name}` }),
+    );
+    expect(await screen.findByRole("button", { name: "Enable Project" })).toBeVisible();
+    expect(screen.getByText(/blocked until it is enabled/u)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Enable Project" }));
+    dialog = screen.getByRole("dialog", { name: "Enable Project" });
+    fireEvent.click(within(dialog).getByRole("button", { name: `Enable ${project.display_name}` }));
+    expect(await screen.findByRole("button", { name: "Disable Project" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Permanently delete Project" }));
+    dialog = screen.getByRole("dialog", { name: "Permanently delete Project" });
+    const deleteButton = within(dialog).getByRole("button", {
+      name: "Permanently delete Project",
+    });
+    const confirmation = within(dialog).getByLabelText(`Type ${project.display_name} to confirm`);
+    expect(deleteButton).toBeDisabled();
+    fireEvent.change(confirmation, { target: { value: `${project.display_name} ` } });
+    expect(deleteButton).toBeDisabled();
+    fireEvent.change(confirmation, { target: { value: project.display_name } });
+    expect(deleteButton).toBeEnabled();
+    fireEvent.click(deleteButton);
+
+    expect(await screen.findByRole("heading", { name: /^Projects$/u })).toBeVisible();
+    expect(screen.queryByRole("link", { name: project.display_name })).toBeNull();
+    expect(mutations).toEqual([
+      {
+        method: "POST",
+        path: `/admin/v1/projects/${project.id}/disable`,
+        body: { expected_security_revision: 1 },
+      },
+      {
+        method: "POST",
+        path: `/admin/v1/projects/${project.id}/enable`,
+        body: { expected_security_revision: 2 },
+      },
+      {
+        method: "DELETE",
+        path: `/admin/v1/projects/${project.id}`,
+        body: { expected_security_revision: 3 },
+      },
+    ]);
   });
 
   it("routes server keys through one-time reveal, explicit disposal, and revisioned revoke", async () => {

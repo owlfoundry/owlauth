@@ -287,8 +287,9 @@ impl ControlOperation {
         let tool_name = format!("owlauth_{operation_id}");
         let title = operation_title(operation_id);
         let read_only = is_read_only_operation(&method, operation_id);
-        let idempotent =
-            read_only || matches!(method, Method::PUT | Method::PATCH) || accepts_idempotency_key;
+        let idempotent = read_only
+            || matches!(method, Method::PUT | Method::PATCH | Method::DELETE)
+            || accepts_idempotency_key;
         let destructive = !read_only && is_destructive_operation(operation_id);
         let open_world = is_open_world_operation(operation_id);
         let tool = Tool::new(
@@ -711,9 +712,11 @@ mod tests {
     #[test]
     fn generated_catalog_covers_every_non_hand_designed_control_operation() {
         let catalog = ControlToolCatalog::from_control_openapi().unwrap();
-        assert_eq!(catalog.tools.len() + HAND_DESIGNED_OPERATION_IDS.len(), 85);
+        assert_eq!(catalog.tools.len() + HAND_DESIGNED_OPERATION_IDS.len(), 87);
         assert!(catalog.contains("owlauth_create_project"));
         assert!(catalog.contains("owlauth_update_project"));
+        assert!(catalog.contains("owlauth_enable_project"));
+        assert!(catalog.contains("owlauth_delete_project"));
         assert!(catalog.contains("owlauth_create_provider"));
         assert!(catalog.contains("owlauth_create_project_server_key"));
         assert!(catalog.contains("owlauth_confirm_identity_mutation_intent"));
@@ -763,6 +766,35 @@ mod tests {
         let disable = annotations("owlauth_disable_application");
         assert_eq!(disable.read_only_hint, Some(false));
         assert_eq!(disable.destructive_hint, Some(true));
+
+        let enable_project = annotations("owlauth_enable_project");
+        assert_eq!(enable_project.read_only_hint, Some(false));
+        assert_eq!(enable_project.destructive_hint, Some(true));
+        assert_eq!(enable_project.idempotent_hint, Some(false));
+
+        let delete_project = annotations("owlauth_delete_project");
+        assert_eq!(delete_project.read_only_hint, Some(false));
+        assert_eq!(delete_project.destructive_hint, Some(true));
+        assert_eq!(delete_project.idempotent_hint, Some(true));
+        assert_eq!(delete_project.open_world_hint, Some(false));
+
+        let delete_schema = Value::Object(
+            catalog
+                .get_tool("owlauth_delete_project")
+                .unwrap()
+                .input_schema
+                .as_ref()
+                .clone(),
+        );
+        assert_eq!(delete_schema["additionalProperties"], false);
+        assert_eq!(
+            delete_schema["properties"]["body"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            delete_schema["properties"]["body"]["required"],
+            json!(["expected_security_revision"])
+        );
 
         let oidc = annotations("owlauth_preflight_oidc_provider");
         assert_eq!(oidc.read_only_hint, Some(true));

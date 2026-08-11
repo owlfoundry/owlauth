@@ -71,6 +71,15 @@ owlauth --profile production project create \
 owlauth --profile production project disable PROJECT_ID \
   --expected-security-revision 7 \
   --yes
+
+owlauth --profile production project enable PROJECT_ID \
+  --expected-security-revision 8 \
+  --yes
+
+# Permanent deletion immediately fences the Project and cannot be undone.
+owlauth --profile production project delete PROJECT_ID \
+  --expected-security-revision 9 \
+  --yes
 ```
 
 Use `owlauth COMMAND --help` at each command level for the complete typed surface. Server-key creation reveals credential material once; capture that JSON directly into approved backend secret custody and do not paste it into shell arguments, logs, tickets, or agent context. Rotate a server key by creating and acknowledging a replacement, deploying it, and then revoking the predecessor. Resource secrets accepted by provider or webhook commands are also read from explicitly named environment variables and may not reuse the operator credential.
